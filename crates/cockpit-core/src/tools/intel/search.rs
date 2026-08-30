@@ -58,6 +58,10 @@ impl Tool for SearchTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // Recall paths never reach the repository index or host-path guards.
+        if let Some(output) = crate::tools::recall::grep(&args, ctx).await? {
+            return Ok(output);
+        }
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)

@@ -50,6 +50,7 @@ pub mod image_generation_runtime;
 pub mod image_sidecar;
 pub mod init;
 pub mod intel;
+pub mod keep_warm;
 pub mod knowledge;
 pub mod leak_report;
 pub mod leaks;

@@ -64,11 +64,13 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("lsp"),
     ToolTimeoutSafety::abandon_safe("knowledge_retrieve"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
+    // Knowledge dreams observe cancellation only while waiting for their
+    // write fence. Once the blocking transaction starts it must reach its
+    // commit/defer boundary, so it must not claim the dispatcher's stronger
+    // cleanup-before-return cancellation contract.
+    ToolTimeoutSafety::abandon_safe("knowledge_dream_apply"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),
-    ToolTimeoutSafety::abandon_safe("plan_edit"),
-    ToolTimeoutSafety::abandon_safe("plan_read"),
-    ToolTimeoutSafety::abandon_safe("plan_write"),
     ToolTimeoutSafety::human_blocking("question"),
     ToolTimeoutSafety::abandon_safe("read"),
     ToolTimeoutSafety::abandon_safe("read_image"),

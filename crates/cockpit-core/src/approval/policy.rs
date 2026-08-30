@@ -82,7 +82,8 @@ impl Approver {
             return false;
         };
         let (extended, providers) = self.store.configs();
-        matches!(crate::engine::safety_gate::evaluate(extended.guard_model_ref(), &providers, redact, None, "local_metadata_refresh", payload).await, crate::engine::safety_gate::SafetyOutcome::Rated(verdict) if verdict.safe)
+        let args = serde_json::json!({ "target": payload });
+        matches!(crate::engine::safety_gate::evaluate(extended.guard_model_ref(), &providers, redact, None, "local_metadata_refresh", &args).await, crate::engine::safety_gate::SafetyOutcome::Rated(verdict) if verdict.safe)
     }
 
     /// Read-only access to the underlying store (the §4 query API).

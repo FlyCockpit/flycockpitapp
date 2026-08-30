@@ -58,7 +58,6 @@ fn selectable_meta() -> render::ChatRowMeta {
 fn app_with_hello_grid() -> App {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.mouse_capture = true;
     app.copy_on_release = true;

@@ -9793,6 +9793,86 @@ mod render_history_spacing_tests {
         );
     }
 
+    #[test]
+    fn hiding_tool_calls_filters_rendered_rows_and_interaction_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![
+            user("visible user message"),
+            HistoryEntry::ToolBox {
+                calls: vec![ToolCall {
+                    call_id: "tool-box-call".to_string(),
+                    tool: "bash".to_string(),
+                    summary: "tool-box-marker".to_string(),
+                    full_input: "printf tool-box-marker".to_string(),
+                    output: String::new(),
+                    expanded: false,
+                    result_offset: 0,
+                    state: ToolCallState::Success,
+                    hint: None,
+                    progress: None,
+                    mcp_child: None,
+                }],
+                view_offset: 0,
+                follow: true,
+            },
+            HistoryEntry::ToolLine {
+                call_id: "tool-line-call".to_string(),
+                tool: "write".to_string(),
+                summary: "tool-line-marker".to_string(),
+                icon_path: None,
+                state: ToolCallState::Success,
+            },
+            diff_entry("tool-diff-marker.rs"),
+            agent("visible assistant message"),
+        ]
+        .into();
+        let history_ids = app.history.ids().to_vec();
+        let history_before = format!("{:?}", &*app.history);
+
+        let shown = buffer_text(&render_history_buffer(&mut app, 100, 24));
+        for marker in ["tool-box-marker", "tool-line-marker", "tool-diff-marker.rs"] {
+            assert!(
+                shown.contains(marker),
+                "fixture must render {marker}:\n{shown}"
+            );
+        }
+
+        app.handle_tool_calls_command("hide");
+        let hidden = buffer_text(&render_history_buffer(&mut app, 100, 24));
+        assert!(hidden.contains("visible user message"), "{hidden}");
+        assert!(hidden.contains("visible assistant message"), "{hidden}");
+        for marker in ["tool-box-marker", "tool-line-marker", "tool-diff-marker.rs"] {
+            assert!(
+                !hidden.contains(marker),
+                "hidden tool row {marker}:\n{hidden}"
+            );
+        }
+        assert!(
+            app.chat_row_meta.iter().all(|meta| {
+                meta.tool_box_target.is_none()
+                    && meta.tool_call_target.is_none()
+                    && meta.tool_result_scroll.is_none()
+                    && meta.diff_path.is_none()
+            }),
+            "hidden tool rows must not leave interaction targets: {:?}",
+            app.chat_row_meta
+        );
+
+        app.handle_tool_calls_command("show");
+        let restored = buffer_text(&render_history_buffer(&mut app, 100, 24));
+        for marker in ["tool-box-marker", "tool-line-marker", "tool-diff-marker.rs"] {
+            assert!(
+                restored.contains(marker),
+                "shown tool row {marker}:\n{restored}"
+            );
+        }
+        assert_eq!(app.history.ids(), history_ids);
+        assert_eq!(format!("{:?}", &*app.history), history_before);
+    }
+
     fn row_has_hover_bg(buffer: &ratatui::buffer::Buffer, row: usize, width: u16) -> bool {
         (0..width).any(|col| buffer[(col, row as u16)].style().bg == Some(TRANSCRIPT_HOVER_BG))
     }

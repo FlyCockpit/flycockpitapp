@@ -44,7 +44,6 @@ pub mod return_tool;
 pub mod sandbox;
 pub mod sandbox_mode;
 pub mod schedule;
-pub mod session_read;
 pub mod session_search;
 pub mod shell_compress;
 pub mod shell_sandbox;
@@ -62,6 +61,4 @@ pub mod web;
 pub mod worktree_orchestrate;
 pub mod write;
 
-pub mod artifact_read;
-pub mod artifact_search;
 pub mod common;

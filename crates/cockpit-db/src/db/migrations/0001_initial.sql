@@ -3204,7 +3204,51 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
--- ---- session full-text search (`session_search` / `session_read`) -----------------
+-- ---- session full-text search (`session_search` / `cockpit://` recall) -------------
+
+-- ---- scheduled jobs --------------------------------------------------------
+-- The immutable insertion identity fences stale asynchronous actions when a
+-- user-chosen job id is deleted and later reused.
+CREATE TABLE scheduled_jobs (
+    id                TEXT    PRIMARY KEY,
+    row_identity      TEXT    NOT NULL UNIQUE,
+    owner             TEXT    NOT NULL,
+    schedule_json     TEXT    NOT NULL CHECK (
+        json_valid(schedule_json) AND json_type(schedule_json) = 'object'
+        AND length(CAST(schedule_json AS BLOB)) <= 65536
+    ),
+    payload_json      TEXT    NOT NULL CHECK (
+        json_valid(payload_json)
+        AND length(CAST(payload_json AS BLOB)) <= 1048576
+    ),
+    enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
+    last_run_at       INTEGER,
+    next_run_at       INTEGER,
+    last_result_json  TEXT CHECK (
+        last_result_json IS NULL OR (
+            json_valid(last_result_json)
+            AND length(CAST(last_result_json AS BLOB)) <= 1048576
+        )
+    ),
+    failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+    backoff_until     INTEGER,
+    disabled_notice   TEXT
+);
+
+CREATE INDEX idx_scheduled_jobs_next_run
+    ON scheduled_jobs(enabled, next_run_at);
+
+CREATE INDEX idx_scheduled_jobs_owner
+    ON scheduled_jobs(owner);
+
+CREATE TRIGGER scheduled_jobs_row_identity_immutable
+BEFORE UPDATE OF row_identity ON scheduled_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'scheduled job row identity is immutable');
+END;
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session TITLE plus the text of `user_message` /
 -- `assistant_message` events and model-written compaction briefs/handoffs.

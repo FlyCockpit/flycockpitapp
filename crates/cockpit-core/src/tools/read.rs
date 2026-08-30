@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use crate::engine::tool::{
     Tool, ToolCtx, ToolEffect, ToolOutput, ToolPresentation, path_or_readable_args,
 };
-use crate::tools::common::{READ_LINE_CAP, looks_binary, read_slice, resolve, truncation_marker};
+use crate::tools::common::{
+    OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice, resolve, truncation_marker,
+};
 
 pub struct ReadTool;
 
@@ -452,14 +454,53 @@ async fn read_range(
             ));
         }
         let end = end.min(total);
-        let mut body = String::new();
+        let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");
+        let mut out = header.clone();
+        let mut continuation = None;
         for number in start..=end {
             let line = lines[number - 1];
             let byte = if number == start { start_byte } else { 0 };
-            body.push_str(&format!("{number}|{}\n", &line[byte..]));
+            let prefix = format!("{number}|");
+            // Reserve enough room for the continuation before selecting any
+            // text from the line.  `start_byte` is a cursor, never a bypass
+            // around the normal model-output ceiling.
+            let remaining = OUTPUT_BYTE_CAP
+                .saturating_sub(out.len())
+                .saturating_sub(256);
+            if remaining <= prefix.len() + 1 {
+                continuation = Some((number, byte));
+                break;
+            }
+            let text_budget = remaining - prefix.len() - 1;
+            let remainder = &line[byte..];
+            let clipped = utf8_prefix(remainder, text_budget);
+            out.push_str(&prefix);
+            out.push_str(clipped);
+            out.push('\n');
+            if clipped.len() != remainder.len() {
+                continuation = Some((number, byte + clipped.len()));
+                break;
+            }
         }
-        let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");
-        return Ok(ToolOutput::text(format!("{header}{body}")));
+        let Some((next_line, next_byte)) = continuation else {
+            return Ok(ToolOutput::text(out));
+        };
+        let marker = if args.get("start_line").is_some() || args.get("end_line").is_some() {
+            format!(
+                "... [truncated; read `{}` with start_line={next_line}, end_line={end}, start_byte={next_byte}]\n",
+                path.display()
+            )
+        } else {
+            format!(
+                "... [truncated; read `{}` with offset={next_line}, limit=1, start_byte={next_byte}]\n",
+                path.display()
+            )
+        };
+        while out.len() + marker.len() > OUTPUT_BYTE_CAP && out.len() > header.len() {
+            out.pop();
+        }
+        out.push_str(&marker);
+        return Ok(ToolOutput::truncated_text(out));
     }
     let end = end.min(total);
     let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");
@@ -476,6 +517,17 @@ async fn read_range(
         "{header}{prelude}{}",
         slice.numbered
     )))
+}
+
+fn utf8_prefix(value: &str, budget: usize) -> &str {
+    if value.len() <= budget {
+        return value;
+    }
+    let mut end = budget;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -558,6 +610,56 @@ mod tests {
         assert!(out.content.contains("returned=2-3"), "got: {}", out.content);
         assert!(out.content.contains("2|l2"));
         assert!(out.content.contains("3|l3"));
+    }
+
+    #[tokio::test]
+    async fn start_byte_range_is_capped_and_returns_a_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("oversized.txt");
+        std::fs::write(&file, "x".repeat(OUTPUT_BYTE_CAP * 2)).unwrap();
+        let ctx = test_ctx(tmp.path());
+
+        let first = ReadTool
+            .call(
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_byte": 0,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(first.truncated);
+        assert!(first.content.len() <= OUTPUT_BYTE_CAP, "{}", first.content);
+        let first_text = first.content.model_text();
+        let cursor = first_text
+            .split("start_byte=")
+            .nth(1)
+            .expect("continuation has byte cursor")
+            .split(']')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(cursor > 0);
+
+        let second = ReadTool
+            .call(
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_byte": cursor,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(second.content.model_text().contains("1|"));
+        assert_ne!(first.content.model_text(), second.content.model_text());
     }
 
     /// A directory is reported as a directory via the portable check, never

@@ -86,6 +86,9 @@ impl Tool for SessionSearchTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::history_scope::require_recall_permission(ctx)?;
         crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
+        // Hold the disclosure fence across discovery, redaction, and rendering.
+        // A consent revocation takes the exclusive side before committing.
+        let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
         ctx.session
             .db
             .fts5_available()
@@ -194,9 +197,6 @@ impl Tool for SessionSearchTool {
             .take(limit as usize)
             .map(|hit| hit.session_id)
             .collect();
-        // Keep the disclosure permit until this call returns. A consent write
-        // cannot commit between the final batch check and its output.
-        let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
         if !ctx
             .session
             .db

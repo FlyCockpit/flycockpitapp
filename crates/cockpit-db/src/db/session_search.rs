@@ -1,5 +1,5 @@
 //! Cross-session full-text recall query layer (`session_search` /
-//! `session_read`, prompt `search-old-sessions.md`).
+//! `cockpit://` pseudofile recall, prompt `search-old-sessions.md`).
 //!
 //! Backed by the `session_fts` FTS5 virtual table (migration 0013). The
 //! engine is BM25 ranking with a `last_active_at_unix_ms` recency tiebreaker; no
@@ -47,7 +47,7 @@ pub struct SearchHit {
     pub bm25: f64,
 }
 
-/// A message turn read back from a thread (`session_read`).
+/// A message turn read back from a thread through `cockpit://` recall.
 #[derive(Debug, Clone)]
 pub struct ThreadTurn {
     pub seq: i64,
@@ -85,7 +85,7 @@ impl Db {
             )
             .context(
                 "FTS5 is not available in this SQLite build; \
-                 session_search/session_read require it and there is no LIKE fallback",
+                 session recall requires it and there is no LIKE fallback",
             )?;
             Ok(())
         })
@@ -216,7 +216,7 @@ impl Db {
     }
 
     /// All `user_message` / `assistant_message` turns of a thread,
-    /// ordered by `seq` (oldest first). Powers `session_read`'s
+    /// ordered by `seq` (oldest first). Powers `cockpit://` transcript
     /// windowing — the tool slices this in Rust per the `read`-tool
     /// pagination conventions. Non-message events are skipped.
     pub async fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
@@ -279,7 +279,7 @@ impl Db {
     }
 
     /// `seq`s within a thread whose message text matches `query` (FTS5),
-    /// oldest first. `session_read` centers its window on these. Empty
+    /// oldest first. Recall consumers center windows on these. Empty
     /// when the thread has no textual match.
     pub async fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
         self.thread_match_seqs_for_trust(session_id, query, HistoryCallerTrust::Trusted)

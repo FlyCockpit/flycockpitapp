@@ -3127,9 +3127,8 @@ pub fn tool_glyph_label(tool: &str, emojis: bool) -> (String, String) {
     tool_glyph_label_for(tool, emojis, false, None)
 }
 
-/// Like [`tool_glyph_label`], but when `file_icons` is on, real write/edit
-/// tools use a Nerd Font file-type icon derived from `path`; virtual plan
-/// documents use the generic document glyph instead.
+/// Like [`tool_glyph_label`], but when `file_icons` is on, write/edit tools use
+/// a Nerd Font file-type icon derived from `path`.
 /// Never re-resolves presentation from args (`Value::Null`).
 pub(crate) fn tool_glyph_label_for(
     tool: &str,
@@ -3150,9 +3149,8 @@ fn tool_call_glyph_label(call: &ToolCall, emojis: bool, file_icons: bool) -> (St
         &serde_json::Value::Null,
         call.mcp_child.as_ref(),
     );
-    // Real write/edit calls derive the file-type icon from their rendered path
-    // summary. Virtual plan documents have no path and receive a generic
-    // document glyph without inspecting their arbitrary summary.
+    // Write/edit calls derive the file-type icon from their rendered path
+    // summary.
     let file_icon = file_icons
         .then(|| crate::tui::file_icons::glyph_for_tool(&call.tool, Some(&call.summary)))
         .flatten();

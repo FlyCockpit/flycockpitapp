@@ -6496,15 +6496,20 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let retrieved = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id }),
-                &ctx,
-            )
-            .await
-            .unwrap();
+        let retrieved = crate::tools::recall::read(
+            &serde_json::json!({
+                "path": format!(
+                    "cockpit://session/{}/artifacts/{}",
+                    session.short_id(),
+                    artifact.artifact_id
+                )
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
-        assert!(retrieved.content.starts_with("head line\n"));
+        assert!(retrieved.content.starts_with("1|head line\n"));
         assert!(retrieved.content.len() > "head line\n... [truncated]\ntail line\n".len());
     }
 
@@ -6604,73 +6609,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_read_pages_utf8_lines_and_hides_foreign_session_artifacts() {
+    async fn recall_artifact_pseudofile_is_bounded_and_session_scoped() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         let long_line = "é".repeat(5_000);
         let artifact = seed_tool_artifact(
             &session,
-            &format!("first line\n{long_line}\nlast line\n"),
-            "artifact-read-page",
+            &format!("first line\n{long_line}\nneedle+literal\nregex-42\n"),
+            "recall-artifact-read-search",
         )
         .await;
         let (tx, _rx) = mpsc::channel(8);
         let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let path = format!(
+            "cockpit://session/{}/artifacts/{}",
+            session.short_id(),
+            artifact.artifact_id
+        );
 
-        let first_line = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({
-                    "artifact_id": artifact.artifact_id,
-                    "start_line": 1,
-                    "end_line": 1,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(first_line.content, "first line\n");
-
-        let first_page = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({
-                    "artifact_id": artifact.artifact_id,
-                    "start_line": 2,
-                    "end_line": 2,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
+        let first_page = crate::tools::recall::read(
+            &serde_json::json!({ "path": path, "start_line": 2, "end_line": 2 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(first_page.truncated);
         assert!(first_page.content.len() <= crate::tools::common::OUTPUT_BYTE_CAP);
-        assert!(first_page.content.contains(&format!(
-            "artifact continuation artifact_id={} start_line=2 start_byte=",
-            artifact.artifact_id
-        )));
-        let continuation_byte = first_page
-            .content
-            .split("start_byte=")
-            .nth(1)
-            .and_then(|suffix| suffix.split(']').next())
-            .unwrap()
-            .parse::<usize>()
-            .unwrap();
+        assert!(
+            first_page
+                .content
+                .contains("start_line=2, end_line=2, start_byte=")
+        );
 
-        let second_page = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({
-                    "artifact_id": artifact.artifact_id,
-                    "start_line": 2,
-                    "end_line": 2,
-                    "start_byte": continuation_byte,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(!second_page.truncated);
-        assert!(!second_page.content.is_empty());
-        assert!(!second_page.content.contains("artifact continuation"));
+        let literal = crate::tools::recall::grep(
+            &serde_json::json!({ "path": path, "pattern": "needle+literal", "mode": "literal" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(literal.content.contains("needle+literal"));
+
+        let regex = crate::tools::recall::grep(
+            &serde_json::json!({ "path": path, "pattern": "regex-\\d+", "mode": "regex" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(regex.content.contains("regex-42"));
 
         let foreign = Arc::new(
             Session::create_for_test(
@@ -6682,136 +6669,10 @@ mod tests {
             .unwrap(),
         );
         let foreign_ctx = tool_ctx(foreign, tmp.path(), &tx);
-        let hidden = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id }),
-                &foreign_ctx,
-            )
+        let hidden = crate::tools::recall::read(&serde_json::json!({ "path": path }), &foreign_ctx)
             .await
             .unwrap();
-        assert_eq!(
-            hidden.content,
-            "No text artifact with that ID is available in this session."
-        );
-    }
-
-    #[tokio::test]
-    async fn artifact_search_honors_literal_regex_case_caps_order_and_session_scope() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = test_session(tmp.path());
-        let artifact = seed_tool_artifact(
-            &session,
-            "Alpha alpha\nneedle once needle twice\nNEEDLE uppercase\nregex-42\nneedle final\n",
-            "artifact-search-modes",
-        )
-        .await;
-        let (tx, _rx) = mpsc::channel(8);
-        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
-
-        let literal = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": "needle" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            literal.content,
-            "2:needle once needle twice\n5:needle final\n"
-        );
-
-        let regex = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({
-                    "artifact_id": artifact.artifact_id,
-                    "pattern": "regex-\\d+",
-                    "mode": "regex",
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(regex.content, "4:regex-42\n");
-
-        let insensitive = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({
-                    "artifact_id": artifact.artifact_id,
-                    "pattern": "needle",
-                    "case_sensitive": false,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            insensitive.content,
-            "2:needle once needle twice\n3:NEEDLE uppercase\n5:needle final\n"
-        );
-
-        let capped = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({
-                    "artifact_id": artifact.artifact_id,
-                    "pattern": "needle",
-                    "max_matches": 1,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            capped.content,
-            "2:needle once needle twice\n[additional matches omitted by max_matches]\n"
-        );
-
-        let no_matches = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": "absent" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(no_matches.content, "No matches.");
-
-        let output_capped = seed_tool_artifact(
-            &session,
-            &format!("needle {}\n", "é".repeat(5_000)),
-            "artifact-search-output-cap",
-        )
-        .await;
-        let truncated = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({ "artifact_id": output_capped.artifact_id, "pattern": "needle" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(truncated.truncated);
-        assert!(truncated.content.contains("[search output truncated]"));
-        assert!(truncated.content.len() <= crate::tools::common::OUTPUT_BYTE_CAP);
-
-        let foreign = Arc::new(
-            Session::create_for_test(
-                session.db.clone(),
-                tmp.path().to_path_buf(),
-                "Build",
-                crate::session::test_redaction_key_resolver(),
-            )
-            .unwrap(),
-        );
-        let foreign_ctx = tool_ctx(foreign, tmp.path(), &tx);
-        let hidden = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": "needle" }),
-                &foreign_ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            hidden.content,
-            "No text artifact with that ID is available in this session."
-        );
+        assert!(hidden.content.contains("No readable artifact exists"));
     }
 
     #[tokio::test]
@@ -6872,22 +6733,23 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let mut ctx = tool_ctx(imported_session, tmp.path(), &tx);
         ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
-        let read = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id }),
-                &ctx,
-            )
+        let path = format!(
+            "cockpit://session/{}/artifacts/{}",
+            ctx.session.short_id(),
+            artifact.artifact_id
+        );
+        let read = crate::tools::recall::read(&serde_json::json!({ "path": path }), &ctx)
             .await
             .unwrap();
         assert!(!read.content.contains(secret));
         assert!(read.content.contains("[redacted]"));
-        let search = crate::tools::artifact_search::ArtifactSearchTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": secret }),
-                &ctx,
-            )
-            .await
-            .unwrap();
+        let search = crate::tools::recall::grep(
+            &serde_json::json!({ "path": path, "pattern": secret, "mode": "literal" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(search.content, "No matches.");
     }
 
@@ -6926,15 +6788,20 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let retrieved = crate::tools::artifact_read::ArtifactReadTool
-            .call(
-                serde_json::json!({ "artifact_id": artifact.artifact_id }),
-                &ctx,
-            )
-            .await
-            .unwrap();
+        let retrieved = crate::tools::recall::read(
+            &serde_json::json!({
+                "path": format!(
+                    "cockpit://session/{}/artifacts/{}",
+                    session.short_id(),
+                    artifact.artifact_id
+                )
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
-        assert!(retrieved.content.starts_with("head line\n"));
+        assert!(retrieved.content.starts_with("1|head line\n"));
         assert!(retrieved.content.len() > "head line\n... [truncated]\ntail line\n".len());
     }
 
@@ -6992,7 +6859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_tools_are_absent_without_a_capture() {
+    async fn artifact_frames_are_absent_without_a_capture() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(TruncatedTool));
         let agent = test_agent(tools.clone());
@@ -7022,16 +6889,6 @@ mod tests {
 
         let wire = last_tool_result_text(&history);
         assert!(!wire.contains("cockpit_artifact_v1"), "{wire}");
-        assert!(
-            !toolbox_with_retrieval_if_needed(
-                tools,
-                &session,
-                &crate::agents::PostureResolution::standard()
-            )
-            .await
-            .names()
-            .contains(&"artifact_read")
-        );
     }
 
     #[tokio::test]

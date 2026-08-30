@@ -863,8 +863,11 @@ impl Db {
             .await
     }
 
-    /// Return the Nth persisted compaction payload for one session. The
-    /// recall facade uses this rather than touching the database directly.
+    /// Return the persisted compaction payload at its chronological ordinal.
+    ///
+    /// The ordinal is assigned before trust filtering and therefore remains a
+    /// stable pseudofile identity across model-trust changes. A hidden row is
+    /// returned as absent; it is never replaced by a later visible row.
     pub async fn compaction_text_for_trust(
         &self,
         session_id: Uuid,
@@ -876,8 +879,9 @@ impl Db {
         }
         self.read(move |conn| {
             let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
-            conn.query_row(
-                "SELECT COALESCE(
+            let row: Option<(Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT e.model_trust, COALESCE(
                             json_extract(e.data_json, '$.handoff_text'),
                             json_extract(h.payload_json, '$.handoff_text'),
                             json_extract(e.data_json, '$.brief_text'),
@@ -888,38 +892,48 @@ impl Db {
                      ON h.handoff_id=json_extract(e.data_json, '$.handoff_ref')
                     AND h.session_id=e.session_id
                   WHERE e.session_id=?1 AND e.type='session_compacted'
-                    AND (?2 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
                   ORDER BY e.seq ASC
-                  LIMIT 1 OFFSET ?3",
-                params![
-                    session_id.to_string(),
-                    permitted,
-                    i64::try_from(number - 1)?
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("reading compaction recall payload")
+                  LIMIT 1 OFFSET ?2",
+                    params![session_id.to_string(), i64::try_from(number - 1)?],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .context("reading chronological compaction recall payload")?;
+            Ok(row.and_then(|(model_trust, text)| {
+                (permitted || model_trust.as_deref() != Some("trusted"))
+                    .then_some(text)
+                    .flatten()
+            }))
         })
         .await
     }
 
-    /// Count visible compaction points for pseudodirectory discovery.
-    pub async fn compaction_count_for_trust(
+    /// Return visible chronological compaction ordinals for pseudodirectory
+    /// discovery. Hidden rows leave gaps rather than recycling their URI.
+    pub async fn compaction_numbers_for_trust(
         &self,
         session_id: Uuid,
         caller_trust: HistoryCallerTrust,
-    ) -> Result<usize> {
+    ) -> Result<Vec<usize>> {
         self.read(move |conn| {
             let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM session_events
+            let mut stmt = conn.prepare(
+                "SELECT model_trust FROM session_events
                   WHERE session_id=?1 AND type='session_compacted'
-                    AND (?2 OR model_trust IS NULL OR model_trust <> 'trusted')",
-                params![session_id.to_string(), permitted],
-                |row| row.get(0),
+                  ORDER BY seq ASC",
             )?;
-            usize::try_from(count).context("negative compaction count")
+            let rows = stmt
+                .query_map([session_id.to_string()], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, model_trust)| {
+                    (permitted || model_trust.as_deref() != Some("trusted")).then_some(index + 1)
+                })
+                .collect())
         })
         .await
     }
@@ -4040,6 +4054,60 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("stored handoff")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_recall_ordinals_are_stable_across_trust_levels() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        for (text, trust) in [("first", None), ("second", Some("trusted"))] {
+            db.insert_session_event_with_context(
+                session.session_id,
+                SessionEventKind::SessionCompacted,
+                Some("builder"),
+                None,
+                SessionEventContext {
+                    model_trust: trust,
+                    ..SessionEventContext::default()
+                },
+                &json!({ "handoff_text": text }),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.compaction_numbers_for_trust(session.session_id, HistoryCallerTrust::Untrusted)
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            db.compaction_numbers_for_trust(session.session_id, HistoryCallerTrust::Trusted)
+                .await
+                .unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            db.compaction_text_for_trust(session.session_id, 1, HistoryCallerTrust::Untrusted)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            db.compaction_text_for_trust(session.session_id, 2, HistoryCallerTrust::Untrusted)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.compaction_text_for_trust(session.session_id, 2, HistoryCallerTrust::Trusted)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("second")
         );
     }
 

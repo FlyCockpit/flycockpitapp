@@ -180,7 +180,11 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     if matches!(target, RecallPath::History) {
         // #134 owns the final history-search tool. Until then, discovery is
         // FTS-only; never fall back to recursively regex-scanning transcripts.
-        require_target_access(ctx, target).await?;
+        if args.get("mode").is_some() {
+            return Err(invalid_input(
+                "`mode` is only available when grepping one cockpit pseudofile; `cockpit://history/` uses FTS discovery",
+            ));
+        }
         return Ok(Some(history_fts_search(args, ctx).await?));
     }
     let pattern = args
@@ -191,8 +195,13 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     let Some(content) = pseudofile_content(target, ctx).await? else {
         return Ok(Some(not_found(path, target)));
     };
-    require_target_access(ctx, target).await?;
-    let regex = RegexBuilder::new(pattern)
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("regex");
+    let expression = match mode {
+        "literal" => regex::escape(pattern),
+        "regex" => pattern.to_owned(),
+        _ => return Err(invalid_input("`mode` must be `literal` or `regex`")),
+    };
+    let regex = RegexBuilder::new(&expression)
         .case_insensitive(
             args.get("case_insensitive")
                 .and_then(Value::as_bool)
@@ -601,9 +610,9 @@ async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
         let compactions = ctx
             .session
             .db
-            .compaction_count_for_trust(session.session_id, caller_history_trust(ctx))
+            .compaction_numbers_for_trust(session.session_id, caller_history_trust(ctx))
             .await?;
-        for n in 1..=compactions {
+        for n in compactions {
             entries.push(format!("cockpit://session/{short}/compactions/{n}"));
         }
         for artifact in ctx
@@ -789,5 +798,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("expected_revision"));
+    }
+    #[tokio::test]
+    async fn single_pseudofile_grep_supports_literal_and_regex_modes() {
+        let tmp = TempDir::new().unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        db.insert_session_event(
+            ctx.session.id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            None,
+            None,
+            &json!({ "text": "a+b\naxb", "display_text": "a+b\naxb" }),
+        )
+        .await
+        .unwrap();
+        let path = format!("cockpit://session/{}/transcript", ctx.session.short_id());
+
+        let literal = grep(
+            &json!({ "path": path, "pattern": "a+b", "mode": "literal" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(literal.content.model_text().contains("a+b"));
+        assert!(!literal.content.model_text().contains("axb"));
+
+        let regex = grep(
+            &json!({ "path": path, "pattern": "a.b", "mode": "regex" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(regex.content.model_text().contains("a+b"));
+        assert!(regex.content.model_text().contains("axb"));
     }
 }

@@ -80,7 +80,6 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("search"),
     ToolTimeoutSafety::abandon_safe("seed"),
     ToolTimeoutSafety::abandon_safe("session_lineage_search"),
-    ToolTimeoutSafety::abandon_safe("session_read"),
     ToolTimeoutSafety::abandon_safe("session_search"),
     ToolTimeoutSafety::abandon_safe("skill"),
     ToolTimeoutSafety::abandon_safe("skill_manage"),
@@ -93,8 +92,6 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     // on drop so a detached send records `completed_after_cancel` instead of
     // `succeeded` with an undeliverable body.
     ToolTimeoutSafety::honors_cancel("transcribe_audio"),
-    ToolTimeoutSafety::abandon_safe("artifact_read"),
-    ToolTimeoutSafety::abandon_safe("artifact_search"),
     ToolTimeoutSafety::abandon_safe("unlock"),
     // `use_sealed_value` dispatches an Owner-compiled adapter outbound to a
     // fixed destination. Abandoning it mid-flight cannot be assumed safe: the

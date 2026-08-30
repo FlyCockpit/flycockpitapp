@@ -1984,92 +1984,13 @@ mod text_artifact_tests {
         ]))
     }
 
-    #[tokio::test]
-    async fn artifact_tools_are_dynamic_after_an_owning_event_commits() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create_for_test(
-            db,
-            PathBuf::from("/x"),
-            "Build",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        session.set_sandbox_escalation_enabled(false);
-        let tools = ToolBox::new()
-            .with(Arc::new(crate::tools::bash::BashTool::new()))
-            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
-            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
-        assert!(
-            !toolbox_with_retrieval_if_needed(
-                tools.clone(),
-                &session,
-                &crate::agents::PostureResolution::standard()
-            )
-            .await
-            .names()
-            .contains(&"artifact_read")
-        );
-        let event = crate::db::text_artifacts::TextArtifactEventInput {
-            session_id: session.id,
-            kind: crate::db::session_log::SessionEventKind::ToolCall,
-            agent: Some("Build".to_string()),
-            call_id: Some("call-1".to_string()),
-            context: Default::default(),
-            ts_ms: 1,
-            data_json: serde_json::json!({"output":"short"}).to_string(),
-            artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
-                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
-                projection_slot: Some(0),
-                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
-                capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
-                content: "redacted original output".to_string(),
-                host_captured_bytes: 24,
-                host_original_bytes: 24,
-                host_dropped_bytes: 0,
-                stored_source_bytes: 24,
-                provenance_json:
-                    serde_json::json!({"tool":"bash","call_id":"call-1","agent_id":"Build"})
-                        .to_string(),
-                created_at: 1,
-            }],
-            unavailable_projection: None,
-        };
-        session
-            .db
-            .record_event_with_text_artifacts(event)
-            .await
-            .unwrap();
-        assert!(
-            toolbox_with_retrieval_if_needed(
-                tools,
-                &session,
-                &crate::agents::PostureResolution::standard()
-            )
-            .await
-            .names()
-            .contains(&"artifact_read")
-        );
-        assert!(
-            toolbox_with_retrieval_if_needed(
-                ToolBox::new(),
-                &session,
-                &crate::agents::PostureResolution::standard(),
-            )
-            .await
-            .names()
-            .contains(&"artifact_search")
-        );
-    }
-
     #[test]
-    fn artifact_tools_are_not_capture_eligible() {
+    fn bounded_tools_are_not_capture_eligible() {
         for tool in [
             "read",
             "write",
             "edit",
             "unlock",
-            "artifact_read",
-            "artifact_search",
             "delegation_payload_retrieve",
         ] {
             assert!(

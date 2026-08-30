@@ -430,7 +430,6 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
                     "write",
                     "edit",
                     "session_search",
-                    "session_read",
                     "session_lineage_search",
                 ]
                 .into_iter()

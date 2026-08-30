@@ -11,7 +11,6 @@ use crate::engine::tool::{ToolCtx, invalid_input};
 /// surfaces (including Monty) may inspect durable session history.
 pub(crate) fn require_recall_permission(ctx: &ToolCtx) -> Result<()> {
     let granted_by_surface = ctx.available_tools.contains("session_search")
-        || ctx.available_tools.contains("session_read")
         || matches!(ctx.agent_id.as_str(), "history" | "Monty" | "monty");
     if granted_by_surface {
         Ok(())

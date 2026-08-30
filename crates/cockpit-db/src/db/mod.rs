@@ -56,6 +56,7 @@ mod files;
 pub mod filesystem_identity;
 pub mod guidance;
 pub mod guidance_proposals;
+pub mod history_scope;
 pub mod image_generation;
 pub mod image_generation_plan;
 pub mod image_sidecar;

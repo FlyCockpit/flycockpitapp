@@ -444,7 +444,7 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
     if !args.interactive {
         return tb;
     }
-    tb.with(Arc::new(crate::tools::session_search::SessionSearchTool))
+    tb.with(Arc::new(crate::tools::session_search::HistorySearchTool))
         .with(Arc::new(crate::tools::todo::TodoTool))
 }
 
@@ -459,7 +459,7 @@ fn with_tiered_recall_tools(
         return Ok(tb);
     }
     let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
-    for name in ["session_search", "session_lineage_search", "todo"] {
+    for name in ["history_search", "todo"] {
         if is_assistant
             && !grant_has_mcp
             && !grant.iter().any(|tool| tool == name)
@@ -535,8 +535,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "return",
         "harness_list",
         "harness_invoke",
-        "session_search",
-        "session_lineage_search",
+        "history_search",
         "todo",
         "write",
         "edit",
@@ -681,14 +680,8 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Session",
-            name: "session_search",
-            summary: "Search prior persisted sessions.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Session",
-            name: "session_lineage_search",
-            summary: "Search the current session's compaction lineage.",
+            name: "history_search",
+            summary: "Search persisted history by scope.",
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
@@ -917,8 +910,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::lsp::LspTool),
         Arc::new(tools::return_tool::ReturnTool),
         Arc::new(tools::plan_doc::StartBuildTool),
-        Arc::new(tools::session_search::SessionSearchTool),
-        Arc::new(tools::session_search::SessionLineageSearchTool),
+        Arc::new(tools::session_search::HistorySearchTool),
         Arc::new(tools::todo::TodoTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
@@ -1046,10 +1038,7 @@ pub(crate) fn materialize_tool_by_name(
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
-        "session_search" => tb.with(Arc::new(tools::session_search::SessionSearchTool)),
-        "session_lineage_search" => {
-            tb.with(Arc::new(tools::session_search::SessionLineageSearchTool))
-        }
+        "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
         "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
             args.swarm_depth,
             args.swarm_max_depth,
@@ -1433,8 +1422,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "change_impact",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
             "lsp",
         ],
         "Careful" => &[
@@ -1446,19 +1434,12 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "skill",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
             "todo",
             "webfetch",
             "websearch",
         ],
-        "Multireview" => &[
-            "harness_list",
-            "harness_invoke",
-            "session_search",
-            "session_lineage_search",
-            "lsp",
-        ],
+        "Multireview" => &["harness_list", "harness_invoke", "history_search", "lsp"],
         _ => &[],
     }
 }
@@ -1473,7 +1454,7 @@ pub(crate) fn default_disabled_tools_for(name: &str) -> &'static [&'static str] 
 }
 
 fn default_assistant_discoverable_tools() -> &'static [&'static str] {
-    &["session_search", "session_lineage_search"]
+    &["history_search"]
 }
 
 fn documented_av_tool_tier(def_name: &str, tool: &str) -> Option<crate::agents::ToolTier> {
@@ -2672,14 +2653,9 @@ fn test_host_tool_surface(cwd: &Path, name: &str) -> Option<Vec<String>> {
 fn default_assistant_tools() -> Vec<String> {
     let mut tools = default_custom_tools();
     tools.extend(
-        [
-            "mcp",
-            "session_search",
-            "session_lineage_search",
-            "skill_manage",
-        ]
-        .into_iter()
-        .map(str::to_string),
+        ["mcp", "history_search", "skill_manage"]
+            .into_iter()
+            .map(str::to_string),
     );
     tools
 }
@@ -4311,7 +4287,7 @@ pub(crate) mod tests {
         assert_eq!(def.mode, AgentMode::Subagent);
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in ["read", "session_search", "session_lineage_search"] {
+        for tool in ["read", "history_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in [
@@ -4322,7 +4298,7 @@ pub(crate) mod tests {
                 "{forbidden} must not be on history"
             );
         }
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
         crate::agents::validate_invariants(&def).expect("history def is invariant-valid");
@@ -4335,7 +4311,7 @@ pub(crate) mod tests {
         let agent = load("history", &args).unwrap();
         let names = agent.tools.names();
 
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert!(
                 names.contains(&tool),
                 "{tool} should be a first-class history tool: {names:?}"
@@ -4745,8 +4721,7 @@ pub(crate) mod tests {
             "change_impact",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
         ] {
             assert!(
                 !names.contains(&tool),
@@ -4897,7 +4872,7 @@ pub(crate) mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -4945,7 +4920,7 @@ pub(crate) mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -4969,7 +4944,7 @@ pub(crate) mod tests {
             mode: AgentMode::Primary,
             model: None,
             temperature: None,
-            tools: Some(vec!["session_search".to_string(), "read".to_string()]),
+            tools: Some(vec!["history_search".to_string(), "read".to_string()]),
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
@@ -4992,7 +4967,7 @@ pub(crate) mod tests {
             Err(err) => err,
         };
         let msg = format!("{err}");
-        assert!(msg.contains("session_search"), "{msg}");
+        assert!(msg.contains("history_search"), "{msg}");
         assert!(msg.contains("mcp"), "{msg}");
 
         def.tools = Some(vec!["read".to_string()]);
@@ -5005,7 +4980,7 @@ pub(crate) mod tests {
         );
 
         def.tools = Some(vec![
-            "session_search".to_string(),
+            "history_search".to_string(),
             "read".to_string(),
             "mcp".to_string(),
         ]);
@@ -5201,13 +5176,7 @@ pub(crate) mod tests {
             names.len() <= 10,
             "Careful direct tools should stay within the small-surface budget: {names:?}"
         );
-        for non_direct in [
-            "session_search",
-            "session_lineage_search",
-            "todo",
-            "webfetch",
-            "websearch",
-        ] {
+        for non_direct in ["history_search", "todo", "webfetch", "websearch"] {
             assert!(
                 !names.contains(&non_direct),
                 "{non_direct} must not be injected into Careful's direct tool surface"
@@ -6341,7 +6310,7 @@ pub(crate) mod tests {
         let args = test_spawn_args(tmp.path());
         let names = known_agent_tool_names();
         assert!(names.contains(&"todo"));
-        assert!(names.contains(&"session_lineage_search"));
+        assert!(names.contains(&"history_search"));
         // `goal` is deliberately not a grantable/runtime tool: the session goal
         // is host/driver-owned durable state, not a tool an agent may mention in
         // `tools:` (see `worker_cannot_create_or_mutate_goal`). Its retired
@@ -6358,7 +6327,7 @@ pub(crate) mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "session_lineage_search"] {
+        for name in ["todo", "history_search"] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }

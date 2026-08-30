@@ -328,8 +328,7 @@ fn careful_def() -> AgentDef {
             "skill",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
             "todo",
             "webfetch",
             "websearch",
@@ -522,11 +521,11 @@ fn history_def() -> AgentDef {
         "history",
         "Read-only recall worker; searches prior sessions and compaction lineage, then reports relevant excerpts.",
         AgentMode::Subagent,
-        &["read", "session_search", "session_lineage_search"],
+        &["read", "history_search"],
         crate::engine::builtin::HISTORY_PROMPT,
         None,
     );
-    for tool in ["session_search", "session_lineage_search"] {
+    for tool in ["history_search"] {
         def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
     }
     def
@@ -948,7 +947,7 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"history"));
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in ["read", "session_search", "session_lineage_search"] {
+        for tool in ["read", "history_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in ["task", "spawn", "handoff", "write", "edit", "unlock"] {
@@ -957,7 +956,7 @@ mod tests {
                 "{forbidden} must not be granted"
             );
         }
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
     }

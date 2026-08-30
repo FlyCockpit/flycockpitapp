@@ -116,6 +116,9 @@ CREATE TABLE sessions (
     -- parent session. NULL means the parent's durable tail at fork time.
     fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
+    description        TEXT CHECK (
+        description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
+    ),                                            -- generated old-session context (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -3191,12 +3194,11 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
--- ---- session full-text search (`session_search` / `session_read`) -----------------
+-- ---- session full-text search (`history_search` / `cockpit://` recall) ------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
--- session: the session TITLE plus the text of `user_message` /
--- `assistant_message` events and model-written compaction briefs/handoffs.
--- Tool outputs, tool-call args, and raw inference payloads are deliberately
--- NOT indexed — they're noise for recall and a token/privacy hazard.
+-- session: the session title/description, the text of `user_message` /
+-- `assistant_message` events, model-written compaction briefs/handoffs, and
+-- session-owned text artifacts. Raw inference payloads remain unindexed.
 --
 -- Layout choice: a contentless FTS5 table (`content=''`) with one indexed
 -- text column, because the searchable text is spread across two base
@@ -3206,8 +3208,8 @@ CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (pro
 -- thread (`session_id`) and, for message rows, an in-thread location
 -- (`seq`); it stores identifiers only, never a second copy of text.
 --
---   row_kind   — 'title' | 'message' | 'compaction', so readers can window
---                messages separately from compaction summary matches.
+--   row_kind   — 'title' | 'description' | 'message' | 'compaction' |
+--                'artifact', preserving the canonical recall target.
 --   seq        — session_events.seq for a message row; NULL for a title.
 
 CREATE VIRTUAL TABLE session_fts USING fts5(
@@ -3217,17 +3219,25 @@ CREATE VIRTUAL TABLE session_fts USING fts5(
 
 CREATE TABLE session_fts_docs (
     rowid      INTEGER PRIMARY KEY,
-    row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message', 'compaction')),
+    row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'description', 'message', 'compaction', 'artifact')),
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     seq        INTEGER,
+    artifact_id TEXT,
     FOREIGN KEY (session_id, seq)
         REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
-    UNIQUE(row_kind, session_id, seq)
+    FOREIGN KEY (session_id, artifact_id)
+        REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    UNIQUE(row_kind, session_id, seq),
+    UNIQUE(row_kind, session_id, artifact_id)
 );
 
 CREATE UNIQUE INDEX session_fts_docs_one_title
     ON session_fts_docs(session_id)
     WHERE row_kind = 'title';
+
+CREATE UNIQUE INDEX session_fts_docs_one_description
+    ON session_fts_docs(session_id)
+    WHERE row_kind = 'description';
 
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
@@ -3393,28 +3403,50 @@ END;
 -- NULL→text, text→text, and text→NULL transitions.
 
 CREATE TRIGGER session_fts_title_ai AFTER INSERT ON sessions
-WHEN new.title IS NOT NULL AND new.title <> ''
+WHEN (new.title IS NOT NULL AND new.title <> '')
+  OR (new.description IS NOT NULL AND new.description <> '')
 BEGIN
-    INSERT INTO session_fts_docs (row_kind, session_id, seq)
-    VALUES ('title', new.session_id, NULL);
-    INSERT INTO session_fts (rowid, body)
-    VALUES (last_insert_rowid(), new.title);
-END;
-
-CREATE TRIGGER session_fts_title_au AFTER UPDATE OF title ON sessions
-BEGIN
-    INSERT INTO session_fts (session_fts, rowid, body)
-    SELECT 'delete', rowid, old.title
-    FROM session_fts_docs
-    WHERE row_kind = 'title' AND session_id = old.session_id;
-    DELETE FROM session_fts_docs
-    WHERE row_kind = 'title' AND session_id = old.session_id;
     INSERT INTO session_fts_docs (row_kind, session_id, seq)
     SELECT 'title', new.session_id, NULL
     WHERE new.title IS NOT NULL AND new.title <> '';
+    INSERT INTO session_fts_docs (row_kind, session_id, seq)
+    SELECT 'description', new.session_id, NULL
+    WHERE new.description IS NOT NULL AND new.description <> '';
     INSERT INTO session_fts (rowid, body)
-    SELECT last_insert_rowid(), new.title
+    SELECT rowid, CASE row_kind
+      WHEN 'title' THEN new.title
+      ELSE new.description
+    END
+    FROM session_fts_docs
+    WHERE session_id = new.session_id
+      AND row_kind IN ('title', 'description');
+END;
+
+CREATE TRIGGER session_fts_title_au AFTER UPDATE OF title, description ON sessions
+BEGIN
+    INSERT INTO session_fts (session_fts, rowid, body)
+    SELECT 'delete', rowid, CASE row_kind
+      WHEN 'title' THEN old.title
+      ELSE old.description
+    END
+    FROM session_fts_docs
+    WHERE row_kind IN ('title', 'description') AND session_id = old.session_id;
+    DELETE FROM session_fts_docs
+    WHERE row_kind IN ('title', 'description') AND session_id = old.session_id;
+    INSERT INTO session_fts_docs (row_kind, session_id, seq)
+    SELECT 'title', new.session_id, NULL
     WHERE new.title IS NOT NULL AND new.title <> '';
+    INSERT INTO session_fts_docs (row_kind, session_id, seq)
+    SELECT 'description', new.session_id, NULL
+    WHERE new.description IS NOT NULL AND new.description <> '';
+    INSERT INTO session_fts (rowid, body)
+    SELECT rowid, CASE row_kind
+      WHEN 'title' THEN new.title
+      ELSE new.description
+    END
+    FROM session_fts_docs
+    WHERE session_id = new.session_id
+      AND row_kind IN ('title', 'description');
 END;
 
 CREATE TRIGGER session_fts_sessions_ad AFTER DELETE ON sessions
@@ -3423,10 +3455,14 @@ BEGIN
     SELECT 'delete', d.rowid,
            CASE d.row_kind
              WHEN 'title' THEN old.title
+             WHEN 'description' THEN old.description
+             WHEN 'artifact' THEN a.content
              ELSE json_extract(e.data_json, '$.text')
            END
     FROM session_fts_docs AS d
     LEFT JOIN session_events AS e ON e.seq = d.seq
+    LEFT JOIN session_text_artifacts AS a
+           ON a.session_id = d.session_id AND a.artifact_id = d.artifact_id
     WHERE d.session_id = old.session_id;
     DELETE FROM session_fts_docs WHERE session_id = old.session_id;
 END;
@@ -3760,6 +3796,32 @@ CREATE TABLE session_text_artifacts (
 
 CREATE INDEX idx_session_text_artifacts_session_created
     ON session_text_artifacts(session_id, created_at, artifact_id);
+
+-- Artifact bodies are immutable and have a canonical cockpit pseudofile, so
+-- they may participate in `history_search` discovery without exposing the
+-- whole body in the tool result. The owner event sequence carries the same
+-- model-trust filter as message and compaction rows.
+CREATE TRIGGER session_fts_artifacts_ai AFTER INSERT ON session_text_artifacts
+BEGIN
+    INSERT INTO session_fts_docs (row_kind, session_id, seq, artifact_id)
+    VALUES ('artifact', new.session_id, new.owner_event_seq, new.artifact_id);
+    INSERT INTO session_fts (rowid, body)
+    VALUES (last_insert_rowid(), new.content);
+END;
+
+CREATE TRIGGER session_fts_artifacts_ad BEFORE DELETE ON session_text_artifacts
+BEGIN
+    INSERT INTO session_fts (session_fts, rowid, body)
+    SELECT 'delete', rowid, old.content
+    FROM session_fts_docs
+    WHERE row_kind = 'artifact'
+      AND session_id = old.session_id
+      AND artifact_id = old.artifact_id;
+    DELETE FROM session_fts_docs
+    WHERE row_kind = 'artifact'
+      AND session_id = old.session_id
+      AND artifact_id = old.artifact_id;
+END;
 
 -- The accepted model-facing composition for an artifact-backed user turn.
 -- Authored bytes are never duplicated here: the sole `authored_text` slot is
@@ -4380,6 +4442,16 @@ CREATE TABLE workspace_trust (
 
 CREATE INDEX idx_workspace_trust_updated_at
     ON workspace_trust(updated_at_unix_ms DESC);
+
+-- ---- workspace history recall scope ----------------------------------------
+-- Independent from execution sandbox and workspace trust. Missing rows are
+-- fail-closed, keeping recall in the current workspace only.
+CREATE TABLE workspace_history_scopes (
+    project_id TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 4096),
+    outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (outbound_enabled IN (0, 1)),
+    inbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (inbound_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
 
 -- ---- task delegations -----------------------------------------------------------------------
 -- Durable state for delegated `task` runs: one job per task call, one

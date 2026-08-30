@@ -168,14 +168,9 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     }
     let target = parse(path, ctx).await?;
     if matches!(target, RecallPath::History) {
-        // #134 owns the final history-search tool. Until then, discovery is
-        // FTS-only; never fall back to recursively regex-scanning transcripts.
-        if args.get("mode").is_some() {
-            return Err(invalid_input(
-                "`mode` is only available when grepping one cockpit pseudofile; `cockpit://history/` uses FTS discovery",
-            ));
-        }
-        return Ok(Some(history_fts_search(args, ctx).await?));
+        return Err(invalid_input(
+            "use `history_search` for cockpit history discovery; grep only searches one returned pseudofile",
+        ));
     }
     let pattern = args
         .get("pattern")
@@ -607,42 +602,6 @@ fn history_glob_pattern(pattern: &str, path: Option<&str>) -> Result<String> {
 
 async fn history_directory(ctx: &ToolCtx) -> Result<String> {
     Ok(history_entries(ctx).await?.join("\n"))
-}
-
-async fn history_fts_search(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-    let query = args
-        .get("pattern")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    ctx.session.db.fts5_available().await?;
-    let hits = ctx
-        .session
-        .db
-        .search_candidates_for_trust(
-            query,
-            Some(&ctx.session.project_id),
-            None,
-            None,
-            20,
-            caller_history_trust(ctx),
-        )
-        .await?;
-    let mut out = String::new();
-    for hit in hits {
-        let row = format!(
-            "cockpit://session/{}/transcript: {}\n",
-            hit.short_id.unwrap_or_else(|| hit.session_id.to_string()),
-            ctx.redact.scrub(hit.snippet.trim())
-        );
-        if !append_capped_record(&mut out, &row) {
-            return Ok(truncated_search_output(out));
-        }
-    }
-    Ok(ToolOutput::text(if out.is_empty() {
-        "No matches.".to_string()
-    } else {
-        out
-    }))
 }
 
 fn append_capped_record(out: &mut String, row: &str) -> bool {

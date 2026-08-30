@@ -1799,6 +1799,7 @@ local	session_events	task_call_id	external
 local	session_events	ts_ms	non_relationship
 local	session_events	type	non_relationship
 local	session_fts	body	non_relationship
+local	session_fts_docs	artifact_id	foreign
 local	session_fts_docs	row_kind	non_relationship
 local	session_fts_docs	rowid	primary
 local	session_fts_docs	seq	foreign
@@ -1897,6 +1898,7 @@ local	sessions	assistant_name	denormalized
 local	sessions	btw_parent_session_id	foreign
 local	sessions	btw_tangent	non_relationship
 local	sessions	created_by_principal	non_relationship
+local	sessions	description	non_relationship
 local	sessions	ended_at_unix_ms	non_relationship
 local	sessions	ephemeral	non_relationship
 local	sessions	fork_point_turn_id	foreign
@@ -2297,6 +2299,10 @@ local	workspace_leases	uncertain_reason	non_relationship
 local	workspace_leases	updated_at_unix_ms	non_relationship
 local	workspace_leases	workspace_lease_id	primary
 local	workspace_leases	write_scope_lease_id	foreign
+local	workspace_history_scopes	inbound_enabled	non_relationship
+local	workspace_history_scopes	outbound_enabled	non_relationship
+local	workspace_history_scopes	project_id	primary
+local	workspace_history_scopes	updated_at_unix_ms	non_relationship
 local	workspace_trust	created_at_unix_ms	non_relationship
 local	workspace_trust	mode	non_relationship
 local	workspace_trust	revision	non_relationship

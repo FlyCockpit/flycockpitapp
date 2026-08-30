@@ -32,6 +32,9 @@ impl HistoryCallerTrust {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: Uuid,
+    /// Owning workspace identity, used by the history-scope consent gate
+    /// before a cross-workspace result is exposed.
+    pub project_id: String,
     pub short_id: Option<String>,
     pub title: Option<String>,
     /// `last_active_at_unix_ms` — the human-date source + recency
@@ -41,6 +44,15 @@ pub struct SearchHit {
     pub snippet: String,
     /// BM25 relevance (lower = more relevant, FTS5 convention). Kept on
     /// the hit so a future re-ranker can blend it with other signals.
+    pub bm25: f64,
+}
+
+/// A current-session artifact discovery hit. The body remains in its bounded
+/// `cockpit://session/<id>/artifacts/<id>` pseudofile; this is only a snippet.
+#[derive(Debug, Clone)]
+pub struct ArtifactSearchHit {
+    pub artifact_id: Uuid,
+    pub snippet: String,
     pub bm25: f64,
 }
 
@@ -82,7 +94,7 @@ impl Db {
             )
             .context(
                 "FTS5 is not available in this SQLite build; \
-                 session_search/session_read require it and there is no LIKE fallback",
+                 history_search/cockpit recall require it and there is no LIKE fallback",
             )?;
             Ok(())
         })
@@ -143,6 +155,22 @@ impl Db {
                 pool,
                 caller_trust,
             )
+        })
+        .await
+    }
+
+    /// FTS discovery over immutable artifacts owned by one current session.
+    /// Artifact rows inherit the trust classification of their owner event.
+    pub async fn search_current_artifact_candidates_for_trust(
+        &self,
+        query: &str,
+        session_id: Uuid,
+        limit: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<ArtifactSearchHit>> {
+        let query = query.to_string();
+        self.read(move |conn| {
+            search_current_artifact_candidates_inner(conn, &query, session_id, limit, caller_trust)
         })
         .await
     }
@@ -329,17 +357,20 @@ fn search_candidates_inner(
     let mut stmt = conn
         .prepare(
             "SELECT f.session_id AS session_id,
+                    s.project_id  AS project_id,
                     s.short_id    AS short_id,
                     s.title       AS title,
                     s.last_active_at_unix_ms AS last_active_at_unix_ms,
                     CASE f.row_kind
                       WHEN 'title' THEN s.title
+                      WHEN 'description' THEN s.description
                       WHEN 'compaction' THEN COALESCE(
                         json_extract(e.data_json, '$.brief_text'),
                         json_extract(e.data_json, '$.handoff_text'),
                         json_extract(h.payload_json, '$.brief_text'),
                         json_extract(h.payload_json, '$.handoff_text')
                       )
+                      WHEN 'artifact' THEN a.content
                       ELSE json_extract(e.data_json, '$.text')
                     END AS body,
                     bm25(session_fts) AS rank
@@ -350,7 +381,10 @@ fn search_candidates_inner(
           LEFT JOIN compaction_handoffs AS h
                  ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                 AND h.session_id = e.session_id
+          LEFT JOIN session_text_artifacts AS a
+                 ON a.session_id = f.session_id AND a.artifact_id = f.artifact_id
               WHERE session_fts MATCH ?1
+                AND f.row_kind <> 'artifact'
                 AND s.archived_at_unix_ms IS NULL
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
@@ -374,6 +408,7 @@ fn search_candidates_inner(
                 let sid: String = row.get("session_id")?;
                 Ok((
                     sid,
+                    row.get::<_, String>("project_id")?,
                     row.get::<_, Option<String>>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
                     row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -391,7 +426,7 @@ fn search_candidates_inner(
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
     for r in rows {
-        let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+        let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
             r.context("decoding search hit")?;
         let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
         if by_session.contains_key(&session_id) {
@@ -405,6 +440,7 @@ fn search_candidates_inner(
             session_id,
             SearchHit {
                 session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -442,17 +478,20 @@ fn search_candidates_in_sessions_inner(
         let mut stmt = conn
             .prepare(
                 "SELECT f.session_id AS session_id,
+                        s.project_id AS project_id,
                         s.short_id AS short_id,
                         s.title AS title,
                         s.last_active_at_unix_ms AS last_active_at_unix_ms,
                         CASE f.row_kind
                           WHEN 'title' THEN s.title
+                          WHEN 'description' THEN s.description
                           WHEN 'compaction' THEN COALESCE(
                             json_extract(e.data_json, '$.brief_text'),
                             json_extract(e.data_json, '$.handoff_text'),
                             json_extract(h.payload_json, '$.brief_text'),
                             json_extract(h.payload_json, '$.handoff_text')
                           )
+                          WHEN 'artifact' THEN a.content
                           ELSE json_extract(e.data_json, '$.text')
                         END AS body,
                         bm25(session_fts) AS rank
@@ -463,7 +502,10 @@ fn search_candidates_in_sessions_inner(
               LEFT JOIN compaction_handoffs AS h
                      ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                     AND h.session_id = e.session_id
+              LEFT JOIN session_text_artifacts AS a
+                     ON a.session_id = f.session_id AND a.artifact_id = f.artifact_id
                   WHERE session_fts MATCH ?1
+                    AND f.row_kind <> 'artifact'
                     AND f.session_id = ?2
                     AND (?3 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
                   ORDER BY rank ASC, f.seq ASC",
@@ -480,6 +522,7 @@ fn search_candidates_in_sessions_inner(
                     let sid: String = row.get("session_id")?;
                     Ok((
                         sid,
+                        row.get::<_, String>("project_id")?,
                         row.get::<_, Option<String>>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
                         row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -490,7 +533,7 @@ fn search_candidates_in_sessions_inner(
             )
             .context("querying lineage search")?;
         for row in rows {
-            let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+            let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
                 row.context("decoding lineage search hit")?;
             let hit_session_id =
                 Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
@@ -502,6 +545,7 @@ fn search_candidates_in_sessions_inner(
             };
             out.push(SearchHit {
                 session_id: hit_session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -514,6 +558,63 @@ fn search_candidates_in_sessions_inner(
         }
     }
     Ok(rank_candidates(out))
+}
+
+fn search_current_artifact_candidates_inner(
+    conn: &Connection,
+    query: &str,
+    session_id: Uuid,
+    limit: u32,
+    caller_trust: HistoryCallerTrust,
+) -> Result<Vec<ArtifactSearchHit>> {
+    let Some(match_query) = literal_fts_match_query(query) else {
+        return Ok(Vec::new());
+    };
+    let terms = literal_fts_terms(query);
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.artifact_id, a.content, bm25(session_fts) AS rank
+               FROM session_fts
+               JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
+               JOIN session_text_artifacts AS a
+                 ON a.session_id = f.session_id AND a.artifact_id = f.artifact_id
+               JOIN session_events AS e
+                 ON e.session_id = f.session_id AND e.seq = f.seq
+              WHERE session_fts MATCH ?1
+                AND f.row_kind = 'artifact'
+                AND f.session_id = ?2
+                AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+              ORDER BY rank ASC, a.created_at ASC
+              LIMIT ?4",
+        )
+        .context("preparing current artifact history search")?;
+    let rows = stmt
+        .query_map(
+            params![
+                match_query,
+                session_id.to_string(),
+                caller_trust.can_read_trusted(),
+                i64::from(limit)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>("artifact_id")?,
+                    row.get::<_, String>("content")?,
+                    row.get::<_, f64>("rank")?,
+                ))
+            },
+        )
+        .context("querying current artifact history search")?;
+    rows.map(|row| {
+        let (artifact_id, body, bm25) = row.context("decoding current artifact history hit")?;
+        Ok(ArtifactSearchHit {
+            artifact_id: Uuid::parse_str(&artifact_id)
+                .with_context(|| format!("artifact_id `{artifact_id}`"))?,
+            snippet: canonical_snippet(&body, &terms),
+            bm25,
+        })
+    })
+    .collect()
 }
 
 fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<Uuid>> {
@@ -1488,6 +1589,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn descriptions_are_indexed_as_history_discovery_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let id = session.session_id.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET description = ?1 WHERE session_id = ?2",
+                ["durable sapphire migration context", id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let hits = db
+            .search_candidates("sapphire", Some("p"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("sapphire"));
     }
 
     #[tokio::test]

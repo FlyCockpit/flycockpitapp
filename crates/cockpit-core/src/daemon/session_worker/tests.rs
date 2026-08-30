@@ -5129,7 +5129,7 @@ async fn stored_tool_surface_override_decodes_for_startup() {
     .unwrap();
     session
         .set_tool_surface_override_json(Some(
-            r#"{"tools":["read","mcp","session_search"],"toolTiers":{"session_search":"discoverable"}}"#
+            r#"{"tools":["read","mcp","history_search"],"toolTiers":{"history_search":"discoverable"}}"#
                 .to_string(),
         ))
         .unwrap();
@@ -5140,11 +5140,11 @@ async fn stored_tool_surface_override_decodes_for_startup() {
         vec![
             "read".to_string(),
             "mcp".to_string(),
-            "session_search".to_string()
+            "history_search".to_string()
         ]
     );
     assert_eq!(
-        selection.tool_tiers.get("session_search"),
+        selection.tool_tiers.get("history_search"),
         Some(&crate::agents::ToolTier::Discoverable)
     );
 }

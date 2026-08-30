@@ -918,7 +918,7 @@ async fn live_model_switch_routes_next_request_to_new_model() {
         "rebuilt foreground Build must preserve interactive direct `todo` tool: {names:?}"
     );
     let discoverable = driver.stack[0].agent.tools.discoverable_mcp_tool_names();
-    for tool in ["session_search"] {
+    for tool in ["history_search"] {
         assert!(
             discoverable.iter().any(|name| name == tool),
             "rebuilt foreground Build must preserve interactive discoverable `{tool}` tool: {discoverable:?}"

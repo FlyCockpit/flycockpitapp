@@ -7184,7 +7184,35 @@ async fn handle_serialized_request_impl(
             // Resolve the three closed-lookup ids to a compiled action kind and
             // parse the safe fields FIRST. An unknown id / unsafe field is
             // rejected here, before any persist.
-            let kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
+            // KB-copy actions deliberately take the configured registry label
+            // as their closed `origin_id`, not an implementation UUID. The
+            // daemon resolves and pins the label's current immutable namespace
+            // while the Owner creates the action. This makes the first copy
+            // operable without manufacturing a dummy sealed value to discover
+            // its destination identity.
+            let resolved_origin_id = if kind_id == "knowledge_base_copy" {
+                let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
+                    &ctx.db,
+                    &ctx.canonical_cwd,
+                )
+                .await
+                .map_err(internal)?;
+                let (_, extended) = ctx
+                    .config_source()
+                    .load_effective_for_daemon(&ctx.canonical_cwd, &trust_policy)
+                    .map_err(daemon_config_error)?;
+                crate::knowledge::sealed_knowledge_base_id_for_owner(
+                    &ctx.canonical_cwd,
+                    &extended,
+                    &origin_id,
+                    ctx.secret_vault.as_ref(),
+                )
+                .map_err(|error| bad_request(error.to_string()))?
+                .to_string()
+            } else {
+                origin_id
+            };
+            let kind = resolve_sealed_action_kind(&kind_id, &resolved_origin_id, &projection_id)
                 .map_err(|error| bad_request(error.to_string()))?;
             let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
@@ -27468,8 +27496,11 @@ fn parse_sealed_owner_scope_kind(
         "session" => Ok(crate::db::sealed_scope::SealedScopeKind::Session),
         "project" => Ok(crate::db::sealed_scope::SealedScopeKind::Project),
         "global" => Ok(crate::db::sealed_scope::SealedScopeKind::Global),
+        "knowledge_base" => Ok(crate::db::sealed_scope::SealedScopeKind::KnowledgeBase),
         other => {
-            anyhow::bail!("scope kind must be `session`, `project`, or `global`, got `{other}`")
+            anyhow::bail!(
+                "scope kind must be `session`, `project`, `global`, or `knowledge_base`, got `{other}`"
+            )
         }
     }
 }
@@ -27566,7 +27597,7 @@ fn build_sealed_scope_ref(
     scope_kind: Option<String>,
     scope_key: Option<String>,
 ) -> anyhow::Result<crate::sealed::identity::SealedScopeRef> {
-    use crate::sealed::identity::{SealedProjectKey, SealedScopeRef};
+    use crate::sealed::identity::{SealedKnowledgeBaseId, SealedProjectKey, SealedScopeRef};
     let kind =
         parse_sealed_owner_scope_kind(scope_kind.as_deref().context("a scope kind is required")?)?;
     let key = scope_key.unwrap_or_default();
@@ -27578,6 +27609,9 @@ fn build_sealed_scope_ref(
             SealedProjectKey::from_canonical(key),
         )),
         crate::db::sealed_scope::SealedScopeKind::Global => Ok(SealedScopeRef::Global),
+        crate::db::sealed_scope::SealedScopeKind::KnowledgeBase => Ok(
+            SealedScopeRef::KnowledgeBase(SealedKnowledgeBaseId::parse(&key)?),
+        ),
     }
 }
 
@@ -27630,6 +27664,9 @@ fn sealed_record_row_to_inventory_item(
         crate::db::sealed_scope::SealedScopeKind::Session => proto::SealedOwnerScopeKind::Session,
         crate::db::sealed_scope::SealedScopeKind::Project => proto::SealedOwnerScopeKind::Project,
         crate::db::sealed_scope::SealedScopeKind::Global => proto::SealedOwnerScopeKind::Global,
+        crate::db::sealed_scope::SealedScopeKind::KnowledgeBase => {
+            proto::SealedOwnerScopeKind::KnowledgeBase
+        }
     };
     proto::SealedOwnerInventoryItem {
         record_id: row.record_id,
@@ -27643,7 +27680,9 @@ fn sealed_record_row_to_inventory_item(
 }
 
 /// The closed server-side catalog that resolves the three `CreateSealedAction`
-/// ids to a compiled [`SealedActionKind`].
+/// ids to a compiled [`SealedActionKind`]. For `knowledge_base_copy`, callers
+/// first resolve the Owner-visible registry label to the immutable attachment
+/// identity and pass that result as `origin_id`.
 ///
 /// The ids are closed lookups, never free-form payloads: `kind_id` selects a
 /// builtin kind template (a fixed origin allowlist, credential placement, path
@@ -27660,6 +27699,15 @@ fn resolve_sealed_action_kind(
     use crate::sealed::action_admin::{
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
     };
+
+    if kind_id == "knowledge_base_copy" {
+        if projection_id != "none" {
+            anyhow::bail!("knowledge-base copy actions require projection id `none`");
+        }
+        return Ok(SealedActionKind::KnowledgeBaseCopy {
+            knowledge_base_id: crate::sealed::SealedKnowledgeBaseId::parse(origin_id)?,
+        });
+    }
 
     // Closed builtin kind templates. Each entry is a fixed, host-owned template;
     // the wire never supplies an origin URL, header, or path.

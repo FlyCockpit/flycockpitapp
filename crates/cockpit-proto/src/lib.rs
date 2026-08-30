@@ -3145,13 +3145,14 @@ impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWireLiteral
 
 /// The safe scope kind of a sealed value, for the sealed-owner begin and
 /// inventory wire shapes. Carries no key material; the key is a separate
-/// `scope_key` field (a session id or canonical project key).
+/// `scope_key` field (a session id, canonical project key, or KB id).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SealedOwnerScopeKind {
     Session,
     Project,
     Global,
+    KnowledgeBase,
 }
 
 /// One safe row of the sealed-owner inventory. The plaintext literal is

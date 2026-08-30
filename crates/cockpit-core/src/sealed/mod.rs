@@ -19,6 +19,8 @@
 //! * [`runtime`] — `use_sealed_value`, the sole use mechanism.
 //! * [`store`] — Owner-only lifecycle, sagas, and safe inventory.
 //! * [`marker`] — the typed predicate downstream renderers and exports read.
+//! * [`reference`] — resolver-agnostic KB markdown references backed locally
+//!   by daemon-vault items.
 //!
 //! # What an untrusted agent can do
 //!
@@ -46,6 +48,7 @@ pub mod identity;
 pub mod marker;
 pub mod owner;
 pub mod owner_commands;
+pub mod reference;
 pub mod runtime;
 pub mod store;
 
@@ -75,8 +78,9 @@ pub use grant::{
     SEALED_USE_DENIED_MESSAGE, SealedUseContext, SealedUseDenied, UseSealedValueRequest,
 };
 pub use identity::{
-    SealedDescription, SealedName, SealedProjectKey, SealedProjectTrust, SealedRecordId,
-    SealedRedactionIdentity, SealedScopeKind, SealedScopeRef, parse_sealed_redaction_origin,
+    SealedDescription, SealedKnowledgeBaseId, SealedName, SealedProjectKey, SealedProjectTrust,
+    SealedRecordId, SealedRedactionIdentity, SealedScopeKind, SealedScopeRef,
+    parse_sealed_redaction_origin,
 };
 pub use marker::{
     SealedCapabilityState, SealedMarkerIdentity, SealedMarkerPredicate,
@@ -86,6 +90,10 @@ pub use owner::{
     BeginResult, BeginSensitiveInput, BeginSensitiveOwnerOperation, CAPABILITY_TTL_MS,
     MAX_SENSITIVE_FRAME_BYTES, OneUseCapability, SensitiveFrameKind, SensitiveFrameOutcome,
     SensitiveOwnerDisposition, SensitiveOwnerFrame, SensitiveOwnerOperation, VersionBinding,
+};
+pub use reference::{
+    KnowledgeBaseSealedStore, LocalVaultResolver, SealedReference, SealedResolver,
+    resolve_kb_markdown,
 };
 pub use runtime::{SealedRedactionSink, SealedRuntime, SessionRedactionSink};
 pub use store::{

@@ -12,6 +12,16 @@ use anyhow::Context as _;
 
 use super::*;
 
+fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
+    crate::tools::knowledge_sealed::ledger_args_for_sensitive_tool(resolved_name, args)
+        .or_else(|| {
+            env.active_tools
+                .get(resolved_name)
+                .map(|tool| tool.ledger_args(args))
+        })
+        .unwrap_or_else(|| args.clone())
+}
+
 #[derive(Debug)]
 pub(crate) struct SchedulerDurableOrder {
     next_started: std::sync::atomic::AtomicUsize,
@@ -1017,7 +1027,7 @@ async fn execute_ordinary_call_unscoped(
             agent: env.agent.name.clone(),
             call_id: tc.id.to_string(),
             tool: resolved_name.to_string(),
-            args: args.clone(),
+            args: ordinary_ledger_args(env, resolved_name, &args),
         })
         .await;
 
@@ -1240,10 +1250,12 @@ async fn execute_ordinary_call_unscoped(
     let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
+        let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
+        let ledger_wire = ordinary_ledger_args(env, resolved_name, &args);
         let start_data = serde_json::json!({
             "tool": resolved_name,
-            "original_input": original.clone(),
-            "wire_input": args.clone(),
+            "original_input": ledger_original,
+            "wire_input": ledger_wire,
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
         });
@@ -2170,6 +2182,12 @@ async fn execute_ordinary_call_unscoped(
     // trust + table and can never disagree across the intervening awaits (finding
     // 7 TOCTOU / finding r11-3 / decision 12).
     let audit_target_trusted = tool_frame().resolved_trusted();
+    // A secret-accepting tool may execute with its full arguments, but the
+    // ordinary tool-call ledger is unencrypted and must receive only that
+    // tool's safe projection. Project both forms independently so shape/name
+    // recovery remains visible without ever persisting secret fields.
+    let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
+    let ledger_wire = ordinary_ledger_args(env, resolved_name, &args);
     scheduler_await_commit().await;
     if let Err(e) = env
         .session
@@ -2194,8 +2212,8 @@ async fn execute_ordinary_call_unscoped(
                 tool: resolved_name.to_string(),
                 path: tool_path,
                 mcp_server: None,
-                original_input_json: original.clone(),
-                wire_input_json: args.clone(),
+                original_input_json: ledger_original.clone(),
+                wire_input_json: ledger_wire.clone(),
                 recovery: recovery.clone(),
                 hard_fail,
                 exit_code,
@@ -2247,8 +2265,8 @@ async fn execute_ordinary_call_unscoped(
     // verbatim into `events.json` on export with no exporter change.
     let mut event_data = serde_json::json!({
         "tool": resolved_name,
-        "original_input": original,
-        "wire_input": args,
+        "original_input": ledger_original,
+        "wire_input": ledger_wire,
         "recovery_kind": recovery_kind,
         "recovery_stage": recovery_stage,
         "hard_fail": hard_fail,
@@ -2994,6 +3012,36 @@ mod tests {
                     .unwrap_or_default()
                     .to_string(),
             ))
+        }
+    }
+
+    struct LedgerProjectedTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for LedgerProjectedTool {
+        fn name(&self) -> &str {
+            "ledger_projected"
+        }
+
+        fn description(&self) -> &str {
+            "Test-only secret-accepting tool."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "literal": { "type": "string" } },
+                "required": ["literal"],
+                "additionalProperties": false,
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("stored"))
+        }
+
+        fn ledger_args(&self, _args: &Value) -> Value {
+            serde_json::json!({ "literal": "[sealed literal omitted]" })
         }
     }
 
@@ -4656,6 +4704,82 @@ mod tests {
         assert!(
             event_body.contains(SECRET),
             "the ToolCall event retains the raw arg — consistent with the audit row (one frame)"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_tool_projection_never_reaches_ordinary_durable_records() {
+        const SECRET: &str = "ordinary-tool-ledger-secret";
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(LedgerProjectedTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("ledger_projected", serde_json::json!({ "literal": SECRET }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "ledger_projected",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolStart { args, .. })
+                if args == serde_json::json!({ "literal": "[sealed literal omitted]" })
+        ));
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.iter().all(|row| {
+            !row.original_input_json.to_string().contains(SECRET)
+                && !row.wire_input_json.to_string().contains(SECRET)
+        }));
+        assert_eq!(
+            rows[0].original_input_json,
+            serde_json::json!({ "literal": "[sealed literal omitted]" })
+        );
+        assert_eq!(rows[0].wire_input_json, rows[0].original_input_json);
+
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let durable_input_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "tool_call_started" | "tool_call" | "tool_call_completed"
+                )
+            })
+            .collect();
+        assert_eq!(durable_input_events.len(), 3);
+        assert!(
+            durable_input_events
+                .iter()
+                .all(|event| { !serde_json::to_string(&event.data).unwrap().contains(SECRET) })
         );
     }
 

@@ -68,7 +68,8 @@ use zeroize::Zeroizing;
 use super::action::OwnerAuthority;
 use super::compartment::{SealedCompartmentKey, SealedLiteral};
 use super::identity::{
-    SealedDescription, SealedName, SealedProjectKey, SealedRecordId, SealedScopeRef,
+    SealedDescription, SealedKnowledgeBaseId, SealedName, SealedProjectKey, SealedRecordId,
+    SealedScopeRef,
 };
 use super::store::{CreateSealedValue, SealedValueDirectory, SealedValueSummary};
 
@@ -443,6 +444,10 @@ fn scope_ref_from_row(row: &SealedValueRecordRow) -> Result<SealedScopeRef> {
             SealedScopeRef::Project(SealedProjectKey::from_canonical(row.scope_key.clone()))
         }
         SealedScopeKind::Global => SealedScopeRef::Global,
+        SealedScopeKind::KnowledgeBase => SealedScopeRef::KnowledgeBase(
+            SealedKnowledgeBaseId::parse(&row.scope_key)
+                .context("record scope key is not a knowledge-base id")?,
+        ),
     })
 }
 
@@ -455,6 +460,9 @@ fn validate_ambient_scope(scope: &SealedScopeRef) -> Result<()> {
                 bail!("project-scope create requires a non-empty project key");
             }
             Ok(())
+        }
+        SealedScopeRef::KnowledgeBase(_) => {
+            bail!("knowledge-base sealed values are created through KnowledgeBaseSealedStore")
         }
     }
 }
@@ -805,6 +813,9 @@ async fn resolve_literal_for_recover(
                 .get_exact_zeroizing(&key)?
                 .context("compartment literal not found (version superseded)")?;
             Ok(literal)
+        }
+        SealedScopeKind::KnowledgeBase => {
+            bail!("knowledge-base sealed values do not use owner recovery")
         }
     }
 }

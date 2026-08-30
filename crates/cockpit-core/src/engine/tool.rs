@@ -536,6 +536,15 @@ pub trait Tool: Send + Sync {
     /// look up the fields it cares about.
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput>;
 
+    /// Return the argument projection that may be stored in ordinary,
+    /// unencrypted tool-call records and their co-persisted lifecycle events.
+    /// Most tools persist their arguments verbatim. Tools that accept secret
+    /// material must replace it here while preserving enough structure for
+    /// transcript display.
+    fn ledger_args(&self, args: &Value) -> Value {
+        args.clone()
+    }
+
     /// True for tools whose `call` future actively observes [`ToolCtx::cancel`]
     /// and performs its own cleanup before returning from cancellation.
     fn honors_dispatch_cancel(&self) -> bool {

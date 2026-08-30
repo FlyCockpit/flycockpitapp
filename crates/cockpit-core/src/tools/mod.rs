@@ -31,6 +31,7 @@ pub mod harness;
 pub mod history_scope;
 pub mod intel;
 pub mod jq_shim;
+pub mod knowledge_sealed;
 mod lock_wait;
 pub mod lsp;
 pub mod mcp_tool;

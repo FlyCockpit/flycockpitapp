@@ -295,6 +295,11 @@ impl SealedValueDirectory {
         literal: SealedLiteral,
         now_ms: i64,
     ) -> Result<SealedValueSummary> {
+        if request.scope.kind() == SealedScopeKind::KnowledgeBase {
+            bail!(
+                "knowledge-base sealed values are created through KnowledgeBaseSealedStore, not the owner action-grant directory"
+            );
+        }
         if !request.scope.kind().is_persistent_compartment() {
             return self
                 .create_session_scoped(owner, request, literal, now_ms)
@@ -470,6 +475,9 @@ impl SealedValueDirectory {
             .sealed_value_record(record_id.to_string())
             .await?
             .context("sealed value record does not exist")?;
+        if row.scope == SealedScopeKind::KnowledgeBase {
+            bail!("knowledge-base sealed values do not support owner action rotation");
+        }
         if row.scope == SealedScopeKind::Session {
             // A session rotate adopts a new literal into a live session, so it
             // MUST journal the adoption in the same transaction that persists the
@@ -597,6 +605,9 @@ impl SealedValueDirectory {
             .sealed_value_record(record_id.to_string())
             .await?
             .context("sealed value record does not exist")?;
+        if row.scope == SealedScopeKind::KnowledgeBase {
+            bail!("knowledge-base sealed values do not support owner action rotation");
+        }
         if row.scope == SealedScopeKind::Session {
             let literal_str = literal.expose_for_redaction().to_string();
             let resolver = self.redaction_resolver.as_ref().context(
@@ -742,6 +753,11 @@ impl SealedValueDirectory {
         let Some(row) = self.db.sealed_value_record(record_id.to_string()).await? else {
             return Ok(false);
         };
+        if row.scope == SealedScopeKind::KnowledgeBase {
+            bail!(
+                "knowledge-base sealed values are not managed by the owner action-grant directory"
+            );
+        }
         if row.scope == SealedScopeKind::Session {
             let deleted = self
                 .db

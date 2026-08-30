@@ -4984,6 +4984,7 @@ mod tests {
         let freshness = FreshSessionRetrieval {
             hits: vec![crate::db::session_search::SearchHit {
                 session_id,
+                project_id: "project".to_string(),
                 short_id: Some("ab12cd".to_string()),
                 title: Some("Recent deploy discussion".to_string()),
                 last_active_at_unix_ms: 101,

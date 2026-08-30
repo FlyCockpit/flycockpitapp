@@ -88,6 +88,23 @@ pub struct SessionCompactionRecord<'a> {
     pub tail_messages: &'a [crate::engine::message::Message],
 }
 
+/// Retained KB source bytes addressed by opaque, session-local read paths.
+/// They intentionally stay in memory: a resumed daemon cannot honestly claim
+/// it can still serve a prior process's retained source snapshot.
+#[derive(Default)]
+pub(crate) struct KnowledgeReadSnapshotStore {
+    entries: std::collections::HashMap<Uuid, KnowledgeReadSnapshot>,
+    total_bytes: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct KnowledgeReadSnapshot {
+    pub contents: String,
+    pub trust_required: bool,
+}
+
+const MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
 tokio::task_local! {
     static SESSION_EVENT_LINEAGE: Option<SessionEventLineage>;
 }
@@ -399,6 +416,9 @@ pub struct Session {
     /// set is a valid completed capture. A false value means worker startup
     /// was interrupted before the first root-definition-bound capture.
     knowledge_base_prompt_snapshot_captured: AtomicBool,
+    /// Exact KB files returned by search, retained only for follow-up native
+    /// `read` calls during this daemon lifetime.
+    knowledge_read_snapshots: Mutex<KnowledgeReadSnapshotStore>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -522,6 +542,50 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) fn retain_knowledge_read_snapshot(
+        &self,
+        contents: String,
+        trust_required: bool,
+    ) -> Result<Uuid> {
+        let mut snapshots = self
+            .knowledge_read_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((id, _)) = snapshots.entries.iter().find(|(_, snapshot)| {
+            snapshot.contents == contents && snapshot.trust_required == trust_required
+        }) {
+            return Ok(*id);
+        }
+        let new_total = snapshots
+            .total_bytes
+            .checked_add(contents.len())
+            .context("knowledge read snapshot byte count overflow")?;
+        anyhow::ensure!(
+            new_total <= MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES,
+            "knowledge read snapshots exceed the per-session {} MiB limit; rerun the needed search after reducing attachment scope",
+            MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES / (1024 * 1024)
+        );
+        let id = Uuid::new_v4();
+        snapshots.total_bytes = new_total;
+        snapshots.entries.insert(
+            id,
+            KnowledgeReadSnapshot {
+                contents,
+                trust_required,
+            },
+        );
+        Ok(id)
+    }
+
+    pub(crate) fn knowledge_read_snapshot(&self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
+        self.knowledge_read_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .get(&id)
+            .cloned()
+    }
+
     /// The session-owned knowledge-dream attachment-consent cell.
     pub(crate) fn dream_read_scope(
         &self,

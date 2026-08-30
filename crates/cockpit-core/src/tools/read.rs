@@ -88,6 +88,15 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // KB snapshot citations are provider-backed immutable source bytes,
+        // never host paths. Dispatch before generic `cockpit://` recall.
+        if args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(crate::knowledge::is_knowledge_snapshot_read_path)
+        {
+            return crate::knowledge::read_knowledge_snapshot(&args, ctx).await;
+        }
         // `cockpit://` is a database-backed recall provider, never a host
         // path. Dispatch before resolve/sandbox/gitignore can inspect it.
         if args
@@ -255,13 +264,37 @@ pub(crate) async fn read_impl_outcome_with_path(
             return Err(anyhow::anyhow!("read `{}`: {err}", path.display()));
         }
     };
-    if looks_binary(&bytes) {
+    render_read_bytes(args, ctx, was_locked, &path, &bytes, true).await
+}
+
+/// Render already-retained bytes through the ordinary read protocol. Snapshot
+/// pseudofiles set `track_read` false because they are not writable host paths.
+pub(crate) async fn read_snapshot_contents(
+    args: &Value,
+    ctx: &ToolCtx,
+    path: &str,
+    bytes: &[u8],
+) -> Result<ToolOutput> {
+    match render_read_bytes(args.clone(), ctx, false, Path::new(path), bytes, false).await? {
+        ReadOutcome::Content(output) | ReadOutcome::NoContent(output) => Ok(output),
+    }
+}
+
+async fn render_read_bytes(
+    args: Value,
+    ctx: &ToolCtx,
+    was_locked: bool,
+    path: &Path,
+    bytes: &[u8],
+    track_read: bool,
+) -> Result<ReadOutcome> {
+    if looks_binary(bytes) {
         return Ok(ReadOutcome::NoContent(ToolOutput::text(format!(
             "Error: `{}` looks binary (NUL bytes in first 1 KB); use `bash` with `head -c` or `file` for binary inspection",
             path.display()
         ))));
     }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text = String::from_utf8_lossy(bytes).into_owned();
 
     // Range mode: an explicit `start_line`/`end_line` reads that
     // inclusive 1-indexed slice and prepends a content-hash header. This
@@ -271,7 +304,7 @@ pub(crate) async fn read_impl_outcome_with_path(
         || args.get("end_line").is_some()
         || args.get("start_byte").is_some()
     {
-        return read_range(&bytes, &text, &path, args, ctx, was_locked)
+        return read_range(bytes, &text, path, args, ctx, was_locked, track_read)
             .await
             .map(ReadOutcome::Content);
     }
@@ -296,10 +329,8 @@ pub(crate) async fn read_impl_outcome_with_path(
                 slice.total_lines
             ));
         }
-        // Always track the read attempt so a subsequent write is allowed.
-        ctx.locks
-            .note_read(&path, &ctx.lock_identity, ctx.session.id)
-            .await;
+        // Host reads track the attempt so a subsequent write is allowed.
+        note_read_if_host_path(ctx, path, track_read).await;
         return Ok(ReadOutcome::Content(ToolOutput::text(out)));
     }
 
@@ -313,21 +344,25 @@ pub(crate) async fn read_impl_outcome_with_path(
         let mut tail = slice.numbered;
         tail.push_str(&truncation_marker(slice.next_offset));
         tail.push('\n');
-        ctx.locks
-            .note_read(&path, &ctx.lock_identity, ctx.session.id)
-            .await;
+        note_read_if_host_path(ctx, path, track_read).await;
         return Ok(ReadOutcome::Content(ToolOutput::truncated_text(format!(
             "{prelude}{tail}"
         ))));
     }
 
-    ctx.locks
-        .note_read(&path, &ctx.lock_identity, ctx.session.id)
-        .await;
+    note_read_if_host_path(ctx, path, track_read).await;
     Ok(ReadOutcome::Content(ToolOutput::text(format!(
         "{prelude}{}",
         slice.numbered
     ))))
+}
+
+async fn note_read_if_host_path(ctx: &ToolCtx, path: &Path, track_read: bool) {
+    if track_read {
+        ctx.locks
+            .note_read(path, &ctx.lock_identity, ctx.session.id)
+            .await;
+    }
 }
 
 fn directory_recovery(path: &Path, ctx: &ToolCtx) -> ToolOutput {
@@ -383,6 +418,7 @@ async fn read_range(
     args: Value,
     ctx: &ToolCtx,
     _was_locked: bool,
+    track_read: bool,
 ) -> Result<ToolOutput> {
     let start = args
         .get("start_line")
@@ -434,9 +470,7 @@ async fn read_range(
     let hash = crate::intel::hex_lower(&digest);
     let hash12 = &hash[..hash.len().min(12)];
 
-    ctx.locks
-        .note_read(path, &ctx.lock_identity, ctx.session.id)
-        .await;
+    note_read_if_host_path(ctx, path, track_read).await;
 
     if slice.offset_exceeded {
         let header = format!("[hash={hash12} total_lines={total} returned=none]\n");

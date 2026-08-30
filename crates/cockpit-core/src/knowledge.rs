@@ -181,6 +181,7 @@ const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const SEMANTIC_SEARCH_TOOL_NAME: &str = "semantic_search";
 const STRUCTURED_SEARCH_TOOL_NAME: &str = "structured_search";
+const KNOWLEDGE_SNAPSHOT_READ_PREFIX: &str = "cockpit://knowledge/";
 const KNOWLEDGE_DREAM_SOURCES_TOOL_NAME: &str = "knowledge_dream_sources";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
@@ -226,6 +227,10 @@ pub(crate) struct KnowledgeBundle {
     pub index_md: Option<String>,
     pub log_md: Option<String>,
     pub concepts: Vec<KnowledgeConcept>,
+    /// Exact source bytes captured with the retained KB root. Search results
+    /// cite these through `cockpit://knowledge/…`, rather than reopening a
+    /// mutable path after the search has completed.
+    source_documents: BTreeMap<PathBuf, String>,
     resources: Vec<KnowledgeResource>,
 }
 
@@ -315,6 +320,10 @@ pub(crate) struct SearchResult {
     pub snippet: String,
     pub citations: Vec<Citation>,
     pub score: f64,
+    /// The immutable source bytes from which this hit was indexed. This is
+    /// consumed before rendering into a session-scoped read pseudofile.
+    snapshot_source: Option<String>,
+    snapshot_trust_required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1906,35 +1915,25 @@ impl KbProvider for LocalKb {
         let sidecars = self.sidecars.canonicalized()?;
         let sidecar_lock = sidecar_lock(&sidecars);
         let _sidecar_guard = sidecar_lock.lock().await;
-        let (index, _) = match &self.snapshot {
-            Some(snapshot) => {
-                let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
-                KnowledgeIndex::open_snapshot_locked(
-                    snapshot.clone(),
-                    sidecars.clone(),
-                    &process_lock,
-                    embedder,
-                    Some(query_vector.len()),
-                )
-                .await?
-            }
-            None => {
-                let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
-                KnowledgeIndex::open_snapshot_locked(
-                    bundle,
-                    sidecars,
-                    &process_lock,
-                    embedder,
-                    Some(query_vector.len()),
-                )
-                .await?
-            }
-        };
+        let snapshot = self
+            .snapshot
+            .clone()
+            .context("local knowledge search requires a retained knowledge snapshot")?;
+        let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        let (index, _) = KnowledgeIndex::open_snapshot_locked(
+            snapshot.clone(),
+            sidecars,
+            &process_lock,
+            embedder,
+            Some(query_vector.len()),
+        )
+        .await?;
         let mut results = index.search_with_vector(&query_vector, query, limit)?;
         for result in &mut results {
             result.knowledge_base_id = self.entry.id.clone();
             result.knowledge_base_name = self.entry.name.clone();
-            result.source_path = self.root.join(&result.source_path).display().to_string();
+            result.snapshot_source = Some(snapshot_source_for_result(&snapshot, result)?);
+            result.snapshot_trust_required = self.entry.trust_required;
         }
         Ok(results)
     }
@@ -1963,7 +1962,8 @@ impl KbProvider for LocalKb {
         for result in &mut results {
             result.knowledge_base_id = self.entry.id.clone();
             result.knowledge_base_name = self.entry.name.clone();
-            result.source_path = self.root.join(&result.source_path).display().to_string();
+            result.snapshot_source = Some(snapshot_source_for_result(&bundle, result)?);
+            result.snapshot_trust_required = self.entry.trust_required;
         }
         Ok(results)
     }
@@ -1995,6 +1995,19 @@ impl KbProvider for LocalKb {
             ..self.clone()
         })
     }
+}
+
+fn snapshot_source_for_result(bundle: &KnowledgeBundle, result: &SearchResult) -> Result<String> {
+    bundle
+        .source_documents
+        .get(Path::new(&result.source_path))
+        .cloned()
+        .with_context(|| {
+            format!(
+                "knowledge search result {} references source {} absent from its retained snapshot",
+                result.concept_id, result.source_path
+            )
+        })
 }
 
 #[async_trait]
@@ -2078,6 +2091,7 @@ fn finish_bundle(
     index_md: Option<String>,
     log_md: Option<String>,
     mut concepts: Vec<KnowledgeConcept>,
+    source_documents: BTreeMap<PathBuf, String>,
     markdown_files: usize,
     markdown_bytes: usize,
 ) -> Result<KnowledgeBundle> {
@@ -2095,6 +2109,7 @@ fn finish_bundle(
         index_md,
         log_md,
         concepts,
+        source_documents,
         resources,
     })
 }
@@ -2177,6 +2192,7 @@ fn parse_bundle_snapshot(
 ) -> Result<KnowledgeBundle> {
     let markdown_files = documents.len();
     let markdown_bytes = documents.iter().map(|(_, body)| body.len()).sum();
+    let source_documents = documents.iter().cloned().collect();
     let mut index_md = None;
     let mut log_md = None;
     let mut concepts = Vec::new();
@@ -2197,6 +2213,7 @@ fn parse_bundle_snapshot(
         index_md,
         log_md,
         concepts,
+        source_documents,
         markdown_files,
         markdown_bytes,
     )
@@ -3432,6 +3449,8 @@ fn structured_search_index(
             snippet: row.get(2)?,
             citations: serde_json::from_str(&citations_json).unwrap_or_default(),
             score: 1.0,
+            snapshot_source: None,
+            snapshot_trust_required: false,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3527,6 +3546,8 @@ fn rrf_merge(
                     snippet: row.get(3)?,
                     citations,
                     score,
+                    snapshot_source: None,
+                    snapshot_trust_required: false,
                 })
             },
         )?;
@@ -3545,6 +3566,51 @@ fn citation_label(result: &SearchResult) -> String {
         "{}; source: {} (knowledge base: {} / {})",
         citation, result.source_path, result.knowledge_base_name, result.knowledge_base_id
     )
+}
+
+fn retain_search_result_sources(results: &mut [SearchResult], session: &Session) -> Result<()> {
+    for result in results {
+        let contents = result.snapshot_source.take().with_context(|| {
+            format!(
+                "knowledge search result {} has no retained source bytes for a follow-up read",
+                result.concept_id
+            )
+        })?;
+        let snapshot_id =
+            session.retain_knowledge_read_snapshot(contents, result.snapshot_trust_required)?;
+        result.source_path = format!("{KNOWLEDGE_SNAPSHOT_READ_PREFIX}{snapshot_id}");
+    }
+    Ok(())
+}
+
+pub(crate) fn is_knowledge_snapshot_read_path(path: &str) -> bool {
+    path.starts_with(KNOWLEDGE_SNAPSHOT_READ_PREFIX)
+}
+
+pub(crate) async fn read_knowledge_snapshot(
+    args: &serde_json::Value,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_input("`path` is required"))?;
+    let snapshot_id = path
+        .strip_prefix(KNOWLEDGE_SNAPSHOT_READ_PREFIX)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or_else(|| invalid_input("invalid cited knowledge snapshot path"))?;
+    let Some(snapshot) = ctx.session.knowledge_read_snapshot(snapshot_id) else {
+        return Ok(ToolOutput::text(
+            "Error: this cited knowledge snapshot is unavailable; rerun semantic_search or structured_search before using it.",
+        ));
+    };
+    if snapshot.trust_required && !ctx.knowledge_access_trusted {
+        return Err(invalid_input(
+            "access denied: this cited knowledge snapshot requires a trusted model",
+        ));
+    }
+    crate::tools::read::read_snapshot_contents(args, ctx, path, snapshot.contents.as_bytes()).await
 }
 
 fn short_summary(snippet: &str) -> String {
@@ -5724,6 +5790,8 @@ impl Tool for SemanticSearchTool {
             ctx.knowledge_access_trusted,
         )
         .await?;
+        let mut results = results;
+        retain_search_result_sources(&mut results, &ctx.session)?;
         let content = render_tool_results(&results, ctx.redact.as_ref());
         Ok(ToolOutput::text(content))
     }
@@ -5818,7 +5886,7 @@ impl Tool for StructuredSearchTool {
                 "No attached knowledge bundles are available.",
             ));
         }
-        let results = retrieve_structured_from_knowledge_bases(
+        let mut results = retrieve_structured_from_knowledge_bases(
             &bundles.bundles,
             &query,
             Some(&crate::sealed::LocalVaultResolver::new(
@@ -5827,6 +5895,7 @@ impl Tool for StructuredSearchTool {
             ctx.knowledge_access_trusted,
         )
         .await?;
+        retain_search_result_sources(&mut results, &ctx.session)?;
         Ok(ToolOutput::text(render_structured_tool_results(
             &results,
             ctx.redact.as_ref(),
@@ -6011,6 +6080,7 @@ fn render_tool_results(results: &[SearchResult], redact: &RedactionTable) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::tool::Tool as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -6027,6 +6097,41 @@ mod tests {
         assert!(first.contains("Last dreamed at: 1970-01-01T00:00:00+00:00"));
         assert!(first.contains("Newer information may live in sessions"));
         assert!(!first.contains("undreamed"));
+    }
+
+    #[tokio::test]
+    async fn cited_source_reads_the_retained_snapshot_after_the_kb_file_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("deploy.md");
+        let original = "---\ntype: procedure\n---\n\nDeploy through the retained lane.\n";
+        fs::write(&source, original).unwrap();
+        let bundle = parse_bundle(tmp.path()).unwrap();
+        let mut results = vec![SearchResult {
+            knowledge_base_id: "project".to_string(),
+            knowledge_base_name: "Project".to_string(),
+            concept_id: "deploy".to_string(),
+            source_path: "deploy.md".to_string(),
+            chunk_index: 0,
+            snippet: "Deploy through the retained lane.".to_string(),
+            citations: Vec::new(),
+            score: 1.0,
+            snapshot_source: None,
+            snapshot_trust_required: false,
+        }];
+        let retained_source = snapshot_source_for_result(&bundle, &results[0]).unwrap();
+        results[0].snapshot_source = Some(retained_source);
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        retain_search_result_sources(&mut results, &ctx.session).unwrap();
+        let cited_path = results[0].source_path.clone();
+        assert!(is_knowledge_snapshot_read_path(&cited_path));
+
+        fs::write(&source, "---\ntype: procedure\n---\n\nSuccessor content.\n").unwrap();
+        let output = crate::tools::read::ReadTool
+            .call(serde_json::json!({ "path": cited_path }), &ctx)
+            .await
+            .unwrap();
+        assert!(output.content.contains("retained lane"));
+        assert!(!output.content.contains("Successor content"));
     }
 
     struct MockEmbedder;

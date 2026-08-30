@@ -225,7 +225,7 @@ async fn parse(path: &str, ctx: &ToolCtx) -> Result<RecallPath> {
     let parts: Vec<_> = path.trim_end_matches('/').split('/').collect();
     if parts.len() < 5 || parts[0] != "cockpit:" || parts[2] != "session" {
         return Err(invalid_input(
-            "invalid cockpit path; use `cockpit://session/<short_id>/transcript`, `/compactions/<n>`, `/artifacts/<uuid>`, or `/plan`",
+            "invalid cockpit path; use `cockpit://session/<short_id-or-uuid>/transcript`, `/compactions/<n>`, `/artifacts/<uuid>`, or `/plan`",
         ));
     }
     let session_id = resolve_session(ctx, parts[3]).await?;
@@ -256,16 +256,13 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
         return Ok(ctx.session.id);
     }
     if let Ok(id) = Uuid::parse_str(id) {
-        let row = ctx
+        let allowed = ctx
             .session
             .db
-            .get_session(id)
-            .await?
-            .ok_or_else(|| invalid_input("session does not exist"))?;
-        if row.project_id != ctx.session.project_id {
-            return Err(invalid_input(
-                "session is outside the current workspace and cannot be recalled",
-            ));
+            .session_access_allowed(&ctx.session.project_id, id)
+            .await?;
+        if !allowed {
+            return Err(invalid_input("no accessible session with that id"));
         }
         return Ok(id);
     }

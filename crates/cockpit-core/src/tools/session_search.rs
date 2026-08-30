@@ -5,7 +5,7 @@
 //! tiebreaker (migration 0013 / [`crate::db::session_search`]). Defaults
 //! to the current project, excludes archived + the live session, and
 //! returns one highlighted ~150-char snippet per recall target. The companion
-//! `read cockpit://session/<short_id>/transcript` reads a chosen thread back.
+//! `read cockpit://session/<short_id-or-uuid>/transcript` reads a chosen thread back.
 //!
 //! Output is plain tool text; it passes back through the redaction
 //! chokepoint on the next outbound prompt like any other tool result —
@@ -185,12 +185,9 @@ impl Tool for HistorySearchTool {
                 let hits = ctx
                     .session
                     .db
-                    .search_lineage_candidates(query, ctx.session.id, limit, trust)
+                    .search_lineage_candidates_in_sessions(query, &permitted_lineage, trust)
                     .await
-                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?
-                    .into_iter()
-                    .filter(|hit| permitted_lineage.contains(&hit.session_id))
-                    .collect();
+                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
                 let include_tool_events = args
                     .get("include_tool_events")
                     .and_then(Value::as_bool)
@@ -212,41 +209,38 @@ impl Tool for HistorySearchTool {
                 } else {
                     None
                 };
-                render_lineage(query, hits, scan)
+                render_lineage(query, hits, scan, limit, &ctx.session.project_id)
             }
             HistorySearchScope::Past | HistorySearchScope::AllProjects => {
                 let all_projects = scope == HistorySearchScope::AllProjects;
                 let project_id = (!all_projects).then_some(ctx.session.project_id.as_str());
-                let pool = (limit.saturating_mul(3)).clamp(limit, MAX_LIMIT * 3);
-                let mut hits = ctx
-                    .session
-                    .db
-                    .search_candidates_for_trust(
-                        query,
-                        project_id,
-                        Some(ctx.session.id),
-                        since,
-                        pool,
-                        trust,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
-                if all_projects {
-                    let mut permitted = Vec::with_capacity(hits.len());
-                    for hit in hits {
-                        if ctx
-                            .session
-                            .db
-                            .history_scope_allows(&ctx.session.project_id, &hit.project_id)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("history_search history scope: {e:#}"))?
-                        {
-                            permitted.push(hit);
-                        }
-                    }
-                    hits = permitted;
+                let hits = if all_projects {
+                    ctx.session
+                        .db
+                        .search_permitted_candidates_for_trust(
+                            query,
+                            &ctx.session.project_id,
+                            Some(ctx.session.id),
+                            since,
+                            limit,
+                            trust,
+                        )
+                        .await
+                } else {
+                    ctx.session
+                        .db
+                        .search_candidates_for_trust(
+                            query,
+                            project_id,
+                            Some(ctx.session.id),
+                            since,
+                            limit,
+                            trust,
+                        )
+                        .await
                 }
-                render_session_hits(query, &hits, limit, all_projects)
+                .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                render_session_hits(query, &hits, limit, all_projects, &ctx.session.project_id)
             }
         }
     }
@@ -257,6 +251,7 @@ fn render_session_hits(
     hits: &[crate::db::session_search::SearchHit],
     limit: u32,
     all_projects: bool,
+    current_project_id: &str,
 ) -> Result<ToolOutput> {
     if hits.is_empty() {
         let scope = if all_projects {
@@ -270,10 +265,13 @@ fn render_session_hits(
     }
     let mut out = String::new();
     for hit in hits.iter().take(limit as usize) {
-        let id = hit
-            .short_id
-            .clone()
-            .unwrap_or_else(|| hit.session_id.to_string());
+        let id = if hit.project_id == current_project_id {
+            hit.short_id
+                .clone()
+                .unwrap_or_else(|| hit.session_id.to_string())
+        } else {
+            hit.session_id.to_string()
+        };
         let title = hit.title.as_deref().unwrap_or("(untitled)");
         out.push_str(&format!(
             "cockpit://session/{id}/transcript  {}  {title}\n    {}\n",
@@ -288,6 +286,8 @@ fn render_lineage(
     query: &str,
     hits: Vec<crate::db::session_search::SearchHit>,
     scan: Option<crate::db::session_search::ToolEventScan>,
+    limit: u32,
+    current_project_id: &str,
 ) -> Result<ToolOutput> {
     if hits.is_empty() && scan.as_ref().is_none_or(|scan| scan.hits.is_empty()) {
         return Ok(ToolOutput::text(format!(
@@ -295,8 +295,12 @@ fn render_lineage(
         )));
     }
     let mut out = format!("Lineage history matches for `{query}`:\n");
-    for hit in hits {
-        let id = hit.short_id.unwrap_or_else(|| hit.session_id.to_string());
+    for hit in hits.into_iter().take(limit as usize) {
+        let id = if hit.project_id == current_project_id {
+            hit.short_id.unwrap_or_else(|| hit.session_id.to_string())
+        } else {
+            hit.session_id.to_string()
+        };
         out.push_str(&format!(
             "cockpit://session/{id}/transcript  {}  {}\n    {}\n",
             human_date(hit.last_active_at_unix_ms),
@@ -572,11 +576,23 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            permitted
-                .content
-                .contains(other.short_id.as_deref().unwrap()),
+            permitted.content.contains(&other.session_id.to_string()),
             "{}",
             permitted.content
+        );
+
+        let recalled = crate::tools::recall::read(
+            &json!({
+                "path": format!("cockpit://session/{}/transcript", other.session_id),
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            recalled.content.contains("cross workspace lodestone"),
+            "{}",
+            recalled.content
         );
     }
 

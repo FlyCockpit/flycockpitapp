@@ -154,6 +154,37 @@ impl Db {
                 since,
                 pool,
                 caller_trust,
+                None,
+            )
+        })
+        .await
+    }
+
+    /// Global FTS discovery restricted to sessions visible to `reader_project`.
+    /// The consent predicate is part of the ranked SQL result set, so the
+    /// requested pool is selected from permitted sessions rather than filtered
+    /// after an arbitrary candidate cap.
+    pub async fn search_permitted_candidates_for_trust(
+        &self,
+        query: &str,
+        reader_project: &str,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                None,
+                exclude_session,
+                since,
+                pool,
+                caller_trust,
+                Some(&reader_project),
             )
         })
         .await
@@ -294,17 +325,16 @@ impl Db {
             .await
     }
 
-    pub async fn search_lineage_candidates(
+    pub async fn search_lineage_candidates_in_sessions(
         &self,
         query: &str,
-        session_id: Uuid,
-        pool: u32,
+        session_ids: &[Uuid],
         caller_trust: HistoryCallerTrust,
     ) -> Result<Vec<SearchHit>> {
         let query = query.to_string();
+        let session_ids = session_ids.to_vec();
         self.read(move |conn| {
-            let lineage = compaction_lineage_sessions_conn(conn, session_id)?;
-            search_candidates_in_sessions_inner(conn, &query, &lineage, pool, caller_trust)
+            search_candidates_in_sessions_inner(conn, &query, &session_ids, caller_trust)
         })
         .await
     }
@@ -341,6 +371,7 @@ fn search_candidates_inner(
     since: Option<i64>,
     pool: u32,
     caller_trust: HistoryCallerTrust,
+    reader_project: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
         return Ok(Vec::new());
@@ -390,6 +421,14 @@ fn search_candidates_inner(
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
                 AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                AND (?6 IS NULL
+                     OR s.project_id = ?6
+                     OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                  WHERE reader.project_id = ?6
+                                    AND reader.outbound_enabled = 1)
+                         AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                     WHERE target.project_id = s.project_id
+                                       AND target.inbound_enabled = 1)))
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
@@ -402,7 +441,8 @@ fn search_candidates_inner(
                 project_id,
                 exclude,
                 since,
-                caller_trust.can_read_trusted()
+                caller_trust.can_read_trusted(),
+                reader_project,
             ],
             |row| {
                 let sid: String = row.get("session_id")?;
@@ -465,7 +505,6 @@ fn search_candidates_in_sessions_inner(
     conn: &Connection,
     query: &str,
     session_ids: &[Uuid],
-    pool: u32,
     caller_trust: HistoryCallerTrust,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
@@ -552,9 +591,6 @@ fn search_candidates_in_sessions_inner(
                 snippet: canonical_snippet(&body, &terms),
                 bm25,
             });
-            if out.len() as u32 >= pool {
-                return Ok(rank_candidates(out));
-            }
         }
     }
     Ok(rank_candidates(out))

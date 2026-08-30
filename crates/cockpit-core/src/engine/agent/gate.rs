@@ -156,14 +156,13 @@ pub(super) async fn safety_gate_decision_with_configs(
         tool,
         "safety gate: evaluating gated call"
     );
-    let payload = gate_payload(tool, args);
     let outcome = evaluate_for_gate(
         model_ref,
         providers,
         ctx.redact.clone(),
         Some(ctx.shutdown_gate.clone()),
         tool,
-        &payload,
+        args,
     )
     .await;
 
@@ -247,7 +246,7 @@ async fn evaluate_for_gate(
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tool: &str,
-    payload: &str,
+    args: &Value,
 ) -> crate::engine::safety_gate::SafetyOutcome {
     #[cfg(test)]
     {
@@ -258,7 +257,7 @@ async fn evaluate_for_gate(
             return outcome;
         }
     }
-    crate::engine::safety_gate::evaluate(model_ref, providers, redact, shutdown_gate, tool, payload)
+    crate::engine::safety_gate::evaluate(model_ref, providers, redact, shutdown_gate, tool, args)
         .await
 }
 

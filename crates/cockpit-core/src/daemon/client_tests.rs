@@ -402,6 +402,18 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
 }
 
 #[test]
+fn background_agents_setting_selects_new_owner_lifetime() {
+    assert_eq!(
+        LifecycleMode::from_background_agents(true),
+        LifecycleMode::AttachOrPersistent
+    );
+    assert_eq!(
+        LifecycleMode::from_background_agents(false),
+        LifecycleMode::AttachOrEphemeral
+    );
+}
+
+#[test]
 fn discover_attach_plan_restart_release_spawns_instead_of_failing() {
     use crate::daemon::DaemonStatus;
 

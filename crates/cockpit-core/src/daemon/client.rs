@@ -16,8 +16,12 @@ const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
     match intent {
         cockpit_client::LifecycleIntent::AttachOrPersistent
-        | cockpit_client::LifecycleIntent::EnsurePersistent => LifecycleMode::AttachOrPersistent,
-        cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+        | cockpit_client::LifecycleIntent::EnsurePersistent => {
+            LifecycleMode::from_background_agents(true)
+        }
+        cockpit_client::LifecycleIntent::AttachOrEphemeral => {
+            LifecycleMode::from_background_agents(false)
+        }
     }
 }
 
@@ -30,6 +34,19 @@ pub enum LifecycleMode {
     AttachOrPersistent,
     /// Attach to any current owner, otherwise start an ephemeral owner.
     AttachOrEphemeral,
+}
+
+impl LifecycleMode {
+    /// Select the lifetime used only when acquisition must spawn an owner.
+    /// Existing owners are always discovered and attached before this policy
+    /// is consulted.
+    pub fn from_background_agents(background_agents: bool) -> Self {
+        if background_agents {
+            Self::AttachOrPersistent
+        } else {
+            Self::AttachOrEphemeral
+        }
+    }
 }
 
 /// Connect-or-spawn result: a ready-to-use client and the lifetime selected

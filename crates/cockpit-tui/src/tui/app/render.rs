@@ -1413,10 +1413,6 @@ impl App {
         if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
             self.dialog
                 .render(frame, rects.body, &mut self.link_registry);
-        } else if self.startup_modal_on_top() == Some(StartupModal::Daemon)
-            && let Some(prompt) = self.daemon_prompt.as_ref()
-        {
-            prompt.render(frame, rects.body);
         } else if self.question_dialog.is_some() {
             // Answering dialog (GOALS §3b): a compact, bottom-anchored
             // overlay above the status row. History stays visible above
@@ -6267,7 +6263,6 @@ mod render_history_spacing_tests {
 
     fn open_subagent_app(root: &std::path::Path, entry: HistoryEntry) -> (App, uuid::Uuid) {
         let mut app = App::new(Some(root), false);
-        app.daemon_prompt = None;
         app.launch.banner_enabled = false;
         app.use_emojis = false;
         let session_id = uuid::Uuid::new_v4();
@@ -6325,7 +6320,6 @@ mod render_history_spacing_tests {
     fn running_subagent_row_exposes_open_target() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.history.push(running_subagent());
         app.history_render_versions.clear();
         app.history_render_fingerprints.clear();
@@ -6351,7 +6345,6 @@ mod render_history_spacing_tests {
     fn opening_subagent_view_pushes_and_esc_restores_parent() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.history.push(user("root prompt"));
         app.history.push(running_subagent());
         app.history_render_versions.clear();
@@ -6375,7 +6368,6 @@ mod render_history_spacing_tests {
     fn db_async_render_subagent_view_renders_empty_state_without_db() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.history.push(user("root prompt"));
         app.history.push(running_subagent());
 
@@ -6389,7 +6381,6 @@ mod render_history_spacing_tests {
     fn subagent_view_swap_keeps_render_maps_with_their_log() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.launch.banner_enabled = false;
         app.history.push(user("root prompt"));
         app.history.push(running_subagent());
@@ -6414,7 +6405,6 @@ mod render_history_spacing_tests {
     fn db_async_render_stale_fetch_for_other_session_is_discarded() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.history.push(user("root prompt"));
         app.history.push(running_subagent());
 
@@ -6440,7 +6430,6 @@ mod render_history_spacing_tests {
     fn subagent_report_while_view_open_settles_parent_view() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.history.push(running_subagent());
         app.history_render_versions.clear();
         app.history_render_fingerprints.clear();
@@ -6540,7 +6529,6 @@ mod render_history_spacing_tests {
             tmp.path(),
             HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
         );
-        app.daemon_prompt = None;
         let session_id = uuid::Uuid::new_v4();
         app.history.push(running_subagent());
 
@@ -6780,7 +6768,6 @@ mod render_history_spacing_tests {
 
     fn empty_banner_app(root: &std::path::Path) -> App {
         let mut app = App::new(Some(root), false);
-        app.daemon_prompt = None;
         app.dialog = crate::tui::settings::Dialog::None;
         app.overlay = super::Overlay::None;
         app.launch.banner_enabled = true;
@@ -8660,7 +8647,6 @@ mod render_history_spacing_tests {
             tmp.path(),
             HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
         );
-        app.daemon_prompt = None;
         app.history.push(running_subagent());
 
         render_history_no_selection(&mut app, 80, 6);
@@ -8685,7 +8671,6 @@ mod render_history_spacing_tests {
 
     fn page_in_app(root: &std::path::Path, total: usize) -> (App, uuid::Uuid) {
         let mut app = window_history_app(root, total);
-        app.daemon_prompt = None;
         render_history_no_selection(&mut app, 80, 6);
         let session_id = uuid::Uuid::new_v4();
         app.launch.session_id = Some(session_id);
@@ -9267,7 +9252,6 @@ mod render_history_spacing_tests {
     fn scroll_anchor_survives_subagent_view_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = plain_history_app(tmp.path(), 14);
-        app.daemon_prompt = None;
         app.history.push(running_subagent());
 
         render_history_no_selection(&mut app, 80, 4);

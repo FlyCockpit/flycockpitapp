@@ -196,11 +196,6 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
         "question",
         RowControlId::QuestionOption { index: 0 },
     );
-    push_row(
-        &mut out,
-        "daemon_prompt",
-        RowControlId::DaemonPrompt { index: 0 },
-    );
     out
 }
 
@@ -311,6 +306,5 @@ pub(crate) fn button_id_family(id: &ButtonId) -> &'static str {
         ButtonId::OverlayAction { .. } => "overlay",
         ButtonId::DialogAction { .. } => "dialog",
         ButtonId::QuestionAction { .. } => "question",
-        ButtonId::DaemonPrompt { .. } => "daemon_prompt",
     }
 }

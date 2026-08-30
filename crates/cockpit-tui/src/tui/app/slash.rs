@@ -3588,7 +3588,6 @@ mod table_tests {
     fn favorite_uses_daemon_confirmed_session_model_not_stale_default() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.config_snapshot.providers.providers.insert(
             "p".to_string(),
@@ -3660,7 +3659,6 @@ mod table_tests {
         let cmd = *slash_command_by_name("help").expect("/help registry row");
         let mut app = App::new(Some(tmp.path()), false);
         app.dialog = Dialog::None;
-        app.daemon_prompt = None;
         app.question_dialog = None;
 
         app.composer.set("/help".to_string());
@@ -3945,7 +3943,6 @@ mod tests {
     fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = crate::tui::settings::Dialog::None;
         let (attached_request_tx, attached_request_rx) = mpsc::channel::<AttachedRequest>(8);
         let runner = AgentRunner::test_fixture(TestRunnerOverrides {

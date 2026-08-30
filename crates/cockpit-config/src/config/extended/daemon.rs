@@ -6,26 +6,20 @@ pub use crate::db::retention::RetentionConfig;
 pub struct DaemonConfig {
     #[serde(default)]
     pub uploads: DaemonUploadLimitsConfig,
+    /// Whether a newly acquired ledger owner remains alive after its last
+    /// terminal client exits. Existing persistent owners are always attached
+    /// regardless of this default.
     #[serde(default)]
-    pub autostart: DaemonAutostart,
+    pub background_agents: bool,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             uploads: DaemonUploadLimitsConfig::default(),
-            autostart: DaemonAutostart::Shared,
+            background_agents: true,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum DaemonAutostart {
-    #[default]
-    Shared,
-    Private,
-    Ask,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,3 +67,23 @@ default_const!(
     usize,
     256 * 1024 * 1024
 );
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonConfig;
+
+    #[test]
+    fn background_agents_defaults_to_persistent_owners() {
+        assert!(DaemonConfig::default().background_agents);
+    }
+
+    #[test]
+    fn background_agents_deserializes_as_a_boolean() {
+        let config: DaemonConfig = serde_json::from_value(serde_json::json!({
+            "background_agents": false
+        }))
+        .expect("daemon config");
+
+        assert!(!config.background_agents);
+    }
+}

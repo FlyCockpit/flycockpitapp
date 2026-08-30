@@ -12,19 +12,15 @@ impl App {
     ///   eager loop; a poisoned `Some(Err)` from a *previous first-message*
     ///   attempt would too, so this also short-circuits then — only the
     ///   `None` state retries here.
-    /// - The "daemon not running" prompt is closed — we don't spawn a
-    ///   daemon out from under the user's choice.
-    /// - The canonical daemon probe is allowed to start. After "Start and
-    ///   connect" the just-spawned socket isn't bound for a beat; probing in
-    ///   the background lets us wait quietly and attach the instant it's up
-    ///   without blocking this tick.
+    /// - The canonical daemon probe is allowed to start. A just-spawned
+    ///   owner's socket may not be bound for a beat, so probing in the
+    ///   background lets us wait quietly and attach without blocking a tick.
     pub(super) fn ensure_session_for_display(&mut self) {
         // Evaluate the cheap struct-only gates first; the daemon probe is the
         // only costly check, so only start it when everything else already
         // permits an attach (`probe_when` is lazy for exactly this reason).
         let should_probe = should_attempt_display_attach(
             self.agent_runner.is_some(),
-            self.daemon_prompt.is_some(),
             self.daemon_connected,
             || true,
         );
@@ -65,7 +61,6 @@ impl App {
         }
         let attach = should_attempt_display_attach(
             self.agent_runner.is_some(),
-            self.daemon_prompt.is_some(),
             self.daemon_connected,
             || true,
         );

@@ -4191,6 +4191,13 @@ struct ResolvedLocalKnowledgeBase {
     id: String,
     root: PathBuf,
     trust_required: bool,
+    /// A duplicate registry label has no single retrieval authority. Keep
+    /// every affected root in the filesystem policy, but never let a label
+    /// grant access to any of them.
+    registry_id_conflicted: bool,
+    /// The source identity could not be validated. Its known daemon-owned
+    /// root remains fenced, but it cannot grant any read capability.
+    policy_denied: bool,
 }
 
 /// Resolve the local portion of the effective registry for a native tool
@@ -4203,9 +4210,10 @@ async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLoc
 /// Resolve every local KB root that can currently contribute to a native or
 /// shell filesystem policy. This deliberately shares the live assistant
 /// registry with native reads: assistant KBs are not merely retrieval inputs.
-/// An unavailable assistant snapshot is logged and omitted so an unrelated
-/// tool operation does not fail solely because its optional source cannot be
-/// read; when the snapshot is reachable, its root is always fenced.
+/// If resolving an assistant snapshot fails, retain its daemon-owned knowledge
+/// root as a conservative denied policy entry. That preserves the filesystem
+/// fence without making unrelated workspace paths fail merely because the
+/// assistant registry is temporarily unavailable.
 async fn effective_local_knowledge_bases(
     session: &Session,
     cwd: &Path,
@@ -4213,16 +4221,30 @@ async fn effective_local_knowledge_bases(
 ) -> Vec<ResolvedLocalKnowledgeBase> {
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
     match assistant_knowledge_registry_entry(session).await {
-        Ok(Some(assistant)) => registry.push(assistant.entry),
+        Ok(Some(assistant)) => registry.push((assistant.entry, false)),
         Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, "ignoring unavailable assistant knowledge source for filesystem policy")
-        }
+        Err(error) => match conservative_assistant_knowledge_policy_entry(session) {
+            Ok(assistant) => {
+                tracing::warn!(%error, "retaining unavailable assistant knowledge source as a denied filesystem policy entry");
+                registry.push((assistant, true));
+            }
+            Err(fallback_error) => tracing::warn!(
+                %error,
+                %fallback_error,
+                "assistant knowledge source is unavailable and its conservative filesystem policy root could not be derived"
+            ),
+        },
     }
-    registry.extend(extended.knowledge_bases.iter().cloned());
+    registry.extend(
+        extended
+            .knowledge_bases
+            .iter()
+            .cloned()
+            .map(|entry| (entry, false)),
+    );
 
     let mut local = Vec::new();
-    for entry in registry {
+    for (entry, policy_denied) in registry {
         let KnowledgeBaseSource::Local { path } = entry.source else {
             continue;
         };
@@ -4235,26 +4257,69 @@ async fn effective_local_knowledge_bases(
         // be resolved cannot grant filesystem authority, but neither can a
         // later shell write turn that spelling into an unfenced target.
         let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
-        if !local.iter().any(|existing: &ResolvedLocalKnowledgeBase| {
-            existing.id == entry.id && existing.root == root
-        }) {
-            local.push(ResolvedLocalKnowledgeBase {
-                id: entry.id,
-                root,
-                trust_required: entry.trust_required,
-            });
+        local.push(ResolvedLocalKnowledgeBase {
+            id: entry.id,
+            root,
+            trust_required: entry.trust_required,
+            registry_id_conflicted: false,
+            policy_denied,
+        });
+    }
+    let duplicate_ids: BTreeSet<_> = local
+        .iter()
+        .map(|knowledge_base| knowledge_base.id.as_str())
+        .fold(BTreeMap::new(), |mut counts, id| {
+            *counts.entry(id).or_insert(0_usize) += 1;
+            counts
+        })
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id.to_owned()))
+        .collect();
+    if !duplicate_ids.is_empty() {
+        tracing::warn!(ids = ?duplicate_ids, "denying duplicate knowledge-base registry IDs in filesystem policy");
+        for knowledge_base in &mut local {
+            knowledge_base.registry_id_conflicted = duplicate_ids.contains(&knowledge_base.id);
         }
     }
     local
+}
+
+/// Fall back to the assistant's daemon-owned home when a live assistant
+/// snapshot cannot be acquired. The caller records it as policy-denied, so it
+/// can only shrink native capabilities even for a broad allowlist or trusted
+/// executor.
+fn conservative_assistant_knowledge_policy_entry(
+    session: &Session,
+) -> Result<KnowledgeBaseRegistryEntry> {
+    let name = session
+        .assistant_name
+        .as_deref()
+        .context("session has no assistant knowledge source")?;
+    crate::assistants::validate_assistant_name(name)?;
+    let root = crate::assistants::default_home_dir(name)?.join("knowledge");
+    Ok(KnowledgeBaseRegistryEntry::new(
+        format!("assistant-policy-unavailable-{name}"),
+        "Unavailable assistant knowledge".to_string(),
+        "Assistant knowledge source could not be validated.".to_string(),
+        KnowledgeBaseSource::Local { path: root },
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    ))
 }
 
 fn native_knowledge_base_permitted(
     ctx: &ToolCtx,
     knowledge_base: &ResolvedLocalKnowledgeBase,
 ) -> bool {
-    !ctx.allowed_knowledge_bases
-        .as_ref()
-        .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+    !knowledge_base.policy_denied
+        && !knowledge_base.registry_id_conflicted
+        && !ctx
+            .allowed_knowledge_bases
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
         && (!knowledge_base.trust_required || ctx.executing_model_trusted)
 }
 
@@ -4301,6 +4366,18 @@ pub(crate) async fn check_native_local_knowledge_path_access(
     for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
         if !cockpit_host::path_containment::contained_under(&knowledge_base.root, path) {
             continue;
+        }
+        if knowledge_base.policy_denied {
+            bail!(
+                "access denied: `{}` is in an assistant knowledge base whose source could not be validated",
+                path.display()
+            );
+        }
+        if knowledge_base.registry_id_conflicted {
+            bail!(
+                "access denied: `{}` is in a local knowledge base with a duplicate registry ID",
+                path.display()
+            );
         }
         if ctx
             .allowed_knowledge_bases
@@ -4371,7 +4448,9 @@ pub(crate) async fn denied_local_knowledge_roots_for_model(
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
-        if !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        if !knowledge_base.policy_denied
+            && !knowledge_base.registry_id_conflicted
+            && !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
             && (!knowledge_base.trust_required || executing_model_trusted)
         {
             continue;
@@ -4444,8 +4523,9 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "harness_invoke",
         // An MCP script can invoke any configured third-party server. The
         // server's runtime capability is not knowable from the outer script,
-        // so this is an opaque host-filesystem proxy just like a workspace
-        // walker when a local KB requires a trusted model.
+        // so this is an opaque host-filesystem proxy. The dedicated MCP gate
+        // below additionally fences every configured local KB, including
+        // attached sources that are readable through native tools.
         "mcp",
         "search",
         "symbol_find",
@@ -4463,33 +4543,37 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
     Ok(())
 }
 
-/// Reject MCP server access for an untrusted model when a configured local KB
-/// requires a trusted model. A configured server is arbitrary host code: its
-/// initialization, discovery, and tool calls can all inspect the filesystem,
-/// so this must fence the connection boundary rather than only named tools.
+/// Reject MCP server access whenever a local KB is configured. A configured
+/// server is arbitrary host code and an opaque tool call cannot prove that it
+/// will not mutate an attached KB, so this fences the connection boundary
+/// rather than only trust-withheld roots or named tools.
 pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
-    if denied_local_knowledge_roots(ctx).await?.is_empty() {
+    if configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
+        .await
+        .is_empty()
+    {
         return Ok(());
     }
     bail!(
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base that requires a trusted model"
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
     );
 }
 
 /// Synchronous conservative subset used while constructing an MCP connection
-/// context. The async dispatcher and MCP tool boundary additionally resolve
-/// assistant-owned KBs before any host process is reached.
+/// context. An assistant session itself is sufficient to deny: its
+/// daemon-owned KB root remains fenced even if its live snapshot is currently
+/// unavailable. The async dispatcher adds the exact assistant root before any
+/// host process is reached.
 pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String> {
-    let denied = ctx.config.extended().knowledge_bases.iter().any(|entry| {
-        matches!(&entry.source, KnowledgeBaseSource::Local { .. })
-            && (ctx
-                .allowed_knowledge_bases
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&entry.id))
-                || entry.trust_required && !ctx.executing_model_trusted)
-    });
-    denied.then(|| {
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base that requires a trusted model".to_string()
+    let fenced = ctx.session.assistant_name.is_some()
+        || ctx
+            .config
+            .extended()
+            .knowledge_bases
+            .iter()
+            .any(|entry| matches!(&entry.source, KnowledgeBaseSource::Local { .. }));
+    fenced.then(|| {
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence".to_string()
     })
 }
 
@@ -7393,6 +7477,36 @@ timestamp: 2026-08-29T12:00:00Z
         .unwrap();
         assert_eq!(attached.bundles.len(), 1);
         assert_eq!(attached.bundles[0].entry.id, "project");
+    }
+
+    #[tokio::test]
+    async fn duplicate_effective_registry_ids_are_retained_only_as_denied_fences() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let mut first = project_knowledge_registry_entry();
+        first.trust_required = false;
+        first.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("first"),
+        };
+        let mut second = first.clone();
+        second.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("second"),
+        };
+
+        let resolved = effective_local_knowledge_bases(
+            &session,
+            tmp.path(),
+            &ExtendedConfig {
+                knowledge_bases: vec![first, second],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(resolved.len(), 2, "both conflicting roots stay fenced");
+        assert!(resolved.iter().all(|entry| entry.registry_id_conflicted));
+        assert!(resolved.iter().all(|entry| !entry.policy_denied));
     }
 
     #[test]

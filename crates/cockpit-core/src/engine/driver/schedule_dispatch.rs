@@ -454,8 +454,11 @@ impl Driver {
         } else {
             crate::tools::shell_sandbox::SandboxAvailability::Available
         };
-        match crate::engine::schedule::background::background_launch_gate(sandbox_on, &availability)
-        {
+        match crate::engine::schedule::background::background_launch_gate(
+            sandbox_on,
+            !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+            &availability,
+        ) {
             crate::tools::shell_sandbox::SandboxGate::Unconfined => {
                 Ok(crate::engine::schedule::background::BackgroundLaunch::unconfined(session_env))
             }

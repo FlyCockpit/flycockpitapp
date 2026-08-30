@@ -555,6 +555,26 @@ pub fn gate_decision(sandbox_on: bool, availability: &SandboxAvailability) -> Sa
     }
 }
 
+/// Decide a shell gate where a caller must enforce filesystem confinement for
+/// a local-KB fence. Unlike ordinary sandbox use, unsupported platforms may
+/// not fall back to an approved unconfined process on this path.
+pub fn gate_decision_requiring_confinement(
+    sandbox_on: bool,
+    confinement_required: bool,
+    availability: &SandboxAvailability,
+) -> SandboxGate {
+    if confinement_required {
+        return match availability {
+            SandboxAvailability::Available => SandboxGate::Confine,
+            SandboxAvailability::Unavailable { reason, .. }
+            | SandboxAvailability::UnsupportedPlatform { reason } => SandboxGate::Refuse {
+                reason: reason.clone(),
+            },
+        };
+    }
+    gate_decision(sandbox_on, availability)
+}
+
 /// Process-lifetime cache for the one-shot environment probe.
 static SANDBOX_AVAILABILITY: tokio::sync::OnceCell<SandboxAvailability> =
     tokio::sync::OnceCell::const_new();
@@ -816,6 +836,19 @@ mod tests {
             reason: "no Windows backend".to_string(),
         };
         assert_eq!(gate_decision(true, &availability), SandboxGate::Unconfined);
+    }
+
+    #[test]
+    fn gate_unsupported_platform_refuses_when_a_kb_fence_requires_confinement() {
+        let availability = SandboxAvailability::UnsupportedPlatform {
+            reason: "no Windows backend".to_string(),
+        };
+        assert_eq!(
+            gate_decision_requiring_confinement(true, true, &availability),
+            SandboxGate::Refuse {
+                reason: "no Windows backend".to_string()
+            }
+        );
     }
 
     #[test]

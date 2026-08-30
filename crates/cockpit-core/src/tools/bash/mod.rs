@@ -584,7 +584,11 @@ async fn call_bash_inner(
         // Not consulted on these paths; the gate ignores it.
         crate::tools::shell_sandbox::SandboxAvailability::Available
     };
-    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability);
+    let gate = crate::tools::shell_sandbox::gate_decision_requiring_confinement(
+        sandbox_on,
+        !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+        &availability,
+    );
 
     if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
         // Sandbox enabled but cannot initialize: record the accurate

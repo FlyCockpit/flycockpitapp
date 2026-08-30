@@ -121,8 +121,16 @@ enum TestSandboxBuild {
     Error(String),
 }
 
-pub fn background_launch_gate(sandbox_on: bool, availability: &SandboxAvailability) -> SandboxGate {
-    crate::tools::shell_sandbox::gate_decision(sandbox_on, availability)
+pub fn background_launch_gate(
+    sandbox_on: bool,
+    confinement_required: bool,
+    availability: &SandboxAvailability,
+) -> SandboxGate {
+    crate::tools::shell_sandbox::gate_decision_requiring_confinement(
+        sandbox_on,
+        confinement_required,
+        availability,
+    )
 }
 
 impl BackgroundHandle {
@@ -968,7 +976,7 @@ mod tests {
         let availability = SandboxAvailability::Available;
 
         assert_eq!(
-            background_launch_gate(false, &availability),
+            background_launch_gate(false, false, &availability),
             SandboxGate::Unconfined
         );
     }
@@ -978,7 +986,7 @@ mod tests {
         let availability = SandboxAvailability::Available;
 
         assert_eq!(
-            background_launch_gate(true, &availability),
+            background_launch_gate(true, false, &availability),
             SandboxGate::Confine
         );
     }
@@ -991,7 +999,7 @@ mod tests {
         };
 
         assert_eq!(
-            background_launch_gate(true, &availability),
+            background_launch_gate(true, false, &availability),
             SandboxGate::Refuse {
                 reason: "bwrap absent".to_string()
             }

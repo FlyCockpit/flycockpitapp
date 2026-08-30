@@ -172,7 +172,14 @@ impl KnowledgeBaseRegistryEntry {
 /// Remote KBs are served to arbitrary third-party agents, so a local-model
 /// trust promise is unenforceable and must be rejected at config load time.
 pub fn validate_knowledge_base_local_policy(entries: &[KnowledgeBaseRegistryEntry]) -> Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
     for entry in entries {
+        if !ids.insert(&entry.id) {
+            anyhow::bail!(
+                "knowledge base registry contains duplicate ID `{}`",
+                entry.id
+            );
+        }
         if matches!(&entry.source, KnowledgeBaseSource::Remote { .. }) && entry.trust_required {
             anyhow::bail!(
                 "knowledge base `{}` is remote and cannot set trustRequired; trustRequired is only enforceable for local knowledge bases",
@@ -2753,13 +2760,8 @@ impl ExtendedConfigDoc {
                     cfg.knowledge_bases = entries;
                 }
                 Ok(_) | Err(_) => {
-                    tracing::warn!(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                    );
-                    warnings.push(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                            .to_string(),
-                    );
+                    tracing::warn!("ignored invalid `knowledgeBases` policy");
+                    warnings.push("ignored invalid `knowledgeBases` policy".to_string());
                 }
             }
         }
@@ -2918,13 +2920,8 @@ impl ExtendedConfigDoc {
             match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
                 Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {}
                 Ok(_) | Err(_) => {
-                    tracing::warn!(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                    );
-                    warnings.push(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                            .to_string(),
-                    );
+                    tracing::warn!("ignored invalid `knowledgeBases` policy");
+                    warnings.push("ignored invalid `knowledgeBases` policy".to_string());
                     // An invalid upper registry must not reveal a lower one.
                     obj.insert("knowledgeBases".into(), serde_json::json!([]));
                 }

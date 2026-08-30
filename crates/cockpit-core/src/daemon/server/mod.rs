@@ -74,6 +74,14 @@ fn start_persistent_scheduler(
             db.clone(),
             registry.clone(),
         ));
+        // Keep daemon-owned callbacks next to the production executor so every
+        // durable scheduler startup path (initial boot and in-place promotion)
+        // has the same callback inventory before it can dispatch work.
+        let keep_warm_registry = registry.clone();
+        executor.register_callback("keep_warm", move |job| {
+            let registry = keep_warm_registry.clone();
+            async move { registry.run_keep_warm_job(job).await }
+        });
         let callbacks = executor.callback_registry();
         Some(
             Arc::new(crate::daemon::scheduler::DaemonScheduler::new(

@@ -2355,6 +2355,37 @@ impl Session {
         *self.last_usage.lock().unwrap()
     }
 
+    /// Record a real cache hit against the concrete endpoint that dispatched
+    /// the request. Fallback attempts call this with their own target, rather
+    /// than the session's mutable active selection.
+    pub fn note_cache_hit_for_endpoint(
+        &self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        usage: crate::tokens::TokenUsage,
+    ) {
+        if usage.hit_rate().is_some_and(|rate| rate > 0.0) {
+            *self.last_cache_hit_endpoint.lock().unwrap() = Some((provider.into(), model.into()));
+        }
+    }
+
+    /// Whether this exact configured endpoint has observed a real cache hit
+    /// during the current live session. Estimates and utility bookkeeping do
+    /// not establish this gate.
+    pub fn has_observed_cache_hit_for_endpoint(&self, provider: &str, model: &str) -> bool {
+        self.last_cache_hit_endpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(hit_provider, hit_model)| hit_provider == provider && hit_model == model)
+    }
+
+    /// A model switch changes the prompt-cache key. Forget all prior evidence
+    /// rather than allowing a switch-away-and-back race to arm an old window.
+    pub fn clear_observed_cache_hit(&self) {
+        *self.last_cache_hit_endpoint.lock().unwrap() = None;
+    }
+
     /// Seed the in-memory `last_usage` **without** writing an
     /// `inference_calls` row. Used by resume rehydration
     /// (implementation note) to recompute the context
@@ -2364,6 +2395,36 @@ impl Session {
     /// it with the provider's figure.
     pub fn set_last_usage_estimate(&self, usage: crate::tokens::TokenUsage) {
         *self.last_usage.lock().unwrap() = Some(usage);
+    }
+}
+
+#[cfg(test)]
+mod keep_warm_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn observed_cache_hits_are_endpoint_scoped_and_clearable() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.note_cache_hit_for_endpoint(
+            "provider-a",
+            "model-a",
+            crate::tokens::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                cached_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        assert!(session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
+        assert!(!session.has_observed_cache_hit_for_endpoint("provider-b", "model-b"));
+        session.clear_observed_cache_hit();
+        assert!(!session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
     }
 }
 

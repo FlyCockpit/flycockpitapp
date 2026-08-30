@@ -420,11 +420,17 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// Wall-clock instant of the most recent inference send. Stamped by
-    /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
-    /// it to decide whether the provider's prompt-cache TTL has elapsed.
-    /// In-memory only — a resumed session re-warms naturally.
-    last_send_at: Mutex<Option<std::time::Instant>>,
+    /// The configured endpoint that reported the last real prompt-cache hit.
+    /// This is deliberately separate from `last_usage`: context chrome may use
+    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// the endpoint it is about to refresh.
+    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
+    /// Monotonic instant and durable identity of the most recent inference
+    /// send. The cache-cold predicate uses the monotonic instant, while the
+    /// daemon-scheduled keep-warm callback carries the unique identity across
+    /// its durable job boundary. In-memory only — a resumed session re-warms
+    /// naturally.
+    last_send_at: Mutex<Option<InferenceSendTime>>,
     /// User messages pinned via `/pin` (GOALS §10 / `plan.md` T6.e):
     /// must-survive content injected verbatim into the `/compact`
     /// handoff, never summarized. In pin order.
@@ -507,6 +513,21 @@ struct LastToolCall {
 struct LastRecoverableToolCall {
     signature: String,
     message: String,
+}
+
+/// The durable identity for exactly one inference send. Wall-clock time
+/// supplies the scheduler deadline; `send_id` prevents two sends in one
+/// millisecond from being treated as the same cache-producing request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InferenceSendIdentity {
+    pub unix_millis: i64,
+    pub send_id: Uuid,
+}
+
+#[derive(Clone, Copy)]
+struct InferenceSendTime {
+    monotonic: std::time::Instant,
+    identity: InferenceSendIdentity,
 }
 
 /// Shared test-only redaction key resolver for constructing `Session`s in unit
@@ -999,10 +1020,14 @@ impl Session {
     }
 
     /// Stamp "an inference send just happened now." Drives the cache-TTL
-    /// arm of the cache-cold predicate (GOALS §10). Called once per
+    /// arm of the cache-cold predicate (GOALS §10) and establishes the
+    /// absolute origin of a keep-warm idle window. Called once per
     /// `model.complete` round-trip.
     pub fn note_send(&self) {
-        *self.last_send_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.note_send_at(
+            std::time::Instant::now(),
+            chrono::Utc::now().timestamp_millis(),
+        );
     }
 
     /// Seconds since the last inference send, or `None` if no send has
@@ -1012,7 +1037,58 @@ impl Session {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| t.monotonic.elapsed().as_secs())
+    }
+
+    /// Snapshot the latest inference send's durable identity. The timestamp
+    /// is only for the daemon job deadline; elapsed-time policy continues to
+    /// use [`Self::seconds_since_last_send`] while the session is live.
+    pub(crate) fn last_send_identity(&self) -> Option<InferenceSendIdentity> {
+        self.last_send_at.lock().unwrap().map(|t| t.identity)
+    }
+
+    /// Atomically snapshot the latest send's durable identity and monotonic
+    /// origin. Keep-warm derives its absolute execution deadline directly
+    /// from this origin, so synchronous preparation cannot extend the idle
+    /// window between sampling elapsed time and arming a timer.
+    pub(crate) fn last_send_identity_and_origin(
+        &self,
+    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
+        self.last_send_at
+            .lock()
+            .unwrap()
+            .map(|t| (t.identity, t.monotonic))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_send_at_for_test(&self, elapsed: std::time::Duration) {
+        let elapsed_millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        self.note_send_at(
+            std::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(std::time::Instant::now),
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(elapsed_millis),
+        );
+    }
+
+    /// Force a timestamp collision between two otherwise distinct sends.
+    /// This test seam proves that keep-warm fences on the send identity, not
+    /// the millisecond used to calculate its deadline.
+    #[cfg(test)]
+    pub(crate) fn note_send_with_unix_millis_for_test(&self, unix_millis: i64) {
+        self.note_send_at(std::time::Instant::now(), unix_millis);
+    }
+
+    fn note_send_at(&self, monotonic: std::time::Instant, unix_millis: i64) {
+        *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
+            monotonic,
+            identity: InferenceSendIdentity {
+                unix_millis,
+                send_id: Uuid::new_v4(),
+            },
+        });
     }
 
     /// Record a dispatched tool call's loop-guard `signature` and return

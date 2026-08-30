@@ -548,7 +548,7 @@ pub async fn ensure_default_job(
     db: &Db,
 ) -> Result<()> {
     if handle
-        .list_jobs(Some(CURATOR_OWNER))
+        .list_system_jobs(Some(CURATOR_OWNER))
         .await?
         .into_iter()
         .any(|job| job.id == CURATOR_JOB_ID)
@@ -556,7 +556,7 @@ pub async fn ensure_default_job(
         return Ok(());
     }
     handle
-        .create_job(ScheduledJobCreate {
+        .create_system_callback_job(ScheduledJobCreate {
             id: CURATOR_JOB_ID.to_string(),
             owner: CURATOR_OWNER.to_string(),
             schedule: ScheduledJobSchedule::Idle {
@@ -901,7 +901,7 @@ mod tests {
         ensure_default_job(&handle, &db).await.unwrap();
 
         let job = handle
-            .list_jobs(Some(CURATOR_OWNER))
+            .list_system_jobs(Some(CURATOR_OWNER))
             .await
             .unwrap()
             .into_iter()

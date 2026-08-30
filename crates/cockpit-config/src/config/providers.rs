@@ -729,6 +729,11 @@ pub struct ContextConfig {
     /// away. `0` disables the away classification. Default 15 minutes.
     #[serde(default = "default_idle_window_secs")]
     pub idle_window_secs: u64,
+    /// Optional cache refresh while the user is away. `auto` is deliberately
+    /// observed-hit gated: a provider is never pinged until it has reported a
+    /// real cached input read for this endpoint. Default `auto`.
+    #[serde(default)]
+    pub keep_warm: KeepWarmMode,
     /// Policy used when an away resume has an exact rolling snapshot.
     #[serde(default)]
     pub resume_default: ResumeDefault,
@@ -754,6 +759,7 @@ impl Default for ContextConfig {
             rolling_precompaction: default_rolling_precompaction(),
             rolling_precompaction_rebuild_turns: default_rolling_precompaction_rebuild_turns(),
             idle_window_secs: default_idle_window_secs(),
+            keep_warm: KeepWarmMode::default(),
             resume_default: ResumeDefault::default(),
             auto_prune_pct: default_auto_prune_pct(),
             auto_prune_prunable_pct: default_auto_prune_prunable_pct(),
@@ -774,6 +780,18 @@ default_const!(default_rolling_precompaction, bool, true);
 default_const!(default_rolling_precompaction_rebuild_turns, usize, 24);
 
 default_const!(default_idle_window_secs, u64, 15 * 60);
+
+/// Cache refresh policy during the configured idle window. This is a cost
+/// optimization only; it never changes resume or context-correctness behavior.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KeepWarmMode {
+    /// Refresh only after this exact endpoint has reported a cache hit.
+    #[default]
+    Auto,
+    /// Never schedule a cache refresh.
+    Off,
+}
 
 /// Default action for an away resume with an exact rolling snapshot.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -955,6 +973,34 @@ pub enum CacheMode {
     /// Provider caches a (possibly implicit) prefix subject to a TTL
     /// (Anthropic ephemeral, OpenAI automatic prefix caching, Gemini).
     Ephemeral,
+}
+
+/// Curated retention knowledge for a provider cache. `Observed` intentionally
+/// makes no TTL claim: aggregators and compatible endpoints can route each
+/// request to a different upstream, so cache hits are the only safe signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheRetentionProfile {
+    None,
+    KnownFloor {
+        secs: u64,
+    },
+    Observed,
+    /// An aggregator can vary its upstream between otherwise identical
+    /// requests. Pin provider routing/ordering before expecting locality.
+    AggregatorObserved,
+}
+
+impl CacheRetentionProfile {
+    pub fn known_floor_secs(self) -> Option<u64> {
+        match self {
+            Self::KnownFloor { secs } => Some(secs),
+            Self::None | Self::Observed | Self::AggregatorObserved => None,
+        }
+    }
+
+    pub fn is_aggregator(self) -> bool {
+        matches!(self, Self::AggregatorObserved)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2512,6 +2558,44 @@ impl ProvidersConfig {
             .find(|m| m.id == model)
             .and_then(|m| m.cache.clone())
             .unwrap_or_else(|| entry.cache.clone())
+    }
+
+    /// Resolve curated prompt-cache retention knowledge for one endpoint.
+    ///
+    /// Explicit cache configuration still decides whether cache use is
+    /// possible. This profile only expresses what Cockpit can safely know
+    /// about retention: OpenAI has an approximate 30-minute floor, Anthropic
+    /// uses the configured 5-minute/1-hour retention, and Gemini's configured
+    /// TTL is explicit. OpenRouter-style routes and all unknown compatible
+    /// providers remain observed-only.
+    pub fn resolve_cache_retention_profile(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> CacheRetentionProfile {
+        let cache = self.resolve_cache(provider, model);
+        if cache.mode == CacheMode::None {
+            return CacheRetentionProfile::None;
+        }
+
+        // Provider map keys are user-renamable connection labels. Curated
+        // retention knowledge belongs only to the immutable template identity;
+        // custom endpoints never inherit a vendor profile from a chosen name.
+        let Some(template) = self
+            .providers
+            .get(provider)
+            .and_then(|entry| entry.effective_template(provider))
+        else {
+            return CacheRetentionProfile::Observed;
+        };
+        match template.to_ascii_lowercase().as_str() {
+            "openai" | "chatgpt" | "codex" => CacheRetentionProfile::KnownFloor { secs: 30 * 60 },
+            "anthropic" | "claude" | "gemini" | "google" => CacheRetentionProfile::KnownFloor {
+                secs: cache.ttl_secs,
+            },
+            "openrouter" => CacheRetentionProfile::AggregatorObserved,
+            _ => CacheRetentionProfile::Observed,
+        }
     }
 
     /// Resolve the effective auto-prune master switch for

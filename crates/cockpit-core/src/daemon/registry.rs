@@ -53,6 +53,16 @@ use crate::{
     session::Session,
 };
 
+/// Ties the scheduler callback future's lifetime to the delivered refresh.
+/// Dropping a timed-out callback must cancel the driver-owned provider call.
+struct KeepWarmCallbackGuard(tokio_util::sync::CancellationToken);
+
+impl Drop for KeepWarmCallbackGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("session entry mode conflict: session is {actual}, attach requested {requested}")]
 pub(crate) struct SessionEntryModeConflict {
@@ -1042,6 +1052,53 @@ impl SessionRegistry {
 
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
         crate::sync::lock_or_recover(&self.inner.scheduler).clone()
+    }
+
+    /// Run a daemon-owned keep-warm callback against its original session.
+    /// The callback payload is locally minted by the driver; malformed or
+    /// stale jobs fail closed and cannot be mistaken for a user submission.
+    pub async fn run_keep_warm_job(
+        &self,
+        job: crate::daemon::scheduler::ScheduledJob,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            job.owner == "system:keep_warm"
+                && matches!(&job.payload, crate::daemon::proto::ScheduledJobPayload::Callback { subsystem } if subsystem == "keep_warm"),
+            "keep-warm callback has invalid daemon ownership"
+        );
+        let keep_warm_job = crate::keep_warm::parse_job_id(&job.id)?;
+
+        let handle = self
+            .attach_existing(
+                keep_warm_job.session_id,
+                None,
+                false,
+                None,
+                crate::env_snapshot::EnvSnapshot::from_process(
+                    crate::daemon::proto::EnvSnapshotSource::DaemonStart,
+                ),
+            )
+            .await?;
+        // `ProductionJobExecutor` cancels this future when its callback
+        // deadline expires. The guard propagates that cancellation into the
+        // delivered driver control so no paid refresh outlives the callback.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_callback_drop = KeepWarmCallbackGuard(cancel.clone());
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
+                cache_send_at_unix_millis: keep_warm_job.cache_send_identity.unix_millis,
+                cache_send_id: keep_warm_job.cache_send_identity.send_id,
+                after_secs: keep_warm_job.after_secs,
+                idle_window_secs: keep_warm_job.idle_window_secs,
+                cancel,
+                respond_to,
+            })
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("keep-warm worker stopped before replying"))?
+            .map_err(anyhow::Error::msg)
     }
 
     fn scheduler_source(

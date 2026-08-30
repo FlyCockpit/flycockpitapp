@@ -811,6 +811,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     ));
     ToolCtx {
         agent_id: "builder".to_string(),
+        allowed_knowledge_bases: None,
         executing_model_trusted: false,
         knowledge_access_trusted: false,
         caller_model: None,

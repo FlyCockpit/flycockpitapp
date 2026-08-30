@@ -79,7 +79,9 @@ pub fn within_root(canonical_root: &Path, candidate: &Path) -> bool {
 /// `path` is the already-resolved absolute target the tool is about to
 /// touch (callers go through [`crate::tools::common::resolve`] first).
 /// The boundary is the session cwd plus both session scratch directories —
-/// ephemeral tmp and durable workspace scratch — all of which are "inside."
+/// ephemeral tmp and durable workspace scratch — and the calling agent's
+/// attached local knowledge-base roots for reads. KB roots are read-only here;
+/// writes remain outside the boundary and retain their ordinary gates.
 /// A path inside the boundary is allowed silently. A path
 /// outside consults part 1's path-grant store via `ctx`; if not granted,
 /// it raises part 1's approval prompt **naming the exact path** and, on a
@@ -132,6 +134,10 @@ pub async fn check_native_access(
                 lease.id
             ))
         })?;
+        let attached_local_knowledge =
+            crate::knowledge::check_native_local_knowledge_path_access(ctx, &effective)
+                .await
+                .map_err(|error| invalid_input(error.to_string()))?;
         let session_scratch = ctx.session.workspace_scratch_dir();
         let is_session_scratch =
             cockpit_host::path_containment::contained_under(&session_scratch, &effective);
@@ -146,19 +152,16 @@ pub async fn check_native_access(
                 lease.id
             )));
         }
-        if !lease.covers_path(&effective) && !is_session_scratch {
+        if !lease.covers_path(&effective)
+            && !is_session_scratch
+            && !(required == SandboxPathAccess::Read && attached_local_knowledge)
+        {
             return Err(invalid_input(format!(
                 "`{}` is outside workspace lease visibility `{}`",
                 effective.display(),
                 lease.visibility_root.display()
             )));
         }
-        // A workspace lease limits where a delegated agent may operate; it
-        // does not override the model-trust boundary for a local KB. Keep
-        // this check on the lease path as well as the ambient path below so
-        // every native filesystem consumer of this choke point is fenced.
-        crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
-            .map_err(|error| invalid_input(error.to_string()))?;
         return Ok(effective);
     }
 
@@ -185,13 +188,17 @@ pub async fn check_native_access(
         }
     };
 
-    // Trust-required local KBs are a hard filesystem boundary. This common
+    // Configured local KBs are a hard filesystem boundary. This common
     // native-path choke point covers read, write, edit, LSP, skills, and every
     // future native tool that obtains host-path authority through this helper.
-    crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
-        .map_err(|error| invalid_input(error.to_string()))?;
+    let attached_local_knowledge =
+        crate::knowledge::check_native_local_knowledge_path_access(ctx, &effective)
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
 
-    if within_boundary(ctx, &effective) {
+    if within_boundary(ctx, &effective)
+        || (required == SandboxPathAccess::Read && attached_local_knowledge)
+    {
         return Ok(effective);
     }
 
@@ -734,6 +741,7 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,
@@ -886,6 +894,104 @@ mod tests {
                 .to_string()
                 .contains("local knowledge base that requires a trusted model"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_local_knowledge_is_in_the_native_read_boundary_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let attached = tempfile::tempdir().unwrap();
+        let withheld = tempfile::tempdir().unwrap();
+        let attached_note = attached.path().join("concept.md");
+        let withheld_note = withheld.path().join("concept.md");
+        std::fs::write(&attached_note, "attached").unwrap();
+        std::fs::write(&withheld_note, "withheld").unwrap();
+
+        let mut ctx = sandboxed_ctx(workspace.path());
+        ctx.allowed_knowledge_bases =
+            Some(std::collections::BTreeSet::from(["attached".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        for (id, path) in [("attached", attached.path()), ("withheld", withheld.path())] {
+            extended.knowledge_bases.push(
+                crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    id.to_string(),
+                    id.to_string(),
+                    format!("{id} local knowledge"),
+                    crate::config::extended::KnowledgeBaseSource::Local {
+                        path: path.to_path_buf(),
+                    },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                ),
+            );
+        }
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let checked = check_native_access(&ctx, &attached_note, SandboxPathAccess::Read)
+            .await
+            .expect("attached local knowledge reads without a path approval");
+        assert_eq!(checked, attached_note);
+
+        ctx.approver = None;
+        let write = check_native_access(&ctx, &attached_note, SandboxPathAccess::ReadWrite)
+            .await
+            .expect_err("local knowledge write remains outside the implicit read boundary");
+        assert!(
+            write.to_string().contains("outside the session boundary"),
+            "unexpected write result: {write:#}"
+        );
+
+        let denied = check_native_access(&ctx, &withheld_note, SandboxPathAccess::Read)
+            .await
+            .expect_err("non-attached local knowledge must not be path-approved");
+        assert!(
+            denied.to_string().contains("not attached to this agent"),
+            "unexpected denial: {denied:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_knowledge_contributes_no_native_read_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ctx = sandboxed_ctx(workspace.path());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended
+            .knowledge_bases
+            .push(crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                "hosted".to_string(),
+                "Hosted".to_string(),
+                "Hosted knowledge".to_string(),
+                crate::config::extended::KnowledgeBaseSource::Remote {
+                    url: "https://knowledge.example.test/team".to_string(),
+                },
+                crate::config::extended::KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+                None,
+                None,
+                false,
+                crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+            ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        assert!(
+            crate::knowledge::attached_local_knowledge_roots(&ctx)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

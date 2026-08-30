@@ -3664,6 +3664,7 @@ mod tests {
     ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,

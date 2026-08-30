@@ -4186,6 +4186,110 @@ fn validate_dream_models(
     )
 }
 
+#[derive(Debug)]
+struct ResolvedLocalKnowledgeBase {
+    id: String,
+    root: PathBuf,
+    trust_required: bool,
+}
+
+/// Resolve the local portion of the effective registry for a native tool
+/// frame. Remote knowledge bases intentionally contribute no filesystem
+/// capability: they remain available only through retrieval tools.
+async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLocalKnowledgeBase>> {
+    let mut registry = Vec::with_capacity(ctx.config.extended().knowledge_bases.len() + 1);
+    if let Some(assistant) = assistant_knowledge_registry_entry(&ctx.session).await? {
+        registry.push(assistant.entry);
+    }
+    registry.extend(ctx.config.extended().knowledge_bases.iter().cloned());
+
+    let mut seen = BTreeSet::new();
+    let mut local = Vec::new();
+    for entry in registry {
+        if !seen.insert(entry.id.clone()) {
+            bail!(
+                "knowledge base registry contains duplicate ID `{}`",
+                entry.id
+            );
+        }
+        let KnowledgeBaseSource::Local { path } = entry.source else {
+            continue;
+        };
+        let root = if path.is_absolute() {
+            path
+        } else {
+            ctx.cwd.join(path)
+        };
+        let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot resolve local knowledge base `{}` source: {error}",
+                entry.id
+            )
+        })?;
+        local.push(ResolvedLocalKnowledgeBase {
+            id: entry.id,
+            root,
+            trust_required: entry.trust_required,
+        });
+    }
+    Ok(local)
+}
+
+/// Return the registry-resolved local roots that the calling agent may read.
+/// This is intentionally a read-only capability: native writes continue
+/// through the ordinary path-approval and write gates.
+pub(crate) async fn attached_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if ctx
+            .allowed_knowledge_bases
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+            || (knowledge_base.trust_required && !ctx.knowledge_access_trusted)
+        {
+            continue;
+        }
+        if !roots.iter().any(|root| root == &knowledge_base.root) {
+            roots.push(knowledge_base.root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Validate a native path that falls under a configured local KB. Returns
+/// whether the path is in an attached local KB so the native sandbox can add
+/// that root to its implicit read set. A configured but non-attached KB is a
+/// hard refusal and therefore cannot be reached through a path approval.
+pub(crate) async fn check_native_local_knowledge_path_access(
+    ctx: &ToolCtx,
+    path: &Path,
+) -> Result<bool> {
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if !cockpit_host::path_containment::contained_under(&knowledge_base.root, path) {
+            continue;
+        }
+        if ctx
+            .allowed_knowledge_bases
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        {
+            bail!(
+                "access denied: `{}` is in local knowledge base `{}` which is not attached to this agent",
+                path.display(),
+                knowledge_base.id
+            );
+        }
+        if knowledge_base.trust_required && !ctx.knowledge_access_trusted {
+            bail!(
+                "access denied: `{}` is in a local knowledge base that requires a trusted model",
+                path.display()
+            );
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Return canonical local KB roots withheld from this model. The result is
 /// shared by native-path and shell confinement gates so trust-required source
 /// Markdown cannot be reached through an ordinary filesystem surface.

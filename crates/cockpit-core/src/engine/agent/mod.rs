@@ -460,7 +460,7 @@ pub(crate) async fn turn_toolbox(
             .await
             .is_none()
         {
-            toolbox = toolbox.deactivate_direct_native_media("transcribe_audio");
+            toolbox = toolbox.deactivate_direct_native_media_for_transcription_dispatch();
         }
     } else {
         toolbox = toolbox.deactivate_direct_native_media_tools();

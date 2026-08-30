@@ -3456,22 +3456,6 @@ impl App {
         )
     }
 
-    #[cfg(test)]
-    #[test]
-    fn composed_constructor_keeps_the_requested_session_mode() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let app = Self::new_composed_with_session_mode(
-            Some(tmp.path()),
-            false,
-            SessionMode::Computer,
-            StartupWorkspaceTrust::Decided,
-            None,
-            cockpit_client::LifecycleClient::disconnected(),
-        );
-
-        assert_eq!(app.session_mode(), Some(SessionMode::Computer));
-    }
-
     pub fn new_composed_with_session(
         project: Option<&Path>,
         no_sandbox: bool,

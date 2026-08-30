@@ -516,7 +516,7 @@ fn parse_text_artifacts(
                     .cloned()
                     .ok_or_else(|| anyhow!("text artifact capture reason missing"))?,
             )?,
-            provenance_json: serde_json::to_string(provenance)?,
+            provenance_json: serde_json::to_string(&provenance)?,
             host_captured_bytes,
             host_original_bytes,
             host_dropped_bytes,

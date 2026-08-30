@@ -365,9 +365,9 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
 async fn redactor_for_target(
     ctx: &ToolCtx,
     target: RecallPath,
-) -> Result<crate::redact::RedactionTable> {
+) -> Result<std::sync::Arc<crate::redact::RedactionTable>> {
     let session_id = match target {
-        RecallPath::History => return Ok(ctx.redact.as_ref().clone()),
+        RecallPath::History => return Ok(ctx.redact.clone()),
         RecallPath::Transcript(session_id)
         | RecallPath::Compaction(session_id, _)
         | RecallPath::Plan(session_id)
@@ -378,10 +378,11 @@ async fn redactor_for_target(
         .persisted_redaction_table_for_session(&ctx.session.project_id, session_id)
         .await?
     else {
-        return Ok(ctx.redact.as_ref().clone());
+        return Ok(ctx.redact.clone());
     };
     ctx.redact
         .union(&target_table)
+        .map(std::sync::Arc::new)
         .map_err(|error| anyhow::anyhow!("unioning target-session redaction table: {error:#}"))
 }
 

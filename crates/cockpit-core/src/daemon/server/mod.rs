@@ -742,6 +742,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             live_application_pending: _,
         }
         | proto::Response::WorkspaceTrust { .. }
+        | proto::Response::WorkspaceHistoryScope { .. }
         | proto::Response::SecretInventory { .. }
         | proto::Response::ProviderCatalogSnapshot { .. }
         | proto::Response::ProviderModelsFetched { .. }

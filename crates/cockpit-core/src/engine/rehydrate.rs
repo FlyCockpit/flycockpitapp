@@ -733,7 +733,7 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                         &outbound_content,
                         preview_lines,
                     ),
-                    "",
+                    String::new(),
                 )
             } else {
                 let (head, tail) =
@@ -745,8 +745,8 @@ fn render_rehydrated_tool_artifact_frame<'a>(
             // content is rendered from the current safe view instead of
             // trusting its representation metadata.
             if outbound_content == artifact_content
-                && (preview_head != preview("preview_head")?
-                    || preview_tail != preview("preview_tail")?)
+                && (preview_head != *preview("preview_head")?
+                    || preview_tail != *preview("preview_tail")?)
             {
                 return Err(anyhow!(
                     "available tool artifact preview differs from durable projection state"

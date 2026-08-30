@@ -137,6 +137,10 @@ pub struct SpawnArgs {
     /// intersect agent-bound servers with this set; scope-level servers stay
     /// visible.
     pub mcp_parent_reachable: Option<std::collections::BTreeSet<(String, String)>>,
+    /// Immutable catalog admitted by the daemon root worker. Factories may
+    /// project an agent package onto it, but must never rediscover persistent
+    /// MCP files for a descendant or a turn refresh.
+    pub mcp_root_catalog: std::sync::Arc<crate::mcp::resolver::EffectiveCatalog>,
     /// Root selection (explicit fresh choice, persisted installed-root resume,
     /// or legacy plan-level override). A delegated vNext child never inherits
     /// this field: it resolves its own prepared slot default unless its direct
@@ -1155,17 +1159,23 @@ fn mcp_resolver_for(
     args: &SpawnArgs,
     def: &crate::agents::AgentDef,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(args.cwd.clone(), def);
-    match args.mcp_parent_reachable.clone() {
-        Some(parent) => resolver.with_parent_reachable(parent),
-        None => resolver,
-    }
+    crate::mcp::resolver::EffectiveCatalogResolver::for_agent_from_root_catalog(
+        args.mcp_root_catalog.clone(),
+        def,
+        args.mcp_parent_reachable.clone(),
+    )
 }
 
 fn mcp_resolver_for_cwd(
     args: &SpawnArgs,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(args.cwd.clone())
+    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::from_root_catalog(
+        args.mcp_root_catalog.clone(),
+    );
+    match args.mcp_parent_reachable.clone() {
+        Some(parent) => resolver.with_parent_reachable(parent),
+        None => resolver,
+    }
 }
 
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
@@ -1805,15 +1815,11 @@ pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) ->
     })?;
     let mut definition = (**definition).clone();
     let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
-    // A foreground child may already carry the parent's no-widening
-    // intersection. Rebuilding from its governing definition must not restore
-    // grants removed at admission. `load_resolved_def` only intersects when
-    // `args.mcp_parent_reachable` is Some; copy the live admission ceiling
-    // so a root-shaped rebuild (`None`) cannot widen the catalog.
+    // Tool-surface refreshes are config-driven, not a new MCP admission. Keep
+    // this agent's exact catalog projection so the turn cannot observe edited
+    // mcp.json files or acquire newly added persistent servers.
     rebuilt.posture = agent.posture.clone();
-    if let Some(parent) = agent.mcp_resolver.parent_reachable() {
-        rebuilt.mcp_resolver = rebuilt.mcp_resolver.with_parent_reachable(parent);
-    }
+    rebuilt.mcp_resolver = agent.mcp_resolver.clone();
     Ok(rebuilt)
 }
 
@@ -4203,6 +4209,8 @@ pub(crate) mod tests {
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
             mcp_parent_reachable: None,
+            mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd)
+                .catalog(),
             model_override: None,
             delegation_model: None,
             delegated: false,
@@ -4604,6 +4612,13 @@ pub(crate) mod tests {
             !agent.mcp_resolver.catalog().servers.contains_key("secret"),
             "agent-bound servers the parent cannot reach must drop at admission"
         );
+        let admitted_catalog = agent.mcp_resolver.catalog();
+        std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+        std::fs::write(
+            project.join(".cockpit/mcp.json"),
+            br#"{ "servers": { "new-persistent": { "transport": "streamable", "endpoint": "https://new/mcp" } } }"#,
+        )
+        .unwrap();
 
         let mut rebuild_args = test_spawn_args(&project);
         rebuild_args.mcp_parent_reachable = None;
@@ -4627,6 +4642,32 @@ pub(crate) mod tests {
         assert_eq!(
             rebuilt.mcp_resolver.parent_reachable(),
             agent.mcp_resolver.parent_reachable()
+        );
+        assert!(
+            Arc::ptr_eq(&admitted_catalog, &rebuilt.mcp_resolver.catalog()),
+            "a turn rebuild must retain the agent's admitted catalog projection"
+        );
+        assert!(
+            !rebuilt
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("new-persistent"),
+            "edited persistent configuration is visible only to a new root worker"
+        );
+        let descendant_args = SpawnArgs {
+            mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
+            mcp_root_catalog: agent.mcp_resolver.root_catalog(),
+            ..rebuild_args
+        };
+        let descendant = agent_from_def(&def, &descendant_args).expect("descendant constructs");
+        assert!(
+            !descendant
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("new-persistent"),
+            "a descendant projects its parent root snapshot, not the current disk catalog"
         );
     }
 

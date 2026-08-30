@@ -86,7 +86,8 @@ async fn list_tools_for_entry(
     context: McpConnectContext,
 ) -> Result<Vec<ToolDescriptor>> {
     let cfg = entry
-        .server
+        .persistent_server()
+        .expect("external catalog entries always have persistent server configuration")
         .with_selected_profile(&entry.name, &entry.profile)?;
     list_tools_cached_identified(
         &entry.name,
@@ -211,7 +212,10 @@ pub async fn describe(
     let Some(entry) = catalog.get(server) else {
         bail!("unknown MCP server `{server}`");
     };
-    if !entry.server.enabled {
+    if !entry
+        .persistent_server()
+        .is_some_and(|server| server.enabled)
+    {
         bail!("MCP server `{server}` is disabled");
     }
     let tools = list_tools_for_entry(entry, connect_context(host)).await?;
@@ -325,7 +329,10 @@ pub async fn invoke(
         }
         bail!("unknown MCP server `{server}`");
     };
-    let server_cfg = entry.server.with_selected_profile(server, &entry.profile)?;
+    let server_cfg = entry
+        .persistent_server()
+        .expect("external catalog entries always have persistent server configuration")
+        .with_selected_profile(server, &entry.profile)?;
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }

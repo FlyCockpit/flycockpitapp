@@ -129,11 +129,11 @@ fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSe
     });
     entries
         .into_iter()
-        .filter(|entry| entry.server.enabled)
+        .filter(CatalogEntry::is_enabled)
         .map(|entry| SessionSetupMcpV1 {
             name: entry.name,
             scope: entry.source.as_str().to_string(),
-            enabled: entry.server.enabled,
+            enabled: entry.is_enabled(),
             shadowed_by: entry.shadowed_by.map(|scope| scope.as_str().to_string()),
             profile: Some(entry.profile).filter(|profile| !profile.is_empty()),
         })
@@ -158,6 +158,7 @@ fn agent_mcp_layer(def: &AgentDef) -> (Option<crate::mcp::config::McpConfig>, bo
 
 fn scope_rank(scope: McpScope) -> u8 {
     match scope {
+        McpScope::Builtin => 0,
         McpScope::Global => 0,
         McpScope::Agent => 1,
         McpScope::Workspace => 2,
@@ -323,7 +324,7 @@ mod tests {
         .expect("server");
         CatalogEntry {
             name: name.to_string(),
-            server,
+            server: Some(server),
             source,
             shadowed_by,
             profile: crate::mcp::resolver::DEFAULT_PROFILE.to_string(),

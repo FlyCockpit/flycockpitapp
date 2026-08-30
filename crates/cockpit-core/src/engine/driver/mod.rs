@@ -14029,6 +14029,7 @@ impl Driver {
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
             mcp_parent_reachable: None,
+            mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),
             // Root construction may consume explicit/resumed selection
             // provenance or a legacy plan-level override. vNext children
             // discard it at the delegated-spawn boundary and resolve their own

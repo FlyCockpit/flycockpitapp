@@ -805,6 +805,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
         mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().reachable_bindings()),
+        mcp_root_catalog: ctx.agent.mcp_resolver.root_catalog(),
         // Plan-level overrides don't apply to ad-hoc swarm fan-out.
         model_override: None,
         delegation_model: None,

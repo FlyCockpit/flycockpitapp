@@ -1,9 +1,9 @@
 //! Source-tagged effective MCP catalog resolver.
 //!
 //! Tool dispatch used to re-read every `mcp.json` layer on each `mcp` tool
-//! call via [`super::config::McpConfig::discover`]. The resolver is built
-//! once per agent construction (or test `ToolCtx`), tagged with the layer
-//! that defined each server, and remains fixed for that agent's lifetime.
+//! call via [`super::config::McpConfig::discover`]. The persistent catalog is
+//! admitted once by the root worker, then each agent projects its package
+//! layer onto that immutable snapshot without further filesystem discovery.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use crate::mcp::config::{McpConfig, ServerConfig};
 /// Where an MCP server definition was loaded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum McpScope {
+    Builtin,
     Global,
     Workspace,
     Agent,
@@ -24,6 +25,7 @@ pub enum McpScope {
 impl McpScope {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Builtin => "builtin",
             Self::Global => "global",
             Self::Workspace => "workspace",
             Self::Agent => "agent",
@@ -42,6 +44,7 @@ impl McpScope {
     /// workspace > agent > global
     fn rank(self) -> u8 {
         match self {
+            Self::Builtin => 3,
             Self::Global => 0,
             Self::Agent => 1,
             Self::Workspace => 2,
@@ -55,7 +58,9 @@ pub use super::config::DEFAULT_PROFILE;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
     pub name: String,
-    pub server: ServerConfig,
+    /// `None` only for the host-owned `cockpit` pseudo-server. Persistent
+    /// entries carry their exact authored configuration.
+    pub server: Option<ServerConfig>,
     pub source: McpScope,
     /// More-specific scope that hid this same-named server, if any.
     pub shadowed_by: Option<McpScope>,
@@ -72,10 +77,41 @@ impl CatalogEntry {
     pub fn is_live(&self) -> bool {
         self.shadowed_by.is_none()
     }
+
+    pub fn builtin() -> Self {
+        Self {
+            name: BUILTIN_SERVER_ID.to_string(),
+            server: None,
+            source: McpScope::Builtin,
+            shadowed_by: None,
+            profile: DEFAULT_PROFILE.to_string(),
+            agent_bound: false,
+        }
+    }
+
+    fn persistent(name: String, server: ServerConfig, source: McpScope) -> Self {
+        debug_assert_ne!(source, McpScope::Builtin);
+        Self {
+            name,
+            server: Some(server),
+            source,
+            shadowed_by: None,
+            profile: DEFAULT_PROFILE.to_string(),
+            agent_bound: source == McpScope::Agent,
+        }
+    }
+
+    pub fn persistent_server(&self) -> Option<&ServerConfig> {
+        self.server.as_ref()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.persistent_server().is_none_or(|server| server.enabled)
+    }
 }
 
 /// Merged, source-tagged view of every MCP server visible to one agent.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveCatalog {
     /// Winning (unshadowed) entries keyed by server name.
     pub servers: BTreeMap<String, CatalogEntry>,
@@ -86,6 +122,16 @@ pub struct EffectiveCatalog {
     pub reserved_builtin_rejected: bool,
 }
 
+impl Default for EffectiveCatalog {
+    fn default() -> Self {
+        Self {
+            servers: BTreeMap::from([(BUILTIN_SERVER_ID.to_string(), CatalogEntry::builtin())]),
+            shadowed: Vec::new(),
+            reserved_builtin_rejected: false,
+        }
+    }
+}
+
 impl EffectiveCatalog {
     /// Wrap a pre-merged [`McpConfig`] as workspace-scoped entries. Used by
     /// tests and non-tool callers that already have a merged document.
@@ -94,37 +140,20 @@ impl EffectiveCatalog {
     }
 
     pub fn from_mcp_config_with_scope(cfg: &McpConfig, source: McpScope) -> Self {
-        let mut servers = BTreeMap::new();
+        let mut catalog = Self::default();
         for (name, server) in &cfg.servers {
-            servers.insert(
+            catalog.merge_entry(CatalogEntry::persistent(
                 name.clone(),
-                CatalogEntry {
-                    name: name.clone(),
-                    server: server.clone(),
-                    source,
-                    shadowed_by: None,
-                    profile: DEFAULT_PROFILE.to_string(),
-                    agent_bound: source == McpScope::Agent,
-                },
-            );
+                server.clone(),
+                source,
+            ));
         }
-        Self {
-            servers,
-            shadowed: Vec::new(),
-            reserved_builtin_rejected: false,
-        }
+        catalog
     }
 
     fn merge_layer(&mut self, layer: McpConfig, source: McpScope) {
         for (name, server) in layer.servers {
-            self.merge_entry(CatalogEntry {
-                name,
-                server,
-                source,
-                shadowed_by: None,
-                profile: DEFAULT_PROFILE.to_string(),
-                agent_bound: source == McpScope::Agent,
-            });
+            self.merge_entry(CatalogEntry::persistent(name, server, source));
         }
     }
 
@@ -158,7 +187,12 @@ impl EffectiveCatalog {
             servers: self
                 .servers
                 .iter()
-                .map(|(name, entry)| (name.clone(), entry.server.clone()))
+                .filter_map(|(name, entry)| {
+                    entry
+                        .persistent_server()
+                        .cloned()
+                        .map(|server| (name.clone(), server))
+                })
                 .collect(),
         }
     }
@@ -166,20 +200,22 @@ impl EffectiveCatalog {
     pub fn enabled_servers(&self) -> Vec<(&str, &ServerConfig, &CatalogEntry)> {
         self.servers
             .iter()
-            .filter(|(name, entry)| {
-                entry.is_live() && entry.server.enabled && name.as_str() != BUILTIN_SERVER_ID
+            .filter(|(_, entry)| {
+                entry.is_live()
+                    && entry
+                        .persistent_server()
+                        .is_some_and(|server| server.enabled)
             })
-            .map(|(name, entry)| (name.as_str(), &entry.server, entry))
+            .filter_map(|(name, entry)| {
+                entry
+                    .persistent_server()
+                    .map(|server| (name.as_str(), server, entry))
+            })
             .collect()
     }
 
     pub fn has_reserved_builtin_server_config(&self) -> bool {
         self.reserved_builtin_rejected
-            || self.servers.contains_key(BUILTIN_SERVER_ID)
-            || self
-                .shadowed
-                .iter()
-                .any(|entry| entry.name == BUILTIN_SERVER_ID)
     }
 
     pub fn get(&self, name: &str) -> Option<&CatalogEntry> {
@@ -196,10 +232,17 @@ impl EffectiveCatalog {
             .collect();
         let mut next = BTreeMap::new();
         for (name, mut entry) in std::mem::take(&mut self.servers) {
+            if entry.source == McpScope::Builtin {
+                next.insert(name, entry);
+                continue;
+            }
             let Some(profile) = wanted.get(name.as_str()).copied() else {
                 continue;
             };
-            if entry.server.auth_for_profile(profile).is_none() {
+            let server = entry
+                .persistent_server()
+                .expect("non-built-in catalog entries carry persistent server configuration");
+            if server.auth_for_profile(profile).is_none() {
                 tracing::warn!(
                     server = %name,
                     profile,
@@ -239,6 +282,10 @@ impl EffectiveCatalog {
 /// once a root worker has admitted the catalog, every descendant receives the
 /// same immutable value through its `ToolCtx`.
 pub struct EffectiveCatalogResolver {
+    /// Persistent catalog admitted by the root worker, including the built-in
+    /// pseudo-server. Agent definitions only project this snapshot; they never
+    /// rediscover persistent files.
+    root_catalog: Arc<EffectiveCatalog>,
     catalog: Arc<EffectiveCatalog>,
     parent_reachable: Option<BTreeSet<(String, String)>>,
 }
@@ -249,12 +296,29 @@ impl EffectiveCatalogResolver {
     }
 
     pub fn for_cwd(cwd: impl Into<PathBuf>) -> Arc<Self> {
-        Self::resolved_for_agent_layer(cwd.into(), None, false, Vec::new(), None)
+        Self::from_catalog(discover_effective_catalog(&cwd.into()))
     }
 
     pub fn for_agent(cwd: impl Into<PathBuf>, def: &crate::agents::AgentDef) -> Arc<Self> {
+        let root_catalog = Self::for_cwd(cwd).root_catalog();
+        Self::for_agent_from_root_catalog(root_catalog, def, None)
+    }
+
+    /// Project an agent definition onto the immutable catalog admitted by its
+    /// root worker. This intentionally performs no filesystem discovery.
+    pub fn for_agent_from_root_catalog(
+        root_catalog: Arc<EffectiveCatalog>,
+        def: &crate::agents::AgentDef,
+        parent_reachable: Option<BTreeSet<(String, String)>>,
+    ) -> Arc<Self> {
         let (layer, reserved) = parse_agent_package_mcp(def);
-        Self::resolved_for_agent_layer(cwd.into(), layer, reserved, def.mcp_bindings.clone(), None)
+        Self::project_root_catalog(
+            root_catalog,
+            layer,
+            reserved,
+            def.mcp_bindings.clone(),
+            parent_reachable,
+        )
     }
 
     /// Admission-time parent-reachable MCP bindings. `None` for a root
@@ -270,39 +334,53 @@ impl EffectiveCatalogResolver {
         let mut catalog = (*self.catalog).clone();
         catalog.intersect_parent_reachable(&parent);
         Arc::new(Self {
+            root_catalog: self.root_catalog.clone(),
             catalog: Arc::new(catalog),
             parent_reachable: Some(parent),
         })
     }
 
-    fn resolved_for_agent_layer(
-        cwd: PathBuf,
+    fn project_root_catalog(
+        root_catalog: Arc<EffectiveCatalog>,
         agent_layer: Option<McpConfig>,
         agent_reserved_rejected: bool,
         bindings: Vec<crate::agents::McpBinding>,
         parent_reachable: Option<BTreeSet<(String, String)>>,
     ) -> Arc<Self> {
-        let mut catalog = discover_effective_catalog_with_agent(&cwd, agent_layer.as_ref());
+        let mut catalog = (*root_catalog).clone();
+        if let Some(agent_layer) = agent_layer {
+            catalog.merge_layer(agent_layer, McpScope::Agent);
+        }
         catalog.reserved_builtin_rejected |= agent_reserved_rejected;
         catalog.apply_bindings(&bindings);
         if let Some(parent) = &parent_reachable {
             catalog.intersect_parent_reachable(parent);
         }
         Arc::new(Self {
+            root_catalog,
             catalog: Arc::new(catalog),
             parent_reachable,
         })
     }
 
     pub fn from_catalog(catalog: EffectiveCatalog) -> Arc<Self> {
+        Self::from_root_catalog(Arc::new(catalog))
+    }
+
+    pub fn from_root_catalog(catalog: Arc<EffectiveCatalog>) -> Arc<Self> {
         Arc::new(Self {
-            catalog: Arc::new(catalog),
+            root_catalog: catalog.clone(),
+            catalog,
             parent_reachable: None,
         })
     }
 
     pub fn catalog(&self) -> Arc<EffectiveCatalog> {
         self.catalog.clone()
+    }
+
+    pub fn root_catalog(&self) -> Arc<EffectiveCatalog> {
+        self.root_catalog.clone()
     }
 }
 
@@ -371,7 +449,7 @@ pub fn discover_effective_catalog_from_layers(
         match McpScope::from_config_dir_kind(*kind) {
             McpScope::Global => globals.push((*kind, path.clone())),
             McpScope::Workspace => workspaces.push((*kind, path.clone())),
-            McpScope::Agent => {}
+            McpScope::Agent | McpScope::Builtin => {}
         }
     }
     load_and_merge_paths(&mut catalog, &globals);
@@ -459,13 +537,21 @@ mod tests {
                 discovered.servers.keys().collect::<Vec<_>>(),
             );
             assert_eq!(
-                catalog.servers["shared"].server.endpoint.as_deref(),
+                catalog.servers["shared"]
+                    .persistent_server()
+                    .unwrap()
+                    .endpoint
+                    .as_deref(),
                 discovered.servers["shared"].endpoint.as_deref(),
             );
             assert_eq!(catalog.servers["shared"].source, McpScope::Workspace);
             assert_eq!(catalog.servers["home_only"].source, McpScope::Global);
             assert_eq!(
-                catalog.servers["shared"].server.endpoint.as_deref(),
+                catalog.servers["shared"]
+                    .persistent_server()
+                    .unwrap()
+                    .endpoint
+                    .as_deref(),
                 Some("https://project/mcp")
             );
         });
@@ -496,7 +582,11 @@ mod tests {
             .unwrap();
             let third = resolver.catalog();
             assert_eq!(
-                third.servers["svc"].server.endpoint.as_deref(),
+                third.servers["svc"]
+                    .persistent_server()
+                    .unwrap()
+                    .endpoint
+                    .as_deref(),
                 Some("https://one/mcp"),
                 "an active worker must keep its root-resolved catalog"
             );
@@ -536,6 +626,15 @@ mod tests {
         );
         assert_eq!(catalog.servers["svc"].source, McpScope::Workspace);
         assert_eq!(catalog.servers["svc"].profile, DEFAULT_PROFILE);
+        assert_eq!(catalog.servers[BUILTIN_SERVER_ID].source, McpScope::Builtin);
+        assert!(catalog.servers[BUILTIN_SERVER_ID].server.is_none());
+        assert!(
+            !catalog
+                .to_mcp_config()
+                .servers
+                .contains_key(BUILTIN_SERVER_ID),
+            "the host-owned pseudo-server must not enter persistent transport configuration"
+        );
         let pinned = EffectiveCatalogResolver::from_catalog(catalog.clone());
         assert_eq!(pinned.catalog().servers["svc"].name, "svc");
     }
@@ -574,14 +673,25 @@ mod tests {
             McpScope::Workspace,
         );
         assert_eq!(
-            catalog.servers["shared"].server.endpoint.as_deref(),
+            catalog.servers["shared"]
+                .persistent_server()
+                .unwrap()
+                .endpoint
+                .as_deref(),
             Some("https://workspace/mcp")
         );
         assert_eq!(catalog.servers["shared"].source, McpScope::Workspace);
         let shadowed: Vec<_> = catalog
             .shadowed
             .iter()
-            .map(|e| (e.source, e.shadowed_by, e.server.endpoint.clone()))
+            .map(|e| {
+                (
+                    e.source,
+                    e.shadowed_by,
+                    e.persistent_server()
+                        .and_then(|server| server.endpoint.clone()),
+                )
+            })
             .collect();
         assert!(
             shadowed.iter().any(|(source, by, endpoint)| {
@@ -614,7 +724,11 @@ mod tests {
             catalog.merge_layer(named_cfg("svc", "https://higher/mcp"), higher);
             assert_eq!(catalog.servers["svc"].source, higher);
             assert_eq!(
-                catalog.servers["svc"].server.endpoint.as_deref(),
+                catalog.servers["svc"]
+                    .persistent_server()
+                    .unwrap()
+                    .endpoint
+                    .as_deref(),
                 Some("https://higher/mcp")
             );
             assert_eq!(catalog.shadowed.len(), 1);
@@ -649,7 +763,11 @@ mod tests {
         crate::config::trust::with_workspace_trust_policy(policy, || {
             let catalog = discover_effective_catalog_with_agent(&project, Some(&agent));
             assert_eq!(
-                catalog.servers["shared"].server.endpoint.as_deref(),
+                catalog.servers["shared"]
+                    .persistent_server()
+                    .unwrap()
+                    .endpoint
+                    .as_deref(),
                 Some("https://workspace/mcp")
             );
             assert_eq!(catalog.servers["shared"].source, McpScope::Workspace);
@@ -668,6 +786,8 @@ mod tests {
             .get_mut("alpha")
             .unwrap()
             .server
+            .as_mut()
+            .unwrap()
             .profiles
             .insert(
                 "admin".into(),
@@ -683,6 +803,7 @@ mod tests {
         }]);
         assert!(catalog.servers.contains_key("alpha"));
         assert!(!catalog.servers.contains_key("beta"));
+        assert!(catalog.servers.contains_key(BUILTIN_SERVER_ID));
         assert_eq!(catalog.servers["alpha"].profile, "admin");
         assert!(catalog.servers["alpha"].agent_bound);
     }
@@ -711,7 +832,8 @@ mod tests {
         );
         catalog.merge_layer(named_cfg("ok", "https://ok/mcp"), McpScope::Global);
         assert!(catalog.has_reserved_builtin_server_config());
-        assert!(!catalog.servers.contains_key(BUILTIN_SERVER_ID));
+        assert_eq!(catalog.servers[BUILTIN_SERVER_ID].source, McpScope::Builtin);
+        assert!(catalog.servers[BUILTIN_SERVER_ID].server.is_none());
         assert!(catalog.servers.contains_key("ok"));
         assert!(catalog.shadowed.is_empty());
     }

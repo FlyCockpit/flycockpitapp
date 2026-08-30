@@ -116,7 +116,7 @@ impl HostContext {
                 catalog.servers.entry(name.clone()).or_insert_with(|| {
                     crate::mcp::resolver::CatalogEntry {
                         name: name.clone(),
-                        server: server.clone(),
+                        server: Some(server.clone()),
                         source: crate::mcp::resolver::McpScope::Workspace,
                         shadowed_by: None,
                         profile: crate::mcp::resolver::DEFAULT_PROFILE.to_string(),

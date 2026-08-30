@@ -9562,6 +9562,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
             interactive: false,
             mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().reachable_bindings()),
+            mcp_root_catalog: parent_agent.mcp_resolver.root_catalog(),
             model_override: None,
             delegation_model: model,
             delegated: true,
@@ -12122,6 +12123,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                     interactive: false,
                     mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
+                    mcp_root_catalog: agent.mcp_resolver.root_catalog(),
                     model_override: None,
                     delegation_model: model,
                     delegated: true,
@@ -12626,6 +12628,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         mcp_parent_reachable: Some(
                             agent.mcp_resolver.catalog().reachable_bindings(),
                         ),
+                        mcp_root_catalog: agent.mcp_resolver.root_catalog(),
                         model_override: None,
                         delegation_model: entry.model.clone(),
                         delegated: true,

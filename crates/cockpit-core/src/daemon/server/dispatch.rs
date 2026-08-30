@@ -14158,7 +14158,11 @@ async fn handle_serialized_request_impl(
                             entry.profile
                         )));
                     }
-                    entry.server.clone()
+                    entry.persistent_server().cloned().ok_or_else(|| {
+                        bad_request(format!(
+                            "MCP OAuth cannot authenticate the built-in `{server}` pseudo-server"
+                        ))
+                    })?
                 } else {
                     let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
                     let config = mcp_config_from_paths(&paths)?;
@@ -27102,6 +27106,8 @@ async fn run_docs_ask_pipeline(
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd.clone())
+            .catalog(),
         model_override: None,
         delegation_model: None,
         delegated: true,

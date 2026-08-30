@@ -295,10 +295,10 @@ pub(crate) struct CanonicalDreamProjectRoot(String);
 impl CanonicalDreamProjectRoot {
     pub(crate) fn from_request_root(
         requested_root: &str,
-    ) -> std::result::Result<Self, crate::daemon::server::ErrorPayload> {
+    ) -> std::result::Result<Self, crate::daemon::proto::ErrorPayload> {
         let canonical = crate::daemon::fs_api::canonical_project_root(requested_root)?;
-        Self::from_canonical_path(&canonical).map_err(|error| crate::daemon::server::ErrorPayload {
-            code: crate::daemon::server::ErrorCode::RootMissing,
+        Self::from_canonical_path(&canonical).map_err(|error| crate::daemon::proto::ErrorPayload {
+            code: crate::daemon::proto::ErrorCode::RootMissing,
             message: error.to_string(),
         })
     }

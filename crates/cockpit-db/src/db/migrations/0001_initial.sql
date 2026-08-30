@@ -34,6 +34,34 @@ CREATE TABLE assistants (
     )
 );
 
+-- ---- per-assistant thread inbox ------------------------------------------
+
+-- Structured upward communication from a persistent assistant thread to its
+-- assistant's main session.  This is intentionally not a generic
+-- thread-to-thread transport: both backlinks are durable and delivery is
+-- claimed only by the resolved main session at a turn boundary.
+CREATE TABLE assistant_inbox_items (
+    inbox_item_id      TEXT PRIMARY KEY CHECK (
+        length(inbox_item_id) = 36 AND inbox_item_id = lower(inbox_item_id)
+        AND substr(inbox_item_id, 9, 1) = '-' AND substr(inbox_item_id, 14, 1) = '-'
+        AND substr(inbox_item_id, 19, 1) = '-' AND substr(inbox_item_id, 24, 1) = '-'
+        AND length(replace(inbox_item_id, '-', '')) = 32
+        AND replace(inbox_item_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE,
+    main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    summary            TEXT NOT NULL CHECK (length(CAST(summary AS BLOB)) BETWEEN 1 AND 4000),
+    delivery           TEXT NOT NULL CHECK (delivery IN ('immediate', 'defer', 'notify')),
+    created_at_unix_ms INTEGER NOT NULL,
+    delivered_at_unix_ms INTEGER CHECK (delivered_at_unix_ms IS NULL OR delivered_at_unix_ms >= created_at_unix_ms),
+    CHECK (main_session_id <> raising_session_id)
+);
+CREATE INDEX assistant_inbox_items_main_pending_idx
+    ON assistant_inbox_items(main_session_id, delivered_at_unix_ms, created_at_unix_ms);
+CREATE INDEX assistant_inbox_items_assistant_rate_idx
+    ON assistant_inbox_items(assistant_name, created_at_unix_ms);
+
 -- ---- projects / sessions ---------------------------------------------------
 
 -- Private durable identity for a project. `project_id` remains the host-facing

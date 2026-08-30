@@ -281,7 +281,7 @@ pub struct StorageSessionCandidate {
 }
 
 impl SessionRow {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id: String = row.get("session_id")?;
         let session_id = parse_uuid(&id)?;
         let parent_str: Option<String> = row.get("parent_session_id")?;

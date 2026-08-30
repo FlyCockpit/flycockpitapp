@@ -72,6 +72,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),
     ToolTimeoutSafety::human_blocking("question"),
+    ToolTimeoutSafety::abandon_safe("raise"),
     ToolTimeoutSafety::abandon_safe("read"),
     ToolTimeoutSafety::abandon_safe("read_image"),
     ToolTimeoutSafety::abandon_safe("ask_image"),

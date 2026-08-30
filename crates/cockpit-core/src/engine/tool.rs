@@ -1658,6 +1658,7 @@ pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
             | "task"
             | "spawn"
             | "defer_to_orchestrator"
+            | "raise"
             | "start_build"
             | "mcp"
             | "read_image"
@@ -3499,6 +3500,7 @@ mod steering_tests {
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),
             ("question", ToolEffect::Dynamic),
+            ("raise", ToolEffect::Mutating),
             ("read", ToolEffect::ReadOnly),
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),

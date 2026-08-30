@@ -692,6 +692,7 @@ fn tool_family(name: &str) -> &'static str {
         | "spawn"
         | "return"
         | "question"
+        | "raise"
         | "defer_to_orchestrator"
         | "schedule"
         | "start_build" => "coordination",

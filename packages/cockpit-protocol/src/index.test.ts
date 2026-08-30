@@ -127,7 +127,7 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
-  it("modes_session_setup_requires an explicit mode only when attach creates a session", () => {
+  it("modes_session_setup_requires an explicit mode for every attach", () => {
     const fresh = {
       v: PROTOCOL_VERSION,
       kind: "req" as const,
@@ -145,7 +145,7 @@ describe("cockpit-proto daemon wire schemas", () => {
         ...fresh,
         params: { session_id: "11111111-1111-4111-8111-111111111111" },
       }).success,
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("modes_session_setup_nonempty snapshot sentinel stays schema-valid and redacted", () => {

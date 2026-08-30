@@ -154,11 +154,22 @@ describe("send_user_message_v2_canonical_vectors", () => {
       request,
     };
     expect(() =>
-      validateLocalOwnerDirectMessageV2({ ...envelope, ingress: "local_owner_direct" }),
+      validateLocalOwnerDirectMessageV2(envelope.request_id, {
+        ingress: "local_owner_direct",
+        operation_id: envelope.operation_id,
+        session_locator: envelope.session_locator,
+        request: envelope.request,
+      }),
     ).toThrow("user-message ingress origin must be external_root");
     expect(() =>
       validateAuthenticatedRemoteMessageV2(
-        { ...envelope, ingress: "authenticated_remote" },
+        envelope.request_id,
+        envelope.operation_id,
+        {
+          ingress: "authenticated_remote_operation",
+          session_locator: envelope.session_locator,
+          request: envelope.request,
+        },
         { id: new Uint8Array(16).fill(42), generation: 9n },
       ),
     ).toThrow("user-message ingress origin must be external_root");

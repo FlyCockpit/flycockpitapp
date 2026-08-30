@@ -901,6 +901,9 @@ export const pendingGuidanceProposalSchema = z
   .strict();
 export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
 
+export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
+export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
+
 const requestParamSchemas = {
   get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
   get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
@@ -1710,8 +1713,6 @@ export const queueTargetSchema = z
   })
   .passthrough();
 export type QueueTarget = z.infer<typeof queueTargetSchema>;
-export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
-export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const queueItemSchema = z
   .object({
     id: uuidSchema,

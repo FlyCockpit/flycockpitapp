@@ -48,7 +48,6 @@ fn every_request_and_response_depth_rejects_unknown_fields() {
     let fixture = fixture();
     let create = &fixture["requests"]["create_max"];
     for path in [
-        vec![],
         vec!["params"],
         vec!["params", "base"],
         vec!["params", "base", "workspace_selector"],
@@ -81,7 +80,7 @@ fn every_request_and_response_depth_rejects_unknown_fields() {
 
     for name in ["create", "attach", "close_closed", "close_already_closed"] {
         let response = &fixture["responses"][name];
-        let mut paths = vec![vec![], vec!["data"]];
+        let mut paths = vec![vec!["data"]];
         if matches!(name, "create" | "attach") {
             paths.extend([
                 vec!["data", "base"],

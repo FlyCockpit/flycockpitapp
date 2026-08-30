@@ -54,7 +54,10 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
             request_source = source;
         }
     }
-    assert_eq!(ingress_definitions, 1, "one closed editor-MCP ingress is allowed");
+    assert_eq!(
+        ingress_definitions, 1,
+        "one closed editor-MCP ingress is allowed"
+    );
     for forbidden in [
         "InstallForwardedMcp",
         "ReleaseForwardedMcp",

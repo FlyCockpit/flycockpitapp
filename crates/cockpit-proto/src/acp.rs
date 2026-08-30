@@ -843,7 +843,9 @@ mod forwarded_mcp_tests {
         }
     }
 
-    fn decode_declaration(value: serde_json::Value) -> Result<AcpForwardedMcpDeclarationV1, String> {
+    fn decode_declaration(
+        value: serde_json::Value,
+    ) -> Result<AcpForwardedMcpDeclarationV1, String> {
         serde_json::from_value(value).map_err(|error| error.to_string())
     }
 
@@ -869,7 +871,10 @@ mod forwarded_mcp_tests {
             remaining -= bytes;
         }
         assert_eq!(remaining, 0, "padding fits the bounded argument vector");
-        assert_eq!(serde_json::to_vec(&declaration).unwrap().len(), target_bytes);
+        assert_eq!(
+            serde_json::to_vec(&declaration).unwrap().len(),
+            target_bytes
+        );
         declaration
     }
 
@@ -942,18 +947,27 @@ mod forwarded_mcp_tests {
         }
         let exact_item = "x".repeat(8_192);
         let over_item = "x".repeat(8_193);
-        assert!(decode_declaration(json!({
-            "name": "server",
-            "transport": {"type": "stdio", "command": "mcp", "args": [exact_item], "env": []}
-        })).is_ok());
-        assert!(decode_declaration(json!({
-            "name": "server",
-            "transport": {"type": "stdio", "command": "mcp", "args": [over_item], "env": []}
-        })).is_err());
-        assert!(decode_declaration(json!({
-            "name": "server\n",
-            "transport": {"type": "stdio", "command": "mcp", "args": [], "env": []}
-        })).is_err());
+        assert!(
+            decode_declaration(json!({
+                "name": "server",
+                "transport": {"type": "stdio", "command": "mcp", "args": [exact_item], "env": []}
+            }))
+            .is_ok()
+        );
+        assert!(
+            decode_declaration(json!({
+                "name": "server",
+                "transport": {"type": "stdio", "command": "mcp", "args": [over_item], "env": []}
+            }))
+            .is_err()
+        );
+        assert!(
+            decode_declaration(json!({
+                "name": "server\n",
+                "transport": {"type": "stdio", "command": "mcp", "args": [], "env": []}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -976,14 +990,22 @@ mod forwarded_mcp_tests {
         });
         assert!(decode_declaration(duplicate_headers).is_err());
         let too_many_args = vec!["x"; 65];
-        assert!(decode_declaration(json!({
-            "name": "server",
-            "transport": {"type": "stdio", "command": "mcp", "args": too_many_args, "env": []}
-        })).is_err());
-        assert!(serde_json::from_str::<AcpForwardedMcpIngressV1>(r#"{
+        assert!(
+            decode_declaration(json!({
+                "name": "server",
+                "transport": {"type": "stdio", "command": "mcp", "args": too_many_args, "env": []}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<AcpForwardedMcpIngressV1>(
+                r#"{
             "version":1,"declarations":[],"client_provenance_id":"p",
             "ingress_request_id":"r","metadata":{}
-        }"#).is_err());
+        }"#
+            )
+            .is_err()
+        );
         assert!(serde_json::from_slice::<AcpForwardedMcpIngressV1>(b"\xff").is_err());
     }
 
@@ -1033,7 +1055,9 @@ mod forwarded_mcp_tests {
         declarations.push(padded_declaration("server-final", final_target));
         let exact_vector = ingress(declarations);
         assert_eq!(
-            serde_json::to_vec(&exact_vector.declarations).unwrap().len(),
+            serde_json::to_vec(&exact_vector.declarations)
+                .unwrap()
+                .len(),
             ACP_FORWARDED_MCP_VECTOR_MAX_CANONICAL_BYTES_V1
         );
         assert!(exact_vector.validate().is_ok());

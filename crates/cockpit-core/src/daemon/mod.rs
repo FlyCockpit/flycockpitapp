@@ -22,10 +22,10 @@
 //!   to the freshly spawned daemon. `cockpit daemon {start, stop,
 //!   status}` lets the user manage the lifecycle explicitly.
 
+pub(crate) mod acp_catalog_composition;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod agent_session_override;
-pub(crate) mod acp_catalog_composition;
 pub(crate) mod authority_token;
 pub mod bulk_staging;
 #[cfg(test)]

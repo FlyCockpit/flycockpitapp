@@ -6,6 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
+use crate::db::session_search::HistoryCallerTrust;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DreamSessionSource {
@@ -59,6 +60,7 @@ impl Db {
         &self,
         kb_id: &str,
         consumer_id: &str,
+        caller_trust: HistoryCallerTrust,
     ) -> Result<Vec<DreamSessionSource>> {
         validate_kb_id(kb_id)?;
         validate_consumer_id(consumer_id)?;
@@ -72,6 +74,7 @@ impl Db {
                            FROM session_events e
                            WHERE e.session_id = s.session_id
                              AND e.type = 'session_compacted'
+                             AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
                            ORDER BY e.seq DESC LIMIT 1),
                           s.title, ''),
                         s.last_active_at_unix_ms
@@ -85,14 +88,21 @@ impl Db {
                        AND d.session_id = a.session_id)
                  ORDER BY s.last_active_at_unix_ms, s.session_id",
             )?;
-            let rows = statement.query_map(params![kb_id, consumer_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?;
+            let rows = statement.query_map(
+                params![
+                    kb_id,
+                    consumer_id,
+                    caller_trust == HistoryCallerTrust::Trusted
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
             rows.map(|row| {
                 let (session_id, title, description, last_active_at_unix_ms) = row?;
                 Ok(DreamSessionSource {
@@ -194,6 +204,8 @@ fn validate_consumer_id(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::session_log::{SessionEventContext, SessionEventKind};
+    use serde_json::json;
 
     #[tokio::test]
     async fn attachment_minus_ledger_is_exact_and_idempotent() {
@@ -205,7 +217,7 @@ mod tests {
             .unwrap();
 
         let initial = db
-            .undreamed_sessions_for_knowledge_base("kb", "consumer")
+            .undreamed_sessions_for_knowledge_base("kb", "consumer", HistoryCallerTrust::Trusted)
             .await
             .unwrap();
         assert_eq!(
@@ -217,7 +229,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            db.undreamed_sessions_for_knowledge_base("kb", "consumer")
+            db.undreamed_sessions_for_knowledge_base(
+                "kb",
+                "consumer",
+                HistoryCallerTrust::Trusted,
+            )
                 .await
                 .unwrap()
                 .is_empty()
@@ -227,7 +243,7 @@ mod tests {
             .await
             .unwrap();
         let next = db
-            .undreamed_sessions_for_knowledge_base("kb", "consumer")
+            .undreamed_sessions_for_knowledge_base("kb", "consumer", HistoryCallerTrust::Trusted)
             .await
             .unwrap();
         assert_eq!(
@@ -251,5 +267,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn untrusted_dream_source_list_excludes_trusted_compaction_briefs() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/p", "Visible session title")
+            .await
+            .unwrap();
+        db.attach_session_to_knowledge_base("kb", session.session_id)
+            .await
+            .unwrap();
+        db.insert_session_event_with_context(
+            session.session_id,
+            SessionEventKind::SessionCompacted,
+            Some("Build"),
+            None,
+            SessionEventContext {
+                provider_id: Some("provider-a"),
+                model_id: Some("trusted-model"),
+                model_trust: Some("trusted"),
+                ..Default::default()
+            },
+            &json!({ "brief_text": "trusted compaction secret" }),
+        )
+        .await
+        .unwrap();
+
+        let untrusted = db
+            .undreamed_sessions_for_knowledge_base("kb", "consumer", HistoryCallerTrust::Untrusted)
+            .await
+            .unwrap();
+        assert_eq!(untrusted.len(), 1);
+        assert_eq!(untrusted[0].description, "Visible session title");
+
+        let trusted = db
+            .undreamed_sessions_for_knowledge_base("kb", "consumer", HistoryCallerTrust::Trusted)
+            .await
+            .unwrap();
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted[0].description, "trusted compaction secret");
     }
 }

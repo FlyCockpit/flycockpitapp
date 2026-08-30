@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::db::session_search::ThreadTurn;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
-use crate::tools::session_search::caller_history_trust;
+use crate::tools::session_search::{caller_history_trust, established_dream_read_scope};
 
 /// Turns per page. A thread rarely needs the whole transcript at once;
 /// the agent pages with `offset` (a `seq`) to see more.
@@ -93,8 +93,12 @@ impl Tool for SessionReadTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid_input("`short_id` is required"))?;
 
+        // Check the Dream source-list precondition before even resolving a
+        // global short id. Once established, retain the resolved ID check
+        // below so an attached scope cannot be widened by explicit UUID.
+        let dream_scope = established_dream_read_scope(ctx)?;
         let session_id = resolve_session(ctx, id_arg).await?;
-        enforce_dream_read_scope(ctx, session_id)?;
+        enforce_dream_read_scope(dream_scope.as_ref(), session_id)?;
 
         let turns = ctx
             .session
@@ -135,12 +139,11 @@ impl Tool for SessionReadTool {
     }
 }
 
-fn enforce_dream_read_scope(ctx: &ToolCtx, session_id: Uuid) -> Result<()> {
-    let guard = ctx
-        .dream_read_scope
-        .read()
-        .expect("dream read scope lock poisoned");
-    if let Some(scope) = guard.as_ref() {
+fn enforce_dream_read_scope(
+    scope: Option<&std::collections::BTreeSet<Uuid>>,
+    session_id: Uuid,
+) -> Result<()> {
+    if let Some(scope) = scope {
         ensure!(
             scope.contains(&session_id),
             "session_read denied: knowledge dreams may read only attached source sessions"

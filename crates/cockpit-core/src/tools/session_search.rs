@@ -21,6 +21,9 @@ use serde_json::Value;
 use crate::db::session_search::HistoryCallerTrust;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
+const DREAM_AGENT_ID: &str = "Dream";
+const DREAM_WORKER_AGENT_ID: &str = "dream-worker";
+
 /// Default number of threads shown; the agent can widen via `limit`.
 const DEFAULT_LIMIT: u32 = 10;
 /// Hard ceiling on `limit` so a runaway value can't dump the whole DB.
@@ -101,11 +104,7 @@ impl Tool for SessionSearchTool {
             .get("all_projects")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let dream_scope = ctx
-            .dream_read_scope
-            .read()
-            .expect("dream read scope lock poisoned")
-            .clone();
+        let dream_scope = established_dream_read_scope(ctx)?;
         ensure!(
             dream_scope.is_none() || !all_projects,
             "session_search denied: knowledge dreams may not widen attachment-scoped recall"
@@ -240,10 +239,7 @@ impl Tool for SessionLineageSearchTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         ensure!(
-            ctx.dream_read_scope
-                .read()
-                .expect("dream read scope lock poisoned")
-                .is_none(),
+            established_dream_read_scope(ctx)?.is_none(),
             "session_lineage_search denied: knowledge dreams may read only attached source sessions"
         );
         ctx.session
@@ -359,6 +355,29 @@ pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
     } else {
         HistoryCallerTrust::Untrusted
     }
+}
+
+/// Return a knowledge-dream attachment scope once it has been established.
+/// Dream's cross-session recall grants are inert until
+/// `knowledge_dream_sources` has atomically installed that scope; ordinary
+/// agents retain their normal project/global recall behavior.
+pub(crate) fn established_dream_read_scope(
+    ctx: &ToolCtx,
+) -> Result<Option<std::collections::BTreeSet<uuid::Uuid>>> {
+    let scope = ctx
+        .dream_read_scope
+        .read()
+        .expect("dream read scope lock poisoned")
+        .clone();
+    ensure!(
+        scope.is_some() || !is_dream_recall_agent(&ctx.agent_id),
+        "knowledge dream recall denied: call knowledge_dream_sources before reading source sessions"
+    );
+    Ok(scope)
+}
+
+fn is_dream_recall_agent(agent_id: &str) -> bool {
+    matches!(agent_id, DREAM_AGENT_ID | DREAM_WORKER_AGENT_ID)
 }
 
 /// `last_active_at_unix_ms` → `YYYY-MM-DD HH:MM UTC`, matching
@@ -528,5 +547,21 @@ mod tests {
         assert!(parse_since("2024-01-01").is_ok());
         assert!(parse_since("2024-01-01T12:00:00Z").is_ok());
         assert!(parse_since("not-a-date").is_err());
+    }
+
+    #[test]
+    fn dream_recall_agents_require_sources_before_cross_session_recall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.agent_id = DREAM_AGENT_ID.to_string();
+        let error = established_dream_read_scope(&ctx).unwrap_err();
+        assert!(error.to_string().contains("knowledge_dream_sources"));
+
+        *ctx.dream_read_scope.write().unwrap() = Some(std::collections::BTreeSet::new());
+        assert!(established_dream_read_scope(&ctx).unwrap().is_some());
+
+        *ctx.dream_read_scope.write().unwrap() = None;
+        ctx.agent_id = "Build".to_string();
+        assert!(established_dream_read_scope(&ctx).unwrap().is_none());
     }
 }

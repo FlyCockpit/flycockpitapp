@@ -3860,7 +3860,11 @@ impl Tool for KnowledgeDreamSourcesTool {
         let mut sources = ctx
             .session
             .db
-            .undreamed_sessions_for_knowledge_base(&knowledge_base.entry.id, consumer.as_hex())
+            .undreamed_sessions_for_knowledge_base(
+                &knowledge_base.entry.id,
+                consumer.as_hex(),
+                dream::history_caller_trust(&model, &providers),
+            )
             .await?;
         let redaction_base = ctx
             .session

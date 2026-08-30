@@ -5809,7 +5809,11 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             let undreamed_session_ids = ctx
                 .db
-                .undreamed_sessions_for_knowledge_base(&knowledge_base_id, consumer.as_hex())
+                .undreamed_sessions_for_knowledge_base(
+                    &knowledge_base_id,
+                    consumer.as_hex(),
+                    crate::knowledge::dream::history_caller_trust(&model, &providers),
+                )
                 .await
                 .map_err(internal)?
                 .into_iter()

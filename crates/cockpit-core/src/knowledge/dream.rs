@@ -23,6 +23,7 @@ use super::{
 use crate::config::extended::{ExtendedConfig, KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
 use crate::config::providers::{ModelTrust, ProvidersConfig};
 use crate::db::knowledge_dreams::DreamSessionSource;
+use crate::db::session_search::HistoryCallerTrust;
 use crate::redact::RedactionTable;
 use crate::session::Session;
 
@@ -72,6 +73,22 @@ pub struct ResolvedDreamModel {
 impl ResolvedDreamModel {
     pub fn reference(&self) -> String {
         format!("{}:{}", self.provider, self.model)
+    }
+}
+
+/// Match the existing transcript/search model-trust boundary for the source
+/// descriptions delivered by `knowledge_dream_sources`.
+pub(crate) fn history_caller_trust(
+    model: &ResolvedDreamModel,
+    providers: &ProvidersConfig,
+) -> HistoryCallerTrust {
+    if providers
+        .resolve_trust(&model.provider, &model.model)
+        .is_trusted()
+    {
+        HistoryCallerTrust::Trusted
+    } else {
+        HistoryCallerTrust::Untrusted
     }
 }
 
@@ -318,7 +335,11 @@ impl DreamEngine {
         let sources = self
             .session
             .db
-            .undreamed_sessions_for_knowledge_base(&knowledge_base.id, consumer.as_hex())
+            .undreamed_sessions_for_knowledge_base(
+                &knowledge_base.id,
+                consumer.as_hex(),
+                history_caller_trust(&model, providers),
+            )
             .await?;
         if sources.is_empty() {
             ensure!(

@@ -33212,6 +33212,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
         code_root_authority: base.code_root_authority.clone(),
+        acp_catalog_composition: base.acp_catalog_composition.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
@@ -33429,6 +33430,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
         code_root_authority: base.code_root_authority.clone(),
+        acp_catalog_composition: base.acp_catalog_composition.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),

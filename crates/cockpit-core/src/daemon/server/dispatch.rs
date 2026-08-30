@@ -5633,6 +5633,39 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::CreateCodeRootWithAcpIngressV1(request) => {
+            let service = ctx.acp_catalog_composition.as_ref().ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Unavailable,
+                message: "ACP forwarded-MCP catalog composition is not available".to_string(),
+            })?;
+            let result = service
+                .create_code_root(&state.principal, request)
+                .await?;
+            Ok(Response::CodeRootWithAcpIngressCreated(result))
+        }
+
+        Request::AttachExistingCodeRootWithAcpIngressV1(request) => {
+            let service = ctx.acp_catalog_composition.as_ref().ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Unavailable,
+                message: "ACP forwarded-MCP catalog composition is not available".to_string(),
+            })?;
+            let result = service
+                .attach_existing_code_root(&state.principal, request)
+                .await?;
+            Ok(Response::CodeRootWithAcpIngressAttached(result))
+        }
+
+        Request::CloseAcpCodeRootAttachmentV1(request) => {
+            let service = ctx.acp_catalog_composition.as_ref().ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Unavailable,
+                message: "ACP forwarded-MCP catalog composition is not available".to_string(),
+            })?;
+            let result = service
+                .close_code_root_attachment(&state.principal, request)
+                .await?;
+            Ok(Response::AcpCodeRootAttachmentClosed(result))
+        }
+
         Request::CreateCodeRootV1(request) => {
             let create_start = {
                 let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);

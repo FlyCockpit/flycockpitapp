@@ -58,6 +58,7 @@ pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
                             no_sandbox,
                             crate::cli::OutputFormat::Default,
                             crate::commands::run::RunPumpOptions {
+                                agent_override: Some("Dream"),
                                 model_override: Some(&before.model),
                                 project_root: Some(&cwd),
                                 ..Default::default()

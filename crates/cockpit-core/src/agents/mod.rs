@@ -48,7 +48,7 @@ mod vnext;
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
     BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_builtin_primary,
-    is_hidden_primary, is_removed_primary, resolve_primary,
+    is_feature_primary, is_hidden_primary, is_removed_primary, resolve_primary,
 };
 pub use invariants::validate_invariants;
 pub use profile::{

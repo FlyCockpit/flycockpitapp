@@ -131,26 +131,39 @@ impl Tool for SessionSearchTool {
         // ranking seam has room to reorder before we truncate (future
         // embedding re-ranker; identity today).
         let pool = (limit.saturating_mul(3)).clamp(limit, MAX_LIMIT * 3);
-        let mut hits = ctx
-            .session
-            .db
-            .search_candidates_for_trust(
-                query,
-                project_id,
-                Some(ctx.session.id),
-                since,
-                pool,
-                caller_history_trust(ctx),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
-        if let Some(scope) = dream_scope {
-            // Dream consent is attachment-based, not project-based. Search
-            // globally so attached sessions in other projects remain usable,
-            // then discard every non-attached result before it can contribute
-            // a title, snippet, or even a result count.
-            hits.retain(|hit| scope.contains(&hit.session_id));
+        let hits = match dream_scope.as_ref() {
+            Some(scope) => {
+                // Dream consent is attachment-based, not project-based. Make
+                // that membership predicate part of the FTS query so BM25 and
+                // pool truncation rank only attached sources.
+                let session_ids = scope.iter().copied().collect::<Vec<_>>();
+                ctx.session
+                    .db
+                    .search_candidates_in_sessions_for_trust(
+                        query,
+                        &session_ids,
+                        Some(ctx.session.id),
+                        since,
+                        pool,
+                        caller_history_trust(ctx),
+                    )
+                    .await
+            }
+            None => {
+                ctx.session
+                    .db
+                    .search_candidates_for_trust(
+                        query,
+                        project_id,
+                        Some(ctx.session.id),
+                        since,
+                        pool,
+                        caller_history_trust(ctx),
+                    )
+                    .await
+            }
         }
+        .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
 
         if hits.is_empty() {
             let scope = if dream_scope.is_some() {

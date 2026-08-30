@@ -88,6 +88,8 @@ pub(crate) const DEEPTHINK_PROMPT: &str = include_str!("deepthink.md");
 pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
 pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
 pub(crate) const MULTIREVIEW_PROMPT: &str = include_str!("multireview.md");
+pub(crate) const DREAM_PROMPT: &str = include_str!("dream.md");
+pub(crate) const DREAM_WORKER_PROMPT: &str = include_str!("dream_worker.md");
 // `bee` — `Swarm`'s recursive parallel worker (GOALS §24/§26).
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
 pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
@@ -1788,6 +1790,11 @@ pub fn load_with_tool_surface_override(
     if name == "computer" {
         return computer(args);
     }
+    if is_internal_agent_def_name(name) {
+        let def = crate::agents::embedded_internal_default(name)
+            .expect("internal agent definition exists");
+        return agent_from_def(&def, args);
+    }
 
     if let Some(mut def) = local_definition_for_spawn(name, args)? {
         return load_resolved_def(name, args, tool_surface_override, &mut def);
@@ -1840,6 +1847,11 @@ pub async fn load_with_assistant_db_and_tool_surface_override(
     }
     if name == "computer" {
         return computer(args);
+    }
+    if is_internal_agent_def_name(name) {
+        let def = crate::agents::embedded_internal_default(name)
+            .expect("internal agent definition exists");
+        return agent_from_def(&def, args);
     }
 
     if let Some(mut def) = local_definition_for_spawn(name, args)? {
@@ -1972,7 +1984,10 @@ pub(crate) fn is_docs_pipeline(name: &str) -> bool {
 }
 
 fn is_internal_agent_def_name(name: &str) -> bool {
-    matches!(name, "computer" | "docs-resolver" | "docs-answerer")
+    matches!(
+        name,
+        "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker"
+    )
 }
 
 fn internal_agent_def_uses_custom_tools(name: &str) -> bool {

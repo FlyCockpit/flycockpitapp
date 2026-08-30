@@ -10864,6 +10864,11 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        // `knowledge_dream_sources` may install attachment consent before any
+        // later fallible work. This root-turn guard is its complete lifecycle
+        // owner, so source-only, refusal, timeout, cancellation, and ordinary
+        // error exits cannot fence a reusable session's later turns.
+        let _dream_read_scope_turn = self.session.begin_dream_read_scope_turn();
         if matches!(
             submission.pending_terminal_disposition,
             Some(crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments)

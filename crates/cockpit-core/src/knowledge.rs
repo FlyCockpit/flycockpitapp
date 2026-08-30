@@ -3747,7 +3747,10 @@ pub(crate) async fn with_memory_search_if_attached(
                         )
                 })
             });
-    if dream_writes_enabled {
+    // Dream tools are a capability boundary, not a prompt convention. They
+    // are exposed only to the fixed internal Dream root; the orchestrator and
+    // its one worker layer receive no filesystem, shell, MCP, or Git tool.
+    if dream_writes_enabled && definition.is_some_and(|definition| definition.name == "Dream") {
         toolbox
             .with(Arc::new(KnowledgeDreamSourcesTool {
                 allowed_knowledge_bases: allowed_knowledge_bases.clone(),
@@ -3859,15 +3862,6 @@ impl Tool for KnowledgeDreamSourcesTool {
             .db
             .undreamed_sessions_for_knowledge_base(&knowledge_base.entry.id, consumer.as_hex())
             .await?;
-        {
-            let scoped_ids = sources
-                .iter()
-                .map(|source| source.session_id)
-                .collect::<BTreeSet<_>>();
-            *ctx.dream_read_scope
-                .write()
-                .expect("dream read scope lock poisoned") = Some(scoped_ids);
-        }
         let redaction_base = ctx
             .session
             .with_machine_scoped_sealed_redactions(&ctx.redact)
@@ -3879,6 +3873,13 @@ impl Tool for KnowledgeDreamSourcesTool {
             source.title = source.title.take().map(|title| target_union.scrub(&title));
             source.description = target_union.scrub(&source.description);
         }
+        // Install consent only after every fallible source/redaction step has
+        // completed. There is no await below this point, so an abandon-safe
+        // dispatcher timeout cannot leave a partially established scope.
+        let scoped_ids = sources
+            .iter()
+            .map(|source| source.session_id)
+            .collect::<BTreeSet<_>>();
         let presentation = sources
             .into_iter()
             .map(|source| {
@@ -3890,9 +3891,11 @@ impl Tool for KnowledgeDreamSourcesTool {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(ToolOutput::text(serde_json::to_string_pretty(
-            &presentation,
-        )?))
+        let output = serde_json::to_string_pretty(&presentation)?;
+        *ctx.dream_read_scope
+            .write()
+            .expect("dream read scope lock poisoned") = Some(scoped_ids);
+        Ok(ToolOutput::text(output))
     }
 }
 
@@ -4022,7 +4025,6 @@ impl Tool for KnowledgeDreamApplyTool {
         let engine = dream::DreamEngine::new(ctx.session.clone());
         let executing_model = self.executing_model.clone();
         let reader_redaction = ctx.redact.clone();
-        let dream_read_scope = ctx.dream_read_scope.clone();
         // A dispatcher timeout drops this tool future.  The provider write
         // itself is blocking and cannot be cancelled by that drop, so the
         // operation which owns the per-KB guard must outlive the caller too:
@@ -4031,7 +4033,6 @@ impl Tool for KnowledgeDreamApplyTool {
         // handle deliberately detaches this task; it keeps the guard, sink
         // transaction, and completion-ledger continuation together.
         let apply = tokio::spawn(async move {
-            let _clear_dream_scope = DreamReadScopeReset(dream_read_scope);
             engine
                 .apply_orchestrated_change_set(
                     &entry,
@@ -4055,16 +4056,6 @@ impl Tool for KnowledgeDreamApplyTool {
 struct DreamWriteCancellation {
     cancel: CancellationToken,
     shutdown_watcher: tokio::task::JoinHandle<()>,
-}
-
-/// Clears ephemeral attachment consent when the task that owns the matching
-/// dream attempt exits, including cancellation and panic unwinds.
-struct DreamReadScopeReset(Arc<std::sync::RwLock<Option<BTreeSet<uuid::Uuid>>>>);
-
-impl Drop for DreamReadScopeReset {
-    fn drop(&mut self) {
-        *self.0.write().expect("dream read scope lock poisoned") = None;
-    }
 }
 
 impl Drop for DreamWriteCancellation {
@@ -5376,7 +5367,26 @@ timestamp: 2026-08-29T12:00:00Z
         .await;
         let attached = attached_toolbox.names();
         assert!(attached.contains(&"memory_search"));
-        assert!(attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME));
+        assert!(
+            !attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME),
+            "ordinary agents must not receive governed dream write tools"
+        );
+        let dream_definition =
+            crate::agents::embedded_internal_default("Dream").expect("Dream internal definition");
+        let dream_toolbox = with_memory_search_if_attached(
+            crate::engine::tool::ToolBox::new(),
+            &session,
+            tmp.path(),
+            Some(&dream_definition),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            "openai:gpt-5",
+        )
+        .await;
+        assert!(
+            dream_toolbox
+                .names()
+                .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
+        );
         let mismatched_toolbox = with_memory_search_if_attached(
             crate::engine::tool::ToolBox::new(),
             &session,

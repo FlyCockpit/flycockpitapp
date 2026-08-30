@@ -248,6 +248,8 @@ fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
 /// uses a named kernel mutex derived from the canonical pathname.
 struct SidecarProcessLock {
     directory: fs::File,
+    root: PathBuf,
+    root_identity: String,
     #[cfg(unix)]
     fence: fs::File,
     #[cfg(windows)]
@@ -259,13 +261,17 @@ struct SidecarProcessLock {
 impl SidecarProcessLock {
     #[cfg(unix)]
     fn try_acquire(sidecars: &KbSidecars) -> Result<Option<Self>> {
-        let directory = cockpit_config::config::open_config_directory_nofollow(sidecars.root())
+        let authority = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(sidecars.root())
             .with_context(|| {
                 format!(
                     "retaining knowledge base directory for process lock {}",
                     sidecars.root().display()
                 )
             })?;
+        let root_identity = authority.identity().to_string();
+        let directory = authority
+            .retained_directory_handle()
+            .context("cloning retained knowledge base directory")?;
         let lock_dir =
             cockpit_config::config::resolve::cockpit_state_dir()?.join("knowledge-sidecar-locks");
         cockpit_host::private_fs::ensure_private_dir(&lock_dir)
@@ -290,7 +296,12 @@ impl SidecarProcessLock {
         .map_err(anyhow::Error::from)
         .context("opening stable knowledge sidecar process lock")?;
         match try_lock_sidecar_fence(&fence)? {
-            true => Ok(Some(Self { directory, fence })),
+            true => Ok(Some(Self {
+                directory,
+                root: sidecars.root().to_path_buf(),
+                root_identity,
+                fence,
+            })),
             false => Ok(None),
         }
     }
@@ -355,6 +366,8 @@ impl SidecarProcessLock {
                     .context("cloning retained knowledge base directory")?;
                 Ok(Some(Self {
                     directory,
+                    root: sidecars.root().to_path_buf(),
+                    root_identity: authority.identity().to_string(),
                     _directory_lease: directory_lease,
                     mutex,
                 }))
@@ -373,6 +386,37 @@ impl SidecarProcessLock {
     /// directory rather than reopen its diagnostic path spelling.
     fn directory(&self) -> &fs::File {
         &self.directory
+    }
+
+    fn revalidate_root(&self) -> Result<()> {
+        let current = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(&self.root)
+            .with_context(|| {
+                format!(
+                    "reopening knowledge base root selected by process lock {}",
+                    self.root.display()
+                )
+            })?;
+        if current.identity() != self.root_identity {
+            bail!(
+                "knowledge base root changed while its process lock was held; refusing to mutate a replacement"
+            );
+        }
+        Ok(())
+    }
+
+    /// A mutation path bound to the retained directory object.
+    #[cfg(target_os = "linux")]
+    fn mutation_root(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+
+        PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
+    /// Windows keeps a no-delete lease; other targets revalidate before each
+    /// pathname-consuming write boundary.
+    #[cfg(not(target_os = "linux"))]
+    fn mutation_root(&self) -> PathBuf {
+        self.root.clone()
     }
 }
 
@@ -645,9 +689,10 @@ fn acquire_knowledge_write_process_lock(root: &Path) -> Result<SidecarProcessLoc
 
 /// Apply a dream's OKF mutation inside the KB's Git transaction boundary.
 ///
-/// Git is intentionally best-effort.  If it is absent or a remote cannot be
-/// synchronized safely, `apply` still runs and the caller receives a status
-/// explaining why history was skipped or deferred.  We never force-push.
+/// Git is intentionally best-effort only when it is unavailable. A Git
+/// repository that cannot be prepared safely defers *before* model output so
+/// the ledger can rerun the dream against a clean worktree. We never
+/// force-push.
 pub fn apply_knowledge_dream<F>(
     root: &Path,
     merge_policy: KnowledgeBaseMergePolicy,
@@ -655,37 +700,38 @@ pub fn apply_knowledge_dream<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce(&Path) -> Result<()>,
 {
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
-    // Do not perform Git setup or a model write under a process-local mutex:
-    // separate daemons must serialize this transaction too. If the private
-    // fence cannot be established, the write still proceeds but Git history
-    // is explicitly deferred rather than racing another daemon.
-    let process_lock = acquire_knowledge_write_process_lock(root);
-    let prepared = match &process_lock {
-        Ok(_) => prepare_knowledge_git(root, merge_policy, &dream.knowledge_base_id),
-        Err(error) => PreparedKnowledgeGit::Deferred(format!(
-            "acquiring the knowledge Git transaction lock failed: {error}"
-        )),
-    };
+    // The model mutation itself is fenced, not just Git. Losing the private
+    // process fence is a hard error because otherwise two daemons can write
+    // the same OKF files concurrently.
+    let process_lock = acquire_knowledge_write_process_lock(root)?;
+    process_lock.revalidate_root()?;
+    let mutation_root = process_lock.mutation_root();
+    let prepared = prepare_knowledge_git(&mutation_root, merge_policy, &dream.knowledge_base_id);
+
+    if let PreparedKnowledgeGit::Deferred(reason) = &prepared {
+        return Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: None,
+            commit: None,
+            reason: reason.clone(),
+        });
+    }
 
     let before_paths = match &prepared {
-        PreparedKnowledgeGit::Active { .. } => match versioned_knowledge_paths(root) {
+        PreparedKnowledgeGit::Active { .. } => match versioned_knowledge_paths(&mutation_root) {
             Ok(paths) => Some(paths),
             Err(error) => {
                 // Parsing the pre-write bundle is required to record deletions
-                // without guessing at arbitrary worktree files.
-                let applied = apply();
                 if let PreparedKnowledgeGit::Active {
                     restore_branch: Some(restore_branch),
                     ..
                 } = &prepared
                 {
-                    let _ = restore_knowledge_branch(root, restore_branch);
+                    let _ = restore_knowledge_branch(&mutation_root, restore_branch);
                 }
-                applied?;
                 return Ok(KnowledgeDreamGitOutcome::Deferred {
                     branch: None,
                     commit: None,
@@ -693,12 +739,14 @@ where
                 });
             }
         },
-        _ => None,
+        PreparedKnowledgeGit::Skipped(_) => None,
+        PreparedKnowledgeGit::Deferred(_) => unreachable!("deferred preparation returned early"),
     };
 
-    // The model write is the authority.  Git setup/synchronization failures
-    // must not turn an otherwise usable local KB into a read-only feature.
-    let applied = apply();
+    // The supplied path is descriptor-bound on Linux and has been proven to
+    // name the held root everywhere else. Callers must write only through it.
+    process_lock.revalidate_root()?;
+    let applied = apply(&mutation_root);
     if let Err(error) = applied {
         if let PreparedKnowledgeGit::Active {
             restore_branch: Some(restore_branch),
@@ -709,7 +757,7 @@ where
             // Best-effort restoration preserves the accepted branch whenever
             // Git can safely switch back; an uncommitted failed write remains
             // visible as dirty state and prevents a later dream from taking it.
-            let _ = restore_knowledge_branch(root, restore_branch);
+            let _ = restore_knowledge_branch(&mutation_root, restore_branch);
         }
         return Err(error);
     }
@@ -727,7 +775,7 @@ where
             restore_branch,
         } => {
             let outcome = match commit_knowledge_dream(
-                root,
+                &mutation_root,
                 &branch,
                 remote.as_deref(),
                 dream,
@@ -743,7 +791,7 @@ where
                 }),
             };
             if let Some(restore_branch) = restore_branch
-                && let Err(error) = restore_knowledge_branch(root, &restore_branch)
+                && let Err(error) = restore_knowledge_branch(&mutation_root, &restore_branch)
             {
                 let commit = outcome
                     .as_ref()
@@ -987,6 +1035,12 @@ fn commit_knowledge_dream(
 
     let message = structured_dream_commit_message(dream);
     let mut commit_args = vec![
+        "-c".to_string(),
+        "user.name=Flycockpit".to_string(),
+        "-c".to_string(),
+        "user.email=knowledge@flycockpit.invalid".to_string(),
+        "-c".to_string(),
+        "commit.gpgSign=false".to_string(),
         "commit".to_string(),
         "--only".to_string(),
         "-m".to_string(),
@@ -4536,16 +4590,15 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[test]
-    fn local_knowledge_dreams_commit_structured_history_by_concept_file() {
+    fn unconfigured_local_knowledge_dreams_commit_structured_history_by_concept_file() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
         let first = apply_knowledge_dream(
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                configure_knowledge_git(tmp.path());
-                write_dream_concept(tmp.path(), "first-concept", "First dream output.");
+            |root| {
+                write_dream_concept(root, "first-concept", "First dream output.");
                 Ok(())
             },
         )
@@ -4559,8 +4612,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                write_dream_concept(tmp.path(), "second-concept", "Second dream output.");
+            |root| {
+                write_dream_concept(root, "second-concept", "Second dream output.");
                 Ok(())
             },
         )
@@ -4575,6 +4628,9 @@ timestamp: 2026-08-29T12:00:00Z
                 "dream(kb=personal): sessions=2 model=openai:gpt-5 concepts=1 data_files=0"
             )
         );
+        let author =
+            crate::git::run_git_checked(tmp.path(), &["log", "-1", "--format=%an <%ae>"]).unwrap();
+        assert_eq!(author.trim(), "Flycockpit <knowledge@flycockpit.invalid>");
         assert!(tmp.path().join("first-concept.md").is_file());
         assert!(tmp.path().join("second-concept.md").is_file());
     }
@@ -4610,8 +4666,8 @@ timestamp: 2026-08-29T12:00:00Z
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            || {
-                write_dream_concept(&root, "local-concept", "Local dream output.");
+            |root| {
+                write_dream_concept(root, "local-concept", "Local dream output.");
 
                 // This commit lands after the writer's pre-apply fetch, so
                 // the first push is rejected. The Git transaction must fetch,
@@ -4646,6 +4702,84 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[test]
+    fn rebase_conflict_defers_the_next_dream_before_it_mutates() {
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("knowledge-remote.git");
+        let remote_arg = remote.to_string_lossy().into_owned();
+        crate::git::run_git_checked(tmp.path(), &["init", "-q", "--bare", &remote_arg]).unwrap();
+
+        let seed = tmp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        write_bundle(&seed);
+        crate::git::run_git_checked(&seed, &["init", "-q"]).unwrap();
+        configure_knowledge_git(&seed);
+        crate::git::run_git_checked(&seed, &["add", "--all"]).unwrap();
+        crate::git::run_git_checked(&seed, &["commit", "-q", "-m", "seed"]).unwrap();
+        crate::git::run_git_checked(&seed, &["branch", "-M", "main"]).unwrap();
+        crate::git::run_git_checked(&seed, &["remote", "add", "origin", &remote_arg]).unwrap();
+        crate::git::run_git_checked(&seed, &["push", "-q", "origin", "main"]).unwrap();
+
+        let root = tmp.path().join("writer");
+        let root_arg = root.to_string_lossy().into_owned();
+        crate::git::run_git_checked(
+            tmp.path(),
+            &["clone", "-q", "--branch", "main", &remote_arg, &root_arg],
+        )
+        .unwrap();
+
+        let first = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            |root| {
+                write_dream_concept(root, "deploy", "Local conflicting dream output.");
+
+                let other = tmp.path().join("other-writer");
+                let other_arg = other.to_string_lossy().into_owned();
+                crate::git::run_git_checked(
+                    tmp.path(),
+                    &["clone", "-q", "--branch", "main", &remote_arg, &other_arg],
+                )
+                .unwrap();
+                configure_knowledge_git(&other);
+                write_dream_concept(&other, "deploy", "Remote conflicting dream output.");
+                crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
+                crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote conflict"])
+                    .unwrap();
+                crate::git::run_git_checked(&other, &["push", "-q", "origin", "main"]).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(first, KnowledgeDreamGitOutcome::Deferred { .. }));
+        assert!(
+            crate::git::run_git_checked(&root, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "the rejected-push rebase must abort to a clean worktree"
+        );
+
+        let second = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            |root| {
+                write_dream_concept(root, "must-not-apply", "Deferred re-entry output.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(second, KnowledgeDreamGitOutcome::Deferred { .. }));
+        assert!(!root.join("must-not-apply.md").exists());
+        assert!(
+            crate::git::run_git_checked(&root, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "a deferred re-entry must preserve the clean local commit"
+        );
+    }
+
+    #[test]
     fn review_knowledge_dream_commits_on_a_dedicated_branch() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
@@ -4653,9 +4787,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            || {
-                configure_knowledge_git(tmp.path());
-                write_dream_concept(tmp.path(), "review-concept", "Needs human review.");
+            |root| {
+                write_dream_concept(root, "review-concept", "Needs human review.");
                 Ok(())
             },
         )
@@ -4680,9 +4813,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            || {
-                configure_knowledge_git(tmp.path());
-                write_dream_concept(tmp.path(), "review-only", "Pending review.");
+            |root| {
+                write_dream_concept(root, "review-only", "Pending review.");
                 Ok(())
             },
         )
@@ -4699,8 +4831,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("team"),
-            || {
-                write_dream_concept(tmp.path(), "accepted-base", "Accepted-base dream.");
+            |root| {
+                write_dream_concept(root, "accepted-base", "Accepted-base dream.");
                 Ok(())
             },
         )
@@ -4728,9 +4860,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                configure_knowledge_git(tmp.path());
-                write_dream_concept(tmp.path(), "obsolete", "To be removed.");
+            |root| {
+                write_dream_concept(root, "obsolete", "To be removed.");
                 Ok(())
             },
         )
@@ -4740,8 +4871,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                fs::remove_file(tmp.path().join("obsolete.md")).unwrap();
+            |root| {
+                fs::remove_file(root.join("obsolete.md")).unwrap();
                 Ok(())
             },
         )
@@ -4759,16 +4890,15 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[test]
-    fn local_manual_edits_are_not_committed_as_a_later_dream() {
+    fn local_manual_edits_defer_a_later_dream_before_it_mutates() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
         apply_knowledge_dream(
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                configure_knowledge_git(tmp.path());
-                write_dream_concept(tmp.path(), "first", "First dream.");
+            |root| {
+                write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
         )
@@ -4779,8 +4909,8 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                write_dream_concept(tmp.path(), "must-not-commit", "Deferred dream.");
+            |root| {
+                write_dream_concept(root, "must-not-commit", "Deferred dream.");
                 Ok(())
             },
         )
@@ -4791,7 +4921,7 @@ timestamp: 2026-08-29T12:00:00Z
         assert!(history.contains("dream(kb=personal)"));
         let status = crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"]).unwrap();
         assert!(status.contains("manual.md"));
-        assert!(status.contains("must-not-commit.md"));
+        assert!(!tmp.path().join("must-not-commit.md").exists());
     }
 
     #[test]
@@ -4807,9 +4937,8 @@ timestamp: 2026-08-29T12:00:00Z
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("project"),
-            || {
-                configure_knowledge_git(&root);
-                write_dream_concept(&root, "isolated", "KB-only history.");
+            |root| {
+                write_dream_concept(root, "isolated", "KB-only history.");
                 Ok(())
             },
         )
@@ -4837,17 +4966,16 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            || {
-                configure_knowledge_git(tmp.path());
+            |root| {
                 for name in KB_MACHINE_STATE_GITIGNORE {
-                    let path = tmp.path().join(name.trim_end_matches('/'));
+                    let path = root.join(name.trim_end_matches('/'));
                     if name.ends_with('/') {
                         fs::create_dir_all(path).unwrap();
                     } else {
                         fs::write(path, "local only").unwrap();
                     }
                 }
-                write_dream_concept(tmp.path(), "ignored-state", "State is private.");
+                write_dream_concept(root, "ignored-state", "State is private.");
                 Ok(())
             },
         )

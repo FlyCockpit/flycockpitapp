@@ -1036,43 +1036,11 @@ impl SessionRegistry {
                 && matches!(&job.payload, crate::daemon::proto::ScheduledJobPayload::Callback { subsystem } if subsystem == "keep_warm"),
             "keep-warm callback has invalid daemon ownership"
         );
-        let mut parts = job.id.split('.');
-        anyhow::ensure!(
-            parts.next() == Some("keep-warm"),
-            "keep-warm callback has an invalid job id"
-        );
-        let session_id = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a session id"))?
-            .parse::<uuid::Uuid>()?;
-        let cache_send_at_unix_millis = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a cache-send time"))?
-            .parse::<i64>()?;
-        let cache_send_id = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a cache-send identity"))?
-            .parse::<uuid::Uuid>()?;
-        let after_secs = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a delay"))?
-            .parse::<u64>()?;
-        let idle_window_secs = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing an idle window"))?
-            .parse::<u64>()?;
-        let _nonce = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a nonce"))?
-            .parse::<uuid::Uuid>()?;
-        anyhow::ensure!(
-            parts.next().is_none(),
-            "keep-warm callback job id has extra fields"
-        );
+        let keep_warm_job = crate::keep_warm::parse_job_id(&job.id)?;
 
         let handle = self
             .attach_existing(
-                session_id,
+                keep_warm_job.session_id,
                 None,
                 false,
                 None,
@@ -1089,10 +1057,10 @@ impl SessionRegistry {
         let (respond_to, response) = tokio::sync::oneshot::channel();
         handle
             .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
-                cache_send_at_unix_millis,
-                cache_send_id,
-                after_secs,
-                idle_window_secs,
+                cache_send_at_unix_millis: keep_warm_job.cache_send_identity.unix_millis,
+                cache_send_id: keep_warm_job.cache_send_identity.send_id,
+                after_secs: keep_warm_job.after_secs,
+                idle_window_secs: keep_warm_job.idle_window_secs,
                 cancel,
                 respond_to,
             })

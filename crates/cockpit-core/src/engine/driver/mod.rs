@@ -1218,6 +1218,11 @@ pub struct Driver {
     shadow_brief_generation: u64,
     /// One one-shot keep-warm may be armed for each accepted user idle window.
     keep_warm_armed_for_idle_window: bool,
+    /// Test-only elapsed preparation injected after the fixed keep-warm
+    /// deadline is captured. This makes the deadline fence observable without
+    /// making production dispatch yield during prompt preparation.
+    #[cfg(test)]
+    keep_warm_pre_dispatch_delay: Option<Duration>,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
     goal_progress_last_seq: i64,
@@ -2243,6 +2248,8 @@ impl Driver {
             shadow_brief: None,
             shadow_brief_generation: 0,
             keep_warm_armed_for_idle_window: false,
+            #[cfg(test)]
+            keep_warm_pre_dispatch_delay: None,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
@@ -2612,6 +2619,8 @@ impl Driver {
             shadow_brief: None,
             shadow_brief_generation: 0,
             keep_warm_armed_for_idle_window: false,
+            #[cfg(test)]
+            keep_warm_pre_dispatch_delay: None,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
@@ -9460,14 +9469,11 @@ impl Driver {
                     return;
                 };
                 let job = crate::daemon::proto::ScheduledJobCreate {
-                    id: format!(
-                        "keep-warm.{}.{}.{}.{}.{}.{}",
-                        self.session.id.simple(),
-                        cache_send_identity.unix_millis,
-                        cache_send_identity.send_id,
+                    id: crate::keep_warm::format_job_id(
+                        self.session.id,
+                        cache_send_identity,
                         schedule.after_secs,
                         schedule.idle_window_secs,
-                        uuid::Uuid::new_v4(),
                     ),
                     owner: "system:keep_warm".to_string(),
                     schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
@@ -9539,11 +9545,12 @@ impl Driver {
         if elapsed < original_delay {
             return Ok("skipped: before keep-warm deadline".to_string());
         }
-        let Some((last_send_identity, last_send_elapsed)) =
-            self.session.last_send_identity_and_elapsed()
+        let Some((last_send_identity, last_send_origin)) =
+            self.session.last_send_identity_and_origin()
         else {
             return Ok("skipped: cache-producing send unavailable".to_string());
         };
+        let last_send_elapsed = last_send_origin.elapsed();
         if last_send_identity != cache_send_identity || last_send_elapsed < original_delay {
             return Ok("skipped: newer session activity".to_string());
         }
@@ -9559,6 +9566,40 @@ impl Driver {
         if elapsed >= live_idle_window || last_send_elapsed >= idle_window {
             return Ok("skipped: idle window elapsed".to_string());
         }
+
+        // Refresh the identity guard after synchronous endpoint/config work,
+        // but derive the deadline from the Session's original monotonic send
+        // origin. Reconstructing it as `Instant::now() + remaining` leaves a
+        // sampling gap in which preparation can extend the idle window.
+        let elapsed = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(cache_send_identity.unix_millis)
+            .max(0) as u64;
+        let elapsed = std::time::Duration::from_millis(elapsed);
+        let Some((last_send_identity, last_send_origin)) =
+            self.session.last_send_identity_and_origin()
+        else {
+            return Ok("skipped: cache-producing send unavailable".to_string());
+        };
+        let last_send_elapsed = last_send_origin.elapsed();
+        if last_send_identity != cache_send_identity || last_send_elapsed < original_delay {
+            return Ok("skipped: newer session activity".to_string());
+        }
+        if elapsed >= original_idle_window || last_send_elapsed >= idle_window {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
+        let Some(idle_deadline_at) = keep_warm_idle_deadline(last_send_origin, idle_window) else {
+            // Configuration accepts the full `u64` seconds domain. A window
+            // too distant for the platform's monotonic instant must not turn
+            // a best-effort refresh into a daemon panic or an unbounded send.
+            return Ok("skipped: idle window elapsed".to_string());
+        };
+
+        #[cfg(test)]
+        if let Some(delay) = self.keep_warm_pre_dispatch_delay {
+            tokio::time::sleep(delay).await;
+        }
+
         let decision = crate::keep_warm::decide(
             context.keep_warm,
             context.idle_window_secs,
@@ -9592,10 +9633,7 @@ impl Driver {
         // This is a hard execution fence, not just a pre-dispatch check. The
         // provider receives `cancel`, so winning either deadline branch drops
         // the in-flight future and aborts its request/stream immediately.
-        let remaining_idle_window = idle_window
-            .checked_sub(last_send_elapsed)
-            .expect("idle window was checked before keep-warm dispatch");
-        let refresh = model.complete_captured(
+        let refresh = model.complete_captured_with_dispatch_deadline(
             &system,
             &history,
             Message::user("Respond only with OK."),
@@ -9605,9 +9643,10 @@ impl Driver {
             None,
             &cancel,
             None,
+            idle_deadline_at,
         );
         tokio::pin!(refresh);
-        let idle_deadline = tokio::time::sleep(remaining_idle_window);
+        let idle_deadline = tokio::time::sleep_until(idle_deadline_at);
         tokio::pin!(idle_deadline);
         let utility_deadline =
             tokio::time::sleep(crate::engine::model::UtilityCallSite::KeepWarm.timeout());
@@ -14793,6 +14832,15 @@ pub(crate) async fn restore_retained_turn_media_authority(session: &Session) {
     };
     let authority = runtime.authority_for_retained_turn(session).await;
     session.set_tool_media_authority(authority);
+}
+
+/// Build the absolute keep-warm idle fence without assuming every valid
+/// duration can be represented by the platform's monotonic instant.
+fn keep_warm_idle_deadline(
+    origin: std::time::Instant,
+    idle_window: std::time::Duration,
+) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::from_std(origin).checked_add(idle_window)
 }
 
 fn driver_spawn_media_availability(

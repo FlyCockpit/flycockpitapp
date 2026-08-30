@@ -1,6 +1,7 @@
 use super::*;
 use futures::StreamExt;
 use rig::completion::{CompletionModel, CompletionRequestBuilder};
+use std::future::Future;
 
 fn configured_completion_request<M: CompletionModel + Clone>(
     model: M,
@@ -476,6 +477,44 @@ impl Model {
         .await
     }
 
+    /// Keep-warm's idle deadline is an execution fence, not merely a caller
+    /// timeout. It follows every retry to the point where `stream()` may put
+    /// bytes on the wire.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_captured_with_dispatch_deadline(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        dispatch_deadline: tokio::time::Instant,
+    ) -> Result<(
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_captured_with_pre_drain_mode(
+            system,
+            history,
+            prompt,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            None,
+            false,
+            Some(dispatch_deadline),
+        )
+        .await
+    }
+
     /// Compact-utility dispatch: one transport attempt, no probe/backoff or
     /// endpoint swap, and TTFT/idle deadlines are terminal even without a
     /// configured backup. The compaction sampler exclusively owns retries.
@@ -498,6 +537,7 @@ impl Model {
         params.detach_inherited_native_computer();
         self.complete_captured_with_pre_drain_mode(
             system, history, prompt, tools, params, agent_name, None, cancel, None, None, true,
+            None,
         )
         .await
     }
@@ -532,6 +572,7 @@ impl Model {
             endpoint_recovery,
             pre_drain,
             false,
+            None,
         )
         .await
     }
@@ -550,6 +591,7 @@ impl Model {
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
         compact_utility: bool,
+        dispatch_deadline: Option<tokio::time::Instant>,
     ) -> Result<(
         (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
@@ -568,7 +610,7 @@ impl Model {
             // table (generic). Sealed-marker derivation is done in the turn.
             None,
         )?;
-        self.complete_prepared_with_pre_drain(
+        self.complete_prepared_with_pre_drain_and_dispatch_deadline(
             prepared,
             tools,
             params,
@@ -579,6 +621,7 @@ impl Model {
             pre_drain,
             compact_utility,
             None,
+            dispatch_deadline,
         )
         .await
     }
@@ -611,6 +654,41 @@ impl Model {
         pre_drain: Option<PreDrainFuture>,
         compact_utility: bool,
         display: Option<crate::engine::model::DisplayAttemptSlot>,
+    ) -> Result<(
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_prepared_with_pre_drain_and_dispatch_deadline(
+            prepared,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            pre_drain,
+            compact_utility,
+            display,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_prepared_with_pre_drain_and_dispatch_deadline(
+        &self,
+        prepared: PreparedCompletionRequest,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        pre_drain: Option<PreDrainFuture>,
+        compact_utility: bool,
+        display: Option<crate::engine::model::DisplayAttemptSlot>,
+        dispatch_deadline: Option<tokio::time::Instant>,
     ) -> Result<(
         (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
@@ -795,6 +873,7 @@ impl Model {
                                     &output_sent,
                                     pre_drain.clone(),
                                     display.as_ref(),
+                                    dispatch_deadline,
                                 )
                                 .await
                             }
@@ -826,6 +905,7 @@ impl Model {
                                     &output_sent,
                                     pre_drain.clone(),
                                     display.as_ref(),
+                                    dispatch_deadline,
                                 )
                                 .await
                             }
@@ -1033,6 +1113,7 @@ impl Model {
                         &output_sent,
                         pre_drain.clone(),
                         display.as_ref(),
+                        dispatch_deadline,
                     )
                     .await
                 };
@@ -1098,6 +1179,7 @@ impl Model {
                         &output_sent,
                         pre_drain.clone(),
                         display.as_ref(),
+                        dispatch_deadline,
                     )
                     .await
                 };
@@ -2128,6 +2210,43 @@ impl std::fmt::Debug for TandemOutcome {
 /// timeout sentinel for backup fallback. `phase` is bumped to the furthest
 /// lifecycle stage reached so cancellation or a terminal provider error still
 /// records exactly where it stopped.
+/// Race the irreversible stream handoff against an optional execution fence.
+/// `dispatch` is not even constructed until the synchronous fence check has
+/// passed; rig can put request bytes on the wire during its first poll.
+async fn dispatch_stream_before_deadline<T, F, R>(
+    deadline: Option<tokio::time::Instant>,
+    cancel: &CancellationToken,
+    dispatch: F,
+) -> Result<T, rig::completion::CompletionError>
+where
+    F: FnOnce() -> R,
+    R: Future<Output = Result<T, rig::completion::CompletionError>>,
+{
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        cancel.cancel();
+        return Err(attempt_cancelled());
+    }
+    let dispatch = dispatch();
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    cancel.cancel();
+                    Err(attempt_cancelled())
+                }
+                _ = cancel.cancelled() => Err(attempt_cancelled()),
+                result = dispatch => result,
+            }
+        }
+        None => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(attempt_cancelled()),
+            result = dispatch => result,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_completion_stream<M>(
     request: CompletionRequestBuilder<M>,
@@ -2144,6 +2263,7 @@ pub(super) async fn drain_completion_stream<M>(
     output_sent: &std::sync::atomic::AtomicBool,
     pre_drain: Option<PreDrainFuture>,
     display: Option<&crate::engine::model::DisplayAttemptSlot>,
+    dispatch_deadline: Option<tokio::time::Instant>,
 ) -> Result<CompleteOut, rig::completion::CompletionError>
 where
     M: rig::completion::CompletionModel,
@@ -2167,12 +2287,9 @@ where
     if !crate::engine::agent::current_agent_tree_steer_dispatch_permit_is_current().await {
         return Err(attempt_late_user_steer_deferred());
     }
+    let mut stream =
+        dispatch_stream_before_deadline(dispatch_deadline, cancel, || request.stream()).await?;
     bump_phase(phase, InferencePhase::Dispatched);
-    let mut stream = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(attempt_cancelled()),
-        built = request.stream() => built?,
-    };
     await_pre_drain_record(pre_drain).await?;
     // Successful-attempt dispatch boundary: construct the display classifier
     // now that the stream is live, before any chunk is drained.
@@ -2475,6 +2592,36 @@ where
 #[cfg(test)]
 mod redact_debug_tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[tokio::test]
+    async fn expired_dispatch_deadline_wins_before_stream_handoff() {
+        let cancel = CancellationToken::new();
+        let polled = Rc::new(Cell::new(false));
+        let observed = polled.clone();
+        let result = dispatch_stream_before_deadline(
+            Some(tokio::time::Instant::now() - std::time::Duration::from_secs(1)),
+            &cancel,
+            move || {
+                futures::future::poll_fn(move |_| {
+                    observed.set(true);
+                    std::task::Poll::Ready(Ok(()))
+                })
+            },
+        )
+        .await;
+
+        assert!(result.is_err(), "expired fence must reject the handoff");
+        assert!(
+            cancel.is_cancelled(),
+            "fence uses normal cancellation semantics"
+        );
+        assert!(
+            !polled.get(),
+            "the stream future must not be polled after an expired dispatch fence"
+        );
+    }
 
     #[test]
     fn tandem_outcome_debug_redacts_request_and_response() {

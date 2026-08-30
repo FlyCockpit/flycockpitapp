@@ -20,7 +20,9 @@ use crate::daemon::proto::{
 use crate::daemon::registry::SessionRegistry;
 use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
-use crate::db::scheduler::{NewScheduledJobRow, ScheduledJobRow, ScheduledJobRunUpdate};
+use crate::db::scheduler::{
+    ConditionalScheduledJob, NewScheduledJobRow, ScheduledJobRow, ScheduledJobRunUpdate,
+};
 use cockpit_host::jitter::{JitterSource, SystemJitter};
 
 const MAX_FAILURES: u32 = 5;
@@ -62,6 +64,8 @@ impl CallbackRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledJob {
     pub id: String,
+    /// Internal insertion fence carried through asynchronous execution.
+    pub(crate) row_identity: String,
     pub owner: String,
     pub schedule: ScheduledJobSchedule,
     pub payload: ScheduledJobPayload,
@@ -139,7 +143,7 @@ pub struct DaemonSchedulerHandle {
 }
 
 impl DaemonSchedulerHandle {
-    pub fn scheduler(&self) -> &Arc<DaemonScheduler> {
+    pub(crate) fn scheduler(&self) -> &Arc<DaemonScheduler> {
         &self.scheduler
     }
 
@@ -172,6 +176,7 @@ impl DaemonSchedulerHandle {
     }
 
     pub async fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
+        validate_public_job_create(&job)?;
         let summary = self.scheduler.create_job(job).await?;
         self.wake();
         Ok(summary)
@@ -191,15 +196,39 @@ impl DaemonSchedulerHandle {
             job.owner == format!("system:{subsystem}"),
             "internal callback owner mismatch"
         );
-        self.create_job(job).await
+        let summary = self.scheduler.create_job(job).await?;
+        self.wake();
+        Ok(summary)
     }
 
+    /// List only client-visible jobs. System callbacks are daemon-owned and
+    /// never become observable through the protocol's unfiltered list.
     pub async fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
+        if owner.is_some_and(is_system_owner) {
+            bail!("system scheduled jobs are daemon-owned");
+        }
+        Ok(self
+            .scheduler
+            .list_jobs(owner)
+            .await?
+            .into_iter()
+            .filter(|job| !is_system_callback_summary(job))
+            .collect())
+    }
+
+    /// Read system jobs only from daemon subsystems that own their callbacks.
+    pub(crate) async fn list_system_jobs(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<Vec<ScheduledJobSummary>> {
+        if owner.is_some_and(|owner| !is_system_owner(owner)) {
+            bail!("internal system job listing requires a system owner");
+        }
         self.scheduler.list_jobs(owner).await
     }
 
     pub async fn delete_job(&self, id: &str) -> Result<bool> {
-        let deleted = self.scheduler.delete_job(id).await?;
+        let deleted = self.scheduler.delete_client_visible_job(id).await?;
         if deleted {
             self.wake();
         }
@@ -211,13 +240,16 @@ impl DaemonSchedulerHandle {
         id: &str,
         enabled: bool,
     ) -> Result<Option<ScheduledJobSummary>> {
-        let job = self.scheduler.set_enabled(id, enabled).await?;
+        let job = self
+            .scheduler
+            .set_client_visible_enabled(id, enabled)
+            .await?;
         self.wake();
         Ok(job)
     }
 
     pub async fn run_now(&self, id: &str) -> Result<()> {
-        self.scheduler.run_job_by_id(id).await?;
+        self.scheduler.run_client_visible_job_by_id(id).await?;
         self.wake();
         Ok(())
     }
@@ -286,7 +318,7 @@ impl DaemonScheduler {
         self.rebuild_timeline().await
     }
 
-    pub async fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
+    pub(crate) async fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
         validate_job_create_with_db(&job, &self.db).await?;
         let now = self.clock.now();
         let next_run_at = compute_next_run(
@@ -316,7 +348,7 @@ impl DaemonScheduler {
         row_to_summary(row)
     }
 
-    pub async fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
+    pub(crate) async fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
         self.db
             .list_scheduled_jobs(owner)
             .await?
@@ -325,7 +357,105 @@ impl DaemonScheduler {
             .collect()
     }
 
-    pub async fn delete_job(&self, id: &str) -> Result<bool> {
+    /// Validate a row read as part of a public scheduler mutation. The caller
+    /// must then use a compare-and-mutate DB primitive with this exact row;
+    /// never separate this check from an unconditional later mutation.
+    fn client_visible_job(row: ScheduledJobRow) -> Result<ScheduledJob> {
+        let job = row_to_job(row)?;
+        if is_system_callback(&job) {
+            bail!("system scheduled jobs are daemon-owned");
+        }
+        Ok(job)
+    }
+
+    async fn delete_client_visible_job(&self, id: &str) -> Result<bool> {
+        loop {
+            let Some(expected) = self.db.get_scheduled_job(id).await? else {
+                return Ok(false);
+            };
+            Self::client_visible_job(expected.clone())?;
+            match self.db.delete_scheduled_job_if_matches(expected).await? {
+                ConditionalScheduledJob::Applied(()) => {
+                    self.rebuild_timeline().await?;
+                    return Ok(true);
+                }
+                ConditionalScheduledJob::Missing => return Ok(false),
+                ConditionalScheduledJob::Current(current) => {
+                    // A system/corrupt replacement fails closed here; a
+                    // legitimate concurrent user update is re-evaluated.
+                    Self::client_visible_job(current)?;
+                }
+            }
+        }
+    }
+
+    async fn set_client_visible_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<ScheduledJobSummary>> {
+        loop {
+            let Some(expected) = self.db.get_scheduled_job(id).await? else {
+                return Ok(None);
+            };
+            let job = Self::client_visible_job(expected.clone())?;
+            let now = self.clock.now();
+            let next_run_at = enabled
+                .then(|| {
+                    compute_next_run(
+                        &job.schedule,
+                        now,
+                        job.last_run_at,
+                        job.created_at,
+                        self.last_user_activity(),
+                        job.missed_run_policy,
+                        job.next_run_at,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            match self
+                .db
+                .set_scheduled_job_enabled_if_matches(expected, enabled, next_run_at, now)
+                .await?
+            {
+                ConditionalScheduledJob::Applied(row) => {
+                    self.rebuild_timeline().await?;
+                    return row_to_summary(row).map(Some);
+                }
+                ConditionalScheduledJob::Missing => return Ok(None),
+                ConditionalScheduledJob::Current(current) => {
+                    Self::client_visible_job(current)?;
+                }
+            }
+        }
+    }
+
+    async fn run_client_visible_job_by_id(&self, id: &str) -> Result<()> {
+        loop {
+            let Some(expected) = self.db.get_scheduled_job(id).await? else {
+                bail!("scheduled job `{id}` not found");
+            };
+            Self::client_visible_job(expected.clone())?;
+            match self
+                .db
+                .claim_scheduled_job_for_manual_run_if_matches(expected)
+                .await?
+            {
+                ConditionalScheduledJob::Applied(row) => {
+                    self.enqueue_job(row_to_job(row)?, RunKind::Manual)?;
+                    self.rebuild_timeline().await?;
+                    return Ok(());
+                }
+                ConditionalScheduledJob::Missing => bail!("scheduled job `{id}` not found"),
+                ConditionalScheduledJob::Current(current) => {
+                    Self::client_visible_job(current)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn delete_job(&self, id: &str) -> Result<bool> {
         let deleted = self.db.delete_scheduled_job(id).await?;
         if deleted {
             self.rebuild_timeline().await?;
@@ -333,7 +463,7 @@ impl DaemonScheduler {
         Ok(deleted)
     }
 
-    pub async fn set_enabled(
+    pub(crate) async fn set_enabled(
         &self,
         id: &str,
         enabled: bool,
@@ -455,7 +585,7 @@ impl DaemonScheduler {
         Ok(results)
     }
 
-    pub async fn run_job_by_id(&self, id: &str) -> Result<()> {
+    pub(crate) async fn run_job_by_id(&self, id: &str) -> Result<()> {
         let row = self
             .db
             .get_scheduled_job(id)
@@ -535,6 +665,11 @@ impl DaemonScheduler {
         let Some(current_row) = self.db.get_scheduled_job(&job.id).await? else {
             return Ok(result);
         };
+        if current_row.row_identity != job.row_identity {
+            // A delete/reinsert may reuse `id`; an old executor must never
+            // record its result against that replacement.
+            return Ok(result);
+        }
         let current = row_to_job(current_row)?;
         let failure_count = if ok {
             0
@@ -569,6 +704,7 @@ impl DaemonScheduler {
         self.db
             .update_scheduled_job_after_run(ScheduledJobRunUpdate {
                 id: job.id,
+                row_identity: job.row_identity,
                 last_run_at: finished_at,
                 next_run_at,
                 last_result_json: serde_json::to_string(&result)?,
@@ -938,10 +1074,26 @@ pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {
 /// `system:<subsystem>` owner is not provenance.
 pub fn validate_public_job_create(job: &ScheduledJobCreate) -> Result<()> {
     validate_job_create(job)?;
-    if matches!(&job.payload, ScheduledJobPayload::Callback { .. }) {
-        bail!("callback scheduled jobs are daemon-owned and cannot be created by clients");
+    if is_system_owner(&job.owner) || matches!(&job.payload, ScheduledJobPayload::Callback { .. }) {
+        bail!("system scheduled jobs are daemon-owned and cannot be created by clients");
     }
     Ok(())
+}
+
+fn is_system_owner(owner: &str) -> bool {
+    owner.starts_with("system:")
+}
+
+/// Treat either half of the daemon callback convention as system-owned when
+/// reading durable rows. Validation normally keeps these halves paired, but a
+/// malformed historical row must fail closed rather than become mutable from a
+/// public scheduler request.
+fn is_system_callback(job: &ScheduledJob) -> bool {
+    is_system_owner(&job.owner) || matches!(job.payload, ScheduledJobPayload::Callback { .. })
+}
+
+fn is_system_callback_summary(job: &ScheduledJobSummary) -> bool {
+    is_system_owner(&job.owner) || matches!(job.payload, ScheduledJobPayload::Callback { .. })
 }
 
 async fn validate_job_create_with_db(job: &ScheduledJobCreate, db: &Db) -> Result<()> {
@@ -1175,6 +1327,7 @@ fn row_to_summary(row: ScheduledJobRow) -> Result<ScheduledJobSummary> {
 fn row_to_job(row: ScheduledJobRow) -> Result<ScheduledJob> {
     Ok(ScheduledJob {
         id: row.id,
+        row_identity: row.row_identity,
         owner: row.owner,
         schedule: serde_json::from_str(&row.schedule_json).context("parsing job schedule")?,
         payload: serde_json::from_str(&row.payload_json).context("parsing job payload")?,
@@ -1754,6 +1907,7 @@ mod tests {
             work_rx,
             job: ScheduledJob {
                 id: job_id.to_string(),
+                row_identity: "fixture-row".to_string(),
                 owner: "assistant:Build".to_string(),
                 schedule: ScheduledJobSchedule::Once { at: 1_000 },
                 payload: ScheduledJobPayload::RunPrompt {
@@ -2359,6 +2513,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_inflight_completion_cannot_update_an_identical_id_replacement() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = BlockingByIdExecutor::new("job-replaced");
+        let scheduler = DaemonScheduler::new(db.clone(), clock, executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-replaced",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .await
+            .unwrap();
+        let original = db.get_scheduled_job("job-replaced").await.unwrap().unwrap();
+
+        scheduler.run_job_by_id("job-replaced").await.unwrap();
+        wait_for_started_jobs(&executor, 1).await;
+        assert!(scheduler.delete_job("job-replaced").await.unwrap());
+        scheduler
+            .create_job(callback_job(
+                "job-replaced",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .await
+            .unwrap();
+        let replacement = db.get_scheduled_job("job-replaced").await.unwrap().unwrap();
+        assert_ne!(original.row_identity, replacement.row_identity);
+
+        executor.notify.notify_waiters();
+        for _ in 0..10_000 {
+            if !scheduler.is_in_flight("job-replaced") {
+                let current = db.get_scheduled_job("job-replaced").await.unwrap().unwrap();
+                assert_eq!(current.row_identity, replacement.row_identity);
+                assert_eq!(current.last_result_json, None);
+                assert_eq!(current.last_run_at, None);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("stale scheduler completion did not finish");
+    }
+
+    #[tokio::test]
     async fn inflight_result_does_not_reenable_disabled_job() {
         let db = Db::open_in_memory().unwrap();
         let clock = ManualClock::new(1_000);
@@ -2587,14 +2783,14 @@ mod tests {
         assert_eq!(sleeper.max_active(), 1);
 
         handle
-            .create_job(callback_job(
+            .create_system_callback_job(callback_job(
                 "job-earlier",
                 ScheduledJobSchedule::Every { seconds: 5 },
             ))
             .await
             .unwrap();
         wait_for_sleeper_calls(&sleeper, 2).await;
-        assert_eq!(handle.list_jobs(None).await.unwrap().len(), 101);
+        assert_eq!(handle.list_system_jobs(None).await.unwrap().len(), 101);
         assert_eq!(handle.wake_generation(), 1);
         assert_eq!(handle.scheduler.next_wake().unwrap(), Some(1_005));
         assert_eq!(sleeper.last_wake(), Some(1_005));
@@ -2628,7 +2824,7 @@ mod tests {
             })
             .unwrap();
         handle
-            .create_job(callback_job(
+            .create_system_callback_job(callback_job(
                 "job-callback",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
@@ -2643,6 +2839,105 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         shutdown.begin_drain();
         drop(tmp);
+    }
+
+    /// The handle is the public scheduler facade used by daemon requests.
+    /// Callback rows stay available to their daemon subsystem, but no public
+    /// entry point can discover or control them.
+    #[tokio::test]
+    async fn public_scheduler_handle_hides_and_rejects_system_callback_jobs() {
+        let (scheduler, _clock, _executor) = scheduler(1_000, false);
+        let scheduler = Arc::new(scheduler);
+        let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
+        let handle = scheduler.clone().start_with_sleeper(
+            shutdown.clone(),
+            Arc::new(RecordingSleeper::default()),
+            None,
+        );
+        let callback = callback_job(
+            "system-boundary",
+            ScheduledJobSchedule::Every { seconds: 60 },
+        );
+        handle
+            .create_system_callback_job(callback.clone())
+            .await
+            .unwrap();
+
+        assert!(handle.list_jobs(None).await.unwrap().is_empty());
+        assert!(handle.list_jobs(Some("system:test")).await.is_err());
+        assert!(handle.create_job(callback).await.is_err());
+        assert!(handle.delete_job("system-boundary").await.is_err());
+        assert!(handle.set_enabled("system-boundary", false).await.is_err());
+        assert!(handle.run_now("system-boundary").await.is_err());
+        assert!(!handle.delete_job("missing").await.unwrap());
+        assert!(
+            handle
+                .set_enabled("missing", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(handle.run_now("missing").await.is_err());
+
+        // Either half of the daemon convention is authoritative. A durable
+        // row with a system owner but a non-callback payload is still not
+        // client-controllable.
+        scheduler
+            .db
+            .insert_scheduled_job(NewScheduledJobRow {
+                id: "system-owner-boundary".to_string(),
+                owner: "system:orphan".to_string(),
+                schedule_json: serde_json::to_string(&ScheduledJobSchedule::Once { at: 2_000 })
+                    .unwrap(),
+                payload_json: serde_json::to_string(&ScheduledJobPayload::RunPrompt {
+                    assistant: "test".to_string(),
+                    prompt: "ignored".to_string(),
+                    project_root: "/tmp".to_string(),
+                })
+                .unwrap(),
+                enabled: true,
+                missed_run_policy: "skip".to_string(),
+                created_at: 1_000,
+                updated_at: 1_000,
+                next_run_at: Some(2_000),
+            })
+            .await
+            .unwrap();
+        assert!(handle.delete_job("system-owner-boundary").await.is_err());
+        assert!(
+            handle
+                .set_enabled("system-owner-boundary", false)
+                .await
+                .is_err()
+        );
+        assert!(handle.run_now("system-owner-boundary").await.is_err());
+
+        // A damaged durable row must fail closed before any of the public
+        // compare-and-mutate paths can alter or enqueue it.
+        scheduler
+            .db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE scheduled_jobs SET payload_json = '{' WHERE id = 'system-boundary'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(handle.delete_job("system-boundary").await.is_err());
+        assert!(handle.set_enabled("system-boundary", false).await.is_err());
+        assert!(handle.run_now("system-boundary").await.is_err());
+        assert!(
+            scheduler
+                .db
+                .get_scheduled_job("system-boundary")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        shutdown.begin_drain();
     }
 
     #[tokio::test]
@@ -2702,6 +2997,20 @@ mod tests {
             subsystem: "keep_warm".to_string(),
         };
         assert!(validate_public_job_create(&callback).is_err());
+
+        // Keep-warm retains every callback argument in its compact durable id
+        // and still passes the real generic scheduler id validation.
+        callback.id = crate::keep_warm::format_job_id(
+            uuid::Uuid::from_u128(1),
+            crate::session::InferenceSendIdentity {
+                unix_millis: i64::MAX,
+                send_id: uuid::Uuid::from_u128(2),
+            },
+            u64::MAX,
+            u64::MAX,
+        );
+        assert!(callback.id.len() <= 96);
+        assert!(validate_job_create(&callback).is_ok());
     }
 
     #[tokio::test]

@@ -3445,6 +3445,18 @@ async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
     assert_eq!(result, "skipped: idle window elapsed");
 }
 
+#[test]
+fn keep_warm_idle_deadline_overflow_fails_closed() {
+    assert!(
+        keep_warm_idle_deadline(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(u64::MAX),
+        )
+        .is_none(),
+        "a valid u64 idle window must not panic or permit dispatch when it cannot fit an instant"
+    );
+}
+
 #[tokio::test]
 async fn keep_warm_uses_the_cache_producing_send_for_its_original_deadline() {
     use crate::config::providers::{CacheMode, ContextConfig};
@@ -3521,6 +3533,48 @@ async fn keep_warm_fences_a_live_idle_window_reduction() {
             cache_send_identity,
             0,
             60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, "skipped: idle window elapsed");
+}
+
+/// Preparation time belongs to the cache-producing send's idle window. The
+/// test seam elapses time after the fixed deadline is captured but before the
+/// provider future is constructed; the refresh must still be skipped instead
+/// of starting a new relative idle timer.
+#[tokio::test(start_paused = true)]
+async fn keep_warm_does_not_extend_the_idle_window_during_preparation() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 1;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver.session.note_send();
+    driver.session.note_cache_hit_for_endpoint(
+        "lmstudio",
+        "local",
+        crate::tokens::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 1,
+            cached_input_tokens: 90,
+            cache_creation_input_tokens: 0,
+        },
+    );
+    driver.keep_warm_pre_dispatch_delay = Some(std::time::Duration::from_secs(2));
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+
+    let result = driver
+        .run_keep_warm(
+            cache_send_identity,
+            0,
+            1,
             tokio_util::sync::CancellationToken::new(),
             &queue,
         )

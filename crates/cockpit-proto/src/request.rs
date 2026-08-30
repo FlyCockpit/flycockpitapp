@@ -1407,8 +1407,9 @@ pub enum Request {
         job: ScheduledJobCreate,
     },
 
-    /// List durable scheduler jobs. Owner filtering is exact, e.g.
-    /// `assistant:alice` or `system:dreamer`.
+    /// List client-visible durable scheduler jobs. Owner filtering is exact
+    /// for assistant owners; daemon-owned `system:*` callback jobs are never
+    /// exposed through this request.
     ListScheduledJobs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,

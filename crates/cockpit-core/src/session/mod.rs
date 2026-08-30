@@ -1019,18 +1019,17 @@ impl Session {
         self.last_send_at.lock().unwrap().map(|t| t.identity)
     }
 
-    /// Atomically snapshot the latest send's durable identity and exact
-    /// monotonic elapsed time. Keep-warm uses this to prove that its job
-    /// still belongs to the cache-producing send rather than a later
-    /// foreground request, and to enforce its idle deadline while a provider
-    /// request is in flight.
-    pub(crate) fn last_send_identity_and_elapsed(
+    /// Atomically snapshot the latest send's durable identity and monotonic
+    /// origin. Keep-warm derives its absolute execution deadline directly
+    /// from this origin, so synchronous preparation cannot extend the idle
+    /// window between sampling elapsed time and arming a timer.
+    pub(crate) fn last_send_identity_and_origin(
         &self,
-    ) -> Option<(InferenceSendIdentity, std::time::Duration)> {
+    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| (t.identity, t.monotonic.elapsed()))
+            .map(|t| (t.identity, t.monotonic))
     }
 
     #[cfg(test)]

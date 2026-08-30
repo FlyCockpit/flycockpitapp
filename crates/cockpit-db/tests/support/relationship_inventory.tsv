@@ -459,6 +459,7 @@ extended	scheduled_jobs	missed_run_policy	non_relationship
 extended	scheduled_jobs	next_run_at	non_relationship
 extended	scheduled_jobs	owner	external
 extended	scheduled_jobs	payload_json	non_relationship
+extended	scheduled_jobs	row_identity	local_identity
 extended	scheduled_jobs	schedule_json	non_relationship
 extended	scheduled_jobs	updated_at	non_relationship
 local	accepted_persistent_guidance_rules	canonical_project_digest	primary

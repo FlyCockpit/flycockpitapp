@@ -1732,7 +1732,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(&canonical);
+        let project_id = crate::session::project_id_for(&canonical).unwrap();
         let project_root = canonical.display().to_string();
         let session_row = db
             .write(move |conn| {
@@ -1766,6 +1766,9 @@ mod tests {
         );
         let ctx = ToolCtx {
             agent_id: "helper".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "helper".to_string(),
             write_scope: None,

@@ -311,6 +311,7 @@ pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
         delegation: Default::default(),
         questions: None,
         verification: None,
+        allowed_knowledge_bases: None,
     }
 }
 

@@ -691,6 +691,25 @@ fn to_markdown_round_trips_through_parse() {
 }
 
 #[test]
+fn vnext_allowed_knowledge_bases_round_trip_through_markdown() {
+    let mut def = embedded_default("builder").unwrap();
+    def.vnext.as_mut().unwrap().allowed_knowledge_bases = Some(std::collections::BTreeSet::from([
+        "project".to_string(),
+        "shared-notes".to_string(),
+    ]));
+    let markdown = def.to_markdown().unwrap();
+    assert!(markdown.contains("allowedKnowledgeBases:"));
+    let parsed = parse_agent_with_scope(
+        &markdown,
+        "builder",
+        "builder.md".into(),
+        DefinitionScope::BuiltinOverride,
+    )
+    .unwrap();
+    assert_eq!(parsed.vnext, def.vnext);
+}
+
+#[test]
 fn agent_vnext_every_editable_builtin_ejects_closed_schema_v2() {
     for &name in crate::agents::BUILTIN_AGENT_NAMES {
         let embedded = embedded_default(name).unwrap();

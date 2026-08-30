@@ -1302,6 +1302,11 @@ fn context_config_defaults_nudge_60_auto_compact_unset() {
     assert_eq!(c.compact_keep_recent_turns, 4);
     assert!(c.compact_shadow);
     assert_eq!(c.compact_shadow_margin_pct, 10);
+    assert!(c.rolling_precompaction);
+    assert_eq!(c.rolling_precompaction_rebuild_turns, 24);
+    assert_eq!(c.idle_window_secs, 15 * 60);
+    assert_eq!(c.keep_warm, KeepWarmMode::Auto);
+    assert_eq!(c.resume_default, ResumeDefault::Ask);
     assert_eq!(c.auto_prune_pct, 50);
     assert_eq!(c.auto_prune_prunable_pct, 30);
     // Older configs (no `context` key) load with the defaults.
@@ -1323,8 +1328,77 @@ fn context_config_defaults_nudge_60_auto_compact_unset() {
     assert_eq!(legacy.compact_keep_recent_turns, 4);
     assert!(legacy.compact_shadow);
     assert_eq!(legacy.compact_shadow_margin_pct, 10);
+    assert!(legacy.rolling_precompaction);
+    assert_eq!(legacy.rolling_precompaction_rebuild_turns, 24);
+    assert_eq!(legacy.idle_window_secs, 15 * 60);
+    assert_eq!(legacy.keep_warm, KeepWarmMode::Auto);
+    assert_eq!(legacy.resume_default, ResumeDefault::Ask);
     let encoded = serde_json::to_value(&legacy).unwrap();
     assert_eq!(encoded["auto_compact_pct"], 77);
+}
+
+#[test]
+fn cache_retention_profile_is_curated_and_conservative() {
+    let mut cfg = ProvidersConfig::default();
+    for provider in ["openai", "anthropic", "gemini", "openrouter", "self-hosted"] {
+        cfg.providers.insert(
+            provider.to_string(),
+            ProviderEntry {
+                template: (provider != "self-hosted").then(|| provider.to_string()),
+                cache: CacheConfig {
+                    mode: CacheMode::Ephemeral,
+                    ttl_secs: 300,
+                },
+                ..ProviderEntry::default()
+            },
+        );
+    }
+
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("openai", "gpt"),
+        CacheRetentionProfile::KnownFloor { secs: 30 * 60 }
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("anthropic", "claude"),
+        CacheRetentionProfile::KnownFloor { secs: 300 }
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("gemini", "flash"),
+        CacheRetentionProfile::KnownFloor { secs: 300 }
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("openrouter", "routed"),
+        CacheRetentionProfile::AggregatorObserved
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("self-hosted", "model"),
+        CacheRetentionProfile::Observed
+    );
+
+    // Connection keys are mutable labels. Curated behavior follows only the
+    // persisted vendor template, so a renamed OpenAI connection keeps its
+    // floor while a custom endpoint named `openai` remains observed-only.
+    let renamed_openai = cfg.providers.remove("openai").unwrap();
+    cfg.providers
+        .insert("work-connection".into(), renamed_openai);
+    cfg.providers.insert(
+        "openai".into(),
+        ProviderEntry {
+            cache: CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: 300,
+            },
+            ..ProviderEntry::default()
+        },
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("work-connection", "gpt"),
+        CacheRetentionProfile::KnownFloor { secs: 30 * 60 }
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("openai", "gpt"),
+        CacheRetentionProfile::Observed
+    );
 }
 
 #[test]
@@ -1340,6 +1414,7 @@ fn resolve_context_prefers_model_then_provider_then_default() {
             compact_shadow_margin_pct: 10,
             auto_prune_pct: 60,
             auto_prune_prunable_pct: 40,
+            ..ContextConfig::default()
         },
         ..ProviderEntry::default()
     };
@@ -1352,6 +1427,7 @@ fn resolve_context_prefers_model_then_provider_then_default() {
         compact_shadow_margin_pct: 12,
         auto_prune_pct: 55,
         auto_prune_prunable_pct: 25,
+        ..ContextConfig::default()
     });
     entry.models.push(pinned);
     entry.models.push(model("bare", false));

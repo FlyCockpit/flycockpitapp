@@ -207,7 +207,7 @@
           },
           "concurrency": "subagents",
           "daemon": {
-            "autostart": "shared",
+            "background_agents": true,
             "uploads": {
               "global_bytes": 268435456,
               "global_uploads": 32,
@@ -316,7 +316,7 @@
           "preflight": {
             "enabled": false
           },
-          "project_knowledge": false,
+          "knowledgeBases": [],
           "prompt_injection_guard": {
             "resultAction": "block",
             "threshold": "off"

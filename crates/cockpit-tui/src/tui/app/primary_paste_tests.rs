@@ -47,7 +47,6 @@ fn held() -> HeldLocalDisplayConnection {
 
 fn primary_ready_app(tmp: &tempfile::TempDir) -> App {
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = Dialog::None;
     app.mouse_capture = true;
     app.terminal_input_generation = Some(1);

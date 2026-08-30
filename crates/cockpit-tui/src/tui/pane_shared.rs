@@ -66,7 +66,7 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<S
 /// resolved yet, in which case we fall back to `cwd`.
 pub(crate) fn resolve_project_id(worktree_root: Option<&Path>, cwd: &Path) -> Option<String> {
     let root = worktree_root.unwrap_or(cwd);
-    Some(cockpit_core::session::project_id_for(root))
+    cockpit_core::session::project_id_for(root).ok()
 }
 
 /// Short prefix of a `project_id` hash for the title chip — the full

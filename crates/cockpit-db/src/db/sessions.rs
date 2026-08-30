@@ -186,6 +186,8 @@ pub struct SessionRow {
     pub fork_point_turn_id: Option<String>,
     /// Auto-generated or user-set title (GOALS §17d).
     pub title: Option<String>,
+    /// Cache-reusing metadata fork's one-sentence session context.
+    pub description: Option<String>,
     /// `true` when the user has manually set [`title`]. Locks out the
     /// utility-model auto-titling pass.
     pub user_renamed: bool,
@@ -217,6 +219,8 @@ pub struct SessionRow {
     /// slot (`0`, `1`, `2`, `4`, `8`, or `16`). Persisted so a resumed session
     /// does not repeat the same automatic utility call.
     pub title_stage: i64,
+    /// Monotonic durable ownership fence for a same-model metadata fork.
+    pub metadata_fork_generation: i64,
     /// Durable one-shot post-auto-title-failure recovery nudge latch (issue
     /// #23). Defaults [`TitleRecoveryNudgeState::None`]; never inherited by a
     /// fork/tangent/copy, and cleared whenever a title is successfully stored.
@@ -248,6 +252,16 @@ pub struct BtwForkInfo {
 pub struct BtwForkCreateResult {
     pub info: BtwForkInfo,
     pub created: bool,
+}
+
+/// Minimal, secret-free session projection used solely to build a storage
+/// cleanup preview. The daemon still owns the actual archive/delete mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageSessionCandidate {
+    pub session_id: Uuid,
+    pub project_id: String,
+    pub title: Option<String>,
+    pub last_active_at_unix_ms: i64,
 }
 
 impl SessionRow {
@@ -288,6 +302,7 @@ impl SessionRow {
             parent_session_id,
             fork_point_turn_id: row.get("fork_point_turn_id")?,
             title: row.get("title")?,
+            description: row.get("description")?,
             user_renamed: user_renamed != 0,
             last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
             archived_at_unix_ms: row.get("archived_at_unix_ms")?,
@@ -296,6 +311,7 @@ impl SessionRow {
             btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
             user_content_tokens: row.get("user_content_tokens")?,
             title_stage: row.get("title_stage")?,
+            metadata_fork_generation: row.get("metadata_fork_generation")?,
             title_recovery_nudge_state: nudge_state_from_sql(
                 row.get("title_recovery_nudge_state")?,
             )?,
@@ -448,8 +464,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
-          assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+          assistant_name, created_by_principal, shared_with_collaborators, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -473,6 +489,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.assistant_name,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
+            row.description,
         ],
     )?;
     Ok(())
@@ -510,11 +527,11 @@ fn execute_fork_insert(
           parent_session_id, fork_point_turn_id,
           provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
-          title_recovery_nudge_state,
+          metadata_fork_generation, title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
-          model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+          model_system_prompt_snapshot_json, assistant_name, active_model_revision, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -534,6 +551,7 @@ fn execute_fork_insert(
             row.ephemeral as i64,
             row.user_content_tokens,
             row.title_stage,
+            row.metadata_fork_generation,
             row.title_recovery_nudge_state.as_i64(),
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
@@ -546,6 +564,7 @@ fn execute_fork_insert(
             row.model_system_prompt_snapshot_json,
             row.assistant_name,
             row.active_model_revision,
+            row.description,
         ],
     )?;
     Ok(())
@@ -658,6 +677,7 @@ fn build_session_row(
         parent_session_id: None,
         fork_point_turn_id: None,
         title: None,
+        description: None,
         user_renamed: false,
         last_viewed_at_unix_ms: None,
         archived_at_unix_ms: None,
@@ -666,6 +686,7 @@ fn build_session_row(
         btw_tangent: false,
         user_content_tokens: 0,
         title_stage: 0,
+        metadata_fork_generation: 0,
         // A brand-new session never carries a recovery nudge.
         title_recovery_nudge_state: TitleRecoveryNudgeState::None,
         guidance_baseline_path: None,
@@ -1019,16 +1040,443 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
             );
         }
     }
+    // `secret_vault_items` deliberately has no foreign key to `sessions`: it
+    // stores several installation-wide namespaces, while session-owned values
+    // are addressed by opaque item ids.  Delete the two session namespaces
+    // explicitly before the session cascade removes the metadata needed to
+    // identify them.  A redaction table is keyed directly by session UUID;
+    // session sealed values are all namespaced below `<session-id>/` (including
+    // superseded versions), so this removes every encrypted generation rather
+    // than merely the currently active one.
+    for member in &subtree {
+        let member_id = member.to_string();
+        conn.execute(
+            "DELETE FROM secret_vault_items
+              WHERE kind = 'redaction_table' AND item_id = ?1",
+            [&member_id],
+        )
+        .context("deleting session redaction-table vault item")?;
+        let session_sealed_prefix = format!("{member_id}/%");
+        conn.execute(
+            "DELETE FROM secret_vault_items
+              WHERE kind = 'session_sealed_value' AND item_id LIKE ?1 ESCAPE '\\'",
+            [&session_sealed_prefix],
+        )
+        .context("deleting session sealed-value vault items")?;
+    }
     let changes_before = conn.total_changes();
     conn.execute(
         "DELETE FROM sessions WHERE session_id = ?1",
         [session_id.to_string()],
     )
     .context("deleting session")?;
+    verify_session_delete_cleanup_conn(conn, &subtree)?;
     Ok(conn.total_changes().saturating_sub(changes_before))
 }
 
+/// Verify the deletion boundary after the session cascade has committed its
+/// relational work but before its transaction is returned to the caller.
+///
+/// This is intentionally a real scan of the narrowly scoped ownership keys,
+/// not a best-effort diagnostic: a successful permanent delete must never
+/// leave vault ciphertext, compaction state, text artifacts, or FTS documents
+/// behind for any member of the deleted fork subtree.
+fn verify_session_delete_cleanup_conn(conn: &Connection, subtree: &[Uuid]) -> Result<()> {
+    for member in subtree {
+        let member_id = member.to_string();
+        let sealed_prefix = format!("{member_id}/%");
+        let leftovers: i64 = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM secret_vault_items
+                  WHERE (kind = 'redaction_table' AND item_id = ?1)
+                     OR (kind = 'session_sealed_value' AND item_id LIKE ?2 ESCAPE '\\'))
+              + (SELECT COUNT(*) FROM protected_redaction_history WHERE session_id = ?1)
+              + (SELECT COUNT(*) FROM compaction_handoffs WHERE session_id = ?1)
+              + (SELECT COUNT(*) FROM session_text_artifacts WHERE session_id = ?1)
+              + (SELECT COUNT(*) FROM session_fts_docs WHERE session_id = ?1)",
+            params![member_id, sealed_prefix],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            leftovers == 0,
+            "session deletion left {leftovers} owned storage record(s) for {member}"
+        );
+    }
+    Ok(())
+}
+
 impl Db {
+    /// Return the exact fork subtree targeted by a permanent session delete.
+    /// The daemon captures this before the cascade so filesystem cleanup can
+    /// remove each corresponding durable scratch directory after commit.
+    pub async fn session_subtree_ids(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
+        self.read(move |conn| collect_subtree(conn, session_id))
+            .await
+    }
+
+    /// List ended, non-archived sessions eligible for the conservative
+    /// "older than N days" storage action. User-renamed sessions and sessions
+    /// with at least one pinned message are excluded by default; callers may
+    /// explicitly opt into including both.
+    pub async fn storage_sessions_older_than(
+        &self,
+        cutoff_unix_ms: i64,
+        include_renamed_or_pinned: bool,
+        include_archived: bool,
+    ) -> Result<Vec<StorageSessionCandidate>> {
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT session_id, project_id, title, last_active_at_unix_ms
+                  FROM sessions
+                  WHERE (?3 != 0 OR archived_at_unix_ms IS NULL)
+                    AND ended_at_unix_ms IS NOT NULL
+                    AND last_active_at_unix_ms < ?1
+                    AND (?2 != 0 OR (
+                        user_renamed = 0
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pins WHERE pins.session_id = sessions.session_id
+                        )
+                    ))
+                  ORDER BY last_active_at_unix_ms ASC",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        cutoff_unix_ms,
+                        include_renamed_or_pinned as i64,
+                        include_archived as i64
+                    ],
+                    |row| {
+                        let session_id: String = row.get(0)?;
+                        Ok(StorageSessionCandidate {
+                            session_id: parse_uuid(&session_id)?,
+                            project_id: row.get(1)?,
+                            title: row.get(2)?,
+                            last_active_at_unix_ms: row.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// List archived sessions that remain eligible for the explicit second
+    /// step of the storage workflow.  Archive never turns an older session
+    /// into an undiscoverable deletion candidate.
+    pub async fn archived_storage_sessions_older_than(
+        &self,
+        cutoff_unix_ms: i64,
+        include_renamed_or_pinned: bool,
+    ) -> Result<Vec<StorageSessionCandidate>> {
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT session_id, project_id, title, last_active_at_unix_ms
+                  FROM sessions
+                  WHERE archived_at_unix_ms IS NOT NULL
+                    AND ended_at_unix_ms IS NOT NULL
+                    AND last_active_at_unix_ms < ?1
+                    AND (?2 != 0 OR (
+                        user_renamed = 0
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pins WHERE pins.session_id = sessions.session_id
+                        )
+                    ))
+                  ORDER BY last_active_at_unix_ms ASC",
+            )?;
+            statement
+                .query_map(
+                    params![cutoff_unix_ms, include_renamed_or_pinned as i64],
+                    |row| {
+                        let session_id: String = row.get(0)?;
+                        Ok(StorageSessionCandidate {
+                            session_id: parse_uuid(&session_id)?,
+                            project_id: row.get(1)?,
+                            title: row.get(2)?,
+                            last_active_at_unix_ms: row.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Archive a storage-previewed batch only when every reviewed session is
+    /// still the same eligible, ended session. This check and the update share
+    /// one writer transaction, so a newly pinned, renamed, resumed, or
+    /// otherwise changed session causes the whole preview to fail closed.
+    pub async fn archive_storage_sessions_if_unchanged(
+        &self,
+        candidates: Vec<StorageSessionCandidate>,
+        include_renamed_or_pinned: bool,
+    ) -> Result<bool> {
+        let now_unix_ms = Utc::now().timestamp_millis();
+        self.transaction(move |conn| {
+            for candidate in &candidates {
+                let eligible: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM sessions
+                          WHERE session_id = ?1
+                            AND project_id = ?2
+                            AND last_active_at_unix_ms = ?3
+                            AND archived_at_unix_ms IS NULL
+                            AND ended_at_unix_ms IS NOT NULL
+                            AND (?4 != 0 OR (
+                                user_renamed = 0
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM pins WHERE pins.session_id = sessions.session_id
+                                )
+                            ))",
+                        params![
+                            candidate.session_id.to_string(),
+                            candidate.project_id,
+                            candidate.last_active_at_unix_ms,
+                            include_renamed_or_pinned as i64,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .context("revalidating storage archive preview")?;
+                if eligible.is_none() {
+                    return Ok(false);
+                }
+            }
+            for candidate in &candidates {
+                conn.execute(
+                    "UPDATE sessions SET archived_at_unix_ms = ?1 WHERE session_id = ?2",
+                    params![now_unix_ms, candidate.session_id.to_string()],
+                )
+                .context("archiving storage-previewed session")?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Atomically prove that a storage preview still names the complete ended
+    /// forest, then install the durable deletion fence for every member.
+    ///
+    /// The fence is deliberately committed before daemon teardown starts:
+    /// session resume, containment creation, and write-scope transfer admission
+    /// all consult `lifecycle`, so a stale preview fails before it can stop a
+    /// worker or cancel an invocation. Once this succeeds the selected forest
+    /// is no longer allowed to gain a descendant or resume.
+    pub async fn fence_storage_sessions_if_unchanged(
+        &self,
+        roots: Vec<Uuid>,
+        expected: Vec<StorageSessionCandidate>,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            let mut actual = std::collections::BTreeSet::new();
+            for root in &roots {
+                actual.extend(collect_subtree(conn, *root)?);
+            }
+            let expected_ids: std::collections::BTreeSet<_> = expected
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect();
+            if actual != expected_ids {
+                return Ok(false);
+            }
+            for candidate in &expected {
+                let Some(current) = get_session_inner(conn, candidate.session_id)? else {
+                    return Ok(false);
+                };
+                if current.project_id != candidate.project_id
+                    || current.last_active_at_unix_ms != candidate.last_active_at_unix_ms
+                    || current.ended_at_unix_ms.is_none()
+                    || current.lifecycle != "active"
+                {
+                    return Ok(false);
+                }
+            }
+            for candidate in &expected {
+                let changed = conn.execute(
+                    "UPDATE sessions SET lifecycle = 'deleting'
+                     WHERE session_id = ?1 AND lifecycle = 'active'",
+                    [candidate.session_id.to_string()],
+                )?;
+                if changed != 1 {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Commit a deletion fence across a complete fork subtree and return the
+    /// exact members it covers. A concurrent fork writer cannot interleave
+    /// with this transaction: once it commits, every possible parent is
+    /// `deleting`, and fork creation refuses non-active parents.
+    ///
+    /// A fully fenced subtree is accepted for the storage path, which has
+    /// already performed its stricter preview-identity transaction. A mixed
+    /// lifecycle is never adopted: it belongs to an incomplete competing
+    /// deletion and must remain fail-closed.
+    pub async fn fence_session_subtree_for_deletion(&self, root: Uuid) -> Result<Vec<Uuid>> {
+        self.transaction(move |conn| {
+            let members = collect_subtree(conn, root)?;
+            ensure!(!members.is_empty(), "session {root} not found");
+
+            let mut active = 0_usize;
+            let mut deleting = 0_usize;
+            for member in &members {
+                match get_session_inner(conn, *member)?
+                    .ok_or_else(|| anyhow!("session {member} disappeared while fencing"))?
+                    .lifecycle
+                    .as_str()
+                {
+                    "active" => active += 1,
+                    "deleting" => deleting += 1,
+                    lifecycle => anyhow::bail!(
+                        "session {member} has unsupported lifecycle `{lifecycle}` while fencing"
+                    ),
+                }
+            }
+            if deleting == members.len() {
+                return Ok(members);
+            }
+            ensure!(
+                active == members.len(),
+                "session subtree rooted at {root} is already being deleted"
+            );
+            for member in &members {
+                ensure!(
+                    conn.execute(
+                        "UPDATE sessions SET lifecycle = 'deleting'
+                         WHERE session_id = ?1 AND lifecycle = 'active'",
+                        [member.to_string()],
+                    )? == 1,
+                    "session {member} changed while fencing"
+                );
+            }
+            Ok(members)
+        })
+        .await
+    }
+
+    /// Delete a forest already fenced by [`Self::fence_storage_sessions_if_unchanged`].
+    /// This intentionally does not repeat preview identity checks after the
+    /// fence: post-fence teardown itself terminalizes run state, while the
+    /// lifecycle fence prevents the identity-relevant re-entry that could make
+    /// a confirmed preview stale.
+    pub async fn delete_fenced_storage_sessions(
+        &self,
+        roots: Vec<Uuid>,
+        expected: Vec<StorageSessionCandidate>,
+        staged_directory_paths: Vec<String>,
+    ) -> Result<bool> {
+        let now_unix_ms = Utc::now().timestamp_millis();
+        let deleted = self
+            .transaction(move |conn| {
+                for candidate in &expected {
+                    let Some(current) = get_session_inner(conn, candidate.session_id)? else {
+                        return Ok(false);
+                    };
+                    if current.lifecycle != "deleting" {
+                        return Ok(false);
+                    }
+                }
+                for staged_path in &staged_directory_paths {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO storage_directory_cleanup_intents(staged_path, created_at_unix_ms)
+                         VALUES (?1, ?2)",
+                        params![staged_path, now_unix_ms],
+                    )?;
+                }
+                for root in &roots {
+                    delete_session_conn(conn, *root)?;
+                }
+                Ok(true)
+            })
+            .await?;
+        if deleted && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, "storage cleanup sidecar cleanup remains durably pending");
+        }
+        Ok(deleted)
+    }
+
+    /// Resolve an ambiguous commit result from the permanent-delete
+    /// transaction. Absence means the reviewed rows committed deleted and the
+    /// caller must never restore them to a retryable filesystem namespace.
+    pub async fn storage_sessions_are_absent(
+        &self,
+        expected: Vec<StorageSessionCandidate>,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            for candidate in expected {
+                if get_session_inner(conn, candidate.session_id)?.is_some() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Load durable post-commit filesystem cleanup work.  The core storage
+    /// owner validates each path against its own staging namespace before it
+    /// touches the filesystem.
+    pub async fn storage_directory_cleanup_intents(&self) -> Result<Vec<String>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT staged_path FROM storage_directory_cleanup_intents
+                 ORDER BY created_at_unix_ms, staged_path",
+            )?;
+            Ok(statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// An intent is acknowledged only after the storage owner proves its
+    /// directory is absent.
+    pub async fn complete_storage_directory_cleanup_intent(
+        &self,
+        staged_path: String,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            conn.execute(
+                "DELETE FROM storage_directory_cleanup_intents WHERE staged_path = ?1",
+                [staged_path],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Release a storage-delete fence when filesystem teardown did not
+    /// complete. The preview's original identity is checked again so this
+    /// cannot revive a different or re-entered session.
+    pub async fn release_storage_session_fence(
+        &self,
+        expected: Vec<StorageSessionCandidate>,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            for candidate in &expected {
+                let Some(current) = get_session_inner(conn, candidate.session_id)? else {
+                    continue;
+                };
+                if current.project_id == candidate.project_id
+                    && current.last_active_at_unix_ms == candidate.last_active_at_unix_ms
+                    && current.lifecycle == "deleting"
+                {
+                    conn.execute(
+                        "UPDATE sessions SET lifecycle = 'active'
+                         WHERE session_id = ?1 AND lifecycle = 'deleting'",
+                        [candidate.session_id.to_string()],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
     /// Load the daemon-private authoritative project UUID. Absence is a
     /// fail-closed state for security receipts; callers must never synthesize
     /// one from the legacy project string.
@@ -1354,6 +1802,10 @@ impl Db {
         // `btw_fork_never_inherits_sealed_values_of_either_kind`.
         let parent = get_session_inner(conn, parent_session_id)?
             .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+        ensure!(
+            parent.lifecycle == "active",
+            "parent session {parent_session_id} is being deleted and cannot be forked"
+        );
         let short_id = generate_unique_short_id(conn, &parent.project_id)
             .context("generating btw fork short_id")?;
         let row = SessionRow {
@@ -1377,6 +1829,7 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: None,
             title: None,
+            description: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1389,6 +1842,7 @@ impl Db {
                 parent.user_content_tokens
             },
             title_stage: if tangent { 0 } else { parent.title_stage },
+            metadata_fork_generation: 0,
             // A `/btw` fork is a distinct session: never inherit the
             // parent's unconsumed recovery nudge (tangent or seeded).
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
@@ -1503,6 +1957,10 @@ impl Db {
     ) -> Result<SessionRow> {
         let parent = get_session_inner(conn, parent_session_id)?
             .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+        ensure!(
+            parent.lifecycle == "active",
+            "parent session {parent_session_id} is being deleted and cannot be forked"
+        );
         // Validate the fork point before inserting a child row. A malformed
         // turn id must not persist a fork that the CHECK then rejects with an
         // opaque constraint error.
@@ -1534,6 +1992,7 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: fork_point_turn_id.clone(),
             title: None,
+            description: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1542,6 +2001,7 @@ impl Db {
             btw_tangent: false,
             user_content_tokens: parent.user_content_tokens,
             title_stage: parent.title_stage,
+            metadata_fork_generation: 0,
             // A fork (plain or ephemeral `/side`) is a distinct session:
             // never inherit the parent's unconsumed recovery nudge.
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
@@ -1792,6 +2252,75 @@ impl Db {
             )
             .context("setting auto title")?;
         Ok(affected > 0)
+    }
+
+    /// Atomically set generated session metadata. Only the ephemeral
+    /// self-metadata fork calls this; it cannot overwrite a manual title or
+    /// mutate a throwaway session.
+    pub fn set_auto_session_metadata_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        title: &str,
+        description: &str,
+        expected_user_content_tokens: i64,
+        expected_metadata_fork_generation: i64,
+    ) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions
+                 SET title = ?1, description = ?2, title_recovery_nudge_state = 0
+                 WHERE session_id = ?3 AND user_renamed = 0 AND ephemeral = 0
+                   AND user_content_tokens = ?4
+                   AND metadata_fork_generation = ?5",
+                params![
+                    title,
+                    description,
+                    session_id.to_string(),
+                    expected_user_content_tokens,
+                    expected_metadata_fork_generation,
+                ],
+            )
+            .context("setting auto session metadata")?;
+        Ok(affected > 0)
+    }
+
+    /// Claim a distinct durable metadata-fork generation. A later claim or
+    /// revocation invalidates every previous fork before it can publish.
+    pub fn activate_metadata_fork_conn(conn: &Connection, session_id: Uuid) -> Result<i64> {
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                SET metadata_fork_generation = metadata_fork_generation + 1
+              WHERE session_id = ?1",
+                params![session_id.to_string()],
+            )
+            .context("activating metadata fork")?;
+        ensure!(changed == 1, "activating metadata fork: session not found");
+        conn.query_row(
+            "SELECT metadata_fork_generation FROM sessions WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("reading activated metadata fork generation")
+    }
+
+    /// Revoke a fork only while it owns the expected generation. This and the
+    /// generated write serialize through SQLite, so cancellation/drain owns a
+    /// durable linearization point rather than an advisory pre-write check.
+    pub fn revoke_metadata_fork_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                    SET metadata_fork_generation = metadata_fork_generation + 1
+                  WHERE session_id = ?1 AND metadata_fork_generation = ?2",
+                params![session_id.to_string(), expected_generation],
+            )
+            .context("revoking metadata fork")?;
+        Ok(changed == 1)
     }
 
     pub async fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
@@ -2865,7 +3394,7 @@ impl Db {
 
     /// Assemble the `/sessions` browser rows for one level, the single
     /// source of truth shared by the daemon's `ListSessions` handler and
-    /// the TUI's daemonless direct-DB fallback. The level selection
+    /// the TUI's disconnected direct-DB fallback. The level selection
     /// mirrors the RPC contract:
     ///
     /// - `parent_session_id = Some(p)` → the direct forks of `p`
@@ -2877,7 +3406,7 @@ impl Db {
     /// (`latest_activity_at`), and open-interrupt count. Live-only fields
     /// (running/processing) are *not* part of this method — callers
     /// attach them separately (the daemon from its registry, the TUI
-    /// daemonless path not at all). A per-row auxiliary-query miss
+    /// disconnected path not at all). A per-row auxiliary-query miss
     /// degrades that field to its empty default rather than failing the
     /// whole list, matching the daemon handler's best-effort behavior.
     pub async fn list_session_summaries(
@@ -2950,6 +3479,7 @@ impl Db {
                 turns: 0, // wire up when we track turn count
                 active_agent: row.active_agent,
                 title: row.title,
+                description: row.description,
                 parent_session_id: row.parent_session_id,
                 fork_count,
                 descendant_count,
@@ -4771,6 +5301,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_session_purges_session_keyed_vault_items_for_every_descendant() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_vault_keys
+                    (key_version, kek_version, wrap_version, algorithm, wrap_nonce, wrapped_dek, active, created_at)
+                 VALUES (1, 1, 1, 'chacha20poly1305', ?1, ?2, 1, 1)",
+                params![vec![1_u8; 12], vec![2_u8; 48]],
+            )?;
+            for (index, session_id) in [parent.session_id, child.session_id].into_iter().enumerate() {
+                for (kind_index, (kind, item_id)) in [
+                    ("redaction_table", session_id.to_string()),
+                    ("session_sealed_value", format!("{session_id}/deploy/v1")),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    conn.execute(
+                        "INSERT INTO secret_vault_items
+                            (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision)
+                         VALUES (?1, ?2, 1, ?3, ?4, 1, 1, 1)",
+                        params![kind, item_id, vec![(3 + index * 2 + kind_index) as u8; 12], vec![4_u8; 16]],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        db.delete_session(parent.session_id).await.unwrap();
+        let remaining: i64 = db
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM secret_vault_items", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "session deletion must leave no vault ciphertext behind"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_session_cascade_failure_rolls_back_deleted_descendants() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/x", "a").await.unwrap();
@@ -5012,7 +5591,7 @@ mod tests {
     #[tokio::test]
     async fn list_session_summaries_scopes_orders_and_groups_forks() {
         // The factored query is the single source of truth for the
-        // `/sessions` browser (daemon RPC + TUI daemonless). Assert the
+        // `/sessions` browser (daemon RPC + TUI disconnected fallback). Assert the
         // three level selections produce the same shape the daemon handler
         // used: project-scoped roots newest-first, forks grouped under a
         // parent, fork/descendant counts, and the all-projects fallback.
@@ -5309,7 +5888,7 @@ mod tests {
         let recent = db.most_recent_open_session_for("p").await.unwrap().unwrap();
         assert_eq!(recent.session_id, root.session_id);
 
-        // Browser summaries (the daemon + daemonless shared path).
+        // Browser summaries (the daemon + disconnected shared path).
         let summaries = db
             .list_session_summaries(Some("p"), None, 100)
             .await

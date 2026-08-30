@@ -3036,7 +3036,8 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             false,
         )
         .await
-        .expect_err("remote KBs cannot enforce local model trust");
+        .err()
+        .expect("remote KBs cannot enforce local model trust");
 
         assert!(error.to_string().contains("cannot require local trust"));
     }

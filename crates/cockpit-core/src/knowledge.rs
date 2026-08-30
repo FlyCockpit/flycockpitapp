@@ -1379,28 +1379,12 @@ pub(crate) async fn attached_bundles(
             .cloned()
             .map(workspace_knowledge_base),
     );
-    for RegistryKnowledgeBase { entry, local } in registry {
-        validate_registry_entry(&entry)?;
+    for RegistryKnowledgeBase { mut entry, local } in registry {
         if !seen.insert(entry.id.clone()) {
             bail!(
                 "knowledge base registry contains duplicate ID `{}`",
                 entry.id
             );
-        }
-        if !seen_attachment_ids.insert(entry.attachment_id) {
-            bail!(
-                "knowledge base registry contains duplicate attachment ID `{}`",
-                entry.attachment_id
-            );
-        }
-        if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
-            continue;
-        }
-        if entry.trust_required
-            && !crate::config::trust::runtime_policy()
-                .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
-        {
-            continue;
         }
         let local = local.map(|local| {
             let root = if local.root.is_absolute() {
@@ -1417,6 +1401,32 @@ pub(crate) async fn attached_bundles(
                 sidecar_path: Some(sidecar_path),
             }
         });
+        // Relative local paths are interpreted against this invocation's
+        // workspace root. Bind the ledger key to that resolved source, not the
+        // spelling in config, so the identity always matches the provider's
+        // concrete root.
+        if let Some(local) = &local {
+            entry.source = KnowledgeBaseSource::Local {
+                path: local.root.clone(),
+            };
+        }
+        validate_registry_entry(&entry)?;
+        let attachment_id = entry.attachment_id();
+        if !seen_attachment_ids.insert(attachment_id) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                attachment_id
+            );
+        }
+        if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
+            continue;
+        }
+        if entry.trust_required
+            && !crate::config::trust::runtime_policy()
+                .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
+        {
+            continue;
+        }
         let Some(provider) = provider_for(entry.clone(), local)? else {
             continue;
         };
@@ -1471,18 +1481,18 @@ async fn assistant_knowledge_registry_entry(
     }
     let cache_root = crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
     cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
-    let entry = KnowledgeBaseRegistryEntry {
-        attachment_id: config.installation_id,
-        id: format!("assistant-{}", config.installation_id),
-        name: format!("Assistant: {name}"),
-        description: format!("Knowledge installed with assistant `{name}`."),
-        source: KnowledgeBaseSource::Local { path: root.clone() },
-        embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-        dream_model: None,
-        dream_schedule: None,
-        trust_required: false,
-        merge_policy: KnowledgeBaseMergePolicy::Auto,
-    };
+    let entry = KnowledgeBaseRegistryEntry::new(
+        format!("assistant-{}", config.installation_id),
+        format!("Assistant: {name}"),
+        format!("Knowledge installed with assistant `{name}`."),
+        KnowledgeBaseSource::Local { path: root.clone() },
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    )
+    .with_host_attachment_identity(config.installation_id);
     Ok(Some(RegistryKnowledgeBase {
         entry,
         local: Some(RegistryLocalKb {
@@ -1497,7 +1507,7 @@ async fn assistant_knowledge_registry_entry(
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
-    if entry.attachment_id.is_nil() {
+    if entry.attachment_id().is_nil() {
         bail!("knowledge base attachment IDs must not be nil");
     }
     if entry.id.is_empty()
@@ -1729,7 +1739,7 @@ async fn retrieve_undreamed_session_hits(
             .db
             .knowledge_dream_watermark(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
                 project_uuid,
-                knowledge_base_attachment_id: bundle.entry.attachment_id,
+                knowledge_base_attachment_id: bundle.entry.attachment_id(),
             })
             .await?
         {
@@ -2079,6 +2089,49 @@ mod tests {
                 .hits
                 .iter()
                 .any(|hit| hit.session_id == ctx.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_kb_source_does_not_reuse_the_previous_dream_watermark() {
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let original = project_knowledge_registry_entry();
+        let mut replacement = original.clone();
+        replacement.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from(".cockpit/replacement-knowledge"),
+        };
+        let project_uuid = session
+            .db
+            .authoritative_project_uuid(&session.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_key = crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+            project_uuid,
+            knowledge_base_attachment_id: original.attachment_id(),
+        };
+        let replacement_key = crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+            project_uuid,
+            knowledge_base_attachment_id: replacement.attachment_id(),
+        };
+
+        assert_ne!(
+            original_key.knowledge_base_attachment_id,
+            replacement_key.knowledge_base_attachment_id
+        );
+        session
+            .db
+            .record_knowledge_dream_watermark(original_key, 100, 110)
+            .await
+            .unwrap();
+        assert!(
+            session
+                .db
+                .knowledge_dream_watermark(replacement_key)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -2507,20 +2560,19 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         let knowledge_root = tmp.path().join("available");
         write_bundle(&knowledge_root);
         let session = test_session(tmp.path()).await;
-        let available = KnowledgeBaseRegistryEntry {
-            attachment_id: uuid::Uuid::from_u128(0x10),
-            id: "available".to_string(),
-            name: "Available".to_string(),
-            description: "Available local knowledge".to_string(),
-            source: KnowledgeBaseSource::Local {
+        let available = KnowledgeBaseRegistryEntry::new(
+            "available".to_string(),
+            "Available".to_string(),
+            "Available local knowledge".to_string(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("available"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        };
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
         let mut missing = available.clone();
         missing.id = "missing".to_string();
         missing.name = "Missing".to_string();
@@ -2557,34 +2609,32 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         let knowledge_root = tmp.path().join("available");
         write_bundle(&knowledge_root);
         let session = test_session(tmp.path()).await;
-        let available = KnowledgeBaseRegistryEntry {
-            attachment_id: uuid::Uuid::from_u128(0x20),
-            id: "available".to_string(),
-            name: "Available".to_string(),
-            description: "Available local knowledge".to_string(),
-            source: KnowledgeBaseSource::Local {
+        let available = KnowledgeBaseRegistryEntry::new(
+            "available".to_string(),
+            "Available".to_string(),
+            "Available local knowledge".to_string(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("available"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        };
-        let remote = KnowledgeBaseRegistryEntry {
-            attachment_id: uuid::Uuid::from_u128(0x21),
-            id: "hosted".to_string(),
-            name: "Hosted".to_string(),
-            description: "Deferred hosted knowledge".to_string(),
-            source: KnowledgeBaseSource::Remote {
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let remote = KnowledgeBaseRegistryEntry::new(
+            "hosted".to_string(),
+            "Hosted".to_string(),
+            "Deferred hosted knowledge".to_string(),
+            KnowledgeBaseSource::Remote {
                 url: "https://knowledge.example.test".to_string(),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::RemoteOwned,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        };
+            KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
         let extended = ExtendedConfig {
             knowledge_bases: vec![available, remote],
             ..Default::default()
@@ -2608,7 +2658,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         fs::write(
             tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"attachmentId":"00000000-0000-0000-0000-000000000010","id":"available","name":"Available","description":"Available local knowledge","source":{"kind":"local","path":"available"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"},{"attachmentId":"00000000-0000-0000-0000-000000000011","id":"hosted","name":"Hosted","description":"Deferred hosted knowledge","source":{"kind":"remote","url":"https://knowledge.example.test"},"embeddingOwnership":"remote-owned","trustRequired":false,"mergePolicy":"auto"}]}"#,
+            r#"{"knowledgeBases":[{"id":"available","name":"Available","description":"Available local knowledge","source":{"kind":"local","path":"available"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"},{"id":"hosted","name":"Hosted","description":"Deferred hosted knowledge","source":{"kind":"remote","url":"https://knowledge.example.test"},"embeddingOwnership":"remote-owned","trustRequired":false,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
         assert!(
@@ -2650,7 +2700,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         fs::write(
             tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"attachmentId":"00000000-0000-0000-0000-000000000001","id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
@@ -2705,20 +2755,19 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     fn project_knowledge_registry_entry() -> KnowledgeBaseRegistryEntry {
-        KnowledgeBaseRegistryEntry {
-            attachment_id: uuid::Uuid::from_u128(1),
-            id: "project".to_string(),
-            name: "Project".to_string(),
-            description: "Workspace project knowledge".to_string(),
-            source: KnowledgeBaseSource::Local {
+        KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from(".cockpit/knowledge"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: true,
-            merge_policy: crate::config::extended::KnowledgeBaseMergePolicy::Auto,
-        }
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            true,
+            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+        )
     }
 
     async fn test_session(root: &Path) -> Session {

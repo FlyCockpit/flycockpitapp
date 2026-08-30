@@ -3237,8 +3237,9 @@ CREATE INDEX session_fts_docs_session_idx
 -- durably folded every session in that project through the timestamp into the
 -- attachment. Retrieval never writes this table: it uses the watermark to
 -- bound its fresh-session fallback to sessions that may not have been dreamed
--- yet. `knowledge_base_attachment_id` is a config-owned UUID, deliberately
--- distinct from the user-configured, workspace-local registry `id`.
+-- yet. `knowledge_base_attachment_id` is a source-derived UUID (or a
+-- host-installer UUID), deliberately distinct from the user-configured,
+-- workspace-local registry `id`.
 CREATE TABLE knowledge_dream_ledger (
     project_uuid BLOB NOT NULL CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16

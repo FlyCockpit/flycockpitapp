@@ -14,9 +14,10 @@ use crate::db::Db;
 
 /// The durable identity of a concrete KB attachment in one project.
 ///
-/// `knowledge_base_attachment_id` is an immutable UUID from the workspace KB
-/// registry. It is intentionally not the user-configured registry name: a
-/// replacement attachment receives a new UUID even if it reuses that name.
+/// `knowledge_base_attachment_id` is an immutable UUID derived from a
+/// workspace KB's concrete source (or assigned by a host-owned installer). It
+/// is intentionally not the user-configured registry name: a replacement
+/// source receives a new UUID even if it reuses that name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnowledgeDreamLedgerKey {
     pub project_uuid: [u8; 16],

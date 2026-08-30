@@ -75,32 +75,32 @@ async fn run_knowledge_dream_all_reports_a_failed_kb_and_continues_in_config_ord
         KnowledgeBaseSource,
     };
 
-    let unusable_local = KnowledgeBaseRegistryEntry {
-        id: "unusable-local".to_string(),
-        name: "Unusable local".to_string(),
-        description: "Has no configured dream model".to_string(),
-        source: KnowledgeBaseSource::Local {
+    let unusable_local = KnowledgeBaseRegistryEntry::new(
+        "unusable-local".to_string(),
+        "Unusable local".to_string(),
+        "Has no configured dream model".to_string(),
+        KnowledgeBaseSource::Local {
             path: "knowledge".into(),
         },
-        embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-        dream_model: None,
-        dream_schedule: None,
-        trust_required: false,
-        merge_policy: KnowledgeBaseMergePolicy::Auto,
-    };
-    let hosted = KnowledgeBaseRegistryEntry {
-        id: "hosted".to_string(),
-        name: "Hosted".to_string(),
-        description: "Deferred hosted execution".to_string(),
-        source: KnowledgeBaseSource::Remote {
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    );
+    let hosted = KnowledgeBaseRegistryEntry::new(
+        "hosted".to_string(),
+        "Hosted".to_string(),
+        "Deferred hosted execution".to_string(),
+        KnowledgeBaseSource::Remote {
             url: "https://knowledge.example.test".to_string(),
         },
-        embedding_ownership: KnowledgeBaseEmbeddingOwnership::RemoteOwned,
-        dream_model: None,
-        dream_schedule: None,
-        trust_required: false,
-        merge_policy: KnowledgeBaseMergePolicy::Auto,
-    };
+        KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    );
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         stub_providers_config(),
         crate::config::extended::ExtendedConfig {

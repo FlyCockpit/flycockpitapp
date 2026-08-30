@@ -9,14 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -219,15 +219,18 @@ fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
 
 /// Process-wide ownership of a KB while a provider call is in flight.
 ///
-/// This fence is deliberately independent of either SQLite sidecar. Generated
-/// files may be deleted and recreated, including while an embedding request is
-/// in flight, so locking one of their inodes would let two daemons acquire
-/// different locks. Unix locks the canonical KB directory; Windows uses a
-/// named kernel mutex derived from that canonical directory. Both identities
-/// survive replacement of `embeddings.sqlite` and avoid locking SQLite data.
+/// This fence is deliberately independent of either SQLite sidecar *and* the
+/// replaceable KB directory. Generated files and the entire KB root may be
+/// replaced while an embedding request is in flight. The Unix fence is a
+/// stable, private lock outside the KB, keyed by its canonical pathname; the
+/// retained directory descriptor separately anchors every Unix sidecar read
+/// and publish to the root that was present when ownership began. Windows uses
+/// a named kernel mutex derived from the canonical pathname.
 struct SidecarProcessLock {
     #[cfg(unix)]
     directory: fs::File,
+    #[cfg(unix)]
+    fence: fs::File,
     #[cfg(windows)]
     mutex: std::os::windows::io::OwnedHandle,
 }
@@ -235,14 +238,38 @@ struct SidecarProcessLock {
 impl SidecarProcessLock {
     #[cfg(unix)]
     fn try_acquire(sidecars: &KbSidecars) -> Result<Option<Self>> {
-        let directory = fs::File::open(sidecars.root()).with_context(|| {
-            format!(
-                "opening knowledge base directory for process lock {}",
-                sidecars.root().display()
-            )
-        })?;
-        match try_lock_sidecar_directory(&directory)? {
-            true => Ok(Some(Self { directory })),
+        let directory = cockpit_config::config::open_config_directory_nofollow(sidecars.root())
+            .with_context(|| {
+                format!(
+                    "retaining knowledge base directory for process lock {}",
+                    sidecars.root().display()
+                )
+            })?;
+        let lock_dir =
+            cockpit_config::config::resolve::cockpit_state_dir()?.join("knowledge-sidecar-locks");
+        cockpit_host::private_fs::ensure_private_dir(&lock_dir)
+            .map_err(anyhow::Error::from)
+            .context("preparing private knowledge sidecar lock directory")?;
+        let identity = sidecars.root().as_os_str().as_encoded_bytes();
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(identity);
+        let leaf = format!(
+            "{}.lock",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let fence = cockpit_host::private_fs::open_private_file_at(
+            &lock_dir,
+            std::ffi::OsStr::new(&leaf),
+            cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
+            "knowledge sidecar process lock",
+        )
+        .map_err(anyhow::Error::from)
+        .context("opening stable knowledge sidecar process lock")?;
+        match try_lock_sidecar_fence(&fence)? {
+            true => Ok(Some(Self { directory, fence })),
             false => Ok(None),
         }
     }
@@ -293,7 +320,7 @@ impl SidecarProcessLock {
 impl Drop for SidecarProcessLock {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Err(error) = unlock_sidecar_directory(&self.directory) {
+        if let Err(error) = unlock_sidecar_fence(&self.fence) {
             tracing::warn!(%error, "releasing knowledge sidecar process lock failed");
         }
         #[cfg(windows)]
@@ -320,28 +347,28 @@ async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarPr
 }
 
 #[cfg(unix)]
-fn try_lock_sidecar_directory(directory: &fs::File) -> Result<bool> {
+fn try_lock_sidecar_fence(fence: &fs::File) -> Result<bool> {
     use std::os::fd::AsRawFd;
 
-    // SAFETY: `directory` stays open for the lifetime of SidecarProcessLock.
+    // SAFETY: `fence` stays open for the lifetime of SidecarProcessLock.
     // flock is advisory, non-blocking, and operates on this valid descriptor.
-    let rc = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         return Ok(true);
     }
     let error = io::Error::last_os_error();
     match error.kind() {
         io::ErrorKind::WouldBlock => Ok(false),
-        _ => Err(error).context("locking knowledge base directory"),
+        _ => Err(error).context("locking stable knowledge sidecar fence"),
     }
 }
 
 #[cfg(unix)]
-fn unlock_sidecar_directory(directory: &fs::File) -> io::Result<()> {
+fn unlock_sidecar_fence(fence: &fs::File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: this is the matching unlock for a lock acquired on `directory`.
-    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) } == 0 {
+    if unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_UN) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -1034,8 +1061,9 @@ impl KnowledgeIndex {
         Self::open_snapshot_locked(bundle, sidecars, embedder, query_dimensions).await
     }
 
-    /// Caller must hold the per-KB sidecar lock. No SQLite connection crosses
-    /// the await in `sync_embeddings`, so this remains valid in KbProvider's
+    /// Caller must hold the per-KB sidecar lock. SQLite receives only verified
+    /// sidecar bytes and runs in memory; no SQLite connection crosses the
+    /// await in `sync_embeddings`, so this remains valid in KbProvider's
     /// required Send future.
     async fn open_snapshot_locked(
         bundle: KnowledgeBundle,
@@ -1048,20 +1076,23 @@ impl KnowledgeIndex {
         // by the caller and makes different daemon data directories serialize
         // their paid work against the same external KB. It also serializes the
         // Git exclusion update before either sidecar can be opened.
-        let _process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
         ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
-        let index = open_index_connection(&sidecars.index)?;
+        let index = open_index_connection(&sidecars.index, &process_lock)?;
         ensure_index_schema(&index)?;
         rebuild_index(&index, &bundle)?;
+        persist_private_sidecar_connection(&index, &sidecars.index, &process_lock)?;
         let stats = sync_embeddings(
             &sidecars.embeddings,
+            &process_lock,
             &bundle,
             embedder.as_ref(),
             query_dimensions,
         )
         .await?;
-        let embeddings = open_embeddings_connection(&sidecars.embeddings)?;
+        let embeddings = open_embeddings_connection(&sidecars.embeddings, &process_lock)?;
         ensure_embeddings_schema(&embeddings)?;
+        persist_private_sidecar_connection(&embeddings, &sidecars.embeddings, &process_lock)?;
         Ok((
             Self {
                 bundle,
@@ -1094,41 +1125,107 @@ impl KnowledgeIndex {
     }
 }
 
-fn open_private_sidecar_file(sidecar: &Path, label: &str) -> Result<fs::File> {
-    if !sidecar.exists() {
-        match cockpit_host::private_fs::write_private_file_exclusive(sidecar, b"") {
-            Ok(()) => {}
-            Err(error) if sidecar.exists() => {
-                cockpit_host::private_fs::repair_private_file(sidecar, label)
-                    .map_err(anyhow::Error::from)
-                    .context("securing concurrently-created knowledge sidecar")?;
-                tracing::debug!(%error, "knowledge sidecar was created concurrently");
-            }
-            Err(error) => return Err(error).context("creating private knowledge sidecar"),
-        }
-    } else {
-        cockpit_host::private_fs::repair_private_file(sidecar, label)
-            .map_err(anyhow::Error::from)?;
+fn read_private_sidecar_bytes(
+    sidecar: &Path,
+    label: &str,
+    process_lock: &SidecarProcessLock,
+) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        let name = sidecar
+            .file_name()
+            .context("knowledge sidecar has no file name")?;
+        let mut file = cockpit_host::private_fs::open_private_file_in_dir_fd(
+            &process_lock.directory,
+            name,
+            cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
+            label,
+        )
+        .map_err(anyhow::Error::from)
+        .context("opening retained private knowledge sidecar")?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("reading knowledge sidecar {label}"))?;
+        return Ok(bytes);
     }
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(sidecar)
-        .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))
+    #[cfg(not(unix))]
+    {
+        let _ = process_lock;
+        if !sidecar.exists() {
+            match cockpit_host::private_fs::write_private_file_exclusive(sidecar, b"") {
+                Ok(()) => {}
+                Err(error) if sidecar.exists() => {
+                    cockpit_host::private_fs::repair_private_file(sidecar, label)
+                        .map_err(anyhow::Error::from)
+                        .context("securing concurrently-created knowledge sidecar")?;
+                    tracing::debug!(%error, "knowledge sidecar was created concurrently");
+                }
+                Err(error) => return Err(error).context("creating private knowledge sidecar"),
+            }
+        } else {
+            cockpit_host::private_fs::repair_private_file(sidecar, label)
+                .map_err(anyhow::Error::from)?;
+        }
+        cockpit_host::private_fs::read_private_file(sidecar, label)
+            .map_err(anyhow::Error::from)?
+            .context("knowledge sidecar disappeared before its verified read")
+    }
 }
 
-fn open_private_sidecar_connection(sidecar: &Path, label: &str) -> Result<Connection> {
-    let _file = open_private_sidecar_file(sidecar, label)?;
-    Connection::open(sidecar)
-        .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))
+fn open_private_sidecar_connection(
+    sidecar: &Path,
+    label: &str,
+    process_lock: &SidecarProcessLock,
+) -> Result<Connection> {
+    let bytes = read_private_sidecar_bytes(sidecar, label, process_lock)?;
+    let mut conn = Connection::open_in_memory().context("opening in-memory knowledge sidecar")?;
+    if !bytes.is_empty() {
+        conn.deserialize_read_exact(MAIN_DB, bytes.as_slice(), bytes.len(), false)
+            .with_context(|| format!("loading verified knowledge sidecar {}", sidecar.display()))?;
+    }
+    Ok(conn)
 }
 
-fn open_index_connection(sidecar: &Path) -> Result<Connection> {
-    open_private_sidecar_connection(sidecar, "knowledge index sidecar")
+fn persist_private_sidecar_connection(
+    conn: &Connection,
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+) -> Result<()> {
+    let bytes = conn
+        .serialize(MAIN_DB)
+        .with_context(|| format!("serializing knowledge sidecar {}", sidecar.display()))?;
+    #[cfg(unix)]
+    {
+        let name = sidecar
+            .file_name()
+            .context("knowledge sidecar has no file name")?;
+        cockpit_host::private_fs::write_private_file_in_dir_fd(
+            &process_lock.directory,
+            name,
+            sidecar,
+            &bytes,
+        )
+        .with_context(|| format!("publishing knowledge sidecar {}", sidecar.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process_lock;
+        cockpit_host::private_fs::write_private_file(sidecar, &bytes)
+            .with_context(|| format!("publishing knowledge sidecar {}", sidecar.display()))?;
+    }
+    Ok(())
 }
 
-fn open_embeddings_connection(sidecar: &Path) -> Result<Connection> {
-    let conn = open_private_sidecar_connection(sidecar, "knowledge embeddings sidecar")?;
+fn open_index_connection(sidecar: &Path, process_lock: &SidecarProcessLock) -> Result<Connection> {
+    open_private_sidecar_connection(sidecar, "knowledge index sidecar", process_lock)
+}
+
+fn open_embeddings_connection(
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+) -> Result<Connection> {
+    let conn =
+        open_private_sidecar_connection(sidecar, "knowledge embeddings sidecar", process_lock)?;
     load_sqlite_vec_for_sidecar(&conn)?;
     Ok(conn)
 }
@@ -1524,6 +1621,7 @@ fn insert_structured_row(
 
 async fn sync_embeddings(
     sidecar: &Path,
+    process_lock: &SidecarProcessLock,
     bundle: &KnowledgeBundle,
     embedder: &dyn Embedder,
     query_dimensions: Option<usize>,
@@ -1537,7 +1635,13 @@ async fn sync_embeddings(
         }
     }
     let model_identity = embedder.identity();
-    let prepared = prepare_embedding_sync(sidecar, &chunks, &model_identity, query_dimensions)?;
+    let prepared = prepare_embedding_sync(
+        sidecar,
+        process_lock,
+        &chunks,
+        &model_identity,
+        query_dimensions,
+    )?;
     let reused_files = if prepared.reset {
         0
     } else {
@@ -1558,11 +1662,13 @@ async fn sync_embeddings(
             indexed_files: 0,
         });
     }
-    // All SQLite connections were dropped by prepare_embedding_sync before the
-    // awaited paid call. The caller's per-KB mutex owns this work interval.
+    // All in-memory SQLite connections were dropped by prepare_embedding_sync
+    // before the awaited paid call. The caller's per-KB mutex owns this work
+    // interval.
     let vectors = embed_chunks(&prepared.missing, embedder, query_dimensions).await?;
     store_embeddings(
         sidecar,
+        process_lock,
         &prepared.missing,
         vectors,
         prepared.reset,
@@ -1582,11 +1688,12 @@ struct PreparedEmbeddingSync {
 
 fn prepare_embedding_sync(
     sidecar: &Path,
+    process_lock: &SidecarProcessLock,
     chunks: &BTreeMap<String, String>,
     model_identity: &str,
     query_dimensions: Option<usize>,
 ) -> Result<PreparedEmbeddingSync> {
-    let conn = open_embeddings_connection(sidecar)?;
+    let conn = open_embeddings_connection(sidecar, process_lock)?;
     ensure_embeddings_schema(&conn)?;
     let stored_model = stored_embedding_model_identity(&conn)?;
     let model_changed = match stored_model {
@@ -1661,12 +1768,13 @@ async fn embed_chunks(
 
 fn store_embeddings(
     sidecar: &Path,
+    process_lock: &SidecarProcessLock,
     chunks: &BTreeMap<String, String>,
     vectors: Vec<Vec<f32>>,
     reset: bool,
     model_identity: &str,
 ) -> Result<()> {
-    let conn = open_embeddings_connection(sidecar)?;
+    let conn = open_embeddings_connection(sidecar, process_lock)?;
     ensure_embeddings_schema(&conn)?;
     let tx = conn.unchecked_transaction()?;
     if reset {
@@ -1689,6 +1797,7 @@ fn store_embeddings(
         .context("inserting sqlite-vec knowledge vector")?;
     }
     tx.commit()?;
+    persist_private_sidecar_connection(&conn, sidecar, process_lock)?;
     Ok(())
 }
 
@@ -3026,29 +3135,67 @@ timestamp: 2026-08-29T12:00:00Z
 
     #[cfg(unix)]
     #[test]
-    fn process_lock_survives_embeddings_sidecar_replacement() {
+    fn process_lock_survives_knowledge_root_replacement() {
         let tmp = TempDir::new().unwrap();
-        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let root = tmp.path().join("knowledge");
+        fs::create_dir(&root).unwrap();
+        let sidecars = KbSidecars::in_root(&root).canonicalized().unwrap();
         let first = SidecarProcessLock::try_acquire(&sidecars)
             .unwrap()
-            .expect("first owner acquires the KB-directory lock");
+            .expect("first owner acquires the stable KB fence");
 
-        fs::write(&sidecars.embeddings, b"old database identity").unwrap();
-        fs::remove_file(&sidecars.embeddings).unwrap();
-        fs::write(&sidecars.embeddings, b"replacement database identity").unwrap();
+        let displaced = tmp.path().join("knowledge-displaced");
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement = KbSidecars::in_root(&root).canonicalized().unwrap();
 
         assert!(
-            SidecarProcessLock::try_acquire(&sidecars)
+            SidecarProcessLock::try_acquire(&replacement)
                 .unwrap()
                 .is_none(),
-            "replacement of embeddings.sqlite must not create a second lock domain"
+            "replacement of the KB directory must not create a second lock domain"
         );
+        cockpit_host::private_fs::write_private_file_in_dir_fd(
+            &first.directory,
+            std::ffi::OsStr::new(EMBEDDINGS_FILE),
+            &sidecars.embeddings,
+            b"old root only",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(displaced.join(EMBEDDINGS_FILE)).unwrap(),
+            b"old root only"
+        );
+        assert!(!replacement.embeddings.exists());
         drop(first);
         assert!(
-            SidecarProcessLock::try_acquire(&sidecars)
+            SidecarProcessLock::try_acquire(&replacement)
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_connection_never_reopens_a_replaced_pathname() {
+        let tmp = TempDir::new().unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let lock = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("first owner acquires the stable KB fence");
+        let conn = open_index_connection(&sidecars.index, &lock).unwrap();
+
+        fs::remove_file(&sidecars.index).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("attacker.sqlite"), &sidecars.index).unwrap();
+
+        // This schema mutation is strictly in memory. Persistence re-checks
+        // the destination through the retained root and fails closed rather
+        // than letting SQLite reopen the replacement symlink.
+        conn.execute_batch("CREATE TABLE retained_identity_test (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let error = persist_private_sidecar_connection(&conn, &sidecars.index, &lock).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(!tmp.path().join("attacker.sqlite").exists());
     }
 
     #[cfg(windows)]
@@ -3059,7 +3206,7 @@ timestamp: 2026-08-29T12:00:00Z
         let _lock = SidecarProcessLock::try_acquire(&sidecars)
             .unwrap()
             .expect("first owner acquires the named mutex");
-        let conn = open_embeddings_connection(&sidecars.embeddings).unwrap();
+        let conn = open_embeddings_connection(&sidecars.embeddings, &_lock).unwrap();
         ensure_embeddings_schema(&conn).unwrap();
         conn.execute(
             "INSERT INTO embedding_meta(key, value) VALUES('lock-test', 'ok')",

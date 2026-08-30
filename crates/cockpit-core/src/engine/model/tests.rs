@@ -131,11 +131,11 @@ async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_
             &tools,
             params.clone(),
             "Build",
+            None,
+            &cancel,
             Some(EndpointRecoveryContext {
                 approve: std::sync::Arc::new(|_| Box::pin(async { true })),
             }),
-            &cancel,
-            None,
         )
         .await
         .expect("foreground request");

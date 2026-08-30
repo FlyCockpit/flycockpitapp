@@ -313,6 +313,26 @@ enum RepeatCallAuthorization {
     ConfirmationDenied { consecutive: u32 },
 }
 
+/// Verification outcomes after the automatic-projection escalation has been
+/// resolved through the user approval boundary. Keeping this separate from
+/// `VerificationOutcome` makes it impossible for the host-effect dispatch
+/// match below to accidentally bypass an unresolved escalation.
+enum DispatchVerificationOutcome {
+    Skip,
+    DispatchOriginal {
+        plan: crate::engine::verification::intercept::VerificationDispatchPlan,
+    },
+    Block {
+        message: String,
+        operation_id: Option<uuid::Uuid>,
+    },
+    Revise {
+        args: serde_json::Value,
+        disclosure: String,
+        plan: crate::engine::verification::intercept::VerificationDispatchPlan,
+    },
+}
+
 fn verification_host_settlement(
     hard_fail: bool,
     host_effect_unknown: bool,
@@ -344,7 +364,7 @@ async fn cancel_replayed_reserved_dispatch(
     session: &Session,
     memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
 ) -> Result<()> {
-    let Some(memo) = memo.filter(replay_memo_has_reserved_dispatch) else {
+    let Some(memo) = memo.filter(|memo| replay_memo_has_reserved_dispatch(memo)) else {
         return Ok(());
     };
     cancel_verification_dispatch_no_submission(
@@ -1445,7 +1465,7 @@ async fn execute_ordinary_call_unscoped(
                 };
                 match decision {
                     Ok(crate::approval::Decision::Allow { .. }) => {
-                        crate::engine::verification::VerificationOutcome::DispatchOriginal { plan }
+                        DispatchVerificationOutcome::DispatchOriginal { plan }
                     }
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         return (Err(crate::engine::interrupt::InterruptParked.into()), 0);
@@ -1466,17 +1486,38 @@ async fn execute_ordinary_call_unscoped(
                         // ordinary verification block. Preserve its observer
                         // audit after the rejected tool result is durable.
                         permission_denied_kind = Some("blocked_verification");
-                        crate::engine::verification::VerificationOutcome::Block {
+                        DispatchVerificationOutcome::Block {
                             message: "verification could not safely project this action for automatic approval and the user declined to run it manually; revise and re-emit".into(),
                             operation_id: Some(operation_id),
                         }
                     }
                 }
             }
-            outcome => outcome,
+            crate::engine::verification::VerificationOutcome::Skip => {
+                DispatchVerificationOutcome::Skip
+            }
+            crate::engine::verification::VerificationOutcome::DispatchOriginal { plan } => {
+                DispatchVerificationOutcome::DispatchOriginal { plan }
+            }
+            crate::engine::verification::VerificationOutcome::Block {
+                message,
+                operation_id,
+            } => DispatchVerificationOutcome::Block {
+                message,
+                operation_id,
+            },
+            crate::engine::verification::VerificationOutcome::Revise {
+                args,
+                disclosure,
+                plan,
+            } => DispatchVerificationOutcome::Revise {
+                args,
+                disclosure,
+                plan,
+            },
         };
         match verification {
-            crate::engine::verification::VerificationOutcome::Block {
+            DispatchVerificationOutcome::Block {
                 message,
                 operation_id,
             } => {
@@ -1494,7 +1535,7 @@ async fn execute_ordinary_call_unscoped(
                 }
                 (Err(invalid_input(message)), 0)
             }
-            crate::engine::verification::VerificationOutcome::Revise {
+            DispatchVerificationOutcome::Revise {
                 args: revised_args,
                 disclosure,
                 mut plan,
@@ -1646,7 +1687,7 @@ async fn execute_ordinary_call_unscoped(
                     }
                 }
             }
-            crate::engine::verification::VerificationOutcome::Skip => {
+            DispatchVerificationOutcome::Skip => {
                 tool_was_dispatched = true;
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                     dispatch_one_timed(
@@ -1660,7 +1701,7 @@ async fn execute_ordinary_call_unscoped(
                 })
                 .await
             }
-            crate::engine::verification::VerificationOutcome::DispatchOriginal { mut plan } => {
+            DispatchVerificationOutcome::DispatchOriginal { mut plan } => {
                 let operation_id = plan.operation_id;
                 let attempt = match env
                     .session

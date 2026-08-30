@@ -211,7 +211,7 @@ fn file_write_projection(args: &Value, edit: bool) -> Result<(Value, Value)> {
             Ok(json!({
                 "field": field,
                 "bytes": value.len(),
-                "sha256": format!("{:x}", Sha256::digest(value.as_bytes())),
+                "sha256": crate::intel::hex_lower(&Sha256::digest(value.as_bytes())),
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -254,7 +254,7 @@ fn plan_document_projection(args: &Value, edit: bool) -> Result<(Value, Value)> 
             Ok(json!({
                 "field": field,
                 "bytes": value.len(),
-                "sha256": format!("{:x}", Sha256::digest(value.as_bytes())),
+                "sha256": crate::intel::hex_lower(&Sha256::digest(value.as_bytes())),
             }))
         })
         .collect::<Result<Vec<_>>>()?;

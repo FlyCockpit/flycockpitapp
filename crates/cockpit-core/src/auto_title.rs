@@ -472,7 +472,7 @@ pub(crate) async fn generate_session_metadata_fork(
             completion = model.complete_captured_with_sealed_egress(
                 &system,
                 &history,
-                prompt,
+                prompt.clone(),
                 &tools,
                 params.clone(),
                 &agent_name,

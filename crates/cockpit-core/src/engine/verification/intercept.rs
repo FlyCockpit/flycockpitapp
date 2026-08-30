@@ -38,7 +38,7 @@ use super::{
         CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set,
         input_cost_microusd,
     },
-    generate::{CollectionInput, collect_candidates},
+    generate::{CollectedCandidate, CollectionInput, collect_candidates},
     recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target},
 };
 

@@ -1160,16 +1160,23 @@ pub(crate) async fn inject_knowledge_for_turn(
     history: &mut Vec<Message>,
     session: &Session,
     cwd: &Path,
-    agent_name: &str,
+    definition: Option<&crate::agents::AgentDef>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     query: &str,
     redact: Arc<RedactionTable>,
 ) {
     let extended = config.extended();
-    let bundles = match attached_bundles(session, cwd, agent_name, &extended).await {
+    let bundles = match attached_bundles(
+        session,
+        cwd,
+        definition.and_then(crate::agents::AgentDef::allowed_knowledge_bases),
+        &extended,
+    )
+    .await
+    {
         Ok(bundles) => bundles,
         Err(error) => {
-            tracing::warn!(%error, "refusing knowledge injection because assistant authority validation failed");
+            tracing::warn!(%error, "refusing knowledge injection because knowledge attachment resolution failed");
             return;
         }
     };
@@ -1267,11 +1274,11 @@ async fn retrieve_from_knowledge_bases(
 pub(crate) async fn attached_bundles_available(
     session: &Session,
     cwd: &Path,
-    agent_name: &str,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> bool {
     let extended = config.extended();
-    match attached_bundles(session, cwd, agent_name, &extended).await {
+    match attached_bundles(session, cwd, allowed_knowledge_bases, &extended).await {
         Ok(bundles) => {
             let mut available = false;
             for knowledge_base in bundles {
@@ -1310,13 +1317,9 @@ pub(crate) async fn attached_bundles_available(
 pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
-    agent_name: &str,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
     extended: &ExtendedConfig,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
-    let allowed = crate::agents::resolve_with_assistant_db(cwd, agent_name, &session.db)
-        .await?
-        .and_then(|agent| agent.vnext)
-        .and_then(|vnext| vnext.allowed_knowledge_bases);
     let mut seen = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
@@ -1338,7 +1341,7 @@ pub(crate) async fn attached_bundles(
                 entry.id
             );
         }
-        if allowed.as_ref().is_some_and(|ids| !ids.contains(&entry.id)) {
+        if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
         if entry.trust_required
@@ -1558,17 +1561,27 @@ pub(crate) async fn with_memory_search_if_attached(
     toolbox: crate::engine::tool::ToolBox,
     session: &Session,
     cwd: &Path,
-    agent_name: &str,
+    definition: Option<&crate::agents::AgentDef>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> crate::engine::tool::ToolBox {
-    if attached_bundles_available(session, cwd, agent_name, config).await {
-        toolbox.with(Arc::new(MemorySearchTool))
+    let allowed_knowledge_bases = definition
+        .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+        .cloned();
+    if attached_bundles_available(session, cwd, allowed_knowledge_bases.as_ref(), config).await {
+        toolbox.with(Arc::new(MemorySearchTool {
+            allowed_knowledge_bases,
+        }))
     } else {
         toolbox.without(MEMORY_SEARCH_TOOL_NAME)
     }
 }
 
-pub(crate) struct MemorySearchTool;
+/// A turn-toolbox instance binds the executing agent definition's KB
+/// restriction.  The tool can therefore refresh workspace configuration at
+/// call time without re-resolving a mutable, same-named agent definition.
+pub(crate) struct MemorySearchTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
 
 #[derive(Debug, Deserialize)]
 struct MemorySearchArgs {
@@ -1612,7 +1625,13 @@ impl Tool for MemorySearchTool {
             return Err(invalid_input("memory_search query must not be empty"));
         }
         let extended = ctx.config.extended();
-        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &ctx.agent_id, &extended).await?;
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+        )
+        .await?;
         if bundles.is_empty() {
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
@@ -1995,7 +2014,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         };
 
         assert!(
-            attached_bundles(&session, tmp.path(), "test", &extended)
+            attached_bundles(&session, tmp.path(), None, &extended)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2005,14 +2024,14 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             WorkspaceTrustMode::Untrusted,
         );
         assert!(
-            attached_bundles(&session, tmp.path(), "test", &extended)
+            attached_bundles(&session, tmp.path(), None, &extended)
                 .await
                 .unwrap()
                 .is_empty()
         );
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
         assert_eq!(
-            attached_bundles(&session, tmp.path(), "test", &extended)
+            attached_bundles(&session, tmp.path(), None, &extended)
                 .await
                 .unwrap()
                 .len(),
@@ -2022,17 +2041,13 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[tokio::test]
-    async fn executing_agent_allow_list_restricts_workspace_knowledge_registry() {
+    async fn executing_definition_snapshot_restricts_workspace_knowledge_registry() {
         let _env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
-        session.set_active_agent("Build").unwrap();
         let mut agent = crate::agents::embedded_default("Plan").unwrap();
         agent.vnext.as_mut().unwrap().allowed_knowledge_bases =
             Some(BTreeSet::from(["project".to_string()]));
-        let agent_dir = tmp.path().join(".cockpit/agents");
-        fs::create_dir_all(&agent_dir).unwrap();
-        fs::write(agent_dir.join("Plan.md"), agent.to_markdown().unwrap()).unwrap();
 
         let mut project = project_knowledge_registry_entry();
         project.trust_required = false;
@@ -2047,9 +2062,16 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        let attached = attached_bundles(&session, tmp.path(), "Plan", &extended)
-            .await
-            .unwrap();
+        // This value comes from the executing agent's definition snapshot;
+        // selection therefore does not require name-based re-resolution.
+        let attached = attached_bundles(
+            &session,
+            tmp.path(),
+            agent.allowed_knowledge_bases(),
+            &extended,
+        )
+        .await
+        .unwrap();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].entry.id, "project");
     }
@@ -2084,14 +2106,9 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         )
         .unwrap();
 
-        let attached = attached_bundles(
-            &session,
-            tmp.path(),
-            "helper-bot",
-            &ExtendedConfig::default(),
-        )
-        .await
-        .unwrap();
+        let attached = attached_bundles(&session, tmp.path(), None, &ExtendedConfig::default())
+            .await
+            .unwrap();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].entry.id, format!("assistant-{installation_id}"));
         assert!(
@@ -2153,7 +2170,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        let attached = attached_bundles(&session, tmp.path(), "test", &extended)
+        let attached = attached_bundles(&session, tmp.path(), None, &extended)
             .await
             .unwrap();
         let results = retrieve_from_knowledge_bases(
@@ -2209,7 +2226,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        let attached = attached_bundles(&session, tmp.path(), "test", &extended)
+        let attached = attached_bundles(&session, tmp.path(), None, &extended)
             .await
             .unwrap();
         let error = retrieve_from_knowledge_bases(
@@ -2234,7 +2251,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             !attached_bundles_available(
                 &session,
                 tmp.path(),
-                "test",
+                None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
                 )
@@ -2255,7 +2272,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 base.clone(),
                 &session,
                 tmp.path(),
-                "test",
+                None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
                 )
@@ -2278,7 +2295,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 base,
                 &session,
                 tmp.path(),
-                "test",
+                None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
                 )

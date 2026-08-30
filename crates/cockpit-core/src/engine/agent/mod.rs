@@ -476,7 +476,7 @@ pub(crate) async fn turn_toolbox(
         toolbox,
         session,
         cwd,
-        &agent.name,
+        agent.definition.as_deref(),
         config,
     )
     .await;

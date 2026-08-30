@@ -202,6 +202,10 @@ pub struct LifecycleResolution {
     pub owns_daemon: bool,
     pub socket: PathBuf,
     pub startup_notice: Option<String>,
+    /// The lifecycle host replaced an ephemeral owner while resolving this
+    /// request. This is an ownership transition, not presentation text: a
+    /// caller holding a client for the predecessor must reconnect.
+    pub promoted_from_ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1940,6 +1944,7 @@ mod tests {
                     owns_daemon: true,
                     socket: PathBuf::from("in-process"),
                     startup_notice: None,
+                    promoted_from_ephemeral: false,
                 }))
                 .is_ok()
         );

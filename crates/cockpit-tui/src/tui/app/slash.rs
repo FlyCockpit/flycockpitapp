@@ -1864,16 +1864,20 @@ impl App {
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::resolve_assistant_session_blocking(lifecycle, request)? {
-                (
-                    cockpit_proto::Response::AssistantSessionResolved { session, .. },
-                    promotion_notice,
-                ) => Ok(AsyncActionPayload::AssistantSessionResolved {
-                    session_id: session.session_id,
-                    source_session_id,
-                    promotion_notice,
-                }),
-                (other, _) => Err(format!("unexpected assistant response: {other:?}")),
+            move || {
+                let resolution =
+                    agent_runner::resolve_assistant_session_blocking(lifecycle, request)?;
+                match resolution.response {
+                    cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
+                        Ok(AsyncActionPayload::AssistantSessionResolved {
+                            session_id: session.session_id,
+                            source_session_id,
+                            startup_notice: resolution.startup_notice,
+                            promoted_from_ephemeral: resolution.promoted_from_ephemeral,
+                        })
+                    }
+                    other => Err(format!("unexpected assistant response: {other:?}")),
+                }
             },
         );
     }

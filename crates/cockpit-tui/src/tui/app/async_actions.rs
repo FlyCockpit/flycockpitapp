@@ -1605,11 +1605,22 @@ impl App {
                 Ok(AsyncActionPayload::AssistantSessionResolved {
                     session_id,
                     source_session_id,
-                    promotion_notice,
+                    startup_notice,
+                    promoted_from_ephemeral,
                 }) => {
                     if self.launch.session_id == source_session_id {
-                        if let Some(notice) = promotion_notice {
-                            self.show_toast(notice, ToastKind::Info);
+                        if let Some(notice) = startup_notice {
+                            // A lifecycle warning is independent of the
+                            // ownership transition below. Keep it in the
+                            // transcript so the required promotion toast
+                            // cannot overwrite it.
+                            self.push_plain(notice);
+                        }
+                        if promoted_from_ephemeral {
+                            self.show_toast(
+                                cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE,
+                                ToastKind::Info,
+                            );
                             // The prior runner was attached to the ephemeral
                             // owner that just exited. Reattach directly to the
                             // resolved persistent owner instead of asking that

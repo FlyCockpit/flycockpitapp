@@ -3,7 +3,9 @@
 //! Local wire framing and typed request/event transport live in
 //! `cockpit-client`; this module owns only process and daemon lifecycle.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -353,26 +355,38 @@ pub async fn ensure_assistant_persistent_daemon() -> Result<PersistentDaemonSess
 /// task; the TUI can request typed lifecycle policy but cannot probe, spawn,
 /// restart, or retain daemon process guards itself.
 pub async fn serve_lifecycle_requests(
-    mut requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
+    requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
 ) -> Result<()> {
+    serve_lifecycle_requests_with(requests, |request| -> LifecycleResolutionFuture<'_> {
+        Box::pin(async move {
+            let mode = mode_for_intent(request.intent);
+            let connected = probe_or_spawn_with_spawn_authorization(mode, Some(request)).await?;
+            Ok(lifecycle_resolution(connected))
+        })
+    })
+    .await
+}
+
+type LifecycleResolutionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<cockpit_client::LifecycleResolution>> + Send + 'a>>;
+
+/// Serialize lifecycle work while retaining each request's reply channel in
+/// the host. Keeping the loop separate from resolution lets terminal
+/// promotion failures prove that the host can accept the next request.
+async fn serve_lifecycle_requests_with<F>(
+    mut requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
+    mut resolve: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(&'a cockpit_client::LifecycleRequest) -> LifecycleResolutionFuture<'a>,
+{
     while let Some(request) = requests.recv().await {
         // A queued request may be cancelled before the lifecycle actor sees
         // it. Never spawn a daemon for a cancelled request.
         if request.is_cancelled() || request.reply.is_closed() {
             continue;
         }
-        let mode = mode_for_intent(request.intent);
-        let resolved = probe_or_spawn_with_spawn_authorization(mode, Some(&request))
-            .await
-            .map(|connected| cockpit_client::LifecycleResolution {
-                endpoint: connected.endpoint,
-                owns_daemon: connected.owns_daemon,
-                socket: connected.socket,
-                startup_notice: lifecycle_startup_notice(
-                    connected.startup_notice,
-                    connected.promoted_from_ephemeral,
-                ),
-            });
+        let resolved = resolve(&request).await;
         match resolved {
             Ok(resolution) => {
                 let _ = request.reply.send(Ok(resolution));
@@ -385,12 +399,14 @@ pub async fn serve_lifecycle_requests(
     Ok(())
 }
 
-fn lifecycle_startup_notice(
-    startup_notice: Option<String>,
-    promoted_from_ephemeral: bool,
-) -> Option<String> {
-    startup_notice
-        .or_else(|| promoted_from_ephemeral.then(|| ASSISTANT_PERSISTENCE_NOTICE.to_string()))
+fn lifecycle_resolution(connected: ConnectedDaemon) -> cockpit_client::LifecycleResolution {
+    cockpit_client::LifecycleResolution {
+        endpoint: connected.endpoint,
+        owns_daemon: connected.owns_daemon,
+        socket: connected.socket,
+        startup_notice: connected.startup_notice,
+        promoted_from_ephemeral: connected.promoted_from_ephemeral,
+    }
 }
 
 /// Test-support composition owned below frontends. TUI tests receive only the
@@ -457,6 +473,34 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
 async fn promote_ephemeral_owner(
     paths: &crate::daemon::DaemonPaths,
     lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+) -> Result<ConnectedDaemon> {
+    promote_ephemeral_owner_with_recovery_policy(
+        paths,
+        lifecycle_request,
+        PromotionRecoveryPolicy::production(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct PromotionRecoveryPolicy {
+    replacement_timeout: Duration,
+    predecessor_release_timeout: Duration,
+}
+
+impl PromotionRecoveryPolicy {
+    fn production() -> Self {
+        Self {
+            replacement_timeout: PROMOTION_REPLACEMENT_TIMEOUT,
+            predecessor_release_timeout: crate::daemon::restart_release_timeout(None),
+        }
+    }
+}
+
+async fn promote_ephemeral_owner_with_recovery_policy(
+    paths: &crate::daemon::DaemonPaths,
+    lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+    recovery: PromotionRecoveryPolicy,
 ) -> Result<ConnectedDaemon> {
     let mut current_paths = paths.clone();
     let mut spawn_permit = None;
@@ -639,12 +683,12 @@ async fn promote_ephemeral_owner(
         }
 
         replacement_required = true;
-        replacement_deadline = Some(std::time::Instant::now() + PROMOTION_REPLACEMENT_TIMEOUT);
+        replacement_deadline = Some(std::time::Instant::now() + recovery.replacement_timeout);
 
         if !crate::daemon::wait_for_restart_release(
             &current_paths,
             old_pid,
-            crate::daemon::restart_release_timeout(None),
+            recovery.predecessor_release_timeout,
         )
         .await
         {

@@ -3317,14 +3317,26 @@ fn daemon_request_blocking(
 /// Code and Computer session work uses the configured default lifetime; an
 /// Assistant is durable background work and therefore promotes an idle
 /// ephemeral owner before its session row is opened or created.
+pub(crate) struct AssistantSessionResolution {
+    pub(crate) response: Response,
+    pub(crate) startup_notice: Option<String>,
+    pub(crate) promoted_from_ephemeral: bool,
+}
+
 pub(crate) fn resolve_assistant_session_blocking(
     lifecycle: cockpit_client::LifecycleClient,
     request: Request,
-) -> Result<(Response, Option<String>), String> {
+) -> Result<AssistantSessionResolution, String> {
     #[cfg(test)]
     {
         let _ = lifecycle;
-        return crate::tui::settings::test_daemon_request(request).map(|response| (response, None));
+        return crate::tui::settings::test_daemon_request(request).map(|response| {
+            AssistantSessionResolution {
+                response,
+                startup_notice: None,
+                promoted_from_ephemeral: false,
+            }
+        });
     }
     #[cfg(not(test))]
     {
@@ -3343,10 +3355,11 @@ pub(crate) fn resolve_assistant_session_blocking(
                     .request_ok(request)
                     .await
                     .map_err(|error| format!("daemon request: {error}"))?;
-                let promotion_notice = resolved.startup_notice.filter(|notice| {
-                    notice == cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
-                });
-                Ok((response, promotion_notice))
+                Ok(AssistantSessionResolution {
+                    response,
+                    startup_notice: resolved.startup_notice,
+                    promoted_from_ephemeral: resolved.promoted_from_ephemeral,
+                })
             })
         })
     }

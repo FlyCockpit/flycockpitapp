@@ -312,16 +312,31 @@ impl PersistentDaemonSession {
     }
 }
 
-/// Require the canonical persistent daemon, promoting an idle ephemeral owner
-/// before spawning one when needed.
+/// Require the canonical persistent daemon, spawning one if needed.
 ///
 /// Product CLI commands that need installation state must go through this
 /// helper. Spawn failure is fail-closed: callers must not open SQLite.
 pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
-    let connected = probe_or_spawn(LifecycleMode::PromoteToPersistent).await?;
+    let connected = probe_or_spawn(LifecycleMode::AttachOrPersistent).await?;
     if connected.owns_daemon {
         anyhow::bail!(
             "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"
+        );
+    }
+    Ok(PersistentDaemonSession {
+        client: connected.client,
+        promoted_from_ephemeral: connected.promoted_from_ephemeral,
+    })
+}
+
+/// Require a persistent daemon for an Assistant session. Unlike ordinary
+/// persistent CLI consumers, an Assistant may promote the shared ephemeral
+/// owner because its work continues after the opening client exits.
+pub async fn ensure_assistant_persistent_daemon() -> Result<PersistentDaemonSession> {
+    let connected = probe_or_spawn(LifecycleMode::PromoteToPersistent).await?;
+    if connected.owns_daemon {
+        anyhow::bail!(
+            "persistent daemon attach produced an ephemeral instance; refusing assistant session"
         );
     }
     Ok(PersistentDaemonSession {
@@ -422,42 +437,380 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     probe_or_spawn_with_spawn_authorization(mode, None).await
 }
 
-/// Replace the shared ephemeral owner once it has confirmed that no agent is
-/// running. The next lifecycle acquisition claims the released canonical
-/// endpoint as a persistent owner.
-async fn promote_ephemeral_owner(paths: &crate::daemon::DaemonPaths) -> Result<()> {
-    let old_pid = crate::daemon::daemon_pid(paths);
-    let client = connect_local_daemon(&paths.socket)
+/// Promote the shared ephemeral owner to a persistent replacement.
+///
+/// The lifecycle permit is claimed before `RestartIfIdle`, the destructive
+/// transition. It remains held through predecessor release and either the
+/// verified persistent attach or the replacement spawn, so a timed-out caller
+/// cannot cancel the only request permitted to replace the old owner.
+async fn promote_ephemeral_owner(
+    paths: &crate::daemon::DaemonPaths,
+    lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+) -> Result<ConnectedDaemon> {
+    let mut current_paths = paths.clone();
+    let mut spawn_permit = None;
+    let mut replacement_required = false;
+
+    loop {
+        if !replacement_required
+            && lifecycle_request
+                .is_some_and(|request| request.is_cancelled() || request.reply.is_closed())
+        {
+            anyhow::bail!("assistant daemon lifecycle request was cancelled before promotion");
+        }
+
+        // Do not retain creation authority while background work is still
+        // running: its next idle boundary must remain cancellable. Once the
+        // daemon accepts RestartIfIdle, retain the permit until replacement.
+        // From that acceptance onward this is a destructive transaction: the
+        // original caller may disappear, but its authorization must still
+        // produce (or attach to) the persistent replacement.
+        if spawn_permit.is_none() {
+            spawn_permit = lifecycle_request
+                .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        let old_pid = crate::daemon::daemon_pid(&current_paths);
+        let client = match connect_local_daemon(&current_paths.socket).await {
+            Ok(client) => client,
+            Err(error) if replacement_required => {
+                // The accepted predecessor can lose its socket between
+                // discovery and this retry. Keep the transaction alive and
+                // return to discovery rather than dropping its permit.
+                tracing::info!(
+                    error = %error,
+                    "accepted assistant promotion observed a restarting daemon socket"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("connecting to ephemeral daemon for persistent promotion");
+            }
+        };
+        let response = match client.request_ok(Request::RestartIfIdle).await {
+            Ok(response) => response,
+            Err(error) if replacement_required => {
+                tracing::info!(
+                    error = %error,
+                    "accepted assistant promotion observed a draining daemon connection"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("requesting ephemeral daemon promotion"),
+        };
+        let proto::Response::RestartDecision {
+            will_restart,
+            reason,
+        } = response
+        else {
+            anyhow::bail!("unexpected daemon promotion response: {response:?}");
+        };
+        drop(client);
+
+        if !will_restart {
+            if replacement_required {
+                // Another restart decision can observe the predecessor (or a
+                // replacement ephemeral owner) while it is already draining.
+                // The first accepted decision is irreversible, so retain its
+                // authority and wait for the terminal persistent owner rather
+                // than treating this as the ordinary busy/cancellable path.
+                tracing::info!(
+                    reason = reason
+                        .as_deref()
+                        .unwrap_or("the current daemon cannot restart"),
+                    "accepted assistant promotion is waiting for an in-progress restart"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
+            // A running agent owns its background work. Leave it untouched,
+            // release this attempt's authority, and retry at its next idle
+            // boundary instead of turning Assistant open into a dead end.
+            drop(spawn_permit.take());
+            tracing::info!(
+                reason = reason
+                    .as_deref()
+                    .unwrap_or("the current daemon cannot restart"),
+                "assistant promotion waiting for ephemeral background work to become idle"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let discovered = crate::daemon::discover().await;
+            match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
+                DiscoverAttachPlan::AttachRunning if !discovered.paths.ephemeral => {
+                    let mut connected =
+                        attach_running_with_skew_check(discovered.paths, None).await?;
+                    connected.promoted_from_ephemeral = true;
+                    return Ok(connected);
+                }
+                DiscoverAttachPlan::AttachRunning => current_paths = discovered.paths,
+                DiscoverAttachPlan::WaitForRestart => {
+                    // `will_restart == false` also reports an owner that is
+                    // already shutting down. Do not re-enter by connecting to
+                    // that old socket: wait for its transition, while keeping
+                    // this pre-acceptance path cancellable.
+                    loop {
+                        if lifecycle_request.is_some_and(|request| {
+                            request.is_cancelled() || request.reply.is_closed()
+                        }) {
+                            anyhow::bail!(
+                                "assistant daemon lifecycle request was cancelled while waiting for restart"
+                            );
+                        }
+
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let restarted = crate::daemon::discover().await;
+                        match discover_attach_plan(restarted.status, restarted.hello.is_some()) {
+                            DiscoverAttachPlan::AttachRunning if !restarted.paths.ephemeral => {
+                                if let Some(connected) =
+                                    try_attach_verified_persistent_replacement(restarted.paths)
+                                        .await
+                                {
+                                    return Ok(connected);
+                                }
+                            }
+                            DiscoverAttachPlan::AttachRunning => {
+                                current_paths = restarted.paths;
+                                break;
+                            }
+                            DiscoverAttachPlan::WaitForRestart => {}
+                            DiscoverAttachPlan::Spawn => {
+                                // The busy retry deliberately dropped its
+                                // prior permit. Reclaim authority at this new
+                                // creation point so cancellation during the
+                                // idle wait cannot spawn an owner after the
+                                // request has stopped waiting.
+                                spawn_permit = lifecycle_request
+                                    .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
+                                    .transpose()
+                                    .map_err(anyhow::Error::msg)?;
+                                return spawn_verified_persistent_replacement(
+                                    &mut spawn_permit,
+                                    false,
+                                )
+                                .await;
+                            }
+                            DiscoverAttachPlan::FailIncompatible
+                            | DiscoverAttachPlan::FailUnreachable => {
+                                anyhow::bail!(
+                                    "shared daemon became unreachable while waiting to promote Assistant work"
+                                );
+                            }
+                        }
+                    }
+                }
+                DiscoverAttachPlan::Spawn => {
+                    // The busy retry deliberately dropped its prior permit.
+                    // Reclaim authority at this new creation point so a
+                    // cancellation during the idle wait cannot spawn an
+                    // owner after the request has stopped waiting.
+                    spawn_permit = lifecycle_request
+                        .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?;
+                    return spawn_verified_persistent_replacement(&mut spawn_permit, false).await;
+                }
+                DiscoverAttachPlan::FailIncompatible | DiscoverAttachPlan::FailUnreachable => {
+                    anyhow::bail!(
+                        "shared daemon became unreachable while waiting to promote Assistant work"
+                    );
+                }
+            }
+            continue;
+        }
+
+        replacement_required = true;
+
+        if !crate::daemon::wait_for_restart_release(
+            &current_paths,
+            old_pid,
+            crate::daemon::restart_release_timeout(None),
+        )
         .await
-        .context("connecting to ephemeral daemon for persistent promotion")?;
-    let response = client
-        .request_ok(Request::RestartIfIdle)
-        .await
-        .context("requesting ephemeral daemon promotion")?;
-    let proto::Response::RestartDecision {
-        will_restart,
-        reason,
-    } = response
-    else {
-        anyhow::bail!("unexpected daemon promotion response: {response:?}");
+        {
+            // This is an observation deadline, not the transaction deadline:
+            // the predecessor may release after it. The accepted restart
+            // still owns a replacement obligation, so retain the permit and
+            // continue discovery until a persistent owner is verified.
+            tracing::warn!(
+                "accepted assistant promotion exceeded the predecessor release wait; continuing replacement acquisition"
+            );
+        }
+
+        loop {
+            // `RestartIfIdle` already accepted the destructive handoff. Do
+            // not observe cancellation here: dropping the unused permit would
+            // otherwise leave the released predecessor without an authorized
+            // replacement. The lifecycle requester waits for this permit's
+            // terminal state before it reports its own cancellation.
+            let discovered = crate::daemon::discover().await;
+            match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
+                DiscoverAttachPlan::AttachRunning if !discovered.paths.ephemeral => {
+                    if let Some(connected) =
+                        try_attach_verified_persistent_replacement(discovered.paths).await
+                    {
+                        return Ok(connected);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                DiscoverAttachPlan::AttachRunning => {
+                    // A competing ephemeral owner won the release race. Keep
+                    // the already-authorized permit and promote that owner;
+                    // never claim success merely because *some* replacement
+                    // answered the socket.
+                    current_paths = discovered.paths;
+                    break;
+                }
+                DiscoverAttachPlan::WaitForRestart => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                DiscoverAttachPlan::Spawn => {
+                    return spawn_verified_persistent_replacement(&mut spawn_permit, true).await;
+                }
+                DiscoverAttachPlan::FailUnreachable => {
+                    // The predecessor may still own its receipt while the
+                    // socket has already disappeared. This accepted handoff
+                    // must wait through that observation instead of dropping
+                    // its retained replacement authority.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                DiscoverAttachPlan::FailIncompatible => {
+                    anyhow::bail!(
+                        "shared daemon became unreachable while promoting Assistant work"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Spawn the replacement covered by the promotion permit, then verify that
+/// discovery identifies the owner as persistent before reporting success.
+async fn spawn_verified_persistent_replacement(
+    spawn_permit: &mut Option<cockpit_client::LifecycleSpawnPermit>,
+    terminal_replacement: bool,
+) -> Result<ConnectedDaemon> {
+    let canonical = crate::daemon::DaemonPaths::resolve_canonical()?;
+    let pid = loop {
+        match crate::daemon::spawn_detached(false) {
+            Ok(pid) => break pid,
+            Err(error) if terminal_replacement => {
+                // The predecessor can release its metadata before its SQLite
+                // boot lock. Keep the accepted handoff alive until creation
+                // succeeds instead of returning a daemonless ledger.
+                tracing::warn!(
+                    error = %error,
+                    "accepted assistant promotion replacement spawn is not ready; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
     };
-    if !will_restart {
-        anyhow::bail!(
-            "persistent daemon owner required; promotion deferred: {}",
-            reason.unwrap_or_else(|| "the current daemon cannot restart".to_string())
-        );
+    if let Some(permit) = spawn_permit.as_mut() {
+        permit.owner_created();
     }
-    drop(client);
-    if !crate::daemon::wait_for_restart_release(
-        paths,
-        old_pid,
-        crate::daemon::restart_release_timeout(None),
-    )
-    .await
+    tracing::info!(
+        pid,
+        ephemeral = false,
+        "assistant daemon promotion spawned replacement"
+    );
+    wait_for_verified_persistent_replacement(&canonical.socket, terminal_replacement).await
+}
+
+/// Wait for a persistent published owner and return a client that was checked
+/// against that same owner identity. A socket handshake alone is insufficient:
+/// a predecessor can still answer it while its PID receipt and endpoint are
+/// being replaced.
+async fn wait_for_verified_persistent_replacement(
+    expected_socket: &Path,
+    terminal_replacement: bool,
+) -> Result<ConnectedDaemon> {
+    let deadline =
+        (!terminal_replacement).then(|| std::time::Instant::now() + SPAWN_DAEMON_TIMEOUT);
+    let mut backoff = Duration::from_millis(2);
+
+    loop {
+        let discovered = crate::daemon::discover().await;
+        if discovered.status == crate::daemon::DaemonStatus::Running
+            && !discovered.paths.ephemeral
+            && discovered.paths.socket == expected_socket
+        {
+            if let Some(connected) =
+                try_attach_verified_persistent_replacement(discovered.paths).await
+            {
+                return Ok(connected);
+            }
+        }
+
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            anyhow::bail!(
+                "timed out waiting for a verified persistent daemon replacement at {}",
+                expected_socket.display()
+            );
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
+}
+
+/// Connect only when the persistent endpoint and PID receipt still name the
+/// same owner generation after the handshake.
+async fn try_attach_verified_persistent_replacement(
+    paths: crate::daemon::DaemonPaths,
+) -> Option<ConnectedDaemon> {
+    let identity = persistent_owner_identity(&paths)?;
+    let client = connect_local_daemon(&paths.socket).await.ok()?;
+    if client.request_ok(Request::DaemonStatus).await.is_err() {
+        return None;
+    }
+    let verified = crate::daemon::discover().await;
+    if verified.status != crate::daemon::DaemonStatus::Running
+        || verified.paths.ephemeral
+        || persistent_owner_identity(&verified.paths) != Some(identity)
     {
-        anyhow::bail!("timed out waiting for ephemeral daemon promotion to finish");
+        return None;
     }
-    Ok(())
+    Some(ConnectedDaemon {
+        endpoint: local_daemon_endpoint(&verified.paths.socket),
+        client,
+        owns_daemon: false,
+        socket: verified.paths.socket,
+        startup_notice: None,
+        promoted_from_ephemeral: true,
+    })
+}
+
+/// The PID receipt and endpoint are published together under the lifecycle
+/// lock. Comparing both before and after connecting binds the returned client
+/// to one persistent owner generation rather than merely a reusable socket.
+fn persistent_owner_identity(
+    paths: &crate::daemon::DaemonPaths,
+) -> Option<(PathBuf, cockpit_host::daemon_lifecycle::DaemonPidReceipt)> {
+    // A numeric legacy PID is not an owner generation. Require the current
+    // PID receipt and the shared endpoint record that binds that receipt to
+    // this persistent socket before and after the connection handshake.
+    if paths.ephemeral {
+        return None;
+    }
+    let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
+    let endpoint = crate::daemon::read_endpoint_record(&canonical)?;
+    if endpoint.kind != crate::daemon::DaemonEndpointKind::Persistent
+        || endpoint.socket != paths.socket
+    {
+        return None;
+    }
+    let cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt) =
+        cockpit_host::daemon_lifecycle::read_daemon_pid_record(&canonical.pid_file)?
+    else {
+        return None;
+    };
+    (receipt == endpoint.receipt).then_some((endpoint.socket, receipt))
 }
 
 /// Resolve a daemon under optional request-scoped spawn authority. The permit
@@ -479,14 +832,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                     if matches!(mode, LifecycleMode::PromoteToPersistent)
                         && discovered.paths.ephemeral
                     {
-                        promote_ephemeral_owner(&discovered.paths).await?;
-                        let mut promoted = probe_or_spawn_with_spawn_authorization(
-                            LifecycleMode::AttachOrPersistent,
-                            lifecycle_request,
-                        )
-                        .await?;
-                        promoted.promoted_from_ephemeral = true;
-                        return Ok(promoted);
+                        return promote_ephemeral_owner(&discovered.paths, lifecycle_request).await;
                     }
                     let attached =
                         attach_running_with_skew_check(discovered.paths.clone(), None).await;

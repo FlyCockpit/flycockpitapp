@@ -10,9 +10,9 @@ pub(super) async fn list_sessions(
 ) -> std::result::Result<Response, ErrorPayload> {
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
-    // and the TUI's daemonless direct-DB fallback produce the same shape
+    // and the TUI's unavailable-connection fallback produce the same shape
     // (ordering / scoping / fork-grouping). The daemon adds its live
-    // processing overlay below; daemonless readers still get the durable
+    // processing overlay below; disconnected readers still get the durable
     // DB-derived state.
     let db = ctx.db.clone();
     let mut sessions = db
@@ -417,7 +417,6 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
-    negotiated_protocol_version: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let session = match ctx.db.get_session(session_id).await {
         Ok(Some(session)) => session,
@@ -429,21 +428,32 @@ pub(super) async fn delete_session(
         }
         Err(e) => return Err(internal(e)),
     };
-    // v10-only: reject deleting an active session. The CLI's existing
-    // behavior bails with "session is active; end it before deleting";
-    // the daemon must match — it must NOT stop-and-delete the active
-    // session. The session row remains intact.
-    //
-    // v9 clients retain the frozen behavior: stop-and-delete proceeds
-    // regardless of the active state. The negotiated protocol version
-    // gates this so a v9 envelope carrying the unchanged DeleteSession
-    // tag does not get the new rejection behavior.
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
-    {
+    if session.ended_at_unix_ms.is_none() {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),
         });
+    }
+    // Capture every durable scratch path before the relational cascade removes
+    // descendants. The daemon owns this filesystem side effect; no UI process
+    // is permitted to infer or delete these paths.
+    let subtree = ctx
+        .db
+        .session_subtree_ids(session_id)
+        .await
+        .map_err(internal)?;
+    let mut scratch_dirs = Vec::with_capacity(subtree.len());
+    let mut result_blob_dirs = Vec::with_capacity(subtree.len());
+    for member in subtree {
+        let Some(member_session) = ctx.db.get_session(member).await.map_err(internal)? else {
+            continue;
+        };
+        scratch_dirs.push(
+            crate::session::workspace_scratch_path_for_session(&member_session.project_id, member)
+                .map_err(internal)?,
+        );
+        result_blob_dirs
+            .push(super::storage::result_blob_directory_for_session(member).map_err(internal)?);
     }
     prepare_session_deletion(ctx, session_id).await?;
     let now_wall_ms = super::run_invocation::wall_ms_now();
@@ -452,8 +462,45 @@ pub(super) async fn delete_session(
         .terminalize_session_run_invocations(session_id, now_wall_ms)
         .await
         .map_err(internal)?;
+    for scratch_dir in scratch_dirs {
+        remove_session_scratch(&scratch_dir).map_err(internal)?;
+    }
+    for result_blob_dir in result_blob_dirs {
+        remove_session_scratch(&result_blob_dir).map_err(internal)?;
+        match std::fs::symlink_metadata(&result_blob_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(internal(anyhow::anyhow!(
+                    "session deletion left result blobs at `{}`",
+                    result_blob_dir.display()
+                )));
+            }
+            Err(error) => {
+                return Err(internal(anyhow::Error::from(error).context(format!(
+                    "verifying result-blob removal at `{}`",
+                    result_blob_dir.display()
+                ))));
+            }
+        }
+    }
     ctx.db.delete_session(session_id).await.map_err(internal)?;
     Ok(Response::Ack)
+}
+
+pub(crate) fn remove_session_scratch(path: &std::path::Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting `{}`", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "refusing to remove non-directory session scratch `{}`",
+        path.display()
+    );
+    std::fs::remove_dir_all(path).with_context(|| format!("removing `{}`", path.display()))
 }
 
 /// Complete every asynchronous, idempotent side-effect phase that must precede
@@ -464,23 +511,37 @@ pub(super) async fn prepare_session_deletion(
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
+    // Commit a fence for the complete fork tree before stopping workers. This
+    // prevents a concurrent fork from appearing between discovery and the
+    // cascade, and gives every descendant the same deletion boundary.
+    let members = ctx
+        .db
+        .fence_session_subtree_for_deletion(session_id)
+        .await
+        .map_err(internal)?;
     // Don't delete out from under a running worker (GOALS §17h): stop any
-    // live workers in the affected subtree first — that cancels their
+    // live workers in the now-fenced subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
     stop_subtree(ctx, session_id, true).await?;
+    // SQLite deletion cascades through every member. Each one therefore needs
+    // its own containment and write-scope admission barrier; fencing only the
+    // requested root would let a descendant retain authority while its durable
+    // rows are removed by the cascade.
     // Deletion barrier: commit Deleting, wait for ProvenEmpty containments.
     if let Some(pc) = ctx.process_containment.as_ref() {
-        pc.begin_session_deletion(session_id)
-            .await
-            .map_err(|e| ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("containment deletion barrier: {e}"),
-            })?;
-        if let Err(e) = pc.finish_session_deletion(session_id).await {
-            return Err(ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("session deletion blocked on nonempty containments: {e}"),
-            });
+        for member in &members {
+            pc.begin_session_deletion(*member)
+                .await
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!("containment deletion barrier: {e}"),
+                })?;
+            if let Err(e) = pc.finish_session_deletion(*member).await {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!("session deletion blocked on nonempty containments: {e}"),
+                });
+            }
         }
     }
     // Write-scope barrier: block new transfers, then refuse to delete while any
@@ -488,21 +549,23 @@ pub(super) async fn prepare_session_deletion(
     // session rows underneath a live lease would drop the durable record of an
     // authority that a still-running descendant believes it owns.
     if let Some(ws) = ctx.write_scope.as_ref() {
-        let blockers = ws
-            .begin_session_deletion(session_id)
-            .await
-            .map_err(|e| ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("write scope deletion barrier: {e}"),
-            })?;
-        if !blockers.is_empty() {
-            return Err(ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!(
-                    "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
-                    blockers.len()
-                ),
-            });
+        for member in &members {
+            let blockers = ws
+                .begin_session_deletion(*member)
+                .await
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!("write scope deletion barrier: {e}"),
+                })?;
+            if !blockers.is_empty() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!(
+                        "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
+                        blockers.len()
+                    ),
+                });
+            }
         }
     }
     let now_wall_ms = super::run_invocation::wall_ms_now();
@@ -512,7 +575,7 @@ pub(super) async fn prepare_session_deletion(
     // that cannot run inside the SQLite ledger transaction, and it is idempotent
     // / reconcilable: a later ledger failure leaves the retry safe because the
     // reconcile pass re-runs it. Run it before either delete path.
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         storage
             .begin_session_deletion_cleanup(session_id, now_wall_ms)
             .await
@@ -668,21 +731,10 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
     internal(error)
 }
 
-pub(super) fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
-    ErrorPayload {
-        code: ErrorCode::Internal,
-        // `{:#}` walks the full anyhow context chain (e.g. `resolving
-        // model: provider ...: ...`) rather than printing only the
-        // outermost context, so daemon-surfaced errors are legible
-        // instead of an opaque `internal: resolving model`.
-        message: format!("{err:#}"),
-    }
-}
-
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
-) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
-    ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
+) -> std::result::Result<DaemonSchedulerHandle, ErrorPayload> {
+    ctx.scheduler().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),
     })
@@ -724,6 +776,7 @@ mod sessions_activity_tests {
             turns: 0,
             active_agent: "Build".into(),
             title: None,
+            description: None,
             parent_session_id: None,
             created_by_principal: None,
             shared_with_collaborators: false,

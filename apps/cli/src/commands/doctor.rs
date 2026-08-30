@@ -2,7 +2,7 @@
 //!
 //! The daemon owns the diagnostics snapshot (`GetDoctorSnapshot`), assembling
 //! it against the store it owns. When no persistent daemon is running, this
-//! command uses a private ephemeral daemon and reaps it after the snapshot.
+//! command uses an ephemeral daemon and reaps it after the snapshot.
 //! The
 //! `--dependencies-json` view reports the host dependency projection, which is
 //! a filesystem/binary probe (like `RefreshHostCapabilities`) that opens no

@@ -300,7 +300,6 @@ fn picker_bootstrap_failure_stays_inline_without_false_success() {
     write_config(&config_path);
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.overlay = Overlay::ModelPicker(snapshot_picker(&app));
     let history_len = app.history.len();
@@ -339,7 +338,6 @@ fn picker_bootstrap_failure_stays_inline_without_false_success() {
 #[tokio::test]
 async fn model_control_is_not_sent_while_session_switch_is_pending() {
     let mut app = App::new(None, false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -375,7 +373,6 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
     let config_path = cockpit.join("config.json");
     write_config(&config_path);
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -498,7 +495,6 @@ fn picker_default_intent_waits_for_daemon_without_local_write() {
     write_config(&source_config);
     _env.set_cockpit_config(&tmp.path().join("missing.json"));
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -533,7 +529,6 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
     write_config(&config_path);
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     let (control_tx, _control_rx) = mpsc::channel(4);
     let runner = AgentRunner::stub_with_control_tx(control_tx);
     app.launch.session_id = Some(runner.session_id());
@@ -619,7 +614,6 @@ fn reopening_model_picker_expires_stale_request_and_carries_queued_submission() 
     write_config(&config_path);
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, _control_rx) = mpsc::channel(4);
     let runner = AgentRunner::stub_with_control_tx(control_tx);
@@ -657,7 +651,6 @@ fn terminal_daemon_link_preserves_full_pending_selection_and_exact_submission() 
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, _control_rx) = mpsc::channel(4);
     let runner = AgentRunner::stub_with_control_tx(control_tx);
@@ -724,7 +717,6 @@ fn adding_model_from_recovery_picker_preserves_auto_submit_intent() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.submit_after_model_selection = true;
     let picker = crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
@@ -750,7 +742,6 @@ fn cancelling_attached_add_model_settings_immediately_reopens_picker() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.submit_after_model_selection = true;
     let (control_tx, _control_rx) = mpsc::channel(4);
@@ -806,7 +797,6 @@ fn changed_snapshot_after_settings_close_refreshes_open_picker_inventory_once() 
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.config_snapshot.providers = snapshot_config();
     let (control_tx, _control_rx) = mpsc::channel(4);
@@ -870,7 +860,6 @@ fn add_model_waits_through_unrelated_and_saved_snapshots_then_reopens_on_close()
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.submit_after_model_selection = true;
     let (control_tx, _control_rx) = mpsc::channel(4);
@@ -946,7 +935,6 @@ fn quick_model_change_waits_for_terminal_confirmation() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -1044,7 +1032,6 @@ fn quick_model_delivery_rejection_does_not_open_picker() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, _control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -1075,7 +1062,6 @@ fn transport_send_failure_retains_complete_queued_submission() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, control_rx) = mpsc::channel(1);
     drop(control_rx);
@@ -1113,7 +1099,6 @@ fn picker_transport_failure_does_not_report_success_or_submit_queued_payload() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, control_rx) = mpsc::channel(1);
     drop(control_rx);
@@ -1157,7 +1142,6 @@ fn assert_control_failure_retains_complete_submission(
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -1270,7 +1254,6 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
     app.config_snapshot.providers = cockpit_config::providers::ConfigDoc::load(&config_path)
         .unwrap()
         .providers();
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     let (input_tx, mut input_rx) = mpsc::channel(4);
@@ -1341,7 +1324,6 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
 fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, _control_rx) = mpsc::channel(2);
     let (input_tx, mut input_rx) = mpsc::channel(1);
@@ -1420,7 +1402,6 @@ fn second_submit_waiting_on_model_preserves_all_unconsumed_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
 
     let held = exact_queued_submission();
@@ -1476,7 +1457,6 @@ fn model_picker_selection_records_summary() {
     write_config(&config_path);
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -1527,7 +1507,6 @@ fn ordinary_picker_selection_is_session_only_and_promises_no_default() {
     write_config(&config_path);
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
@@ -1559,7 +1538,6 @@ fn chrome_renders_session_derived_active_model() {
     write_config(&cockpit.join("config.json"));
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("p", "a"),
         default_selection: Some(selection("other", "old")),
@@ -1596,7 +1574,6 @@ fn config_drift_state_retains_config_model_fields() {
     write_config(&cockpit.join("config.json"));
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("session-p", "session-m"),
         default_selection: Some(selection("config-p", "config-m")),
@@ -1618,7 +1595,6 @@ fn config_drift_stale_generation_ignored() {
     write_config(&cockpit.join("config.json"));
 
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.apply_event(cockpit_client::presentation::TurnEvent::ActiveModelState {
         selection: selection("p", "a"),
         default_selection: Some(selection("p", "a")),
@@ -1655,7 +1631,6 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let _runtime_guard = runtime.enter();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
 
     let old_session_id = uuid::Uuid::new_v4();
@@ -1763,6 +1738,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                 },
                 session_id: new_session_id,
                 session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Computer,
+                promoted_from_ephemeral: false,
                 short_id: "new001".to_string(),
                 active_agent: "Build".to_string(),
                 active_agent_path: vec!["Build".to_string()],
@@ -1773,6 +1749,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                 history: Vec::new(),
                 paused_work: Vec::new(),
                 repair_required: None,
+                resume_compaction_offer: None,
                 btw_fork: None,
                 daemon_version: "test".to_string(),
                 daemon_compatible: true,
@@ -1956,7 +1933,6 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
     let transition_guard = runtime.block_on(transition_gate.clone().lock_owned());
     let _runtime_guard = runtime.enter();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let old_session_id = uuid::Uuid::new_v4();
     let new_session_id = uuid::Uuid::new_v4();
@@ -2017,6 +1993,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         },
         session_id: new_session_id,
         session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
+        promoted_from_ephemeral: false,
         short_id: "new001".to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
@@ -2032,6 +2009,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         history: Vec::new(),
         paused_work: Vec::new(),
         repair_required: None,
+        resume_compaction_offer: None,
         btw_fork: None,
         daemon_version: "test".to_string(),
         daemon_compatible: true,
@@ -2119,7 +2097,6 @@ fn picker_app_awaiting_default_terminal(
     let config_path = cockpit.join("config.json");
     write_config(&config_path);
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let (control_tx, control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));

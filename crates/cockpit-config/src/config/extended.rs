@@ -30,7 +30,7 @@ mod resource_scheduler;
 pub mod tui;
 
 #[allow(unused_imports)]
-pub use daemon::{DaemonAutostart, DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
+pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
 #[allow(unused_imports)]
 pub use data_syntax::DataSyntaxConfig;
 #[allow(unused_imports)]
@@ -318,8 +318,8 @@ pub struct ExtendedConfig {
     /// prompt-injection guard when enabled, and similar small tasks.
     /// Identifier format mirrors the primary model selector
     /// (`"<provider>:<model-id>"`). Unset disables every
-    /// utility-model-dependent feature — auto-titling is skipped and
-    /// sessions display their short id as the label.
+    /// utility-model-dependent feature. Session titling falls back to the
+    /// cache-reusing active-model metadata fork when this is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utility_model: Option<String>,
 
@@ -340,6 +340,12 @@ pub struct ExtendedConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
+
+    /// Prefer the active session model for the cache-reusing, ephemeral
+    /// title-and-description fork. When no utility title model is configured,
+    /// Cockpit also takes this path automatically.
+    #[serde(default)]
+    pub auto_title_with_session_model: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_injection: Option<String>,
@@ -1664,6 +1670,7 @@ impl Default for ExtendedConfig {
             reasoning: None,
             agent_chooses_subagent_model: false,
             auto_title: None,
+            auto_title_with_session_model: false,
             skill_injection: None,
             predict_next_message_model: None,
             harness_report_summarization: None,
@@ -2642,6 +2649,10 @@ impl ExtendedConfigDoc {
         parse_field!("reasoning", reasoning);
         parse_field!("agent_chooses_subagent_model", agent_chooses_subagent_model);
         parse_field!("auto_title", auto_title);
+        parse_field!(
+            "auto_title_with_session_model",
+            auto_title_with_session_model
+        );
         parse_field!("skill_injection", skill_injection);
         parse_field!("predict_next_message_model", predict_next_message_model);
         parse_field!("harness_report_summarization", harness_report_summarization);

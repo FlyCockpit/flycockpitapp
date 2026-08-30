@@ -304,7 +304,9 @@ impl Driver {
         let args = serde_json::json!({ "name": skill_name });
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
-            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
             agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
@@ -346,12 +348,7 @@ impl Driver {
             media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
-            mcp_resolver: {
-                agent
-                    .mcp_resolver
-                    .observe_config_generation(self.config.snapshot().generation);
-                agent.mcp_resolver.clone()
-            },
+            mcp_resolver: agent.mcp_resolver.clone(),
         };
 
         let started = std::time::Instant::now();

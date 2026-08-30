@@ -32,6 +32,9 @@ impl HistoryCallerTrust {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: Uuid,
+    /// Owning workspace identity. History-scope policy is applied above this
+    /// raw search layer before a hit is exposed to a caller.
+    pub project_id: String,
     pub short_id: Option<String>,
     pub title: Option<String>,
     /// `last_active_at_unix_ms` — the human-date source + recency
@@ -138,6 +141,39 @@ impl Db {
                 conn,
                 &query,
                 project_id.as_deref(),
+                None,
+                exclude_session,
+                since,
+                None,
+                pool,
+                caller_trust,
+            )
+        })
+        .await
+    }
+
+    /// Search only sessions that the requesting workspace may disclose.  The
+    /// consent predicate is evaluated inside the ranked SQL query, before its
+    /// bounded candidate pool is cut off.
+    pub async fn search_accessible_candidates_for_trust(
+        &self,
+        query: &str,
+        reader_project: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let reader_project = reader_project.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                Some(&reader_project),
                 exclude_session,
                 since,
                 None,
@@ -168,6 +204,7 @@ impl Db {
                 conn,
                 &query,
                 project_id.as_deref(),
+                None,
                 exclude_session,
                 None,
                 Some(after_session_event_seq),
@@ -292,6 +329,30 @@ impl Db {
         .await
     }
 
+    /// Read transcript turns only when the target is visible to the reader in
+    /// the same SQLite snapshot. `None` deliberately covers both an absent
+    /// session and a non-consenting workspace.
+    pub async fn thread_turns_for_access(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<Vec<ThreadTurn>>> {
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            if crate::db::history_scope::session_access_allowed_conn(
+                conn,
+                &reader_project,
+                session_id,
+            )? {
+                Self::thread_turns_conn_for_trust(conn, session_id, caller_trust).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
     pub async fn compaction_lineage_sessions(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
         self.read(move |conn| compaction_lineage_sessions_conn(conn, session_id))
             .await
@@ -340,6 +401,7 @@ fn search_candidates_inner(
     conn: &Connection,
     query: &str,
     project_id: Option<&str>,
+    reader_project: Option<&str>,
     exclude_session: Option<Uuid>,
     since: Option<i64>,
     after_session_event_seq: Option<i64>,
@@ -361,6 +423,7 @@ fn search_candidates_inner(
     let mut stmt = conn
         .prepare(
             "SELECT f.session_id AS session_id,
+                    s.project_id  AS project_id,
                     s.short_id    AS short_id,
                     s.title       AS title,
                     s.last_active_at_unix_ms AS last_active_at_unix_ms,
@@ -394,6 +457,12 @@ fn search_candidates_inner(
                        AND later_event.seq > ?5
                 ))
                 AND (?6 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                AND (?7 IS NULL OR s.project_id = ?7 OR (
+                    EXISTS (SELECT 1 FROM workspace_history_scopes reader
+                            WHERE reader.project_id = ?7 AND reader.outbound_enabled = 1)
+                    AND EXISTS (SELECT 1 FROM workspace_history_scopes target
+                                WHERE target.project_id = s.project_id AND target.inbound_enabled = 1)
+                ))
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
@@ -407,12 +476,14 @@ fn search_candidates_inner(
                 exclude,
                 since,
                 after_session_event_seq,
-                caller_trust.can_read_trusted()
+                caller_trust.can_read_trusted(),
+                reader_project
             ],
             |row| {
                 let sid: String = row.get("session_id")?;
                 Ok((
                     sid,
+                    row.get::<_, String>("project_id")?,
                     row.get::<_, Option<String>>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
                     row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -430,7 +501,7 @@ fn search_candidates_inner(
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
     for r in rows {
-        let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+        let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
             r.context("decoding search hit")?;
         let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
         if by_session.contains_key(&session_id) {
@@ -444,6 +515,7 @@ fn search_candidates_inner(
             session_id,
             SearchHit {
                 session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -480,8 +552,9 @@ fn search_candidates_in_sessions_inner(
     for session_id in session_ids {
         let mut stmt = conn
             .prepare(
-                "SELECT f.session_id AS session_id,
-                        s.short_id AS short_id,
+            "SELECT f.session_id AS session_id,
+                    s.project_id AS project_id,
+                    s.short_id AS short_id,
                         s.title AS title,
                         s.last_active_at_unix_ms AS last_active_at_unix_ms,
                         CASE f.row_kind
@@ -519,6 +592,7 @@ fn search_candidates_in_sessions_inner(
                     let sid: String = row.get("session_id")?;
                     Ok((
                         sid,
+                        row.get::<_, String>("project_id")?,
                         row.get::<_, Option<String>>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
                         row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -529,7 +603,7 @@ fn search_candidates_in_sessions_inner(
             )
             .context("querying lineage search")?;
         for row in rows {
-            let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+            let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
                 row.context("decoding lineage search hit")?;
             let hit_session_id =
                 Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
@@ -541,6 +615,7 @@ fn search_candidates_in_sessions_inner(
             };
             out.push(SearchHit {
                 session_id: hit_session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -556,10 +631,10 @@ fn search_candidates_in_sessions_inner(
 }
 
 fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<Uuid>> {
-    let existing = existing_session_ids(conn)?;
-    if !existing.contains(&session_id) {
+    let projects = session_projects(conn)?;
+    let Some(root_project) = projects.get(&session_id) else {
         return Ok(Vec::new());
-    }
+    };
     let links = compaction_links(conn)?;
     let mut visited = std::collections::HashSet::new();
     visited.insert(session_id);
@@ -567,7 +642,7 @@ fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Resu
     let mut backwards = Vec::new();
     let mut cursor = session_id;
     while let Some((predecessor, _)) = links.iter().find(|(_, successor)| *successor == cursor) {
-        if !existing.contains(predecessor) || !visited.insert(*predecessor) {
+        if projects.get(predecessor) != Some(root_project) || !visited.insert(*predecessor) {
             break;
         }
         backwards.push(*predecessor);
@@ -578,7 +653,7 @@ fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Resu
     let mut forwards = Vec::new();
     cursor = session_id;
     while let Some((_, successor)) = links.iter().find(|(predecessor, _)| *predecessor == cursor) {
-        if !existing.contains(successor) || !visited.insert(*successor) {
+        if projects.get(successor) != Some(root_project) || !visited.insert(*successor) {
             break;
         }
         forwards.push(*successor);
@@ -591,17 +666,25 @@ fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Resu
     Ok(lineage)
 }
 
-fn existing_session_ids(conn: &Connection) -> Result<std::collections::HashSet<Uuid>> {
+fn session_projects(conn: &Connection) -> Result<std::collections::HashMap<Uuid, String>> {
     let mut stmt = conn
-        .prepare("SELECT session_id FROM sessions")
+        .prepare("SELECT session_id, project_id FROM sessions")
         .context("preparing session id scan")?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, String>("session_id"))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>("session_id")?,
+                row.get::<_, String>("project_id")?,
+            ))
+        })
         .context("querying session ids")?;
-    let mut out = std::collections::HashSet::new();
+    let mut out = std::collections::HashMap::new();
     for row in rows {
-        let sid = row.context("decoding session id")?;
-        out.insert(Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?);
+        let (sid, project_id) = row.context("decoding session id")?;
+        out.insert(
+            Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?,
+            project_id,
+        );
     }
     Ok(out)
 }

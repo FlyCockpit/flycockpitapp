@@ -1053,11 +1053,13 @@ impl ToolOutput {
 /// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
     pub(crate) agent_id: String,
-    /// History-read trust of the concrete tool frame. This is carried from the
-    /// agent frame rather than inferred from the session's active model;
-    /// delegated frames remain untrusted even when a host-selected fallback
-    /// model is trusted, because their custody is redacted-untrusted.
-    pub(crate) executing_model_trusted: bool,
+    /// Exact provider/model identity of the agent that issued this tool call.
+    ///
+    /// This is intentionally dispatch-scoped rather than derived from the
+    /// session's active-model preference: delegated and custom agents may run
+    /// a different model. `None` is reserved for isolated/headless contexts
+    /// and must be handled as untrusted by custody-sensitive tools.
+    pub(crate) caller_model: Option<CallerModel>,
     /// Stable daemon-owned lifecycle identity for this concrete executor.
     /// `None` is reserved for isolated tests and legacy headless helpers;
     /// production driver frames always carry a durable instance id.
@@ -1211,9 +1213,9 @@ pub struct ToolCtx {
     /// direct-native media tools are registered on the toolbox at all.
     pub(crate) media_availability: crate::tool_media_authority::MediaToolAvailability,
     /// Source-tagged MCP catalog for this agent. Built once per agent
-    /// construction (or test `ToolCtx`) and refreshed when layer files or
-    /// the session config generation change. Tool dispatch must not call
-    /// [`crate::mcp::config::McpConfig::discover`].
+    /// construction (or test `ToolCtx`) and passed read-only to every
+    /// descendant context. Tool dispatch must not call
+    /// [`crate::mcp::config::McpConfig::discover`] or re-read catalog files.
     pub(crate) mcp_resolver: Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
@@ -1252,7 +1254,7 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
-            executing_model_trusted: self.executing_model_trusted,
+            caller_model: self.caller_model.clone(),
             agent_instance_id: self.agent_instance_id,
             lock_identity: self.lock_identity.clone(),
             write_scope: self.write_scope.clone(),
@@ -1351,6 +1353,37 @@ impl ToolCtx {
         let mut cloned = self.clone_for_dispatch();
         cloned.locks = Arc::new(self.locks.without_read_recording());
         cloned
+    }
+}
+
+/// Non-secret identity of the model that issued a tool call.
+///
+/// `ToolCtx` carries this small value instead of a model handle so tools can
+/// apply their own turn-pinned policy without retaining inference capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallerModel {
+    provider_id: String,
+    model_id: String,
+}
+
+impl CallerModel {
+    pub(crate) fn new(provider_id: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        }
+    }
+
+    pub(crate) fn from_model(model: &crate::engine::model::Model) -> Self {
+        Self::new(model.provider_id(), model.model_id_ref())
+    }
+
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
     }
 }
 
@@ -1505,10 +1538,15 @@ impl From<Capability> for crate::agents::AgentCapability {
 pub struct ToolBox {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     /// Exact direct-native media tools selected by the agent definition but
-    /// withheld at construction because no accepted root had live authority.
+    /// currently withheld by root authority, host runtime, or model capability.
     /// They are not returned by `names`, `get`, definitions, MCP, or Monty;
     /// the turn boundary moves them into `tools` only after revalidation.
     dormant_direct_native_media: BTreeMap<String, Arc<dyn Tool>>,
+    /// The call-time reason a provider-visible direct-native media tool is
+    /// dormant. This deliberately travels separately from its schema: a
+    /// runtime/model/dispatch change must not perturb the cacheable tools
+    /// prefix, but must still give a model call the actual diagnosis.
+    direct_native_media_unavailable: BTreeMap<String, DirectNativeMediaUnavailable>,
     mcp_builtin_tools: BTreeMap<String, McpBuiltinToolEntry>,
     /// Per-tool-name description overrides. Empty (the default) means every
     /// tool renders its own steering-selected description — byte-identical to the
@@ -1519,6 +1557,61 @@ pub struct ToolBox {
     definition_cache: Arc<Mutex<HashMap<crate::agents::ToolSteering, Vec<ToolDefinition>>>>,
     capability_unavailable: BTreeMap<String, Vec<crate::capabilities::ToolCapabilityIssue>>,
     capability_description_suffixes: BTreeMap<String, Vec<String>>,
+}
+
+/// Whether a provider-advertised tool can be called in the current turn.
+///
+/// Provider schemas deliberately remain stable while capability probes and
+/// direct-native media authority change.  Callers must therefore distinguish a
+/// provider-visible but unavailable tool from a name the provider was never
+/// told about; the latter is a hallucinated tool call, while the former gets a
+/// normal call-time availability result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCallAvailability {
+    Callable,
+    AdvertisedUnavailable,
+    NotAdvertised,
+}
+
+/// Why a direct-native media schema is advertised but cannot be called in the
+/// current turn. Kept private because callers need the rendered call result,
+/// not another availability policy surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectNativeMediaUnavailable {
+    AuthorityUnavailable,
+    Availability(crate::tool_media_authority::MediaToolAvailabilityReason),
+    TranscriptionDispatchUnavailable,
+}
+
+impl DirectNativeMediaUnavailable {
+    fn message(self) -> &'static str {
+        match self {
+            Self::AuthorityUnavailable => "this session has no live media authority",
+            Self::Availability(
+                crate::tool_media_authority::MediaToolAvailabilityReason::AuthorityUnavailable,
+            ) => "this session has no live media authority",
+            Self::Availability(
+                crate::tool_media_authority::MediaToolAvailabilityReason::RuntimeProfileUnsupported,
+            ) => "the host media runtime does not support this operation",
+            Self::Availability(
+                crate::tool_media_authority::MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement,
+            ) => "the current model requires an entitlement for this media capability",
+            Self::Availability(
+                crate::tool_media_authority::MediaToolAvailabilityReason::ModelCapabilityUnsupported,
+            ) => "the current model does not support this media capability",
+            Self::Availability(
+                crate::tool_media_authority::MediaToolAvailabilityReason::ModelCapabilityUnknown,
+            ) => "the current model's media capability is unknown",
+            // `Present` cannot make a direct-native tool dormant. Keep the
+            // fallback accurate if a future media tool adds a divergent gate.
+            Self::Availability(
+                crate::tool_media_authority::MediaToolAvailabilityReason::Present,
+            ) => "it is not callable in this turn",
+            Self::TranscriptionDispatchUnavailable => {
+                "no authorized transcription dispatch is available for this session and current model"
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1567,6 +1660,7 @@ impl ToolBox {
             );
         }
         self.tools.insert(name.clone(), tool);
+        self.direct_native_media_unavailable.remove(&name);
         self.capability_unavailable.remove(&name);
         self.capability_description_suffixes.remove(&name);
         self.definition_cache.lock().unwrap().clear();
@@ -1578,7 +1672,9 @@ impl ToolBox {
         debug_assert!(
             crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name.as_str())
         );
-        self.dormant_direct_native_media.insert(name, tool);
+        self.dormant_direct_native_media.insert(name.clone(), tool);
+        self.direct_native_media_unavailable
+            .insert(name, DirectNativeMediaUnavailable::AuthorityUnavailable);
         self
     }
 
@@ -1589,7 +1685,17 @@ impl ToolBox {
         let dormant = std::mem::take(&mut self.dormant_direct_native_media);
         for (name, tool) in dormant {
             if availability.exposes_direct_tool(&name) {
+                self.direct_native_media_unavailable.remove(&name);
                 self.tools.insert(name, tool);
+            } else {
+                // Retain the schema-only dormant entry so a partial live
+                // authority changes callability, never the cacheable tools
+                // prefix advertised to the provider.
+                self.direct_native_media_unavailable.insert(
+                    name.clone(),
+                    DirectNativeMediaUnavailable::Availability(availability.reason_for(&name)),
+                );
+                self.dormant_direct_native_media.insert(name, tool);
             }
         }
         self.definition_cache.lock().unwrap().clear();
@@ -1606,6 +1712,47 @@ impl ToolBox {
         })
     }
 
+    /// Move a direct-native media tool out of the callable surface while
+    /// retaining its schema in the stable provider projection.
+    fn deactivate_direct_native_media(
+        mut self,
+        name: &str,
+        reason: DirectNativeMediaUnavailable,
+    ) -> Self {
+        debug_assert!(crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name));
+        if let Some(tool) = self.tools.remove(name) {
+            self.dormant_direct_native_media
+                .insert(name.to_string(), tool);
+            self.definition_cache.lock().unwrap().clear();
+        }
+        if self.dormant_direct_native_media.contains_key(name) {
+            self.direct_native_media_unavailable
+                .insert(name.to_string(), reason);
+        }
+        self
+    }
+
+    /// Keep transcription's stable schema while returning the dispatch failure
+    /// that actually made this turn non-callable.
+    pub(crate) fn deactivate_direct_native_media_for_transcription_dispatch(self) -> Self {
+        self.deactivate_direct_native_media(
+            "transcribe_audio",
+            DirectNativeMediaUnavailable::TranscriptionDispatchUnavailable,
+        )
+    }
+
+    /// Deactivate every direct-native media tool for a turn without deleting
+    /// the stable provider schema selected for this agent.
+    pub(crate) fn deactivate_direct_native_media_tools(mut self) -> Self {
+        for &name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+            self = self.deactivate_direct_native_media(
+                name,
+                DirectNativeMediaUnavailable::AuthorityUnavailable,
+            );
+        }
+        self
+    }
+
     /// Permanently strip direct-native media from a background clone.
     pub(crate) fn without_direct_native_media(mut self) -> Self {
         for name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
@@ -1617,6 +1764,7 @@ impl ToolBox {
     pub fn without(mut self, name: &str) -> Self {
         self.tools.remove(name);
         self.dormant_direct_native_media.remove(name);
+        self.direct_native_media_unavailable.remove(name);
         self.mcp_builtin_tools.remove(name);
         self.overrides.remove(name);
         self.capability_unavailable.remove(name);
@@ -1704,6 +1852,54 @@ impl ToolBox {
 
     pub fn get_cloned(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.get(name).cloned()
+    }
+
+    /// Return a tool from the provider-visible schema, including a dormant
+    /// direct-native media tool. Unlike [`Self::get`], this does not imply the
+    /// tool is callable in this turn.
+    pub(crate) fn advertised_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools
+            .get(name)
+            .or_else(|| self.dormant_direct_native_media.get(name))
+    }
+
+    /// Resolve the call-time status of a name against the stable provider
+    /// schema. This is the sole boundary that distinguishes an unavailable
+    /// advertised tool from a hallucinated name.
+    pub(crate) fn call_availability(&self, name: &str) -> ToolCallAvailability {
+        if self.get(name).is_some() {
+            ToolCallAvailability::Callable
+        } else if self.advertised_tool(name).is_some() {
+            ToolCallAvailability::AdvertisedUnavailable
+        } else {
+            ToolCallAvailability::NotAdvertised
+        }
+    }
+
+    /// Model-visible explanation for an advertised tool that cannot be called
+    /// in this turn. Capability detail is retained when it is safe and useful,
+    /// including the runtime/model/dispatch reason for dormant media tools.
+    pub(crate) fn unavailable_call_message(&self, name: &str) -> Option<String> {
+        if self.call_availability(name) != ToolCallAvailability::AdvertisedUnavailable {
+            return None;
+        }
+        if let Some(issues) = self.capability_unavailable.get(name) {
+            let notice = crate::capabilities::missing_required_notice(
+                issues.iter().cloned(),
+                crate::capabilities::RemedyPlatform::current(),
+            )
+            .unwrap_or_else(|| "required host capability is unavailable".to_string());
+            return Some(format!("Tool `{name}` is currently unavailable: {notice}"));
+        }
+        let reason = self
+            .direct_native_media_unavailable
+            .get(name)
+            .copied()
+            .map(DirectNativeMediaUnavailable::message)
+            .unwrap_or("it is not callable in this turn");
+        Some(format!(
+            "Tool `{name}` is currently unavailable because {reason}."
+        ))
     }
 
     pub fn apply_capabilities(
@@ -1822,6 +2018,36 @@ impl ToolBox {
             .unwrap()
             .insert(steering, definitions.clone());
         definitions
+    }
+
+    /// Project the session-stable provider tool schema.
+    ///
+    /// A live capability probe or root-scoped media authority may make a tool
+    /// temporarily non-callable, but it must not add or remove that tool from
+    /// the provider's cacheable `tools[]` prefix.  The ordinary
+    /// [`Self::definitions`] projection remains the operational view for UI and
+    /// MCP; this projection includes dormant media tools and deliberately omits
+    /// volatile capability-description suffixes. Dispatch uses this stable
+    /// schema to distinguish an unavailable advertised call from a
+    /// hallucinated name at call time.
+    pub fn advertised_definitions(
+        &self,
+        steering: crate::agents::ToolSteering,
+    ) -> Vec<ToolDefinition> {
+        let tools: BTreeMap<&str, &Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.as_str(), tool))
+            .chain(
+                self.dormant_direct_native_media
+                    .iter()
+                    .map(|(name, tool)| (name.as_str(), tool)),
+            )
+            .collect();
+        tools
+            .into_values()
+            .map(|tool| definition_of(&**tool, steering, self.overrides.get(tool.name())))
+            .collect()
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -2216,6 +2442,107 @@ mod definition_cache_tests {
         // A different steering is a different cache key → rebuild.
         let _ = toolbox.definitions(crate::agents::ToolSteering::Verbose);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct DormantMediaTool(&'static str);
+
+    #[async_trait]
+    impl Tool for DormantMediaTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "read a current-session image"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("unavailable without live media authority"))
+        }
+    }
+
+    #[test]
+    fn advertised_definitions_include_dormant_media_without_making_it_callable() {
+        let toolbox = ToolBox::new()
+            .with_dormant_direct_native_media(Arc::new(DormantMediaTool("read_image")));
+
+        assert!(toolbox.get("read_image").is_none());
+        assert_eq!(
+            toolbox.call_availability("read_image"),
+            ToolCallAvailability::AdvertisedUnavailable
+        );
+        assert!(
+            toolbox
+                .unavailable_call_message("read_image")
+                .is_some_and(|message| message.contains("live media authority"))
+        );
+        assert!(
+            toolbox
+                .definitions(crate::agents::ToolSteering::Terse)
+                .is_empty()
+        );
+        let advertised = toolbox.advertised_definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0].name, "read_image");
+
+        let activated = toolbox.clone().activate_dormant_direct_native_media(
+            crate::tool_media_authority::MediaToolAvailability::available(),
+        );
+        assert!(activated.get("read_image").is_some());
+        assert_eq!(
+            serde_json::to_vec(&advertised).unwrap(),
+            serde_json::to_vec(
+                &activated.advertised_definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            "a media authority may change callability but never tools[]"
+        );
+    }
+
+    #[test]
+    fn dormant_media_call_reports_the_live_model_limitation() {
+        let toolbox = ToolBox::new()
+            .with_dormant_direct_native_media(Arc::new(DormantMediaTool("inspect_audio")))
+            .activate_dormant_direct_native_media(
+                crate::tool_media_authority::MediaToolAvailability::available_with(
+                    crate::tool_media_authority::AvRuntimeProfile::FullClip,
+                    crate::config::providers::CapabilityStatus::Supported,
+                    crate::config::providers::CapabilityStatus::RequiresEntitlement,
+                    crate::config::providers::CapabilityStatus::Supported,
+                ),
+            );
+
+        assert_eq!(
+            toolbox.call_availability("inspect_audio"),
+            ToolCallAvailability::AdvertisedUnavailable,
+            "the provider schema remains stable while the model limitation gates dispatch"
+        );
+        let message = toolbox
+            .unavailable_call_message("inspect_audio")
+            .expect("an advertised but dormant tool has a call-time result");
+        assert!(message.contains("requires an entitlement"));
+        assert!(!message.contains("no live media authority"));
+    }
+
+    #[test]
+    fn dormant_transcription_call_reports_dispatch_unavailability() {
+        let toolbox = ToolBox::new()
+            .with(Arc::new(DormantMediaTool("transcribe_audio")))
+            .deactivate_direct_native_media_for_transcription_dispatch();
+
+        assert_eq!(
+            toolbox.call_availability("transcribe_audio"),
+            ToolCallAvailability::AdvertisedUnavailable
+        );
+        assert!(
+            toolbox
+                .unavailable_call_message("transcribe_audio")
+                .is_some_and(|message| message.contains("authorized transcription dispatch"))
+        );
     }
 }
 
@@ -2614,9 +2941,6 @@ mod steering_tests {
             ("write", &["read", "edit"]),
             ("edit", &["read", "write"]),
             ("unlock", &["write", "edit"]),
-            ("plan_read", &["plan_edit", "plan_write", "todo"]),
-            ("plan_write", &["plan_edit", "todo"]),
-            ("plan_edit", &["plan_read", "plan_write"]),
             ("todo", &["task"]),
         ];
         for (name, siblings) in cases {
@@ -3148,9 +3472,6 @@ mod steering_tests {
             ("lsp", ToolEffect::ReadOnly),
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),
-            ("plan_edit", ToolEffect::Dynamic),
-            ("plan_read", ToolEffect::Dynamic),
-            ("plan_write", ToolEffect::Dynamic),
             ("question", ToolEffect::Dynamic),
             ("read", ToolEffect::ReadOnly),
             ("return", ToolEffect::Dynamic),

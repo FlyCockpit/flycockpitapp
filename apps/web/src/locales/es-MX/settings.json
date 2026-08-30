@@ -5,6 +5,7 @@
   },
   "navProfile": "Perfil",
   "navSecurity": "Seguridad",
+  "navStorage": "Almacenamiento",
   "profile": {
     "title": "Perfil",
     "description": "Administra tu información de perfil",
@@ -75,5 +76,48 @@
     "passwordChangeError": "No se pudo cambiar la contraseña. Intenta de nuevo.",
     "passwordsMustMatch": "Las contraseñas deben coincidir."
   },
-  "title": "Configuración"
+  "title": "Configuración",
+  "storage": {
+    "title": "Administración de almacenamiento",
+    "description": "Revisa los datos de Cockpit y libera solo los elementos que confirmes.",
+    "chooseInstance": "Elige una instancia",
+    "instanceDescription": "El almacenamiento permanece en la instancia de Cockpit seleccionada.",
+    "refresh": "Cargar informe de almacenamiento",
+    "waitingForInstance": "Conectando a la instancia seleccionada…",
+    "hint": "Cockpit usa {{size}} en esta instancia. Revisa el almacenamiento.",
+    "dismiss": "Descartar",
+    "total": "Espacio total: {{size}}",
+    "breakdownDescription": "Medido en disco. Los elementos recuperables requieren una vista previa.",
+    "reclaimable": "{{size}} recuperables",
+    "quickActions": "Acciones de limpieza",
+    "previewRequired": "Cada limpieza muestra los elementos exactos y bytes recuperados antes de ejecutarse.",
+    "archiveOlderThan30": "Vista previa para archivar sesiones de más de 30 días",
+    "includeRenamedOrPinned": "Incluir también sesiones renombradas y sesiones con mensajes fijados",
+    "archivedReadyForDeletion": "Las sesiones revisadas están archivadas y siguen disponibles para el paso separado de eliminación permanente.",
+    "previewArchivedDelete": "Vista previa para eliminar permanentemente las sesiones revisadas",
+    "archivedSessions": "Sesiones archivadas",
+    "archivedSessionsDescription": "Las sesiones archivadas siguen siendo legibles y pueden revisarse aquí antes de eliminarlas permanentemente.",
+    "removeOrphans": "Vista previa para limpiar espacios de trabajo huérfanos",
+    "permanentDelete": "Eliminar sesiones permanentemente",
+    "sessionIdsPlaceholder": "UUID de sesiones separados por comas o espacios",
+    "previewDelete": "Vista previa de eliminación permanente",
+    "previewTitle": "Revisar limpieza",
+    "previewDescription": "Esta limpieza recuperará {{size}}.",
+    "confirm": "Confirmar limpieza",
+    "loadError": "No se pudo cargar el informe de almacenamiento.",
+    "previewError": "No se pudo crear la vista previa de limpieza.",
+    "executeError": "No se pudo completar la limpieza. Revisa el almacenamiento antes de reintentar.",
+    "categories": {
+      "ledger": "Registro",
+      "sessions_by_age": "Sesiones de más de 30 días",
+      "workspace_scratch": "Espacio temporal del proyecto",
+      "local_configs": "Configuraciones locales",
+      "worktrees": "Árboles de trabajo",
+      "task_artifacts": "Artefactos de tareas",
+      "computer_capture": "Capturas de computadora",
+      "result_blobs": "Resultados almacenados",
+      "session_shims": "Comandos auxiliares de sesión",
+      "session_tmp": "Archivos temporales de sesión"
+    }
+  }
 }

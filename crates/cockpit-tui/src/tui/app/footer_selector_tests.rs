@@ -34,7 +34,6 @@ fn click(column: u16, row: u16) -> MouseEvent {
 
 fn app(tmp: &tempfile::TempDir) -> App {
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = Dialog::None;
     app
 }

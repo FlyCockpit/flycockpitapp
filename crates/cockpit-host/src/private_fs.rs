@@ -1852,8 +1852,6 @@ enum PrivateWritePublish {
 
 #[cfg(unix)]
 fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePublish) -> Result<()> {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
 
     let dir = atomic_write_dir(path);
@@ -1863,9 +1861,6 @@ fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePubli
             path.display()
         )
     })?;
-    let final_c = std::ffi::CString::new(final_name.as_bytes())
-        .with_context(|| format!("write target {} name contains NUL", path.display()))?;
-
     // Hold the destination directory through a no-follow component walk from a
     // trusted root (`walk_private_dir`): no ancestor is resolved by following a
     // symlink reachable in an attacker-writable directory, so an attacker who
@@ -1882,6 +1877,47 @@ fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePubli
     // below, and the credential path establishes its 0700 parent through
     // `ensure_parent_dir_private` before ever reaching this funnel.
     let dir_handle = walk_private_dir(dir, false)?;
+    write_private_file_in_held_dir(&dir_handle, final_name, path, bytes, publish)
+}
+
+/// Crash-atomically replace a private file relative to an already-held
+/// directory descriptor.
+///
+/// The caller owns the directory capability and keeps it open across any
+/// operation that selected this destination. This is for state whose logical
+/// root can be renamed or replaced while it is being generated: publishing
+/// through the retained descriptor ensures the final rename cannot be
+/// redirected to a replacement pathname.
+#[cfg(unix)]
+pub fn write_private_file_in_dir_fd(
+    dir_fd: &std::fs::File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    write_private_file_in_held_dir(
+        dir_fd,
+        name,
+        display_path,
+        bytes,
+        PrivateWritePublish::Replace,
+    )
+}
+
+#[cfg(unix)]
+fn write_private_file_in_held_dir(
+    dir_handle: &std::fs::File,
+    final_name: &std::ffi::OsStr,
+    path: &Path,
+    bytes: &[u8],
+    publish: PrivateWritePublish,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let final_c = std::ffi::CString::new(final_name.as_bytes())
+        .with_context(|| format!("write target {} name contains NUL", path.display()))?;
 
     // Refuse a hostile pre-existing target (symlink / directory / hard-linked)
     // before writing; the rename below is non-following regardless, so a secret
@@ -1988,7 +2024,7 @@ fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePubli
 
     dir_handle
         .sync_all()
-        .with_context(|| format!("fsync directory {}", dir.display()))?;
+        .with_context(|| format!("fsync directory for {}", path.display()))?;
     Ok(())
 }
 

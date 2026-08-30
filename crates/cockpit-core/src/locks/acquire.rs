@@ -32,9 +32,7 @@ impl LockManager {
         })
     }
 
-    /// In-memory-only manager. Used by tests and the (rare) headless
-    /// `cockpit run --ephemeral` path that doesn't persist anything.
-    // Retained for the not-yet-wired `cockpit run --ephemeral` path.
+    /// In-memory-only manager used by tests and isolated daemon contexts.
     #[allow(dead_code)]
     pub fn in_memory(db: Db) -> Self {
         Self {

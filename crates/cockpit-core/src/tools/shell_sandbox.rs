@@ -1,7 +1,8 @@
 //! zerobox shell confinement for the `bash` tool (sandboxing part 2).
 //!
 //! Wraps a `sh -c <command>` invocation in a zerobox `Sandbox` confined
-//! to: the agent cwd (read+write), the per-session tmp dir (read+write),
+//! to: the agent cwd (read+write), the ephemeral per-session tmp dir
+//! (read+write), and the durable workspace scratch dir (read+write),
 //! and `PATH` execution (zerobox's default profile auto-adds a minimal
 //! system-path read entry, so any binary on `PATH` still runs). Reads
 //! outside that allowlist are denied — silently, inside the child only
@@ -102,9 +103,21 @@ pub fn sandbox_policy(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> SandboxPolicy {
+    sandbox_policy_with_workspace_scratch(cwd, tmp_dir, None, session_env, extra_paths, write_scope)
+}
+
+pub fn sandbox_policy_with_workspace_scratch(
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+) -> SandboxPolicy {
     sandbox_policy_with_visibility_restriction(
         cwd,
         tmp_dir,
+        workspace_scratch_dir,
         session_env,
         extra_paths,
         write_scope,
@@ -126,6 +139,7 @@ pub fn sandbox_policy_for_workspace_lease(
     sandbox_policy_with_visibility_restriction(
         cwd,
         tmp_dir,
+        None,
         session_env,
         extra_paths,
         write_scope,
@@ -137,6 +151,7 @@ pub fn sandbox_policy_for_workspace_lease(
 fn sandbox_policy_with_visibility_restriction(
     cwd: &std::path::Path,
     tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
@@ -188,6 +203,10 @@ fn sandbox_policy_with_visibility_restriction(
         // hatch into another workspace's shared state.
         push_unique_path(&mut allow_read_roots, tmp.to_path_buf());
         push_unique_path(&mut allow_write_roots, tmp.to_path_buf());
+    }
+    if let Some(scratch) = workspace_scratch_dir {
+        push_unique_path(&mut allow_read_roots, scratch.to_path_buf());
+        push_unique_path(&mut allow_write_roots, scratch.to_path_buf());
     }
 
     SandboxPolicy {
@@ -271,11 +290,12 @@ pub const fn shell_sandbox_supported() -> bool {
 /// run its cancel/timeout loop.
 ///
 /// `command` is the full (prelude-prefixed) shell line. `cwd` is the
-/// agent working directory — read+write inside the sandbox. `tmp_dir`,
-/// when present, is the per-session scratch dir — also read+write, and
-/// counted as inside the boundary by native-tool checks. `extra_env` is
-/// applied on top of the inherited environment (cockpit uses it for the
-/// env-scrub overrides). Reads outside cwd + tmp are denied.
+/// agent working directory — read+write inside the sandbox. `tmp_dir`, when
+/// present, is the ephemeral per-session scratch; `workspace_scratch_dir` is
+/// the durable per-workspace, per-session scratch. Both are read+write and
+/// count as inside the native-tool boundary. `extra_env` is applied on top of
+/// the inherited environment (cockpit uses it for the env-scrub overrides).
+/// Reads outside cwd and these scratch roots are denied.
 ///
 /// Returns an error only if zerobox's policy validation fails (e.g. an
 /// unusable cwd); a failure there is surfaced to the model as a spawn
@@ -289,11 +309,35 @@ pub async fn build_sandboxed_command(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> Result<tokio::process::Command> {
+    build_sandboxed_command_with_workspace_scratch(
+        command,
+        cwd,
+        tmp_dir,
+        None,
+        extra_env,
+        session_env,
+        extra_paths,
+        write_scope,
+    )
+    .await
+}
+
+pub async fn build_sandboxed_command_with_workspace_scratch(
+    command: &str,
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+) -> Result<tokio::process::Command> {
     build_sandboxed_command_with_visibility_root(
         command,
         cwd,
         cwd,
         tmp_dir,
+        workspace_scratch_dir,
         extra_env,
         session_env,
         extra_paths,
@@ -314,6 +358,7 @@ pub async fn build_sandboxed_command_with_visibility_root(
     cwd: &std::path::Path,
     visibility_root: &std::path::Path,
     tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
     extra_env: &[(String, String)],
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
@@ -321,9 +366,9 @@ pub async fn build_sandboxed_command_with_visibility_root(
     restrict_to_visibility: bool,
     workspace_write_allowed: bool,
 ) -> Result<tokio::process::Command> {
-    // Session scratch is shared state and may sit outside a child lease. A
-    // writable leased shell instead receives a dedicated scratch directory
-    // below its visibility root; read/execute-only leases receive none.
+    // The ephemeral tmp remains lease-local, while the session's durable
+    // scratch is an explicit capability and remains available outside a child
+    // lease's workspace visibility root.
     let lease_scratch = if restrict_to_visibility && workspace_write_allowed {
         let scratch_root = write_scope
             .filter(|scope| cockpit_host::path_containment::contained_under(visibility_root, scope))
@@ -343,6 +388,7 @@ pub async fn build_sandboxed_command_with_visibility_root(
     let policy = sandbox_policy_with_visibility_restriction(
         visibility_root,
         tmp_dir,
+        workspace_scratch_dir,
         session_env,
         extra_paths,
         if restrict_to_visibility && !workspace_write_allowed {
@@ -952,6 +998,32 @@ mod tests {
                     .allow_write_roots
                     .contains(&shared_tmp.path().to_path_buf()),
             "a shared session temp dir must not escape a workspace lease"
+        );
+    }
+
+    #[test]
+    fn leased_policy_admits_durable_workspace_scratch() {
+        let lease_root = tempfile::tempdir().unwrap();
+        let workspace_scratch = tempfile::tempdir().unwrap();
+        let policy = sandbox_policy_with_visibility_restriction(
+            lease_root.path(),
+            None,
+            Some(workspace_scratch.path()),
+            &std::collections::HashMap::new(),
+            &[],
+            Some(std::path::Path::new("/__cockpit-deny-writes__")),
+            true,
+            false,
+        );
+        assert!(
+            policy
+                .allow_read_roots
+                .contains(&workspace_scratch.path().to_path_buf())
+        );
+        assert!(
+            policy
+                .allow_write_roots
+                .contains(&workspace_scratch.path().to_path_buf())
         );
     }
 

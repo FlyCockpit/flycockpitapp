@@ -362,6 +362,37 @@ pub fn remaining_seed_reads(history: &[Message], seed_reads: Vec<SeedRead>) -> V
         .collect()
 }
 
+/// Materialize host-selected seeds as stable synthetic tool calls before the
+/// child is published.  The declaration, rather than the one-use selection
+/// receipt, is the durable authority for recovering pre-inference execution.
+pub fn declare_seed_read_calls(
+    seed_reads: &[SeedRead],
+) -> Result<Vec<crate::engine::message::ToolCall>, String> {
+    use rig::message::{ToolCall, ToolFunction};
+
+    let calls = seed_reads
+        .iter()
+        .cloned()
+        .map(SeedRead::validate)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|seed| ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(format!(
+                "seed-read-{}",
+                uuid::Uuid::now_v7()
+            )),
+            provider: None,
+            function: ToolFunction {
+                name: seed.tool,
+                arguments: seed.args,
+            },
+            signature: None,
+            additional_params: None,
+        })
+        .collect::<Vec<_>>();
+    Ok(calls)
+}
+
 /// Execute seeds through the same ordinary-call boundary used for model-authored
 /// calls. The caller supplies the implementation child's full `ToolCtx`; this
 /// deliberately preserves its permission, sandbox, lease, hook, and timeout
@@ -379,32 +410,10 @@ pub async fn execute_before_first_inference(
     cwd: &std::path::Path,
     loop_guard_threshold: u32,
 ) -> anyhow::Result<()> {
-    use rig::message::{ToolCall, ToolFunction};
-
     if seed_reads.is_empty() {
         return Ok(());
     }
-    let calls = seed_reads
-        .iter()
-        .cloned()
-        .map(SeedRead::validate)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(anyhow::Error::msg)?
-        .into_iter()
-        .map(|seed| ToolCall {
-            id: rig::message::ToolCallId::new_or_mint(format!(
-                "seed-read-{}",
-                uuid::Uuid::now_v7()
-            )),
-            provider: None,
-            function: ToolFunction {
-                name: seed.tool,
-                arguments: seed.args,
-            },
-            signature: None,
-            additional_params: None,
-        })
-        .collect::<Vec<_>>();
+    let calls = declare_seed_read_calls(seed_reads).map_err(anyhow::Error::msg)?;
     history.push(Message::Assistant {
         id: None,
         content: calls
@@ -555,6 +564,29 @@ mod tests {
             pending_declared_seed_calls(&history),
             vec![second_call],
             "after a parked seed replays, the driver must retain every later declared seed for ordinary dispatch"
+        );
+    }
+
+    #[test]
+    fn durable_seed_declarations_remain_replayable_before_any_result() {
+        let seed = SeedRead {
+            tool: "read".to_string(),
+            args: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let calls = declare_seed_read_calls(&[seed]).expect("valid seed declares a call");
+        let history = vec![Message::Assistant {
+            id: None,
+            content: calls
+                .iter()
+                .cloned()
+                .map(AssistantContent::ToolCall)
+                .collect(),
+        }];
+
+        assert_eq!(
+            pending_declared_seed_calls(&history),
+            calls,
+            "a published seed declaration is sufficient recovery authority before its first dispatch"
         );
     }
 }

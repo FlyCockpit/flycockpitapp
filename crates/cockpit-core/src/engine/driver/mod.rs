@@ -1109,6 +1109,11 @@ pub struct Driver {
     /// frames. The queue merely schedules a safe-boundary turn; its placeholder
     /// text is never authority for the recovered model input.
     recovered_interactive_continuations: std::collections::HashMap<uuid::Uuid, Message>,
+    /// Recovered interactive continuations whose durable initial snapshot
+    /// contains seed declarations that must run before their first inference.
+    /// The queue UUID is a scheduling key only; the declarations remain in the
+    /// task snapshot until ordinary dispatch records their tool results.
+    recovered_interactive_seed_replays: std::collections::HashSet<uuid::Uuid>,
     /// Reattached accepted late-steer checkpoints waiting for the worker's
     /// exact `ResumeAcceptedLateUserDecisionSteer` control.  Keeping this
     /// separate from the queue scheduler makes an accepted checkpoint
@@ -2223,6 +2228,7 @@ impl Driver {
             pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
+            recovered_interactive_seed_replays: std::collections::HashSet::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             time_injection_interval_minutes: self.time_injection_interval_minutes,
@@ -2599,6 +2605,7 @@ impl Driver {
             pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
+            recovered_interactive_seed_replays: std::collections::HashSet::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -4052,6 +4059,8 @@ impl Driver {
                 .context("recovered interactive task snapshot has no history")?,
         )
         .context("decoding recovered interactive task history")?;
+        let recovered_seed_replay =
+            !crate::engine::seed_reads::pending_declared_seed_calls(&history).is_empty();
         let snapshot_next_prompt = snapshot
             .get("next_prompt")
             .cloned()
@@ -4200,6 +4209,10 @@ impl Driver {
             .await;
         self.recovered_interactive_continuations
             .insert(queue_item_id, next_prompt);
+        if recovered_seed_replay {
+            self.recovered_interactive_seed_replays
+                .insert(queue_item_id);
+        }
         Ok(endpoint_generation)
     }
 
@@ -4603,14 +4616,22 @@ impl Driver {
         Ok(())
     }
 
-    async fn execute_interactive_seed_reads(
+    /// Run seed calls that were declared in the interactive child's durable
+    /// history before its first model inference.  Recovery reuses the same
+    /// declarations and call IDs, so publication never depends on the
+    /// in-memory explore receipt remaining available.
+    async fn execute_interactive_declared_seed_reads(
         &mut self,
-        seed_reads: &[crate::engine::seed_reads::SeedRead],
         brief: Message,
         tx: &mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Message> {
-        if seed_reads.is_empty() {
+        let pending = self
+            .stack
+            .last()
+            .map(|frame| crate::engine::seed_reads::pending_declared_seed_calls(&frame.history))
+            .unwrap_or_default();
+        if pending.is_empty() {
             return Ok(brief);
         }
         let agent = self
@@ -4675,21 +4696,26 @@ impl Driver {
             config: self.config.clone(),
             mcp_resolver: agent.mcp_resolver.clone(),
         };
+        let snapshot = self.config.snapshot();
+        let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+            agent: &agent,
+            session: &self.session,
+            model: &agent.model,
+            active_tools: &active_tools,
+            ctx: &ctx,
+            tx,
+            hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
+                &self.session,
+                &self.config,
+            ),
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: snapshot.hooks(),
+        };
         let frame = self.stack.last_mut().context("driver stack is empty")?;
         frame.history.push(brief);
-        crate::engine::seed_reads::execute_before_first_inference(
-            &agent,
-            &active_tools,
-            &ctx,
-            tx,
-            &mut frame.history,
-            seed_reads,
-            &self.session,
-            &self.config,
-            &self.cwd,
-            self.loop_guard_threshold,
-        )
-        .await?;
+        crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
+            .await?;
         Ok(crate::engine::seed_reads::completion_prompt())
     }
 
@@ -11443,6 +11469,11 @@ impl Driver {
             self.recovered_interactive_continuations
                 .remove(queue_item_id)
         });
+        let recovered_seed_replay = recovered_next_prompt.is_some()
+            && submission.queue_item_ids.iter().any(|queue_item_id| {
+                self.recovered_interactive_seed_replays
+                    .remove(queue_item_id)
+            });
         let submission_has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
@@ -12484,6 +12515,11 @@ impl Driver {
                 delivery_class: Default::default(),
             })
         };
+        if recovered_seed_replay {
+            next_prompt = self
+                .execute_interactive_declared_seed_reads(next_prompt, tx, cancel.clone())
+                .await?;
+        }
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
         // ROOT stop-gate latch for THIS user turn (`tool-hooks-lifecycle-
@@ -13528,9 +13564,45 @@ impl Driver {
                             continue;
                         }
                     };
+                    // Declare every seed before publishing the child. The
+                    // declaration is durable executor state: after the
+                    // one-use receipt is committed, restart replays these
+                    // exact calls through the implementation child's normal
+                    // tool boundary before it permits any inference.
+                    let declared_seed_calls =
+                        match crate::engine::seed_reads::declare_seed_read_calls(&seed_reads) {
+                            Ok(calls) => calls,
+                            Err(error) => {
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                                continue;
+                            }
+                        };
+                    let mut snapshot_history = delegation_payload_history.clone();
+                    if !declared_seed_calls.is_empty() {
+                        snapshot_history.push(Message::Assistant {
+                            id: None,
+                            content: declared_seed_calls
+                                .iter()
+                                .cloned()
+                                .map(crate::engine::message::AssistantContent::ToolCall)
+                                .collect(),
+                        });
+                    }
                     let snapshot_json = match serde_json::to_string(&serde_json::json!({
-                        "version": 1,
-                        "history": &delegation_payload_history,
+                        "version": 2,
+                        "history": &snapshot_history,
+                        // This is also the recovery continuation when no
+                        // seed was selected. When declarations are present,
+                        // reattachment records it in history before replaying
+                        // the calls and supplies the completion notice next.
+                        "next_prompt": Message::user(brief.clone()),
+                        "late_user_steer_continuation_id": serde_json::Value::Null,
                     })) {
                         Ok(snapshot_json) => snapshot_json,
                         Err(error) => {
@@ -13702,7 +13774,7 @@ impl Driver {
                         pending_computer_continuations: Vec::new(),
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),
-                        history: delegation_payload_history,
+                        history: snapshot_history,
                         answering: Some(PendingTaskCall {
                             call_id: task_call_id.clone(),
                             provider_item_id: task_provider_item_id,
@@ -13786,8 +13858,7 @@ impl Driver {
                         )
                     };
                     next_prompt = self
-                        .execute_interactive_seed_reads(
-                            &seed_reads,
+                        .execute_interactive_declared_seed_reads(
                             Message::user(brief),
                             tx,
                             cancel.clone(),

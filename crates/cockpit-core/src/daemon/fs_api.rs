@@ -1480,6 +1480,26 @@ fn save_extended_config_sync(
             &current,
         )
         .map_err(bad_request_config)?;
+    // Reject an invalid KB trust policy before the atomic write. In
+    // particular, a trust-required KB cannot persist an untrusted dream model
+    // and remote KBs cannot claim a client-side-only trust guarantee.
+    let merged_value: serde_json::Value =
+        serde_json::from_slice(&merged).map_err(bad_request_config)?;
+    let extended: cockpit_config::config::extended::ExtendedConfig =
+        serde_json::from_value(merged_value).map_err(bad_request_config)?;
+    // Provider bodies are layered separately from config.json. Resolve the
+    // actual effective catalog instead of treating a project-only settings
+    // write as if it had no trusted providers from an ambient layer.
+    let provider_paths = cockpit_config::config::dirs::config_file_paths_for_load(&root);
+    let providers = cockpit_config::config::providers::ConfigDoc::try_load_effective_from_paths(
+        &provider_paths,
+    )
+    .map_err(bad_request_config)?;
+    cockpit_config::config::extended::validate_knowledge_base_registry(
+        &extended.knowledge_bases,
+        &providers,
+    )
+    .map_err(|_| invalid_knowledge_base_trust_config())?;
     let desired_hash = content_hash(&merged);
     let config_generation = if desired_hash != current_hash {
         cockpit_config::config::write_config_bytes_atomic(&target, &merged).map_err(internal)?;
@@ -2249,6 +2269,17 @@ fn bad_request_config<E>(_error: E) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "configuration payload is not valid config.json".into(),
+    }
+}
+
+/// Stable, non-secret policy feedback for settings clients. Unlike a generic
+/// serde failure, this is an intentional user-facing rejection of a valid JSON
+/// shape whose requested trust relationship cannot be honored.
+fn invalid_knowledge_base_trust_config() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "knowledge-base trust configuration is invalid: trustRequired is local-only and dreamModel must be trusted"
+            .into(),
     }
 }
 

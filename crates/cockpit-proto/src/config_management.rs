@@ -210,7 +210,7 @@ pub enum ExtendedConfigField {
     CompactModel,
     BtwModel,
     EmbeddingModel,
-    ProjectKnowledge,
+    KnowledgeBases,
     KnowledgeInjectMaxTokens,
     CompactPrompt,
     PromptInjectionGuard,
@@ -280,7 +280,7 @@ impl ExtendedConfigField {
             ExtendedConfigField::CompactModel,
             ExtendedConfigField::BtwModel,
             ExtendedConfigField::EmbeddingModel,
-            ExtendedConfigField::ProjectKnowledge,
+            ExtendedConfigField::KnowledgeBases,
             ExtendedConfigField::KnowledgeInjectMaxTokens,
             ExtendedConfigField::CompactPrompt,
             ExtendedConfigField::PromptInjectionGuard,
@@ -351,7 +351,7 @@ impl ExtendedConfigField {
             Self::CompactModel => "compact_model",
             Self::BtwModel => "btw_model",
             Self::EmbeddingModel => "embedding_model",
-            Self::ProjectKnowledge => "project_knowledge",
+            Self::KnowledgeBases => "knowledgeBases",
             Self::KnowledgeInjectMaxTokens => "knowledge_inject_max_tokens",
             Self::CompactPrompt => "compact_prompt",
             Self::PromptInjectionGuard => "prompt_injection_guard",
@@ -466,6 +466,18 @@ mod tests {
         assert_ne!(
             first.sanitized_intent_hash().unwrap(),
             different_target.sanitized_intent_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn knowledge_base_registry_is_a_patchable_config_field() {
+        assert_eq!(
+            ExtendedConfigField::from_json_key("knowledgeBases"),
+            Some(ExtendedConfigField::KnowledgeBases)
+        );
+        assert_eq!(
+            ExtendedConfigField::KnowledgeBases.json_key(),
+            "knowledgeBases"
         );
     }
 }

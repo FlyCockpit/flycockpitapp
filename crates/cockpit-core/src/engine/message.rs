@@ -1473,6 +1473,30 @@ impl UserSubmissionQueue {
         }
     }
 
+    /// Wait until a matching foreground submission is pending without taking
+    /// it from the queue. Utility work uses this to yield immediately to user
+    /// re-entry while preserving the normal group-order dequeue path.
+    pub async fn wait_for_pending_for(&self, target_id: Option<&str>) -> bool {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            {
+                let state = self.inner.lock().await;
+                if state.closed {
+                    return false;
+                }
+                let pending = match target_id {
+                    Some(target_id) => state.pending.iter().any(|item| item.target.id == target_id),
+                    None => !state.pending.is_empty(),
+                };
+                if pending {
+                    return true;
+                }
+            }
+            notified.await;
+        }
+    }
+
     #[cfg(test)]
     pub async fn discard_pending(&self) -> usize {
         self.discard_pending_with_receipts().await.0

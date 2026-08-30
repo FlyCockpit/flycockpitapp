@@ -62,12 +62,15 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("list-packages"),
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
+    ToolTimeoutSafety::abandon_safe("knowledge_retrieve"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
+    // Knowledge dreams observe cancellation only while waiting for their
+    // write fence. Once the blocking transaction starts it must reach its
+    // commit/defer boundary, so it must not claim the dispatcher's stronger
+    // cleanup-before-return cancellation contract.
+    ToolTimeoutSafety::abandon_safe("knowledge_dream_apply"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),
-    ToolTimeoutSafety::abandon_safe("plan_edit"),
-    ToolTimeoutSafety::abandon_safe("plan_read"),
-    ToolTimeoutSafety::abandon_safe("plan_write"),
     ToolTimeoutSafety::human_blocking("question"),
     ToolTimeoutSafety::abandon_safe("read"),
     ToolTimeoutSafety::abandon_safe("read_image"),
@@ -76,9 +79,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("schedule"),
     ToolTimeoutSafety::abandon_safe("search"),
     ToolTimeoutSafety::abandon_safe("seed"),
-    ToolTimeoutSafety::abandon_safe("session_lineage_search"),
-    ToolTimeoutSafety::abandon_safe("session_read"),
-    ToolTimeoutSafety::abandon_safe("session_search"),
+    ToolTimeoutSafety::abandon_safe("history_search"),
     ToolTimeoutSafety::abandon_safe("skill"),
     ToolTimeoutSafety::abandon_safe("skill_manage"),
     ToolTimeoutSafety::abandon_safe("spawn"),
@@ -90,8 +91,6 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     // on drop so a detached send records `completed_after_cancel` instead of
     // `succeeded` with an undeliverable body.
     ToolTimeoutSafety::honors_cancel("transcribe_audio"),
-    ToolTimeoutSafety::abandon_safe("artifact_read"),
-    ToolTimeoutSafety::abandon_safe("artifact_search"),
     ToolTimeoutSafety::abandon_safe("unlock"),
     // `use_sealed_value` dispatches an Owner-compiled adapter outbound to a
     // fixed destination. Abandoning it mid-flight cannot be assumed safe: the
@@ -367,6 +366,11 @@ async fn dispatch_tool_with_policy_unscoped(
                 "workspace lease is unavailable at this tool boundary: {error:#}"
             ))
         })?;
+    // Whole-workspace index/walk tools cannot prove their eventual file set
+    // before traversing. Keep trust-required KB sources out of those model
+    // operations at the common production dispatcher boundary.
+    crate::knowledge::ensure_workspace_tool_access(&ctx, name)
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
     // command/MCP/harness/filesystem/package/computer candidate carries facts

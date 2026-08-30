@@ -82,7 +82,14 @@ pub async fn run_mode(
     let trust = prepare_tui_workspace_trust(project)?;
 
     let (lifecycle, lifecycle_task) = lifecycle_composition();
-    let mut app = App::new_composed(project, no_sandbox, trust, launch_start, lifecycle);
+    let mut app = App::new_composed_with_session_mode(
+        project,
+        no_sandbox,
+        mode,
+        trust,
+        launch_start,
+        lifecycle,
+    );
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;

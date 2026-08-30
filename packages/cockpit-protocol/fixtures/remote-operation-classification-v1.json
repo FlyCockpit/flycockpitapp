@@ -1040,6 +1040,31 @@
       "tag": "set_workspace_trust"
     },
     {
+      "class": "transactional_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|outbound:bool|inbound:bool",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "outbound",
+          "role": "param",
+          "type": "bool"
+        },
+        {
+          "field": "inbound",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "project_root:String|outbound:bool|inbound:bool",
+      "strategy": "sql_transaction",
+      "tag": "set_workspace_history_scope"
+    },
+    {
       "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string",
@@ -1055,6 +1080,61 @@
       "tag": "get_workspace_trust"
     },
     {
+      "class": "transactional_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|outbound:bool|inbound:bool",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "outbound",
+          "role": "param",
+          "type": "bool"
+        },
+        {
+          "field": "inbound",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "project_root:String|outbound:bool|inbound:bool",
+      "strategy": "sql_transaction",
+      "tag": "set_workspace_history_scope"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
+      "tag": "get_workspace_history_scope"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
+      "tag": "get_workspace_history_scope"
+    },
+    {
       "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string",
@@ -1068,41 +1148,6 @@
       "fcorSchema": "project_root:String",
       "strategy": "none",
       "tag": "get_startup_disclosures"
-    },
-    {
-      "class": "local_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "key:enum16:AppFlagKey",
-      "fcorRoles": [
-        {
-          "field": "key",
-          "role": "param",
-          "type": "AppFlagKey"
-        }
-      ],
-      "fcorSchema": "key:AppFlagKey",
-      "strategy": "none",
-      "tag": "get_app_flag"
-    },
-    {
-      "class": "local_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "key:enum16:AppFlagKey|expected_version:u64",
-      "fcorRoles": [
-        {
-          "field": "key",
-          "role": "param",
-          "type": "AppFlagKey"
-        },
-        {
-          "field": "expected_version",
-          "role": "param",
-          "type": "u64"
-        }
-      ],
-      "fcorSchema": "key:AppFlagKey|expected_version:u64",
-      "strategy": "none",
-      "tag": "mark_app_flag_seen"
     },
     {
       "class": "transactional_mutation",

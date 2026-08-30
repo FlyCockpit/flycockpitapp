@@ -84,8 +84,7 @@ fn prepared_untrusted_body(model: &Model, active: &std::collections::HashSet<Str
     let history = [Message::user(format!("the deploy token is {TEST_LITERAL}"))];
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &history,
+            crate::engine::model::AgentPromptParts::new("system", &history),
             &Message::user("proceed"),
             &[],
             &ModelParams::default(),
@@ -159,8 +158,7 @@ async fn sealed_marker_reaches_untrusted_wire_only_with_active_grant() {
     let trusted_history = [Message::user(format!("the deploy token is {TEST_LITERAL}"))];
     let trusted_prepared = trusted
         .prepare_completion_request(
-            "system",
-            &trusted_history,
+            crate::engine::model::AgentPromptParts::new("system", &trusted_history),
             &Message::user("proceed"),
             &[],
             &ModelParams::default(),

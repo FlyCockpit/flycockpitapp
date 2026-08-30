@@ -678,6 +678,10 @@ impl Tool for ReadImageTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let parsed = ReadImageArgs::from_value(&args)?;
 
+        if let ReadImageSource::Path { path } = &parsed.source {
+            crate::knowledge::ensure_local_knowledge_media_path_access(ctx, path)?;
+        }
+
         let Some(authority) = ctx.media_authority() else {
             bail!(
                 "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"

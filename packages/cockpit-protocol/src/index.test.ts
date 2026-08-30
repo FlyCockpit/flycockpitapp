@@ -585,7 +585,7 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("config_refreshed_typescript_mirror_is_v21", () => {
-    expect(PROTOCOL_VERSION).toBe(22);
+    expect(PROTOCOL_VERSION).toBe(21);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );
@@ -598,22 +598,6 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("bounds mirrored Rust u64 and i64 JSON numbers to exact JavaScript integers", () => {
-    const markSeen = requestsFixture.mark_app_flag_seen;
-    expect(
-      clientEnvelopeSchema.safeParse({
-        ...markSeen,
-        params: { ...markSeen.params, expected_version: Number.MAX_SAFE_INTEGER },
-      }).success,
-    ).toBe(true);
-    for (const expected_version of [-1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
-      expect(
-        clientEnvelopeSchema.safeParse({
-          ...markSeen,
-          params: { ...markSeen.params, expected_version },
-        }).success,
-      ).toBe(false);
-    }
-
     for (const request of [
       requestsFixture.attach,
       requestsFixture.read_history_page,

@@ -8,7 +8,8 @@
 use std::fmt;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use cockpit_db::db::sealed_scope::SealedScopeKind;
@@ -131,8 +132,8 @@ impl SealedProjectKey {
     /// Derive the canonical key from a project root, using the same project
     /// identity function the session layer uses. There is deliberately no
     /// second canonicalization rule for sealed values.
-    pub fn canonical(project_root: &Path) -> Self {
-        Self(crate::session::project_id_for(project_root))
+    pub fn canonical(project_root: &Path) -> Result<Self> {
+        Ok(Self(crate::session::project_id_for(project_root)?))
     }
 
     /// Adopt an already-canonical key (for example `Session::project_id`).
@@ -148,6 +149,39 @@ impl SealedProjectKey {
 impl fmt::Display for SealedProjectKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The immutable attachment identity of a knowledge base used as the key for
+/// KB-scoped sealed values.
+///
+/// This is deliberately *not* the user-configured registry id. Registry ids
+/// are names and can be reused after a source is removed; attachment ids bind
+/// a capability to the concrete source object that owns its markdown.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SealedKnowledgeBaseId(Uuid);
+
+impl SealedKnowledgeBaseId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let id = Uuid::parse_str(raw).context("knowledge base attachment ID must be a UUID")?;
+        if id.is_nil() {
+            bail!("knowledge base attachment ID must not be nil");
+        }
+        Ok(Self(id))
+    }
+
+    pub fn from_attachment_id(id: Uuid) -> Result<Self> {
+        Self::parse(&id.to_string())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for SealedKnowledgeBaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -176,6 +210,7 @@ pub enum SealedScopeRef {
     Session(Uuid),
     Project(SealedProjectKey),
     Global,
+    KnowledgeBase(SealedKnowledgeBaseId),
 }
 
 impl SealedScopeRef {
@@ -184,6 +219,7 @@ impl SealedScopeRef {
             Self::Session(_) => SealedScopeKind::Session,
             Self::Project(_) => SealedScopeKind::Project,
             Self::Global => SealedScopeKind::Global,
+            Self::KnowledgeBase(_) => SealedScopeKind::KnowledgeBase,
         }
     }
 
@@ -193,6 +229,7 @@ impl SealedScopeRef {
             Self::Session(id) => id.to_string(),
             Self::Project(key) => key.as_str().to_string(),
             Self::Global => String::new(),
+            Self::KnowledgeBase(id) => id.to_string(),
         }
     }
 }

@@ -416,9 +416,8 @@ pub struct Agent {
     /// fresh build for that candidate model (identity prefix + role body). `None`
     /// for non-assistant sessions.
     pub assistant_identity_prefix: Option<String>,
-    /// Source-tagged MCP catalog frozen at agent construction. Global and
-    /// workspace layers still refresh on file/generation change; the agent
-    /// package layer stays pinned until the agent is rebuilt.
+    /// Source-tagged MCP catalog frozen at agent construction and threaded
+    /// read-only through every `ToolCtx` built for this agent.
     pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
@@ -460,19 +459,29 @@ pub(crate) async fn turn_toolbox(
             .await
             .is_none()
         {
-            toolbox = toolbox.without("transcribe_audio");
+            toolbox = toolbox.deactivate_direct_native_media_for_transcription_dispatch();
         }
     } else {
-        for &name in
-            crate::tool_media_authority::MediaToolAvailability::unavailable().omitted_tool_names()
-        {
-            toolbox = toolbox.without(name);
-        }
+        toolbox = toolbox.deactivate_direct_native_media_tools();
     }
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
-    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config).await;
+    let executing_model = format!(
+        "{}:{}",
+        agent.model.provider_id(),
+        agent.model.model_id_ref()
+    );
+    toolbox = crate::knowledge::with_memory_search_if_attached(
+        toolbox,
+        session,
+        cwd,
+        agent.definition.as_deref(),
+        config,
+        &executing_model,
+        agent.model.is_trusted(),
+    )
+    .await;
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
     toolbox.apply_capabilities(&env, cwd, target)
 }
@@ -729,28 +738,21 @@ async fn toolbox_with_retrieval_if_needed(
     session: &Session,
     posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
-    // These two tools are registered with the built-in inventory so their
-    // schemas are available once a capture exists, but they must never be
-    // offered speculatively.  Start by removing any static registration so a
-    // rebuilt/restarted session gets the same artifact-dependent surface as a
-    // newly-created one.
+    // These retrieval tools are intentionally availability-gated: advertising
+    // a durable artifact or delegation payload before it exists would create a
+    // capability oracle. Their appearance therefore reflects a genuine new
+    // session resource and is an explicitly accepted cache-boundary change.
+    // Start by removing any static registration so a rebuilt/restarted session
+    // gets the same artifact-dependent surface as a newly-created one.
     tools = tools.without("artifact_read").without("artifact_search");
+    // Escalation is likewise a real session policy change, not a probe result;
+    // its schema changes only when that user-controlled policy changes.
     if session.sandbox_escalation_enabled()
         && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {
         tools = tools.without("escalate");
-    }
-    if session
-        .db
-        .session_has_text_artifacts(session.id)
-        .await
-        .unwrap_or(false)
-    {
-        tools = tools
-            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
-            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
     }
     if session
         .db
@@ -769,27 +771,20 @@ pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
     // Read/search pages are bounded responses, not new durable captures.
     !matches!(
         tool,
-        "read"
-            | "write"
-            | "edit"
-            | "unlock"
-            | "artifact_read"
-            | "artifact_search"
-            | "delegation_payload_retrieve"
+        "read" | "write" | "edit" | "unlock" | "delegation_payload_retrieve"
     )
 }
 
 pub(crate) fn text_artifact_capture_is_persistable(
     tool: &str,
     capture: Option<&crate::engine::tool::TextArtifactCapture>,
-    delivered_body: &str,
+    _delivered_body: &str,
     recheck_modified_output: bool,
 ) -> bool {
     text_artifact_capture_is_eligible(tool)
         && !recheck_modified_output
         && capture.is_some_and(|value| {
             !value.content.is_empty()
-                && value.content != delivered_body
                 && value.host_original_bytes >= value.host_captured_bytes
                 && value.host_dropped_bytes == value.host_original_bytes - value.host_captured_bytes
                 && value.stored_source_bytes == value.content.len()
@@ -801,7 +796,9 @@ async fn record_usage_blocking(
     session: Arc<Session>,
     call_id: Uuid,
     usage: crate::tokens::TokenUsage,
+    model: &Model,
 ) -> anyhow::Result<()> {
+    session.note_cache_hit_for_endpoint(model.provider_id(), model.model_id_ref(), usage);
     session.record_usage(call_id, usage).await
 }
 
@@ -1550,6 +1547,9 @@ mod redaction_placeholder_guard_tests {
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
@@ -1983,92 +1983,13 @@ mod text_artifact_tests {
         ]))
     }
 
-    #[tokio::test]
-    async fn artifact_tools_are_dynamic_after_an_owning_event_commits() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create_for_test(
-            db,
-            PathBuf::from("/x"),
-            "Build",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        session.set_sandbox_escalation_enabled(false);
-        let tools = ToolBox::new()
-            .with(Arc::new(crate::tools::bash::BashTool::new()))
-            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
-            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
-        assert!(
-            !toolbox_with_retrieval_if_needed(
-                tools.clone(),
-                &session,
-                &crate::agents::PostureResolution::standard()
-            )
-            .await
-            .names()
-            .contains(&"artifact_read")
-        );
-        let event = crate::db::text_artifacts::TextArtifactEventInput {
-            session_id: session.id,
-            kind: crate::db::session_log::SessionEventKind::ToolCall,
-            agent: Some("Build".to_string()),
-            call_id: Some("call-1".to_string()),
-            context: Default::default(),
-            ts_ms: 1,
-            data_json: serde_json::json!({"output":"short"}).to_string(),
-            artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
-                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
-                projection_slot: Some(0),
-                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
-                capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
-                content: "redacted original output".to_string(),
-                host_captured_bytes: 24,
-                host_original_bytes: 24,
-                host_dropped_bytes: 0,
-                stored_source_bytes: 24,
-                provenance_json:
-                    serde_json::json!({"tool":"bash","call_id":"call-1","agent_id":"Build"})
-                        .to_string(),
-                created_at: 1,
-            }],
-            unavailable_projection: None,
-        };
-        session
-            .db
-            .record_event_with_text_artifacts(event)
-            .await
-            .unwrap();
-        assert!(
-            toolbox_with_retrieval_if_needed(
-                tools,
-                &session,
-                &crate::agents::PostureResolution::standard()
-            )
-            .await
-            .names()
-            .contains(&"artifact_read")
-        );
-        assert!(
-            toolbox_with_retrieval_if_needed(
-                ToolBox::new(),
-                &session,
-                &crate::agents::PostureResolution::standard(),
-            )
-            .await
-            .names()
-            .contains(&"artifact_search")
-        );
-    }
-
     #[test]
-    fn artifact_tools_are_not_capture_eligible() {
+    fn bounded_tools_are_not_capture_eligible() {
         for tool in [
             "read",
             "write",
             "edit",
             "unlock",
-            "artifact_read",
-            "artifact_search",
             "delegation_payload_retrieve",
         ] {
             assert!(

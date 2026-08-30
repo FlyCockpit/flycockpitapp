@@ -105,19 +105,10 @@ pub(crate) struct IndexStats {
     pub indexed_files: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AttachedKnowledgeBase {
     entry: KnowledgeBaseRegistryEntry,
-    local: Option<AttachedLocalKb>,
-}
-
-#[derive(Debug, Clone)]
-struct AttachedLocalKb {
-    root: PathBuf,
-    /// Assistant knowledge is captured while its installation identity is
-    /// verified. Workspace KBs remain path-based.
-    snapshot: Option<KnowledgeBundle>,
-    sidecar_path: PathBuf,
+    provider: Arc<dyn KbProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,8 +127,10 @@ struct ChunkDoc {
 pub(crate) trait KbProvider: Send + Sync {
     async fn is_available(&self) -> Result<bool>;
     async fn retrieve(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    fn with_embedder(&self, embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider>;
 }
 
+#[derive(Clone)]
 struct LocalKb {
     entry: KnowledgeBaseRegistryEntry,
     root: PathBuf,
@@ -165,6 +158,55 @@ impl LocalKb {
             sidecar_path,
             embedder,
         }
+    }
+
+    /// Build an assistant provider while its installation identity has been
+    /// resolved. The local provider owns this filesystem read so registry
+    /// assembly never needs to know how local KB contents are represented.
+    fn assistant(
+        entry: KnowledgeBaseRegistryEntry,
+        root: PathBuf,
+        snapshot_root: PathBuf,
+        sidecar_path: PathBuf,
+    ) -> Result<Option<Self>> {
+        let Some(snapshot) = Self::snapshot_assistant(&root, snapshot_root)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::new(
+            entry,
+            root,
+            Some(snapshot),
+            sidecar_path,
+            None,
+        )))
+    }
+
+    fn snapshot_assistant(root: &Path, snapshot_root: PathBuf) -> Result<Option<KnowledgeBundle>> {
+        let handle = match cockpit_config::config::open_config_directory_nofollow(root) {
+            Ok(handle) => handle,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("opening assistant knowledge root {}", root.display())
+                });
+            }
+        };
+        drop(handle);
+        let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+            root,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )?;
+        parse_bundle_snapshot(snapshot_root, documents).map(Some)
     }
 }
 
@@ -228,6 +270,13 @@ impl KbProvider for LocalKb {
         }
         Ok(results)
     }
+
+    fn with_embedder(&self, embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider> {
+        Arc::new(Self {
+            embedder: Some(embedder),
+            ..self.clone()
+        })
+    }
 }
 
 #[async_trait]
@@ -242,6 +291,12 @@ impl KbProvider for RemoteKb {
     async fn retrieve(&self, _query: &str, _limit: usize) -> Result<Vec<SearchResult>> {
         // TODO(#136): implement hosted KbProvider retrieval for remote-owned KBs.
         bail!("remote knowledge-base providers are not implemented")
+    }
+
+    fn with_embedder(&self, _embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider> {
+        Arc::new(Self {
+            entry: self.entry.clone(),
+        })
     }
 }
 
@@ -1238,8 +1293,7 @@ async fn retrieve_from_knowledge_bases(
     let mut all = Vec::new();
     let mut available_providers = Vec::new();
     for knowledge_base in knowledge_bases {
-        let provider = provider_for(knowledge_base, Some(embedder.clone()))?;
-        match provider.is_available().await {
+        match knowledge_base.provider.is_available().await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::debug!(
@@ -1257,7 +1311,7 @@ async fn retrieve_from_knowledge_bases(
                 });
             }
         }
-        available_providers.push(provider);
+        available_providers.push(knowledge_base.provider.with_embedder(embedder.clone()));
     }
     for provider in available_providers {
         all.extend(provider.retrieve(query, limit).await?);
@@ -1282,24 +1336,14 @@ pub(crate) async fn attached_bundles_available(
         Ok(bundles) => {
             let mut available = false;
             for knowledge_base in bundles {
-                match provider_for(&knowledge_base, None) {
-                    Ok(provider) => match provider.is_available().await {
-                        Ok(true) => available = true,
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                knowledge_base = %knowledge_base.entry.id,
-                                "knowledge provider availability check failed closed"
-                            );
-                            return false;
-                        }
-                    },
+                match knowledge_base.provider.is_available().await {
+                    Ok(true) => available = true,
+                    Ok(false) => {}
                     Err(error) => {
                         tracing::warn!(
                             %error,
                             knowledge_base = %knowledge_base.entry.id,
-                            "knowledge provider construction failed closed"
+                            "knowledge provider availability check failed closed"
                         );
                         return false;
                     }
@@ -1359,13 +1403,16 @@ pub(crate) async fn attached_bundles(
             let sidecar_path = local
                 .sidecar_path
                 .unwrap_or_else(|| root.join(SIDE_CAR_FILE));
-            AttachedLocalKb {
+            RegistryLocalKb {
                 root,
-                snapshot: local.snapshot,
-                sidecar_path,
+                assistant_snapshot_root: local.assistant_snapshot_root,
+                sidecar_path: Some(sidecar_path),
             }
         });
-        knowledge_bases.push(AttachedKnowledgeBase { entry, local });
+        let Some(provider) = provider_for(entry.clone(), local)? else {
+            continue;
+        };
+        knowledge_bases.push(AttachedKnowledgeBase { entry, provider });
     }
     Ok(knowledge_bases)
 }
@@ -1379,7 +1426,7 @@ struct RegistryKnowledgeBase {
 #[derive(Debug, Clone)]
 struct RegistryLocalKb {
     root: PathBuf,
-    snapshot: Option<KnowledgeBundle>,
+    assistant_snapshot_root: Option<PathBuf>,
     sidecar_path: Option<PathBuf>,
 }
 
@@ -1387,7 +1434,7 @@ fn workspace_knowledge_base(entry: KnowledgeBaseRegistryEntry) -> RegistryKnowle
     let local = match &entry.source {
         KnowledgeBaseSource::Local { path } => Some(RegistryLocalKb {
             root: path.clone(),
-            snapshot: None,
+            assistant_snapshot_root: None,
             sidecar_path: None,
         }),
         KnowledgeBaseSource::Remote { .. } => None,
@@ -1408,9 +1455,6 @@ async fn assistant_knowledge_registry_entry(
         return Ok(None);
     };
     let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
-    let Some(knowledge_snapshot) = assistant_knowledge_snapshot(&snapshot.row, &root)? else {
-        return Ok(None);
-    };
     let config: crate::assistants::AssistantConfig =
         serde_json::from_str(&snapshot.row.config_json)
             .context("parsing assistant identity for knowledge cache")?;
@@ -1434,51 +1478,13 @@ async fn assistant_knowledge_registry_entry(
         entry,
         local: Some(RegistryLocalKb {
             root,
-            snapshot: Some(knowledge_snapshot),
+            assistant_snapshot_root: Some(PathBuf::from(format!(
+                "assistant://{}/knowledge",
+                snapshot.row.name
+            ))),
             sidecar_path: Some(cache_root.join(format!("{}.sqlite", config.installation_id))),
         }),
     }))
-}
-
-/// Capture assistant knowledge while the assistant row is the validated
-/// installation identity. The resulting bundle must outlive asynchronous
-/// retrieval without another filesystem read through a reusable home path.
-fn assistant_knowledge_snapshot(
-    row: &crate::db::assistants::AssistantRow,
-    diagnostic_root: &Path,
-) -> Result<Option<KnowledgeBundle>> {
-    let handle = match cockpit_config::config::open_config_directory_nofollow(diagnostic_root) {
-        Ok(handle) => handle,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "opening assistant knowledge root {}",
-                    diagnostic_root.display()
-                )
-            });
-        }
-    };
-    drop(handle);
-    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-        diagnostic_root,
-        MAX_KNOWLEDGE_FILES,
-        MAX_KNOWLEDGE_ENTRIES,
-        MAX_KNOWLEDGE_DEPTH,
-        MAX_KNOWLEDGE_FILE_BYTES,
-        MAX_KNOWLEDGE_TOTAL_BYTES,
-    )?;
-    parse_bundle_snapshot(
-        PathBuf::from(format!("assistant://{}/knowledge", row.name)),
-        documents,
-    )
-    .map(Some)
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
@@ -1536,23 +1542,31 @@ fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
 }
 
 fn provider_for(
-    knowledge_base: &AttachedKnowledgeBase,
-    embedder: Option<Arc<dyn Embedder>>,
-) -> Result<Arc<dyn KbProvider>> {
-    match (&knowledge_base.entry.source, &knowledge_base.local) {
-        (KnowledgeBaseSource::Local { .. }, Some(local)) => Ok(Arc::new(LocalKb::new(
-            knowledge_base.entry.clone(),
-            local.root.clone(),
-            local.snapshot.clone(),
-            local.sidecar_path.clone(),
-            embedder,
-        ))),
-        (KnowledgeBaseSource::Remote { .. }, None) => Ok(Arc::new(RemoteKb {
-            entry: knowledge_base.entry.clone(),
-        })),
+    entry: KnowledgeBaseRegistryEntry,
+    local: Option<RegistryLocalKb>,
+) -> Result<Option<Arc<dyn KbProvider>>> {
+    match (entry.source.clone(), local) {
+        (KnowledgeBaseSource::Local { .. }, Some(local)) => {
+            let sidecar_path = local
+                .sidecar_path
+                .context("local knowledge provider has no sidecar path")?;
+            if let Some(snapshot_root) = local.assistant_snapshot_root {
+                return LocalKb::assistant(entry, local.root, snapshot_root, sidecar_path).map(
+                    |provider| provider.map(|provider| Arc::new(provider) as Arc<dyn KbProvider>),
+                );
+            }
+            Ok(Some(Arc::new(LocalKb::new(
+                entry,
+                local.root,
+                None,
+                sidecar_path,
+                None,
+            ))))
+        }
+        (KnowledgeBaseSource::Remote { .. }, None) => Ok(Some(Arc::new(RemoteKb { entry }))),
         _ => bail!(
             "knowledge base `{}` has an invalid provider resolution",
-            knowledge_base.entry.id
+            entry.id
         ),
     }
 }
@@ -2111,13 +2125,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             .unwrap();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].entry.id, format!("assistant-{installation_id}"));
-        assert!(
-            attached[0]
-                .local
-                .as_ref()
-                .and_then(|local| local.snapshot.as_ref())
-                .is_some()
-        );
+        assert!(attached[0].provider.is_available().await.unwrap());
 
         fs::remove_dir_all(home.join("knowledge")).unwrap();
         fs::create_dir_all(home.join("knowledge")).unwrap();
@@ -2126,8 +2134,9 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             "---\ntype: replacement\n---\n\nReplacement knowledge must not be read.\n",
         )
         .unwrap();
-        let results = provider_for(&attached[0], Some(mock_embedder()))
-            .unwrap()
+        let results = attached[0]
+            .provider
+            .with_embedder(mock_embedder())
             .retrieve("release shipping procedure", DEFAULT_SEARCH_LIMIT)
             .await
             .unwrap();

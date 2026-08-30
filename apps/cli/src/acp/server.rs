@@ -68,6 +68,20 @@ fn run_blocking(handle: &Handle) -> Result<()> {
     });
 
     loop {
+        if let Some(peer) = peer.as_mut() {
+            if peer.adapter.connection_closed || peer.adapter.registry.connection_closed() {
+                break;
+            }
+            // Poll terminal events before accepting the next editor request.
+            // In particular, a queued `SessionEnded` or a closed attachment
+            // stream must unregister its capability before `session/load` can
+            // decide whether an existing attachment is live.
+            peer.drain_turn_events()?;
+            peer.drain_deliveries()?;
+            if peer.adapter.connection_closed || peer.adapter.registry.connection_closed() {
+                break;
+            }
+        }
         match frame_rx.recv_timeout(Duration::from_millis(25)) {
             Ok(ReaderEvent::Frame(frame)) => {
                 let mut counters = AcpTransportCounters::default();
@@ -123,13 +137,6 @@ fn run_blocking(handle: &Handle) -> Result<()> {
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
-        }
-        if let Some(peer) = peer.as_mut() {
-            peer.drain_deliveries()?;
-            peer.drain_turn_events()?;
-            if peer.adapter.connection_closed || peer.adapter.registry.connection_closed() {
-                break;
-            }
         }
     }
     if let Some(mut peer) = peer {
@@ -255,13 +262,13 @@ impl Peer {
             .collect();
         for (session_id, attachment) in attachments {
             if !attachment.rendered_initial {
-                let response =
-                    self.handle
-                        .block_on(attachment.client.request_ok(Request::ReadCodeRootV1(
-                            ReadCodeRootV1Request {
-                                attachment_capability: attachment.capability.clone(),
-                            },
-                        )))?;
+                let response = self.read_attachment(
+                    &session_id,
+                    &attachment.client,
+                    Request::ReadCodeRootV1(ReadCodeRootV1Request {
+                        attachment_capability: attachment.capability.clone(),
+                    }),
+                )?;
                 let Response::CodeRootRead(root) = response else {
                     return Err(anyhow!("unexpected ACP Code-root read response"));
                 };
@@ -285,13 +292,15 @@ impl Peer {
             }
             let mut cursor = attachment.cursor.clone();
             loop {
-                let response = self.handle.block_on(attachment.client.request_ok(
+                let response = self.read_attachment(
+                    &session_id,
+                    &attachment.client,
                     Request::ReadCodeRootDeliveriesV1(ReadCodeRootDeliveriesV1Request {
                         attachment_capability: attachment.capability.clone(),
                         after: Some(cursor.clone()),
                         limit: DISCOVERY_PAGE_SIZE,
                     }),
-                ))?;
+                )?;
                 let Response::CodeRootDeliveries(page) = response else {
                     return Err(anyhow!("unexpected ACP Code-root delivery response"));
                 };
@@ -343,6 +352,27 @@ impl Peer {
             }
         }
         Ok(())
+    }
+
+    /// A failed attachment read means this peer can no longer prove the
+    /// attachment is usable. Remove that capability before returning the
+    /// delivery failure so a later `session/load` must attach afresh, and so
+    /// deferred ACP work follows the same terminal settlement path as a
+    /// closed event stream.
+    fn read_attachment(
+        &mut self,
+        session_id: &str,
+        client: &DaemonClient,
+        request: Request,
+    ) -> Result<Response> {
+        match self.handle.block_on(client.request_ok(request)) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.terminate_session(session_id)
+                    .context("settling failed ACP attachment")?;
+                Err(error).context("reading ACP Code-root attachment")
+            }
+        }
     }
 
     /// Suppress the optimistic jsonrpsee response only after the daemon has
@@ -433,10 +463,14 @@ impl Peer {
     fn terminate_session(&mut self, session_id: &str) -> Result<()> {
         let capability = {
             let mut state = self.state.lock().expect("ACP state");
+            // `attachments` is the live attachment-capability registry, not a
+            // record of every root this ACP process has seen. Removing before
+            // settling outbound work makes terminal cleanup idempotent and
+            // prevents `session/load` from accepting a stale attachment.
             let capability = state
                 .attachments
-                .get(session_id)
-                .map(|attachment| attachment.capability.clone());
+                .remove(session_id)
+                .map(|attachment| attachment.capability);
             if let Some(capability) = &capability {
                 state
                     .permission_deliveries
@@ -991,4 +1025,84 @@ fn permission_option_id(option: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("Code-root decision option has no id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use cockpit_client::InProcessConnection;
+
+    use super::*;
+
+    fn closed_client() -> DaemonClient {
+        let (requests, request_receiver) = tokio::sync::mpsc::channel(1);
+        drop(request_receiver);
+        let (event_sender, events) = tokio::sync::mpsc::channel(1);
+        drop(event_sender);
+        DaemonClient::from_in_process(InProcessConnection { requests, events })
+    }
+
+    fn attachment() -> Attachment {
+        Attachment {
+            client: closed_client(),
+            capability: CodeRootAttachmentCapabilityV1::from_daemon_random(Uuid::new_v4()),
+            cursor: cockpit_proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::new_v4()),
+            rendered_initial: false,
+        }
+    }
+
+    fn peer() -> (tokio::runtime::Runtime, Peer) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let peer = Peer::new(runtime.handle().clone(), closed_client(), true);
+        (runtime, peer)
+    }
+
+    #[test]
+    fn terminal_attachment_is_removed_from_the_live_registry() {
+        let (_runtime, mut peer) = peer();
+        peer.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .insert("root".to_string(), attachment());
+
+        peer.terminate_session("root").expect("terminal cleanup");
+
+        assert!(
+            !peer
+                .state
+                .lock()
+                .expect("ACP state")
+                .attachments
+                .contains_key("root")
+        );
+    }
+
+    #[test]
+    fn delivery_read_failure_settles_and_unregisters_the_attachment() {
+        let (_runtime, mut peer) = peer();
+        peer.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .insert("root".to_string(), attachment());
+
+        let error = peer.drain_deliveries().expect_err("closed attachment read");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reading ACP Code-root attachment")
+        );
+        assert!(
+            !peer
+                .state
+                .lock()
+                .expect("ACP state")
+                .attachments
+                .contains_key("root")
+        );
+    }
 }

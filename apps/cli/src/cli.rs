@@ -109,6 +109,8 @@ pub enum PublicCommand {
     Debug(DebugCommand),
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Dream one knowledge base, or every configured knowledge base.
+    Dream(DreamArgs),
     #[command(subcommand)]
     Trust(TrustCommand),
     Export(ExportArgs),
@@ -138,6 +140,7 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Doctor(args) => Command::Doctor(args),
                 PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Session(args) => Command::Session(args),
+                PublicCommand::Dream(args) => Command::Dream(args),
                 PublicCommand::Trust(args) => Command::Trust(args),
                 PublicCommand::Export(args) => Command::Export(args),
                 PublicCommand::Config(args) => Command::Config(args),
@@ -1732,8 +1735,10 @@ mod tests {
     }
 
     #[test]
-    fn dream_requires_one_knowledge_base_or_all_and_preserves_the_selection() {
-        let single = Cli::try_parse_from(["cockpit", "dream", "research"]).unwrap();
+    fn public_dream_requires_one_knowledge_base_or_all_and_preserves_the_selection() {
+        let single: Cli = PublicCli::try_parse_from(["cockpit", "dream", "research"])
+            .unwrap()
+            .into();
         match single.command {
             Some(Command::Dream(args)) => {
                 assert_eq!(args.knowledge_base_id.as_deref(), Some("research"));
@@ -1742,7 +1747,9 @@ mod tests {
             other => panic!("expected dream command, got {other:?}"),
         }
 
-        let all = Cli::try_parse_from(["cockpit", "dream", "--all"]).unwrap();
+        let all: Cli = PublicCli::try_parse_from(["cockpit", "dream", "--all"])
+            .unwrap()
+            .into();
         match all.command {
             Some(Command::Dream(args)) => {
                 assert!(args.knowledge_base_id.is_none());
@@ -1751,8 +1758,8 @@ mod tests {
             other => panic!("expected dream command, got {other:?}"),
         }
 
-        assert!(Cli::try_parse_from(["cockpit", "dream"]).is_err());
-        assert!(Cli::try_parse_from(["cockpit", "dream", "research", "--all"]).is_err());
+        assert!(PublicCli::try_parse_from(["cockpit", "dream"]).is_err());
+        assert!(PublicCli::try_parse_from(["cockpit", "dream", "research", "--all"]).is_err());
     }
 
     #[test]

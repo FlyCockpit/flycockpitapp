@@ -434,6 +434,27 @@ pub(super) async fn delete_session(
             message: format!("session {session_id} is active; end it before deleting"),
         });
     }
+    // Capture filesystem targets before the relational cascade removes the
+    // descendants that authorize them. Both workspace scratch and result blobs
+    // are daemon-owned state and must be deleted with the session.
+    let subtree = ctx
+        .db
+        .session_subtree_ids(session_id)
+        .await
+        .map_err(internal)?;
+    let mut scratch_dirs = Vec::with_capacity(subtree.len());
+    let mut result_blob_dirs = Vec::with_capacity(subtree.len());
+    for member in subtree {
+        let Some(member_session) = ctx.db.get_session(member).await.map_err(internal)? else {
+            continue;
+        };
+        scratch_dirs.push(
+            crate::session::workspace_scratch_path_for_session(&member_session.project_id, member)
+                .map_err(internal)?,
+        );
+        result_blob_dirs
+            .push(super::storage::result_blob_directory_for_session(member).map_err(internal)?);
+    }
     prepare_session_deletion(ctx, session_id).await?;
     let now_wall_ms = super::run_invocation::wall_ms_now();
     // Local/owner path: terminalize then delete (each its own autocommit).
@@ -441,6 +462,22 @@ pub(super) async fn delete_session(
         .terminalize_session_run_invocations(session_id, now_wall_ms)
         .await
         .map_err(internal)?;
+    for scratch_dir in scratch_dirs {
+        remove_session_scratch(&scratch_dir).map_err(internal)?;
+    }
+    for result_blob_dir in result_blob_dirs {
+        remove_session_scratch(&result_blob_dir).map_err(internal)?;
+        match std::fs::symlink_metadata(&result_blob_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(internal(anyhow::anyhow!(
+                    "session deletion left result blobs at `{}`",
+                    result_blob_dir.display()
+                )));
+            }
+            Err(error) => return Err(internal(error)),
+        }
+    }
     ctx.db.delete_session(session_id).await.map_err(internal)?;
     if let Some(service) = ctx.acp_catalog_composition.as_ref() {
         service.revoke_root(session_id);
@@ -449,6 +486,22 @@ pub(super) async fn delete_session(
         tracing::warn!(%error, %session_id, "text artifact blob cleanup remains pending");
     }
     Ok(Response::Ack)
+}
+
+pub(crate) fn remove_session_scratch(path: &std::path::Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting `{}`", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "refusing to remove non-directory session scratch `{}`",
+        path.display()
+    );
+    std::fs::remove_dir_all(path).with_context(|| format!("removing `{}`", path.display()))
 }
 
 /// Complete every asynchronous, idempotent side-effect phase that must precede
@@ -666,17 +719,6 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
     internal(error)
 }
 
-pub(super) fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
-    ErrorPayload {
-        code: ErrorCode::Internal,
-        // `{:#}` walks the full anyhow context chain (e.g. `resolving
-        // model: provider ...: ...`) rather than printing only the
-        // outermost context, so daemon-surfaced errors are legible
-        // instead of an opaque `internal: resolving model`.
-        message: format!("{err:#}"),
-    }
-}
-
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
 ) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
@@ -722,6 +764,7 @@ mod sessions_activity_tests {
             turns: 0,
             active_agent: "Build".into(),
             title: None,
+            description: None,
             parent_session_id: None,
             created_by_principal: None,
             shared_with_collaborators: false,

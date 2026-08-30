@@ -50,6 +50,7 @@ pub mod image_generation_runtime;
 pub mod image_sidecar;
 pub mod init;
 pub mod intel;
+pub mod keep_warm;
 pub mod knowledge;
 pub mod leak_report;
 pub mod leaks;
@@ -85,6 +86,7 @@ mod slot_resolution_ratchet;
 pub mod startup;
 pub mod sync;
 pub mod tags;
+pub mod text_artifact_blob;
 // This surface is compiled for core's own tests and for dependents that
 // explicitly opt into the dev-only `test-support` feature. It intentionally
 // exposes only test instrumentation, never a production database API.

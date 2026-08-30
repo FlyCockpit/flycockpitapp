@@ -409,12 +409,12 @@ pub fn build_dream_prompt(knowledge_base_id: &str) -> String {
         "Run a knowledge dream for `{knowledge_base_id}`. First call \
          knowledge_dream_sources for exactly this KB. If it returns no sessions, report that and \
          stop. Partition the returned sessions across one layer of read-only subagents. Give each \
-         subagent the cheap title/description summaries first; it may call session_read for a \
-         narrow transcript/tool-result-collapsed window only when a proposed concept needs more \
+         subagent the cheap title/description summaries first; it may use history_search and the \
+         returned cockpit:// pseudofile for a narrow transcript window only when a proposed concept needs more \
          evidence. Subagents only propose dream-provenance concept upserts and must not spawn. \
          Merge and deduplicate their proposals yourself, preserve human-authored concepts, then \
          call knowledge_dream_apply once with the exact source session IDs and the final \
-         provider-neutral upserts. Do not write KB files or invoke Git directly."
+         validated root-level file writes. Do not write KB files or invoke Git directly."
     )
 }
 

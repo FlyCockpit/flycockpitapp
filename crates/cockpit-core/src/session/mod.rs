@@ -125,6 +125,29 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Work due for the cache-reusing, same-model metadata fork. The title slots
+/// refine both fields; later slots refresh the richer description while still
+/// requiring the atomic combined metadata call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAction {
+    None,
+    TitleAndDescribe,
+    Describe,
+}
+
+/// A scheduled self-metadata pass, fenced to the exact user-content
+/// generation that made it eligible. The durable token total fences newer user
+/// content, while the durable metadata-fork generation fences cancellation,
+/// drain, and superseding fork ownership before a generated write can publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataWork {
+    pub action: MetadataAction,
+    pub expected_user_content_tokens: usize,
+    /// Assigned at the foreground dispatch seam. It is included in the
+    /// generated write's durable CAS predicate.
+    pub expected_metadata_fork_generation: i64,
+}
+
 /// Process-wide audit counter: how many times any session waived the
 /// durable-before-handoff inference journal barrier. Read by doctor / audit
 /// surfaces; never reset in production. `nextest` runs each test in its own
@@ -264,6 +287,10 @@ pub struct Session {
     /// [`Self::tmp_dir`] access; removed on [`Self::end`] and on drop.
     /// `Mutex<Option<…>>` so creation is one-shot and `end()` can take it.
     tmp_dir: Mutex<Option<PathBuf>>,
+    /// Durable per-workspace scratch, partitioned by session under the Cockpit
+    /// state directory. Unlike [`Self::tmp_dir`], this directory deliberately
+    /// survives session end and daemon restart.
+    workspace_scratch_dir: PathBuf,
     /// Per-session host executable shims under the Cockpit data dir. These
     /// are separate from [`Self::tmp_dir`] so shell PATH shims live in a
     /// stable user-data location, but they share the same end/drop cleanup.
@@ -338,6 +365,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub btw_tangent: bool,
     title: Mutex<Option<String>>,
+    description: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
     active_agent: Mutex<String>,
     /// Complete session selection, including invocation preferences that are
@@ -378,6 +406,10 @@ pub struct Session {
     /// resumed session has already passed any previous slot and must not
     /// re-nudge it.
     title_nudge_slot_pending: AtomicU8,
+    /// One metadata pass waiting for the foreground request that owns its
+    /// cached prefix to complete.  It is consumed by that request's turn
+    /// phase, never by a later user turn.
+    pending_metadata_fork: Mutex<Option<MetadataWork>>,
     /// In-memory two-shot latch for compact self-nudges (`0`, `1`, `2`).
     /// Reset only by successful compaction; prunes deliberately do not re-arm
     /// it because ctx% can oscillate around the threshold.
@@ -397,11 +429,17 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// Wall-clock instant of the most recent inference send. Stamped by
-    /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
-    /// it to decide whether the provider's prompt-cache TTL has elapsed.
-    /// In-memory only — a resumed session re-warms naturally.
-    last_send_at: Mutex<Option<std::time::Instant>>,
+    /// The configured endpoint that reported the last real prompt-cache hit.
+    /// This is deliberately separate from `last_usage`: context chrome may use
+    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// the endpoint it is about to refresh.
+    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
+    /// Monotonic instant and durable identity of the most recent inference
+    /// send. The cache-cold predicate uses the monotonic instant, while the
+    /// daemon-scheduled keep-warm callback carries the unique identity across
+    /// its durable job boundary. In-memory only — a resumed session re-warms
+    /// naturally.
+    last_send_at: Mutex<Option<InferenceSendTime>>,
     /// User messages pinned via `/pin` (GOALS §10 / `plan.md` T6.e):
     /// must-survive content injected verbatim into the `/compact`
     /// handoff, never summarized. In pin order.
@@ -513,6 +551,21 @@ struct LastToolCall {
 struct LastRecoverableToolCall {
     signature: String,
     message: String,
+}
+
+/// The durable identity for exactly one inference send. Wall-clock time
+/// supplies the scheduler deadline; `send_id` prevents two sends in one
+/// millisecond from being treated as the same cache-producing request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InferenceSendIdentity {
+    pub unix_millis: i64,
+    pub send_id: Uuid,
+}
+
+#[derive(Clone, Copy)]
+struct InferenceSendTime {
+    monotonic: std::time::Instant,
+    identity: InferenceSendIdentity,
 }
 
 /// Shared test-only redaction key resolver for constructing `Session`s in unit
@@ -1005,10 +1058,14 @@ impl Session {
     }
 
     /// Stamp "an inference send just happened now." Drives the cache-TTL
-    /// arm of the cache-cold predicate (GOALS §10). Called once per
+    /// arm of the cache-cold predicate (GOALS §10) and establishes the
+    /// absolute origin of a keep-warm idle window. Called once per
     /// `model.complete` round-trip.
     pub fn note_send(&self) {
-        *self.last_send_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.note_send_at(
+            std::time::Instant::now(),
+            chrono::Utc::now().timestamp_millis(),
+        );
     }
 
     /// Seconds since the last inference send, or `None` if no send has
@@ -1018,7 +1075,58 @@ impl Session {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| t.monotonic.elapsed().as_secs())
+    }
+
+    /// Snapshot the latest inference send's durable identity. The timestamp
+    /// is only for the daemon job deadline; elapsed-time policy continues to
+    /// use [`Self::seconds_since_last_send`] while the session is live.
+    pub(crate) fn last_send_identity(&self) -> Option<InferenceSendIdentity> {
+        self.last_send_at.lock().unwrap().map(|t| t.identity)
+    }
+
+    /// Atomically snapshot the latest send's durable identity and monotonic
+    /// origin. Keep-warm derives its absolute execution deadline directly
+    /// from this origin, so synchronous preparation cannot extend the idle
+    /// window between sampling elapsed time and arming a timer.
+    pub(crate) fn last_send_identity_and_origin(
+        &self,
+    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
+        self.last_send_at
+            .lock()
+            .unwrap()
+            .map(|t| (t.identity, t.monotonic))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_send_at_for_test(&self, elapsed: std::time::Duration) {
+        let elapsed_millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        self.note_send_at(
+            std::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(std::time::Instant::now),
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(elapsed_millis),
+        );
+    }
+
+    /// Force a timestamp collision between two otherwise distinct sends.
+    /// This test seam proves that keep-warm fences on the send identity, not
+    /// the millisecond used to calculate its deadline.
+    #[cfg(test)]
+    pub(crate) fn note_send_with_unix_millis_for_test(&self, unix_millis: i64) {
+        self.note_send_at(std::time::Instant::now(), unix_millis);
+    }
+
+    fn note_send_at(&self, monotonic: std::time::Instant, unix_millis: i64) {
+        *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
+            monotonic,
+            identity: InferenceSendIdentity {
+                unix_millis,
+                send_id: Uuid::new_v4(),
+            },
+        });
     }
 
     /// Record a dispatched tool call's loop-guard `signature` and return
@@ -1362,23 +1470,212 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-/// Hash the project root into a 12-char hex id. Stable across symlink
-/// shifts because the input is the realpath when available.
-pub fn project_id_for(root: &Path) -> String {
+/// Derive a workspace key from the held root directory object, not a path or
+/// workspace metadata. This is a read-only observation: resolving a workspace
+/// must work on read-only and metadata-limited filesystems, and no user-owned
+/// workspace state can change the key while that directory object is live.
+pub fn project_id_for(root: &Path) -> Result<String> {
+    let canonical = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    let authority =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            &canonical,
+        )
+        .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
+    Ok(project_id_from_workspace_object(authority.identity()))
+}
+
+fn project_id_from_workspace_object(object_identity: &str) -> String {
     use sha2::{Digest, Sha256};
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let s = canon.to_string_lossy();
     let mut h = Sha256::new();
-    h.update(s.as_bytes());
+    h.update(b"cockpit-workspace-object-identity-v1\0");
+    h.update(object_identity.as_bytes());
     let out = h.finalize();
-    let mut hex = String::with_capacity(12);
-    for byte in out.iter().take(6) {
+    let mut hex = String::with_capacity(64);
+    for byte in out {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
 }
 
+/// Resolve a workspace root to the single path spelling that may be persisted
+/// in session state or published in a workspace marker.
+fn canonical_workspace_root(project_root: &Path) -> Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(project_root)
+        .with_context(|| format!("canonicalizing workspace root `{}`", project_root.display()))?;
+    anyhow::ensure!(
+        canonical_root.is_dir(),
+        "workspace root `{}` is not a directory",
+        canonical_root.display()
+    );
+    Ok(canonical_root)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WorkspaceDirMarker {
+    project_id: String,
+    canonical_root: String,
+    created_at_unix_ms: i64,
+    last_used_at_unix_ms: i64,
+}
+
+/// Per-workspace process-local serialization for marker read/modify/write.
+///
+/// The marker itself is published with a crash-atomic replacement, so readers
+/// in other processes observe either the previous complete document or the
+/// next one. The mutex preserves the timestamp and canonical-root invariant
+/// between concurrent sessions in this daemon before that publication occurs.
+static WORKSPACE_MARKER_LOCKS: OnceLock<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn workspace_marker_lock(project_id: &str) -> Arc<Mutex<()>> {
+    let locks = WORKSPACE_MARKER_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(project_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Return the durable workspace root for a known `project_id`. This is a
+/// direct path calculation; it never scans project roots or re-hashes paths.
+pub fn workspace_dir_for_project_id(project_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !project_id.is_empty()
+            && project_id.len() <= 1024
+            && project_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid workspace project id"
+    );
+    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
+        .join("workspaces")
+        .join(project_id))
+}
+
+/// Recover the canonical workspace path recorded for `project_id`, without a
+/// filesystem scan or path re-hash. A missing marker means this workspace has
+/// not yet used durable scratch on this machine.
+pub fn workspace_root_for_project_id(project_id: &str) -> Result<Option<PathBuf>> {
+    let marker_path = workspace_dir_for_project_id(project_id)?.join(".workspace.json");
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+    anyhow::ensure!(
+        marker.project_id == project_id,
+        "workspace marker project id does not match directory"
+    );
+    let canonical_root = PathBuf::from(marker.canonical_root);
+    anyhow::ensure!(
+        canonical_root.is_absolute(),
+        "workspace marker canonical root must be absolute"
+    );
+    Ok(Some(canonical_root))
+}
+
+/// Return the reverse-map details needed by daemon-owned storage maintenance.
+/// This reads only the project-id marker; it never scans candidate workspace
+/// roots or attempts to rediscover a missing mount.
+pub fn workspace_storage_details_for_project_id(
+    project_id: &str,
+) -> Result<Option<(PathBuf, i64)>> {
+    let marker_path = workspace_dir_for_project_id(project_id)?.join(".workspace.json");
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+    anyhow::ensure!(
+        marker.project_id == project_id,
+        "workspace marker project id does not match directory"
+    );
+    let canonical_root = PathBuf::from(marker.canonical_root);
+    anyhow::ensure!(
+        canonical_root.is_absolute(),
+        "workspace marker canonical root must be absolute"
+    );
+    Ok(Some((canonical_root, marker.last_used_at_unix_ms)))
+}
+
+fn workspace_scratch_dir_for_session(
+    project_id: &str,
+    project_root: &Path,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    // The marker is the authoritative project_id -> path reverse map. Never
+    // publish a caller spelling here: relative paths and inaccessible roots
+    // would make its value cwd-dependent or noncanonical on later reads.
+    // Canonicalize before creating any durable workspace state so a failed
+    // session setup cannot leave a misleading workspace directory behind.
+    let canonical_root = canonical_workspace_root(project_root)?
+        .to_string_lossy()
+        .into_owned();
+
+    let workspace_dir = workspace_dir_for_project_id(project_id)?;
+    std::fs::create_dir_all(&workspace_dir)
+        .with_context(|| format!("creating `{}`", workspace_dir.display()))?;
+
+    let marker_path = workspace_dir.join(".workspace.json");
+    let marker_lock = workspace_marker_lock(project_id);
+    let _marker_guard = marker_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Utc::now().timestamp_millis();
+    let created_at_unix_ms = match std::fs::read(&marker_path) {
+        Ok(bytes) => {
+            let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+            anyhow::ensure!(
+                marker.project_id == project_id && marker.canonical_root == canonical_root,
+                "workspace marker does not match this project identity"
+            );
+            marker.created_at_unix_ms
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => now,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker = WorkspaceDirMarker {
+        project_id: project_id.to_string(),
+        canonical_root,
+        created_at_unix_ms,
+        last_used_at_unix_ms: now,
+    };
+    let mut marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    marker_bytes.push(b'\n');
+    cockpit_host::private_fs::write_private_file(&marker_path, &marker_bytes)
+        .with_context(|| format!("atomically publishing `{}`", marker_path.display()))?;
+
+    let session_dir = workspace_scratch_path_for_session(project_id, session_id)?;
+    std::fs::create_dir_all(&session_dir)
+        .with_context(|| format!("creating `{}`", session_dir.display()))?;
+    Ok(session_dir)
+}
+
+/// Calculate a session's durable scratch path without touching the filesystem.
+/// Consumers that inspect persisted history use this rather than recreating a
+/// marker or depending on the live session object.
+pub(crate) fn workspace_scratch_path_for_session(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(workspace_dir_for_project_id(project_id)?
+        .join("sessions")
+        .join(session_id.to_string()))
+}
+
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
+const METADATA_SCHEDULE_SLOTS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 fn normalize_title_slot(value: i64) -> u8 {
     match value {
@@ -1387,13 +1684,25 @@ fn normalize_title_slot(value: i64) -> u8 {
         2 | 3 => 2,
         4..=7 => 4,
         8..=15 => 8,
-        _ => 16,
+        16..=31 => 16,
+        32..=63 => 32,
+        64..=127 => 64,
+        _ => 128,
     }
 }
 
 fn scheduled_title_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
     let slot = u8::try_from(user_turns).ok()?;
     if TITLE_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+fn scheduled_metadata_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
+    let slot = u8::try_from(user_turns).ok()?;
+    if METADATA_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
         Some(slot)
     } else {
         None
@@ -2305,6 +2614,148 @@ mod tests {
         assert!(!dir.exists(), "tmp dir must be cleaned up on session end");
     }
 
+    #[test]
+    fn test_constructor_supports_a_synthetic_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let synthetic_root = home.path().join("fixture-workspace-that-does-not-exist");
+        let db = Db::open_in_memory().unwrap();
+
+        let session = Session::create_for_test(
+            db,
+            synthetic_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        assert_eq!(session.project_root, synthetic_root);
+        assert!(session.workspace_scratch_dir().is_dir());
+        assert_eq!(
+            workspace_root_for_project_id(&session.project_id).unwrap(),
+            None,
+            "a synthetic fixture must not publish a canonical workspace marker"
+        );
+    }
+
+    #[test]
+    fn test_constructor_resumes_a_persisted_synthetic_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let synthetic_root = home.path().join("fixture-workspace-that-does-not-exist");
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            synthetic_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+
+        assert!(session.persist_if_needed().unwrap());
+        drop(session);
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.project_root, synthetic_root);
+    }
+
+    #[test]
+    fn workspace_scratch_is_durable_and_reverse_mapped_by_project_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let project_root = home.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let supplied_root = project_root.join(".");
+        let canonical_root = std::fs::canonicalize(&project_root).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let a = Session::create_for_test(
+            db.clone(),
+            supplied_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let b = Session::create_for_test(
+            db.clone(),
+            supplied_root,
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let scratch_a = a.workspace_scratch_dir();
+        let scratch_b = b.workspace_scratch_dir();
+        assert_ne!(
+            scratch_a, scratch_b,
+            "concurrent sessions get distinct scratch dirs"
+        );
+        assert!(scratch_a.ends_with(Path::new("sessions").join(a.id.to_string())));
+        assert!(scratch_b.ends_with(Path::new("sessions").join(b.id.to_string())));
+        assert_eq!(a.project_root, canonical_root);
+        let persisted = db
+            .blocking_write_for_sync_maintenance({
+                let session_id = a.id;
+                move |conn| crate::db::Db::get_session_conn(conn, session_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.project_root,
+            canonical_root.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            workspace_root_for_project_id(&a.project_id).unwrap(),
+            Some(canonical_root)
+        );
+
+        a.end().unwrap();
+        assert!(scratch_a.exists(), "durable scratch survives session end");
+    }
+
+    #[test]
+    fn concurrent_workspace_scratch_initialization_keeps_marker_parseable() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let project_root = home.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_id = project_id_for(&project_root).unwrap();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+
+        let (first_scratch, second_scratch) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                workspace_scratch_dir_for_session(&project_id, &project_root, first_id).unwrap()
+            });
+            let second = scope.spawn(|| {
+                workspace_scratch_dir_for_session(&project_id, &project_root, second_id).unwrap()
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_ne!(first_scratch, second_scratch);
+        assert_eq!(
+            workspace_root_for_project_id(&project_id).unwrap(),
+            Some(std::fs::canonicalize(&project_root).unwrap())
+        );
+    }
+
+    #[test]
+    fn workspace_scratch_rejects_uncanonicalizable_project_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let missing_root = home.path().join("missing-project");
+        let error = project_id_for(&missing_root).unwrap_err();
+
+        assert!(error.to_string().contains("canonicalizing workspace root"));
+    }
+
     #[tokio::test]
     async fn host_shim_dir_is_under_data_dir() {
         let data_dir = PathBuf::from("/data/cockpit");
@@ -3195,5 +3646,35 @@ mod tests {
         // Editing to v3 injects, diffed from v2.
         std::fs::write(&path, "v3\n").unwrap();
         assert!(s.guidance_change_injection(tmp.path()).await.is_some());
+    }
+
+    #[test]
+    fn replacement_workspace_at_the_same_path_gets_a_new_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        std::fs::rename(&workspace, temp.path().join("retired-workspace")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let replacement = project_id_for(&workspace).unwrap();
+
+        assert_ne!(original, replacement);
+    }
+
+    #[test]
+    fn workspace_contents_cannot_change_a_live_workspace_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        // Workspace contents are not identity input. Their modification and
+        // cleanup must not detach a live workspace from its consent state.
+        let untracked = workspace.join("repository-artifact");
+        std::fs::write(&untracked, "edited by repository tooling").unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
+        std::fs::remove_file(untracked).unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
     }
 }

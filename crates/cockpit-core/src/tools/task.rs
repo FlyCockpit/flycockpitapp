@@ -137,7 +137,7 @@ impl TaskTool {
             "properties": {
                 "agent":  {
                     "type": "string",
-                    "description": "`docs` for dependency API usage; `explore`; `builder`",
+                    "description": "`docs` for dependency API usage; `knowledge` for cited KB retrieval; `explore`; `builder`",
                     "enum": agents
                 },
                 "prompt": {
@@ -198,7 +198,7 @@ impl TaskTool {
                 },
                 "agent":  {
                     "type": "string",
-                    "description": "`docs` for dependency API usage; `explore`",
+                    "description": "`docs` for dependency API usage; `knowledge` for cited KB retrieval; `explore`",
                     "enum": agents
                 },
                 "prompt": {
@@ -292,10 +292,10 @@ impl TaskTool {
         });
         let mut verbose_parameters = parameters.clone();
         verbose_parameters["properties"]["payload"]["properties"]["agent"]["description"] = serde_json::json!(
-            "Subagent name; for dependency API usage call `docs` first unless exact usage is already in local code; `explore` investigates, `builder` writes/edits"
+            "Subagent name; for dependency API usage call `docs` first unless exact usage is already in local code; `knowledge` returns cited KB retrieval, `explore` investigates, `builder` writes/edits"
         );
         verbose_parameters["properties"]["payload"]["items"]["properties"]["agent"]["description"] = serde_json::json!(
-            "Subagent name; batch entries must target noninteractive agents such as `explore` or `docs`; for dependency API usage call `docs` first unless exact usage is already in local code"
+            "Subagent name; batch entries must target noninteractive agents such as `knowledge`, `explore`, or `docs`; for dependency API usage call `docs` first unless exact usage is already in local code"
         );
         verbose_parameters["properties"]["payload"]["description"] = serde_json::json!(
             "Payload selected by `intent`: delegate uses an object with `agent`/`prompt` (for dependency API usage call `docs` first unless exact usage is already in local code); batch uses an array of entries; models/list may omit/null/{}; status/cancel/query/steer use control fields; query/steer require `message`"

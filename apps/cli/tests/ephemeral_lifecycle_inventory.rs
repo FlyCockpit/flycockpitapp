@@ -7,8 +7,6 @@ const RAW_AUTHORITY: &[&str] = &[
     "OwnedDaemonSession",
     "probe_or_spawn",
     "ConnectedDaemon",
-    "take_owned_daemon_guard",
-    "spawn_signal_shutdown",
     "EphemeralDaemonGuard",
 ];
 const EXPECTED_RUNNERS: &[(&str, &str)] = &[
@@ -672,9 +670,8 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
             r#"
             fn lifecycle(self) -> LifecycleMode {
                 match self {
-                    Self::AttachOrAutoPromote => LifecycleMode::AttachOrAutoPromote,
+                    Self::AttachOrPersistent => LifecycleMode::AttachOrPersistent,
                     Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
-                    Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
                 }
             }
         "#
@@ -683,43 +680,19 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
             r#"
             async fn connect(mode: OwnedSessionMode) -> Result<Self> {
                 let mut connected = probe_or_spawn(mode.lifecycle()).await?;
-                let guard = connected.take_owned_daemon_guard();
-                let signal_task =
-                    match crate::daemon::ephemeral_guard::spawn_signal_shutdown(guard.as_ref(), true) {
-                        Ok(task) => task,
-                        Err(error) => {
-                            let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-                            drop(guard);
-                            return crate::daemon::ephemeral_guard::aggregate_shutdown_result(
-                                Err::<Self, _>(error.context("arming owned-daemon signal cleanup")),
-                                shutdown,
-                            );
-                        }
-                    };
                 if let Some(notice) = connected.startup_notice.take() {
                     eprintln!("{notice}");
                 }
                 Ok(Self {
                     client: connected.client,
-                    guard,
-                    signal_task,
                 })
             }
         "#
         }
         "finish" => {
             r#"
-            async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
-                let signal_task = self.signal_task.take();
-                if let Some(task) = &signal_task {
-                    task.abort();
-                }
-                let shutdown = self.guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-                self.guard.take();
-                if let Some(task) = signal_task {
-                    let _ = task.await;
-                }
-                crate::daemon::ephemeral_guard::aggregate_shutdown_result(result, shutdown)
+            async fn finish<T>(self, result: Result<T>) -> Result<T> {
+                result
             }
         "#
         }
@@ -727,15 +700,6 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
             r#"
             fn client(&self) -> &DaemonClient {
                 &self.client
-            }
-        "#
-        }
-        "drop" => {
-            r#"
-            fn drop(&mut self) {
-                if let Some(task) = self.signal_task.take() {
-                    task.abort();
-                }
             }
         "#
         }
@@ -999,24 +963,6 @@ fn core_contract_violations(source: &str) -> Vec<String> {
             ));
         }
     }
-    let drop_method = file.items.iter().find_map(|item| match item {
-        syn::Item::Impl(item)
-            if matches!(&item.trait_, Some((_, path, _)) if path.is_ident("Drop"))
-                && matches!(&*item.self_ty, syn::Type::Path(path)
-                    if path.path.is_ident("OwnedDaemonSession")) =>
-        {
-            item.items.iter().find_map(|item| match item {
-                syn::ImplItem::Fn(method) if method.sig.ident == "drop" => Some(method),
-                _ => None,
-            })
-        }
-        _ => None,
-    });
-    if drop_method.is_none_or(|method| {
-        compact_tokens(method) != compact_tokens(canonical_owned_method("drop"))
-    }) {
-        violations.push("OwnedDaemonSession::drop canonical fallback cleanup body changed".into());
-    }
     violations
 }
 
@@ -1220,7 +1166,6 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
                     .collect::<Vec<_>>();
                 let canonical = match &item.trait_ {
                     None => methods == ["connect", "client", "finish"],
-                    Some((_, path, _)) if path.is_ident("Drop") => methods == ["drop"],
                     Some(_) => false,
                 };
                 if !canonical || methods.len() != item.items.len() {
@@ -1591,8 +1536,8 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
 
     for (before, after) in [
         (
-            "Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral",
-            "Self::AlwaysEphemeral => LifecycleMode::AttachOrAutoPromote",
+            "Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral",
+            "Self::AttachOrEphemeral => LifecycleMode::AttachOrPersistent",
         ),
         (
             "fn client(&self) -> &DaemonClient {\n        &self.client\n    }",
@@ -1610,26 +1555,6 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
         (
             "let result = operation(ScopedDaemonClient",
             "loop { break; }\n    let result = operation(ScopedDaemonClient",
-        ),
-        (
-            "let signal_task = self.signal_task.take();\n        if let Some(task) = &signal_task",
-            "if false { return result; }\n        let signal_task = self.signal_task.take();\n        if let Some(task) = &signal_task",
-        ),
-        (
-            "task.abort();\n        }\n        let shutdown",
-            "let _dead = || task.abort();\n        }\n        let shutdown",
-        ),
-        (
-            "let guard = connected.take_owned_daemon_guard();",
-            "let guard = connected.take_owned_daemon_guard();\n        if false { return Err(anyhow::anyhow!(\"before signal arming\")); }",
-        ),
-        (
-            "drop(guard);\n                    return crate::daemon::ephemeral_guard::aggregate_shutdown_result",
-            "return crate::daemon::ephemeral_guard::aggregate_shutdown_result",
-        ),
-        (
-            "if let Some(task) = self.signal_task.take() {\n            task.abort();\n        }\n        // `guard` deliberately remains armed.",
-            "if let Some(_task) = self.signal_task.take() {}\n        // `guard` deliberately remains armed.",
         ),
     ] {
         let adversarial = source.replacen(before, after, 1);
@@ -1651,7 +1576,7 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
     assert_eq!(raw_owner_acquisitions(&bypass).len(), 2);
     let literal = source.replacen(
         "let session = OwnedDaemonSession::connect(mode)",
-        "let leaked = OwnedDaemonSession { client: todo!(), guard: None, signal_task: None }; drop(leaked);\n    let session = OwnedDaemonSession::connect(mode)",
+        "let leaked = OwnedDaemonSession { client: todo!() }; drop(leaked);\n    let session = OwnedDaemonSession::connect(mode)",
         1,
     );
     assert_eq!(

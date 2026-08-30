@@ -26,6 +26,14 @@ pub(crate) use registry::{
     OutboundPermissionRegistry,
 };
 
+/// ACP host acquisition seam. The settings owner supplies the current
+/// background-agents value; acquisition itself is guaranteed socket-only.
+pub async fn acquire_ledger_owner(
+    background_agents: bool,
+) -> anyhow::Result<cockpit_client::DaemonClient> {
+    crate::daemon::client::acquire_acp_socket_daemon(background_agents).await
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct AcpTransportCounters {
     pub daemon_mutations: u64,

@@ -23,8 +23,8 @@ use crate::sealed::{
 };
 
 /// Reads the workspace-trust decision live from the database.
-struct LiveWorkspaceTrust {
-    session: std::sync::Arc<crate::session::Session>,
+pub(crate) struct LiveWorkspaceTrust {
+    pub(crate) session: std::sync::Arc<crate::session::Session>,
 }
 
 #[async_trait]
@@ -64,7 +64,7 @@ impl UseSealedValueTool {
         }
     }
 
-    async fn runtime_for(&self, ctx: &ToolCtx) -> Result<Arc<SealedRuntime>> {
+    pub(crate) async fn runtime_for(&self, ctx: &ToolCtx) -> Result<Arc<SealedRuntime>> {
         if let Some(runtime) = &self.runtime {
             return Ok(Arc::clone(runtime));
         }

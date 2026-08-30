@@ -472,6 +472,8 @@ mod tests {
             context_policy: Some(crate::agents::ContextPolicy {
                 auto_compact_pct: Some(65),
                 inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+                artifact_spill_bytes: None,
+                artifact_preview_lines: None,
             }),
             lock_identity: "Build".to_string(),
             write_scope: None,

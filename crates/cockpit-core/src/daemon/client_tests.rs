@@ -7,74 +7,6 @@ use cockpit_proto::{Body, Envelope, ProtoStream};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-#[tokio::test]
-async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
-    use tokio::io::AsyncBufReadExt as _;
-
-    struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
-    impl Drop for NotifyDrop {
-        fn drop(&mut self) {
-            if let Some(notify) = self.0.take() {
-                let _ = notify.send(());
-            }
-        }
-    }
-
-    let root = tempfile::tempdir().unwrap();
-    let socket = root.path().join("owned-session.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let stop = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut reader = tokio::io::BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        line
-    });
-    let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
-    let (_events, event_rx) = tokio::sync::mpsc::channel(1);
-    let client = DaemonClient::from_in_process(cockpit_client::InProcessConnection {
-        requests,
-        events: event_rx,
-    });
-    let (watcher_dropped, watcher_drop) = tokio::sync::oneshot::channel();
-    let (watcher_started_tx, watcher_started_rx) = tokio::sync::oneshot::channel();
-    let signal_task = tokio::spawn(async move {
-        let _notify = NotifyDrop(Some(watcher_dropped));
-        let _ = watcher_started_tx.send(());
-        std::future::pending::<()>().await;
-    });
-    let session = OwnedDaemonSession {
-        client,
-        guard: Some(crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new_for_socket(socket)),
-        signal_task: Some(signal_task),
-    };
-    // Aborting an unpolled task drops the captured sender without running
-    // `NotifyDrop`. Wait until the watcher has constructed its guard so Drop
-    // abort exercises the live cleanup path.
-    watcher_started_rx.await.unwrap();
-
-    tokio::task::spawn_blocking(move || drop(session))
-        .await
-        .unwrap();
-
-    // The blocking drop calls `task.abort()`, but the actual abort (and the
-    // `NotifyDrop` that signals `watcher_drop`) is processed asynchronously by
-    // the runtime.  Under parallel nextest execution the abort may not be
-    // scheduled for several polls.  A brief sleep gives the runtime time to
-    // process it before the timeout wait begins.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    tokio::time::timeout(Duration::from_secs(2), watcher_drop)
-        .await
-        .expect("signal watcher was detached")
-        .unwrap();
-    let line = tokio::time::timeout(Duration::from_secs(2), stop)
-        .await
-        .expect("guard cleanup did not contact daemon")
-        .unwrap();
-    assert!(line.contains("stop_daemon"));
-}
-
 #[test]
 fn ephemeral_spawn_arms_raii_before_the_first_wait() {
     let source = include_str!("client.rs");
@@ -123,7 +55,7 @@ fn attach_request_with_client_protocol_version(
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version,
         env_snapshot: None,
@@ -146,6 +78,7 @@ fn attached_response(session_id: Uuid) -> Response {
         history: Vec::new(),
         paused_work: Vec::new(),
         repair_required: None,
+        resume_compaction_offer: None,
         daemon_version: proto::DAEMON_VERSION.to_string(),
         compatible: true,
         env_baseline: None,
@@ -177,6 +110,51 @@ async fn send_daemon_hello(
         .unwrap();
 }
 
+async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
+    let id = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::DaemonStatus,
+                ..
+            } => id,
+            other => panic!("expected lifetime confirmation, got {other:?}"),
+        },
+        other => panic!("expected lifetime confirmation envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            id,
+            daemon_status_response_with("0.1.handshake", proto::PROTOCOL_VERSION),
+        ))
+        .await
+        .unwrap();
+}
+
+async fn accept_restart_if_idle(daemon: &mut ProtoStream<UnixStream>) {
+    let id = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::RestartIfIdle,
+                ..
+            } => id,
+            other => panic!("expected RestartIfIdle, got {other:?}"),
+        },
+        other => panic!("expected RestartIfIdle envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            id,
+            Response::RestartDecision {
+                will_restart: true,
+                reason: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn negotiation_parses_daemon_hello_on_connect() {
     let (_dir, socket, listener) = bind_test_socket();
@@ -184,6 +162,7 @@ async fn negotiation_parses_daemon_hello_on_connect() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
     });
 
     let client = DaemonClient::connect(&socket).await.unwrap();
@@ -263,6 +242,7 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
         )
         .await;
         daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+        confirm_client_lifetime(&mut daemon).await;
         let request_id = match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
                 Body::Request { id, request, .. } => {
@@ -304,18 +284,9 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
     server.await.unwrap();
 }
 
-/// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`
-/// §1). `LifecycleMode::AttachOwnEphemeral` attaches to this process's
-/// cached ephemeral daemon when it's already up and reports
-/// `owns_daemon = true` at that exact socket — i.e. a re-attach in the
-/// same daemonless TUI (`/compact`, `/sessions` resume, `/new`)
-/// reconnects to the owned daemon instead of spawning a second one. The
-/// daemon is run in-process at the cached path with isolated XDG dirs, so
-/// the spawn branch (which would launch a child) is never taken.
 #[tokio::test]
 async fn connect_uses_registered_in_process_context_without_socket() {
     let _guard = crate::test_env::lock_async().await;
-    reset_own_ephemeral_paths_for_test();
     let root = tempfile::tempdir().expect("daemon path tempdir");
 
     let paths = temp_ephemeral_paths(root.path(), "cockpit-in-process-test");
@@ -346,44 +317,31 @@ async fn connect_uses_registered_in_process_context_without_socket() {
     );
     drop(client);
     drop(ctx);
-    reset_own_ephemeral_paths_for_test();
 }
 
-#[tokio::test]
-async fn attach_own_ephemeral_uses_in_process_context() {
-    let _guard = crate::test_env::lock_async().await;
-    reset_own_ephemeral_paths_for_test();
-    let root = tempfile::tempdir().expect("daemon path tempdir");
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_daemon_uses_an_in_process_owner_without_socket_metadata() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
 
-    let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-owned");
-    set_own_ephemeral_paths_for_test(own.clone());
-    let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
-    let _ctx = crate::daemon::boot_in_process_with_db(own.clone(), db)
-        .await
-        .expect("boot local daemon context");
+    let response = super::run_one_shot_daemon(|client| {
+        Box::pin(async move { client.request_ok(Request::DaemonStatus).await })
+    })
+    .await
+    .expect("one-shot daemon status");
+    assert!(matches!(response, Response::DaemonStatus { .. }));
 
-    let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)
-        .await
-        .expect("attach to own in-process daemon");
+    let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
     assert!(
-        !connected.owns_daemon,
-        "in-process daemonless mode needs no child-process guard"
-    );
-    assert_eq!(
-        connected.socket, own.socket,
-        "must reuse the process-local owned path as the local transport key"
+        !paths.socket.exists(),
+        "one-shot in-process owner must not bind {}",
+        paths.socket.display()
     );
     assert!(
-        !connected.socket.exists(),
-        "in-process daemonless mode must not bind a Unix socket"
+        !paths.pid_file.exists(),
+        "one-shot in-process owner must not publish a pid record"
     );
-    connected
-        .client
-        .request_ok(Request::DaemonStatus)
-        .await
-        .expect("owned in-process daemon answers");
-
-    reset_own_ephemeral_paths_for_test();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -407,6 +365,167 @@ async fn in_process_auto_promote_hellos_without_os_socket() {
         .request_ok(Request::DaemonStatus)
         .await
         .expect("promoted owner answers DaemonStatus");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_assistant_promotion_replaces_the_ephemeral_owner_with_persistent() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
+    let _promote = crate::daemon::enable_in_process_auto_promote();
+
+    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
+    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion");
+    let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
+    let socket = paths.socket.clone();
+    let predecessor = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept promotion client");
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
+        accept_restart_if_idle(&mut daemon).await;
+        drop(daemon);
+        drop(listener);
+        std::fs::remove_file(&socket).expect("release accepted predecessor socket");
+    });
+
+    let promoted = promote_ephemeral_owner(&paths, None)
+        .await
+        .expect("accepted promotion must acquire a persistent replacement");
+
+    assert!(promoted.promoted_from_ephemeral);
+    assert!(!promoted.owns_daemon);
+    promoted
+        .client
+        .request_ok(Request::DaemonStatus)
+        .await
+        .expect("persistent replacement answers DaemonStatus");
+    predecessor.await.expect("predecessor task");
+}
+
+#[test]
+fn promoted_lifecycle_resolution_preserves_an_independent_startup_notice() {
+    let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
+    let (_events_tx, events) = tokio::sync::mpsc::channel(1);
+    let resolution = lifecycle_resolution(ConnectedDaemon {
+        client: DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events,
+        }),
+        endpoint: cockpit_client::ClientEndpoint::Wire(PathBuf::from("persistent.sock")),
+        owns_daemon: false,
+        ephemeral_owner: false,
+        socket: PathBuf::from("persistent.sock"),
+        startup_notice: Some("daemon version skew resolved".to_string()),
+        promoted_from_ephemeral: true,
+    });
+
+    assert_eq!(
+        resolution.startup_notice.as_deref(),
+        Some("daemon version skew resolved")
+    );
+    assert!(
+        resolution.promoted_from_ephemeral,
+        "the TUI must receive the ownership transition even when startup text is present"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
+    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
+    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion-timeout");
+    let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
+    let socket = paths.socket.clone();
+    let predecessor = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept promotion client");
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
+        accept_restart_if_idle(&mut daemon).await;
+        drop(daemon);
+        drop(listener);
+        std::fs::remove_file(&socket).expect("release accepted predecessor socket");
+    });
+
+    let (lifecycle, requests) = cockpit_client::LifecycleClient::channel(2);
+    let resolution_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host = tokio::spawn({
+        let paths = paths.clone();
+        let resolution_count = std::sync::Arc::clone(&resolution_count);
+        async move {
+            serve_lifecycle_requests_with(
+                requests,
+                move |request| -> LifecycleResolutionFuture<'_> {
+                    let paths = paths.clone();
+                    let attempt =
+                        resolution_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async move {
+                        if attempt == 0 {
+                            assert_eq!(
+                                request.intent,
+                                cockpit_client::LifecycleIntent::PromoteToPersistent
+                            );
+                            let recovery = PromotionRecoveryPolicy {
+                                replacement_timeout: Duration::ZERO,
+                                predecessor_release_timeout: Duration::ZERO,
+                            };
+                            let connected = promote_ephemeral_owner_with_recovery_policy(
+                                &paths,
+                                Some(request),
+                                recovery,
+                            )
+                            .await?;
+                            Ok(lifecycle_resolution(connected))
+                        } else {
+                            Ok(cockpit_client::LifecycleResolution {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    paths.socket.clone(),
+                                ),
+                                owns_daemon: false,
+                                ephemeral_owner: false,
+                                socket: paths.socket.clone(),
+                                startup_notice: Some("later lifecycle notice".to_string()),
+                                promoted_from_ephemeral: false,
+                            })
+                        }
+                    })
+                },
+            )
+            .await
+        }
+    });
+
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(1),
+        lifecycle.resolve(cockpit_client::LifecycleIntent::PromoteToPersistent),
+    )
+    .await
+    .expect("accepted promotion recovery must reach a terminal result")
+    .expect_err("expired accepted-handoff deadline must reject the promotion");
+    assert!(
+        terminal.contains("persistent Assistant daemon replacement"),
+        "terminal policy must remain observable through lifecycle resolution"
+    );
+
+    let later = lifecycle
+        .resolve(cockpit_client::LifecycleIntent::AttachOrPersistent)
+        .await
+        .expect("terminal promotion failure must not wedge the lifecycle host");
+    assert_eq!(
+        later.startup_notice.as_deref(),
+        Some("later lifecycle notice")
+    );
+    assert_eq!(
+        resolution_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the serialized host must accept a request after the terminal recovery failure"
+    );
+
+    drop(lifecycle);
+    host.await
+        .expect("lifecycle host task")
+        .expect("lifecycle host");
+    predecessor.await.expect("predecessor task");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -434,102 +553,49 @@ async fn boot_test_persistent_daemon_hellos_without_os_socket() {
 }
 
 #[test]
-fn attach_own_ephemeral_reuses_cached_path() {
-    let _guard = crate::test_env::lock();
-    let root = tempfile::tempdir().expect("daemon path tempdir");
-    let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-cache");
-    reset_own_ephemeral_paths_for_test();
-    set_own_ephemeral_paths_for_test(own.clone());
-
-    let first = own_ephemeral_paths().expect("first owned path");
-    let second = own_ephemeral_paths().expect("second owned path");
-
-    assert_eq!(first.socket, own.socket);
-    assert_eq!(first.socket, second.socket);
-    assert_eq!(first.pid_file, own.pid_file);
-    assert_eq!(first.pid_file, second.pid_file);
-    reset_own_ephemeral_paths_for_test();
-}
-
-#[test]
-fn always_ephemeral_allocates_fresh_paths() {
-    let root = tempfile::tempdir().expect("daemon path tempdir");
-    let first = temp_ephemeral_paths(root.path(), "cockpit-eph-test-always-one");
-    let second = temp_ephemeral_paths(root.path(), "cockpit-eph-test-always-two");
-
-    assert_ne!(first.socket, second.socket);
-    assert_ne!(first.pid_file, second.pid_file);
-}
-
-#[tokio::test]
-async fn lifecycle_guard_is_retained_only_after_endpoint_acceptance() {
-    struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for DropSpy {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut retained = Vec::new();
-    let (accepted, acceptance) = tokio::sync::oneshot::channel();
-    accepted.send(()).unwrap();
-    retain_guard_after_acceptance(
-        Some(DropSpy(std::sync::Arc::clone(&drops))),
-        acceptance,
-        &mut retained,
-    )
-    .await;
-    assert_eq!(retained.len(), 1);
-    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-    drop(retained);
-    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn cancelled_lifecycle_acceptance_reaps_unclaimed_guard() {
-    struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for DropSpy {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut retained = Vec::new();
-    let (accepted, acceptance) = tokio::sync::oneshot::channel::<()>();
-    drop(accepted);
-    retain_guard_after_acceptance(
-        Some(DropSpy(std::sync::Arc::clone(&drops))),
-        acceptance,
-        &mut retained,
-    )
-    .await;
-    assert!(retained.is_empty());
-    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+fn socket_ephemeral_shutdown_authority_transfers_to_client_presence_after_boot() {
+    let source = include_str!("client.rs");
+    let receipt = source
+        .find("guard.bind_published_receipt()?")
+        .expect("the provisional guard binds the boot receipt");
+    let disarm = source[receipt..]
+        .find("guard.disarm()")
+        .map(|offset| receipt + offset)
+        .expect("a booted ephemeral guard transfers shutdown authority");
+    assert!(receipt < disarm);
+    assert!(
+        !source.contains("take_owned_daemon_guard")
+            && !source.contains("take_lifecycle_guard")
+            && !source.contains("owned_daemons"),
+        "no foreground or lifecycle actor may retain socket-owner shutdown authority"
+    );
 }
 
 #[test]
 fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AttachOrAutoPromote),
-        LifecycleMode::AttachOrAutoPromote
-    );
-    assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
-        LifecycleMode::AttachOrAutoPromote
+        mode_for_intent(cockpit_client::LifecycleIntent::AttachOrPersistent),
+        LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
         mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
         LifecycleMode::AttachOrEphemeral
     );
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AlwaysEphemeral),
-        LifecycleMode::AlwaysEphemeral
+        mode_for_intent(cockpit_client::LifecycleIntent::PromoteToPersistent),
+        LifecycleMode::PromoteToPersistent
+    );
+}
+
+#[test]
+fn background_agents_setting_selects_new_owner_lifetime() {
+    assert_eq!(
+        LifecycleMode::from_background_agents(true),
+        LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AttachOwnEphemeral),
-        LifecycleMode::AttachOwnEphemeral
+        LifecycleMode::from_background_agents(false),
+        LifecycleMode::AttachOrEphemeral
     );
 }
 
@@ -538,68 +604,29 @@ fn discover_attach_plan_restart_release_spawns_instead_of_failing() {
     use crate::daemon::DaemonStatus;
 
     assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrAutoPromote,
-            DaemonStatus::LivePidSocketUnreachable,
-            false,
-        ),
+        discover_attach_plan(DaemonStatus::LivePidSocketUnreachable, false),
         DiscoverAttachPlan::WaitForRestart
     );
     assert_eq!(
-        after_restart_wait(
-            LifecycleMode::AttachOrAutoPromote,
-            SharedWaitError::Released
-        ),
+        after_restart_wait(SharedWaitError::Released),
         RestartWaitPlan::WaitForReplacement
     );
     assert_eq!(
-        after_restart_wait(LifecycleMode::AlwaysEphemeral, SharedWaitError::Released),
-        RestartWaitPlan::Spawn
-    );
-    assert_eq!(
-        after_restart_wait(LifecycleMode::AttachOrEphemeral, SharedWaitError::Wedged),
-        RestartWaitPlan::Spawn
-    );
-    assert_eq!(
-        after_restart_wait(LifecycleMode::AttachOrAutoPromote, SharedWaitError::Wedged),
+        after_restart_wait(SharedWaitError::Wedged),
         RestartWaitPlan::FailWedged
     );
 }
 
 #[test]
-fn discover_attach_plan_ephemeral_spawns_beside_incompatible_or_unverified() {
+fn discover_attach_plan_fails_closed_for_unavailable_owners() {
     use crate::daemon::DaemonStatus;
 
     assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AlwaysEphemeral,
-            DaemonStatus::IncompatibleProtocol,
-            true,
-        ),
-        DiscoverAttachPlan::Spawn
-    );
-    assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrEphemeral,
-            DaemonStatus::UnverifiedPid,
-            false,
-        ),
-        DiscoverAttachPlan::Spawn
-    );
-    assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrAutoPromote,
-            DaemonStatus::IncompatibleProtocol,
-            true,
-        ),
+        discover_attach_plan(DaemonStatus::IncompatibleProtocol, true),
         DiscoverAttachPlan::FailIncompatible
     );
     assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrAutoPromote,
-            DaemonStatus::UnverifiedPid,
-            false,
-        ),
+        discover_attach_plan(DaemonStatus::UnverifiedPid, false),
         DiscoverAttachPlan::FailUnreachable
     );
 }

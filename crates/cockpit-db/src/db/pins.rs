@@ -189,7 +189,8 @@ impl Db {
                 .prepare(
                     "SELECT e.seq, e.type, e.data_json
                        FROM pins p
-                       JOIN session_events e ON e.seq = p.seq
+                       JOIN session_events e
+                         ON e.session_id = p.session_id AND e.seq = p.seq
                       WHERE p.session_id = ?1
                       ORDER BY p.pinned_ms ASC, p.rowid ASC",
                 )

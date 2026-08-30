@@ -22,6 +22,7 @@
 //!   to the freshly spawned daemon. `cockpit daemon {start, stop,
 //!   status}` lets the user manage the lifecycle explicitly.
 
+pub(crate) mod acp_catalog_composition;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod agent_session_override;
@@ -31,6 +32,7 @@ pub mod bulk_staging;
 pub mod bulk_upload;
 pub mod caffeinate;
 pub mod client;
+pub mod code_roots;
 pub(crate) mod config_publication_recovery;
 pub(crate) mod config_refresh;
 pub mod config_source;
@@ -163,23 +165,19 @@ pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::
     });
 }
 
-/// Env var carrying the ephemeral daemon's socket path from the parent
-/// `run` process to the daemon child it spawns. Internal wiring only —
-/// never exposed on the user-facing CLI surface (Layer B). Its presence
-/// is also what flips the child into ephemeral mode (enabling the
-/// self-reaping watchdog, Layer C).
-const EPHEMERAL_SOCKET_ENV: &str = "COCKPIT_EPHEMERAL_SOCKET";
-/// Companion to [`EPHEMERAL_SOCKET_ENV`]: the ephemeral pid-file path.
-const EPHEMERAL_PID_ENV: &str = "COCKPIT_EPHEMERAL_PID_FILE";
+/// Internal lifetime marker passed to a detached child. Both persistent and
+/// ephemeral owners publish at the canonical socket; only their lifetime
+/// policy differs.
+const DAEMON_LIFETIME_ENV: &str = "COCKPIT_DAEMON_LIFETIME";
+const EPHEMERAL_LIFETIME: &str = "ephemeral";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
     pub pid_file: PathBuf,
     pub socket: PathBuf,
-    /// True for a per-run ephemeral daemon (unique
-    /// `cockpit-eph-<pid>-<nonce>` paths); false for the canonical persistent daemon. Gates the
-    /// idle-reaping watchdog (Layer C) — the persistent daemon must
-    /// never self-exit on idle.
+    /// True when this canonical owner is reference-counted. Persistent owners
+    /// survive zero clients; ephemeral owners begin teardown when the last
+    /// client detaches.
     pub ephemeral: bool,
 }
 
@@ -195,6 +193,7 @@ struct DaemonEndpointRecord {
 #[serde(rename_all = "snake_case")]
 enum DaemonEndpointKind {
     Persistent,
+    Ephemeral,
 }
 
 #[derive(Debug, Clone)]
@@ -269,7 +268,7 @@ fn read_published_endpoint_record_from(
         return None;
     }
     let record = read_endpoint_record_from(path)?;
-    if record.version != 1 || record.kind != DaemonEndpointKind::Persistent {
+    if record.version != 1 {
         return None;
     }
     let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
@@ -278,7 +277,6 @@ fn read_published_endpoint_record_from(
     (record.receipt == receipt).then_some(record)
 }
 
-#[cfg(any(unix, test))]
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
     let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&paths.pid_file) else {
         anyhow::bail!("daemon PID receipt is missing before endpoint publication");
@@ -288,16 +286,12 @@ fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
     write_endpoint_record_with_receipt_and_canonical(paths, &canonical, &receipt)
 }
 
-#[cfg(any(unix, test))]
 fn write_endpoint_record_with_receipt_and_canonical(
     paths: &DaemonPaths,
     canonical: &DaemonPaths,
     receipt: &DaemonPidReceipt,
 ) -> Result<()> {
-    if paths.ephemeral {
-        return Ok(());
-    }
-    if paths != canonical {
+    if paths.pid_file != canonical.pid_file || paths.socket != canonical.socket {
         anyhow::bail!(
             "refusing to publish shared daemon endpoint from noncanonical paths: pid_file={}, socket={}",
             paths.pid_file.display(),
@@ -321,7 +315,11 @@ fn write_endpoint_record_with_receipt_and_canonical(
             version: 1,
             socket: paths.socket.clone(),
             receipt: receipt.clone(),
-            kind: DaemonEndpointKind::Persistent,
+            kind: if paths.ephemeral {
+                DaemonEndpointKind::Ephemeral
+            } else {
+                DaemonEndpointKind::Persistent
+            },
         };
         let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
         cockpit_host::private_fs::write_private_file(&path, &data)
@@ -330,16 +328,14 @@ fn write_endpoint_record_with_receipt_and_canonical(
 }
 
 impl DaemonPaths {
-    /// Resolve the daemon paths. A daemon child spawned for an
-    /// ephemeral run inherits its unique path set from
-    /// [`EPHEMERAL_SOCKET_ENV`] / [`EPHEMERAL_PID_ENV`] (set by the
-    /// parent via [`spawn_detached_ephemeral`]); everyone else gets the
-    /// canonical persistent path set.
+    /// Resolve the canonical daemon paths and the detached child's lifetime.
+    /// Transport discovery is always canonical: an ephemeral owner is
+    /// attachable by every client of this ledger.
     pub fn resolve() -> Result<Self> {
-        if let Some(paths) = Self::from_ephemeral_env()? {
-            return Ok(paths);
-        }
-        Self::resolve_canonical()
+        let mut paths = Self::resolve_canonical()?;
+        paths.ephemeral =
+            std::env::var_os(DAEMON_LIFETIME_ENV).is_some_and(|value| value == EPHEMERAL_LIFETIME);
+        Ok(paths)
     }
 
     /// The canonical persistent daemon's path set. `cockpit daemon
@@ -361,6 +357,14 @@ impl DaemonPaths {
         })
     }
 
+    /// Mark the canonical endpoint as a reference-counted ephemeral owner.
+    /// This changes lifetime only; it never changes the ledger's discovery
+    /// paths or write authority.
+    pub fn with_ephemeral_lifetime(mut self) -> Self {
+        self.ephemeral = true;
+        self
+    }
+
     #[cfg(test)]
     fn resolve_canonical_in(state_home: &Path, runtime_dir: Option<&Path>) -> Result<Self> {
         let state = state_home.join("cockpit");
@@ -380,18 +384,6 @@ impl DaemonPaths {
         })
     }
 
-    /// Allocate a unique ephemeral path set:
-    /// `cockpit-eph-<pid>-<nonce>.sock` + `cockpit-eph-<pid>-<nonce>.pid`,
-    /// in the same directory the canonical socket/pid would live in.
-    /// The parent computes this once and hands the exact paths to the
-    /// child it spawns (Layer B).
-    pub fn allocate_ephemeral() -> Result<Self> {
-        Self::ephemeral_with_nonce(
-            std::process::id(),
-            uuid::Uuid::new_v4().simple().to_string(),
-        )
-    }
-
     #[cfg(test)]
     fn allocate_ephemeral_for_test_in(
         pid: u32,
@@ -404,24 +396,6 @@ impl DaemonPaths {
             state_home,
             runtime_dir,
         )
-    }
-
-    fn ephemeral_with_nonce(pid: u32, nonce: String) -> Result<Self> {
-        let state = state_dir().context("could not locate state dir")?;
-        ensure_private_dir(&state).with_context(|| format!("securing {}", state.display()))?;
-        let stem = format!("cockpit-eph-{pid}-{nonce}");
-        let pid_file = state.join(format!("{stem}.pid"));
-        let socket = if let Some(rt) = runtime_dir() {
-            ensure_private_dir(&rt).with_context(|| format!("securing {}", rt.display()))?;
-            rt.join(format!("{stem}.sock"))
-        } else {
-            state.join(format!("{stem}.sock"))
-        };
-        Ok(Self {
-            pid_file,
-            socket,
-            ephemeral: true,
-        })
     }
 
     #[cfg(test)]
@@ -447,23 +421,6 @@ impl DaemonPaths {
             socket,
             ephemeral: true,
         })
-    }
-
-    /// Reconstruct the ephemeral path set the parent chose, from the
-    /// internal env vars. Returns `Ok(None)` when not running as an
-    /// ephemeral child (the common case).
-    fn from_ephemeral_env() -> Result<Option<Self>> {
-        let socket = std::env::var_os(EPHEMERAL_SOCKET_ENV);
-        let pid_file = std::env::var_os(EPHEMERAL_PID_ENV);
-        Self::from_ephemeral_values(socket.map(PathBuf::from), pid_file.map(PathBuf::from))
-    }
-
-    #[cfg(test)]
-    fn from_ephemeral_paths(
-        socket: Option<PathBuf>,
-        pid_file: Option<PathBuf>,
-    ) -> Result<Option<Self>> {
-        Self::from_ephemeral_values(socket, pid_file)
     }
 
     /// The dedicated leak-reveal socket path for this daemon instance: same
@@ -496,26 +453,6 @@ impl DaemonPaths {
         match control_socket.parent() {
             Some(parent) => parent.join(file_name),
             None => PathBuf::from(file_name),
-        }
-    }
-
-    fn from_ephemeral_values(
-        socket: Option<PathBuf>,
-        pid_file: Option<PathBuf>,
-    ) -> Result<Option<Self>> {
-        match (socket, pid_file) {
-            (Some(socket), Some(pid_file)) => {
-                if let Some(parent) = socket.parent() {
-                    ensure_private_dir(parent)
-                        .with_context(|| format!("securing {}", parent.display()))?;
-                }
-                Ok(Some(Self {
-                    pid_file,
-                    socket,
-                    ephemeral: true,
-                }))
-            }
-            _ => Ok(None),
         }
     }
 }
@@ -733,7 +670,7 @@ fn endpoint_paths(canonical: &DaemonPaths, record: &DaemonEndpointRecord) -> Dae
     DaemonPaths {
         pid_file: canonical.pid_file.clone(),
         socket: record.socket.clone(),
-        ephemeral: false,
+        ephemeral: record.kind == DaemonEndpointKind::Ephemeral,
     }
 }
 
@@ -756,9 +693,7 @@ pub async fn discover() -> DaemonProbe {
         return DaemonProbe::new(DaemonStatus::Running, canonical);
     }
 
-    if let Some(record) = read_endpoint_record(&canonical)
-        && record.kind == DaemonEndpointKind::Persistent
-    {
+    if let Some(record) = read_endpoint_record(&canonical) {
         let recorded = endpoint_paths(&canonical, &record);
         if let Some(response) = socket_responds(&recorded.socket).await {
             return DaemonProbe::with_hello(
@@ -815,9 +750,7 @@ pub fn discover_blocking() -> DaemonProbe {
         return DaemonProbe::new(DaemonStatus::Running, canonical);
     }
 
-    if let Some(record) = read_endpoint_record(&canonical)
-        && record.kind == DaemonEndpointKind::Persistent
-    {
+    if let Some(record) = read_endpoint_record(&canonical) {
         let recorded = endpoint_paths(&canonical, &record);
         if let Some(response) = socket_responds_blocking(&recorded.socket) {
             return DaemonProbe::with_hello(
@@ -839,9 +772,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
     note_blocking_probe_call();
     if let Some(state) = canonical.pid_file.parent() {
         let endpoint = endpoint_file_for_state(state);
-        if let Some(record) = read_published_endpoint_record_from(&endpoint, &canonical)
-            && record.kind == DaemonEndpointKind::Persistent
-        {
+        if let Some(record) = read_published_endpoint_record_from(&endpoint, &canonical) {
             let recorded = endpoint_paths(&canonical, &record);
             if let Some(response) = socket_responds_blocking(&recorded.socket) {
                 return DaemonProbe::with_hello(
@@ -1054,10 +985,9 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
     pid_file_released && process_released && !paths.pid_file.exists() && !paths.socket.exists()
 }
 
-/// Spawn a detached *ephemeral* daemon bound to `paths` (a unique
-/// `cockpit-eph-<pid>-<nonce>` path set).
-/// The child binds the exact path the parent chose by reading the
-/// internal env vars (Layer B); never via the user-facing CLI surface.
+/// Spawn a detached ephemeral daemon at the canonical ledger endpoint.
+/// The lifetime marker is internal; the socket remains discoverable so every
+/// client of this ledger can share the same owner.
 /// Returns the live child handle. The owning guard retains it until verified
 /// shutdown, so PID reuse is impossible even before the v2 receipt publishes.
 ///
@@ -1158,10 +1088,8 @@ fn spawn_detached_child(
     if resume_all_sessions {
         command.arg("--resume-all-sessions");
     }
-    if let Some(paths) = ephemeral {
-        command
-            .env(EPHEMERAL_SOCKET_ENV, &paths.socket)
-            .env(EPHEMERAL_PID_ENV, &paths.pid_file);
+    if ephemeral.is_some() {
+        command.env(DAEMON_LIFETIME_ENV, EPHEMERAL_LIFETIME);
     }
     #[cfg(unix)]
     command.process_group(0);
@@ -1197,26 +1125,15 @@ fn spawn_detached_child(
     anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
-/// Idle grace period for the ephemeral self-reaping watchdog (Layer C).
-/// When the last client of an *ephemeral* daemon disconnects, the
-/// daemon waits this long before exiting on its own; a reconnect within
-/// the window cancels the countdown. Bounds the lifetime of an orphan
-/// left by an uncatchable foreground death (SIGKILL, power loss) to
-/// roughly this value. The persistent daemon never arms this timer.
-pub const EPHEMERAL_IDLE_GRACE: Duration = Duration::from_secs(30);
-
 /// Run the daemon's accept loop in the current process. Blocks until
 /// SIGINT/SIGTERM. Boots the DB + lock manager, registers a shutdown
-/// watcher, and runs the [`server::run_accept_loop`]. Uses the production
-/// idle ([`EPHEMERAL_IDLE_GRACE`]) and drain
-/// ([`shutdown::SHUTDOWN_DRAIN_GRACE`]) graces.
+/// watcher, and runs the [`server::run_accept_loop`].
 pub async fn run_foreground(
     paths: DaemonPaths,
     terminal_factory: terminal::TerminalHostFactory,
 ) -> Result<()> {
     run_foreground_inner(
         paths,
-        EPHEMERAL_IDLE_GRACE,
         shutdown::SHUTDOWN_DRAIN_GRACE,
         false,
         terminal_factory,
@@ -1231,7 +1148,6 @@ pub async fn run_foreground_with_resume(
 ) -> Result<()> {
     run_foreground_inner(
         paths,
-        EPHEMERAL_IDLE_GRACE,
         shutdown::SHUTDOWN_DRAIN_GRACE,
         resume_all_sessions,
         terminal_factory,
@@ -1742,7 +1658,7 @@ async fn boot_test_persistent_daemon_with_source(
     })
 }
 
-/// Test seam for first-run auto-promote: `probe_or_spawn(AttachOrAutoPromote)`
+/// Test seam for first-run persistent promotion.
 /// boots an in-process canonical daemon instead of spawning a child.
 #[cfg(any(test, feature = "test-support"))]
 static IN_PROCESS_AUTO_PROMOTE: std::sync::atomic::AtomicBool =
@@ -1826,23 +1742,18 @@ pub(crate) async fn boot_in_process_with_db(
     Ok(ctx)
 }
 
-/// Like [`run_foreground`] but with injectable idle- and drain-grace
-/// durations so tests can exercise the ephemeral watchdog (Layer C) and the
-/// graceful drain (`daemon-graceful-drain-shutdown.md`) without sleeping the
-/// full 30s of wall-clock. `idle_grace` bounds the ephemeral idle watchdog;
-/// `drain_grace` bounds how long teardown awaits in-flight work before
+/// Like [`run_foreground`] but with injectable drain grace for lifecycle
+/// tests. `drain_grace` bounds how long teardown awaits in-flight work before
 /// force-aborting it.
 #[cfg(unix)]
 pub async fn run_foreground_inner(
     paths: DaemonPaths,
-    idle_grace: Duration,
     drain_grace: Duration,
     resume_all_sessions: bool,
     terminal_factory: terminal::TerminalHostFactory,
 ) -> Result<()> {
     run_foreground_inner_with_boot_db(
         paths,
-        idle_grace,
         drain_grace,
         resume_all_sessions,
         terminal_factory,
@@ -1854,7 +1765,6 @@ pub async fn run_foreground_inner(
 #[cfg(unix)]
 async fn run_foreground_inner_with_boot_db(
     paths: DaemonPaths,
-    idle_grace: Duration,
     drain_grace: Duration,
     resume_all_sessions: bool,
     terminal_factory: terminal::TerminalHostFactory,
@@ -1870,7 +1780,13 @@ async fn run_foreground_inner_with_boot_db(
             paths.socket.display()
         );
     }
-    if boot_db.is_none() && !paths.ephemeral && paths == DaemonPaths::resolve_canonical()? {
+    if boot_db.is_none()
+        && DaemonPaths::resolve_canonical()
+            .as_ref()
+            .is_ok_and(|canonical| {
+                paths.pid_file == canonical.pid_file && paths.socket == canonical.socket
+            })
+    {
         let discovered = discover().await;
         if matches!(
             discovered.status,
@@ -1887,11 +1803,11 @@ async fn run_foreground_inner_with_boot_db(
         }
     }
     let executable = std::env::current_exe().context("resolving daemon executable identity")?;
-    let endpoint_record = if !paths.ephemeral
-        && DaemonPaths::resolve_canonical()
-            .as_ref()
-            .is_ok_and(|canonical| canonical == &paths)
-    {
+    let endpoint_record = if DaemonPaths::resolve_canonical()
+        .as_ref()
+        .is_ok_and(|canonical| {
+            paths.pid_file == canonical.pid_file && paths.socket == canonical.socket
+        }) {
         paths.pid_file.parent().map(endpoint_file_for_state)
     } else {
         None
@@ -1996,18 +1912,17 @@ async fn run_foreground_inner_with_boot_db(
         })
     };
 
-    // Layer C: ephemeral-only self-reaping watchdog. The persistent daemon
-    // must never self-exit on idle, so the watchdog is armed only when this
-    // daemon owns an ephemeral path set (Layer B's flag). It routes through
-    // the same `request_shutdown` path, so a fired timer drains in-flight
-    // work before reaping (an *in-flight* ephemeral daemon drains; only an
-    // *idle* one is reaped promptly).
-    let watchdog_task = if paths.ephemeral {
+    // A reference-counted ephemeral owner remains available until at least
+    // one client has established a transport connection, then begins the
+    // normal drain immediately when the final client disconnects. This
+    // deliberately has no idle timeout.
+    let lifecycle_task = if paths.ephemeral {
         let ctx = ctx.clone();
+        let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
         Some(tokio::spawn(async move {
-            idle_watchdog(client_presence, idle_grace, move || {
-                server::request_shutdown(&ctx);
+            ephemeral_last_client_reaper(client_presence, move || {
+                reaper_ctx.reap_ephemeral_last_client()
             })
             .await;
         }))
@@ -2052,7 +1967,7 @@ async fn run_foreground_inner_with_boot_db(
         }
     };
 
-    timer.phase("signal_and_watchdog");
+    timer.phase("signal_and_lifecycle");
     timer.done();
     let accept = server::run_accept_loop(ctx.clone(), listener);
     let result = accept.await;
@@ -2087,8 +2002,8 @@ async fn run_foreground_inner_with_boot_db(
     let metadata_result = metadata_guard.cleanup();
 
     signal_task.abort();
-    if let Some(watchdog) = watchdog_task {
-        watchdog.abort();
+    if let Some(task) = lifecycle_task {
+        task.abort();
     }
     #[cfg(feature = "remote")]
     org_sync_task.abort();
@@ -2124,7 +2039,6 @@ async fn run_foreground_inner_with_boot_db(
 #[cfg(not(unix))]
 pub async fn run_foreground_inner(
     _paths: DaemonPaths,
-    _idle_grace: Duration,
     _drain_grace: Duration,
     _resume_all_sessions: bool,
     _terminal_factory: terminal::TerminalHostFactory,
@@ -2146,51 +2060,42 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
     Ok(())
 }
 
-/// Ephemeral self-reaping watchdog (Layer C). Watches `presence` (a live
-/// count of connected clients). Whenever the count drops to zero, it starts
-/// an `idle_grace` countdown; if a client reconnects before the timer
-/// fires, the countdown is cancelled and the daemon keeps running; if the
-/// timer fires with still no client, it routes into the single graceful
-/// drain via [`server::request_shutdown`]. Idempotent: re-entry just
-/// re-reads the latest count.
-///
-/// Note the drain still runs to completion afterwards — an ephemeral daemon
-/// whose last UI detached *mid-inference* drains the in-flight work (same
-/// grace/force bound) before the process exits; only an *idle* one reaps
-/// with nothing to wait on.
+/// Wait for an ephemeral owner to acquire its first lifetime client and then
+/// request teardown as soon as the reference count returns to zero. The gate
+/// prevents a freshly spawned daemon from racing its creator's initial
+/// handshake or a hello-only reachability probe.
 #[cfg(any(unix, test))]
-async fn idle_watchdog(
-    mut presence: tokio::sync::watch::Receiver<usize>,
-    idle_grace: Duration,
-    mut on_reap: impl FnMut(),
+async fn ephemeral_last_client_reaper(
+    mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
+    mut try_reap: impl FnMut() -> server::EphemeralReapDecision,
 ) {
     loop {
-        // Block until there are no connected clients.
-        if *presence.borrow() != 0 {
-            if presence.changed().await.is_err() {
-                // Sender dropped — daemon is tearing down anyway.
-                return;
+        let observed = *presence.borrow_and_update();
+        if observed.has_lifetime_client && observed.count == 0 {
+            match try_reap() {
+                server::EphemeralReapDecision::Shutdown => {
+                    tracing::info!("ephemeral daemon lost its final client; beginning teardown");
+                    return;
+                }
+                server::EphemeralReapDecision::Persistent => return,
+                // A detach-time snapshot may race a worker becoming live after
+                // the client receives its response. Never tear that work down;
+                // wait for it to settle before completing ephemeral teardown.
+                server::EphemeralReapDecision::WaitingForLiveWork => {
+                    tokio::select! {
+                        changed = presence.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                    continue;
+                }
             }
-            continue;
         }
-
-        // No clients: race the grace timer against a reconnect.
-        tokio::select! {
-            _ = tokio::time::sleep(idle_grace) => {
-                // Re-check under the borrow: a client may have connected
-                // in the same tick the timer fired.
-                if *presence.borrow() == 0 {
-                    tracing::info!("ephemeral daemon idle past grace; self-reaping");
-                    on_reap();
-                    return;
-                }
-            }
-            changed = presence.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                // Loop re-evaluates the (possibly non-zero) count.
-            }
+        if presence.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -2331,13 +2236,9 @@ fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
 
 #[cfg(unix)]
 fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) -> Result<bool> {
-    let endpoint = if paths.ephemeral {
-        None
-    } else {
-        Some(endpoint_file_for_state(
-            paths.pid_file.parent().context("PID file has no parent")?,
-        ))
-    };
+    let endpoint = Some(endpoint_file_for_state(
+        paths.pid_file.parent().context("PID file has no parent")?,
+    ));
     retire_metadata_if_receipt_matches(&paths.pid_file, &paths.socket, endpoint.as_deref(), receipt)
 }
 
@@ -2884,180 +2785,296 @@ mod tests {
         drop(lb);
     }
 
-    /// Layer B wiring: a daemon child started for an ephemeral run binds
-    /// the exact path set the parent chose, transmitted via the internal
-    /// env vars. `resolve()` honors those env vars (flagging ephemeral);
-    /// absent them, it falls back to the canonical path set.
-    #[test]
-    fn resolve_honors_ephemeral_env() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("runtime").join("chosen.sock");
-        let pid_file = dir.path().join("state").join("chosen.pid");
-
-        let resolved =
-            DaemonPaths::from_ephemeral_paths(Some(socket.clone()), Some(pid_file.clone()))
-                .expect("resolve explicit ephemeral paths")
-                .expect("ephemeral paths");
-        assert_eq!(resolved.socket, socket);
-        assert_eq!(resolved.pid_file, pid_file);
-        assert!(resolved.ephemeral);
-        #[cfg(unix)]
-        assert_eq!(mode(resolved.socket.parent().unwrap()), 0o700);
-
-        let canonical = DaemonPaths::from_ephemeral_paths(None, None)
-            .expect("resolve absent explicit ephemeral paths");
-        assert!(canonical.is_none());
-
-        let canonical = canonical_in(&dir.path().join("state"), &dir.path().join("runtime"));
-        assert!(!canonical.ephemeral);
-    }
-
-    /// Layer C: with no connected client, the watchdog signals shutdown
-    /// once the (injected, short) grace elapses.
-    #[tokio::test(start_paused = true)]
-    async fn watchdog_reaps_after_idle_grace() {
-        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0usize);
-        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let grace = Duration::from_secs(30);
-
-        let reaped_c = reaped.clone();
-        let task = tokio::spawn(idle_watchdog(presence_rx, grace, move || {
-            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
-
-        // Advance past the grace window. With paused time this is
-        // deterministic and instant — no wall-clock sleep.
-        tokio::time::advance(grace + Duration::from_secs(1)).await;
-        let _ = task.await;
-
-        assert!(
-            reaped.load(std::sync::atomic::Ordering::SeqCst),
-            "watchdog should have reaped after idle grace"
-        );
-        drop(presence_tx);
-    }
-
-    /// Layer C: a client reconnecting inside the grace window cancels the
-    /// countdown; the daemon does not self-exit while a client is present.
-    #[tokio::test(start_paused = true)]
-    async fn watchdog_reconnect_cancels_countdown() {
-        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0usize);
-        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let grace = Duration::from_secs(30);
-
-        let reaped_c = reaped.clone();
-        let task = tokio::spawn(idle_watchdog(presence_rx, grace, move || {
-            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
-
-        // A client connects partway through the grace window.
-        tokio::time::advance(grace / 2).await;
-        presence_tx.send(1).unwrap();
-
-        // Even well past the original deadline, no shutdown fires while a
-        // client is connected.
-        tokio::time::advance(grace * 2).await;
-        tokio::task::yield_now().await;
-        assert!(
-            !reaped.load(std::sync::atomic::Ordering::SeqCst),
-            "watchdog reaped despite a client"
-        );
-
-        drop(presence_tx);
-        let _ = task.await;
-    }
-
-    /// End-to-end gating (Layers B + C): a real *ephemeral* daemon with
-    /// no client self-reaps within the injected grace and removes its
-    /// own socket + pid files; a real *persistent* daemon with the same
-    /// idle conditions stays up. Uses a short injected grace and advances
-    /// paused Tokio time so the test does not depend on wall-clock sleeps.
     #[tokio::test]
-    async fn ephemeral_self_reaps_persistent_does_not() {
+    async fn ephemeral_reaps_when_first_lifetime_client_disconnect_precedes_reaper() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reaped_c = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            server::EphemeralReapDecision::Shutdown
+        }));
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the durable first-connection marker must survive a coalesced disconnect")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn promoted_owner_does_not_reap_after_its_last_client_detaches() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let ephemeral = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ephemeral_for_reaper = ephemeral.clone();
+        let reaped_for_reaper = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
+                return server::EphemeralReapDecision::Persistent;
+            }
+            reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
+            server::EphemeralReapDecision::Shutdown
+        }));
+
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+        ephemeral.store(false, std::sync::atomic::Ordering::SeqCst);
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(!reaped.load(std::sync::atomic::Ordering::SeqCst));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ephemeral_reaper_waits_for_live_work_that_races_last_detach() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper_live = live.clone();
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            if reaper_live.load(std::sync::atomic::Ordering::Acquire) {
+                return server::EphemeralReapDecision::WaitingForLiveWork;
+            }
+            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+            server::EphemeralReapDecision::Shutdown
+        }));
+
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::Acquire),
+            "last-client teardown must not destroy daemon-owned live work"
+        );
+
+        live.store(false, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("reaper retries after live work settles")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn promotion_holds_the_last_client_reaper_decision_until_lifetime_changes() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let decision = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let ephemeral = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reaper_decision = decision.clone();
+        let reaper_ephemeral = ephemeral.clone();
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            let _decision = crate::sync::lock_or_recover(&reaper_decision);
+            if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
+                return server::EphemeralReapDecision::Persistent;
+            }
+            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+            server::EphemeralReapDecision::Shutdown
+        }));
+
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+
+        let promotion_decision = decision.clone();
+        let promotion_ephemeral = ephemeral.clone();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let promotion = tokio::task::spawn_blocking(move || {
+            let _decision = crate::sync::lock_or_recover(&promotion_decision);
+            held_tx
+                .send(())
+                .expect("test waits for promotion decision lock");
+            release_rx.recv().expect("test releases promotion");
+            promotion_ephemeral.store(false, std::sync::atomic::Ordering::Release);
+        });
+        held_rx.await.expect("promotion holds decision lock");
+
+        // The reaper sees zero clients before promotion has changed the
+        // lifetime flag, but must wait for the shared decision lock.
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::Acquire),
+            "the reaper must not decide while promotion owns the lifecycle gate"
+        );
+
+        release_tx.send(()).expect("release promotion");
+        promotion.await.expect("promotion task joins");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("reaper observes the promoted lifetime")
+            .expect("reaper task joins");
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::Acquire),
+            "a zero-client observation before promotion must not reap its persistent owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_socket_owner_reaps_after_connected_client_drops_before_request() {
         let harness = DaemonTestHarness::new();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
-        let grace = Duration::from_millis(300);
-
-        // --- Ephemeral: must self-reap. ---
-        let eph = harness.ephemeral_paths("eph");
-        let eph_clone = eph.clone();
-        let eph_db = harness.db.clone();
-        let eph_task = tokio::spawn(async move {
+        let paths = harness.ephemeral_paths("detached-rpc-client");
+        let daemon_paths = paths.clone();
+        let daemon_db = harness.db.clone();
+        let daemon_task = tokio::spawn(async move {
             run_foreground_inner_with_boot_db(
-                eph_clone,
-                grace,
-                grace,
+                daemon_paths,
+                Duration::from_millis(300),
                 false,
                 crate::daemon::terminal::test_host_factory(),
-                Some(eph_db),
+                Some(daemon_db),
             )
             .await
         });
+        wait_until(|| paths.socket.exists(), Duration::from_secs(2)).await;
 
-        wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
-        assert!(eph.pid_file.exists(), "ephemeral pid file written");
-        // Bind happens before boot. Give boot real time to arm the idle
-        // watchdog; pausing the clock immediately freezes boot forever.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        tokio::time::pause();
-
-        // No client ever connects; it should self-reap and clean up.
-        tokio::time::advance(grace + Duration::from_millis(1)).await;
-        let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
+        let client = cockpit_client::DaemonClient::connect(&paths.socket)
             .await
-            .expect("ephemeral daemon did not self-reap in time");
-        reaped.expect("join").expect("run_foreground_inner ok");
-        assert!(!eph.socket.exists(), "ephemeral socket removed on reap");
-        assert!(!eph.pid_file.exists(), "ephemeral pid removed on reap");
+            .expect("connect detached socket client");
+        drop(client);
 
-        // --- Persistent: must NOT self-reap. ---
-        let persistent = canonical_in(&harness.state_home, &harness._runtime_dir);
-        let persistent_clone = persistent.clone();
-        let persistent_db = harness.db.clone();
-        let persist_task = tokio::spawn(async move {
-            run_foreground_inner_with_boot_db(
-                persistent_clone,
-                grace,
-                grace,
-                false,
-                crate::daemon::terminal::test_host_factory(),
-                Some(persistent_db),
+        tokio::time::timeout(Duration::from_secs(3), daemon_task)
+            .await
+            .expect(
+                "connected client drop before an application request must reap the ephemeral owner",
             )
-            .await
-        });
-        wait_until(|| persistent.socket.exists(), Duration::from_secs(2)).await;
-
-        // Past several grace windows with no client: still alive.
-        tokio::time::advance(grace * 4).await;
+            .expect("daemon task joins")
+            .expect("daemon drain completes after detached client disconnect");
+        assert!(!paths.socket.exists(), "last client removes the socket");
         assert!(
-            persistent.socket.exists(),
-            "persistent daemon must never self-reap on idle"
+            !paths.pid_file.exists(),
+            "last client removes the pid record"
         );
-        assert!(
-            !persist_task.is_finished(),
-            "persistent daemon exited on idle"
-        );
-
-        // Tear it down so the test leaves nothing behind.
-        persist_task.abort();
-        let _ = persist_task.await;
-        let _ = std::fs::remove_file(&persistent.socket);
-        let _ = std::fs::remove_file(&persistent.pid_file);
     }
 
-    /// Lingering-daemon fix (`daemonless-tui-ephemeral-lifecycle.md` §2): a
-    /// **persisted** session must not, by itself, keep an *owned* ephemeral
-    /// daemon alive past its owner's exit. We stand up a real ephemeral
+    #[tokio::test]
+    async fn ephemeral_socket_owner_waits_for_its_last_connected_client() {
+        let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let project = tempfile::tempdir().expect("project directory");
+        harness
+            .db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .await
+            .expect("trust project");
+
+        let paths = harness.ephemeral_paths("two-socket-clients");
+        let daemon_paths = paths.clone();
+        let daemon_db = harness.db.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_foreground_inner_with_boot_db(
+                daemon_paths,
+                Duration::from_millis(300),
+                false,
+                crate::daemon::terminal::test_host_factory(),
+                Some(daemon_db),
+            )
+            .await
+        });
+        wait_until(|| paths.socket.exists(), Duration::from_secs(2)).await;
+
+        let client_a = cockpit_client::DaemonClient::connect(&paths.socket)
+            .await
+            .expect("connect first socket client");
+        let first = client_a
+            .request_ok(proto::Request::Attach {
+                session_id: None,
+                since_seq: None,
+                project_root: Some(project.path().to_string_lossy().into_owned()),
+                initial_model: None,
+                no_sandbox: false,
+                interactive: true,
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            })
+            .await
+            .expect("first socket client attaches");
+        let proto::Response::Attached { session_id, .. } = first else {
+            panic!("first socket client must receive Attached");
+        };
+
+        let client_b = cockpit_client::DaemonClient::connect(&paths.socket)
+            .await
+            .expect("connect second socket client");
+        // The completed connection confirmation must retain the owner before
+        // B sends any application request; otherwise this A -> B handoff can
+        // race the ephemeral reaper into draining at count zero.
+        drop(client_a);
+        client_b
+            .request_ok(proto::Request::Attach {
+                session_id: Some(session_id),
+                since_seq: None,
+                project_root: None,
+                initial_model: None,
+                no_sandbox: false,
+                interactive: true,
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            })
+            .await
+            .expect("second socket client attaches");
+
+        client_b
+            .request_ok(proto::Request::DaemonStatus)
+            .await
+            .expect("second attached socket client retains the owner");
+        assert!(
+            paths.socket.exists(),
+            "owner remains published for client B"
+        );
+
+        drop(client_b);
+        tokio::time::timeout(Duration::from_secs(3), daemon_task)
+            .await
+            .expect("last socket client must drain and reap the ephemeral owner")
+            .expect("daemon task joins")
+            .expect("daemon drain cancels attached session work cleanly");
+        assert!(!paths.socket.exists(), "last client removes the socket");
+        assert!(
+            !paths.pid_file.exists(),
+            "last client removes the pid record"
+        );
+    }
+
+    /// A persisted session must not, by itself, keep an ephemeral daemon alive
+    /// after an explicit stop. We stand up a real ephemeral
     /// daemon, write a persisted `sessions` row into the very DB the daemon
     /// opened (the exact effect the first user message has via
-    /// `persist_if_needed`), then trigger the owner-exit teardown
-    /// (`StopDaemon`, the same request the `EphemeralDaemonGuard` sends). The
-    /// daemon must drain and reap — removing its socket + pid — within the
-    /// grace, identically to the no-message case. A long idle grace is used
-    /// so the *only* thing that can reap it is the `StopDaemon`, not the idle
-    /// watchdog backstop.
+    /// `persist_if_needed`), then trigger an explicit `StopDaemon`. The daemon
+    /// must drain and reap — removing its socket + pid — within the grace.
     #[tokio::test]
     async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
         use crate::daemon::ephemeral_guard::stop_daemon_blocking;
@@ -3066,9 +3083,6 @@ mod tests {
         let harness = DaemonTestHarness::new();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
-        // Idle grace far longer than the test window: the watchdog can NOT be
-        // what reaps the daemon — only the `StopDaemon` teardown can.
-        let idle_grace = Duration::from_secs(3600);
         let drain_grace = Duration::from_millis(300);
 
         let eph = harness.ephemeral_paths("eph-with-session");
@@ -3077,7 +3091,6 @@ mod tests {
         let eph_task = tokio::spawn(async move {
             run_foreground_inner_with_boot_db(
                 eph_clone,
-                idle_grace,
                 drain_grace,
                 false,
                 crate::daemon::terminal::test_host_factory(),
@@ -3103,8 +3116,8 @@ mod tests {
             assert!(session.is_persisted(), "row is persisted");
         }
 
-        // Owner exit: the same `StopDaemon` the guard fires synchronously.
-        // Run it off the runtime thread (mirrors the real blocking `Drop`).
+        // Explicit administrative stop. Run it off the runtime thread because
+        // this helper uses a blocking Unix socket.
         let socket = eph.socket.clone();
         tokio::task::spawn_blocking(move || stop_daemon_blocking(&socket))
             .await
@@ -3113,52 +3126,16 @@ mod tests {
         // The daemon must drain and exit — despite the persisted session.
         let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
             .await
-            .expect("owned ephemeral daemon did not reap on StopDaemon with a persisted session");
+            .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
         reaped.expect("join").expect("run_foreground_inner ok");
         assert!(
             !eph.socket.exists(),
-            "ephemeral socket removed on owner-exit teardown"
+            "ephemeral socket removed on explicit teardown"
         );
         assert!(
             !eph.pid_file.exists(),
-            "ephemeral pid removed on owner-exit teardown"
+            "ephemeral pid removed on explicit teardown"
         );
-    }
-
-    /// Two daemonless TUIs are fully isolated: each owns a per-spawn ephemeral
-    /// daemon, so even the same pid prefix can resolve to distinct
-    /// sockets/pid files and never the canonical ones. Stale files from a
-    /// prior crashed run of one TUI can't belong to — or block — the other.
-    /// This is the path-level isolation guarantee
-    /// `LifecycleMode::AttachOwnEphemeral` relies on.
-    #[test]
-    fn two_daemonless_tuis_resolve_distinct_owned_ephemeral_paths() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_home = dir.path().join("state");
-        let runtime_dir = dir.path().join("runtime");
-
-        // Two daemonless TUI instances, even if the OS later reuses a pid.
-        let tui_a =
-            DaemonPaths::allocate_ephemeral_for_test_in(4242, &state_home, Some(&runtime_dir))
-                .expect("resolve eph a");
-        let tui_b =
-            DaemonPaths::allocate_ephemeral_for_test_in(4242, &state_home, Some(&runtime_dir))
-                .expect("resolve eph b");
-        let canonical = canonical_in(&state_home, &runtime_dir);
-
-        // Distinct sockets + pid files → two independent ephemeral daemons.
-        assert_ne!(tui_a.socket, tui_b.socket);
-        assert_ne!(tui_a.pid_file, tui_b.pid_file);
-
-        // Neither daemonless TUI binds the canonical (shared persistent)
-        // socket — they coexist with it and with `daemon stop`/`status`.
-        assert_ne!(tui_a.socket, canonical.socket);
-        assert_ne!(tui_b.socket, canonical.socket);
-
-        // Both are flagged ephemeral so the self-reaping idle watchdog
-        // (Layer C) is armed as the SIGKILL backstop.
-        assert!(tui_a.ephemeral && tui_b.ephemeral);
-        assert!(!canonical.ephemeral);
     }
 
     #[cfg(unix)]

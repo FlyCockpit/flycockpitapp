@@ -644,6 +644,10 @@ pub(super) async fn authorize_attach(
 
     if let Some(session_id) = session_id {
         match ctx.db.get_session(*session_id).await {
+            Ok(Some(row)) if row.session_entry_mode == "code" => Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "Code roots require AttachExistingCodeRootV1".into(),
+            }),
             Ok(Some(row)) => match session_access_for_row(principal, &row) {
                 SessionAccess::Writer => Ok(()),
                 SessionAccess::Readonly => {
@@ -889,6 +893,10 @@ pub(super) async fn authorize_shared_custom(
             }
             if let Some(session_id) = session_id {
                 match ctx.db.get_session(*session_id).await {
+                    Ok(Some(row)) if row.session_entry_mode == "code" => Err(ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: "Code roots require AttachExistingCodeRootV1".into(),
+                    }),
                     Ok(Some(row)) => match session_access_for_row(principal, &row) {
                         SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {
                             Ok(())

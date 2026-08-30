@@ -25,6 +25,11 @@ use crate::{
 
 pub struct WriteTool;
 
+/// The `Plan` agent's deliberately narrow `write` capability.  It retains the
+/// ordinary tool name and schema so the model has one `read`/`write` mental
+/// model, but it never enters the host-file writer.
+pub struct PlanWriteTool;
+
 #[async_trait]
 impl Tool for WriteTool {
     fn name(&self) -> &str {
@@ -32,7 +37,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read; prefer `edit` for small changes"
+        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
     }
 
     fn verbose_description(&self) -> Option<String> {
@@ -56,7 +61,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "x-cockpit-kind": "path", "x-cockpit-may-create": true, "x-cockpit-aliases": ["file_path", "filePath", "filepath", "pathname", "target_file", "file", "absolute_path"], "description": "Path to write" },
-                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "Entire new file content" }
+                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "Entire new file content" },
+                "expected_revision": { "type": "integer", "description": "Required to replace an existing `cockpit://.../plan`; use the revision returned by read. Ignored for host files." }
             },
             "required": ["path", "content"]
         })
@@ -67,7 +73,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "x-cockpit-kind": "path", "x-cockpit-may-create": true, "x-cockpit-aliases": ["file_path", "filePath", "filepath", "pathname", "target_file", "file", "absolute_path"], "description": "Path to create or overwrite, absolute or relative to the session working directory; existing files must be the same file you previously locked/read" },
-                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" }
+                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" },
+                "expected_revision": { "type": "integer", "description": "For an existing `cockpit://.../plan`, the revision returned by read; ignored for host files." }
             },
             "required": ["path", "content"]
         }))
@@ -79,6 +86,11 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // The recall provider owns its sole writable pseudofile (plan) and
+        // must run before every host-path guard.
+        if let Some(output) = crate::tools::recall::write(&args, ctx).await? {
+            return Ok(output);
+        }
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)
@@ -246,6 +258,62 @@ impl Tool for WriteTool {
         }
 
         Ok(ToolOutput::text(message))
+    }
+}
+
+#[async_trait]
+impl Tool for PlanWriteTool {
+    fn name(&self) -> &str {
+        "write"
+    }
+
+    fn description(&self) -> &str {
+        "Replace the current session's `cockpit://session/<short_id>/plan` pseudofile with `content`; no host files or other recall pseudofiles are writable"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Replace the complete current-session plan document. Read it first, then pass its \
+             revision as `expected_revision` when replacing an existing plan. This capability \
+             cannot write workspace files or any other recall pseudofile."
+                .to_string(),
+        )
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "x-cockpit-kind": "path", "description": "The current session's plan pseudofile" },
+                "content": { "type": "string", "description": "Entire new plan content" },
+                "expected_revision": { "type": "integer", "description": "Required to replace an existing plan; use the revision returned by read." }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    fn verbose_parameters(&self) -> Option<Value> {
+        Some(self.parameters())
+    }
+
+    fn presentation(&self, args: &Value) -> ToolPresentation {
+        let (summary, full_input) = path_or_readable_args(args);
+        ToolPresentation::with_parts(Some("🔓"), self.name(), summary, full_input)
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
+        if !crate::tools::recall::is_recall_path(path) {
+            return Err(crate::engine::tool::invalid_input(
+                "Plan may write only its current session plan pseudofile",
+            ));
+        }
+        crate::tools::recall::write(&args, ctx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("recall plan write was not dispatched"))
     }
 }
 
@@ -1664,7 +1732,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(&canonical);
+        let project_id = crate::session::project_id_for(&canonical).unwrap();
         let project_root = canonical.display().to_string();
         let session_row = db
             .write(move |conn| {
@@ -1698,6 +1766,9 @@ mod tests {
         );
         let ctx = ToolCtx {
             agent_id: "helper".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "helper".to_string(),
             write_scope: None,
@@ -1776,6 +1847,24 @@ mod tests {
         crate::config::trust::with_workspace_trust_policy(trusted_policy(&ctx.cwd), || {
             crate::skills::catalog_cache_contains(&ctx.cwd, cfg)
         })
+    }
+
+    #[tokio::test]
+    async fn plan_write_tool_cannot_fall_through_to_a_host_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let host_path = tmp.path().join("must-not-exist.txt");
+
+        let error = PlanWriteTool
+            .call(
+                serde_json::json!({ "path": host_path, "content": "forbidden" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("Plan may write only"));
+        assert!(!tmp.path().join("must-not-exist.txt").exists());
     }
 
     #[test]

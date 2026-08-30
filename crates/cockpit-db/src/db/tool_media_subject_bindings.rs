@@ -9,7 +9,7 @@
 //! atomically. Exact replay compares canonical receipt only, never randomized
 //! ciphertext.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 

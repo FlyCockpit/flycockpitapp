@@ -195,9 +195,7 @@
         "extended": {
           "agent_chooses_subagent_model": false,
           "agent_dirs": [],
-          "agent_guidance_files": [
-            "AGENTS.md"
-          ],
+          "agent_guidance_files": ["AGENTS.md"],
           "allow_remote_config": false,
           "approvalPolicy": {
             "dangerousFlags": {},
@@ -207,7 +205,7 @@
           },
           "concurrency": "subagents",
           "daemon": {
-            "autostart": "shared",
+            "background_agents": true,
             "uploads": {
               "global_bytes": 268435456,
               "global_uploads": 32,
@@ -324,10 +322,7 @@
           "redact": {
             "allowlist": [],
             "denylist": [],
-            "dotenv_patterns": [
-              ".env",
-              ".env.local"
-            ],
+            "dotenv_patterns": [".env", ".env.local"],
             "enabled": true,
             "extra_dotenv_paths": [],
             "min_secret_length": 8,
@@ -557,15 +552,9 @@
         "baseline_digest": "base",
         "candidate_digest": "cand",
         "changed_keys": 3,
-        "changed_secret_keys": [
-          "TOKEN"
-        ],
-        "path_added": [
-          "/opt/bin"
-        ],
-        "path_removed": [
-          "/bin"
-        ],
+        "changed_secret_keys": ["TOKEN"],
+        "path_added": ["/opt/bin"],
+        "path_removed": ["/bin"],
         "removed_keys": 2
       },
       "policy": "update-daemon"
@@ -599,9 +588,7 @@
   },
   "gitignore_allow": {
     "data": {
-      "allow": [
-        "allow-fixture"
-      ],
+      "allow": ["allow-fixture"],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "gitignore_allow",
@@ -659,9 +646,7 @@
         ],
         "features": [
           {
-            "dependency_ids": [
-              "security.keyring"
-            ],
+            "dependency_ids": ["security.keyring"],
             "id": "secret_store.keyring",
             "reason": "missing",
             "state": "missing"
@@ -740,27 +725,18 @@
         "data": {
           "allow_freetext": false,
           "command_detail": {
-            "affected_targets": [
-              "/tmp/project/file"
-            ],
+            "affected_targets": ["/tmp/project/file"],
             "cwd": "/tmp/project",
             "full_command": "echo hi && rm x",
             "highlight": {
               "end": 7,
               "start": 0
             },
-            "native_tool_hints": [
-              "use write"
-            ],
-            "offered_scopes": [
-              "once",
-              "session"
-            ],
+            "native_tool_hints": ["use write"],
+            "offered_scopes": ["once", "session"],
             "policy_cap": "session",
             "remembered_key": "echo",
-            "risk_reasons": [
-              "writes file"
-            ],
+            "risk_reasons": ["writes file"],
             "risk_tier": "mutating",
             "step": 1,
             "step_count": 2,
@@ -792,27 +768,18 @@
             "data": {
               "allow_freetext": false,
               "command_detail": {
-                "affected_targets": [
-                  "/tmp/project/file"
-                ],
+                "affected_targets": ["/tmp/project/file"],
                 "cwd": "/tmp/project",
                 "full_command": "echo hi && rm x",
                 "highlight": {
                   "end": 7,
                   "start": 0
                 },
-                "native_tool_hints": [
-                  "use write"
-                ],
-                "offered_scopes": [
-                  "once",
-                  "session"
-                ],
+                "native_tool_hints": ["use write"],
+                "offered_scopes": ["once", "session"],
                 "policy_cap": "session",
                 "remembered_key": "echo",
-                "risk_reasons": [
-                  "writes file"
-                ],
+                "risk_reasons": ["writes file"],
                 "risk_tier": "mutating",
                 "step": 1,
                 "step_count": 2,
@@ -901,9 +868,7 @@
                 "hostedIdentity": "gpt-image-1",
                 "workflowId": null,
                 "workflowDigest": null,
-                "formats": [
-                  "png"
-                ],
+                "formats": ["png"],
                 "referenceSupport": "unsupported",
                 "maxReferences": 0,
                 "maxSamples": 1,
@@ -1059,9 +1024,7 @@
   },
   "preflight_started": {
     "data": {
-      "client_submission_ids": [
-        "11111111-1111-4111-8111-111111111111"
-      ],
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "preflight_started",
@@ -1091,9 +1054,7 @@
       "auto": true,
       "bodies": 7,
       "cache_break": true,
-      "elided": [
-        "elided-fixture"
-      ],
+      "elided": ["elided-fixture"],
       "session_id": "11111111-1111-4111-8111-111111111111",
       "tokens_saved": 7,
       "trigger_reason": "trigger_reason-fixture"
@@ -1130,9 +1091,7 @@
     "data": {
       "display_text": "queued @src/lib.rs",
       "preflight_cleaned": "preflight_cleaned-fixture",
-      "queue_item_ids": [
-        "11111111-1111-4111-8111-111111111111"
-      ],
+      "queue_item_ids": ["11111111-1111-4111-8111-111111111111"],
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111",
       "tag_expansions": [
@@ -1410,9 +1369,7 @@
   },
   "tandem_state": {
     "data": {
-      "models": [
-        "model-fixture"
-      ],
+      "models": ["model-fixture"],
       "session_id": "11111111-1111-4111-8111-111111111111",
       "warning": "warning-fixture"
     },
@@ -1441,11 +1398,7 @@
   },
   "terminal_output": {
     "data": {
-      "bytes": [
-        65,
-        66,
-        67
-      ],
+      "bytes": [65, 66, 67],
       "terminal_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "terminal_output",
@@ -1541,9 +1494,7 @@
   },
   "user_message_recorded": {
     "data": {
-      "client_submission_ids": [
-        "11111111-1111-4111-8111-111111111111"
-      ],
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "preflight_cleaned": "preflight_cleaned-fixture",
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
@@ -1554,9 +1505,7 @@
   },
   "user_message_retracted": {
     "data": {
-      "client_submission_ids": [
-        "11111111-1111-4111-8111-111111111111"
-      ],
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "user_message_retracted",
@@ -1565,9 +1514,7 @@
   },
   "user_messages_terminated": {
     "data": {
-      "client_submission_ids": [
-        "11111111-1111-4111-8111-111111111111"
-      ],
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "disposition": "preflight_rejected",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },

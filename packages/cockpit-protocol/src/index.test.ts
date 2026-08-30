@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import acpForwardedMcpRoutesFixture from "../fixtures/acp-forwarded-mcp-v1.json" with {
+  type: "json",
+};
 import errorsFixture from "../fixtures/daemon-wire/errors.json" with { type: "json" };
 import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "json" };
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
@@ -9,6 +12,7 @@ import remoteOperationIdentityFixture from "../fixtures/remote-operation-identit
   type: "json",
 };
 import {
+  acpForwardedMcpIngressV1Schema,
   activeModelStateSchema,
   canonicalToolResultContentSchema,
   clientEnvelopeSchema,
@@ -31,6 +35,218 @@ import {
   sandboxEscalationSchema,
   serverMessageSchema,
 } from ".";
+
+describe("ACP forwarded MCP ingress v1", () => {
+  const ingress = {
+    version: 1,
+    declarations: [
+      {
+        name: "server",
+        transport: {
+          type: "stdio",
+          command: "mcp",
+          args: ["--stdio"],
+          env: [{ name: "ROUTING_HINT", value: "blue" }],
+        },
+      },
+    ],
+    client_provenance_id: "editor-1",
+    ingress_request_id: "request-1",
+  } as const;
+
+  it("normalizes NFC and accepts each stable transport", () => {
+    for (const transport of [
+      ingress.declarations[0]!.transport,
+      { type: "http", url: "https://example.invalid/mcp", headers: [] },
+      { type: "sse", url: "https://example.invalid/events", headers: [] },
+    ]) {
+      const parsed = acpForwardedMcpIngressV1Schema.parse({
+        ...ingress,
+        declarations: [{ name: "e\u0301", transport }],
+      });
+      expect(parsed.declarations[0]!.name).toBe("é");
+    }
+  });
+
+  it("rejects unknown fields, variants, semantic duplicates, and independent bounds", () => {
+    expect(acpForwardedMcpIngressV1Schema.safeParse({ ...ingress, _meta: {} }).success).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse({
+        ...ingress,
+        declarations: [{ name: "server", transport: { type: "websocket", url: "wss://x" } }],
+      }).success,
+    ).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse({
+        ...ingress,
+        declarations: [ingress.declarations[0], ingress.declarations[0]],
+      }).success,
+    ).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse({
+        ...ingress,
+        declarations: [{ ...ingress.declarations[0], name: "🦀".repeat(65) }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("uses ASCII-only case folding for semantic header-name uniqueness", () => {
+    const withHeaders = (names: string[]) => ({
+      ...ingress,
+      declarations: [
+        {
+          name: "server",
+          transport: {
+            type: "http" as const,
+            url: "https://example.invalid/mcp",
+            headers: names.map((name) => ({ name, value: "value" })),
+          },
+        },
+      ],
+    });
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["X-Route", "x-route"])).success,
+    ).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["Ä-Route", "ä-route"])).success,
+    ).toBe(true);
+  });
+
+  it("locks every forwarded string's scalar and UTF-8 byte edges", () => {
+    type FieldCase = {
+      label: string;
+      maxScalars: number;
+      maxBytes: number;
+      declaration(value: string): unknown;
+    };
+    const stdio = (change: Record<string, unknown>) => ({
+      name: "server",
+      transport: {
+        type: "stdio",
+        command: "mcp",
+        args: ["--stdio"],
+        env: [{ name: "ROUTING_HINT", value: "blue" }],
+        ...change,
+      },
+    });
+    const http = (change: Record<string, unknown>) => ({
+      name: "server",
+      transport: {
+        type: "http",
+        url: "https://example.invalid/mcp",
+        headers: [{ name: "x-route", value: "blue" }],
+        ...change,
+      },
+    });
+    const cases: FieldCase[] = [
+      {
+        label: "declaration name",
+        maxScalars: 64,
+        maxBytes: 256,
+        declaration: (name) => ({ ...stdio({}), name }),
+      },
+      {
+        label: "stdio command",
+        maxScalars: 4096,
+        maxBytes: 4096,
+        declaration: (command) => stdio({ command }),
+      },
+      {
+        label: "stdio argument",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (argument) => stdio({ args: [argument] }),
+      },
+      {
+        label: "environment name",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (name) => stdio({ env: [{ name, value: "blue" }] }),
+      },
+      {
+        label: "environment value",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (value) => stdio({ env: [{ name: "ROUTING_HINT", value }] }),
+      },
+      { label: "URL", maxScalars: 4096, maxBytes: 4096, declaration: (url) => http({ url }) },
+      {
+        label: "header name",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (name) => http({ headers: [{ name, value: "blue" }] }),
+      },
+      {
+        label: "header value",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (value) => http({ headers: [{ name: "x-route", value }] }),
+      },
+    ];
+    for (const field of cases) {
+      const parses = (value: string) =>
+        acpForwardedMcpIngressV1Schema.safeParse({
+          ...ingress,
+          declarations: [field.declaration(value)],
+        }).success;
+      const edges: Array<[string, string, boolean]> = [
+        ["ASCII scalar max", "a".repeat(field.maxScalars), true],
+        ["ASCII scalar max+1", "a".repeat(field.maxScalars + 1), false],
+        [
+          "multibyte scalar max",
+          "é".repeat(field.maxScalars),
+          field.maxScalars * 2 <= field.maxBytes,
+        ],
+        ["multibyte scalar max+1", "é".repeat(field.maxScalars + 1), false],
+        ["UTF-8 byte max", "🦀".repeat(field.maxBytes / 4), true],
+        ["UTF-8 byte max+1", `${"🦀".repeat(field.maxBytes / 4)}a`, false],
+      ];
+      for (const [edge, value, accepted] of edges) {
+        expect(parses(value), `${field.label}: ${edge}`).toBe(accepted);
+      }
+    }
+  });
+
+  it("parses every canonical composed-route request and rejects extra nested fields", () => {
+    expect(Object.keys(acpForwardedMcpRoutesFixture.requests)).toEqual([
+      "create_code_root_with_acp_ingress_v1",
+      "attach_existing_code_root_with_acp_ingress_v1",
+      "close_acp_code_root_attachment_v1",
+    ]);
+    for (const [name, frame] of Object.entries(acpForwardedMcpRoutesFixture.requests)) {
+      const parsed = clientEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) expect(parsed.data.request).toBe(name);
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...frame,
+          params: { ...frame.params, unexpected: true },
+        }).success,
+        `${name}: outer params`,
+      ).toBe(false);
+    }
+  });
+
+  it("parses every canonical composed-route success response and rejects extra data", () => {
+    expect(Object.keys(acpForwardedMcpRoutesFixture.responses)).toEqual([
+      "code_root_with_acp_ingress_created",
+      "code_root_with_acp_ingress_attached",
+      "acp_code_root_attachment_closed",
+    ]);
+    for (const [name, frame] of Object.entries(acpForwardedMcpRoutesFixture.responses)) {
+      const parsed = responseEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) expect(parsed.data.response).toBe(name);
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...frame,
+          data: { ...frame.data, unexpected: true },
+        }).success,
+        `${name}: response data`,
+      ).toBe(false);
+    }
+  });
+});
 
 const goldenFiles = [
   requestsFixture,
@@ -598,22 +814,6 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("bounds mirrored Rust u64 and i64 JSON numbers to exact JavaScript integers", () => {
-    const markSeen = requestsFixture.mark_app_flag_seen;
-    expect(
-      clientEnvelopeSchema.safeParse({
-        ...markSeen,
-        params: { ...markSeen.params, expected_version: Number.MAX_SAFE_INTEGER },
-      }).success,
-    ).toBe(true);
-    for (const expected_version of [-1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
-      expect(
-        clientEnvelopeSchema.safeParse({
-          ...markSeen,
-          params: { ...markSeen.params, expected_version },
-        }).success,
-      ).toBe(false);
-    }
-
     for (const request of [
       requestsFixture.attach,
       requestsFixture.read_history_page,

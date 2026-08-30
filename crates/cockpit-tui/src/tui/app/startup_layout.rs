@@ -216,9 +216,7 @@ impl App {
     }
 
     pub(super) fn geometry(&self) -> PaneGeometry {
-        let dialog = if self.daemon_prompt.is_some() {
-            crate::tui::daemon_prompt::DIALOG_HEIGHT
-        } else if self.dialog.is_active() {
+        let dialog = if self.dialog.is_active() {
             settings::DIALOG_HEIGHT
         } else if self.overlay.dialog_height() > 0 {
             self.overlay.dialog_height()

@@ -419,7 +419,20 @@ pub struct RunInvocationOptions {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", content = "params")]
 pub enum Request {
-    /// Attach to an existing session by id, or create a new one.
+    CreateCodeRootV1(crate::CreateCodeRootV1Request),
+    AttachExistingCodeRootV1(crate::AttachExistingCodeRootV1Request),
+    CloseCodeRootAttachmentV1(crate::CloseCodeRootAttachmentV1Request),
+    CreateCodeRootWithAcpIngressV1(crate::CreateCodeRootWithAcpIngressV1Request),
+    AttachExistingCodeRootWithAcpIngressV1(crate::AttachExistingCodeRootWithAcpIngressV1Request),
+    CloseAcpCodeRootAttachmentV1(crate::CloseAcpCodeRootAttachmentV1Request),
+    DiscoverCodeRootsV1(crate::DiscoverCodeRootsV1Request),
+    ReadCodeRootV1(crate::ReadCodeRootV1Request),
+    ReadCodeRootDeliveriesV1(crate::ReadCodeRootDeliveriesV1Request),
+    AckCodeRootDeliveriesV1(crate::AckCodeRootDeliveriesV1Request),
+    ResolveCodeRootInterruptV1(crate::ResolveCodeRootInterruptV1),
+
+    /// Attach to an existing Assistant/Computer session, or create a new
+    /// non-Code session. Code is structurally absent from this route.
     /// Returns the session's identity + a snapshot of its existing
     /// history so the TUI can re-render the transcript after a
     /// reconnect.
@@ -459,13 +472,9 @@ pub enum Request {
         /// treated as headless — the safe, non-blocking default.
         #[serde(default)]
         interactive: bool,
-        /// Immutable daemon-owned entry setup for a newly-created session.
-        /// It is required for new sessions. Existing-session attaches omit it
-        /// in all first-party clients; if another client supplies it, the
-        /// daemon requires exact equality with the durable value and never
-        /// permits it to overwrite that value.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_entry_mode: Option<crate::SessionEntryMode>,
+        /// Required non-Code mode assertion for both create and resume. The
+        /// daemon verifies an existing row has the same immutable mode.
+        session_entry_mode: crate::NonCodeSessionEntryMode,
         /// Plan-level model pin (prompt
         /// `plan-duplication-and-model-override.md`). The complete selection
         /// is also the new session's authoritative active model, while this
@@ -891,6 +900,19 @@ pub enum Request {
     GetWorkspaceTrust {
         project_root: String,
     },
+    /// Read or change this workspace's independent cross-workspace history
+    /// recall consents. The caller must configure outbound access in the
+    /// querying workspace and inbound access in every workspace it permits.
+    SetWorkspaceHistoryScope {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        outbound: bool,
+        inbound: bool,
+    },
+    GetWorkspaceHistoryScope {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+    },
     GetStartupDisclosures {
         project_root: String,
     },
@@ -900,6 +922,19 @@ pub enum Request {
     MarkAppFlagSeen {
         key: AppFlagKey,
         expected_version: u64,
+    },
+    /// Read the daemon-owned, whole-installation storage footprint for the
+    /// Settings → Storage page. This has no deletion side effect.
+    GetStorageReport,
+    /// Create a single-use dry-run cleanup plan. Destructive work is impossible
+    /// without the separately returned preview id.
+    PreviewStorageCleanup {
+        target: StorageCleanupTarget,
+    },
+    /// Execute exactly one unexpired dry-run plan returned by
+    /// `PreviewStorageCleanup`.
+    ExecuteStorageCleanup {
+        preview_id: Uuid,
     },
     ResolveAssistantSession {
         assistant_id: String,
@@ -1032,6 +1067,19 @@ pub enum Request {
     /// daemon aborts the streaming completion and returns control to
     /// the agent stack so the user can redirect.
     CancelTurn,
+
+    /// Cancel every live unit of work in the attached session: the foreground
+    /// turn and all loop, timer, background, and swarm jobs.
+    CancelAllSessionWork,
+    /// Convert the current reference-counted daemon owner into a persistent
+    /// owner without interrupting its live session workers.
+    PromoteToPersistent,
+    /// Authoritative attached-session snapshot used immediately before a
+    /// client detaches.
+    ExitGuardStatus,
+    /// Release this attached client's pending exit-guard decision without
+    /// changing daemon lifetime.
+    ReleaseExitGuard,
 
     FsList {
         project_root: String,
@@ -1658,6 +1706,10 @@ pub enum Request {
     /// Run `/compact` on the attached session's foreground agent. Acked
     /// immediately; the in-place boundary arrives as a `CompactReady` event.
     Compact,
+
+    /// Accept the compacted branch of a prior interactive attach's rolling
+    /// snapshot at the daemon's safe boundary.
+    ResumeFromCompaction,
 
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
@@ -2741,6 +2793,71 @@ impl Request {
         }
 
         match self {
+            Self::CreateCodeRootV1(request) => {
+                if request.workspace_selector.path.is_empty()
+                    || request.workspace_selector.path.len() > 32_768
+                {
+                    return Err("workspace selector path must contain 1..=32768 bytes".to_string());
+                }
+                if let Some(selection) = &request.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+            }
+            Self::CreateCodeRootWithAcpIngressV1(request) => {
+                if request.base.workspace_selector.path.is_empty()
+                    || request.base.workspace_selector.path.len() > 32_768
+                {
+                    return Err("workspace selector path must contain 1..=32768 bytes".to_string());
+                }
+                if let Some(selection) = &request.base.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.base.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+                request.ingress.validate()?;
+            }
+            Self::AttachExistingCodeRootV1(request) => {
+                if request.root_id.0.is_nil() {
+                    return Err("Code root id must not be nil".to_string());
+                }
+                if let Some(selection) = &request.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+            }
+            Self::AttachExistingCodeRootWithAcpIngressV1(request) => {
+                if request.base.root_id.0.is_nil() {
+                    return Err("Code root id must not be nil".to_string());
+                }
+                if let Some(selection) = &request.base.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.base.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+                request.ingress.validate()?;
+            }
+            Self::DiscoverCodeRootsV1(request) => {
+                if request.workspace_selector.path.is_empty()
+                    || request.workspace_selector.path.len() > 32_768
+                {
+                    return Err("workspace selector path must contain 1..=32768 bytes".to_string());
+                }
+                if !(1..=crate::acp::CODE_ROOT_DISCOVERY_PAGE_MAX).contains(&request.limit) {
+                    return Err("Code root discovery limit must be 1..=100".to_string());
+                }
+            }
+            Self::ReadCodeRootDeliveriesV1(request) => {
+                if !(1..=crate::acp::CODE_ROOT_DELIVERY_PAGE_MAX).contains(&request.limit) {
+                    return Err("Code root delivery limit must be 1..=256".to_string());
+                }
+            }
             #[cfg(feature = "remote")]
             Self::StoreFlycockpitCredential { credential, .. } => {
                 credential
@@ -4055,6 +4172,17 @@ fn validate_agent_interrupt_response(response: &AgentInterruptResponse) -> Resul
 macro_rules! request_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
+            (Request::CreateCodeRootV1(..), "create_code_root_v1");
+            (Request::AttachExistingCodeRootV1(..), "attach_existing_code_root_v1");
+            (Request::CloseCodeRootAttachmentV1(..), "close_code_root_attachment_v1");
+            (Request::CreateCodeRootWithAcpIngressV1(..), "create_code_root_with_acp_ingress_v1");
+            (Request::AttachExistingCodeRootWithAcpIngressV1(..), "attach_existing_code_root_with_acp_ingress_v1");
+            (Request::CloseAcpCodeRootAttachmentV1(..), "close_acp_code_root_attachment_v1");
+            (Request::DiscoverCodeRootsV1(..), "discover_code_roots_v1");
+            (Request::ReadCodeRootV1(..), "read_code_root_v1");
+            (Request::ReadCodeRootDeliveriesV1(..), "read_code_root_deliveries_v1");
+            (Request::AckCodeRootDeliveriesV1(..), "ack_code_root_deliveries_v1");
+            (Request::ResolveCodeRootInterruptV1(..), "resolve_code_root_interrupt_v1");
             (Request::Attach { .. }, "attach");
             (Request::SubagentTranscript { .. }, "subagent_transcript");
             (Request::AttachKnowledgeBaseSession { .. }, "attach_knowledge_base_session");
@@ -4113,9 +4241,14 @@ macro_rules! request_variants {
             (Request::DeleteProjectNote { .. }, "delete_project_note");
             (Request::SetWorkspaceTrust { .. }, "set_workspace_trust");
             (Request::GetWorkspaceTrust { .. }, "get_workspace_trust");
+            (Request::SetWorkspaceHistoryScope { .. }, "set_workspace_history_scope");
+            (Request::GetWorkspaceHistoryScope { .. }, "get_workspace_history_scope");
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
+            (Request::GetStorageReport, "get_storage_report");
+            (Request::PreviewStorageCleanup { .. }, "preview_storage_cleanup");
+            (Request::ExecuteStorageCleanup { .. }, "execute_storage_cleanup");
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
@@ -4129,6 +4262,10 @@ macro_rules! request_variants {
             (Request::ReadRedactedExportChunk { .. }, "read_redacted_export_chunk");
             (Request::Curator { .. }, "curator");
             (Request::CancelTurn, "cancel_turn");
+            (Request::CancelAllSessionWork, "cancel_all_session_work");
+            (Request::PromoteToPersistent, "promote_to_persistent");
+            (Request::ExitGuardStatus, "exit_guard_status");
+            (Request::ReleaseExitGuard, "release_exit_guard");
             (Request::FsList { .. }, "fs_list");
             (Request::FsStat { .. }, "fs_stat");
             (Request::FsRead { .. }, "fs_read");
@@ -4201,6 +4338,7 @@ macro_rules! request_variants {
             (Request::CancelSchedule { .. }, "cancel_schedule");
             (Request::Prune, "prune");
             (Request::Compact, "compact");
+            (Request::ResumeFromCompaction, "resume_from_compaction");
             (Request::Pin { .. }, "pin");
             #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential");
@@ -4368,7 +4506,18 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
-            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
+            (Request::CreateCodeRootV1(request), "create_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootV1Request", [request: $crate::CreateCodeRootV1Request => param]);
+            (Request::AttachExistingCodeRootV1(request), "attach_existing_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AttachExistingCodeRootV1Request", [request: $crate::AttachExistingCodeRootV1Request => param]);
+            (Request::CloseCodeRootAttachmentV1(request), "close_code_root_attachment_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CloseCodeRootAttachmentV1Request", [request: $crate::CloseCodeRootAttachmentV1Request => param]);
+            (Request::CreateCodeRootWithAcpIngressV1(request), "create_code_root_with_acp_ingress_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootWithAcpIngressV1Request", [request: $crate::CreateCodeRootWithAcpIngressV1Request => param]);
+            (Request::AttachExistingCodeRootWithAcpIngressV1(request), "attach_existing_code_root_with_acp_ingress_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AttachExistingCodeRootWithAcpIngressV1Request", [request: $crate::AttachExistingCodeRootWithAcpIngressV1Request => param]);
+            (Request::CloseAcpCodeRootAttachmentV1(request), "close_acp_code_root_attachment_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CloseAcpCodeRootAttachmentV1Request", [request: $crate::CloseAcpCodeRootAttachmentV1Request => param]);
+            (Request::DiscoverCodeRootsV1(request), "discover_code_roots_v1", owner_only, none, false, read_only, none, serialized, none, "request:DiscoverCodeRootsV1Request", [request: $crate::DiscoverCodeRootsV1Request => param]);
+            (Request::ReadCodeRootV1(request), "read_code_root_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootV1Request", [request: $crate::ReadCodeRootV1Request => param]);
+            (Request::ReadCodeRootDeliveriesV1(request), "read_code_root_deliveries_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootDeliveriesV1Request", [request: $crate::ReadCodeRootDeliveriesV1Request => param]);
+            (Request::AckCodeRootDeliveriesV1(request), "ack_code_root_deliveries_v1", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:AckCodeRootDeliveriesV1Request", [request: $crate::AckCodeRootDeliveriesV1Request => param]);
+            (Request::ResolveCodeRootInterruptV1(request), "resolve_code_root_interrupt_v1", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ResolveCodeRootInterruptV1", [request: $crate::ResolveCodeRootInterruptV1 => param]);
+            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:NonCodeSessionEntryMode|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: $crate::NonCodeSessionEntryMode => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::AttachKnowledgeBaseSession { knowledge_base_id, session_id }, "attach_knowledge_base_session", session_row_writer(session_id), field(session_id), true, local_only, none, serialized, none, "knowledge_base_id:String|session_id:Uuid", [knowledge_base_id: String => param, session_id: Uuid => session]);
             (Request::DetachKnowledgeBaseSession { knowledge_base_id, session_id }, "detach_knowledge_base_session", session_row_writer(session_id), field(session_id), true, local_only, none, serialized, none, "knowledge_base_id:String|session_id:Uuid", [knowledge_base_id: String => param, session_id: Uuid => session]);
@@ -4426,9 +4575,14 @@ macro_rules! command {
             (Request::DeleteProjectNote { project_root, id }, "delete_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid", [project_root: String => project_root, id: Uuid => param]);
             (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
             (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::SetWorkspaceHistoryScope { project_root, outbound, inbound }, "set_workspace_history_scope", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|outbound:bool|inbound:bool", [project_root: String => project_root, outbound: bool => param, inbound: bool => param]);
+            (Request::GetWorkspaceHistoryScope { project_root }, "get_workspace_history_scope", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
+            (Request::GetStorageReport, "get_storage_report", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::PreviewStorageCleanup { target }, "preview_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "target:StorageCleanupTarget", [target: StorageCleanupTarget => param]);
+            (Request::ExecuteStorageCleanup { preview_id }, "execute_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "preview_id:Uuid", [preview_id: Uuid => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
@@ -4446,6 +4600,10 @@ macro_rules! command {
             (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32", [transfer_id: $crate::bulk_transfer::BulkTransferId => param, chunk_index: u32 => param]);
             (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::CancelAllSessionWork, "cancel_all_session_work", owner_only, attached, true, local_only, none, serialized, none, "-", []);
+            (Request::PromoteToPersistent, "promote_to_persistent", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::ExitGuardStatus, "exit_guard_status", owner_only, attached, false, local_only, none, serialized, none, "-", []);
+            (Request::ReleaseExitGuard, "release_exit_guard", owner_only, attached, false, local_only, none, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
             (Request::FsStat { project_root, path }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::FsRead { project_root, path, base64 }, "fs_read", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|base64:bool", [project_root: String => project_root, path: String => file_existing(project_root), base64: bool => param]);
@@ -4518,6 +4676,7 @@ macro_rules! command {
             (Request::CancelSchedule { job_id }, "cancel_schedule", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "job_id:String", [job_id: String => param]);
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::ResumeFromCompaction, "resume_from_compaction", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String", [text: String => param]);
             #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);
@@ -5048,6 +5207,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         }
         "ActiveModelSwitchTrigger"
         | "AppFlagKey"
+        | "StorageCleanupTarget"
         | "ApprovalMode"
         | "AssistantSessionResolutionMode"
         | "AttachmentPurpose"
@@ -5278,32 +5438,26 @@ mod tests {
     fn semantic_validation_covers_every_active_model_request_shape() {
         let invalid = active_model("", "model", None);
         let requests = [
-            Request::Attach {
-                session_id: None,
-                since_seq: None,
-                project_root: None,
-                initial_model: Some(invalid.clone()),
-                no_sandbox: false,
-                interactive: false,
-                session_entry_mode: Some(SessionEntryMode::Code),
-                model_override: None,
-                client_protocol_version: PROTOCOL_VERSION,
-                env_snapshot: None,
-                env_policy: EnvDriftPolicy::Daemon,
-            },
-            Request::Attach {
-                session_id: None,
-                since_seq: None,
-                project_root: None,
-                initial_model: None,
-                no_sandbox: false,
-                interactive: false,
-                session_entry_mode: Some(SessionEntryMode::Code),
-                model_override: Some(invalid.clone()),
-                client_protocol_version: PROTOCOL_VERSION,
-                env_snapshot: None,
-                env_policy: EnvDriftPolicy::Daemon,
-            },
+            crate::create_code_root_v1_request(
+                "/repo".into(),
+                Some(invalid.clone()),
+                false,
+                false,
+                None,
+                PROTOCOL_VERSION,
+                None,
+                EnvDriftPolicy::Daemon,
+            ),
+            crate::create_code_root_v1_request(
+                "/repo".into(),
+                None,
+                false,
+                false,
+                Some(invalid.clone()),
+                PROTOCOL_VERSION,
+                None,
+                EnvDriftPolicy::Daemon,
+            ),
             Request::CreateAssistantSession {
                 name: "assistant".to_string(),
                 project_root: "/repo".to_string(),

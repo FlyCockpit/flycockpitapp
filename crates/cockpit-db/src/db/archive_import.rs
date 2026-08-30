@@ -169,6 +169,101 @@ pub struct ArchiveImportResult {
     pub redacted: bool,
 }
 
+/// Validates the two durable projections of a fresh assistant thread's
+/// originating message. The session row is relational lineage; the
+/// `thread_anchor` event is portable audit data. Neither may exist without the
+/// other, and they must identify the same parent message.
+pub fn validate_thread_anchors(
+    sessions: &[ImportedArchiveSession],
+    events: &[ImportedArchiveEvent],
+) -> Result<()> {
+    thread_anchor_sources(sessions, events).map(|_| ())
+}
+
+fn thread_anchor_sources(
+    sessions: &[ImportedArchiveSession],
+    events: &[ImportedArchiveEvent],
+) -> Result<BTreeMap<Uuid, (Uuid, i64)>> {
+    let sessions_by_id: BTreeMap<Uuid, &ImportedArchiveSession> = sessions
+        .iter()
+        .map(|session| (session.source_id, session))
+        .collect();
+    let mut events_by_identity = BTreeMap::new();
+    let mut anchors = BTreeMap::new();
+    for event in events {
+        if events_by_identity
+            .insert((event.source_session_id, event.seq), event.kind)
+            .is_some()
+        {
+            bail!("import archive has a duplicate session event sequence");
+        }
+        if event.kind != SessionEventKind::ThreadAnchor {
+            continue;
+        }
+        let session = sessions_by_id
+            .get(&event.source_session_id)
+            .ok_or_else(|| {
+                anyhow!("import archive contains a thread anchor for an unknown session")
+            })?;
+        if !session.is_assistant_thread {
+            bail!("import archive thread anchor belongs to a non-thread session");
+        }
+        let data: Value = serde_json::from_str(&event.data_json)
+            .context("parsing imported thread anchor payload")?;
+        let object = data
+            .as_object()
+            .ok_or_else(|| anyhow!("import thread anchor payload must be an object"))?;
+        let parent_source_id = object
+            .get("parent_session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("import thread anchor lacks parent_session_id"))
+            .and_then(|value| {
+                Uuid::parse_str(value)
+                    .with_context(|| "import thread anchor has invalid parent_session_id")
+            })?;
+        let parent_turn_id = object
+            .get("parent_turn_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("import thread anchor lacks parent_turn_id"))?;
+        let parent_seq: i64 = parent_turn_id
+            .parse()
+            .with_context(|| "import thread anchor parent_turn_id is not an integer")?;
+        let relational_parent = session
+            .parent_source_id
+            .ok_or_else(|| anyhow!("import assistant thread lacks parent_session_id"))?;
+        let relational_turn = session
+            .fork_point_turn_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("import assistant thread lacks fork_point_turn_id"))?;
+        if parent_source_id != relational_parent || parent_turn_id != relational_turn {
+            bail!("import thread anchor does not match assistant-thread lineage");
+        }
+        if anchors
+            .insert(event.source_session_id, (parent_source_id, parent_seq))
+            .is_some()
+        {
+            bail!("import assistant thread has more than one thread anchor");
+        }
+    }
+    for session in sessions {
+        if session.is_assistant_thread && !anchors.contains_key(&session.source_id) {
+            bail!("import assistant thread lacks a thread anchor event");
+        }
+    }
+    for (parent_id, parent_seq) in anchors.values() {
+        let parent_kind = events_by_identity
+            .get(&(*parent_id, *parent_seq))
+            .ok_or_else(|| anyhow!("import thread anchor points to a missing parent event"))?;
+        if !matches!(
+            parent_kind,
+            SessionEventKind::UserMessage | SessionEventKind::AssistantMessage
+        ) {
+            bail!("import thread anchor must point to a parent message");
+        }
+    }
+    Ok(anchors)
+}
+
 impl Db {
     /// Restore all sessions, events, sidecars, artifact associations, and
     /// import provenance inside one database-owned writer transaction.
@@ -205,6 +300,7 @@ fn import_session_archive_graph_conn(
             bail!("import archive contains an event for an unknown session");
         }
     }
+    let thread_anchors = thread_anchor_sources(&graph.sessions, &graph.events)?;
     for result in &graph.text_artifacts {
         if !source_ids.contains(&result.source_session_id) {
             bail!("import archive contains a text artifact for an unknown session");
@@ -402,6 +498,7 @@ fn import_session_archive_graph_conn(
         inference_call_id_map,
         imported,
         pending_forks,
+        thread_anchors,
     )
 }
 
@@ -538,6 +635,7 @@ fn restore_events_and_artifacts(
     inference_call_id_map: BTreeMap<String, String>,
     imported: Vec<Uuid>,
     pending_forks: Vec<(Uuid, Uuid, String, bool)>,
+    thread_anchors: BTreeMap<Uuid, (Uuid, i64)>,
 ) -> Result<ArchiveImportResult> {
     let provenance_ts = graph
         .events
@@ -551,6 +649,7 @@ fn restore_events_and_artifacts(
     events.sort_by_key(|event| event.seq);
     let mut event_seq_map = BTreeMap::new();
     let mut tandem_sidecars = Vec::new();
+    let mut pending_thread_anchors = Vec::new();
     for mut event in events {
         if event.seq <= 0 || event_seq_map.contains_key(&(event.source_session_id, event.seq)) {
             bail!("import archive has an invalid or duplicate session event sequence");
@@ -626,6 +725,18 @@ fn restore_events_and_artifacts(
             )?
         };
         event_seq_map.insert((event.source_session_id, event.seq), restored_seq);
+        if event.kind == SessionEventKind::ThreadAnchor {
+            let (parent_source_id, parent_source_seq) = thread_anchors
+                .get(&event.source_session_id)
+                .copied()
+                .ok_or_else(|| anyhow!("import thread anchor has no validated lineage"))?;
+            pending_thread_anchors.push((
+                id_map[&event.source_session_id],
+                restored_seq,
+                parent_source_id,
+                parent_source_seq,
+            ));
+        }
         if let Some(sidecar) = event_data.get("tandem_inference_sidecar") {
             tandem_sidecars.push((event, sidecar.clone()));
         }
@@ -753,6 +864,25 @@ fn restore_events_and_artifacts(
                 is_assistant_thread as i64,
                 dest_session_id.to_string(),
             ],
+        )?;
+    }
+
+    // Insertions allocate destination event sequences. Rewrite the validated
+    // portable projection only after every parent mapping is known, keeping it
+    // identical to the relational parent/fork projection even when the child
+    // anchor was restored before its parent event.
+    for (thread_id, thread_event_seq, parent_source_id, parent_source_seq) in pending_thread_anchors
+    {
+        let parent_event_seq = event_seq_map
+            .get(&(parent_source_id, parent_source_seq))
+            .ok_or_else(|| anyhow!("import thread anchor points to an unrestored parent event"))?;
+        let data_json = serde_json::to_string(&json!({
+            "parent_session_id": id_map[&parent_source_id],
+            "parent_turn_id": parent_event_seq.to_string(),
+        }))?;
+        conn.execute(
+            "UPDATE session_events SET data_json = ?1 WHERE session_id = ?2 AND seq = ?3",
+            params![data_json, thread_id.to_string(), thread_event_seq],
         )?;
     }
 

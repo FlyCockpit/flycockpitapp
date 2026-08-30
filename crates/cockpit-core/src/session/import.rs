@@ -24,7 +24,7 @@ use cockpit_db::db::{
         ImportedArchiveDelegationPayload as ImportedDelegationPayload,
         ImportedArchiveDelegationSteer as ImportedDelegationSteer,
         ImportedArchiveEvent as ImportedEvent, ImportedArchiveSession as ImportedSession,
-        ImportedArchiveTextArtifact as ImportedTextArtifact,
+        ImportedArchiveTextArtifact as ImportedTextArtifact, validate_thread_anchors,
     },
     session_log::SessionEventKind,
     text_artifacts::{
@@ -213,6 +213,10 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
         .iter()
         .map(|value| parse_event(value, &mut archive))
         .collect::<Result<Vec<_>>>()?;
+    // The anchor event and relational fork fields are two durable projections
+    // of one originating parent message. Reject a malformed graph before any
+    // blob staging or database work.
+    validate_thread_anchors(&sessions, &events)?;
     let text_artifacts = parse_text_artifacts(&mut archive, &archive_paths)?;
     validate_text_artifact_graph(&sessions, &events, &text_artifacts)?;
     let delegation_jobs = parse_delegation_jobs(&mut archive)?;

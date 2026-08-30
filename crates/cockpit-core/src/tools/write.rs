@@ -56,7 +56,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "x-cockpit-kind": "path", "x-cockpit-may-create": true, "x-cockpit-aliases": ["file_path", "filePath", "filepath", "pathname", "target_file", "file", "absolute_path"], "description": "Path to write" },
-                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "Entire new file content" }
+                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "Entire new file content" },
+                "expected_revision": { "type": "integer", "description": "Required to replace an existing `cockpit://.../plan`; use the revision returned by read. Ignored for host files." }
             },
             "required": ["path", "content"]
         })
@@ -67,7 +68,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "x-cockpit-kind": "path", "x-cockpit-may-create": true, "x-cockpit-aliases": ["file_path", "filePath", "filepath", "pathname", "target_file", "file", "absolute_path"], "description": "Path to create or overwrite, absolute or relative to the session working directory; existing files must be the same file you previously locked/read" },
-                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" }
+                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" },
+                "expected_revision": { "type": "integer", "description": "For an existing `cockpit://.../plan`, the revision returned by read; ignored for host files." }
             },
             "required": ["path", "content"]
         }))

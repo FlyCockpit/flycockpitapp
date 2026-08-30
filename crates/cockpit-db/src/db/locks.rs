@@ -546,6 +546,19 @@ mod tests {
         assert_eq!(second.revision, 2);
         assert_eq!(loaded.content, "two");
         assert_eq!(loaded.revision, 2);
+
+        let stale = db
+            .write_session_plan_doc_if_revision(s.session_id, 1, "stale")
+            .await
+            .unwrap();
+        assert!(stale.is_none());
+        let current = db
+            .write_session_plan_doc_if_revision(s.session_id, 2, "three")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.content, "three");
+        assert_eq!(current.revision, 3);
     }
 
     #[tokio::test]

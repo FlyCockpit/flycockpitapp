@@ -4312,12 +4312,7 @@ pub(crate) mod tests {
         assert_eq!(def.mode, AgentMode::Subagent);
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in [
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ] {
+        for tool in ["read", "session_search", "session_lineage_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in [
@@ -4328,7 +4323,7 @@ pub(crate) mod tests {
                 "{forbidden} must not be on history"
             );
         }
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
         crate::agents::validate_invariants(&def).expect("history def is invariant-valid");
@@ -4341,7 +4336,7 @@ pub(crate) mod tests {
         let agent = load("history", &args).unwrap();
         let names = agent.tools.names();
 
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert!(
                 names.contains(&tool),
                 "{tool} should be a first-class history tool: {names:?}"
@@ -4752,7 +4747,6 @@ pub(crate) mod tests {
             "harness_list",
             "harness_invoke",
             "session_search",
-            "session_read",
             "session_lineage_search",
         ] {
             assert!(
@@ -4904,7 +4898,7 @@ pub(crate) mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -4952,7 +4946,7 @@ pub(crate) mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -5210,7 +5204,6 @@ pub(crate) mod tests {
         );
         for non_direct in [
             "session_search",
-            "session_read",
             "session_lineage_search",
             "todo",
             "webfetch",

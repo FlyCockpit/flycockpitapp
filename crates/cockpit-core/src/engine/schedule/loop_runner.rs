@@ -434,7 +434,7 @@ fn local_change_digest(root: &std::path::Path, paths: &[String]) -> String {
                                 Err(error) => entries.push(format!(
                                     "{path}:metadata-error:{}:{}",
                                     relative.to_string_lossy(),
-                                    error.kind()
+                                    error
                                 )),
                             }
                         }

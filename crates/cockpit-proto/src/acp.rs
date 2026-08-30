@@ -60,6 +60,18 @@ impl<'de> Deserialize<'de> for OpaqueAsciiId128V1 {
 #[serde(transparent)]
 pub struct CodeRootIdV1(pub Uuid);
 
+impl CodeRootIdV1 {
+    /// Stable, non-zero capture identity for this never-recycled root. Both
+    /// discovery and attachment derive the value from the durable root id, so
+    /// model selection and daemon-local attachment order cannot mint a second
+    /// authority for the same capture.
+    pub fn capture_generation(self) -> u64 {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&self.0.as_bytes()[..8]);
+        (u64::from_be_bytes(bytes) & 0x001f_ffff_ffff_ffff).max(1)
+    }
+}
+
 /// Server-minted boot-local attachment authority. The value is opaque and
 /// disappears with the daemon process; it is never stored in SQLite.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
@@ -216,6 +228,9 @@ pub struct CreateCodeRootV1Request {
 #[serde(deny_unknown_fields)]
 pub struct AttachExistingCodeRootV1Request {
     pub root_id: CodeRootIdV1,
+    /// The frozen discovery generation being attached. A daemon rejects a
+    /// stale or forged generation before it starts a session worker.
+    pub capture_generation: u64,
     pub logical_client_id: OpaqueAsciiId128V1,
     pub client_request_id: OpaqueAsciiId128V1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,6 +464,7 @@ pub fn attach_existing_code_root_v1_request(
         .expect("generated logical client id is bounded ASCII");
     crate::Request::AttachExistingCodeRootV1(AttachExistingCodeRootV1Request {
         root_id: CodeRootIdV1(session_id),
+        capture_generation: CodeRootIdV1(session_id).capture_generation(),
         logical_client_id,
         client_request_id: OpaqueAsciiId128V1::new(Uuid::new_v4().to_string())
             .expect("generated request id is bounded ASCII"),

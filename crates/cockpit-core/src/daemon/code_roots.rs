@@ -4,7 +4,10 @@
 //! boot-local. Only the redacted delivery projection and logical-client ACK
 //! cursor are durable (in `cockpit-db`).
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -16,6 +19,9 @@ use crate::{daemon::proto, db::Db};
 const MAX_ATTACHMENTS: usize = 4_096;
 const MAX_IDEMPOTENCY_RECEIPTS: usize = 8_192;
 const MAX_DISCOVERY_SNAPSHOTS: usize = 256;
+const ATTACHMENT_TOMBSTONE_TTL: Duration = Duration::from_secs(10 * 60);
+const IDEMPOTENCY_RECEIPT_TTL: Duration = Duration::from_secs(10 * 60);
+const DISCOVERY_SNAPSHOT_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub(crate) struct CodeRootAttachmentRecord {
@@ -24,6 +30,7 @@ pub(crate) struct CodeRootAttachmentRecord {
     pub capture_generation: u64,
     pub replay_cursor: proto::CodeRootReplayCursorV1,
     pub open: bool,
+    closed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +45,7 @@ enum IdempotencyResult {
 struct IdempotencyReceipt {
     fingerprint: [u8; 32],
     result: IdempotencyResult,
+    recorded_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +54,7 @@ struct DiscoverySnapshot {
     logical_client_id: proto::OpaqueAsciiId128V1,
     roots: Vec<proto::CodeRootSummaryV1>,
     offset: usize,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -53,30 +62,93 @@ pub(crate) struct CodeRootAuthorityV1 {
     attachments: HashMap<String, CodeRootAttachmentRecord>,
     idempotency: HashMap<(String, String, &'static str), IdempotencyReceipt>,
     discovery: HashMap<String, DiscoverySnapshot>,
-    next_capture_generation: u64,
+    attachment_reservations: HashSet<String>,
+    interrupt_resolutions_in_flight: HashSet<(String, String)>,
 }
 
 impl CodeRootAuthorityV1 {
-    pub fn preflight_new_attachment(&self) -> Result<()> {
-        if self.attachments.len() >= MAX_ATTACHMENTS {
+    fn reap_expired(&mut self, now: Instant) {
+        self.attachments.retain(|_, record| {
+            record.open
+                || record.closed_at.is_some_and(|closed_at| {
+                    now.duration_since(closed_at) < ATTACHMENT_TOMBSTONE_TTL
+                })
+        });
+        self.idempotency
+            .retain(|_, receipt| now.duration_since(receipt.recorded_at) < IDEMPOTENCY_RECEIPT_TTL);
+        self.discovery
+            .retain(|_, snapshot| now < snapshot.expires_at);
+    }
+
+    pub fn reserve_new_attachment(&mut self) -> Result<String> {
+        self.reap_expired(Instant::now());
+        let open_attachments = self
+            .attachments
+            .values()
+            .filter(|record| record.open)
+            .count();
+        if open_attachments + self.attachment_reservations.len() >= MAX_ATTACHMENTS {
             bail!("Code-root attachment capacity exhausted");
         }
+        if self.idempotency.len() + self.attachment_reservations.len() >= MAX_IDEMPOTENCY_RECEIPTS {
+            bail!("Code-root idempotency capacity exhausted");
+        }
+        let reservation = Uuid::new_v4().simple().to_string();
+        self.attachment_reservations.insert(reservation.clone());
+        Ok(reservation)
+    }
+
+    pub fn release_attachment_reservation(&mut self, reservation: &str) {
+        self.attachment_reservations.remove(reservation);
+    }
+
+    /// Serializes one logical interrupt resolution until its durable receipt
+    /// is written. A concurrent retry never gets to manufacture a competing
+    /// terminal result while the original worker call is still in flight.
+    pub fn begin_interrupt_resolution(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+    ) -> bool {
+        self.interrupt_resolutions_in_flight.insert((
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+        ))
+    }
+
+    pub fn finish_interrupt_resolution(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+    ) {
+        self.interrupt_resolutions_in_flight.remove(&(
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+        ));
+    }
+
+    pub fn preflight_idempotency(&mut self) -> Result<()> {
+        self.reap_expired(Instant::now());
         if self.idempotency.len() >= MAX_IDEMPOTENCY_RECEIPTS {
             bail!("Code-root idempotency capacity exhausted");
         }
         Ok(())
     }
 
-    pub fn preflight_idempotency(&self) -> Result<()> {
-        if self.idempotency.len() >= MAX_IDEMPOTENCY_RECEIPTS {
-            bail!("Code-root idempotency capacity exhausted");
-        }
-        Ok(())
+    pub fn capture_generation_for(&self, root_id: proto::CodeRootIdV1) -> u64 {
+        root_id.capture_generation()
     }
 
-    pub fn next_capture_generation(&mut self) -> u64 {
-        self.next_capture_generation = self.next_capture_generation.saturating_add(1).max(1);
-        self.next_capture_generation
+    pub fn validate_capture_generation(
+        &mut self,
+        root_id: proto::CodeRootIdV1,
+        capture_generation: u64,
+    ) -> Result<()> {
+        let current = self.capture_generation_for(root_id);
+        if current != capture_generation {
+            bail!("stale Code-root capture generation");
+        }
+        Ok(())
     }
 
     pub fn mint_attachment(
@@ -85,10 +157,12 @@ impl CodeRootAuthorityV1 {
         logical_client_id: proto::OpaqueAsciiId128V1,
         capture_generation: u64,
         replay_cursor: proto::CodeRootReplayCursorV1,
+        reservation: &str,
     ) -> Result<proto::CodeRootAttachmentV1> {
-        if self.attachments.len() >= MAX_ATTACHMENTS {
-            bail!("Code-root attachment capacity exhausted");
+        if !self.attachment_reservations.remove(reservation) {
+            bail!("unknown Code-root attachment reservation");
         }
+        debug_assert_eq!(capture_generation, self.capture_generation_for(root_id));
         let capability = proto::CodeRootAttachmentCapabilityV1::from_daemon_random(Uuid::new_v4());
         self.attachments.insert(
             capability.expose_opaque().to_owned(),
@@ -98,6 +172,7 @@ impl CodeRootAuthorityV1 {
                 capture_generation,
                 replay_cursor: replay_cursor.clone(),
                 open: true,
+                closed_at: None,
             },
         );
         Ok(proto::CodeRootAttachmentV1 {
@@ -133,6 +208,7 @@ impl CodeRootAuthorityV1 {
             .context("unknown Code-root attachment capability")?;
         if record.open {
             record.open = false;
+            record.closed_at = Some(Instant::now());
             Ok(proto::CloseCodeRootAttachmentV1Result::Closed)
         } else {
             Ok(proto::CloseCodeRootAttachmentV1Result::AlreadyClosed)
@@ -156,6 +232,7 @@ impl CodeRootAuthorityV1 {
         roots: Vec<proto::CodeRootSummaryV1>,
         limit: u16,
     ) -> Result<proto::DiscoverCodeRootsV1Result> {
+        self.reap_expired(Instant::now());
         if roots.len() <= usize::from(limit) {
             return Ok(proto::DiscoverCodeRootsV1Result {
                 roots,
@@ -174,6 +251,7 @@ impl CodeRootAuthorityV1 {
                 logical_client_id,
                 roots,
                 offset: usize::from(limit),
+                expires_at: Instant::now() + DISCOVERY_SNAPSHOT_TTL,
             },
         );
         Ok(proto::DiscoverCodeRootsV1Result {
@@ -189,6 +267,7 @@ impl CodeRootAuthorityV1 {
         logical_client_id: &proto::OpaqueAsciiId128V1,
         limit: u16,
     ) -> Result<proto::DiscoverCodeRootsV1Result> {
+        self.reap_expired(Instant::now());
         let key = cursor.expose_opaque().to_owned();
         let snapshot = self
             .discovery
@@ -253,6 +332,7 @@ impl CodeRootAuthorityV1 {
             IdempotencyReceipt {
                 fingerprint,
                 result,
+                recorded_at: Instant::now(),
             },
         );
         Ok(())
@@ -266,7 +346,7 @@ impl CodeRootAuthorityV1 {
             &request.logical_client_id,
             &request.client_request_id,
             "create",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
         )? {
             Some(IdempotencyResult::Create(result)) => {
                 self.authenticate(&result.attachment.attachment_capability)?;
@@ -286,7 +366,7 @@ impl CodeRootAuthorityV1 {
             &request.logical_client_id,
             &request.client_request_id,
             "create",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
             IdempotencyResult::Create(result),
         )
     }
@@ -299,7 +379,7 @@ impl CodeRootAuthorityV1 {
             &request.logical_client_id,
             &request.client_request_id,
             "attach",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
         )? {
             Some(IdempotencyResult::Attach(result)) => {
                 self.authenticate(&result.attachment.attachment_capability)?;
@@ -319,7 +399,7 @@ impl CodeRootAuthorityV1 {
             &request.logical_client_id,
             &request.client_request_id,
             "attach",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
             IdempotencyResult::Attach(result),
         )
     }
@@ -333,7 +413,7 @@ impl CodeRootAuthorityV1 {
             logical_client_id,
             &request.client_request_id,
             "close",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
         )? {
             Some(IdempotencyResult::Close(result)) => Ok(Some(result)),
             Some(_) => bail!("invalid Code-root idempotency receipt"),
@@ -351,7 +431,7 @@ impl CodeRootAuthorityV1 {
             logical_client_id,
             &request.client_request_id,
             "close",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
             IdempotencyResult::Close(result),
         )
     }
@@ -365,7 +445,7 @@ impl CodeRootAuthorityV1 {
             logical_client_id,
             &request.client_request_id,
             "ack",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
         )? {
             Some(IdempotencyResult::Ack(result)) => Ok(Some(result)),
             Some(_) => bail!("invalid Code-root idempotency receipt"),
@@ -383,13 +463,13 @@ impl CodeRootAuthorityV1 {
             logical_client_id,
             &request.client_request_id,
             "ack",
-            fingerprint(request)?,
+            request_fingerprint(request)?,
             IdempotencyResult::Ack(result),
         )
     }
 }
 
-fn fingerprint<T: serde::Serialize>(value: &T) -> Result<[u8; 32]> {
+pub(crate) fn request_fingerprint<T: serde::Serialize>(value: &T) -> Result<[u8; 32]> {
     let bytes = serde_json::to_vec(value).context("serializing Code-root idempotency input")?;
     Ok(Sha256::digest(bytes).into())
 }

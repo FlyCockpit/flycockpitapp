@@ -454,6 +454,7 @@ export const createCodeRootV1RequestSchema = z
 export const attachExistingCodeRootV1RequestSchema = z
   .object({
     root_id: codeRootIdV1Schema,
+    capture_generation: safeU64NumberSchema,
     logical_client_id: opaqueAsciiId128V1Schema,
     client_request_id: opaqueAsciiId128V1Schema,
     replay_cursor: codeRootReplayCursorV1Schema.optional(),

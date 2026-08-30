@@ -25,6 +25,12 @@ pub struct CodeRootProjectionDeliveryRow {
     pub created_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeRootInterruptReceiptRow {
+    pub fingerprint: [u8; 32],
+    pub outcome: String,
+}
+
 impl Db {
     pub async fn append_code_root_projection_delivery(
         &self,
@@ -221,6 +227,82 @@ impl Db {
             )
             .optional()
             .context("reading durable Code-root replay cursor")
+        })
+        .await
+    }
+
+    pub async fn code_root_interrupt_receipt(
+        &self,
+        session_id: Uuid,
+        logical_client_id: &str,
+        client_request_id: &str,
+    ) -> Result<Option<CodeRootInterruptReceiptRow>> {
+        let logical_client_id = logical_client_id.to_owned();
+        let client_request_id = client_request_id.to_owned();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT fingerprint, outcome FROM code_root_interrupt_receipts
+                 WHERE session_id = ?1 AND logical_client_id = ?2 AND client_request_id = ?3",
+                params![session_id.to_string(), logical_client_id, client_request_id],
+                |row| {
+                    let fingerprint: Vec<u8> = row.get(0)?;
+                    let fingerprint: [u8; 32] = fingerprint.try_into().map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::other(
+                                "invalid Code-root interrupt receipt fingerprint",
+                            )),
+                        )
+                    })?;
+                    Ok(CodeRootInterruptReceiptRow {
+                        fingerprint,
+                        outcome: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .context("reading Code-root interrupt receipt")
+        })
+        .await
+    }
+
+    /// Inserts the terminal outcome only if this exact client identity has no
+    /// prior receipt, then returns the durable winner. Callers compare the
+    /// fingerprint before exposing a replayed outcome.
+    pub async fn record_code_root_interrupt_receipt(
+        &self,
+        session_id: Uuid,
+        logical_client_id: &str,
+        client_request_id: &str,
+        fingerprint: [u8; 32],
+        outcome: &str,
+        resolved_at_unix_ms: i64,
+    ) -> Result<CodeRootInterruptReceiptRow> {
+        let logical_client_id = logical_client_id.to_owned();
+        let client_request_id = client_request_id.to_owned();
+        let outcome = outcome.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO code_root_interrupt_receipts
+                 (session_id, logical_client_id, client_request_id, fingerprint, outcome, resolved_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(session_id, logical_client_id, client_request_id) DO NOTHING",
+                params![
+                    session_id.to_string(), logical_client_id, client_request_id,
+                    fingerprint.as_slice(), outcome, resolved_at_unix_ms,
+                ],
+            )?;
+            let (stored_fingerprint, outcome): (Vec<u8>, String) = conn.query_row(
+                "SELECT fingerprint, outcome FROM code_root_interrupt_receipts
+                 WHERE session_id = ?1 AND logical_client_id = ?2 AND client_request_id = ?3",
+                params![session_id.to_string(), logical_client_id, client_request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let fingerprint: [u8; 32] = stored_fingerprint.try_into().map_err(|_| {
+                anyhow::anyhow!("invalid Code-root interrupt receipt fingerprint")
+            })?;
+            Ok(CodeRootInterruptReceiptRow { fingerprint, outcome })
         })
         .await
     }

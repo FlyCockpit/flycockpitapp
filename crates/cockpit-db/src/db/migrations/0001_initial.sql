@@ -2736,6 +2736,30 @@ CREATE TABLE code_root_replay_cursors (
         ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
+-- First-wins, durable receipts for ACP decision resolution. The boot-local
+-- attachment capability authorizes a live call; this row lets the same
+-- logical client recover its accepted terminal result after reconnect/restart.
+CREATE TABLE code_root_interrupt_receipts (
+    session_id TEXT NOT NULL,
+    logical_client_id TEXT NOT NULL CHECK (
+        length(CAST(logical_client_id AS BLOB)) BETWEEN 1 AND 128
+        AND logical_client_id NOT GLOB '*[^ -~]*'
+    ),
+    client_request_id TEXT NOT NULL CHECK (
+        length(CAST(client_request_id AS BLOB)) BETWEEN 1 AND 128
+        AND client_request_id NOT GLOB '*[^ -~]*'
+    ),
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'accepted', 'already_resolved_same', 'already_resolved_other',
+        'cancelled', 'expired'
+    )),
+    resolved_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, logical_client_id, client_request_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
 -- ---- verification ledger ----------------------------------------------------
 -- Verification work is daemon-owned audit state.  Rows deliberately contain
 -- only bounded classifications, opaque identifiers, and SHA-256 digests.  The

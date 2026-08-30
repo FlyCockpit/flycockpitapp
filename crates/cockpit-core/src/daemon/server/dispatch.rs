@@ -5668,14 +5668,18 @@ async fn handle_serialized_request_impl(
                 }
                 return Ok(Response::CodeRootCreated(result));
             }
-            crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .preflight_new_attachment()
-                .map_err(code_root_contract_error)?;
             let canonical =
                 crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?;
+            // Reserve before any async session or durable-projection work.
+            // The reservation covers both the open capability and its
+            // idempotency receipt, so concurrent clients cannot all perform
+            // side effects after passing a stale capacity observation.
+            let reservation = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .reserve_new_attachment()
+                .map_err(code_root_contract_error)?;
             let options = request.options.clone();
             let principal = state.principal.clone();
-            let attached = Box::pin(attach(
+            let attached = match Box::pin(attach(
                 state,
                 ctx,
                 None,
@@ -5692,29 +5696,53 @@ async fn handle_serialized_request_impl(
                 &principal,
                 effects,
             ))
-            .await?;
-            let mut root = code_root_read_from_attached_response(ctx, attached).await?;
+            .await
+            {
+                Ok(attached) => attached,
+                Err(error) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(error);
+                }
+            };
+            let mut root = match code_root_read_from_attached_response(ctx, attached).await {
+                Ok(root) => root,
+                Err(error) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(error);
+                }
+            };
             if let Some(attached) = state.attached.as_ref() {
                 scrub_code_root_read(&mut root, &attached.handle.redaction_table());
             }
             if let Some(attached) = state.attached.as_ref() {
-                attached.handle.persist_if_needed().map_err(internal)?;
+                if let Err(error) = attached.handle.persist_if_needed() {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(internal(error));
+                }
             }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial = writer
-                .write_root_state_changed(root.root_id)
-                .await
-                .map_err(internal)?;
+            let initial = match writer.write_root_state_changed(root.root_id).await {
+                Ok(initial) => initial,
+                Err(error) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(internal(error));
+                }
+            };
             let result = {
                 let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
-                let capture_generation = authority.next_capture_generation();
+                let capture_generation = authority.capture_generation_for(root.root_id);
                 let attachment = authority
                     .mint_attachment(
                         root.root_id,
                         request.logical_client_id.clone(),
                         capture_generation,
                         initial.cursor,
+                        &reservation,
                     )
                     .map_err(code_root_contract_error)?;
                 let result = proto::CreateCodeRootV1Result { attachment, root };
@@ -5765,9 +5793,11 @@ async fn handle_serialized_request_impl(
                 }
                 return Ok(Response::CodeRootAttached(result));
             }
-            crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .preflight_new_attachment()
-                .map_err(code_root_contract_error)?;
+            if let Err(error) = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .validate_capture_generation(request.root_id, request.capture_generation)
+            {
+                return Err(code_root_contract_error(error));
+            }
             if let Some(cursor) = &request.replay_cursor {
                 ctx.db
                     .read_code_root_projection_deliveries(
@@ -5778,9 +5808,12 @@ async fn handle_serialized_request_impl(
                     .await
                     .map_err(code_root_contract_error)?;
             }
+            let reservation = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .reserve_new_attachment()
+                .map_err(code_root_contract_error)?;
             let options = request.options.clone();
             let principal = state.principal.clone();
-            let attached = Box::pin(attach(
+            let attached = match Box::pin(attach(
                 state,
                 ctx,
                 Some(request.root_id.0),
@@ -5797,41 +5830,74 @@ async fn handle_serialized_request_impl(
                 &principal,
                 effects,
             ))
-            .await?;
-            let mut root = code_root_read_from_attached_response(ctx, attached).await?;
+            .await
+            {
+                Ok(attached) => attached,
+                Err(error) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(error);
+                }
+            };
+            let mut root = match code_root_read_from_attached_response(ctx, attached).await {
+                Ok(root) => root,
+                Err(error) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(error);
+                }
+            };
             if let Some(attached) = state.attached.as_ref() {
                 scrub_code_root_read(&mut root, &attached.handle.redaction_table());
             }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial = writer
-                .write_root_state_changed(root.root_id)
-                .await
-                .map_err(internal)?;
+            let initial = match writer.write_root_state_changed(root.root_id).await {
+                Ok(initial) => initial,
+                Err(error) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .release_attachment_reservation(&reservation);
+                    return Err(internal(error));
+                }
+            };
             let replay_cursor = match request.replay_cursor.clone() {
                 Some(cursor) => cursor,
-                None => ctx
+                None => match ctx
                     .db
                     .code_root_replay_cursor_for_client(
                         root.root_id.0,
                         request.logical_client_id.as_str(),
                     )
                     .await
-                    .map_err(internal)?
-                    .map(proto::CodeRootReplayCursorV1::from_daemon_opaque)
-                    .transpose()
-                    .map_err(|error| internal(anyhow::anyhow!(error)))?
-                    .unwrap_or(initial.cursor),
+                {
+                    Ok(cursor) => match cursor
+                        .map(proto::CodeRootReplayCursorV1::from_daemon_opaque)
+                        .transpose()
+                    {
+                        Ok(cursor) => cursor.unwrap_or(initial.cursor),
+                        Err(error) => {
+                            crate::sync::lock_or_recover(&ctx.code_root_authority)
+                                .release_attachment_reservation(&reservation);
+                            return Err(internal(anyhow::anyhow!(error)));
+                        }
+                    },
+                    Err(error) => {
+                        crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .release_attachment_reservation(&reservation);
+                        return Err(internal(error));
+                    }
+                },
             };
             let result = {
                 let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
-                let capture_generation = authority.next_capture_generation();
+                let capture_generation = authority.capture_generation_for(root.root_id);
                 let attachment = authority
                     .mint_attachment(
                         root.root_id,
                         request.logical_client_id.clone(),
                         capture_generation,
                         replay_cursor,
+                        &reservation,
                     )
                     .map_err(code_root_contract_error)?;
                 let result = proto::AttachExistingCodeRootV1Result { attachment, root };
@@ -5927,8 +5993,8 @@ async fn handle_serialized_request_impl(
                         workspace_path: row.project_root,
                         last_active_at_unix_ms: row.last_active_at_unix_ms,
                         lifecycle,
-                        capture_generation: u64::try_from(row.active_model_revision)
-                            .unwrap_or_default(),
+                        capture_generation: crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .capture_generation_for(proto::CodeRootIdV1(row.session_id)),
                     });
                 }
                 crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -5956,22 +6022,10 @@ async fn handle_serialized_request_impl(
                 .clone();
             let attached = require_attached(state)?;
             ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
-            let mut projection = code_root_read_snapshot(ctx, attached, record.root_id).await?;
-            scrub_code_root_read(&mut projection, &attached.handle.redaction_table());
-            let writer =
-                crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            for entry in projection.history {
-                writer
-                    .write_history(record.root_id, entry)
-                    .await
-                    .map_err(internal)?;
-            }
-            for entry in projection.attention {
-                writer
-                    .write_attention(record.root_id, entry)
-                    .await
-                    .map_err(internal)?;
-            }
+            // Deliveries are captured at the worker's durable transition
+            // seam. Reading is a pure replay operation: it must never create
+            // new history/attention records or turn a poll timestamp into the
+            // apparent time of an earlier state change.
             let rows = ctx
                 .db
                 .read_code_root_projection_deliveries(
@@ -6042,6 +6096,27 @@ async fn handle_serialized_request_impl(
                 .authenticate(&request.attachment_capability)
                 .map_err(code_root_contract_error)?
                 .clone();
+            let fingerprint =
+                crate::daemon::code_roots::request_fingerprint(&request).map_err(internal)?;
+            if let Some(receipt) = ctx
+                .db
+                .code_root_interrupt_receipt(
+                    record.root_id.0,
+                    record.logical_client_id.as_str(),
+                    request.client_request_id.as_str(),
+                )
+                .await
+                .map_err(internal)?
+            {
+                if receipt.fingerprint != fingerprint {
+                    return Err(code_root_contract_error(anyhow::anyhow!(
+                        "Code-root idempotency conflict"
+                    )));
+                }
+                return Ok(Response::CodeRootInterruptResolved(
+                    code_root_interrupt_outcome_from_stored(&receipt.outcome)?,
+                ));
+            }
             let attached = require_attached(state)?;
             ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
             let attention_id =
@@ -6063,6 +6138,14 @@ async fn handle_serialized_request_impl(
                     message: "Code-root attention is no longer available".into(),
                 })?;
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            if !crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .begin_interrupt_resolution(&record.logical_client_id, &request.client_request_id)
+            {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "Code-root interrupt resolution is already in progress; retry the same request".into(),
+                });
+            }
             attached
                 .handle
                 .send_work(SessionWork::ResolveAgentDecision {
@@ -6073,13 +6156,66 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(session_work_error)?;
+                .map_err(|error| {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .finish_interrupt_resolution(
+                            &record.logical_client_id,
+                            &request.client_request_id,
+                        );
+                    session_work_error(error)
+                })?;
             let outcome = match response_rx.await {
-                Ok(Ok(_)) => proto::ResolveCodeRootInterruptResultV1::Accepted,
-                Ok(Err(_)) => proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedOther,
+                Ok(Ok(
+                    crate::agent_tree::DecisionSettlement::Resolved(_)
+                    | crate::agent_tree::DecisionSettlement::Steered { .. },
+                )) => proto::ResolveCodeRootInterruptResultV1::Accepted,
+                Ok(Ok(crate::agent_tree::DecisionSettlement::AlreadyTerminal(_))) => {
+                    proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedOther
+                }
+                Ok(Ok(crate::agent_tree::DecisionSettlement::Retry)) => {
+                    proto::ResolveCodeRootInterruptResultV1::Cancelled
+                }
+                Ok(Err(error)) => {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .finish_interrupt_resolution(
+                            &record.logical_client_id,
+                            &request.client_request_id,
+                        );
+                    return Err(internal(anyhow::anyhow!(
+                        "Code-root interrupt resolution failed: {error}"
+                    )));
+                }
                 Err(_) => proto::ResolveCodeRootInterruptResultV1::Cancelled,
             };
-            Ok(Response::CodeRootInterruptResolved(outcome))
+            let receipt = ctx
+                .db
+                .record_code_root_interrupt_receipt(
+                    record.root_id.0,
+                    record.logical_client_id.as_str(),
+                    request.client_request_id.as_str(),
+                    fingerprint,
+                    code_root_interrupt_outcome_as_stored(outcome),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    crate::sync::lock_or_recover(&ctx.code_root_authority)
+                        .finish_interrupt_resolution(
+                            &record.logical_client_id,
+                            &request.client_request_id,
+                        );
+                    internal(error)
+                })?;
+            crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .finish_interrupt_resolution(&record.logical_client_id, &request.client_request_id);
+            if receipt.fingerprint != fingerprint {
+                return Err(code_root_contract_error(anyhow::anyhow!(
+                    "Code-root idempotency conflict"
+                )));
+            }
+            Ok(Response::CodeRootInterruptResolved(
+                code_root_interrupt_outcome_from_stored(&receipt.outcome)?,
+            ))
         }
 
         Request::Attach {
@@ -26439,6 +26575,35 @@ pub(super) fn code_root_contract_error(error: anyhow::Error) -> ErrorPayload {
         ErrorCode::BadRequest
     };
     ErrorPayload { code, message }
+}
+
+fn code_root_interrupt_outcome_as_stored(
+    outcome: proto::ResolveCodeRootInterruptResultV1,
+) -> &'static str {
+    match outcome {
+        proto::ResolveCodeRootInterruptResultV1::Accepted => "accepted",
+        proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedSame => "already_resolved_same",
+        proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedOther => "already_resolved_other",
+        proto::ResolveCodeRootInterruptResultV1::Cancelled => "cancelled",
+        proto::ResolveCodeRootInterruptResultV1::Expired => "expired",
+    }
+}
+
+fn code_root_interrupt_outcome_from_stored(
+    outcome: &str,
+) -> std::result::Result<proto::ResolveCodeRootInterruptResultV1, ErrorPayload> {
+    match outcome {
+        "accepted" => Ok(proto::ResolveCodeRootInterruptResultV1::Accepted),
+        "already_resolved_same" => Ok(proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedSame),
+        "already_resolved_other" => {
+            Ok(proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedOther)
+        }
+        "cancelled" => Ok(proto::ResolveCodeRootInterruptResultV1::Cancelled),
+        "expired" => Ok(proto::ResolveCodeRootInterruptResultV1::Expired),
+        _ => Err(internal(anyhow::anyhow!(
+            "invalid durable Code-root interrupt outcome"
+        ))),
+    }
 }
 
 async fn code_root_read_from_attached_response(

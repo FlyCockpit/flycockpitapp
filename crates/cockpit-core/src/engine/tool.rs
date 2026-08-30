@@ -2471,9 +2471,9 @@ mod definition_cache_tests {
             .activate_dormant_direct_native_media(
                 crate::tool_media_authority::MediaToolAvailability::available_with(
                     crate::tool_media_authority::AvRuntimeProfile::FullClip,
-                    cockpit_proto::CapabilityStatus::Supported,
-                    cockpit_proto::CapabilityStatus::RequiresEntitlement,
-                    cockpit_proto::CapabilityStatus::Supported,
+                    crate::config::providers::CapabilityStatus::Supported,
+                    crate::config::providers::CapabilityStatus::RequiresEntitlement,
+                    crate::config::providers::CapabilityStatus::Supported,
                 ),
             );
 

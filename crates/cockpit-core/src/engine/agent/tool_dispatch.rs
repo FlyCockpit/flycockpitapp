@@ -5181,10 +5181,10 @@ mod tests {
     async fn advertised_capability_unavailable_tool_returns_availability_result() {
         let tmp = tempfile::tempdir().unwrap();
         let called = Arc::new(AtomicBool::new(false));
-        let mut tools = ToolBox::new().with(Arc::new(CapabilityUnavailableTool {
+        let tools = ToolBox::new().with(Arc::new(CapabilityUnavailableTool {
             called: called.clone(),
         }));
-        tools.apply_capabilities(
+        let tools = tools.apply_capabilities(
             &HashMap::new(),
             tmp.path(),
             crate::capabilities::ExecutionTarget::Host,

@@ -1,20 +1,4 @@
 {
-  "app_flag": {
-    "data": {
-      "key": "daemon_autostart_notice",
-      "seen": false,
-      "version": 7
-    },
-    "response": "app_flag"
-  },
-  "app_flag_seen": {
-    "data": {
-      "changed": true,
-      "key": "daemon_autostart_notice",
-      "version": 8
-    },
-    "response": "app_flag_seen"
-  },
   "assistant_session_resolved": {
     "data": {
       "created": true,
@@ -2474,7 +2458,7 @@
                 "per_upload_bytes": 4194304,
                 "global_bytes": 268435456
               },
-              "autostart": "shared"
+              "background_agents": true
             },
             "mediaResources": {
               "version": 1,

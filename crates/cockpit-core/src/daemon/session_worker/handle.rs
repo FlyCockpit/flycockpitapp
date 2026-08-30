@@ -1647,6 +1647,7 @@ impl SessionWorkerHandle {
             &work,
             SessionWork::ReplaceConfigSnapshot { .. }
                 | SessionWork::Cancel
+                | SessionWork::CancelAll
                 | SessionWork::Shutdown { .. }
         );
         // Reserve capacity before taking the publication read fence. Holding
@@ -2388,6 +2389,9 @@ pub enum SessionWork {
     CancelSchedule {
         job_id: String,
     },
+    /// Cancel the foreground turn and every scheduled/background job as one
+    /// ordered worker command for the exit guard's "Stop all" choice.
+    CancelAll,
     /// Run `/prune` (snapshot dedup) on the foreground agent now.
     Prune,
     /// Run `/compact` (fresh-thread handoff) on the foreground agent.

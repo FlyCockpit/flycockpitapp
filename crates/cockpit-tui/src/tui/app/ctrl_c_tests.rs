@@ -1,5 +1,14 @@
 use super::{CTRL_C_EXIT_WINDOW, CtrlCAction, decide_ctrl_c, input};
+use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
 use std::time::{Duration, Instant};
+
+fn install_ephemeral_runner(app: &mut super::App) {
+    let mut runner = AgentRunner::test_fixture(TestRunnerOverrides::default());
+    runner
+        .ephemeral_owner
+        .store(true, std::sync::atomic::Ordering::Release);
+    app.agent_runner = Some(Ok(runner));
+}
 
 /// Idle + single (first) press: arm the window + show hint only,
 /// nothing to interrupt. The window is armed at `now`.
@@ -248,7 +257,6 @@ fn idle_empty_ctrl_d_exits_immediately() {
     use crate::tui::settings::Dialog;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = Dialog::None;
 
     let exit = app.handle_key(ctrl('d'));
@@ -265,6 +273,7 @@ fn busy_ctrl_d_uses_guarded_quit_path() {
     use super::App;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
+    install_ephemeral_runner(&mut app);
 
     app.busy = true;
     app.queue.push(input::optimistic_queue_item(
@@ -274,13 +283,27 @@ fn busy_ctrl_d_uses_guarded_quit_path() {
     let exit = app.handle_key(ctrl('d'));
 
     assert!(!exit, "first busy ctrl+d should guard instead of exiting");
-    assert!(
-        app.ctrl_c_armed_at.is_some(),
-        "guarded ctrl+d should arm the same exit window as ctrl+c"
+    assert!(app.ctrl_c_armed_at.is_none(), "ctrl+d must not arm ctrl+c");
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_client::presentation::ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        },
     );
     assert!(
-        app.queue.is_empty(),
-        "guarded busy ctrl+d should reuse ctrl+c interrupt cleanup"
+        app.question_dialog.is_some(),
+        "daemon-confirmed busy ephemeral ctrl+d must offer the exit choice"
+    );
+    assert_eq!(
+        app.queue.len(),
+        1,
+        "opening the exit choice must not cancel or discard queued work"
     );
 }
 
@@ -292,6 +315,7 @@ fn scheduled_work_ctrl_d_uses_guarded_quit_path() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
+    install_ephemeral_runner(&mut app);
     app.active_schedules.insert(
         "sched-1".to_string(),
         ActiveSchedule {
@@ -309,7 +333,44 @@ fn scheduled_work_ctrl_d_uses_guarded_quit_path() {
         !exit,
         "ctrl+d should not directly exit while scheduled/background work exists"
     );
-    assert!(app.ctrl_c_armed_at.is_some());
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_client::presentation::ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        },
+    );
+    assert!(app.question_dialog.is_some());
+    assert!(app.ctrl_c_armed_at.is_none());
+}
+
+#[test]
+fn exit_guard_stop_all_cancels_only_the_attached_session() {
+    use super::App;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+    let mut runner = AgentRunner::test_fixture(TestRunnerOverrides {
+        control_tx: Some(control_tx),
+        ..Default::default()
+    });
+    runner
+        .ephemeral_owner
+        .store(true, std::sync::atomic::Ordering::Release);
+    app.agent_runner = Some(Ok(runner));
+
+    app.resolve_exit_guard_choice(Some("stop_all"));
+
+    let control = control_rx.try_recv().expect("stop-all control request");
+    assert!(matches!(
+        control.request,
+        cockpit_proto::Request::CancelAllSessionWork
+    ));
 }
 
 #[test]
@@ -335,7 +396,6 @@ fn durable_control_receipt_fences_every_guarded_exit() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let request_id = cockpit_client::presentation::ControlRequestId(41);
     app.pending_control_requests.insert(
@@ -374,12 +434,7 @@ fn exit_routes_share_the_app_wide_authority_gate() {
             || terminal_controls
                 .contains("CtrlCAction::Exit => {\n                self.request_guarded_exit()")
     );
-    assert!(input.contains(
-        "self.ctrl_d_can_exit_immediately() {\n                self.request_guarded_exit()"
-    ));
-    assert!(input.contains(
-        "DaemonChoice::Exit) | None => {\n                    return self.request_guarded_exit();"
-    ));
+    assert!(input.contains("return self.request_guarded_exit();"));
     assert!(
         slash.contains(
             "fn run_exit(app: &mut App, _: &str) -> bool {\n    app.request_guarded_exit()"

@@ -7244,7 +7244,7 @@ fn validate_agent_lineage(
                     Some(parent_workspace_ref)
                 }
                 None => {
-                    // Legacy/test-only daemonless roots deliberately have no
+                    // Legacy/test-only isolated roots deliberately have no
                     // workspace identity. They may only produce another
                     // absent identity; a child still cannot inject text.
                     ensure!(
@@ -7259,7 +7259,7 @@ fn validate_agent_lineage(
             // `ensure_session_root_agent` is the only root creation API that
             // accepts a workspace identity; it receives the daemon-derived
             // path digest and persists the stable `session-root` binding.
-            // Generic agent creation remains useful for daemonless fixtures
+            // Generic agent creation remains useful for isolated fixtures
             // and non-root recovery scaffolding, but cannot inject a root
             // workspace selector into packets.
             ensure!(

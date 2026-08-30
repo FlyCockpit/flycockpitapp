@@ -733,6 +733,15 @@ impl App {
         self.launch.session_short_id = Some(outcome.short_id.clone());
         self.project_id = Some(outcome.project_id.clone());
         self.foreground_input_target = outcome.foreground_target.clone();
+        if outcome.promoted_from_ephemeral
+            && outcome.session_entry_mode
+                == cockpit_core::daemon::proto::SessionEntryMode::Assistant
+        {
+            self.show_toast(
+                cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE,
+                ToastKind::Info,
+            );
+        }
     }
 
     fn apply_session_switch_outcome_inner(

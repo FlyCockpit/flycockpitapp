@@ -200,7 +200,10 @@ struct Inner {
         Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
-    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Serializes the all-or-nothing persistent-service snapshot copied into
+    /// a newly created session with an in-place lifetime promotion.
+    persistent_service_transition: Mutex<()>,
+    resource_scheduler: Mutex<Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>>,
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
@@ -679,6 +682,7 @@ impl SessionRegistry {
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
+                persistent_service_transition: Mutex::new(()),
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
                 message_media_authority: Arc::new(Mutex::new(None)),
@@ -689,7 +693,7 @@ impl SessionRegistry {
                 command_secret_cache: Mutex::new(
                     crate::secret_command::CommandSecretCache::with_subprocess_executor(),
                 ),
-                resource_scheduler,
+                resource_scheduler: Mutex::new(resource_scheduler),
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
@@ -731,6 +735,13 @@ impl SessionRegistry {
 
     pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
         *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
+    }
+
+    /// Fence a promotion's service installation against the synchronous
+    /// session-worker construction snapshot. The guard is never held across
+    /// an await by either side.
+    pub(crate) fn lock_persistent_service_transition(&self) -> std::sync::MutexGuard<'_, ()> {
+        crate::sync::lock_or_recover(&self.inner.persistent_service_transition)
     }
 
     pub fn set_media_storage_recovery(
@@ -802,7 +813,14 @@ impl SessionRegistry {
     pub fn resource_scheduler(
         &self,
     ) -> Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>> {
-        self.inner.resource_scheduler.clone()
+        crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone()
+    }
+
+    pub fn set_resource_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.resource_scheduler) = scheduler;
     }
 
     pub fn set_global_bus(&self, tx: EventSender) {
@@ -811,6 +829,10 @@ impl SessionRegistry {
 
     pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
+    }
+
+    pub fn clear_scheduler(&self) {
+        *crate::sync::lock_or_recover(&self.inner.scheduler) = None;
     }
 
     pub fn set_write_scope(
@@ -841,6 +863,10 @@ impl SessionRegistry {
             Some((storage, ledger));
     }
 
+    pub(crate) fn clear_message_media_authority(&self) {
+        *crate::sync::lock_or_recover(&self.inner.message_media_authority) = None;
+    }
+
     fn message_media_authority(
         &self,
     ) -> Option<(
@@ -855,6 +881,10 @@ impl SessionRegistry {
         runtime: Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>,
     ) {
         *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
+    }
+
+    pub(crate) fn clear_tool_media_runtime(&self) {
+        *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = None;
     }
 
     pub(crate) fn tool_media_runtime(
@@ -2031,6 +2061,10 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        // A concurrent promotion either finishes its complete service bundle
+        // before this snapshot, or this new session keeps the coherent
+        // pre-promotion bundle. It can never retain an intermediate mix.
+        let _persistent_service_transition = self.lock_persistent_service_transition();
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
         self.copy_tool_media_runtime_to_session(&session);
@@ -2072,7 +2106,7 @@ impl SessionRegistry {
             daemon_no_sandbox,
             &extended_cfg,
             self.inner.lsp.clone(),
-            self.inner.resource_scheduler.clone(),
+            crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone(),
             self.scheduler_source(),
             self.write_scope_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
@@ -2521,8 +2555,8 @@ impl SessionRegistry {
             .live
             .values()
             .any(|entry| {
-                let (has_schedules, processing, _tool_running) = entry.handle.live_status();
-                has_schedules || processing
+                let (has_schedules, processing, tool_running) = entry.handle.live_status();
+                has_schedules || processing || tool_running
             })
     }
 
@@ -3001,6 +3035,7 @@ mod tests {
         scheduler.start_with_sleeper(
             ShutdownSignal::new(),
             Arc::new(PendingSchedulerSleeper),
+            None,
             None,
         )
     }

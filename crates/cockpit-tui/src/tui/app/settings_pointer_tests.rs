@@ -230,7 +230,6 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
     }
 
     app.dialog = SettingsDialogKind::None;
-    app.daemon_prompt = None;
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let mut draw = |app: &mut App| {

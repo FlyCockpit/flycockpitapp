@@ -642,8 +642,6 @@ local	agent_transition_receipts	session_event_seq	foreign
 local	agent_transition_receipts	session_id	foreign
 local	agent_transition_receipts	terminal_revision	non_relationship
 local	agent_transition_receipts	terminal_state	primary
-local	app_flags	key	primary
-local	app_flags	seen_at	non_relationship
 local	approval_grants	access	non_relationship
 local	approval_grants	grant_key	primary
 local	approval_grants	grant_kind	primary

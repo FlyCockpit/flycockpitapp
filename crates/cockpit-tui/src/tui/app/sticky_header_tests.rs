@@ -67,7 +67,6 @@ fn overflowing_app(root: &std::path::Path) -> App {
     let mut app = App::new(Some(root), false);
     app.launch.banner_enabled = false;
     app.sticky_user_message = true;
-    app.daemon_prompt = None;
     app.mouse_capture = true;
     let mut entries = Vec::new();
     for i in 0..12 {

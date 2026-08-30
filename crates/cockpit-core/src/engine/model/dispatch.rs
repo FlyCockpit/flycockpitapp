@@ -515,6 +515,43 @@ impl Model {
         .await
     }
 
+    /// Captured completion with the same request-local sealed egress table and
+    /// endpoint-recovery normalization policy as an already-prepared
+    /// foreground request. The metadata fork uses this to extend that
+    /// request's prefix without changing any rendered bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_captured_with_sealed_egress(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        endpoint_recovery_enabled: bool,
+        cancel: &CancellationToken,
+        sealed_egress: Option<&crate::redact::RedactionTable>,
+    ) -> Result<(
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        let params = self.with_resolved_model_params(params);
+        let prepared = self.prepare_completion_request(
+            system,
+            history,
+            &prompt,
+            tools,
+            &params,
+            endpoint_recovery_enabled,
+            sealed_egress,
+        )?;
+        self.complete_prepared_with_pre_drain(
+            prepared, tools, params, agent_name, None, cancel, None, None, false, None,
+        )
+        .await
+    }
+
     /// Compact-utility dispatch: one transport attempt, no probe/backoff or
     /// endpoint swap, and TTFT/idle deadlines are terminal even without a
     /// configured backup. The compaction sampler exclusively owns retries.

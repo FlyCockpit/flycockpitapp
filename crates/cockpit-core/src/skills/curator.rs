@@ -895,6 +895,7 @@ mod tests {
             crate::daemon::shutdown::ShutdownSignal::new(),
             Arc::new(crate::daemon::scheduler::TokioSchedulerSleeper),
             Some(executor.callback_registry()),
+            None,
         );
 
         ensure_default_job(&handle, &db).await.unwrap();

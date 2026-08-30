@@ -125,6 +125,29 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Work due for the cache-reusing, same-model metadata fork. The title slots
+/// refine both fields; later slots refresh the richer description while still
+/// requiring the atomic combined metadata call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAction {
+    None,
+    TitleAndDescribe,
+    Describe,
+}
+
+/// A scheduled self-metadata pass, fenced to the exact user-content
+/// generation that made it eligible. The durable token total fences newer user
+/// content, while the durable metadata-fork generation fences cancellation,
+/// drain, and superseding fork ownership before a generated write can publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataWork {
+    pub action: MetadataAction,
+    pub expected_user_content_tokens: usize,
+    /// Assigned at the foreground dispatch seam. It is included in the
+    /// generated write's durable CAS predicate.
+    pub expected_metadata_fork_generation: i64,
+}
+
 /// Process-wide audit counter: how many times any session waived the
 /// durable-before-handoff inference journal barrier. Read by doctor / audit
 /// surfaces; never reset in production. `nextest` runs each test in its own
@@ -333,6 +356,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub btw_tangent: bool,
     title: Mutex<Option<String>>,
+    description: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
     active_agent: Mutex<String>,
     /// Complete session selection, including invocation preferences that are
@@ -373,6 +397,10 @@ pub struct Session {
     /// resumed session has already passed any previous slot and must not
     /// re-nudge it.
     title_nudge_slot_pending: AtomicU8,
+    /// One metadata pass waiting for the foreground request that owns its
+    /// cached prefix to complete.  It is consumed by that request's turn
+    /// phase, never by a later user turn.
+    pending_metadata_fork: Mutex<Option<MetadataWork>>,
     /// In-memory two-shot latch for compact self-nudges (`0`, `1`, `2`).
     /// Reset only by successful compaction; prunes deliberately do not re-arm
     /// it because ctx% can oscillate around the threshold.
@@ -1421,6 +1449,7 @@ pub fn project_id_for(root: &Path) -> String {
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
+const METADATA_SCHEDULE_SLOTS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 fn normalize_title_slot(value: i64) -> u8 {
     match value {
@@ -1429,13 +1458,25 @@ fn normalize_title_slot(value: i64) -> u8 {
         2 | 3 => 2,
         4..=7 => 4,
         8..=15 => 8,
-        _ => 16,
+        16..=31 => 16,
+        32..=63 => 32,
+        64..=127 => 64,
+        _ => 128,
     }
 }
 
 fn scheduled_title_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
     let slot = u8::try_from(user_turns).ok()?;
     if TITLE_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+fn scheduled_metadata_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
+    let slot = u8::try_from(user_turns).ok()?;
+    if METADATA_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
         Some(slot)
     } else {
         None

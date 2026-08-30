@@ -129,6 +129,234 @@ fn cache_boundary_keeps_system_and_tools_byte_identical_across_volatile_turns() 
 }
 
 #[tokio::test]
+async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_ephemerally() {
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("foreground response".into()))
+        .turn(Turn::ToolCall {
+            id: "metadata-call".into(),
+            name: "mcp".into(),
+            arguments: serde_json::json!({
+                "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'repair-cache-fence', 'description': 'Repairs the durable metadata write fence.'})"
+            }),
+        })
+        .start()
+        .await;
+    // An auto-selected Chat Completions endpoint enables identity
+    // normalization when the interactive foreground may recover to Responses.
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, false);
+    let session = std::sync::Arc::new(
+        crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/metadata-fork-test"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let work = session
+        .note_user_content_for_metadata("repair the metadata cache fence")
+        .expect("first user boundary schedules metadata");
+    let work = session.activate_metadata_fork(work).unwrap();
+    let history = vec![
+        Message::user("prior user context"),
+        assistant(vec![responses_tool_call("provider-item", None)]),
+        tool_result_message("provider-item", None),
+    ];
+    let foreground_prompt = Message::user("foreground user turn");
+    let tools = vec![ToolDefinition {
+        name: "mcp".into(),
+        description: "Execute a Monty script.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "script": { "type": "string" } },
+            "required": ["script"]
+        }),
+    }];
+    let params = ModelParams::default();
+    let cancel = CancellationToken::new();
+
+    let (_, foreground_captured, _) = model
+        .complete_captured(
+            "shared system prompt",
+            &history,
+            foreground_prompt.clone(),
+            &tools,
+            params.clone(),
+            "Build",
+            None,
+            &cancel,
+            Some(EndpointRecoveryContext {
+                approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+            }),
+        )
+        .await
+        .expect("foreground request");
+    let without_recovery = model
+        .prepare_completion_request(
+            "shared system prompt",
+            &history,
+            &foreground_prompt,
+            &tools,
+            &params,
+            false,
+            None,
+        )
+        .expect("non-recovery preparation");
+    assert_ne!(
+        foreground_captured, without_recovery.captured,
+        "the tool-bearing fixture must exercise recovery-specific identity normalization"
+    );
+    crate::auto_title::generate_session_metadata_fork(
+        session.clone(),
+        model,
+        "shared system prompt".into(),
+        "Build".into(),
+        params,
+        history.clone(),
+        foreground_prompt,
+        tools,
+        true,
+        work,
+        std::path::PathBuf::from("/metadata-fork-test"),
+        crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        cancel,
+        None,
+    )
+    .await;
+
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 2, "one foreground and one fork request");
+    let foreground = &captured[0].body;
+    let fork = &captured[1].body;
+    assert_eq!(
+        fork["tools"], foreground["tools"],
+        "native tool block is identical"
+    );
+    let foreground_messages = foreground["messages"].as_array().unwrap();
+    let fork_messages = fork["messages"].as_array().unwrap();
+    assert_eq!(
+        &fork_messages[..foreground_messages.len()],
+        foreground_messages.as_slice(),
+        "fork retains the foreground request through its cached prefix"
+    );
+    assert_eq!(
+        serde_json::to_vec(foreground_messages).unwrap(),
+        serde_json::to_vec(&fork_messages[..foreground_messages.len()]).unwrap(),
+        "the serialized cached message prefix is byte-identical"
+    );
+    assert_eq!(fork_messages.len(), foreground_messages.len() + 1);
+    assert_eq!(
+        history,
+        vec![
+            Message::user("prior user context"),
+            assistant(vec![responses_tool_call("provider-item", None)]),
+            tool_result_message("provider-item", None),
+        ]
+    );
+
+    let row = session.db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("repair-cache-fence"));
+    assert_eq!(
+        row.description.as_deref(),
+        Some("Repairs the durable metadata write fence.")
+    );
+}
+
+#[tokio::test]
+async fn metadata_fork_retry_retains_the_initial_call_skeleton() {
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("I will provide metadata shortly.".into()))
+        .turn(Turn::ToolCall {
+            id: "metadata-call".into(),
+            name: "mcp".into(),
+            arguments: serde_json::json!({
+                "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'retain-call-skeleton', 'description': 'Retains the initial metadata call skeleton during recovery.'})"
+            }),
+        })
+        .start()
+        .await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, true);
+    let session = std::sync::Arc::new(
+        crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/metadata-fork-retry-test"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let work = session
+        .note_user_content_for_metadata("retain the metadata call skeleton")
+        .expect("first user boundary schedules metadata");
+    let work = session.activate_metadata_fork(work).unwrap();
+    let history = vec![Message::user("prior user context")];
+    let foreground_prompt = Message::user("foreground user turn");
+    let tools = vec![ToolDefinition {
+        name: "mcp".into(),
+        description: "Execute a Monty script.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "script": { "type": "string" } },
+            "required": ["script"]
+        }),
+    }];
+    let params = ModelParams::default();
+    let cancel = CancellationToken::new();
+
+    model
+        .complete_captured(
+            "shared system prompt",
+            &history,
+            foreground_prompt.clone(),
+            &tools,
+            params.clone(),
+            "Build",
+            None,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("foreground request");
+    crate::auto_title::generate_session_metadata_fork(
+        session.clone(),
+        model,
+        "shared system prompt".into(),
+        "Build".into(),
+        params,
+        history,
+        foreground_prompt,
+        tools,
+        false,
+        work,
+        std::path::PathBuf::from("/metadata-fork-retry-test"),
+        crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        cancel,
+        None,
+    )
+    .await;
+
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 3, "foreground plus two capped fork turns");
+    let retry_messages = captured[2].body["messages"].as_array().unwrap();
+    let retry_wire = serde_json::to_string(retry_messages).unwrap();
+    assert!(
+        retry_wire.contains("short-kebab-title"),
+        "the retry retains the concrete call skeleton from the first fork turn: {retry_wire}"
+    );
+    assert!(
+        retry_wire.contains("I will provide metadata shortly."),
+        "the retry retains the first fork response: {retry_wire}"
+    );
+
+    let row = session.db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("retain-call-skeleton"));
+    assert_eq!(
+        row.description.as_deref(),
+        Some("Retains the initial metadata call skeleton during recovery.")
+    );
+}
+
+#[tokio::test]
 async fn pre_drain_record_failure_aborts_before_response_processing() {
     let pre_drain = async { Err::<(), _>("write failed".to_string()) }
         .boxed()

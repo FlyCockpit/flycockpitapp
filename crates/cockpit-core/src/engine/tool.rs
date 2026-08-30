@@ -1206,9 +1206,9 @@ pub struct ToolCtx {
     /// direct-native media tools are registered on the toolbox at all.
     pub(crate) media_availability: crate::tool_media_authority::MediaToolAvailability,
     /// Source-tagged MCP catalog for this agent. Built once per agent
-    /// construction (or test `ToolCtx`) and refreshed when layer files or
-    /// the session config generation change. Tool dispatch must not call
-    /// [`crate::mcp::config::McpConfig::discover`].
+    /// construction (or test `ToolCtx`) and passed read-only to every
+    /// descendant context. Tool dispatch must not call
+    /// [`crate::mcp::config::McpConfig::discover`] or re-read catalog files.
     pub(crate) mcp_resolver: Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 

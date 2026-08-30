@@ -9,8 +9,6 @@ use crate::daemon::proto::{self, Request, Response};
 use crate::daemon::{self, DaemonPaths, DaemonStatus};
 use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
-const EPHEMERAL_TUI_NOTE: &str =
-    "  note: a live TUI may still be connected to a separate ephemeral daemon.";
 const MAX_STOP_GRACE_SECS: u64 = 24 * 60 * 60;
 const PROTOCOL_MISMATCH_STATUS_REMEDY: &str =
     "run `cockpit daemon restart` to restart the daemon on this version";
@@ -193,30 +191,27 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 },
                 DaemonStatus::LivePidSocketUnreachable => {
                     println!(
-                        "daemon: pid file belongs to a live cockpit daemon, but the recorded socket is unreachable\n  pid: {}\n  socket: {}\n{}",
+                        "daemon: pid file belongs to a live cockpit daemon, but the recorded socket is unreachable\n  pid: {}\n  socket: {}",
                         probe.paths.pid_file.display(),
                         probe.paths.socket.display(),
-                        EPHEMERAL_TUI_NOTE
                     );
                 }
                 DaemonStatus::UnverifiedPid => {
                     println!(
-                        "daemon: pid file names a live process whose identity could not be verified\n  pid: {}\n  socket: {}\n{}",
+                        "daemon: pid file names a live process whose identity could not be verified\n  pid: {}\n  socket: {}",
                         probe.paths.pid_file.display(),
                         probe.paths.socket.display(),
-                        EPHEMERAL_TUI_NOTE
                     );
                 }
                 DaemonStatus::Stale => {
                     println!(
-                        "daemon: canonical daemon not responding (stale pid file or socket)\n  pid: {}\n  socket: {}\n{}",
+                        "daemon: canonical daemon not responding (stale pid file or socket)\n  pid: {}\n  socket: {}",
                         probe.paths.pid_file.display(),
                         probe.paths.socket.display(),
-                        EPHEMERAL_TUI_NOTE
                     );
                 }
                 DaemonStatus::NotRunning => {
-                    println!("daemon: canonical daemon not running\n{EPHEMERAL_TUI_NOTE}");
+                    println!("daemon: not running");
                 }
             }
             Ok(())
@@ -270,7 +265,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 serde_json::json!({
                     "rendered": crate::diagnostics::render(&snapshot),
                     "has_failures": snapshot.has_failures,
-                    // This worker is used only when a private ephemeral daemon
+                    // This worker is used only when an ephemeral daemon
                     // could not become ready. Keep the classification machine
                     // readable so its parent can preserve the original daemon
                     // error unless the database bootstrap is the actual cause.
@@ -573,21 +568,13 @@ fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) 
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonVersions, EPHEMERAL_TUI_NOTE, RunningJsonStatus, incompatible_protocol_json_status,
+        DaemonVersions, RunningJsonStatus, incompatible_protocol_json_status,
         render_incompatible_protocol_status, render_running_status,
         restart_release_timeout_for_stop_path, restart_should_stop, restart_started_message,
         running_json_status, validate_grace, version_skew_reason,
     };
     use crate::daemon::proto;
     use crate::daemon::{self, DaemonStatus};
-
-    #[test]
-    fn stale_and_not_running_note_mentions_ephemeral_tui_without_discovery() {
-        assert!(EPHEMERAL_TUI_NOTE.contains("live TUI"));
-        assert!(EPHEMERAL_TUI_NOTE.contains("separate ephemeral daemon"));
-        assert!(!EPHEMERAL_TUI_NOTE.contains("pid"));
-        assert!(!EPHEMERAL_TUI_NOTE.contains("socket"));
-    }
 
     #[test]
     fn grace_validation_allows_zero_and_rejects_absurd_values() {

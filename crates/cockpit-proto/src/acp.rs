@@ -11,10 +11,9 @@
 //! widen the payload later; the transport seam depends only on this closed
 //! shape.
 //!
-//! TODO(acp-forwarded-mcp-proto-ingress-contract): replace these stubs with
-//! the landed ingress/discovery contracts without changing the CLI codec.
-
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 /// Maximum size of every caller-generated opaque identity in this contract.
@@ -488,15 +487,31 @@ pub fn attach_existing_code_root_v1_request(
     })
 }
 
-/// Closed forwarded-MCP ingress: declarations plus provenance, nothing else.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub const ACP_FORWARDED_MCP_VERSION_V1: u8 = 1;
+pub const ACP_FORWARDED_MCP_NAME_MAX_SCALARS_V1: usize = 64;
+pub const ACP_FORWARDED_MCP_NAME_MAX_BYTES_V1: usize = 256;
+pub const ACP_FORWARDED_MCP_ENDPOINT_MAX_SCALARS_V1: usize = 4_096;
+pub const ACP_FORWARDED_MCP_ENDPOINT_MAX_BYTES_V1: usize = 4_096;
+pub const ACP_FORWARDED_MCP_ITEM_MAX_SCALARS_V1: usize = 8_192;
+pub const ACP_FORWARDED_MCP_ITEM_MAX_BYTES_V1: usize = 8_192;
+pub const ACP_FORWARDED_MCP_ITEMS_MAX_V1: usize = 64;
+pub const ACP_FORWARDED_MCP_DECLARATIONS_MAX_V1: usize = 32;
+pub const ACP_FORWARDED_MCP_DECLARATION_MAX_CANONICAL_BYTES_V1: usize = 131_072;
+pub const ACP_FORWARDED_MCP_VECTOR_MAX_CANONICAL_BYTES_V1: usize = 1_048_576;
+
+/// Closed forwarded-MCP ingress: declarations and two opaque ids, nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpForwardedMcpIngressV1 {
+    pub version: u8,
     pub declarations: Vec<AcpForwardedMcpDeclarationV1>,
-    pub provenance: AcpForwardedMcpProvenanceV1,
+    pub client_provenance_id: OpaqueAsciiId128V1,
+    pub ingress_request_id: OpaqueAsciiId128V1,
 }
 
 /// One forwarded MCP server declaration admitted from ACP `mcpServers`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpForwardedMcpDeclarationV1 {
     pub name: String,
     pub transport: AcpForwardedMcpTransportV1,
@@ -504,7 +519,7 @@ pub struct AcpForwardedMcpDeclarationV1 {
 
 /// Transport discriminant for a forwarded MCP declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcpForwardedMcpTransportV1 {
     Stdio {
         command: String,
@@ -523,24 +538,261 @@ pub enum AcpForwardedMcpTransportV1 {
 
 /// Explicit name/value pair used for env and headers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpNameValuePairV1 {
     pub name: String,
     pub value: String,
 }
 
-/// Provenance for an ingress batch. No root, capability, epoch, or binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcpForwardedMcpProvenanceV1 {
-    pub method: AcpSessionAdmissionMethodV1,
-    pub session_id: Option<String>,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcpForwardedMcpIngressV1 {
+    version: u8,
+    declarations: Vec<AcpForwardedMcpDeclarationV1>,
+    client_provenance_id: OpaqueAsciiId128V1,
+    ingress_request_id: OpaqueAsciiId128V1,
 }
 
-/// ACP method that produced the ingress declarations.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcpForwardedMcpDeclarationV1 {
+    name: String,
+    transport: AcpForwardedMcpTransportV1,
+}
+
+impl<'de> Deserialize<'de> for AcpForwardedMcpDeclarationV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawAcpForwardedMcpDeclarationV1::deserialize(deserializer)?;
+        let mut declaration = Self {
+            name: raw.name,
+            transport: raw.transport,
+        };
+        declaration
+            .normalize_and_validate()
+            .map_err(serde::de::Error::custom)?;
+        Ok(declaration)
+    }
+}
+
+impl<'de> Deserialize<'de> for AcpForwardedMcpIngressV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawAcpForwardedMcpIngressV1::deserialize(deserializer)?;
+        let ingress = Self {
+            version: raw.version,
+            declarations: raw.declarations,
+            client_provenance_id: raw.client_provenance_id,
+            ingress_request_id: raw.ingress_request_id,
+        };
+        ingress.validate().map_err(serde::de::Error::custom)?;
+        Ok(ingress)
+    }
+}
+
+impl AcpForwardedMcpDeclarationV1 {
+    fn normalize_and_validate(&mut self) -> Result<(), String> {
+        normalize_bounded(
+            &mut self.name,
+            "declaration name",
+            ACP_FORWARDED_MCP_NAME_MAX_SCALARS_V1,
+            ACP_FORWARDED_MCP_NAME_MAX_BYTES_V1,
+            false,
+        )?;
+        match &mut self.transport {
+            AcpForwardedMcpTransportV1::Stdio { command, args, env } => {
+                normalize_bounded(
+                    command,
+                    "stdio command",
+                    ACP_FORWARDED_MCP_ENDPOINT_MAX_SCALARS_V1,
+                    ACP_FORWARDED_MCP_ENDPOINT_MAX_BYTES_V1,
+                    false,
+                )?;
+                validate_count(args, "stdio arguments")?;
+                for argument in args {
+                    normalize_bounded(
+                        argument,
+                        "stdio argument",
+                        ACP_FORWARDED_MCP_ITEM_MAX_SCALARS_V1,
+                        ACP_FORWARDED_MCP_ITEM_MAX_BYTES_V1,
+                        true,
+                    )?;
+                }
+                normalize_pairs(env, "environment", false)?;
+            }
+            AcpForwardedMcpTransportV1::Http { url, headers }
+            | AcpForwardedMcpTransportV1::Sse { url, headers } => {
+                normalize_bounded(
+                    url,
+                    "transport URL",
+                    ACP_FORWARDED_MCP_ENDPOINT_MAX_SCALARS_V1,
+                    ACP_FORWARDED_MCP_ENDPOINT_MAX_BYTES_V1,
+                    false,
+                )?;
+                normalize_pairs(headers, "header", true)?;
+            }
+        }
+        let canonical = serde_json::to_vec(self)
+            .map_err(|error| format!("serializing canonical MCP declaration: {error}"))?;
+        if canonical.len() > ACP_FORWARDED_MCP_DECLARATION_MAX_CANONICAL_BYTES_V1 {
+            return Err("canonical MCP declaration exceeds 131072 bytes".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let mut normalized = self.clone();
+        normalized.normalize_and_validate()?;
+        if &normalized != self {
+            return Err("forwarded MCP strings must be NFC-normalized".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl AcpForwardedMcpIngressV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != ACP_FORWARDED_MCP_VERSION_V1 {
+            return Err("forwarded MCP ingress version must be 1".to_string());
+        }
+        if self.declarations.len() > ACP_FORWARDED_MCP_DECLARATIONS_MAX_V1 {
+            return Err("forwarded MCP ingress exceeds 32 declarations".to_string());
+        }
+        let mut names = HashSet::with_capacity(self.declarations.len());
+        for declaration in &self.declarations {
+            declaration.validate()?;
+            if !names.insert(declaration.name.clone()) {
+                return Err("forwarded MCP declaration names must be unique".to_string());
+            }
+        }
+        let canonical = serde_json::to_vec(&self.declarations)
+            .map_err(|error| format!("serializing canonical MCP declaration vector: {error}"))?;
+        if canonical.len() > ACP_FORWARDED_MCP_VECTOR_MAX_CANONICAL_BYTES_V1 {
+            return Err("canonical MCP declaration vector exceeds 1048576 bytes".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_count<T>(values: &[T], field: &str) -> Result<(), String> {
+    if values.len() > ACP_FORWARDED_MCP_ITEMS_MAX_V1 {
+        return Err(format!("{field} exceeds 64 entries"));
+    }
+    Ok(())
+}
+
+fn normalize_pairs(
+    pairs: &mut [AcpNameValuePairV1],
+    field: &str,
+    ascii_case_insensitive: bool,
+) -> Result<(), String> {
+    validate_count(pairs, field)?;
+    let mut names = HashSet::with_capacity(pairs.len());
+    for pair in pairs {
+        normalize_bounded(
+            &mut pair.name,
+            &format!("{field} name"),
+            ACP_FORWARDED_MCP_ITEM_MAX_SCALARS_V1,
+            ACP_FORWARDED_MCP_ITEM_MAX_BYTES_V1,
+            false,
+        )?;
+        normalize_bounded(
+            &mut pair.value,
+            &format!("{field} value"),
+            ACP_FORWARDED_MCP_ITEM_MAX_SCALARS_V1,
+            ACP_FORWARDED_MCP_ITEM_MAX_BYTES_V1,
+            true,
+        )?;
+        let semantic_name = if ascii_case_insensitive {
+            pair.name.to_ascii_lowercase()
+        } else {
+            pair.name.clone()
+        };
+        if !names.insert(semantic_name) {
+            return Err(format!("duplicate semantic {field} name"));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_bounded(
+    value: &mut String,
+    field: &str,
+    max_scalars: usize,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    *value = value.nfc().collect();
+    let scalar_count = value.chars().count();
+    if (!allow_empty && value.is_empty())
+        || scalar_count > max_scalars
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{field} must be control-free and within {max_scalars} scalars/{max_bytes} bytes"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateCodeRootWithAcpIngressV1Request {
+    pub base: CreateCodeRootV1Request,
+    pub ingress: AcpForwardedMcpIngressV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateCodeRootWithAcpIngressV1Result {
+    pub base: CreateCodeRootV1Result,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachExistingCodeRootWithAcpIngressV1Request {
+    pub base: AttachExistingCodeRootV1Request,
+    pub ingress: AcpForwardedMcpIngressV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachExistingCodeRootWithAcpIngressV1Result {
+    pub base: AttachExistingCodeRootV1Result,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseAcpCodeRootAttachmentV1Request {
+    pub attachment_capability: CodeRootAttachmentCapabilityV1,
+    pub client_request_id: OpaqueAsciiId128V1,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AcpSessionAdmissionMethodV1 {
-    SessionNew,
-    SessionLoad,
+pub enum CloseAcpCodeRootAttachmentV1Outcome {
+    Closed,
+    AlreadyClosed,
+}
+
+impl From<CloseCodeRootAttachmentV1Result> for CloseAcpCodeRootAttachmentV1Outcome {
+    fn from(value: CloseCodeRootAttachmentV1Result) -> Self {
+        match value {
+            CloseCodeRootAttachmentV1Result::Closed => Self::Closed,
+            CloseCodeRootAttachmentV1Result::AlreadyClosed => Self::AlreadyClosed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseAcpCodeRootAttachmentV1Result {
+    pub outcome: CloseAcpCodeRootAttachmentV1Outcome,
 }
 
 /// Typed resolve submitted at most once per selected permission response.

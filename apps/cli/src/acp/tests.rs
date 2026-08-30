@@ -631,13 +631,12 @@ fn acp_transport_session_new_bridge_conversion_requires_explicit_recording_ingre
     assert_eq!(ingress.admissions[0].server_count, 1);
     assert_eq!(ingress.admissions[0].ingress.declarations.len(), 1);
     assert_eq!(ingress.admissions[1].server_count, 0);
-    assert_eq!(
+    assert!(
         ingress.admissions[1]
             .ingress
-            .provenance
-            .session_id
-            .as_deref(),
-        Some("s1")
+            .client_provenance_id
+            .as_str()
+            .starts_with("load-")
     );
     assert!(!elicitation_is_rejected("session/new"));
     assert!(elicitation_is_rejected("elicitation/create"));

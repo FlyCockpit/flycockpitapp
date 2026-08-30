@@ -413,6 +413,32 @@ pub(crate) fn spawn_image_generation_worker(
     artifact_root: Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
     shutdown: ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_image_generation_worker_gated(
+        db,
+        boot_id,
+        started_at,
+        adapters,
+        proof_source,
+        recovery_router,
+        artifact_root,
+        shutdown,
+        None,
+    )
+}
+
+/// As [`spawn_image_generation_worker`], but the loop stays inert until an
+/// in-place promotion has committed endpoint and lifetime publication.
+pub(crate) fn spawn_image_generation_worker_gated(
+    db: cockpit_db::Db,
+    boot_id: Uuid,
+    started_at: std::time::Instant,
+    adapters: ImageGenerationAdapterMap,
+    proof_source: Arc<dyn ImageDispatchProofSource>,
+    recovery_router: Arc<dyn ImageGenerationAdapter>,
+    artifact_root: Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
+    shutdown: ShutdownSignal,
+    start_gate: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tokio::task::JoinHandle<()> {
     let worker = ImageGenerationWorker::new(
         db,
         boot_id,
@@ -424,7 +450,16 @@ pub(crate) fn spawn_image_generation_worker(
     )
     .with_reconciler(recovery_router)
     .with_artifact_root(artifact_root);
-    tokio::spawn(worker.run(shutdown))
+    tokio::spawn(async move {
+        if let Some(mut start_gate) = start_gate {
+            while !*start_gate.borrow_and_update() {
+                if start_gate.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+        worker.run(shutdown).await;
+    })
 }
 
 #[cfg(all(test, feature = "extended"))]

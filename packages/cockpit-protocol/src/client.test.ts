@@ -127,10 +127,12 @@ describe("RemoteSessionClient", () => {
 
     const resumed = client.attach({
       session_id: "11111111-1111-4111-8111-111111111111",
+      session_entry_mode: "assistant",
     });
     const resumedRelay = JSON.parse(socket.sent[1] ?? "{}");
     expect(resumedRelay.payload.params).toEqual({
       session_id: "11111111-1111-4111-8111-111111111111",
+      session_entry_mode: "assistant",
     });
     socket.message({ ...responsesFixture.attached, id: resumedRelay.payload.id });
     await expect(resumed).resolves.toEqual(responsesFixture.attached.data);

@@ -1,6 +1,15 @@
 import { isAdminRole } from "@flycockpit/auth/roles";
 import type { LucideIcon } from "lucide-react";
-import { Cookie, Home, Info, LayoutDashboard, Monitor, Settings, Shield } from "lucide-react";
+import {
+  Cookie,
+  HardDrive,
+  Home,
+  Info,
+  LayoutDashboard,
+  Monitor,
+  Settings,
+  Shield,
+} from "lucide-react";
 
 export type NavDirection = "forward" | "back" | "none";
 export type NavAudience = "public" | "authenticated" | "admin";
@@ -14,7 +23,8 @@ export type AppNavPath =
   | "/settings"
   | "/admin"
   | "/settings/security"
-  | "/settings/privacy";
+  | "/settings/privacy"
+  | "/settings/storage";
 export type LangNavRoute =
   | "/$lang"
   | "/$lang/about"
@@ -24,7 +34,8 @@ export type LangNavRoute =
   | "/$lang/settings"
   | "/$lang/admin"
   | "/$lang/settings/security"
-  | "/$lang/settings/privacy";
+  | "/$lang/settings/privacy"
+  | "/$lang/settings/storage";
 
 export type RouteNavItem = {
   /** Path WITHOUT the `/$lang/` prefix, starts with "/". Use "/" for root. */
@@ -155,6 +166,12 @@ export const settingsNavItems: RouteNavItem[] = [
     path: "/settings/privacy",
     labelKey: "consent:settings.navPrivacy",
     icon: Cookie,
+    exact: false,
+  },
+  {
+    path: "/settings/storage",
+    labelKey: "settings:navStorage",
+    icon: HardDrive,
     exact: false,
   },
 ];

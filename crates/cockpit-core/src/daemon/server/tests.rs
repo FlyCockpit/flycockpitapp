@@ -1388,6 +1388,18 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
             description: "helper".into(),
             prompt: "help".into(),
         },
+        Request::ResolveAssistantSession {
+            assistant_id: "helper-bot".into(),
+            project_root: "/repo".into(),
+            mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+        },
+        Request::CreateAssistantSession {
+            name: "helper-bot".into(),
+            project_root: "/repo".into(),
+            initial_model: None,
+            no_sandbox: false,
+            env_snapshot: None,
+        },
     ];
     for request in mutations {
         let mut state = owner_state();
@@ -1912,9 +1924,10 @@ async fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         })
     };
     let read = Request::DaemonStatus;
-    let mutation = Request::MarkAppFlagSeen {
-        key: proto::AppFlagKey::DaemonAutostartNotice,
-        expected_version: 0,
+    let mutation = Request::RecordUsage {
+        kind: proto::UsageKind::Slash,
+        key: "/remote-gate".into(),
+        project_id: None,
     };
     let reachable_mutation = Request::CancelRunInvocation {
         client_submission_id: Uuid::now_v7(),
@@ -2062,7 +2075,7 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
         initial_model: None,
         no_sandbox: false,
         interactive: false,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
@@ -2265,7 +2278,7 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
         initial_model: None,
         no_sandbox: false,
         interactive: false,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
@@ -2593,9 +2606,10 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     handle_envelope(
         Envelope::request(
             local_id,
-            Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
+            Request::RecordUsage {
+                kind: proto::UsageKind::Slash,
+                key: "/local-owner-gate".into(),
+                project_id: None,
             },
         ),
         &mut state,
@@ -5756,7 +5770,7 @@ async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable(
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -6094,7 +6108,7 @@ async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
             initial_model,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -6191,7 +6205,7 @@ async fn attach_update_daemon_environment_policy_requires_owner() {
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: Some(
@@ -6260,7 +6274,7 @@ async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: Some(
@@ -6530,7 +6544,7 @@ async fn typed_invalid_attach_model_is_rejected_before_any_mutation() {
             }),
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -8046,6 +8060,74 @@ fn persistent_test_ctx() -> Arc<DaemonContext> {
     ))
 }
 
+#[test]
+#[cfg(feature = "extended")]
+fn preparing_ephemeral_promotion_keeps_persistent_services_private() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+
+    // Preparation may allocate/open private resources, but must not register a
+    // scheduler or start a worker before endpoint/lifetime publication commits.
+    let prepared = ctx
+        .prepare_persistent_services()
+        .expect("prepare persistent services");
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+    assert!(ctx.registry.resource_scheduler().is_none());
+    drop(prepared);
+}
+
+#[test]
+fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+
+    let ctx = test_ctx();
+    ctx.persistent_endpoint_publication_failure
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    assert!(ctx.promote_to_persistent(None).is_err());
+    assert!(ctx.is_ephemeral_lifetime());
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+    assert!(ctx.registry.resource_scheduler().is_none());
+    assert!(ctx.active_media_storage_recovery().is_none());
+    assert!(ctx.registry.tool_media_runtime().is_none());
+    #[cfg(feature = "extended")]
+    assert!(
+        crate::sync::lock_or_recover(&ctx.promoted_persistent_services)
+            .image_generation_worker
+            .is_none()
+    );
+}
+
+#[test]
+fn live_exit_guard_reservation_blocks_another_clients_promotion_until_released() {
+    let ctx = test_ctx();
+    let mut deciding_client = MutableClientState::detached_for_test();
+    ctx.reserve_exit_guard(&mut deciding_client)
+        .expect("reserve live exit decision");
+
+    let error = ctx
+        .promote_to_persistent(None)
+        .expect_err("another client cannot promote during an exit decision");
+    assert!(
+        error
+            .to_string()
+            .contains("another client is deciding how to detach"),
+        "promotion must be fenced until the deciding client resolves or disconnects"
+    );
+
+    ctx.release_exit_guard_reservation(&mut deciding_client);
+    ctx.require_exit_guard_promotion_owner(None)
+        .expect("releasing the prompt lets another client promote");
+}
+
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
@@ -8173,7 +8255,7 @@ fn remote_state_with_grants(
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
+        exit_guard_reservation: None,
     }
 }
 
@@ -8215,7 +8297,7 @@ fn owner_state() -> MutableClientState {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
+        exit_guard_reservation: None,
     }
 }
 
@@ -11027,27 +11109,45 @@ async fn end_btw_fork_remote_path_commits_transactional_ledger() {
 
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn delete_session_remote_path_commits_transactional_ledger() {
+async fn remote_storage_delete_commits_and_replays_the_cleanup_operation() {
     let ctx = persistent_test_ctx();
     let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     ctx.db.end_session(session.session_id).await.unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
+    let preview_operation = remote_owner_operation().await;
+    let preview_request = Request::PreviewStorageCleanup {
+        target: proto::StorageCleanupTarget::PermanentlyDeleteSessions {
+            session_ids: vec![session.session_id],
+        },
+    };
+    let preview = dispatch_remote_session(
+        &ctx,
+        &mut state,
+        &shared,
+        preview_request,
+        &preview_operation,
+    )
+    .await
+    .expect("remote storage preview succeeds");
+    let Response::StorageCleanupPreview { preview } = preview else {
+        panic!("expected storage cleanup preview");
+    };
     let operation = remote_owner_operation().await;
-    let request = Request::DeleteSession {
-        session_id: session.session_id,
+    let request = Request::ExecuteStorageCleanup {
+        preview_id: preview.preview_id,
     };
     let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
         .await
-        .expect("remote delete succeeds");
-    assert!(matches!(first, Response::Ack));
+        .expect("remote storage cleanup succeeds");
+    assert!(matches!(first, Response::StorageCleanupCompleted { .. }));
     assert!(
         ctx.db
             .get_session(session.session_id)
             .await
             .unwrap()
             .is_none(),
-        "the session row must be deleted"
+        "the previewed session row must be deleted"
     );
     assert_eq!(
         remote_ledger_state(&ctx, &operation).await.as_deref(),
@@ -11055,17 +11155,17 @@ async fn delete_session_remote_path_commits_transactional_ledger() {
     );
     let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
         .await
-        .expect("replayed remote delete is idempotent");
-    assert!(matches!(replay, Response::Ack));
+        .expect("replayed remote cleanup is idempotent");
+    assert!(matches!(replay, Response::StorageCleanupCompleted { .. }));
 }
 
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
-    // `mark_app_flag_seen` is classified `local_only`. Even if an operation
-    // identity is injected (which `admit_remote_operation` never produces for a
-    // `local_only` class), the daemon must persist locally and reserve NO
-    // transactional ledger row.
+async fn mark_app_flag_seen_is_owner_remoted_and_replay_safe() {
+    // The remote Settings shell owns storage-hint dismissal, so this durable
+    // acknowledgement is a nonrepeatable owner mutation rather than a
+    // local-only write. Its completed response is replayed from the remote
+    // operation ledger instead of applying the versioned write twice.
     let ctx = persistent_test_ctx();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
@@ -11087,8 +11187,8 @@ async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
     assert_eq!(version, 1, "the local app flag write must have applied");
     assert_eq!(
         remote_ledger_state(&ctx, &operation).await,
-        None,
-        "a local_only mutation must NOT reserve any transactional ledger row"
+        Some("committed".to_string()),
+        "the owner-remoted acknowledgement must commit a replay record"
     );
 }
 
@@ -15225,6 +15325,7 @@ async fn attached_state_with_worker_receiver(
             },
             attached: Some(AttachedSession {
                 handle,
+                code_root_capability: None,
                 workspace_identity: Some(
                     crate::daemon::agent_installation::AuthorizedWorkspaceRoot::capture(
                         std::path::Path::new(&project_root),
@@ -15232,6 +15333,7 @@ async fn attached_state_with_worker_receiver(
                     .expect("test workspace identity"),
                 ),
                 _interactive_guard: None,
+                resume_compaction_offer_issued: false,
             }),
             pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
@@ -15240,11 +15342,61 @@ async fn attached_state_with_worker_receiver(
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
-            negotiated_protocol_version: proto::PROTOCOL_VERSION,
+            exit_guard_reservation: None,
         },
         session_row.session_id,
         work_rx,
     )
+}
+
+#[tokio::test]
+async fn resume_from_compaction_requires_this_attachment_to_receive_an_offer() {
+    let ctx = test_ctx();
+    let project_root = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project_root.path()).await;
+
+    let error = handle_request(Request::ResumeFromCompaction, &mut state, &ctx)
+        .await
+        .expect_err("an attached client without an offer must retain full history");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("offered interactive away-resume"));
+    assert!(matches!(
+        work_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    state
+        .attached
+        .as_mut()
+        .expect("attached state")
+        .resume_compaction_offer_issued = true;
+    let ctx_for_request = ctx.clone();
+    let request = tokio::spawn(async move {
+        let response =
+            handle_request(Request::ResumeFromCompaction, &mut state, &ctx_for_request).await;
+        (response, state)
+    });
+    let SessionWork::ResumeFromCompaction { respond_to } = work_rx
+        .recv()
+        .await
+        .expect("an offered attachment delivers resume work")
+    else {
+        panic!("expected resume compaction work");
+    };
+    respond_to
+        .send(Ok(()))
+        .expect("request receiver remains open");
+    let (response, mut state) = request.await.expect("request joins");
+    assert!(matches!(response, Ok(Response::Ack)));
+    let error = handle_request(Request::ResumeFromCompaction, &mut state, &ctx)
+        .await
+        .expect_err("an offer is consumed by its first acceptance request");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(matches!(
+        work_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
@@ -16815,6 +16967,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::Cancel delivered to attached worker",
         },
         MutatingDispatchCase {
+            kind: "cancel_all_session_work",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::CancelAll cancels foreground and scheduled work",
+        },
+        MutatingDispatchCase {
             kind: "fs_write",
             effect_class: Durable,
             observation: "file contents written under project root",
@@ -17399,13 +17556,13 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "create_goal"
         | "get_workspace_trust"
         | "get_startup_disclosures"
-        | "get_app_flag"
-        | "mark_app_flag_seen"
         | "set_workspace_trust"
         | "guidance_estimate"
         | "list_guidance_proposals"
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
+        | "exit_guard_status"
+        | "release_exit_guard"
         | "stop_daemon"
         | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
         "count_pinned_messages"
@@ -17517,6 +17674,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
+        | "cancel_all_session_work"
         | "resolve_interrupt"
         | "archive_session"
         | "discard_session"
@@ -17782,6 +17940,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("read_redacted_export_chunk"),
         authz_owner_only("curator"),
         authz_session_writer("cancel_turn"),
+        authz_owner_only("cancel_all_session_work"),
         authz_project_files("fs_list"),
         authz_project_files("fs_stat"),
         authz_project_files("fs_read"),
@@ -17958,8 +18117,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("stats_rollup"),
         authz_owner_only("get_workspace_trust"),
         authz_owner_only("get_startup_disclosures"),
-        authz_owner_only("get_app_flag"),
-        authz_owner_only("mark_app_flag_seen"),
         authz_owner_only("set_workspace_trust"),
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
@@ -17981,6 +18138,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
+        authz_owner_only("exit_guard_status"),
+        authz_owner_only("release_exit_guard"),
         authz_owner_only("get_local_operation_settlement"),
     ]
 }
@@ -18808,6 +18967,9 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_paused_work"
             | "repair_resume"
             | "cancel_turn"
+            | "cancel_all_session_work"
+            | "exit_guard_status"
+            | "release_exit_guard"
             | "resolve_interrupt"
             | "resolve_agent_decision"
             | "apply_agent_session_override"
@@ -19142,6 +19304,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             action: proto::CuratorAction::Status,
         },
         "cancel_turn" => Request::CancelTurn,
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "fs_list" => Request::FsList {
             project_root: root,
             path: ".".into(),
@@ -19458,6 +19623,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember".into(),
         },
@@ -19592,13 +19758,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "get_workspace_trust" => Request::GetWorkspaceTrust { project_root: root },
         "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
-        "get_app_flag" => Request::GetAppFlag {
-            key: proto::AppFlagKey::DaemonAutostartNotice,
-        },
-        "mark_app_flag_seen" => Request::MarkAppFlagSeen {
-            key: proto::AppFlagKey::DaemonAutostartNotice,
-            expected_version: 0,
-        },
         "set_workspace_trust" => Request::SetWorkspaceTrust {
             project_root: root,
             mode: proto::WorkspaceTrustMode::Trust,
@@ -21077,7 +21236,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: true,
-                    session_entry_mode: Some(proto::SessionEntryMode::Code),
+                    session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
                     client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
@@ -21229,6 +21388,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
+        | "cancel_all_session_work"
         | "resolve_interrupt"
         | "set_active_model"
         | "set_agent"
@@ -21313,7 +21473,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: true,
-                    session_entry_mode: Some(proto::SessionEntryMode::Code),
+                    session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
                     client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
@@ -21448,6 +21608,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
+        | "cancel_all_session_work"
         | "resolve_interrupt"
         | "set_model_favorite"
         | "set_default_model"
@@ -21680,7 +21841,7 @@ async fn dispatch_attached_worker_request(
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -21824,6 +21985,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::from_u128(2),
             response: proto::ResolveResponse::Cancel,
@@ -21889,6 +22053,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember this".into(),
         },
@@ -22055,7 +22220,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ("repair_resume", SessionWork::RepairResume { respond_to }) => {
                     respond_to.send(Ok(())).unwrap();
                 }
+                ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
+                    respond_to.send(Ok(())).unwrap();
+                }
                 ("cancel_turn", SessionWork::Cancel) => {}
+                ("cancel_all_session_work", SessionWork::CancelAll) => {}
                 (
                     "resolve_interrupt",
                     SessionWork::ResolveInterrupt {
@@ -22459,6 +22628,9 @@ async fn assert_attached_required_malformed(kind: &str) {
             session_id: Uuid::new_v4(),
         },
         "cancel_turn" => Request::CancelTurn,
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::new_v4(),
             response: proto::ResolveResponse::Cancel,
@@ -22525,6 +22697,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
@@ -23875,7 +24048,7 @@ async fn create_test_assistant(
 #[cfg(unix)]
 async fn assert_create_assistant_session_happy() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let ctx = test_ctx();
+    let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     ctx.db
@@ -24687,7 +24860,7 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let scheduler = ctx.scheduler.as_ref().expect("persistent scheduler");
+    let scheduler = ctx.scheduler().expect("persistent scheduler");
     if kind != "create_scheduled_job" {
         dispatch_matrix_request(
             &ctx,
@@ -25056,7 +25229,7 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
@@ -25077,7 +25250,7 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         .await
         .unwrap();
     let root = project.path().to_string_lossy().into_owned();
-    let attach = |session_id, mode| Request::Attach {
+    let attach = |session_id, mode: proto::NonCodeSessionEntryMode| Request::Attach {
         session_id,
         since_seq: None,
         project_root: Some(root.clone()),
@@ -25091,27 +25264,21 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         env_policy: EnvDriftPolicy::Daemon,
     };
 
-    let missing_mode = dispatch_matrix_request(&ctx, attach(None, None))
-        .await
-        .expect_err("fresh attach cannot default its entry mode");
-    assert_eq!(missing_mode.code, ErrorCode::BadRequest);
-    assert!(ctx.registry.active_session_ids().is_empty());
-
     for mode in [
-        proto::SessionEntryMode::Assistant,
-        proto::SessionEntryMode::Computer,
+        proto::NonCodeSessionEntryMode::Assistant,
+        proto::NonCodeSessionEntryMode::Computer,
     ] {
         let Response::Attached {
             session_id,
             session_entry_mode,
             ..
-        } = dispatch_matrix_request(&ctx, attach(None, Some(mode)))
+        } = dispatch_matrix_request(&ctx, attach(None, mode))
             .await
             .expect("fresh mode attach")
         else {
             panic!("expected Attached");
         };
-        assert_eq!(session_entry_mode, mode);
+        assert_eq!(session_entry_mode, mode.into());
         assert!(
             ctx.db.get_session(session_id).await.unwrap().is_none(),
             "lazy session must not require a durable row before reattach"
@@ -25120,27 +25287,29 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         let Response::Attached {
             session_entry_mode: resumed_mode,
             ..
-        } = dispatch_matrix_request(&ctx, attach(Some(session_id), None))
+        } = dispatch_matrix_request(&ctx, attach(Some(session_id), mode))
             .await
             .expect("second local client reattaches the live lazy session")
         else {
             panic!("expected Attached");
         };
-        assert_eq!(resumed_mode, mode);
+        assert_eq!(resumed_mode, mode.into());
 
-        let mismatch = dispatch_matrix_request(
-            &ctx,
-            attach(Some(session_id), Some(proto::SessionEntryMode::Code)),
-        )
-        .await
-        .expect_err("live mode mismatch must reject before changing the worker");
+        let mismatched_mode = match mode {
+            proto::NonCodeSessionEntryMode::Assistant => proto::NonCodeSessionEntryMode::Computer,
+            proto::NonCodeSessionEntryMode::Computer => proto::NonCodeSessionEntryMode::Assistant,
+        };
+
+        let mismatch = dispatch_matrix_request(&ctx, attach(Some(session_id), mismatched_mode))
+            .await
+            .expect_err("live mode mismatch must reject before changing the worker");
         assert_eq!(mismatch.code, ErrorCode::BadRequest);
         assert_eq!(
             ctx.registry
                 .live_handle(session_id)
                 .expect("original live worker remains")
                 .session_entry_mode(),
-            mode
+            proto::SessionEntryMode::from(mode)
         );
         ctx.registry
             .live_handle(session_id)
@@ -25154,7 +25323,7 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
                 .unwrap()
                 .expect("persisted lazy session")
                 .session_entry_mode,
-            mode.as_str()
+            proto::SessionEntryMode::from(mode).as_str()
         );
     }
 }
@@ -25442,6 +25611,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "promote_queued_user_messages",
         "send_now_queued_user_message",
         "cancel_turn",
+        "cancel_all_session_work",
         "steer_delegation",
         "resolve_interrupt",
         "set_model_favorite",
@@ -25588,7 +25758,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: false,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: Default::default(),
                 env_snapshot: None,
@@ -25995,6 +26165,27 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::CancelAllSessionWork,
+            kind: "cancel_all_session_work",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ExitGuardStatus,
+            kind: "exit_guard_status",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReleaseExitGuard,
+            kind: "release_exit_guard",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: false,
         },
         CommandMetadataCase {
             request: Request::FsList {
@@ -26597,6 +26788,13 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::ResumeFromCompaction,
+            kind: "resume_from_compaction",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::Pin {
                 text: "remember".into(),
             },
@@ -27078,25 +27276,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::GetAppFlag {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-            },
-            kind: "get_app_flag",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
-            },
-            kind: "mark_app_flag_seen",
-            session_id: None,
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
             request: Request::ResolveAssistantSession {
                 assistant_id: "a".into(),
                 project_root: project_root.clone(),
@@ -27560,8 +27739,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetWorkspaceTrust,
         GetWorkspaceTrust,
         GetStartupDisclosures,
-        GetAppFlag,
-        MarkAppFlagSeen,
         ResolveAssistantSession,
         ListAssistants,
         UpsertAssistant,
@@ -27962,7 +28139,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             initial_model: None,
             no_sandbox: true,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -28613,7 +28790,7 @@ async fn image_submission_exact_retry_case() {
             initial_model: None,
             no_sandbox: true,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -28751,7 +28928,7 @@ async fn image_submission_exact_retry_case() {
             initial_model: None,
             no_sandbox: true,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -31682,7 +31859,7 @@ async fn attach_fails_closed_on_an_unrecoverable_default_model_journal() {
             initial_model: None,
             no_sandbox: true,
             interactive: false,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -32443,7 +32620,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: true,
-                    session_entry_mode: Some(proto::SessionEntryMode::Code),
+                    session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
                     client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
@@ -32940,6 +33117,33 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
 }
 
 #[tokio::test]
+async fn hello_only_probe_does_not_claim_client_lifetime() {
+    let ctx = test_ctx();
+    let presence = ctx.client_presence();
+    let (server, client) = tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES);
+    let task = tokio::spawn(handle_client_transport_as(
+        server,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+    ));
+    let mut client = ProtoStream::new(client);
+
+    assert!(matches!(
+        client.recv().await.unwrap(),
+        Some(RecvFrame::Envelope(_))
+    ));
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("hello-only probe transport exits")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(*presence.borrow(), ClientPresence::default());
+}
+
+#[tokio::test]
 async fn attach_replay_precedes_live_events_under_task_split() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -32988,7 +33192,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -33106,7 +33310,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -33302,6 +33506,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let (global_events, _) = broadcast::channel(1);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        code_root_authority: base.code_root_authority.clone(),
+        acp_catalog_composition: base.acp_catalog_composition.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
@@ -33316,11 +33522,14 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         global_redaction: base.global_redaction.clone(),
         redaction_generation: std::sync::atomic::AtomicU64::new(0),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
-        client_count: base.client_count.clone(),
+        client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
+        exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
+        ephemeral_lifetime: std::sync::atomic::AtomicBool::new(base.is_ephemeral_lifetime()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
@@ -33329,6 +33538,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
+        promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
         _dream_scheduler: None,
@@ -33519,6 +33729,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        code_root_authority: base.code_root_authority.clone(),
+        acp_catalog_composition: base.acp_catalog_composition.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
@@ -33533,11 +33745,14 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         global_redaction: base.global_redaction.clone(),
         redaction_generation: std::sync::atomic::AtomicU64::new(0),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
-        client_count: base.client_count.clone(),
+        client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
+        exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
+        ephemeral_lifetime: std::sync::atomic::AtomicBool::new(base.is_ephemeral_lifetime()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
@@ -33546,6 +33761,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
+        promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
         _dream_scheduler: None,
@@ -33636,8 +33852,8 @@ async fn delete_session_rejects_active_session() {
     .await
     .expect_err("active session must be rejected");
 
-    // v10: DeleteSession rejects an active session with a typed Conflict
-    // error. The session row remains intact.
+    // Active sessions reject deletion with a typed Conflict error. The session
+    // row remains intact.
     assert_eq!(err.code, ErrorCode::Conflict);
     assert!(err.message.contains("is active; end it before deleting"));
     assert!(
@@ -33646,45 +33862,6 @@ async fn delete_session_rejects_active_session() {
             .await
             .unwrap()
             .is_some()
-    );
-}
-
-#[tokio::test]
-async fn delete_session_at_min_supported_rejects_active_session() {
-    let ctx = test_ctx();
-    // The v11 cutover retired v9/v10 (MIN_SUPPORTED == 11), so the
-    // active-session rejection now applies to every supported client. A
-    // client negotiated at the minimum supported version must therefore get
-    // the Conflict — the old frozen v9 stop-and-delete leniency is gone.
-    // This also guards the gate against drift: if PROTOCOL_VERSION were ever
-    // bumped above MIN_SUPPORTED, the oldest supported client must not
-    // silently fall back to the lenient path.
-    let mut state = MutableClientState::detached_for_test_with_protocol_version(
-        proto::MIN_SUPPORTED_PROTOCOL_VERSION,
-    );
-    // A freshly created session is active (ended_at is None).
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
-
-    let err = handle_request(
-        Request::DeleteSession {
-            session_id: session.session_id,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect_err("min-supported DeleteSession must reject an active session");
-
-    assert_eq!(err.code, ErrorCode::Conflict);
-    assert!(err.message.contains("is active; end it before deleting"));
-    // The session row survives — a rejected delete must not remove it.
-    assert!(
-        ctx.db
-            .get_session(session.session_id)
-            .await
-            .unwrap()
-            .is_some(),
-        "a rejected active-session delete must leave the session intact"
     );
 }
 
@@ -33915,8 +34092,10 @@ async fn btw_concurrent_with_parent_turn() {
         },
         attached: Some(AttachedSession {
             handle: parent_handle,
+            code_root_capability: None,
             workspace_identity: None,
             _interactive_guard: None,
+            resume_compaction_offer_issued: false,
         }),
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -33925,7 +34104,7 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
+        exit_guard_reservation: None,
     };
     let parent_session_id = parent_row.session_id;
     let ctx_for_parent = ctx.clone();
@@ -33992,8 +34171,10 @@ async fn btw_concurrent_with_parent_turn() {
         },
         attached: Some(AttachedSession {
             handle: btw_handle,
+            code_root_capability: None,
             workspace_identity: None,
             _interactive_guard: None,
+            resume_compaction_offer_issued: false,
         }),
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -34002,7 +34183,7 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
+        exit_guard_reservation: None,
     };
     let btw_session_id = created.info.session_id;
     let ctx_for_btw = ctx.clone();
@@ -34154,7 +34335,7 @@ async fn btw_rehydrate_reports_live_fork() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34548,7 +34729,7 @@ async fn attach_replays_drain_state_after_attached_response() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -34655,7 +34836,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34720,7 +34901,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: 0,
             env_snapshot: None,
@@ -34745,7 +34926,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34815,7 +34996,7 @@ async fn attach_resolves_model_from_injected_config_source() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34929,7 +35110,7 @@ async fn reconnect_attach_uses_authoritative_default_correction_before_config_wa
             initial_model: Some(selected.clone()),
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35256,7 +35437,7 @@ async fn attach_requires_db_workspace_trust_row() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35307,7 +35488,7 @@ async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable(
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35395,7 +35576,7 @@ async fn modes_session_setup_dispatch_preserves_attach_time_workspace_identity()
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35464,7 +35645,7 @@ async fn modes_session_setup_dispatch_rejects_replaced_ancestor_config_authority
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35527,7 +35708,7 @@ async fn modes_session_setup_shared_dispatch_rejects_replaced_ancestor_config_au
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35604,7 +35785,7 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35733,7 +35914,7 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,

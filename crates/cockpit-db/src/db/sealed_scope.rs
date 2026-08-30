@@ -2,7 +2,7 @@
 //! action-grant tuple.
 //!
 //! This module owns the durable half of owner-managed sealed values across
-//! Session, Project, and Global scope. It stores **identity and lifecycle
+//! Session, Project, Global, and KnowledgeBase scope. It stores **identity and lifecycle
 //! metadata only**. Session literals stay in the pre-existing `sealed_values`
 //! table; Project and Global literals live in a dedicated sealed-value
 //! compartment outside this database, reachable only through the random opaque
@@ -34,6 +34,9 @@ pub enum SealedScopeKind {
     Session,
     Project,
     Global,
+    /// A value owned by a named knowledge base. Its literal lives in the
+    /// daemon vault, never in the KB markdown or disposable retrieval index.
+    KnowledgeBase,
 }
 
 impl SealedScopeKind {
@@ -42,6 +45,7 @@ impl SealedScopeKind {
             Self::Session => "session",
             Self::Project => "project",
             Self::Global => "global",
+            Self::KnowledgeBase => "knowledge_base",
         }
     }
 
@@ -50,12 +54,14 @@ impl SealedScopeKind {
             "session" => Ok(Self::Session),
             "project" => Ok(Self::Project),
             "global" => Ok(Self::Global),
+            "knowledge_base" => Ok(Self::KnowledgeBase),
             other => bail!("unknown sealed value scope: {other}"),
         }
     }
 
-    /// Whether this scope keeps its literal outside SQLite, in the sealed
-    /// compartment. Only these scopes need a cross-store saga.
+    /// Whether this scope keeps its literal in the sealed compartment. KB
+    /// values use direct encrypted vault items instead, so only these scopes
+    /// need a cross-store saga.
     pub fn is_persistent_compartment(self) -> bool {
         matches!(self, Self::Project | Self::Global)
     }
@@ -1043,6 +1049,32 @@ impl Db {
                 .query_map([], decode_record)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .context("listing all sealed value records")?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Internal redaction input: every resolvable Project/Global record.
+    ///
+    /// This is not an inventory surface: callers consume the opaque locators
+    /// only to construct a machine-wide containment table and must not project
+    /// any row or existence result to an agent-facing response.
+    pub async fn machine_scoped_sealed_redaction_records(
+        &self,
+    ) -> Result<Vec<SealedValueRecordRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RECORD_COLUMNS} FROM sealed_value_records
+                  WHERE deleted_at_ms IS NULL
+                    AND active_version >= 1
+                    AND scope IN ('project', 'global')
+                    AND compartment_key IS NOT NULL
+                  ORDER BY created_at_ms ASC, record_id ASC"
+            ))?;
+            let rows = stmt
+                .query_map([], decode_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("listing machine-scoped sealed redaction records")?;
             Ok(rows)
         })
         .await

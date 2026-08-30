@@ -1024,10 +1024,6 @@ mod tests {
             ToolEffect::Dynamic
         )));
         assert!(!is_private_investigation_tool(&Fixture(
-            "session_read",
-            ToolEffect::ReadOnly
-        )));
-        assert!(!is_private_investigation_tool(&Fixture(
             "read_image",
             ToolEffect::ReadOnly
         )));

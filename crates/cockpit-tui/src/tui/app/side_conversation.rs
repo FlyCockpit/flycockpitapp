@@ -403,7 +403,7 @@ impl App {
             .expect("side preflight preserved conversation");
         self.schedule_created_session_discard(side.endpoint.clone(), side.side_session_id);
         self.restore_side_snapshot(side);
-        // The daemonless ownership guard stays armed throughout — the side
+        // The lifecycle ownership guard stays armed throughout — the side
         // fork lives on the same owned daemon, so it's never dropped and
         // needs no re-arming here.
 

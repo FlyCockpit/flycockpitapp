@@ -239,6 +239,9 @@ fn https_kind_credential_placement_is_fixed_header() {
             }
             _ => panic!("expected Header placement"),
         },
+        SealedActionKind::KnowledgeBaseCopy { .. } => {
+            panic!("expected HTTPS action kind");
+        }
     }
 }
 

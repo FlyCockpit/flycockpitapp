@@ -324,7 +324,6 @@ struct ActorState {
     db: Db,
     adapter: SharedAdapter,
     live: HashMap<Uuid, LiveEntry>,
-    deleting_sessions: HashSet<Uuid>,
     intake_closed: bool,
     /// Serialize per-containment: track in-flight command keys.
     in_flight: HashSet<String>,
@@ -335,7 +334,6 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
         db,
         adapter,
         live: HashMap::new(),
-        deleting_sessions: HashSet::new(),
         intake_closed: false,
         in_flight: HashSet::new(),
     };
@@ -468,12 +466,11 @@ async fn create_native(
     if state.intake_closed {
         return Err(ContainmentError::ShutdownIntakeClosed);
     }
-    if state.deleting_sessions.contains(&session_id)
-        || state
-            .db
-            .is_session_deleting(session_id)
-            .await
-            .map_err(|e| ContainmentError::Internal(e.to_string()))?
+    if state
+        .db
+        .is_session_deleting(session_id)
+        .await
+        .map_err(|e| ContainmentError::Internal(e.to_string()))?
     {
         return Err(ContainmentError::SessionDeleting);
     }
@@ -604,12 +601,11 @@ async fn create_container(
     if state.intake_closed {
         return Err(ContainmentError::ShutdownIntakeClosed);
     }
-    if state.deleting_sessions.contains(&session_id)
-        || state
-            .db
-            .is_session_deleting(session_id)
-            .await
-            .map_err(|e| ContainmentError::Internal(e.to_string()))?
+    if state
+        .db
+        .is_session_deleting(session_id)
+        .await
+        .map_err(|e| ContainmentError::Internal(e.to_string()))?
     {
         return Err(ContainmentError::SessionDeleting);
     }
@@ -883,8 +879,6 @@ async fn begin_session_deletion(
         .mark_session_deleting(session_id)
         .await
         .map_err(|e| ContainmentError::Internal(e.to_string()))?;
-    state.deleting_sessions.insert(session_id);
-
     let leases: Vec<_> = state
         .live
         .iter()

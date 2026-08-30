@@ -97,7 +97,7 @@ impl App {
     /// Re-run the pre-attach bootstrap projection (extended read + redacted,
     /// credential-free provider view) and re-derive launch + TUI chrome from
     /// it. This is the one sanctioned client-side resolution, reused for the
-    /// detached case (pre-attach first-run, daemonless `/settings` save).
+    /// detached case (pre-attach first-run, unavailable-daemon `/settings` save).
     pub(super) fn refresh_bootstrap_config_snapshot(&mut self) {
         let LaunchBundle {
             launch: fresh,
@@ -127,6 +127,11 @@ impl App {
         &mut self,
         extended: &cockpit_config::extended::ExtendedConfig,
     ) {
+        // This controls acquisition rather than rendering, but it must follow
+        // the same authoritative snapshot as the Settings UI so the next
+        // owner acquisition uses the current global preference.
+        self.ephemeral_preference = !extended.daemon.background_agents;
+        self.lifecycle.set_default_intent(self.lifecycle_intent());
         let tui_cfg = extended.tui.clone();
         self.vim_setting = tui_cfg.vim_mode;
         self.thinking_setting = tui_cfg.thinking;

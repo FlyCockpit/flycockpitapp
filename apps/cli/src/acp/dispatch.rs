@@ -36,12 +36,14 @@ const INBOUND_METHODS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionIngressError {
     Unavailable,
+    InvalidAdmission,
 }
 
 impl SessionIngressError {
     fn message(self) -> &'static str {
         match self {
             Self::Unavailable => "ACP session adaptation is unavailable",
+            Self::InvalidAdmission => "ACP session admission is invalid",
         }
     }
 }

@@ -784,9 +784,12 @@ impl SecretVault {
     }
 
     pub fn list_item_ids(&self, kind: SecretVaultKind) -> Result<Vec<String>, SecureKeyError> {
-        if kind == SecretVaultKind::SealedCompartment {
+        if matches!(
+            kind,
+            SecretVaultKind::SealedCompartment | SecretVaultKind::KnowledgeBaseSealedValue
+        ) {
             return Err(SecureKeyError::Internal(
-                "sealed compartment listing is not exposed".into(),
+                "sealed literal listing is not exposed".into(),
             ));
         }
         self.db

@@ -868,6 +868,19 @@ impl App {
                 self.apply_host_capabilities(*snapshot);
                 self.apply_control_success(pending.applied);
             }
+            ControlRequestOutcome::ExitGuardStatus {
+                ephemeral_owner,
+                has_live_work,
+            } => {
+                if matches!(pending.applied, ControlApplied::ExitGuardStatus) {
+                    self.apply_exit_guard_status(ephemeral_owner, has_live_work);
+                } else {
+                    self.push_plain(format!(
+                        "{}: daemon returned an unexpected exit-guard response",
+                        pending.label
+                    ));
+                }
+            }
             ControlRequestOutcome::Rejected(error) => {
                 if refresh_session_setup_on_failure {
                     self.request_session_setup_snapshot_refresh();
@@ -1083,6 +1096,9 @@ impl App {
         match applied {
             ControlApplied::None => {}
             ControlApplied::ModelSelection { .. } => {}
+            // ExitGuardStatus has a dedicated response payload that controls
+            // the exit path in `apply_control_request_outcome`.
+            ControlApplied::ExitGuardStatus => {}
             ControlApplied::CacheBreakWarning => {
                 if let Some(warning) = self.cache_break_warning() {
                     self.push_plain(warning);
@@ -1139,6 +1155,16 @@ impl App {
                 if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                     runner.retry_retained_user_submissions();
                 }
+            }
+            ControlApplied::ExitAfterStoppingWork => {
+                self.exit_requested = true;
+            }
+            ControlApplied::ExitAfterBackgroundPromotion => {
+                self.exit_notice = Some(format!(
+                    "This session is still running in the background; reattach with {}",
+                    self.exit_reattach_command()
+                ));
+                self.exit_requested = true;
             }
             ControlApplied::ResponseMetricsTokenizer { .. } => {
                 // Confirmation is driven by ConfigRefreshed / snapshot arms.

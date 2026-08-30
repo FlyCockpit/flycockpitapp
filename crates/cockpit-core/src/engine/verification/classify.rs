@@ -8,13 +8,11 @@ use crate::agents::ToolClass;
 
 /// Classify an ordinary tool name for verification matching.
 ///
-/// Returns [`ToolClass::ArtifactWrite`] for `write`/`edit` and the plan
-/// variants (`plan_write`/`plan_edit`) when those tools are granted (a
-/// dispatch that reaches this function has already been granted). Every
-/// other name is unclassified: no verification rule can match it yet.
+/// Returns [`ToolClass::ArtifactWrite`] for `write`/`edit`. Every other name
+/// is unclassified: no verification rule can match it yet.
 pub(crate) fn classify_tool(tool_id: &str) -> Option<ToolClass> {
     match tool_id {
-        "write" | "edit" | "plan_write" | "plan_edit" => Some(ToolClass::ArtifactWrite),
+        "write" | "edit" => Some(ToolClass::ArtifactWrite),
         _ => None,
     }
 }
@@ -24,8 +22,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifier_maps_write_edit_and_plan_variants_to_artifact_write() {
-        for name in ["write", "edit", "plan_write", "plan_edit"] {
+    fn classifier_maps_write_and_edit_to_artifact_write() {
+        for name in ["write", "edit"] {
             assert_eq!(
                 classify_tool(name),
                 Some(ToolClass::ArtifactWrite),

@@ -5330,6 +5330,44 @@ impl AgentTreeRuntime {
         Ok(settlement)
     }
 
+    pub async fn resolve_user_answer_with_code_root_receipt(
+        &self,
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        answer: PublicDecisionAnswer,
+        code_root_receipt: crate::db::agent_tree_decisions::CodeRootInterruptReceiptWrite,
+    ) -> Result<DecisionSettlement> {
+        let Some(decision) = self
+            .lifecycle
+            .db
+            .decision_request(session_id, decision_request_id)
+            .await?
+        else {
+            return Ok(DecisionSettlement::Retry);
+        };
+        if !is_terminal(decision.state)
+            && !self
+                .resolvers
+                .exact_owner_executor_is_live(session_id, decision.agent_instance_id)
+        {
+            return Ok(DecisionSettlement::Retry);
+        }
+        let settlement = self
+            .lifecycle
+            .resolve_user_answer_with_code_root_receipt(
+                session_id,
+                decision_request_id,
+                answer,
+                code_root_receipt,
+                self.clock.now_unix_ms(),
+            )
+            .await?;
+        if settlement.is_terminal() {
+            self.deadlines.cancel(session_id, decision_request_id);
+        }
+        Ok(settlement)
+    }
+
     /// Resolve an answer that the daemon has obtained from the exact linked
     /// private continuation. This is intentionally crate-private: public
     /// clients must use [`Self::resolve_user_answer`] with opaque tokens from
@@ -6355,6 +6393,83 @@ impl AgentTreeLifecycle {
             now_unix_ms,
         )
         .await
+    }
+
+    /// ACP's first-wins receipt is part of the same durable transition as a
+    /// newly answered decision. The worker owns this call after request
+    /// dispatch, so a disconnected transport cannot strand a winning answer
+    /// without its request identity.
+    pub async fn resolve_user_answer_with_code_root_receipt(
+        &self,
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        answer: PublicDecisionAnswer,
+        code_root_receipt: crate::db::agent_tree_decisions::CodeRootInterruptReceiptWrite,
+        now_unix_ms: i64,
+    ) -> Result<DecisionSettlement> {
+        validate_public_answer_option_tokens(&answer)?;
+        let decision = self
+            .db
+            .decision_request(session_id, decision_request_id)
+            .await?
+            .context("decision request is not authorized for this session")?;
+        // A late answer after auto-resolution creates a distinct durable
+        // steer. It does not settle this decision again, so the caller writes
+        // its receipt after that idempotent steer path returns.
+        if decision.state == DecisionState::AutoResolved {
+            return self
+                .resolve_user_answer(session_id, decision_request_id, answer, now_unix_ms)
+                .await;
+        }
+        if is_terminal(decision.state) {
+            let receipt = self
+                .db
+                .decision_terminal_receipt(session_id, decision_request_id)
+                .await?
+                .context("terminal decision has no receipt")?;
+            return Ok(DecisionSettlement::AlreadyTerminal(receipt.terminal_state));
+        }
+        ensure!(
+            DecisionClass::parse(&decision.decision_class)? != DecisionClass::HostApproval,
+            "host approvals are bound and resolved only by the host"
+        );
+        let owner = self
+            .db
+            .agent_instance(session_id, decision.agent_instance_id)
+            .await?
+            .context("decision owner disappeared")?;
+        ensure!(
+            owner.state == AgentInstanceState::WaitingForUser,
+            "user answer does not own this decision state"
+        );
+        let private_answer = self
+            .private_continuation_answer_for_public_answer(session_id, decision_request_id, &answer)
+            .await?;
+        validate_answer(&decision, &answer)?;
+        let outcome = self
+            .db
+            .resolve_decision_request_with_resume_payload_and_code_root_receipt(
+                session_id,
+                decision.decision_request_id,
+                decision.revision,
+                DecisionState::Answered,
+                &answer_receipt("user", &answer),
+                &answer_resume_payload("user", &private_answer),
+                code_root_receipt,
+                now_unix_ms,
+            )
+            .await?;
+        match outcome {
+            crate::db::agent_tree_decisions::DecisionTransitionOutcome::Transitioned(row) => {
+                Ok(DecisionSettlement::Resolved(row.state))
+            }
+            crate::db::agent_tree_decisions::DecisionTransitionOutcome::AlreadyTerminal(
+                receipt,
+            ) => Ok(DecisionSettlement::AlreadyTerminal(receipt.terminal_state)),
+            crate::db::agent_tree_decisions::DecisionTransitionOutcome::RevisionConflict => {
+                Ok(DecisionSettlement::Retry)
+            }
+        }
     }
 
     /// Resolve a response supplied by an already-authenticated private

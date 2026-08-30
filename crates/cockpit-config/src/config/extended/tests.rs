@@ -92,6 +92,51 @@ fn knowledge_base_registry_round_trips_through_extended_config_doc() {
 }
 
 #[test]
+fn configured_knowledge_attachment_provisional_identity_follows_its_source() {
+    let entry = KnowledgeBaseRegistryEntry::new(
+        "project".to_string(),
+        "Project memory".to_string(),
+        "Project retrieval".to_string(),
+        KnowledgeBaseSource::Local {
+            path: PathBuf::from(".cockpit/knowledge"),
+        },
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        true,
+        KnowledgeBaseMergePolicy::Auto,
+    );
+    let mut replacement = entry.clone();
+    replacement.source = KnowledgeBaseSource::Local {
+        path: PathBuf::from(".cockpit/replacement-knowledge"),
+    };
+    let mut relabeled = entry.clone();
+    relabeled.id = "project-memory".to_string();
+
+    assert_ne!(entry.attachment_id(), replacement.attachment_id());
+    assert_eq!(entry.attachment_id(), relabeled.attachment_id());
+}
+
+#[test]
+fn configured_knowledge_attachment_id_is_not_accepted_from_workspace_config() {
+    let error = serde_json::from_str::<KnowledgeBaseRegistryEntry>(
+        r#"{
+            "attachmentId": "a87144f0-548d-4a70-b9cf-04452e334867",
+            "id": "project",
+            "name": "Project memory",
+            "description": "Project retrieval",
+            "source": {"kind": "local", "path": ".cockpit/knowledge"},
+            "embeddingOwnership": "local",
+            "trustRequired": true,
+            "mergePolicy": "auto"
+        }"#,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("attachmentId"));
+}
+
+#[test]
 fn extended_replacement_is_invisible_until_commit_and_drop_preserves_destination() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

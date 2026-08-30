@@ -49,6 +49,7 @@ pub(crate) fn validate_tandem_tool_calls(
     response: Option<&Value>,
     session_root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Value {
     let Some(response) = response else {
         return json!([]);
@@ -58,7 +59,16 @@ pub(crate) fn validate_tandem_tool_calls(
     let calls = extract_tool_calls(response);
     let rows: Vec<ToolCallValidation> = calls
         .into_iter()
-        .map(|call| validate_one(call, &available, &known, session_root, tmp_dir))
+        .map(|call| {
+            validate_one(
+                call,
+                &available,
+                &known,
+                session_root,
+                tmp_dir,
+                workspace_scratch_dir,
+            )
+        })
         .collect();
     json!(rows)
 }
@@ -69,6 +79,7 @@ fn validate_one(
     known: &BTreeMap<String, Value>,
     session_root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> ToolCallValidation {
     if call.unsupported {
         return ToolCallValidation {
@@ -138,7 +149,8 @@ fn validate_one(
     }
 
     if name == "bash"
-        && let Some(outside) = bash_boundary_violation(&args, session_root, tmp_dir)
+        && let Some(outside) =
+            bash_boundary_violation(&args, session_root, tmp_dir, workspace_scratch_dir)
     {
         reasons.push(format!(
             "cwd or directory-changing command resolves outside session root: {}",
@@ -176,17 +188,33 @@ fn validate_one(
     }
 }
 
-fn bash_boundary_violation(args: &Value, root: &Path, tmp_dir: Option<&Path>) -> Option<PathBuf> {
+fn bash_boundary_violation(
+    args: &Value,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
+) -> Option<PathBuf> {
     let cwd = args
         .get("cwd")
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, root))
         .unwrap_or_else(|| root.to_path_buf());
-    if let Some(outside) = crate::tools::bash::outside_session_boundary(&cwd, root, tmp_dir) {
+    if let Some(outside) = crate::tools::bash::outside_session_boundary_with_workspace_scratch(
+        &cwd,
+        root,
+        tmp_dir,
+        workspace_scratch_dir,
+    ) {
         return Some(outside);
     }
     let command = args.get("command").and_then(Value::as_str)?;
-    crate::tools::bash::command_directory_escape(command, &cwd, root, tmp_dir)
+    crate::tools::bash::command_directory_escape_with_workspace_scratch(
+        command,
+        &cwd,
+        root,
+        tmp_dir,
+        workspace_scratch_dir,
+    )
 }
 
 fn available_tool_schemas(request: &Value) -> BTreeMap<String, Value> {

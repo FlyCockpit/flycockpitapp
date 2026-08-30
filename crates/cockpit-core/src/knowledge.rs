@@ -4532,8 +4532,8 @@ fn assistant_knowledge_registry_entry_from_row(
     cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
     let entry = KnowledgeBaseRegistryEntry::new(
         format!("assistant-{}", config.installation_id),
-        format!("Assistant: {name}"),
-        format!("Knowledge installed with assistant `{name}`."),
+        format!("Assistant: {}", row.name),
+        format!("Knowledge installed with assistant `{}`.", row.name),
         KnowledgeBaseSource::Local { path: root.clone() },
         KnowledgeBaseEmbeddingOwnership::Local,
         None,

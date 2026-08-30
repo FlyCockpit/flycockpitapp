@@ -5634,40 +5634,57 @@ async fn handle_serialized_request_impl(
     require_compiled_product_domain(&request)?;
     match request {
         Request::CreateCodeRootV1(request) => {
-            if let Some(result) = crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .replay_create(&request)
+            match crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .start_create(&request)
                 .map_err(code_root_contract_error)?
             {
-                if state.attached.as_ref().is_none_or(|attached| {
-                    attached.handle.session_id != result.attachment.root_id.0
-                }) {
-                    let options = request.options.clone();
-                    let principal = state.principal.clone();
-                    Box::pin(attach(
-                        state,
-                        ctx,
-                        Some(result.attachment.root_id.0),
-                        None,
-                        None,
-                        options.initial_model,
-                        options.no_sandbox,
-                        options.interactive,
-                        Some(proto::SessionEntryMode::Code),
-                        options.model_override,
-                        options.client_protocol_version,
-                        options.env_snapshot,
-                        options.env_policy,
-                        &principal,
-                        effects,
-                    ))
-                    .await?;
+                crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
+                    if state.attached.as_ref().is_none_or(|attached| {
+                        attached.handle.session_id != result.attachment.root_id.0
+                    }) {
+                        let options = request.options.clone();
+                        let principal = state.principal.clone();
+                        Box::pin(attach(
+                            state,
+                            ctx,
+                            Some(result.attachment.root_id.0),
+                            None,
+                            None,
+                            options.initial_model,
+                            options.no_sandbox,
+                            options.interactive,
+                            Some(proto::SessionEntryMode::Code),
+                            options.model_override,
+                            options.client_protocol_version,
+                            options.env_snapshot,
+                            options.env_policy,
+                            &principal,
+                            effects,
+                        ))
+                        .await?;
+                    }
+                    if let Some(attached) = state.attached.as_mut() {
+                        attached.code_root_capability =
+                            Some(result.attachment.attachment_capability.clone());
+                    }
+                    return Ok(Response::CodeRootCreated(result));
                 }
-                if let Some(attached) = state.attached.as_mut() {
-                    attached.code_root_capability =
-                        Some(result.attachment.attachment_capability.clone());
+                crate::daemon::code_roots::CodeRootRequestStart::InFlight => {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message:
+                            "Code-root create request is already in progress; retry the same request"
+                                .into(),
+                    });
                 }
-                return Ok(Response::CodeRootCreated(result));
+                crate::daemon::code_roots::CodeRootRequestStart::Started => {}
             }
+            let _request_guard = CodeRootRequestGuard::new(
+                &ctx.code_root_authority,
+                request.logical_client_id.clone(),
+                request.client_request_id.clone(),
+                "create",
+            );
             let canonical =
                 crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?;
             // Reserve before any async session or durable-projection work.
@@ -5763,40 +5780,57 @@ async fn handle_serialized_request_impl(
         }
 
         Request::AttachExistingCodeRootV1(request) => {
-            if let Some(result) = crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .replay_attach(&request)
+            match crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .start_attach(&request)
                 .map_err(code_root_contract_error)?
             {
-                if state.attached.as_ref().is_none_or(|attached| {
-                    attached.handle.session_id != result.attachment.root_id.0
-                }) {
-                    let options = request.options.clone();
-                    let principal = state.principal.clone();
-                    Box::pin(attach(
-                        state,
-                        ctx,
-                        Some(result.attachment.root_id.0),
-                        request.since_seq,
-                        None,
-                        options.initial_model,
-                        options.no_sandbox,
-                        options.interactive,
-                        Some(proto::SessionEntryMode::Code),
-                        options.model_override,
-                        options.client_protocol_version,
-                        options.env_snapshot,
-                        options.env_policy,
-                        &principal,
-                        effects,
-                    ))
-                    .await?;
+                crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
+                    if state.attached.as_ref().is_none_or(|attached| {
+                        attached.handle.session_id != result.attachment.root_id.0
+                    }) {
+                        let options = request.options.clone();
+                        let principal = state.principal.clone();
+                        Box::pin(attach(
+                            state,
+                            ctx,
+                            Some(result.attachment.root_id.0),
+                            request.since_seq,
+                            None,
+                            options.initial_model,
+                            options.no_sandbox,
+                            options.interactive,
+                            Some(proto::SessionEntryMode::Code),
+                            options.model_override,
+                            options.client_protocol_version,
+                            options.env_snapshot,
+                            options.env_policy,
+                            &principal,
+                            effects,
+                        ))
+                        .await?;
+                    }
+                    if let Some(attached) = state.attached.as_mut() {
+                        attached.code_root_capability =
+                            Some(result.attachment.attachment_capability.clone());
+                    }
+                    return Ok(Response::CodeRootAttached(result));
                 }
-                if let Some(attached) = state.attached.as_mut() {
-                    attached.code_root_capability =
-                        Some(result.attachment.attachment_capability.clone());
+                crate::daemon::code_roots::CodeRootRequestStart::InFlight => {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message:
+                            "Code-root attach request is already in progress; retry the same request"
+                                .into(),
+                    });
                 }
-                return Ok(Response::CodeRootAttached(result));
+                crate::daemon::code_roots::CodeRootRequestStart::Started => {}
             }
+            let _request_guard = CodeRootRequestGuard::new(
+                &ctx.code_root_authority,
+                request.logical_client_id.clone(),
+                request.client_request_id.clone(),
+                "attach",
+            );
             if let Err(error) = crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .validate_capture_generation(request.root_id, request.capture_generation)
             {
@@ -26630,6 +26664,45 @@ impl Drop for CodeRootAttachmentReservationGuard<'_> {
     }
 }
 
+/// Owns a create/attach idempotency fence until the route has returned or its
+/// connection-owned dispatch future is cancelled.  The fence is separate from
+/// attachment capacity: it serializes request identity while the reservation
+/// accounts for the resulting open attachment.
+struct CodeRootRequestGuard<'a> {
+    authority: &'a std::sync::Arc<std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
+    logical_client_id: proto::OpaqueAsciiId128V1,
+    client_request_id: proto::OpaqueAsciiId128V1,
+    route: &'static str,
+}
+
+impl<'a> CodeRootRequestGuard<'a> {
+    fn new(
+        authority: &'a std::sync::Arc<
+            std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>,
+        >,
+        logical_client_id: proto::OpaqueAsciiId128V1,
+        client_request_id: proto::OpaqueAsciiId128V1,
+        route: &'static str,
+    ) -> Self {
+        Self {
+            authority,
+            logical_client_id,
+            client_request_id,
+            route,
+        }
+    }
+}
+
+impl Drop for CodeRootRequestGuard<'_> {
+    fn drop(&mut self) {
+        crate::sync::lock_or_recover(self.authority).finish_code_root_request(
+            &self.logical_client_id,
+            &self.client_request_id,
+            self.route,
+        );
+    }
+}
+
 /// Owns the in-flight first-wins fence until the dispatch future has either
 /// completed or been dropped. This makes connection cancellation equivalent
 /// to every explicit finish path.
@@ -27229,10 +27302,9 @@ pub(super) async fn attach(
                 &extended_cfg_for_attach,
             );
             let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
-                let replay_max_seq =
-                    crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)
-                        .ok()
-                        .and_then(|rows| rows.into_iter().map(|row| row.seq).max());
+                let replay_rows =
+                    crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)?;
+                let replay_max_seq = replay_rows.into_iter().map(|row| row.seq).max();
                 let history =
                     crate::engine::rehydrate::history_snapshot_since_with_active_subagent_conn(
                         conn,
@@ -27240,11 +27312,7 @@ pub(super) async fn attach(
                         &root_agent,
                         active_subagent_for_attach.as_ref(),
                         since_seq,
-                    )
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, %session_id, since_seq, "building attach replay snapshot failed; sending empty replay");
-                        Vec::new()
-                    });
+                    )?;
                 (history, replay_max_seq)
             } else {
                 let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(

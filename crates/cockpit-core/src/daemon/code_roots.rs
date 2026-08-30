@@ -48,6 +48,19 @@ struct IdempotencyReceipt {
     recorded_at: Instant,
 }
 
+/// Outcome of atomically claiming a mutating Code-root request identity.
+///
+/// The authority lock is intentionally released before the route performs
+/// asynchronous session or projection work.  While that work is pending, a
+/// matching retry must not manufacture a second result; once the receipt is
+/// recorded it can instead replay the first result.
+#[derive(Debug)]
+pub(crate) enum CodeRootRequestStart<T> {
+    Started,
+    Replayed(T),
+    InFlight,
+}
+
 #[derive(Debug, Clone)]
 struct DiscoverySnapshot {
     workspace_path: String,
@@ -63,6 +76,7 @@ pub(crate) struct CodeRootAuthorityV1 {
     idempotency: HashMap<(String, String, &'static str), IdempotencyReceipt>,
     discovery: HashMap<String, DiscoverySnapshot>,
     attachment_reservations: HashSet<String>,
+    code_root_requests_in_flight: HashMap<(String, String, &'static str), [u8; 32]>,
     interrupt_resolutions_in_flight: HashSet<(String, String)>,
 }
 
@@ -100,6 +114,88 @@ impl CodeRootAuthorityV1 {
 
     pub fn release_attachment_reservation(&mut self, reservation: &str) {
         self.attachment_reservations.remove(reservation);
+    }
+
+    fn start_request(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+        route: &'static str,
+        fingerprint: [u8; 32],
+    ) -> Result<CodeRootRequestStart<IdempotencyResult>> {
+        self.reap_expired(Instant::now());
+        if let Some(result) =
+            self.replay(logical_client_id, client_request_id, route, fingerprint)?
+        {
+            return Ok(CodeRootRequestStart::Replayed(result));
+        }
+
+        let key = (
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+            route,
+        );
+        if let Some(in_flight_fingerprint) = self.code_root_requests_in_flight.get(&key) {
+            if *in_flight_fingerprint != fingerprint {
+                bail!("Code-root idempotency conflict");
+            }
+            return Ok(CodeRootRequestStart::InFlight);
+        }
+        self.code_root_requests_in_flight.insert(key, fingerprint);
+        Ok(CodeRootRequestStart::Started)
+    }
+
+    pub fn start_create(
+        &mut self,
+        request: &proto::CreateCodeRootV1Request,
+    ) -> Result<CodeRootRequestStart<proto::CreateCodeRootV1Result>> {
+        match self.start_request(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "create",
+            request_fingerprint(request)?,
+        )? {
+            CodeRootRequestStart::Started => Ok(CodeRootRequestStart::Started),
+            CodeRootRequestStart::InFlight => Ok(CodeRootRequestStart::InFlight),
+            CodeRootRequestStart::Replayed(IdempotencyResult::Create(result)) => {
+                self.authenticate(&result.attachment.attachment_capability)?;
+                Ok(CodeRootRequestStart::Replayed(result))
+            }
+            CodeRootRequestStart::Replayed(_) => bail!("invalid Code-root idempotency receipt"),
+        }
+    }
+
+    pub fn start_attach(
+        &mut self,
+        request: &proto::AttachExistingCodeRootV1Request,
+    ) -> Result<CodeRootRequestStart<proto::AttachExistingCodeRootV1Result>> {
+        match self.start_request(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "attach",
+            request_fingerprint(request)?,
+        )? {
+            CodeRootRequestStart::Started => Ok(CodeRootRequestStart::Started),
+            CodeRootRequestStart::InFlight => Ok(CodeRootRequestStart::InFlight),
+            CodeRootRequestStart::Replayed(IdempotencyResult::Attach(result)) => {
+                self.authenticate(&result.attachment.attachment_capability)?;
+                Ok(CodeRootRequestStart::Replayed(result))
+            }
+            CodeRootRequestStart::Replayed(_) => bail!("invalid Code-root idempotency receipt"),
+        }
+    }
+
+    pub fn finish_code_root_request(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+        route: &'static str,
+    ) {
+        self.code_root_requests_in_flight.remove(&(
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+            route,
+        ));
     }
 
     /// Serializes one logical interrupt resolution until its durable receipt
@@ -320,15 +416,19 @@ impl CodeRootAuthorityV1 {
         fingerprint: [u8; 32],
         result: IdempotencyResult,
     ) -> Result<()> {
+        let key = (
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+            route,
+        );
+        if self.idempotency.contains_key(&key) {
+            bail!("Code-root idempotency conflict");
+        }
         if self.idempotency.len() >= MAX_IDEMPOTENCY_RECEIPTS {
             bail!("Code-root idempotency capacity exhausted");
         }
         self.idempotency.insert(
-            (
-                logical_client_id.as_str().to_owned(),
-                client_request_id.as_str().to_owned(),
-                route,
-            ),
+            key,
             IdempotencyReceipt {
                 fingerprint,
                 result,
@@ -336,25 +436,6 @@ impl CodeRootAuthorityV1 {
             },
         );
         Ok(())
-    }
-
-    pub fn replay_create(
-        &self,
-        request: &proto::CreateCodeRootV1Request,
-    ) -> Result<Option<proto::CreateCodeRootV1Result>> {
-        match self.replay(
-            &request.logical_client_id,
-            &request.client_request_id,
-            "create",
-            request_fingerprint(request)?,
-        )? {
-            Some(IdempotencyResult::Create(result)) => {
-                self.authenticate(&result.attachment.attachment_capability)?;
-                Ok(Some(result))
-            }
-            Some(_) => bail!("invalid Code-root idempotency receipt"),
-            None => Ok(None),
-        }
     }
 
     pub fn record_create(
@@ -369,25 +450,6 @@ impl CodeRootAuthorityV1 {
             request_fingerprint(request)?,
             IdempotencyResult::Create(result),
         )
-    }
-
-    pub fn replay_attach(
-        &self,
-        request: &proto::AttachExistingCodeRootV1Request,
-    ) -> Result<Option<proto::AttachExistingCodeRootV1Result>> {
-        match self.replay(
-            &request.logical_client_id,
-            &request.client_request_id,
-            "attach",
-            request_fingerprint(request)?,
-        )? {
-            Some(IdempotencyResult::Attach(result)) => {
-                self.authenticate(&result.attachment.attachment_capability)?;
-                Ok(Some(result))
-            }
-            Some(_) => bail!("invalid Code-root idempotency receipt"),
-            None => Ok(None),
-        }
     }
 
     pub fn record_attach(

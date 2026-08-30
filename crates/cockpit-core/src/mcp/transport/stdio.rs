@@ -47,6 +47,7 @@ pub struct StdioClient<R = ChildStdout, W = ChildStdin> {
     next_id: u64,
     timeouts: McpTimeouts,
     cancel: Option<CancellationToken>,
+    epoch_cancel: Option<CancellationToken>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +69,10 @@ struct StdioState {
 #[derive(Clone, Default)]
 pub(crate) struct StdioRuntimeContext {
     pub(crate) cancel: Option<CancellationToken>,
+    /// A catalog lifetime is independent of a single tool call.  Forwarded
+    /// epochs use this second cancellation source so final release kills a
+    /// child even when the caller's tool token remains live.
+    pub(crate) epoch_cancel: Option<CancellationToken>,
     pub(crate) abandon_scope: Option<StdioAbandonScope>,
 }
 
@@ -85,11 +90,7 @@ impl StdioClient {
         // Bridge feature cancellation into the launch gate so a cancel that
         // lands during health evaluation cannot authorize OS handoff.
         let launch_cancel = crate::external_runtime::CancelToken::new();
-        if runtime
-            .cancel
-            .as_ref()
-            .is_some_and(|token| token.is_cancelled())
-        {
+        if runtime_cancelled(&runtime) {
             launch_cancel.cancel();
         }
         crate::external_runtime::require_configured_command_available_for_launch_with_cancel(
@@ -109,11 +110,7 @@ impl StdioClient {
             )
         })?;
         // Recheck immediately before spawn — late cancel after health.
-        if runtime
-            .cancel
-            .as_ref()
-            .is_some_and(|token| token.is_cancelled())
-        {
+        if runtime_cancelled(&runtime) {
             return Err(ChildFailure::cancel(server_name, "request_cancelled_before_spawn").into());
         }
         let mut cmd = tokio::process::Command::new(command);
@@ -145,11 +142,7 @@ impl StdioClient {
         };
         // Cancellation after the pre-spawn recheck but before/at handoff: reap
         // immediately so a late cancel cannot leave a running MCP child.
-        if runtime
-            .cancel
-            .as_ref()
-            .is_some_and(|token| token.is_cancelled())
-        {
+        if runtime_cancelled(&runtime) {
             let _ = child.start_kill();
             // Blocking reap so a cancelled handoff never leaves an orphan.
             // Bounded so a stuck process cannot wedge spawn forever.
@@ -207,6 +200,7 @@ where
             next_id: 1,
             timeouts,
             cancel: runtime.cancel,
+            epoch_cancel: runtime.epoch_cancel,
         }
     }
 
@@ -223,8 +217,22 @@ where
     ) -> Result<JsonRpcResponse> {
         self.state.ensure_not_poisoned()?;
         let cancel = self.cancel.clone();
-        let outcome = match cancel {
-            Some(cancel) => {
+        let epoch_cancel = self.epoch_cancel.clone();
+        let outcome = match (cancel, epoch_cancel) {
+            (Some(cancel), Some(epoch_cancel)) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => RequestOutcome::Cancelled,
+                    _ = epoch_cancel.cancelled() => RequestOutcome::Cancelled,
+                    result = tokio::time::timeout(request_timeout, self.request_unbounded(method, params)) => {
+                        match result {
+                            Ok(result) => RequestOutcome::Complete(result),
+                            Err(_) => RequestOutcome::TimedOut,
+                        }
+                    }
+                }
+            }
+            (Some(cancel), None) => {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => RequestOutcome::Cancelled,
@@ -236,7 +244,19 @@ where
                     }
                 }
             }
-            None => {
+            (None, Some(epoch_cancel)) => {
+                tokio::select! {
+                    biased;
+                    _ = epoch_cancel.cancelled() => RequestOutcome::Cancelled,
+                    result = tokio::time::timeout(request_timeout, self.request_unbounded(method, params)) => {
+                        match result {
+                            Ok(result) => RequestOutcome::Complete(result),
+                            Err(_) => RequestOutcome::TimedOut,
+                        }
+                    }
+                }
+            }
+            (None, None) => {
                 match tokio::time::timeout(request_timeout, self.request_unbounded(method, params))
                     .await
                 {
@@ -400,6 +420,17 @@ where
             .into_result()?;
         Ok(())
     }
+}
+
+fn runtime_cancelled(runtime: &StdioRuntimeContext) -> bool {
+    runtime
+        .cancel
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+        || runtime
+            .epoch_cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
 }
 
 enum RequestOutcome<T> {
@@ -784,6 +815,7 @@ mod tests {
             },
             StdioRuntimeContext {
                 cancel,
+                epoch_cancel: None,
                 abandon_scope: None,
             },
         );
@@ -953,6 +985,7 @@ mod tests {
                 McpTimeouts::from_secs(10, 60),
                 StdioRuntimeContext {
                     cancel: None,
+                    epoch_cancel: None,
                     abandon_scope: Some(scope.clone()),
                 },
             );
@@ -985,6 +1018,7 @@ mod tests {
             McpTimeouts::from_secs(10, 60),
             StdioRuntimeContext {
                 cancel: None,
+                epoch_cancel: None,
                 abandon_scope: Some(scope.clone()),
             },
         );

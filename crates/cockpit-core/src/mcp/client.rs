@@ -23,6 +23,7 @@ use super::transport::{
 #[derive(Clone)]
 pub struct McpConnectContext {
     cancel: Option<CancellationToken>,
+    forwarded_epoch_cancel: Option<CancellationToken>,
     stdio_abandon_scope: Option<StdioAbandonScope>,
     approver: Option<Arc<Approver>>,
     approval_mode: ApprovalMode,
@@ -41,6 +42,7 @@ impl Default for McpConnectContext {
     fn default() -> Self {
         Self {
             cancel: None,
+            forwarded_epoch_cancel: None,
             stdio_abandon_scope: None,
             approver: None,
             approval_mode: ApprovalMode::default(),
@@ -57,6 +59,7 @@ impl McpConnectContext {
     pub fn from_tool_ctx(ctx: &crate::engine::tool::ToolCtx) -> Self {
         Self {
             cancel: Some(ctx.cancel.clone()),
+            forwarded_epoch_cancel: None,
             stdio_abandon_scope: Some(StdioAbandonScope {
                 session_id: ctx.session.id,
                 tool_call_id: ctx.current_tool_call_id.clone(),
@@ -84,6 +87,14 @@ impl McpConnectContext {
 
     pub fn with_agent_bound(mut self, agent_bound: bool) -> Self {
         self.agent_bound = agent_bound;
+        self
+    }
+
+    fn with_forwarded_epoch(
+        mut self,
+        epoch: &crate::mcp::forwarded::AcpForwardedMcpCatalogV1,
+    ) -> Self {
+        self.forwarded_epoch_cancel = Some(epoch.cancellation_token());
         self
     }
 
@@ -130,6 +141,7 @@ impl McpConnectContext {
     fn stdio_runtime(&self) -> StdioRuntimeContext {
         StdioRuntimeContext {
             cancel: self.cancel.clone(),
+            epoch_cancel: self.forwarded_epoch_cancel.clone(),
             abandon_scope: self.stdio_abandon_scope.clone(),
         }
     }
@@ -153,7 +165,7 @@ impl McpConnectContext {
         let identity = entry.safe_display_identity();
         match approver
             .authorize(AuthorizationRequest::ForwardedMcpServerConnect {
-                server: entry.name(),
+                display_name: entry.redacted_display_name(),
                 transport: entry.transport_kind(),
                 identity: &identity,
             })
@@ -194,6 +206,7 @@ pub async fn connect_forwarded(
     epoch: &crate::mcp::forwarded::AcpForwardedMcpCatalogV1,
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
+    let context = context.with_forwarded_epoch(epoch);
     context.authorize_forwarded_connect(entry, epoch).await?;
     epoch.recheck_effect_gate()?;
     let timeouts = McpTimeouts::from_secs(10, 120);

@@ -6,14 +6,16 @@ impl Approver {
     /// "always" by existing clients but is retained only by the live epoch.
     pub(super) async fn approve_forwarded_mcp_inner(
         &self,
-        server: &str,
+        display_name: &str,
         tool: Option<&str>,
         transport: &str,
         identity: &str,
     ) -> Result<Decision> {
         let offered = [Scope::Once, Scope::Session];
         let operation = tool.map_or("connect", |_| "tool");
-        let target = format!("acp_forwarded:{operation}:{server}");
+        // `display_name` is already host-owned/redacted.  Never make a
+        // durable target from an editor declaration name.
+        let target = format!("acp_forwarded:{operation}:{display_name}");
         if self.yolo_mode()
             || self
                 .auto_allows(crate::agent_tree::HostEffectClass::ExternalAction, &target)
@@ -23,10 +25,10 @@ impl Approver {
         }
         let prompt = match tool {
             Some(tool) => format!(
-                "`{tool}` on editor-forwarded MCP server `{server}` wants to run. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
+                "`{tool}` on `{display_name}` wants to run. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
             ),
             None => format!(
-                "Editor-forwarded MCP server `{server}` wants to connect. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
+                "`{display_name}` wants to connect. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
             ),
         };
         let question = approval_question(
@@ -47,7 +49,7 @@ impl Approver {
                 "acp_forwarded_mcp",
                 serde_json::json!({
                     "source": crate::mcp::forwarded::SOURCE_ACP_FORWARDED,
-                    "server": server,
+                    "server_display": display_name,
                     "transport": transport,
                     "identity": identity,
                     "operation": operation,

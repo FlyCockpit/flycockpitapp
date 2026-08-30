@@ -127,11 +127,25 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
 #[test]
 fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let forwarded = fs::read_to_string(manifest.join("src/mcp/forwarded.rs"))
-        .expect("read forwarded catalog source");
-    let composition = fs::read_to_string(manifest.join("src/daemon/acp_catalog_composition.rs"))
-        .expect("read catalog composition source");
-    let inspected = format!("{forwarded}\n{composition}");
+    let source_root = manifest.join("src");
+    let mut files = Vec::new();
+    collect_rust_files(&source_root, &mut files);
+    let declaration_paths = files
+        .iter()
+        .filter_map(|path| {
+            let source = fs::read_to_string(path).expect("read Rust source");
+            // Test-only fixture code deliberately names forbidden sinks to
+            // assert the ratchet; it is not a production declaration path.
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            (production.contains("AcpForwardedMcpDeclarationV1")
+                || production.contains("AcpForwardedMcpIngressV1"))
+            .then_some((path, production.to_string()))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !declaration_paths.is_empty(),
+        "the repository-wide forwarded-declaration audit needs at least one producer"
+    );
     for forbidden in [
         "McpConfig::write_private",
         "McpConfig::discover(",
@@ -148,10 +162,13 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         "serde::Serialize",
         "derive(Serialize",
     ] {
-        assert!(
-            !inspected.contains(forbidden),
-            "ACP-forwarded declarations must not reach {forbidden}"
-        );
+        for (path, source) in &declaration_paths {
+            assert!(
+                !source.contains(forbidden),
+                "{} lets ACP-forwarded declarations reach {forbidden}",
+                path.display()
+            );
+        }
     }
 
     let client =
@@ -173,6 +190,54 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         assert!(
             !forwarded_connect.contains(forbidden),
             "forwarded connection must bypass credential path {forbidden}"
+        );
+    }
+
+    let catalog =
+        fs::read_to_string(manifest.join("src/mcp/catalog.rs")).expect("read MCP catalog source");
+    let forwarded_catalog = catalog
+        .split("async fn list_tools_for_forwarded(")
+        .nth(1)
+        .expect("forwarded discovery function")
+        .split("fn catalog_view")
+        .next()
+        .expect("forwarded discovery boundary");
+    let forwarded_invoke = catalog
+        .split("async fn invoke_forwarded(")
+        .nth(1)
+        .expect("forwarded invoke function")
+        .split("pub(crate) fn connect_context")
+        .next()
+        .expect("forwarded invoke boundary");
+    for forbidden in [
+        "cache::save",
+        "cache::load",
+        "list_tools_cached",
+        "McpConfig",
+        "SecretVault",
+        "GrantStore",
+        "record_mcp_tool_key",
+        "record_mcp_server_connect_key",
+    ] {
+        assert!(
+            !forwarded_catalog.contains(forbidden) && !forwarded_invoke.contains(forbidden),
+            "forwarded catalog path must not reach {forbidden}"
+        );
+    }
+
+    let policy = fs::read_to_string(manifest.join("src/approval/policy.rs"))
+        .expect("read approval policy source");
+    let forwarded_approval = policy
+        .split("pub(super) async fn approve_forwarded_mcp_inner")
+        .nth(1)
+        .expect("forwarded approval function")
+        .split("pub fn new")
+        .next()
+        .expect("forwarded approval boundary");
+    for forbidden in ["server: &str", "\"server\": server", "{server}"] {
+        assert!(
+            !forwarded_approval.contains(forbidden),
+            "forwarded approval must project a redacted server display, not {forbidden}"
         );
     }
 }

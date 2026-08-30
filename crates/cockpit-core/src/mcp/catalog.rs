@@ -536,7 +536,7 @@ async fn invoke_forwarded(
             };
             approver
                 .authorize(crate::approval::AuthorizationRequest::ForwardedMcpTool {
-                    server: entry.name(),
+                    display_name: entry.redacted_display_name(),
                     tool,
                     transport: entry.transport_kind(),
                     identity: &entry.safe_display_identity(),

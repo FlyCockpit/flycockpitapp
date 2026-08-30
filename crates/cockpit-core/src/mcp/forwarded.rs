@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +15,7 @@ use cockpit_proto::{
     CodeRootAttachmentCapabilityV1,
 };
 use reqwest::header::{HeaderName, HeaderValue};
+use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -61,6 +61,14 @@ impl AcpForwardedMcpEntryV1 {
             AcpForwardedTransportV1::Http(_) => "http",
             AcpForwardedTransportV1::Sse(_) => "sse",
         }
+    }
+
+    /// The approval/session-audit display label is deliberately independent
+    /// of the editor-controlled server name.  A declaration name can itself
+    /// contain secret-like text, so even a truncated copy is not safe to
+    /// project into durable interrupt or audit records.
+    pub fn redacted_display_name(&self) -> &'static str {
+        "editor-provided MCP server"
     }
 
     pub(crate) fn transport(&self) -> &AcpForwardedTransportV1 {
@@ -124,10 +132,19 @@ pub struct AcpForwardedMcpCatalogV1 {
     root_id: Uuid,
     epoch: Uuid,
     entries: BTreeMap<String, Arc<AcpForwardedMcpEntryV1>>,
-    normalized_declarations: Vec<AcpForwardedMcpDeclarationV1>,
-    cache: RwLock<HashMap<String, Arc<Vec<ToolDescriptor>>>>,
-    grants: RwLock<HashMap<(String, String), EpochGrantDecision>>,
-    released: AtomicBool,
+    /// This is the converted representation, not the ingress bytes.  The
+    /// latter retain non-canonical spellings (notably NFC names and URLs).
+    /// Epoch sharing is defined over the semantic representation.
+    normalized_entries: BTreeMap<String, Arc<AcpForwardedMcpEntryV1>>,
+    state: RwLock<EpochState>,
+    cancellation: CancellationToken,
+}
+
+#[derive(Default)]
+struct EpochState {
+    cache: HashMap<String, Arc<Vec<ToolDescriptor>>>,
+    grants: HashMap<(String, String), EpochGrantDecision>,
+    released: bool,
 }
 
 impl AcpForwardedMcpCatalogV1 {
@@ -148,7 +165,7 @@ impl AcpForwardedMcpCatalogV1 {
             .map(|(name, entry)| (name.as_str(), entry.clone()))
     }
     pub fn is_released(&self) -> bool {
-        self.released.load(Ordering::Acquire)
+        self.state.read().map_or(true, |state| state.released)
     }
     pub fn recheck_effect_gate(&self) -> Result<()> {
         if self.is_released() {
@@ -157,21 +174,28 @@ impl AcpForwardedMcpCatalogV1 {
         Ok(())
     }
     pub(crate) fn cached_tools(&self, name: &str) -> Option<Arc<Vec<ToolDescriptor>>> {
-        self.cache.read().ok()?.get(name).cloned()
+        let state = self.state.read().ok()?;
+        (!state.released)
+            .then(|| state.cache.get(name).cloned())
+            .flatten()
     }
     pub(crate) fn cache_tools(&self, name: &str, tools: Vec<ToolDescriptor>) {
-        if !self.is_released()
-            && let Ok(mut cache) = self.cache.write()
+        if let Ok(mut state) = self.state.write()
+            && !state.released
         {
-            cache.insert(name.to_string(), Arc::new(tools));
+            state.cache.insert(name.to_string(), Arc::new(tools));
         }
     }
     pub fn grant(&self, server: &str, tool: &str) -> Option<EpochGrantDecision> {
-        self.grants
-            .read()
-            .ok()?
-            .get(&(server.to_string(), tool.to_string()))
-            .copied()
+        let state = self.state.read().ok()?;
+        (!state.released)
+            .then(|| {
+                state
+                    .grants
+                    .get(&(server.to_string(), tool.to_string()))
+                    .copied()
+            })
+            .flatten()
     }
     pub fn record_epoch_grant(
         &self,
@@ -179,24 +203,38 @@ impl AcpForwardedMcpCatalogV1 {
         tool: &str,
         decision: EpochGrantDecision,
     ) -> Result<()> {
-        self.recheck_effect_gate()?;
-        self.grants
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| anyhow::anyhow!("forwarded MCP grant lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("forwarded MCP epoch lock poisoned"))?;
+        if state.released {
+            bail!("acp_mcp_catalog_released");
+        }
+        state
+            .grants
             .insert((server.to_string(), tool.to_string()), decision);
         Ok(())
     }
-    fn normalized_equivalent(&self, declarations: &[AcpForwardedMcpDeclarationV1]) -> bool {
-        self.normalized_declarations == declarations
+    fn normalized_equivalent(
+        &self,
+        declarations: &[AcpForwardedMcpDeclarationV1],
+        persistent_names: impl IntoIterator<Item = String>,
+    ) -> Result<bool> {
+        Ok(self.normalized_entries == validate_and_convert(declarations, persistent_names)?)
+    }
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
     fn revoke(&self) {
-        self.released.store(true, Ordering::Release);
-        if let Ok(mut cache) = self.cache.write() {
-            cache.clear();
+        // One write lock is the final-release linearization point for every
+        // cache/grant writer and reader.  Cancelling it also poisons any
+        // stdio request that was already handed to the transport.
+        if let Ok(mut state) = self.state.write() {
+            state.released = true;
+            state.cache.clear();
+            state.grants.clear();
         }
-        if let Ok(mut grants) = self.grants.write() {
-            grants.clear();
-        }
+        self.cancellation.cancel();
     }
 }
 
@@ -256,10 +294,14 @@ impl AcpForwardedMcpRegistryV1 {
         persistent_names: impl IntoIterator<Item = String>,
         slot: Arc<ForwardedCatalogSlot>,
     ) -> Result<Option<Arc<AcpForwardedMcpCatalogV1>>> {
+        let persistent_names: Vec<String> = persistent_names.into_iter().collect();
         let mut roots = crate::sync::lock_or_recover(&self.roots);
         if let Some(active) = roots.get_mut(&root_id) {
             if ingress.declarations.is_empty()
-                || !active.catalog.normalized_equivalent(&ingress.declarations)
+                || !active.catalog.normalized_equivalent(
+                    &ingress.declarations,
+                    persistent_names.iter().cloned(),
+                )?
             {
                 bail!("acp_mcp_catalog_conflict");
             }
@@ -277,10 +319,9 @@ impl AcpForwardedMcpRegistryV1 {
             root_id,
             epoch: Uuid::new_v4(),
             entries,
-            normalized_declarations: ingress.declarations.clone(),
-            cache: RwLock::new(HashMap::new()),
-            grants: RwLock::new(HashMap::new()),
-            released: AtomicBool::new(false),
+            normalized_entries: entries.clone(),
+            state: RwLock::new(EpochState::default()),
+            cancellation: CancellationToken::new(),
         });
         slot.publish(catalog.clone());
         roots.insert(
@@ -537,6 +578,56 @@ mod tests {
         assert!(registry.release_attachment(root, &second));
         assert!(epoch.is_released());
         assert!(slot.active().is_none());
+    }
+
+    #[test]
+    fn normalized_equivalent_declarations_share_the_active_epoch() {
+        let registry = AcpForwardedMcpRegistryV1::default();
+        let root = Uuid::new_v4();
+        let slot = Arc::new(ForwardedCatalogSlot::default());
+        let first = CodeRootAttachmentCapabilityV1::new_opaque("first").unwrap();
+        let second = CodeRootAttachmentCapabilityV1::new_opaque("second").unwrap();
+        let composed = ingress(vec![remote("caf\u{e9}", "https://example.com/mcp")]);
+        let decomposed = ingress(vec![remote("cafe\u{301}", "https://example.com/mcp")]);
+
+        let epoch = registry
+            .bind(root, &first, &composed, Vec::new(), slot.clone())
+            .unwrap()
+            .unwrap();
+        let shared = registry
+            .bind(root, &second, &decomposed, Vec::new(), slot)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(shared.epoch(), epoch.epoch());
+    }
+
+    #[test]
+    fn final_release_linearizes_epoch_state_writers() {
+        let registry = AcpForwardedMcpRegistryV1::default();
+        let root = Uuid::new_v4();
+        let slot = Arc::new(ForwardedCatalogSlot::default());
+        let attachment = CodeRootAttachmentCapabilityV1::new_opaque("attachment").unwrap();
+        let epoch = registry
+            .bind(
+                root,
+                &attachment,
+                &ingress(vec![remote("docs", "https://example.com/mcp")]),
+                Vec::new(),
+                slot,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(registry.release_attachment(root, &attachment));
+        epoch.cache_tools("docs", vec![]);
+        let error = epoch
+            .record_epoch_grant("docs", "read", EpochGrantDecision::Allow)
+            .unwrap_err();
+        assert!(error.to_string().contains("acp_mcp_catalog_released"));
+        assert!(epoch.cached_tools("docs").is_none());
+        assert!(epoch.grant("docs", "read").is_none());
+        assert!(epoch.cancellation_token().is_cancelled());
     }
 
     #[test]

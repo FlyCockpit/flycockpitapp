@@ -5673,7 +5673,7 @@ async fn handle_serialized_request_impl(
                 &request.ingress,
                 slot,
             ) {
-                let _ = Box::pin(handle_serialized_request_impl(
+                let rollback = Box::pin(handle_serialized_request_impl(
                     request_id,
                     Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
                         attachment_capability: capability,
@@ -5687,6 +5687,25 @@ async fn handle_serialized_request_impl(
                     remote_operation,
                 ))
                 .await;
+                if let Err(rollback_error) = rollback {
+                    return Err(internal(anyhow::anyhow!(
+                        "ACP catalog create composition failed ({}) and attachment rollback failed ({})",
+                        error.message,
+                        rollback_error.message,
+                    )));
+                }
+                // A create must not leave a durable runnable root behind when
+                // its catalog cannot be composed. Archiving revokes the root
+                // worker/catalog and makes the provisional root undiscoverable.
+                if let Err(rollback_error) =
+                    super::sessions::archive_session(ctx, base.attachment.root_id.0, true).await
+                {
+                    return Err(internal(anyhow::anyhow!(
+                        "ACP catalog create composition failed ({}) and root rollback failed ({})",
+                        error.message,
+                        rollback_error.message,
+                    )));
+                }
                 return Err(error);
             }
             Ok(Response::CodeRootWithAcpIngressCreated(
@@ -5744,7 +5763,7 @@ async fn handle_serialized_request_impl(
                 &request.ingress,
                 slot,
             ) {
-                let _ = Box::pin(handle_serialized_request_impl(
+                let rollback = Box::pin(handle_serialized_request_impl(
                     request_id,
                     Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
                         attachment_capability: capability,
@@ -5758,6 +5777,13 @@ async fn handle_serialized_request_impl(
                     remote_operation,
                 ))
                 .await;
+                if let Err(rollback_error) = rollback {
+                    return Err(internal(anyhow::anyhow!(
+                        "ACP catalog attach composition failed ({}) and attachment rollback failed ({})",
+                        error.message,
+                        rollback_error.message,
+                    )));
+                }
                 return Err(error);
             }
             Ok(Response::CodeRootWithAcpIngressAttached(
@@ -6173,6 +6199,12 @@ async fn handle_serialized_request_impl(
                     .replay_close(&record.logical_client_id, &request)
                     .map_err(code_root_contract_error)?
                 {
+                    // The generic close route is a valid lifecycle consumer.
+                    // Replaying a prior close must also be able to drain a
+                    // binding left by an older interrupted composition.
+                    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+                        service.release_catalog(record.root_id.0, &request.attachment_capability);
+                    }
                     return Ok(Response::CodeRootAttachmentClosed(outcome));
                 }
                 authority
@@ -6185,6 +6217,12 @@ async fn handle_serialized_request_impl(
                 authority
                     .record_close(&record.logical_client_id, &request, outcome)
                     .map_err(code_root_contract_error)?;
+                // Release regardless of which client owns this daemon
+                // connection.  `release_catalog` is attachment-idempotent;
+                // the later connection drain is therefore harmless.
+                if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+                    service.release_catalog(root_id.0, &request.attachment_capability);
+                }
                 if state.attached.as_ref().is_none_or(|attached| {
                     attached.handle.session_id != root_id.0
                         || attached.code_root_capability.as_ref()

@@ -328,7 +328,9 @@ pub enum AuthorizationRequest<'a> {
     /// Epoch-scoped editor-forwarded MCP invocation. The policy implementation
     /// never consults or writes the durable grant store for this variant.
     ForwardedMcpTool {
-        server: &'a str,
+        /// Host-owned bounded projection. Never pass the editor declaration
+        /// name into the interrupt/session-audit pipeline.
+        display_name: &'a str,
         tool: &'a str,
         transport: &'a str,
         identity: &'a str,
@@ -352,7 +354,7 @@ pub enum AuthorizationRequest<'a> {
     },
     /// Epoch-scoped editor-forwarded connection authorization.
     ForwardedMcpServerConnect {
-        server: &'a str,
+        display_name: &'a str,
         transport: &'a str,
         identity: &'a str,
     },
@@ -616,12 +618,12 @@ impl Approver {
                     .await
             }
             AuthorizationRequest::ForwardedMcpTool {
-                server,
+                display_name,
                 tool,
                 transport,
                 identity,
             } => {
-                self.approve_forwarded_mcp_inner(server, Some(tool), transport, identity)
+                self.approve_forwarded_mcp_inner(display_name, Some(tool), transport, identity)
                     .await
             }
             AuthorizationRequest::CustomTool {
@@ -644,11 +646,11 @@ impl Approver {
                     .await
             }
             AuthorizationRequest::ForwardedMcpServerConnect {
-                server,
+                display_name,
                 transport,
                 identity,
             } => {
-                self.approve_forwarded_mcp_inner(server, None, transport, identity)
+                self.approve_forwarded_mcp_inner(display_name, None, transport, identity)
                     .await
             }
             AuthorizationRequest::FileWrite {

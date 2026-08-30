@@ -1651,14 +1651,16 @@ mod backup_fallback_tests {
             2,
             "one provider request per dispatched turn"
         );
-        let system_message = |request: &cockpit_test_support::provider::CapturedRequest| {
+        fn system_message(
+            request: &cockpit_test_support::provider::CapturedRequest,
+        ) -> &serde_json::Value {
             request.body["messages"]
                 .as_array()
                 .expect("chat-completions messages")
                 .iter()
                 .find(|message| message["role"] == "system")
                 .expect("system preamble")
-        };
+        }
         assert_eq!(
             serde_json::to_vec(system_message(&requests[0])).unwrap(),
             serde_json::to_vec(system_message(&requests[1])).unwrap(),

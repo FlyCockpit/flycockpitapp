@@ -162,6 +162,7 @@ pub struct LocalGitSink {
     cwd: PathBuf,
     allowed_knowledge_bases: Option<BTreeSet<String>>,
     config: ExtendedConfig,
+    knowledge_access_trusted: bool,
 }
 
 /// TODO(hosted dream service): add `RemoteSink` when hosted KB writes can
@@ -175,12 +176,14 @@ impl LocalGitSink {
         cwd: PathBuf,
         allowed_knowledge_bases: Option<BTreeSet<String>>,
         config: ExtendedConfig,
+        knowledge_access_trusted: bool,
     ) -> Self {
         Self {
             session,
             cwd,
             allowed_knowledge_bases,
             config,
+            knowledge_access_trusted,
         }
     }
 }
@@ -206,6 +209,7 @@ impl DreamSink for LocalGitSink {
             &self.cwd,
             self.allowed_knowledge_bases.as_ref(),
             &self.config,
+            self.knowledge_access_trusted,
             &commit,
             cancel,
             move |root| apply_change_set_to_local_bundle(root, &change_set),
@@ -223,7 +227,7 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
         .collect();
     for upsert in &change_set.upserts {
         if let Some(concept) = by_id.get(upsert.id.as_str())
-            && concept.provenance == ConceptProvenance::Human
+            && concept.provenance() == Some(ConceptProvenance::Human.as_str())
         {
             bail!(
                 "dream cannot modify human-provenance concept `{}`",
@@ -236,27 +240,13 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
         .upserts
         .iter()
         .map(|upsert| {
-            let mut frontmatter = BTreeMap::new();
-            frontmatter.insert("id".to_owned(), upsert.id.clone());
-            frontmatter.insert(
-                "provenance".to_owned(),
-                ConceptProvenance::Dream.as_str().to_owned(),
+            let concept = KnowledgeConcept::dream(
+                upsert.id.clone(),
+                upsert.concept_type.clone(),
+                upsert.title.clone(),
+                upsert.body.clone(),
+                upsert.citations.clone(),
             );
-            if let Some(title) = &upsert.title {
-                frontmatter.insert("title".to_owned(), title.clone());
-            }
-            let concept = KnowledgeConcept {
-                id: upsert.id.clone(),
-                path: PathBuf::from(format!("{}.md", upsert.id)),
-                concept_type: upsert.concept_type.clone(),
-                provenance: ConceptProvenance::Dream,
-                frontmatter,
-                body: upsert.body.clone(),
-                citations: upsert.citations.clone(),
-                valid_from: None,
-                supersedes: Vec::new(),
-                invalidated_by: None,
-            };
             KnowledgeDreamWrite {
                 path: concept.path.to_string_lossy().into_owned(),
                 content: super::serialize_concept(&concept),
@@ -360,8 +350,7 @@ impl DreamEngine {
         for source in &sources {
             redaction = self
                 .session
-                .recall_redaction_table_from_base(&redaction, source.session_id)
-                .await?;
+                .recall_redaction_table_from_base(&redaction, source.session_id)?;
         }
         let redacted = redact_and_validate_change_set(change_set, &redaction)?;
         let sink_outcome = sink.apply(&model, &redacted, cancel).await?;
@@ -480,19 +469,19 @@ mod tests {
     use crate::config::providers::{ModelEntry, ProviderEntry};
 
     fn entry(trust_required: bool) -> KnowledgeBaseRegistryEntry {
-        KnowledgeBaseRegistryEntry {
-            id: "kb".into(),
-            name: "Knowledge".into(),
-            description: "test".into(),
-            source: KnowledgeBaseSource::Local {
+        KnowledgeBaseRegistryEntry::new(
+            "kb".into(),
+            "Knowledge".into(),
+            "test".into(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("kb"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
             trust_required,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        }
+            KnowledgeBaseMergePolicy::Auto,
+        )
     }
 
     fn providers(trust: ModelTrust) -> ProvidersConfig {

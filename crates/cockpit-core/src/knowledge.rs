@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,9 @@ use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
+
+pub(crate) mod dream;
+pub use dream::build_dream_prompt;
 
 /// Durable, paid projection of local KB chunks.  This database deliberately
 /// contains no OKF metadata or FTS state, so rebuilding the other sidecar can
@@ -131,6 +134,41 @@ pub(crate) struct KnowledgeConcept {
 }
 
 impl KnowledgeConcept {
+    /// Build a concept produced by the governed dream pipeline.  Provenance is
+    /// represented in the stable OKF frontmatter rather than as a parallel
+    /// in-memory field, so parsed and newly-created concepts have one source
+    /// of truth.
+    pub(crate) fn dream(
+        id: String,
+        concept_type: String,
+        title: Option<String>,
+        body: String,
+        citations: Vec<Citation>,
+    ) -> Self {
+        let mut frontmatter = BTreeMap::new();
+        frontmatter.insert("id".to_owned(), id.clone());
+        frontmatter.insert("provenance".to_owned(), "dream".to_owned());
+        if let Some(title) = title {
+            frontmatter.insert("title".to_owned(), title);
+        }
+        Self {
+            path: PathBuf::from(format!("{id}.md")),
+            id,
+            concept_type,
+            frontmatter,
+            body,
+            citations,
+            valid_from: None,
+            supersedes: Vec::new(),
+            invalidated_by: None,
+        }
+    }
+
+    /// Return the source-of-truth OKF provenance marker, when supplied.
+    pub(crate) fn provenance(&self) -> Option<&str> {
+        self.frontmatter.get("provenance").map(String::as_str)
+    }
+
     /// Resolve this concept's KB-scoped symbolic references at read time.
     /// Markdown serialization never calls this method, so the source tree and
     /// git only ever receive the symbolic token.
@@ -4534,8 +4572,7 @@ impl Tool for KnowledgeDreamSourcesTool {
         for source in &mut sources {
             let redactor = ctx
                 .session
-                .recall_redaction_table_from_base(&redaction_base, source.session_id)
-                .await?;
+                .recall_redaction_table_from_base(&redaction_base, source.session_id)?;
             source.title = source.title.take().map(|title| redactor.scrub(&title));
             source.description = redactor.scrub(&source.description);
         }

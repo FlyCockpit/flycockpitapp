@@ -28,6 +28,19 @@ const MAX_LIMIT: u32 = 50;
 const TOOL_SCAN_MAX_SESSIONS: u32 = 16;
 const TOOL_SCAN_MAX_ROWS_PER_SESSION: u32 = 20;
 
+/// Return the source-session attachment set established by
+/// `knowledge_dream_sources`.  The lock is session-owned so a reconstructed
+/// tool context observes the same turn-scoped consent, while poisoning fails
+/// closed rather than widening history recall.
+pub(crate) fn established_dream_read_scope(
+    ctx: &crate::engine::tool::ToolCtx,
+) -> Result<Option<std::collections::BTreeSet<uuid::Uuid>>> {
+    ctx.dream_read_scope
+        .read()
+        .map(|scope| scope.clone())
+        .map_err(|_| anyhow::anyhow!("knowledge dream read scope lock poisoned"))
+}
+
 pub struct HistorySearchTool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

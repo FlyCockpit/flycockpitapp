@@ -26,7 +26,6 @@ use crate::config::extended::{
     ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
     KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
 };
-use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
 use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
@@ -111,6 +110,15 @@ pub(crate) struct IndexStats {
 pub(crate) struct AttachedKnowledgeBase {
     entry: KnowledgeBaseRegistryEntry,
     provider: Arc<dyn KbProvider>,
+}
+
+/// The KBs a concrete model may access, plus local KB IDs withheld by the
+/// trusted-model policy. Keeping the denial separate from an empty registry
+/// lets tool callers report access denial without ever resolving a provider
+/// or reading a restricted source.
+pub(crate) struct AttachedKnowledgeBases {
+    bundles: Vec<AttachedKnowledgeBase>,
+    denied_knowledge_base_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1221,13 +1229,20 @@ pub(crate) async fn inject_knowledge_for_turn(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     query: &str,
     redact: Arc<RedactionTable>,
+    executing_model_trusted: bool,
 ) {
     let extended = config.extended();
-    let bundles = match attached_bundles(
+    let providers = config.providers();
+    if let Err(error) = validate_dream_models(&extended, &providers) {
+        tracing::warn!(%error, "refusing knowledge injection because dream-model policy is invalid");
+        return;
+    }
+    let attachments = match attached_bundles(
         session,
         cwd,
         definition.and_then(crate::agents::AgentDef::allowed_knowledge_bases),
         &extended,
+        executing_model_trusted,
     )
     .await
     {
@@ -1237,13 +1252,18 @@ pub(crate) async fn inject_knowledge_for_turn(
             return;
         }
     };
-    if bundles.is_empty() {
+    if attachments.bundles.is_empty() {
         return;
     }
     match production_embedder(&extended, config, redact.clone(), session).await {
         Ok(Some(embedder)) => {
-            match retrieve_from_knowledge_bases(&bundles, embedder, query, DEFAULT_SEARCH_LIMIT)
-                .await
+            match retrieve_from_knowledge_bases(
+                &attachments.bundles,
+                embedder,
+                query,
+                DEFAULT_SEARCH_LIMIT,
+            )
+            .await
             {
                 Ok(results) => {
                     if let Some(block) =
@@ -1332,12 +1352,33 @@ pub(crate) async fn attached_bundles_available(
     cwd: &Path,
     allowed_knowledge_bases: Option<&BTreeSet<String>>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    executing_model_trusted: bool,
 ) -> bool {
     let extended = config.extended();
-    match attached_bundles(session, cwd, allowed_knowledge_bases, &extended).await {
-        Ok(bundles) => {
+    let providers = config.providers();
+    if let Err(error) = validate_dream_models(&extended, &providers) {
+        tracing::warn!(%error, "knowledge registry dream-model policy failed closed");
+        return false;
+    }
+    match attached_bundles(
+        session,
+        cwd,
+        allowed_knowledge_bases,
+        &extended,
+        executing_model_trusted,
+    )
+    .await
+    {
+        Ok(attachments) => {
+            // Keep the retrieval tool present when every selected local KB is
+            // withheld solely by model trust. Its call then returns the
+            // explicit access-denied diagnostic instead of making a protected
+            // KB indistinguishable from an absent registry.
+            if !attachments.denied_knowledge_base_ids.is_empty() {
+                return true;
+            }
             let mut available = false;
-            for knowledge_base in bundles {
+            for knowledge_base in attachments.bundles {
                 match knowledge_base.provider.is_available().await {
                     Ok(true) => available = true,
                     Ok(false) => {}
@@ -1365,10 +1406,12 @@ pub(crate) async fn attached_bundles(
     cwd: &Path,
     allowed_knowledge_bases: Option<&BTreeSet<String>>,
     extended: &ExtendedConfig,
-) -> Result<Vec<AttachedKnowledgeBase>> {
+    executing_model_trusted: bool,
+) -> Result<AttachedKnowledgeBases> {
     let mut seen = BTreeSet::new();
     let mut seen_attachment_ids = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
+    let mut denied_knowledge_base_ids = Vec::new();
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
     if let Some(assistant) = assistant_knowledge_registry_entry(session).await? {
         registry.push(assistant);
@@ -1442,10 +1485,8 @@ pub(crate) async fn attached_bundles(
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
-        if entry.trust_required
-            && !crate::config::trust::runtime_policy()
-                .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
-        {
+        if entry.trust_required && !executing_model_trusted {
+            denied_knowledge_base_ids.push(entry.id.clone());
             continue;
         }
         let Some(provider) = provider_for(entry.clone(), local)? else {
@@ -1453,7 +1494,57 @@ pub(crate) async fn attached_bundles(
         };
         knowledge_bases.push(AttachedKnowledgeBase { entry, provider });
     }
-    Ok(knowledge_bases)
+    Ok(AttachedKnowledgeBases {
+        bundles: knowledge_bases,
+        denied_knowledge_base_ids,
+    })
+}
+
+fn validate_dream_model_trust(
+    entry: &KnowledgeBaseRegistryEntry,
+    providers: &crate::config::providers::ProvidersConfig,
+) -> Result<()> {
+    if !entry.trust_required {
+        return Ok(());
+    }
+    let Some(selector) = entry
+        .dream_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let (provider, model) = selector
+        .split_once(':')
+        .or_else(|| selector.split_once('/'))
+        .filter(|(provider, model)| !provider.trim().is_empty() && !model.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "knowledge base `{}` dream model `{selector}` must use provider:model or provider/model",
+                entry.id
+            )
+        })?;
+    if !providers
+        .resolve_trust(provider.trim(), model.trim())
+        .is_trusted()
+    {
+        bail!(
+            "knowledge base `{}` requires a trusted dream model; `{selector}` is untrusted",
+            entry.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_dream_models(
+    extended: &ExtendedConfig,
+    providers: &crate::config::providers::ProvidersConfig,
+) -> Result<()> {
+    for entry in &extended.knowledge_bases {
+        validate_dream_model_trust(entry, providers)?;
+    }
+    Ok(())
 }
 
 /// Resolve a workspace-local KB to the filesystem object that owns it.
@@ -1719,17 +1810,33 @@ pub(crate) async fn with_memory_search_if_attached(
     cwd: &Path,
     definition: Option<&crate::agents::AgentDef>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    executing_model_trusted: bool,
 ) -> crate::engine::tool::ToolBox {
     let allowed_knowledge_bases = definition
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
         .cloned();
-    if attached_bundles_available(session, cwd, allowed_knowledge_bases.as_ref(), config).await {
+    if attached_bundles_available(
+        session,
+        cwd,
+        allowed_knowledge_bases.as_ref(),
+        config,
+        executing_model_trusted,
+    )
+    .await
+    {
         toolbox.with(Arc::new(MemorySearchTool {
             allowed_knowledge_bases,
         }))
     } else {
         toolbox.without(MEMORY_SEARCH_TOOL_NAME)
     }
+}
+
+fn knowledge_access_denied_message(knowledge_base_ids: &[String]) -> String {
+    format!(
+        "Access denied: local knowledge base(s) {} require a trusted model.",
+        knowledge_base_ids.join(", ")
+    )
 }
 
 /// A turn-toolbox instance binds the executing agent definition's KB
@@ -1799,14 +1906,22 @@ impl Tool for KnowledgeRetrieveTool {
             return Err(invalid_input("knowledge_retrieve query must not be empty"));
         }
         let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        validate_dream_models(&extended, &providers)?;
         let bundles = attached_bundles(
             &ctx.session,
             &ctx.cwd,
             self.allowed_knowledge_bases.as_ref(),
             &extended,
+            ctx.knowledge_access_trusted,
         )
         .await?;
-        if bundles.is_empty() {
+        if bundles.bundles.is_empty() {
+            if !bundles.denied_knowledge_base_ids.is_empty() {
+                return Err(anyhow::anyhow!(knowledge_access_denied_message(
+                    &bundles.denied_knowledge_base_ids
+                )));
+            }
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available; no fresh-session subset was searched.",
             ));
@@ -1818,11 +1933,13 @@ impl Tool for KnowledgeRetrieveTool {
                 .await?
             {
                 Some(embedder) => {
-                    retrieve_from_knowledge_bases(&bundles, embedder, &args.query, limit).await?
+                    retrieve_from_knowledge_bases(&bundles.bundles, embedder, &args.query, limit)
+                        .await?
                 }
                 None => Vec::new(),
             };
-        let freshness = retrieve_undreamed_session_hits(&bundles, &args.query, limit, ctx).await?;
+        let freshness =
+            retrieve_undreamed_session_hits(&bundles.bundles, &args.query, limit, ctx).await?;
         Ok(ToolOutput::text(render_knowledge_retrieval(
             &results,
             &freshness,
@@ -2050,14 +2167,22 @@ impl Tool for MemorySearchTool {
             return Err(invalid_input("memory_search query must not be empty"));
         }
         let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        validate_dream_models(&extended, &providers)?;
         let bundles = attached_bundles(
             &ctx.session,
             &ctx.cwd,
             self.allowed_knowledge_bases.as_ref(),
             &extended,
+            ctx.knowledge_access_trusted,
         )
         .await?;
-        if bundles.is_empty() {
+        if bundles.bundles.is_empty() {
+            if !bundles.denied_knowledge_base_ids.is_empty() {
+                return Err(anyhow::anyhow!(knowledge_access_denied_message(
+                    &bundles.denied_knowledge_base_ids
+                )));
+            }
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
             ));
@@ -2070,7 +2195,8 @@ impl Tool for MemorySearchTool {
             ));
         };
         let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
-        let results = retrieve_from_knowledge_bases(&bundles, embedder, &args.query, limit).await?;
+        let results =
+            retrieve_from_knowledge_bases(&bundles.bundles, embedder, &args.query, limit).await?;
         let content = render_tool_results(&results, ctx.redact.as_ref());
         Ok(ToolOutput::text(content))
     }
@@ -2332,9 +2458,10 @@ mod tests {
             knowledge_bases: vec![entry],
             ..Default::default()
         };
-        let original = attached_bundles(&session, tmp.path(), None, &extended)
+        let original = attached_bundles(&session, tmp.path(), None, &extended, true)
             .await
             .unwrap()
+            .bundles
             .pop()
             .unwrap()
             .entry;
@@ -2356,9 +2483,10 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
         write_bundle(&root);
-        let replacement = attached_bundles(&session, tmp.path(), None, &extended)
+        let replacement = attached_bundles(&session, tmp.path(), None, &extended, true)
             .await
             .unwrap()
+            .bundles
             .pop()
             .unwrap()
             .entry;
@@ -2411,18 +2539,20 @@ mod tests {
             knowledge_bases: vec![entry],
             ..Default::default()
         };
-        let first = attached_bundles(&session, tmp.path(), None, &extended)
+        let first = attached_bundles(&session, tmp.path(), None, &extended, true)
             .await
             .unwrap()
+            .bundles
             .pop()
             .unwrap()
             .entry;
 
         fs::remove_file(&link).unwrap();
         symlink(&second_target, &link).unwrap();
-        let second = attached_bundles(&session, tmp.path(), None, &extended)
+        let second = attached_bundles(&session, tmp.path(), None, &extended, true)
             .await
             .unwrap()
+            .bundles
             .pop()
             .unwrap()
             .entry;
@@ -2735,9 +2865,8 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[tokio::test]
-    async fn project_bundle_trust_gated() {
+    async fn project_bundle_requires_a_trusted_model() {
         let _env = crate::test_env::lock_async().await;
-        crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let project_bundle = tmp.path().join(".cockpit/knowledge");
         write_bundle(&project_bundle);
@@ -2747,31 +2876,69 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        assert!(
-            attached_bundles(&session, tmp.path(), None, &extended)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        crate::config::trust::set_runtime_policy(
-            trust_root(tmp.path()),
-            WorkspaceTrustMode::Untrusted,
-        );
-        assert!(
-            attached_bundles(&session, tmp.path(), None, &extended)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
+        let denied = attached_bundles(&session, tmp.path(), None, &extended, false)
+            .await
+            .unwrap();
+        assert!(denied.bundles.is_empty());
         assert_eq!(
-            attached_bundles(&session, tmp.path(), None, &extended)
-                .await
-                .unwrap()
-                .len(),
-            1
+            denied.denied_knowledge_base_ids,
+            vec!["project".to_string()]
         );
-        crate::config::trust::clear_runtime_policy_for_tests();
+
+        let allowed = attached_bundles(&session, tmp.path(), None, &extended, true)
+            .await
+            .unwrap();
+        assert_eq!(allowed.bundles.len(), 1);
+    }
+
+    #[test]
+    fn trust_required_kb_rejects_an_untrusted_dream_model() {
+        let mut entry = project_knowledge_registry_entry();
+        entry.dream_model = Some("untrusted-provider:dreamer".to_string());
+        let error = validate_dream_models(
+            &ExtendedConfig {
+                knowledge_bases: vec![entry],
+                ..Default::default()
+            },
+            &crate::config::providers::ProvidersConfig::default(),
+        )
+        .expect_err("an untrusted dream model must be rejected for a trust-required KB");
+
+        assert!(error.to_string().contains("requires a trusted dream model"));
+        assert!(error.to_string().contains("untrusted-provider:dreamer"));
+    }
+
+    #[tokio::test]
+    async fn remote_kb_rejects_trust_required_with_a_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "hosted".to_string(),
+            "Hosted".to_string(),
+            "Hosted knowledge".to_string(),
+            KnowledgeBaseSource::Remote {
+                url: "https://knowledge.example.test".to_string(),
+            },
+            KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            None,
+            None,
+            true,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let error = attached_bundles(
+            &session,
+            tmp.path(),
+            None,
+            &ExtendedConfig {
+                knowledge_bases: vec![entry],
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect_err("remote KBs cannot enforce local model trust");
+
+        assert!(error.to_string().contains("cannot require local trust"));
     }
 
     #[tokio::test]
@@ -2803,11 +2970,12 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             tmp.path(),
             agent.allowed_knowledge_bases(),
             &extended,
+            true,
         )
         .await
         .unwrap();
-        assert_eq!(attached.len(), 1);
-        assert_eq!(attached[0].entry.id, "project");
+        assert_eq!(attached.bundles.len(), 1);
+        assert_eq!(attached.bundles[0].entry.id, "project");
     }
 
     #[tokio::test]
@@ -2840,12 +3008,21 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         )
         .unwrap();
 
-        let attached = attached_bundles(&session, tmp.path(), None, &ExtendedConfig::default())
-            .await
-            .unwrap();
-        assert_eq!(attached.len(), 1);
-        assert_eq!(attached[0].entry.id, format!("assistant-{installation_id}"));
-        assert!(attached[0].provider.is_available().await.unwrap());
+        let attached = attached_bundles(
+            &session,
+            tmp.path(),
+            None,
+            &ExtendedConfig::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached.bundles.len(), 1);
+        assert_eq!(
+            attached.bundles[0].entry.id,
+            format!("assistant-{installation_id}")
+        );
+        assert!(attached.bundles[0].provider.is_available().await.unwrap());
 
         fs::remove_dir_all(home.join("knowledge")).unwrap();
         fs::create_dir_all(home.join("knowledge")).unwrap();
@@ -2854,7 +3031,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             "---\ntype: replacement\n---\n\nReplacement knowledge must not be read.\n",
         )
         .unwrap();
-        let results = attached[0]
+        let results = attached.bundles[0]
             .provider
             .with_embedder(mock_embedder())
             .retrieve("release shipping procedure", DEFAULT_SEARCH_LIMIT)
@@ -2899,11 +3076,11 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        let attached = attached_bundles(&session, tmp.path(), None, &extended)
+        let attached = attached_bundles(&session, tmp.path(), None, &extended, false)
             .await
             .unwrap();
         let results = retrieve_from_knowledge_bases(
-            &attached,
+            &attached.bundles,
             mock_embedder(),
             "release shipping procedure",
             DEFAULT_SEARCH_LIMIT,
@@ -2955,11 +3132,11 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        let attached = attached_bundles(&session, tmp.path(), None, &extended)
+        let attached = attached_bundles(&session, tmp.path(), None, &extended, false)
             .await
             .unwrap();
         let error = retrieve_from_knowledge_bases(
-            &attached,
+            &attached.bundles,
             mock_embedder(),
             "release shipping procedure",
             DEFAULT_SEARCH_LIMIT,
@@ -2983,7 +3160,8 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
-                )
+                ),
+                false,
             )
             .await
         );
@@ -2992,7 +3170,6 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     #[tokio::test]
     async fn memory_search_tool_gated() {
         let _env = crate::test_env::lock_async().await;
-        crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
         let base = crate::engine::tool::ToolBox::new();
@@ -3004,7 +3181,8 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
-                )
+                ),
+                false,
             )
             .await
             .names()
@@ -3018,7 +3196,21 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
-        crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
+        assert!(
+            with_memory_search_if_attached(
+                base.clone(),
+                &session,
+                tmp.path(),
+                None,
+                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    tmp.path()
+                ),
+                false,
+            )
+            .await
+            .names()
+            .contains(&"memory_search")
+        );
         assert!(
             with_memory_search_if_attached(
                 base,
@@ -3027,13 +3219,13 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
-                )
+                ),
+                true,
             )
             .await
             .names()
             .contains(&"memory_search")
         );
-        crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     #[tokio::test]
@@ -3107,13 +3299,5 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         )
         .unwrap()
         .unwrap()
-    }
-
-    fn trust_root(root: &Path) -> crate::config::trust::TrustRoot {
-        crate::config::trust::TrustRoot {
-            opened_path: root.to_path_buf(),
-            root: root.to_path_buf(),
-            kind: crate::config::trust::TrustRootKind::Directory,
-        }
     }
 }

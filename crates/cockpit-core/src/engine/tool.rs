@@ -1058,6 +1058,10 @@ pub struct ToolCtx {
     /// delegated frames remain untrusted even when a host-selected fallback
     /// model is trusted, because their custody is redacted-untrusted.
     pub(crate) executing_model_trusted: bool,
+    /// Provider/model trust for KB access. This intentionally remains distinct
+    /// from `executing_model_trusted`: a delegated model may receive redacted
+    /// history while still being explicitly trusted for a local KB.
+    pub(crate) knowledge_access_trusted: bool,
     /// Stable daemon-owned lifecycle identity for this concrete executor.
     /// `None` is reserved for isolated tests and legacy headless helpers;
     /// production driver frames always carry a durable instance id.
@@ -1252,6 +1256,8 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            executing_model_trusted: self.executing_model_trusted,
+            knowledge_access_trusted: self.knowledge_access_trusted,
             agent_instance_id: self.agent_instance_id,
             lock_identity: self.lock_identity.clone(),
             write_scope: self.write_scope.clone(),

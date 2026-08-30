@@ -97,6 +97,10 @@ pub struct KnowledgeBaseRegistryEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub dream_schedule: Option<String>,
+    /// Local-KB access policy. When enabled, only a provider/model explicitly
+    /// configured as trusted may read or write this KB, including through its
+    /// dream model. It does not disable content redaction. Remote KBs cannot
+    /// enforce client-side model trust and are rejected when this is enabled.
     #[serde(rename = "trustRequired", default)]
     pub trust_required: bool,
     #[serde(rename = "mergePolicy")]

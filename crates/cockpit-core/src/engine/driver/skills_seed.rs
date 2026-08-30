@@ -305,6 +305,7 @@ impl Driver {
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
             executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
             agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,

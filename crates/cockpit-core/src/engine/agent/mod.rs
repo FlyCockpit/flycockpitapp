@@ -478,6 +478,7 @@ pub(crate) async fn turn_toolbox(
         cwd,
         agent.definition.as_deref(),
         config,
+        agent.model.is_trusted(),
     )
     .await;
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
@@ -1558,6 +1559,7 @@ mod redaction_placeholder_guard_tests {
         ToolCtx {
             agent_id: "builder".to_string(),
             executing_model_trusted: false,
+            knowledge_access_trusted: false,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,

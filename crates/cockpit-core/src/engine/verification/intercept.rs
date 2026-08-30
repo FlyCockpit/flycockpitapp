@@ -1395,6 +1395,7 @@ mod tests {
         ToolCtx {
             agent_id: "Build".to_string(),
             executing_model_trusted: false,
+            knowledge_access_trusted: false,
             agent_instance_id: Some(agent_instance_id),
             lock_identity: "Build".to_string(),
             write_scope: None,

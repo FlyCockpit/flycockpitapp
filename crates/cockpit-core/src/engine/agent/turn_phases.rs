@@ -2231,6 +2231,7 @@ pub(crate) async fn run_turn(
         &config,
         &knowledge_query,
         redact.clone(),
+        model.is_trusted(),
     )
     .await;
 
@@ -3310,6 +3311,7 @@ pub(crate) async fn run_turn(
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
         executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+        knowledge_access_trusted: agent.model.is_trusted(),
         agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
@@ -4079,6 +4081,7 @@ mod tests {
             tool_ctx: crate::engine::tool::ToolCtx {
                 agent_id: agent.name.clone(),
                 executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+                knowledge_access_trusted: agent.model.is_trusted(),
                 agent_instance_id: None,
                 lock_identity: agent.lock_identity.clone(),
                 write_scope: None,

@@ -3359,6 +3359,7 @@ mod tests {
         ToolCtx {
             agent_id: "Build".to_string(),
             executing_model_trusted: false,
+            knowledge_access_trusted: false,
             agent_instance_id: None,
             lock_identity: "Build".to_string().clone(),
             write_scope: None,

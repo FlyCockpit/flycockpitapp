@@ -154,11 +154,13 @@ impl Tool for HistorySearchTool {
                 }
                 let mut out = format!("Current artifact matches for `{query}`:\n");
                 for hit in hits {
+                    let snippet =
+                        redact_target_text(ctx, ctx.session.id, hit.snippet.trim()).await?;
                     out.push_str(&format!(
                         "cockpit://session/{}/artifacts/{}\n    {}\n",
                         ctx.session.short_id(),
                         hit.artifact_id,
-                        hit.snippet.trim()
+                        snippet.trim()
                     ));
                 }
                 Ok(ToolOutput::text(out))
@@ -209,7 +211,7 @@ impl Tool for HistorySearchTool {
                 } else {
                     None
                 };
-                render_lineage(query, hits, scan, limit, &ctx.session.project_id)
+                render_lineage(query, hits, scan, limit, ctx).await
             }
             HistorySearchScope::Past | HistorySearchScope::AllProjects => {
                 let all_projects = scope == HistorySearchScope::AllProjects;
@@ -240,18 +242,18 @@ impl Tool for HistorySearchTool {
                         .await
                 }
                 .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
-                render_session_hits(query, &hits, limit, all_projects, &ctx.session.project_id)
+                render_session_hits(query, &hits, limit, all_projects, ctx).await
             }
         }
     }
 }
 
-fn render_session_hits(
+async fn render_session_hits(
     query: &str,
     hits: &[crate::db::session_search::SearchHit],
     limit: u32,
     all_projects: bool,
-    current_project_id: &str,
+    ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
     if hits.is_empty() {
         let scope = if all_projects {
@@ -265,29 +267,35 @@ fn render_session_hits(
     }
     let mut out = String::new();
     for hit in hits.iter().take(limit as usize) {
-        let id = if hit.project_id == current_project_id {
+        let id = if hit.project_id == ctx.session.project_id {
             hit.short_id
                 .clone()
                 .unwrap_or_else(|| hit.session_id.to_string())
         } else {
             hit.session_id.to_string()
         };
-        let title = hit.title.as_deref().unwrap_or("(untitled)");
+        let title = redact_target_text(
+            ctx,
+            hit.session_id,
+            hit.title.as_deref().unwrap_or("(untitled)"),
+        )
+        .await?;
+        let snippet = redact_target_text(ctx, hit.session_id, hit.snippet.trim()).await?;
         out.push_str(&format!(
             "cockpit://session/{id}/transcript  {}  {title}\n    {}\n",
             human_date(hit.last_active_at_unix_ms),
-            hit.snippet.trim()
+            snippet.trim()
         ));
     }
     Ok(ToolOutput::text(out))
 }
 
-fn render_lineage(
+async fn render_lineage(
     query: &str,
     hits: Vec<crate::db::session_search::SearchHit>,
     scan: Option<crate::db::session_search::ToolEventScan>,
     limit: u32,
-    current_project_id: &str,
+    ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
     if hits.is_empty() && scan.as_ref().is_none_or(|scan| scan.hits.is_empty()) {
         return Ok(ToolOutput::text(format!(
@@ -296,28 +304,37 @@ fn render_lineage(
     }
     let mut out = format!("Lineage history matches for `{query}`:\n");
     for hit in hits.into_iter().take(limit as usize) {
-        let id = if hit.project_id == current_project_id {
+        let id = if hit.project_id == ctx.session.project_id {
             hit.short_id.unwrap_or_else(|| hit.session_id.to_string())
         } else {
             hit.session_id.to_string()
         };
+        let title = redact_target_text(
+            ctx,
+            hit.session_id,
+            hit.title.as_deref().unwrap_or("(untitled)"),
+        )
+        .await?;
+        let snippet = redact_target_text(ctx, hit.session_id, hit.snippet.trim()).await?;
         out.push_str(&format!(
             "cockpit://session/{id}/transcript  {}  {}\n    {}\n",
             human_date(hit.last_active_at_unix_ms),
-            hit.title.as_deref().unwrap_or("(untitled)"),
-            hit.snippet.trim()
+            title.trim(),
+            snippet.trim()
         ));
     }
     if let Some(scan) = scan {
         if !scan.hits.is_empty() {
             out.push_str("\nBounded tool-event matches:\n");
             for hit in scan.hits {
+                let event_type = redact_target_text(ctx, hit.session_id, &hit.event_type).await?;
+                let snippet = redact_target_text(ctx, hit.session_id, hit.snippet.trim()).await?;
                 out.push_str(&format!(
                     "{} [{}] {}: {}\n",
                     hit.session_id,
                     hit.seq,
-                    hit.event_type,
-                    hit.snippet.trim()
+                    event_type.trim(),
+                    snippet.trim()
                 ));
             }
         }
@@ -329,6 +346,25 @@ fn render_lineage(
         }
     }
     Ok(ToolOutput::text(out))
+}
+
+/// Build the model-visible redactor for one history target. A target session's
+/// persisted table is durable knowledge of secrets it observed, so it must be
+/// unioned with the caller's table even for same-workspace recall. Parse and
+/// union errors fail the search rather than exposing an unredacted snippet.
+async fn redact_target_text(ctx: &ToolCtx, session_id: uuid::Uuid, text: &str) -> Result<String> {
+    let Some(target_table) = ctx
+        .session
+        .persisted_redaction_table_for_session(session_id)
+        .await?
+    else {
+        return Ok(ctx.redact.scrub(text));
+    };
+    let redactor = ctx
+        .redact
+        .union(&target_table)
+        .map_err(|error| anyhow::anyhow!("history_search target redaction union: {error:#}"))?;
+    Ok(redactor.scrub(text))
 }
 
 pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
@@ -467,6 +503,61 @@ mod tests {
             "current session must be excluded: {}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn target_session_redaction_covers_search_snippets_and_recall_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let secret = "target-session-history-secret";
+        let other = ctx
+            .session
+            .db
+            .create_session(&ctx.session.project_id, "/x", "Build")
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .insert_session_event(
+                other.session_id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": format!("stored {secret}") }),
+            )
+            .await
+            .unwrap();
+        let target_redaction = crate::redact::RedactionTable::empty()
+            .with_forced_literal(secret.to_string(), "test".to_string())
+            .unwrap();
+        ctx.session
+            .db
+            .set_session_redaction_table_json(
+                other.session_id,
+                Some(target_redaction.to_persisted_json().unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let found = HistorySearchTool
+            .call(json!({ "query": secret }), &ctx)
+            .await
+            .unwrap();
+        assert!(!found.content.contains(secret), "{}", found.content);
+
+        let path = format!("cockpit://session/{}/transcript", other.short_id.unwrap());
+        let read = crate::tools::recall::read(&json!({ "path": path.clone() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!read.content.contains(secret), "{}", read.content);
+        let grep = crate::tools::recall::grep(
+            &json!({ "path": path, "pattern": secret, "mode": "literal" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(grep.content, "No matches.");
     }
 
     #[tokio::test]

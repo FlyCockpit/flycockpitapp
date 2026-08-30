@@ -45,12 +45,30 @@ pub fn is_recall_path(path: &str) -> bool {
     path.starts_with(PREFIX)
 }
 
+/// `history_search` is the recall capability. The ordinary file tools may
+/// route `cockpit://` requests here, but that routing must not turn their
+/// ambient filesystem authority into history authority.
+fn require_recall_authority(ctx: &ToolCtx) -> Result<()> {
+    if ctx.available_tools.contains("history_search") {
+        return Ok(());
+    }
+    Err(invalid_input(
+        "`cockpit://` recall is unavailable to this agent; use an agent granted `history_search`",
+    ))
+}
+
 pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_input("`path` is required"))?;
+    if is_recall_path(path) {
+        require_recall_authority(ctx)?;
+    }
     let target = parse(path, ctx).await?;
+    // Rehydrate and union the target's durable redaction knowledge before
+    // loading any target-owned bytes for the recall response.
+    let redactor = redactor_for_target(ctx, target).await?;
     let content = match target {
         RecallPath::History => history_directory(ctx).await?,
         target => match pseudofile_content(target, ctx).await? {
@@ -60,7 +78,7 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     };
     // Scrub before selecting a page so a secret split across a page boundary
     // cannot leave a prefix or suffix in a later continuation.
-    render_page(&ctx.redact.scrub(&content), path, args)
+    render_page(&redactor.scrub(&content), path, args)
 }
 
 pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
@@ -127,6 +145,7 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
     if !is_recall_path(requested) && !pattern.starts_with(PREFIX) {
         return Ok(None);
     }
+    require_recall_authority(ctx)?;
     let resolved_pattern = history_glob_pattern(pattern, path)?;
     let matcher = globset::Glob::new(&resolved_pattern)
         .map_err(|err| invalid_input(format!("invalid glob `{resolved_pattern}`: {err}")))?
@@ -166,6 +185,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     if !is_recall_path(path) {
         return Ok(None);
     }
+    require_recall_authority(ctx)?;
     let target = parse(path, ctx).await?;
     if matches!(target, RecallPath::History) {
         return Err(invalid_input(
@@ -177,6 +197,9 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_input("`pattern` is required"))?;
+    // Construct the union before loading target-owned bytes so every recall
+    // path has the same target-redaction ordering as `read`.
+    let redactor = redactor_for_target(ctx, target).await?;
     let Some(content) = pseudofile_content(target, ctx).await? else {
         return Ok(Some(not_found(path, target)));
     };
@@ -197,7 +220,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
 
     // Search the complete redacted pseudofile, rather than `read`'s first
     // byte-capped result. The result itself has an independent byte cap.
-    let content = ctx.redact.scrub(&content);
+    let content = redactor.scrub(&content);
     let mut out = String::new();
     let mut matches = 0usize;
     for (line, text) in content.lines().enumerate() {
@@ -324,6 +347,29 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
             .map(|artifact| crate::text_artifact_blob::read_artifact_content(&artifact))
             .transpose()?),
     }
+}
+
+async fn redactor_for_target(
+    ctx: &ToolCtx,
+    target: RecallPath,
+) -> Result<crate::redact::RedactionTable> {
+    let session_id = match target {
+        RecallPath::History => return Ok(ctx.redact.as_ref().clone()),
+        RecallPath::Transcript(session_id)
+        | RecallPath::Compaction(session_id, _)
+        | RecallPath::Plan(session_id)
+        | RecallPath::Artifact(session_id, _) => session_id,
+    };
+    let Some(target_table) = ctx
+        .session
+        .persisted_redaction_table_for_session(session_id)
+        .await?
+    else {
+        return Ok(ctx.redact.as_ref().clone());
+    };
+    ctx.redact
+        .union(&target_table)
+        .map_err(|error| anyhow::anyhow!("unioning target-session redaction table: {error:#}"))
 }
 
 fn not_found(path: &str, target: RecallPath) -> ToolOutput {
@@ -629,6 +675,8 @@ fn truncated_search_output(mut out: String) -> ToolOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -744,5 +792,29 @@ mod tests {
         .unwrap();
         assert!(regex.content.model_text().contains("a+b"));
         assert!(regex.content.model_text().contains("axb"));
+    }
+
+    #[tokio::test]
+    async fn recall_provider_rejects_callers_without_history_search() {
+        let tmp = TempDir::new().unwrap();
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        ctx.available_tools = Arc::new(HashSet::from(["read".to_string(), "grep".to_string()]));
+        let path = format!("cockpit://session/{}/transcript", ctx.session.short_id());
+
+        for result in [
+            read(&json!({ "path": path.clone() }), &ctx)
+                .await
+                .map(|_| ()),
+            grep(
+                &json!({ "path": path.clone(), "pattern": "anything", "mode": "literal" }),
+                &ctx,
+            )
+            .await
+            .map(|_| ()),
+            glob("cockpit://history/**", None, &ctx).await.map(|_| ()),
+        ] {
+            assert!(result.is_err());
+            assert!(format!("{:#}", result.unwrap_err()).contains("history_search"));
+        }
     }
 }

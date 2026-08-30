@@ -51,6 +51,15 @@ impl Db {
         .await
     }
 
+    /// Return this workspace's explicit consent state. Missing rows are the
+    /// safe default so callers can render an actionable disabled status.
+    pub async fn workspace_history_scope(&self, project_id: &str) -> Result<WorkspaceHistoryScope> {
+        validate_project_id(project_id)?;
+        let project_id = project_id.to_string();
+        self.read(move |conn| workspace_history_scope_conn(conn, &project_id))
+            .await
+    }
+
     /// Same-workspace history is always visible. Cross-workspace history
     /// requires the querying workspace's outbound consent and the target
     /// workspace's inbound consent in one database snapshot.

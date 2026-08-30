@@ -532,6 +532,21 @@ pub enum ConfigCommand {
     /// Import portable provider/model policy JSON without credentials.
     #[command(name = "import-policy")]
     ImportPolicy(ConfigImportPolicyArgs),
+    /// Show or set this workspace's cross-workspace history-recall consent.
+    #[command(name = "history-scope")]
+    HistoryScope(ConfigHistoryScopeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ConfigHistoryScopeArgs {
+    /// Workspace root to configure (defaults to the current directory).
+    pub path: Option<PathBuf>,
+    /// Permit this workspace to search history in other consenting workspaces.
+    #[arg(long)]
+    pub outbound: Option<bool>,
+    /// Permit other consenting workspaces to search this workspace's history.
+    #[arg(long)]
+    pub inbound: Option<bool>,
 }
 
 #[cfg(feature = "extended")]

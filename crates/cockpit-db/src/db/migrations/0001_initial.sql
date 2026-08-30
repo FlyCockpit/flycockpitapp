@@ -173,6 +173,15 @@ CREATE TABLE sessions (
         AND length(CAST(model_system_prompt_snapshot_json AS BLOB)) <= 8388608
     ),
 
+    -- Frozen knowledge-base identity and freshness snapshot for this
+    -- conversation lineage. The daemon injects any later dream completion as
+    -- history rather than rewriting this cached system-prompt prefix.
+    knowledge_base_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(knowledge_base_prompt_snapshot_json)
+        AND json_type(knowledge_base_prompt_snapshot_json) = 'object'
+        AND length(CAST(knowledge_base_prompt_snapshot_json AS BLOB)) <= 8388608
+    ),
+
     -- 1 for hidden side-conversation forks. Legacy `/side` rows are
     -- throwaway and swept on daemon boot; BTW rows carry
     -- btw_parent_session_id and are persistent until explicit end or parent

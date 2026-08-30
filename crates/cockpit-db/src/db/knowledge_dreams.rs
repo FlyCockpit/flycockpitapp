@@ -195,20 +195,7 @@ impl Db {
         let project_root = project_root.to_owned();
         let consumer_id = consumer_id.to_owned();
         self.read(move |conn| {
-            conn.query_row(
-                "SELECT MAX(last_dreamed_at_unix_ms) FROM (
-                    SELECT MAX(dreamed_at_unix_ms) AS last_dreamed_at_unix_ms
-                      FROM knowledge_dreamed_sessions
-                     WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3
-                    UNION ALL
-                    SELECT last_dreamed_at_unix_ms
-                      FROM knowledge_dream_schedule_state
-                     WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3
-                 )",
-                params![kb_id, project_root, consumer_id],
-                |row| row.get(0),
-            )
-            .context("loading knowledge-base last dreamed time")
+            knowledge_base_last_dreamed_at_conn(conn, &kb_id, &project_root, &consumer_id)
         })
         .await
     }
@@ -332,6 +319,35 @@ impl Db {
         })
         .await
     }
+}
+
+/// Connection-level form used while atomically creating a session's frozen
+/// knowledge-prompt snapshot. It deliberately shares the daemon status query
+/// so the stable prefix and live freshness notices agree on what "dreamed"
+/// means for an installation.
+pub fn knowledge_base_last_dreamed_at_conn(
+    conn: &rusqlite::Connection,
+    kb_id: &str,
+    project_root: &str,
+    consumer_id: &str,
+) -> Result<Option<i64>> {
+    validate_kb_id(kb_id)?;
+    validate_project_root(project_root)?;
+    validate_consumer_id(consumer_id)?;
+    conn.query_row(
+        "SELECT MAX(last_dreamed_at_unix_ms) FROM (
+            SELECT MAX(dreamed_at_unix_ms) AS last_dreamed_at_unix_ms
+              FROM knowledge_dreamed_sessions
+             WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3
+            UNION ALL
+            SELECT last_dreamed_at_unix_ms
+              FROM knowledge_dream_schedule_state
+             WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3
+         )",
+        params![kb_id, project_root, consumer_id],
+        |row| row.get(0),
+    )
+    .context("loading knowledge-base last dreamed time")
 }
 
 fn validate_kb_id(value: &str) -> Result<()> {

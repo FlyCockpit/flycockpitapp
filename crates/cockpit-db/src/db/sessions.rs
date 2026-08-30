@@ -231,6 +231,9 @@ pub struct SessionRow {
     pub guidance_baseline_hash: Option<String>,
     pub redaction_table_json: Option<String>,
     pub model_system_prompt_snapshot_json: String,
+    /// Frozen KB names/descriptions/last-dreamed facts for the cached system
+    /// prefix. Later dream completion is delivered as injected history.
+    pub knowledge_base_prompt_snapshot_json: String,
     pub created_by_principal: Option<String>,
     pub shared_with_collaborators: bool,
     /// Session lifecycle barrier. `active` accepts work; `deleting` rejects new
@@ -309,6 +312,9 @@ impl SessionRow {
             redaction_table_json: row.get("redaction_table_json")?,
             model_system_prompt_snapshot_json: row
                 .get("model_system_prompt_snapshot_json")
+                .unwrap_or_else(|_| "{}".to_string()),
+            knowledge_base_prompt_snapshot_json: row
+                .get("knowledge_base_prompt_snapshot_json")
                 .unwrap_or_else(|_| "{}".to_string()),
             created_by_principal: row.get("created_by_principal")?,
             shared_with_collaborators: row.get::<_, i64>("shared_with_collaborators")? != 0,
@@ -453,8 +459,9 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
+          knowledge_base_prompt_snapshot_json,
           assistant_name, created_by_principal, shared_with_collaborators, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -475,6 +482,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.guidance_baseline_hash,
             row.redaction_table_json,
             row.model_system_prompt_snapshot_json,
+            row.knowledge_base_prompt_snapshot_json,
             row.assistant_name,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
@@ -519,8 +527,9 @@ fn execute_fork_insert(
           title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
-          model_system_prompt_snapshot_json, assistant_name, active_model_revision, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+          model_system_prompt_snapshot_json, knowledge_base_prompt_snapshot_json,
+          assistant_name, active_model_revision, is_dream_session)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -550,6 +559,7 @@ fn execute_fork_insert(
             row.btw_tangent as i64,
             row.model_selection_json,
             row.model_system_prompt_snapshot_json,
+            row.knowledge_base_prompt_snapshot_json,
             row.assistant_name,
             row.active_model_revision,
             row.is_dream_session as i64,
@@ -680,6 +690,7 @@ fn build_session_row(
         guidance_baseline_hash: None,
         redaction_table_json: None,
         model_system_prompt_snapshot_json: "{}".to_string(),
+        knowledge_base_prompt_snapshot_json: "{}".to_string(),
         created_by_principal: None,
         shared_with_collaborators: false,
         lifecycle: "active".to_string(),
@@ -1371,6 +1382,7 @@ impl Db {
             guidance_baseline_hash: parent.guidance_baseline_hash,
             redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
+            knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             created_by_principal: parent.created_by_principal,
             shared_with_collaborators: false,
             lifecycle: "active".to_string(),
@@ -1525,6 +1537,7 @@ impl Db {
             guidance_baseline_hash: parent.guidance_baseline_hash,
             redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
+            knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             created_by_principal: parent.created_by_principal,
             shared_with_collaborators: false,
             lifecycle: "active".to_string(),
@@ -3708,11 +3721,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_session_row_round_trips_model_system_prompt_snapshot_json() {
+    async fn insert_session_row_round_trips_cached_prompt_snapshots() {
         let db = Db::open_in_memory().unwrap();
         let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
         row.model_system_prompt_snapshot_json =
             r#"{"prompts":{"p":{"m":"model instructions"}}}"#.to_string();
+        row.knowledge_base_prompt_snapshot_json = r#"{"entries":[{"id":"kb","name":"Team notes","description":"Shared decisions","last_dreamed_at_unix_ms":42}]}"#.to_string();
 
         db.insert_session_row(&row).await.unwrap();
 
@@ -3720,6 +3734,10 @@ mod tests {
         assert_eq!(
             got.model_system_prompt_snapshot_json,
             r#"{"prompts":{"p":{"m":"model instructions"}}}"#
+        );
+        assert_eq!(
+            got.knowledge_base_prompt_snapshot_json,
+            r#"{"entries":[{"id":"kb","name":"Team notes","description":"Shared decisions","last_dreamed_at_unix_ms":42}]}"#
         );
     }
 
@@ -3926,6 +3944,7 @@ mod tests {
         );
         parent.model_system_prompt_snapshot_json =
             r#"{"prompts":{"anthropic":{"opus-4-7":"fork prompt"}}}"#.to_string();
+        parent.knowledge_base_prompt_snapshot_json = r#"{"entries":[{"id":"kb","name":"Team notes","description":"Shared decisions","last_dreamed_at_unix_ms":42}]}"#.to_string();
         let parent = db.insert_session_row(&parent).await.unwrap();
         let fork_point = record_message(&db, parent.session_id, "fork here", false)
             .await
@@ -3940,6 +3959,10 @@ mod tests {
         assert_eq!(fork.project_root, "/proj");
         assert_eq!(fork.active_agent, "Build");
         assert_eq!(fork.parent_session_id, Some(parent.session_id));
+        assert_eq!(
+            fork.knowledge_base_prompt_snapshot_json,
+            parent.knowledge_base_prompt_snapshot_json
+        );
         assert_eq!(
             fork.fork_point_turn_id.as_deref(),
             Some(fork_point.as_str())

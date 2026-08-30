@@ -14047,6 +14047,7 @@ impl Driver {
             session_short_id: self.session.short_id(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
+            knowledge_base_system_prefix: self.session.knowledge_base_system_prompt(),
             interactive,
             mcp_parent_reachable: None,
             // Root construction may consume explicit/resumed selection

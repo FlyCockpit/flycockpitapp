@@ -124,6 +124,9 @@ pub struct SpawnArgs {
     pub assistant_identity_prefix: Option<String>,
     /// Frozen model-specific prompt snapshot for this session/invocation.
     pub model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
+    /// Frozen KB identity/freshness block for this session. It is appended to
+    /// the cached system prompt and never replaced by live dream status.
+    pub knowledge_base_system_prefix: String,
     /// Whether this agent is being spawned into a user-facing
     /// interactive session (the daemon root, or an interactive handoff
     /// such as `builder`) versus a one-shot leaf delegation
@@ -1189,7 +1192,11 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         || args.compiled_guidance.clone(),
         |compiler| compiler.compile(&args.cwd, model.provider_id(), model.model_id_ref()),
     );
-    let role_prompt = assistant_role_prompt(role_prompt, args.assistant_identity_prefix.as_deref());
+    let role_prompt = stable_session_role_prompt(
+        role_prompt,
+        args.assistant_identity_prefix.as_deref(),
+        &args.knowledge_base_system_prefix,
+    );
     let model_prompt = args
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
@@ -1225,6 +1232,26 @@ fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
     }
     out.push('\n');
     out.push_str(role_prompt);
+    out
+}
+
+fn stable_session_role_prompt(
+    role_prompt: &str,
+    assistant_identity_prefix: Option<&str>,
+    knowledge_base_system_prefix: &str,
+) -> String {
+    let role_prompt = assistant_role_prompt(role_prompt, assistant_identity_prefix);
+    let knowledge_base_system_prefix = knowledge_base_system_prefix.trim();
+    if knowledge_base_system_prefix.is_empty() {
+        return role_prompt;
+    }
+    let mut out = String::with_capacity(knowledge_base_system_prefix.len() + role_prompt.len() + 2);
+    out.push_str(knowledge_base_system_prefix);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&role_prompt);
     out
 }
 
@@ -2190,7 +2217,11 @@ fn compose_reposture_system(
     cwd: &Path,
 ) -> String {
     let snapshot = session.model_system_prompt_snapshot();
-    let role = assistant_role_prompt(role, assistant_identity_prefix);
+    let role = stable_session_role_prompt(
+        role,
+        assistant_identity_prefix,
+        &session.knowledge_base_system_prompt(),
+    );
     let short_id = session.short_id();
     let role_system = compose_system_prompt(&role, &short_id, cwd);
     match snapshot.get(model.provider_id(), model.model_id_ref()) {
@@ -4225,6 +4256,7 @@ pub(crate) mod tests {
             session_short_id: String::new(),
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
+            knowledge_base_system_prefix: String::new(),
             interactive: true,
             mcp_parent_reachable: None,
             model_override: None,
@@ -7658,6 +7690,24 @@ pub(crate) mod tests {
         let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
         let with_snapshot = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
         assert_eq!(with_snapshot, existing);
+    }
+
+    #[test]
+    fn compose_system_prompt_keeps_kb_snapshot_in_cached_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.knowledge_base_system_prefix =
+            "Knowledge bases (session-start snapshot):\n- Team Notes\n".to_string();
+
+        let first = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        let second = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+
+        assert_eq!(
+            first, second,
+            "KB prefix must be byte-identical across turns"
+        );
+        assert!(first.contains("Knowledge bases (session-start snapshot):"));
+        assert!(first.contains("- Team Notes"));
     }
 
     /// Config with a name set, used by the deterministic name-present case.

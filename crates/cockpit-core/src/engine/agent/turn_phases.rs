@@ -3528,6 +3528,19 @@ async fn inject_turn_start_system_messages(
     if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
         history.push(Message::System { content: notice });
     }
+    // Dream completion is volatile session state. Deliver it only as a
+    // root-turn history message; the stable KB snapshot in the cached system
+    // prefix is intentionally never rewritten.
+    if is_root {
+        for notice in session.knowledge_base_freshness_notices().await {
+            if !history
+                .iter()
+                .any(|message| matches!(message, Message::System { content } if content == &notice))
+            {
+                history.push(Message::System { content: notice });
+            }
+        }
+    }
     if let Some(nudge) =
         session.unnamed_session_title_nudge(active_tool_names.contains(&"mcp"), is_root)
         && !history

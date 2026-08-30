@@ -9570,6 +9570,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             session_short_id: session.short_id(),
             assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+            knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
             interactive: false,
             mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().reachable_bindings()),
             model_override: None,
@@ -12137,6 +12138,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     session_short_id: session.short_id(),
                     assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+                    knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
                     interactive: false,
                     mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
                     model_override: None,
@@ -12640,6 +12642,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         session_short_id: session.short_id(),
                         assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+                        knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
                         interactive: false,
                         mcp_parent_reachable: Some(
                             agent.mcp_resolver.catalog().reachable_bindings(),

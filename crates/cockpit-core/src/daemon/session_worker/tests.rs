@@ -3404,6 +3404,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         model_system_prompt_snapshot: Arc::new(
             crate::model_system_prompt::ModelSystemPromptSnapshot::empty(),
         ),
+        knowledge_base_system_prefix: String::new(),
         interactive: true,
         mcp_parent_reachable: None,
         model_override: None,

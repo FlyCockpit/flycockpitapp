@@ -147,6 +147,19 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
     ModelSystemPromptSnapshot::capture(&providers).to_json_string()
 }
 
+fn capture_knowledge_base_prompt_snapshot_json(
+    db: &Db,
+    project_root: &std::path::Path,
+) -> Result<String> {
+    let config = crate::config::extended::load_for_cwd(project_root);
+    let project_root = project_root.to_string_lossy().into_owned();
+    db.blocking_write_for_sync_maintenance(move |conn| {
+        crate::knowledge::KnowledgeBasePromptSnapshot::capture(&config, conn, &project_root)
+            .map(|snapshot| snapshot.to_json_string())
+    })
+    .context("capturing knowledge-base prompt snapshot")
+}
+
 impl Session {
     /// Create a brand-new session, inserting its row in the DB.
     #[allow(dead_code)]
@@ -172,6 +185,8 @@ impl Session {
         })?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
+        row.knowledge_base_prompt_snapshot_json =
+            capture_knowledge_base_prompt_snapshot_json(&db, &project_root)?;
         let row_for_db = row.clone();
         let row = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -211,6 +226,8 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
+        row.knowledge_base_prompt_snapshot_json =
+            capture_knowledge_base_prompt_snapshot_json(&db, &project_root)?;
         let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -288,6 +305,8 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
+        row.knowledge_base_prompt_snapshot_json =
+            capture_knowledge_base_prompt_snapshot_json(&db, &project_root)?;
         let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -460,6 +479,11 @@ impl Session {
         let model_system_prompt_snapshot = Arc::new(ModelSystemPromptSnapshot::from_json_str(
             &row.model_system_prompt_snapshot_json,
         ));
+        let knowledge_base_prompt_snapshot = Arc::new(
+            crate::knowledge::KnowledgeBasePromptSnapshot::from_json_str(
+                &row.knowledge_base_prompt_snapshot_json,
+            ),
+        );
         let short_id = match row.short_id.clone() {
             Some(s) => s,
             None => {
@@ -536,6 +560,8 @@ impl Session {
             redaction_table_json: Mutex::new(redaction_table_json),
             secret_path_matcher: std::sync::OnceLock::new(),
             model_system_prompt_snapshot,
+            knowledge_base_prompt_snapshot,
+            knowledge_base_freshness_notices: Mutex::new(std::collections::BTreeMap::new()),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),

@@ -36,6 +36,7 @@ use crate::db::Db;
 use crate::db::sessions::SessionRow;
 use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
+use crate::knowledge::KnowledgeBasePromptSnapshot;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
 pub mod export;
@@ -356,6 +357,13 @@ pub struct Session {
     redaction_table_json: Mutex<Option<String>>,
     secret_path_matcher: OnceLock<crate::secret_paths::SecretPathMatcher>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
+    /// Immutable session-start KB identity/freshness facts rendered into the
+    /// cached system prefix. Never rewritten after a dream completes.
+    knowledge_base_prompt_snapshot: Arc<KnowledgeBasePromptSnapshot>,
+    /// In-memory delivery watermarks for volatile dream-completion notices.
+    /// They intentionally reset on attach: the persisted snapshot remains the
+    /// authority for whether a resumed session needs one notice.
+    knowledge_base_freshness_notices: Mutex<std::collections::BTreeMap<String, i64>>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -1183,6 +1191,78 @@ impl Session {
         self.model_system_prompt_snapshot.clone()
     }
 
+    /// Stable KB block for the cached system prompt. Its source is the
+    /// session-start snapshot, never a live registry or dream-status read.
+    pub fn knowledge_base_system_prompt(&self) -> String {
+        self.knowledge_base_prompt_snapshot.render_system_block()
+    }
+
+    /// Return one-line, per-turn freshness facts for dreams that completed
+    /// after this session began. This does not update the cached system prompt.
+    pub async fn knowledge_base_freshness_notices(&self) -> Vec<String> {
+        let snapshot = self.knowledge_base_prompt_snapshot.clone();
+        if snapshot.entries().is_empty() {
+            return Vec::new();
+        }
+        let consumer = match self.db.ensure_installation_identity().await {
+            Ok(consumer) => consumer,
+            Err(error) => {
+                tracing::warn!(%error, "loading installation identity for knowledge freshness failed");
+                return Vec::new();
+            }
+        };
+        let project_root = self.project_root.to_string_lossy().into_owned();
+        let already_announced = self
+            .knowledge_base_freshness_notices
+            .lock()
+            .unwrap()
+            .clone();
+        let mut fresh = Vec::new();
+        for entry in snapshot.entries() {
+            let current = match self
+                .db
+                .knowledge_base_last_dreamed_at(&entry.id, &project_root, consumer.as_hex())
+                .await
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(knowledge_base = %entry.id, %error, "loading knowledge freshness failed");
+                    continue;
+                }
+            };
+            let Some(current) = current else {
+                continue;
+            };
+            if entry
+                .last_dreamed_at_unix_ms
+                .map_or(true, |snapshot| current > snapshot)
+                && already_announced
+                    .get(&entry.id)
+                    .map_or(true, |announced| current > *announced)
+            {
+                fresh.push((entry.id.clone(), entry.name.clone(), current));
+            }
+        }
+
+        let mut announced = self.knowledge_base_freshness_notices.lock().unwrap();
+        fresh
+            .into_iter()
+            .filter_map(|(id, name, timestamp)| {
+                if announced
+                    .get(&id)
+                    .is_some_and(|previous| *previous >= timestamp)
+                {
+                    return None;
+                }
+                announced.insert(id, timestamp);
+                Some(format!(
+                    "KB {name} finished a new dream at {}; newer knowledge is now available.",
+                    crate::knowledge::format_dream_timestamp(timestamp)
+                ))
+            })
+            .collect()
+    }
+
     /// Record that the model successfully used the dedicated tool `tool` this
     /// session, for the defensive bash-routing nudge's self-suppression
     /// (implementation note). Only the
@@ -1667,6 +1747,40 @@ mod tests {
             assert!(scope.read().unwrap().is_some());
         }
         assert!(scope.read().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dream_completion_injects_freshness_without_rewriting_kb_prefix() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.knowledge_base_prompt_snapshot = Arc::new(
+            KnowledgeBasePromptSnapshot::from_json_str(
+                r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":null}]}"#,
+            ),
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let root = root.path().to_string_lossy().into_owned();
+        db.attach_session_to_knowledge_base("team", &root, session.id)
+            .await
+            .unwrap();
+        db.record_knowledge_dream_completion("team", &root, consumer.as_hex(), &[session.id])
+            .await
+            .unwrap();
+
+        let notices = session.knowledge_base_freshness_notices().await;
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("KB Team Notes finished a new dream at"));
+        assert!(notices[0].contains("newer knowledge is now available"));
+        assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
+        assert!(session.knowledge_base_freshness_notices().await.is_empty());
     }
 
     fn providers_config(

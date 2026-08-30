@@ -39,6 +39,106 @@ use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, 
 use crate::redact::RedactionTable;
 use crate::session::Session;
 
+/// Immutable knowledge-base facts captured when a session starts. This renders
+/// into the cached system prefix; live dream completion deliberately never
+/// rewrites it, and instead becomes a one-turn history injection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct KnowledgeBasePromptSnapshot {
+    entries: Vec<KnowledgeBasePromptSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KnowledgeBasePromptSnapshotEntry {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) last_dreamed_at_unix_ms: Option<i64>,
+}
+
+impl KnowledgeBasePromptSnapshot {
+    pub(crate) fn capture(
+        config: &ExtendedConfig,
+        conn: &rusqlite::Connection,
+        project_root: &str,
+    ) -> Result<Self> {
+        let consumer = crate::db::installation_identity::ensure_installation_identity_conn(conn)?;
+        let entries = config
+            .knowledge_bases
+            .iter()
+            .map(|knowledge_base| {
+                Ok(KnowledgeBasePromptSnapshotEntry {
+                    id: knowledge_base.id.clone(),
+                    name: knowledge_base.name.clone(),
+                    description: knowledge_base.description.clone(),
+                    last_dreamed_at_unix_ms:
+                        crate::db::knowledge_dreams::knowledge_base_last_dreamed_at_conn(
+                            conn,
+                            &knowledge_base.id,
+                            project_root,
+                            consumer.as_hex(),
+                        )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn from_json_str(raw: &str) -> Self {
+        if raw.trim().is_empty() {
+            return Self::default();
+        }
+        match serde_json::from_str(raw) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "failed to decode knowledge-base prompt snapshot");
+                Self::default()
+            }
+        }
+    }
+
+    pub(crate) fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub(crate) fn render_system_block(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::from("Knowledge bases (session-start snapshot):\n");
+        for entry in &self.entries {
+            out.push_str("- ");
+            out.push_str(&entry.name);
+            out.push_str(" (id: ");
+            out.push_str(&entry.id);
+            out.push_str("): ");
+            out.push_str(&entry.description);
+            out.push('\n');
+            out.push_str("  Last dreamed at: ");
+            match entry.last_dreamed_at_unix_ms {
+                Some(timestamp) => out.push_str(&format_dream_timestamp(timestamp)),
+                None => out.push_str("never"),
+            }
+            out.push('\n');
+        }
+        out.push_str(
+            "Newer information may live in sessions after these timestamps; search it through the retrieval subagent.\n",
+        );
+        out
+    }
+
+    pub(crate) fn entries(&self) -> &[KnowledgeBasePromptSnapshotEntry] {
+        &self.entries
+    }
+}
+
+pub(crate) fn format_dream_timestamp(timestamp_unix_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_unix_ms)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| format!("invalid unix-ms timestamp {timestamp_unix_ms}"))
+}
+
 /// Durable, paid projection of local KB chunks.  This database deliberately
 /// contains no OKF metadata or FTS state, so rebuilding the other sidecar can
 /// reuse its vectors without talking to an embedding provider.
@@ -4299,6 +4399,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn knowledge_prompt_snapshot_renders_stable_identity_and_frozen_freshness() {
+        let snapshot = KnowledgeBasePromptSnapshot::from_json_str(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Decisions and conventions","last_dreamed_at_unix_ms":0}]}"#,
+        );
+
+        let first = snapshot.render_system_block();
+        let second = snapshot.render_system_block();
+        assert_eq!(first, second, "cached KB prefix must be byte-stable");
+        assert!(first.contains("Team Notes (id: team): Decisions and conventions"));
+        assert!(first.contains("Last dreamed at: 1970-01-01T00:00:00+00:00"));
+        assert!(first.contains("Newer information may live in sessions"));
+        assert!(!first.contains("undreamed"));
+    }
 
     struct MockEmbedder;
     struct DimEmbedder(usize);

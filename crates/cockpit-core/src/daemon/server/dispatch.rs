@@ -27359,6 +27359,7 @@ async fn run_docs_ask_pipeline(
         session_short_id: session.short_id(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+        knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
         interactive: false,
         mcp_parent_reachable: None,
         model_override: None,

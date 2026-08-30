@@ -362,6 +362,10 @@ pub struct Session {
     /// rewritten after a dream completes; root replacement is the sole
     /// rebinding boundary.
     knowledge_base_prompt_snapshot: RwLock<Arc<KnowledgeBasePromptSnapshot>>,
+    /// Kept separately from the snapshot value because an empty attachment
+    /// set is a valid completed capture. A false value means worker startup
+    /// was interrupted before the first root-definition-bound capture.
+    knowledge_base_prompt_snapshot_captured: AtomicBool,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -1199,6 +1203,15 @@ impl Session {
             .render_system_block()
     }
 
+    /// Whether worker startup still has to bind the initial root's KB prompt
+    /// snapshot. This is intentionally independent of `freshly_created`: a
+    /// durable row can survive an interrupted first startup before capture.
+    pub(crate) fn needs_knowledge_base_prompt_snapshot_capture(&self) -> bool {
+        !self
+            .knowledge_base_prompt_snapshot_captured
+            .load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_knowledge_base_prompt_snapshot_for_test(&mut self, raw: &str) {
         *self
@@ -1206,6 +1219,8 @@ impl Session {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Arc::new(KnowledgeBasePromptSnapshot::from_json_str(raw));
+        self.knowledge_base_prompt_snapshot_captured
+            .store(true, Ordering::Release);
     }
 
     /// Return one-line, per-turn freshness facts for dreams that completed
@@ -2117,7 +2132,10 @@ mod tests {
         let snapshot = r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#;
         db.blocking_write_for_sync_maintenance(move |conn| {
             conn.execute(
-                "UPDATE sessions SET knowledge_base_prompt_snapshot_json = ?1 WHERE session_id = ?2",
+                "UPDATE sessions
+                 SET knowledge_base_prompt_snapshot_json = ?1,
+                     knowledge_base_prompt_snapshot_captured = 1
+                 WHERE session_id = ?2",
                 rusqlite::params![snapshot, session_id.to_string()],
             )
             .context("persisting test knowledge-base prompt snapshot")?;
@@ -2136,6 +2154,62 @@ mod tests {
         assert_eq!(
             resumed.knowledge_base_system_prompt(),
             "Knowledge bases (root-definition snapshot):\n- Team Notes (id: team): Shared decisions\n  Last dreamed at: 1970-01-01T00:00:01+00:00\nNewer information may live in sessions after these timestamps; search it through the retrieval subagent.\n"
+        );
+        assert!(
+            !resumed.needs_knowledge_base_prompt_snapshot_capture(),
+            "a persisted snapshot must not be recaptured on resume"
+        );
+    }
+
+    #[test]
+    fn resume_distinguishes_uncommitted_kb_capture_from_captured_empty_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+        drop(session);
+
+        let interrupted = Session::resume_for_test(
+            db.clone(),
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            interrupted.needs_knowledge_base_prompt_snapshot_capture(),
+            "a durable row before initial capture must retry root binding"
+        );
+        drop(interrupted);
+
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET knowledge_base_prompt_snapshot_json = '{\"entries\":[]}',
+                     knowledge_base_prompt_snapshot_captured = 1
+                 WHERE session_id = ?1",
+                rusqlite::params![session_id.to_string()],
+            )
+            .context("persisting captured empty knowledge-base snapshot")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !resumed.needs_knowledge_base_prompt_snapshot_capture(),
+            "a captured empty snapshot is a completed stable-prefix binding"
         );
     }
 

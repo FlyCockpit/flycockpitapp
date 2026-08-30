@@ -6470,11 +6470,14 @@ pub(super) async fn run_worker(
     // avoids a second name-based filesystem resolution between snapshot
     // capture and root construction.
     //
-    // Resumed sessions instead retain the durable snapshot already supplied
-    // in `spawn_args`. Recapturing here would let a completion that happened
-    // while the worker was down rewrite the session-frozen prefix and erase
-    // the next-turn freshness notice.
-    let root_result = if session.is_freshly_created() {
+    // A resumed session retains its durable snapshot. The narrow exception is
+    // a row that survived an interrupted first-worker startup before its
+    // initial capture committed: its explicit completion marker remains
+    // false, so retry the first root-definition-bound capture. Recapturing a
+    // completed snapshot here would let a dream completion while the worker
+    // was down rewrite the session-frozen prefix and erase the next-turn
+    // freshness notice.
+    let root_result = if session.needs_knowledge_base_prompt_snapshot_capture() {
         (|| -> anyhow::Result<_> {
             let definition = root_result
                 .definition

@@ -330,22 +330,29 @@ impl Session {
     ) -> Result<()> {
         if self.stage_pending_row(|row| {
             row.knowledge_base_prompt_snapshot_json = captured.raw.clone();
+            row.knowledge_base_prompt_snapshot_captured = true;
         }) {
             *self
                 .knowledge_base_prompt_snapshot
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = captured.snapshot;
+            self.knowledge_base_prompt_snapshot_captured
+                .store(true, std::sync::atomic::Ordering::Release);
             return Ok(());
         }
         let session_id = self.id;
         let raw = captured.raw.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                let changed = conn.execute(
-                    "UPDATE sessions SET knowledge_base_prompt_snapshot_json = ?1 WHERE session_id = ?2",
-                    rusqlite::params![raw, session_id.to_string()],
-                )
-                .context("updating session knowledge-base prompt snapshot")?;
+                let changed = conn
+                    .execute(
+                        "UPDATE sessions
+                     SET knowledge_base_prompt_snapshot_json = ?1,
+                         knowledge_base_prompt_snapshot_captured = 1
+                     WHERE session_id = ?2",
+                        rusqlite::params![raw, session_id.to_string()],
+                    )
+                    .context("updating session knowledge-base prompt snapshot")?;
                 anyhow::ensure!(
                     changed == 1,
                     "session disappeared while updating its knowledge-base prompt snapshot"
@@ -357,6 +364,8 @@ impl Session {
             .knowledge_base_prompt_snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = captured.snapshot;
+        self.knowledge_base_prompt_snapshot_captured
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -649,6 +658,9 @@ impl Session {
             secret_path_matcher: std::sync::OnceLock::new(),
             model_system_prompt_snapshot,
             knowledge_base_prompt_snapshot,
+            knowledge_base_prompt_snapshot_captured: AtomicBool::new(
+                row.knowledge_base_prompt_snapshot_captured,
+            ),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),

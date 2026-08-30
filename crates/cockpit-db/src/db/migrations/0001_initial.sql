@@ -182,6 +182,13 @@ CREATE TABLE sessions (
         AND length(CAST(knowledge_base_prompt_snapshot_json AS BLOB)) <= 8388608
     ),
 
+    -- An empty snapshot is a valid completed capture. Keep its completion
+    -- state separate so a row persisted before first-worker root binding is
+    -- retried on resume rather than treated as an empty attachment set.
+    knowledge_base_prompt_snapshot_captured INTEGER NOT NULL DEFAULT 0 CHECK (
+        knowledge_base_prompt_snapshot_captured IN (0, 1)
+    ),
+
     -- 1 for hidden side-conversation forks. Legacy `/side` rows are
     -- throwaway and swept on daemon boot; BTW rows carry
     -- btw_parent_session_id and are persistent until explicit end or parent

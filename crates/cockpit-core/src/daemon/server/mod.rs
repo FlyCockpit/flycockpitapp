@@ -2350,11 +2350,11 @@ pub struct DaemonContext {
     /// on the first broadcast after construction.
     redaction_generation: std::sync::atomic::AtomicU64,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
-    /// Live client state. Each accepted transport connection increments the
-    /// count and permanently records that this owner has served a client.
+    /// Live client state. Each protocol-active transport increments the count
+    /// and permanently records that this owner has served a client.
     /// Ephemeral owners need both facts: a watch receiver may coalesce a
-    /// fast `0 -> 1 -> 0`, but it must still reap after that first connection
-    /// leaves.
+    /// fast `0 -> 1 -> 0`, but it must still reap after that first lifetime
+    /// client leaves.
     client_presence: tokio::sync::watch::Sender<ClientPresence>,
     /// Daemon-wide graceful-shutdown gate
     /// (`daemon-graceful-drain-shutdown.md`). Shared with the registry
@@ -3506,25 +3506,49 @@ impl DaemonContext {
         self.client_presence.subscribe()
     }
 
-    /// RAII guard: bumps the connected-client count on construction and
-    /// decrements it on drop, so the count stays correct on every exit
-    /// path of a client task (clean EOF, decode error, send failure).
+    /// RAII guard: bumps the protocol-active client count on construction and
+    /// decrements it on drop, so the count stays correct on every exit path of
+    /// a client task (clean EOF, decode error, send failure).
     fn track_client(self: &Arc<Self>) -> ClientGuard {
         self.client_presence.send_modify(|presence| {
             presence.count += 1;
-            presence.has_connected = true;
+            presence.has_lifetime_client = true;
         });
         ClientGuard { ctx: self.clone() }
     }
 }
 
-/// The observed client state of one daemon owner. `has_connected` is monotonic
-/// for the owner's lifetime, so the first complete connection cannot be erased by
-/// a later disconnect before the lifecycle reaper observes the watch channel.
+/// Defers a socket transport's lifetime reference until it proves it is a
+/// client rather than a hello-only reachability probe. Clones share one guard,
+/// so the claim is made at most once and remains live until the transport task
+/// has fully stopped.
+#[derive(Clone)]
+struct DeferredClientLifetime {
+    ctx: Arc<DaemonContext>,
+    guard: Arc<OnceLock<ClientGuard>>,
+}
+
+impl DeferredClientLifetime {
+    fn new(ctx: Arc<DaemonContext>) -> Self {
+        Self {
+            ctx,
+            guard: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn activate(&self) {
+        self.guard.get_or_init(|| self.ctx.track_client());
+    }
+}
+
+/// The observed client state of one daemon owner. `has_lifetime_client` is monotonic
+/// for the owner's lifetime, so the first protocol-active client cannot be
+/// erased by a later disconnect before the lifecycle reaper observes the watch
+/// channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClientPresence {
     pub(crate) count: usize,
-    pub(crate) has_connected: bool,
+    pub(crate) has_lifetime_client: bool,
 }
 
 /// Decrements the daemon's connected-client count when a client task
@@ -4954,8 +4978,8 @@ async fn run_in_process_client(
     event_tx: mpsc::Sender<proto::Event>,
 ) {
     // An in-process endpoint is handed only to the owning foreground process;
-    // opening it is therefore the same lifetime reference as a completed
-    // socket handshake.
+    // opening it is therefore the same lifetime reference as a socket client
+    // sending its first valid protocol envelope.
     let _client_guard = ctx.track_client();
     let client_instance_id = Uuid::new_v4();
     let mut state = MutableClientState::detached_with_principal(
@@ -5232,10 +5256,13 @@ async fn handle_client_transport_as<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // The server has accepted the connection and is about to emit its hello.
-    // Holding this RAII guard through transport teardown covers detached RPC
-    // clients and pre-Attach failures as well as session-attached clients.
-    let _client_guard = ctx.track_client();
+    // A hello-only connection is a reachability probe, not a client lifetime
+    // reference. Defer the claim until the peer sends a valid protocol
+    // envelope, then retain it through every transport teardown path. This
+    // keeps discovery from reaping an ephemeral owner during its creator's
+    // startup handoff while still covering detached RPC clients and pre-Attach
+    // failures.
+    let client_lifetime = DeferredClientLifetime::new(ctx.clone());
     let proto = ProtoStream::new(stream);
     let (reader, writer) = proto.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -5282,6 +5309,7 @@ where
         reader_executor_tx,
         reader_writer_tx,
         Some(reader_ctx.caffeinate_state_event()),
+        client_lifetime.clone(),
     ));
     let writer_task = tokio::spawn(async move {
         run_client_writer(writer, writer_rx).await;
@@ -5456,6 +5484,7 @@ async fn run_client_reader<R>(
     executor_tx: mpsc::Sender<ClientExecutorInput>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
     initial_event_after_negotiation: Option<proto::Event>,
+    client_lifetime: DeferredClientLifetime,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -5491,6 +5520,9 @@ where
                         );
                     }
                     return Ok(());
+                }
+                if matches!(&frame, RecvFrame::Envelope(_)) {
+                    client_lifetime.activate();
                 }
                 if let Some(version) = negotiated_writer_version_for_frame(&frame) {
                     if writer_tx

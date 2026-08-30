@@ -32825,6 +32825,33 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
 }
 
 #[tokio::test]
+async fn hello_only_probe_does_not_claim_client_lifetime() {
+    let ctx = test_ctx();
+    let presence = ctx.client_presence();
+    let (server, client) = tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES);
+    let task = tokio::spawn(handle_client_transport_as(
+        server,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+    ));
+    let mut client = ProtoStream::new(client);
+
+    assert!(matches!(
+        client.recv().await.unwrap(),
+        Some(RecvFrame::Envelope(_))
+    ));
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("hello-only probe transport exits")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(*presence.borrow(), ClientPresence::default());
+}
+
+#[tokio::test]
 async fn attach_replay_precedes_live_events_under_task_split() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();

@@ -2059,10 +2059,10 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
     Ok(())
 }
 
-/// Wait for an ephemeral owner to acquire its first connected client and then request
-/// teardown as soon as the reference count returns to zero. The first-client
-/// gate prevents a freshly spawned daemon from racing its creator's initial
-/// handshake.
+/// Wait for an ephemeral owner to acquire its first lifetime client and then
+/// request teardown as soon as the reference count returns to zero. The gate
+/// prevents a freshly spawned daemon from racing its creator's initial
+/// handshake or a hello-only reachability probe.
 #[cfg(any(unix, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
@@ -2070,7 +2070,7 @@ async fn ephemeral_last_client_reaper(
 ) {
     loop {
         let observed = *presence.borrow_and_update();
-        if observed.has_connected && observed.count == 0 {
+        if observed.has_lifetime_client && observed.count == 0 {
             tracing::info!("ephemeral daemon lost its final client; beginning teardown");
             on_reap();
             return;
@@ -2767,7 +2767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_reaps_when_first_connection_and_disconnect_precede_reaper() {
+    async fn ephemeral_reaps_when_first_lifetime_client_disconnect_precedes_reaper() {
         let (presence_tx, presence_rx) =
             tokio::sync::watch::channel(server::ClientPresence::default());
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2778,7 +2778,7 @@ mod tests {
         }));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
-            presence.has_connected = true;
+            presence.has_lifetime_client = true;
         });
         presence_tx.send_modify(|presence| presence.count = 0);
         tokio::time::timeout(Duration::from_secs(1), task)

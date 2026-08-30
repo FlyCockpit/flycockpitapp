@@ -72,7 +72,11 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),
     ToolTimeoutSafety::human_blocking("question"),
-    ToolTimeoutSafety::abandon_safe("raise"),
+    // `raise` crosses a durable SQLite commit boundary. It observes dispatcher
+    // cancellation and uses the tool-call id as its replay identity, so an
+    // ambiguous timeout is retried against the same inbox row rather than
+    // creating a second human/agent-visible effect.
+    ToolTimeoutSafety::honors_cancel("raise"),
     ToolTimeoutSafety::abandon_safe("read"),
     ToolTimeoutSafety::abandon_safe("read_image"),
     ToolTimeoutSafety::abandon_safe("ask_image"),
@@ -1208,6 +1212,19 @@ mod tests {
         let policy = ToolTimeoutPolicy::default();
 
         assert!(policy.lookup("mcp") > policy.lookup("read"));
+    }
+
+    #[test]
+    fn raise_timeout_boundary_waits_for_cancel_aware_durable_outcome() {
+        let policy = ToolTimeoutPolicy::default();
+        let tool = crate::tools::raise::RaiseTool;
+        let safety = TOOL_TIMEOUT_SAFETY
+            .iter()
+            .find(|entry| entry.name == tool.name())
+            .map(|entry| entry.safety);
+
+        assert_eq!(safety, Some(ToolAbandonSafety::HonorsCancel));
+        assert_eq!(policy.cancel_grace(&tool), Some(TOOL_ABANDON_HOOK_TIMEOUT));
     }
 
     #[test]

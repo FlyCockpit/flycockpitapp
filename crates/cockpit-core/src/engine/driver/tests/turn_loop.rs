@@ -394,6 +394,159 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
     assert_eq!(assistant.data["text"], "plain assistant reply");
 }
 
+#[tokio::test(start_paused = true)]
+async fn assistant_inbox_defer_waits_for_human_turn_while_immediate_runs_at_idle() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("idle delivery handled".into()))
+        .turn(Turn::Text("human turn handled".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let main_session_id = driver.session.id;
+    let inbox_db = driver.session.db.clone();
+    driver
+        .session
+        .db
+        .upsert_assistant("inbox-source", "/tmp/inbox-source", "{}", &"0".repeat(64))
+        .await
+        .unwrap();
+    let source = driver
+        .session
+        .db
+        .create_assistant_session(
+            "inbox-source-project",
+            "/tmp/inbox-source-project",
+            "Build",
+            "inbox-source",
+        )
+        .await
+        .unwrap();
+    let source_session_id = source.session_id;
+    driver
+        .session
+        .db
+        .write(move |conn| {
+            for (offset, delivery, summary) in [
+                (0_i64, "immediate", "IMMEDIATE_INBOX_MARKER"),
+                (1_i64, "defer", "DEFERRED_INBOX_MARKER"),
+            ] {
+                conn.execute(
+                    "INSERT INTO assistant_inbox_items(
+                        inbox_item_id, assistant_name, main_session_id,
+                        raising_session_id, operation_id, summary, delivery,
+                        created_at_unix_ms
+                     ) VALUES(?1, 'inbox-source', ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        main_session_id.to_string(),
+                        source_session_id.to_string(),
+                        format!("boundary-{offset}"),
+                        summary,
+                        delivery,
+                        1_000 + offset,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let run_queue = queue.clone();
+    let run_tx = tx.clone();
+    let run =
+        tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
+
+    tokio::time::advance(Duration::from_millis(250)).await;
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let posts = provider_posts(&provider);
+    assert_eq!(
+        posts.len(),
+        1,
+        "immediate delivery runs at the idle boundary"
+    );
+    let immediate_prompt = chat_messages(&posts[0])
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(immediate_prompt.contains("IMMEDIATE_INBOX_MARKER"));
+    assert!(!immediate_prompt.contains("DEFERRED_INBOX_MARKER"));
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        provider_posts(&provider).len(),
+        1,
+        "a heartbeat must neither claim defer nor start inference"
+    );
+
+    queue
+        .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
+        .await;
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let posts = provider_posts(&provider);
+    assert_eq!(posts.len(), 2, "the human turn starts the second inference");
+    let human_prompt = chat_messages(&posts[1])
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let deferred = human_prompt.find("DEFERRED_INBOX_MARKER").unwrap();
+    let human = human_prompt.find("HUMAN_TURN_MARKER").unwrap();
+    assert!(
+        deferred < human,
+        "defer is prepended to the authored human turn"
+    );
+
+    let mut visible = Vec::new();
+    for _ in 0..100 {
+        visible = inbox_db
+            .assistant_inbox_for_main(main_session_id, true, 10)
+            .await
+            .unwrap();
+        if visible
+            .iter()
+            .all(|item| item.delivered_at_unix_ms.is_some())
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(visible.len(), 2);
+    assert!(
+        visible
+            .iter()
+            .all(|item| item.delivered_at_unix_ms.is_some()),
+        "idle immediate and human-prepended defer are acknowledged only after their turns accept them"
+    );
+
+    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    let result = run.await.expect("driver task joins");
+    assert!(
+        result
+            .expect_err("test abort terminates the driver")
+            .to_string()
+            .contains("driver abort requested for test")
+    );
+}
+
 #[tokio::test]
 async fn terminalized_oversized_submission_without_a_lease_never_reaches_provider() {
     let provider = ScriptedProvider::builder()
@@ -984,6 +1137,106 @@ fn later_batch_persist_failure_retains_recorded_history_and_recovers_fifo() {
             );
         }
         assert!(queue.snapshot().await.is_empty());
+    });
+}
+
+#[test]
+fn queued_user_fold_retry_does_not_duplicate_assistant_inbox_text() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        const INBOX: &str = "RETRY_INBOX_MARKER_6d42";
+        const FIRST: &str = "retry-authored-first-7e53";
+        const LAST: &str = "retry-authored-last-8f64";
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("retry completed".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_driver(&provider);
+        let main_session_id = driver.session.id;
+        driver
+            .session
+            .db
+            .upsert_assistant(
+                "retry-inbox-source",
+                "/tmp/retry-inbox-source",
+                "{}",
+                &"0".repeat(64),
+            )
+            .await
+            .unwrap();
+        let source = driver
+            .session
+            .db
+            .create_assistant_session(
+                "retry-inbox-project",
+                "/tmp/retry-inbox-project",
+                "Build",
+                "retry-inbox-source",
+            )
+            .await
+            .unwrap();
+        let source_session_id = source.session_id;
+        driver
+            .session
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO assistant_inbox_items(
+                        inbox_item_id, assistant_name, main_session_id,
+                        raising_session_id, operation_id, summary, delivery,
+                        created_at_unix_ms
+                     ) VALUES(?1, 'retry-inbox-source', ?2, ?3, 'retry-boundary', ?4, 'defer', 1000)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        main_session_id.to_string(),
+                        source_session_id.to_string(),
+                        INBOX,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (queue, tx, _rx) = event_harness();
+        let target = driver.active_queue_target();
+        for text in [FIRST, LAST] {
+            queue.push(UserSubmission::text(text), target.clone()).await;
+        }
+        let mut batch = Vec::new();
+        queue.drain_into_for(&mut batch, 2, Some(&target.id)).await;
+        driver.test_fail_all_user_message_event_writes = true;
+        driver
+            .run_prepared_queued_user_batch(batch, &queue, &tx)
+            .await
+            .unwrap();
+
+        let first_retry = queue.recv().await.unwrap();
+        assert_eq!(
+            first_retry.text, FIRST,
+            "requeued text must remain authored-only"
+        );
+        let mut retry_batch = vec![first_retry];
+        queue
+            .drain_into_for(&mut retry_batch, 2, Some(&target.id))
+            .await;
+        driver.test_fail_all_user_message_event_writes = false;
+        driver
+            .run_prepared_queued_user_batch(retry_batch, &queue, &tx)
+            .await
+            .unwrap();
+
+        let posts = provider_posts(&provider);
+        assert_eq!(posts.len(), 1);
+        let user_text = chat_messages(&posts[0])
+            .iter()
+            .filter(|message| message_role(message) == "user")
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(user_text.matches(INBOX).count(), 1, "{user_text}");
+        assert_eq!(user_text.matches(FIRST).count(), 1, "{user_text}");
+        assert_eq!(user_text.matches(LAST).count(), 1, "{user_text}");
     });
 }
 

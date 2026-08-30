@@ -58,6 +58,7 @@ pub struct AssistantInboxItem {
     pub assistant_name: String,
     pub main_session_id: Uuid,
     pub raising_session_id: Uuid,
+    pub operation_id: String,
     pub summary: String,
     pub delivery: AssistantInboxDelivery,
     pub created_at_unix_ms: i64,
@@ -93,6 +94,7 @@ impl AssistantInboxItem {
                     error.into(),
                 )
             })?,
+            operation_id: row.get("operation_id")?,
             summary: row.get("summary")?,
             delivery: AssistantInboxDelivery::parse(&delivery)?,
             created_at_unix_ms: row.get("created_at_unix_ms")?,
@@ -110,10 +112,19 @@ impl Db {
     pub async fn raise_assistant_inbox_item(
         &self,
         raising_session_id: Uuid,
+        operation_id: String,
         summary: String,
         delivery: AssistantInboxDelivery,
     ) -> Result<AssistantInboxItem> {
         let summary = summary.trim().to_string();
+        ensure!(
+            !operation_id.is_empty(),
+            "assistant inbox operation id must not be empty"
+        );
+        ensure!(
+            operation_id.len() <= 1_024,
+            "assistant inbox operation id exceeds 1024 bytes"
+        );
         ensure!(
             !summary.is_empty(),
             "assistant inbox summary must not be empty"
@@ -136,6 +147,23 @@ impl Db {
                 .context("assistant thread has no assistant owner")?;
             let main = assistant_main_session(conn, &raising, &assistant_name)?;
 
+            if let Some(existing) = conn
+                .query_row(
+                    "SELECT * FROM assistant_inbox_items
+                       WHERE raising_session_id = ?1 AND operation_id = ?2",
+                    params![raising_session_id.to_string(), operation_id],
+                    AssistantInboxItem::from_row,
+                )
+                .optional()
+                .context("reading prior assistant inbox operation")?
+            {
+                ensure!(
+                    existing.summary == summary && existing.delivery == delivery,
+                    "assistant inbox operation id was reused with different arguments"
+                );
+                return Ok(existing);
+            }
+
             let recent: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM assistant_inbox_items
                    WHERE assistant_name = ?1 AND created_at_unix_ms >= ?2",
@@ -148,7 +176,8 @@ impl Db {
             );
             let pending: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM assistant_inbox_items
-                   WHERE assistant_name = ?1 AND delivered_at_unix_ms IS NULL",
+                   WHERE assistant_name = ?1 AND delivered_at_unix_ms IS NULL
+                     AND delivery <> 'notify'",
                 params![assistant_name],
                 |row| row.get(0),
             )?;
@@ -160,13 +189,14 @@ impl Db {
             conn.execute(
                 "INSERT INTO assistant_inbox_items(
                     inbox_item_id, assistant_name, main_session_id,
-                    raising_session_id, summary, delivery, created_at_unix_ms
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    raising_session_id, operation_id, summary, delivery, created_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     inbox_item_id.to_string(),
                     assistant_name,
                     main.session_id.to_string(),
                     raising_session_id.to_string(),
+                    operation_id,
                     summary,
                     delivery.as_str(),
                     now,
@@ -209,7 +239,10 @@ impl Db {
         .await
     }
 
-    /// Atomically claim the items that are allowed to enter a main turn.
+    /// Read the items that are allowed to enter a main turn without consuming
+    /// them. The driver acknowledges the returned identities only after the
+    /// turn accepts them, so cancellation and prompt/driver errors are safely
+    /// retryable.
     /// `notify` items deliberately never appear here: remote notification is
     /// a later remote-track delivery and must not wake or inject agent work.
     pub async fn claim_assistant_inbox_for_delivery(
@@ -217,8 +250,7 @@ impl Db {
         main_session_id: Uuid,
         include_deferred: bool,
     ) -> Result<Vec<AssistantInboxItem>> {
-        let now = Utc::now().timestamp_millis();
-        self.transaction(move |conn| {
+        self.read(move |conn| {
             let mode_filter = if include_deferred {
                 "('immediate', 'defer')"
             } else {
@@ -240,16 +272,36 @@ impl Db {
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context("decoding inbox delivery claim")?;
-            for item in &items {
-                let changed = conn.execute(
-                    "UPDATE assistant_inbox_items
-                       SET delivered_at_unix_ms = ?1
-                     WHERE inbox_item_id = ?2 AND delivered_at_unix_ms IS NULL",
-                    params![now, item.inbox_item_id.to_string()],
-                )?;
-                ensure!(changed == 1, "assistant inbox delivery claim raced");
-            }
             Ok(items)
+        })
+        .await
+    }
+
+    /// Acknowledge a previously read delivery batch after the driver has
+    /// successfully accepted it. This is idempotent for retry-safe cleanup.
+    pub async fn acknowledge_assistant_inbox_delivery(
+        &self,
+        main_session_id: Uuid,
+        inbox_item_ids: Vec<Uuid>,
+    ) -> Result<()> {
+        if inbox_item_ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        self.transaction(move |conn| {
+            for inbox_item_id in inbox_item_ids {
+                let matched = conn.execute(
+                    "UPDATE assistant_inbox_items
+                       SET delivered_at_unix_ms = COALESCE(delivered_at_unix_ms, ?1)
+                     WHERE inbox_item_id = ?2 AND main_session_id = ?3",
+                    params![now, inbox_item_id.to_string(), main_session_id.to_string()],
+                )?;
+                ensure!(
+                    matched == 1,
+                    "assistant inbox acknowledgement target missing"
+                );
+            }
+            Ok(())
         })
         .await
     }
@@ -300,4 +352,197 @@ fn assistant_inbox_item_conn(
     )
     .optional()
     .context("reading assistant inbox item")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::session_log::SessionEventKind;
+
+    async fn assistant_with_thread(db: &Db) -> (SessionRow, SessionRow) {
+        db.upsert_assistant("helper", "/tmp/helper", "{}", &"0".repeat(64))
+            .await
+            .unwrap();
+        let main = db
+            .create_assistant_session("project", "/project", "Build", "helper")
+            .await
+            .unwrap();
+        let anchor = db
+            .insert_session_event(
+                main.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "anchor"}),
+            )
+            .await
+            .unwrap();
+        let thread = db
+            .create_thread(main.session_id, anchor.to_string())
+            .await
+            .unwrap();
+        (main, thread)
+    }
+
+    #[tokio::test]
+    async fn raise_operation_is_idempotent_and_argument_bound() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, thread) = assistant_with_thread(&db).await;
+        let first = db
+            .raise_assistant_inbox_item(
+                thread.session_id,
+                "call-1".into(),
+                "result".into(),
+                AssistantInboxDelivery::Immediate,
+            )
+            .await
+            .unwrap();
+        let retry = db
+            .raise_assistant_inbox_item(
+                thread.session_id,
+                "call-1".into(),
+                "result".into(),
+                AssistantInboxDelivery::Immediate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.inbox_item_id, retry.inbox_item_id);
+        assert!(
+            db.raise_assistant_inbox_item(
+                thread.session_id,
+                "call-1".into(),
+                "different".into(),
+                AssistantInboxDelivery::Immediate,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("reused with different arguments")
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_claim_respects_immediate_defer_and_notify() {
+        let db = Db::open_in_memory().unwrap();
+        let (main, thread) = assistant_with_thread(&db).await;
+        for (operation, delivery) in [
+            ("immediate", AssistantInboxDelivery::Immediate),
+            ("defer", AssistantInboxDelivery::Defer),
+            ("notify", AssistantInboxDelivery::Notify),
+        ] {
+            db.raise_assistant_inbox_item(
+                thread.session_id,
+                operation.into(),
+                operation.into(),
+                delivery,
+            )
+            .await
+            .unwrap();
+        }
+        let immediate = db
+            .claim_assistant_inbox_for_delivery(main.session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(immediate.len(), 1);
+        assert_eq!(immediate[0].delivery, AssistantInboxDelivery::Immediate);
+        let retried = db
+            .claim_assistant_inbox_for_delivery(main.session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(retried, immediate, "an unacknowledged claim must retry");
+        db.acknowledge_assistant_inbox_delivery(
+            main.session_id,
+            immediate.iter().map(|item| item.inbox_item_id).collect(),
+        )
+        .await
+        .unwrap();
+        let deferred = db
+            .claim_assistant_inbox_for_delivery(main.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].delivery, AssistantInboxDelivery::Defer);
+        db.acknowledge_assistant_inbox_delivery(
+            main.session_id,
+            deferred.iter().map(|item| item.inbox_item_id).collect(),
+        )
+        .await
+        .unwrap();
+        let visible = db
+            .assistant_inbox_for_main(main.session_id, true, 10)
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 3);
+        assert!(visible.iter().any(|item| {
+            item.delivery == AssistantInboxDelivery::Notify
+                && item.delivered_at_unix_ms.is_none()
+                && item.raising_session_id == thread.session_id
+        }));
+    }
+
+    #[tokio::test]
+    async fn notify_does_not_exhaust_agent_work_pending_guard() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, thread) = assistant_with_thread(&db).await;
+        for index in 0..MAX_PENDING_INBOX_ITEMS_PER_ASSISTANT + 1 {
+            db.raise_assistant_inbox_item(
+                thread.session_id,
+                format!("notify-{index}"),
+                format!("notify {index}"),
+                AssistantInboxDelivery::Notify,
+            )
+            .await
+            .unwrap();
+        }
+        db.raise_assistant_inbox_item(
+            thread.session_id,
+            "immediate-after-notify".into(),
+            "still accepted".into(),
+            AssistantInboxDelivery::Immediate,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn raise_spawn_raise_amplification_is_bounded_per_assistant() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, mut thread) = assistant_with_thread(&db).await;
+        for index in 0..MAX_RAISES_PER_ASSISTANT_PER_HOUR {
+            db.raise_assistant_inbox_item(
+                thread.session_id,
+                format!("call-{index}"),
+                format!("raise {index}"),
+                AssistantInboxDelivery::Notify,
+            )
+            .await
+            .unwrap();
+            let anchor = db
+                .insert_session_event(
+                    thread.session_id,
+                    SessionEventKind::AssistantMessage,
+                    Some("Build"),
+                    None,
+                    &serde_json::json!({"text": "spawn"}),
+                )
+                .await
+                .unwrap();
+            thread = db
+                .create_thread(thread.session_id, anchor.to_string())
+                .await
+                .unwrap();
+        }
+        assert!(
+            db.raise_assistant_inbox_item(
+                thread.session_id,
+                "over-bound".into(),
+                "must fail".into(),
+                AssistantInboxDelivery::Notify,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("raise guard reached")
+        );
+    }
 }

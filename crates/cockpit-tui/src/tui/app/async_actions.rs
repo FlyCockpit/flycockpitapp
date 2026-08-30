@@ -1087,6 +1087,22 @@ impl App {
                     }
                 }
             }
+            AsyncActionKind::DaemonRpc("sessions.inbox") => {
+                if let Overlay::Sessions(pane) = &mut self.overlay {
+                    match result.payload {
+                        Ok(AsyncActionPayload::AssistantInbox {
+                            main_session_id,
+                            items,
+                        }) => pane.apply_inbox_result(main_session_id, Ok(items)),
+                        Err(error) => {
+                            if let Some(main_session_id) = pane.selected_session_id_for_action() {
+                                pane.apply_inbox_result(main_session_id, Err(error));
+                            }
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
             AsyncActionKind::DaemonRpc("skills.list") => {
                 if let Ok(AsyncActionPayload::Skills(result)) = result.payload {
                     let owns_result = matches!(
@@ -3180,6 +3196,26 @@ impl App {
                     before_seq,
                     messages,
                     has_more,
+                })
+            },
+        );
+    }
+
+    pub(super) fn start_sessions_inbox_action(&mut self, main_session_id: uuid::Uuid) {
+        let endpoint = self.sessions_daemon_endpoint();
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("sessions.inbox"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.inbox")),
+            move || {
+                let endpoint = endpoint
+                    .ok_or_else(|| "daemon endpoint unavailable for sessions.inbox".to_string())?;
+                let items = crate::tui::agent_runner::read_assistant_inbox_blocking(
+                    &endpoint,
+                    main_session_id,
+                )?;
+                Ok(AsyncActionPayload::AssistantInbox {
+                    main_session_id,
+                    items,
                 })
             },
         );

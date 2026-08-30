@@ -5199,6 +5199,9 @@ impl Driver {
         }
 
         let mut goal_watchdog: Option<Pin<Box<Sleep>>> = None;
+        let mut assistant_inbox_idle_poll = tokio::time::interval(Duration::from_millis(250));
+        assistant_inbox_idle_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        assistant_inbox_idle_poll.tick().await;
         loop {
             let active_target_id = self.active_queue_target_id();
             // Persist-on-re-entry owns started-unsettled keep-parked
@@ -5211,9 +5214,14 @@ impl Driver {
             // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
+            // The interval can also become ready while a foreground turn is
+            // busy.  On re-entry, do not let that stale tick beat a human
+            // submission that is already waiting for this target.
+            let human_input_already_pending =
+                input_queue.has_pending_for(Some(&active_target_id)).await;
             if !waiting_for_keep_parked_siblings
                 && !self.pending_noninteractive_completions.is_empty()
-                && !input_queue.has_pending_for(Some(&active_target_id)).await
+                && !human_input_already_pending
                 && self
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
@@ -5243,6 +5251,26 @@ impl Driver {
             // must not bypass it.
             tokio::select! {
                 biased;
+                _ = assistant_inbox_idle_poll.tick(),
+                    if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
+                    match self.claim_assistant_inbox_text(false).await {
+                        Ok(Some((text, inbox_item_ids))) => {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission =
+                                crate::engine::message::UserSubmission::text(text);
+                            submission.origin =
+                                crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(
+                                submission,
+                                &input_queue,
+                                tx,
+                            ).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "assistant inbox immediate delivery failed"),
+                    }
+                }
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
                     if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
@@ -8734,12 +8762,33 @@ impl Driver {
 
     async fn run_prepared_queued_user_batch(
         &mut self,
-        submissions: Vec<UserSubmission>,
+        mut submissions: Vec<UserSubmission>,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         if submissions.is_empty() {
             return Ok(());
+        }
+        // A human message is both a main-turn boundary and a defer wake. Claim
+        // before prompt construction so inbox text is never appended to a warm
+        // prefix or injected into an already-running turn.
+        let mut inbox_item_ids = Vec::new();
+        let mut inbox_augmented_authored_text = None;
+        match self.claim_assistant_inbox_text(true).await {
+            Ok(Some((inbox, claimed_ids))) => {
+                inbox_item_ids = claimed_ids;
+                let first = submissions
+                    .first_mut()
+                    .expect("non-empty submission batch has a first item");
+                inbox_augmented_authored_text =
+                    Some((first.text.clone(), first.display_text.clone()));
+                first.text = format!("{inbox}\n\n{}", first.text);
+                if let Some(display) = first.display_text.as_mut() {
+                    *display = format!("{inbox}\n\n{display}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "assistant inbox user-turn delivery failed"),
         }
         // A phase-one FCM2 lease is tied to exactly one user event and must
         // survive to that event's phase-two materialization. Folding it into
@@ -8756,6 +8805,7 @@ impl Driver {
             for submission in submissions {
                 self.run_user_input(submission, input_rx, tx).await?;
             }
+            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
             return Ok(());
         }
         if submissions.len() == 1
@@ -8767,6 +8817,7 @@ impl Driver {
             for submission in submissions {
                 self.run_user_input(submission, input_rx, tx).await?;
             }
+            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
             return Ok(());
         }
 
@@ -8777,10 +8828,19 @@ impl Driver {
         let mut leading_history = Vec::with_capacity(pending.len());
         let mut leading_queue_item_ids = Vec::new();
         let mut leading_media_submission_ids = Vec::new();
+        let mut is_first = true;
         while let Some(submission) = pending.pop_front() {
+            let mut submission = submission;
             if self.record_queued_user_fold(&submission, tx).await.is_err() {
                 if let Some(top) = self.stack.last_mut() {
                     top.history.extend(leading_history);
+                }
+                if is_first
+                    && let Some((authored_text, authored_display_text)) =
+                        inbox_augmented_authored_text.take()
+                {
+                    submission.text = authored_text;
+                    submission.display_text = authored_display_text;
                 }
                 pending.push_front(submission);
                 pending.push_back(last);
@@ -8796,6 +8856,7 @@ impl Driver {
                 input_rx.finish(&leading_queue_item_ids).await;
                 return Ok(());
             }
+            is_first = false;
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
             leading_media_submission_ids.extend(
                 submission
@@ -8837,7 +8898,45 @@ impl Driver {
             )
             .await;
         input_rx.finish(&leading_queue_item_ids).await;
-        result
+        result?;
+        self.acknowledge_assistant_inbox(inbox_item_ids).await
+    }
+
+    async fn claim_assistant_inbox_text(
+        &self,
+        include_deferred: bool,
+    ) -> Result<Option<(String, Vec<Uuid>)>> {
+        let items = self
+            .session
+            .db
+            .claim_assistant_inbox_for_delivery(self.session.id, include_deferred)
+            .await?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let inbox_item_ids = items.iter().map(|item| item.inbox_item_id).collect();
+        let payload = items
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.inbox_item_id,
+                    "source_session_id": item.raising_session_id,
+                    "delivery": item.delivery.as_str(),
+                    "summary": item.summary,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Some((
+            format!("[assistant inbox]\n{}", serde_json::to_string(&payload)?),
+            inbox_item_ids,
+        )))
+    }
+
+    async fn acknowledge_assistant_inbox(&self, inbox_item_ids: Vec<Uuid>) -> Result<()> {
+        self.session
+            .db
+            .acknowledge_assistant_inbox_delivery(self.session.id, inbox_item_ids)
+            .await
     }
 
     async fn run_folded_submission_commands(

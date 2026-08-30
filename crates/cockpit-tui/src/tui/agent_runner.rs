@@ -3671,6 +3671,30 @@ pub fn read_session_messages_blocking(
     }
 }
 
+pub fn read_assistant_inbox_blocking(
+    endpoint: &ClientEndpoint,
+    main_session_id: uuid::Uuid,
+) -> Result<Vec<proto::AssistantInboxItemWire>, String> {
+    match daemon_request_at_blocking(
+        endpoint,
+        Request::ReadAssistantInbox {
+            main_session_id,
+            // Inbox delivery into agent context must not erase the human's
+            // durable history view.
+            include_delivered: true,
+            limit: 100,
+        },
+    )? {
+        Response::AssistantInbox {
+            main_session_id: got,
+            items,
+        } if got == main_session_id => Ok(items),
+        other => Err(format!(
+            "unexpected read_assistant_inbox response: {other:?}"
+        )),
+    }
+}
+
 pub fn read_client_submission_receipt_blocking(
     endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,

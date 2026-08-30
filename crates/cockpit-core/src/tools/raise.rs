@@ -23,18 +23,22 @@ impl Tool for RaiseTool {
     }
 
     fn description(&self) -> &str {
-        "Raise a concise structured item from this assistant thread to the main thread inbox. Choose immediate to wake main at its next idle boundary, defer for its next heartbeat or human turn, or notify to alert the human without agent work."
+        "Raise a concise structured item from this assistant thread to the main thread inbox. Choose immediate to wake main at its next idle boundary, defer to prepend it to the next human turn, or notify to alert the human without agent work."
     }
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Use this only when the main thread needs a self-contained update, decision, or escalation from this persistent assistant thread. State the useful result in `summary`; Cockpit records the raising thread/session backlink automatically. `immediate` never interrupts a user turn and is injected only at the next turn start. `defer` waits for the main thread's next heartbeat or human message. `notify` is for a human alert and does not wake or inject the agent."
+            "Use this only when the main thread needs a self-contained update, decision, or escalation from this persistent assistant thread. State the useful result in `summary`; Cockpit records the raising thread/session backlink automatically. `immediate` never interrupts a user turn and is injected only at the next idle turn start. `defer` is visible in the inbox immediately but enters agent context only by being prepended to the next human message. `notify` is for a human alert and does not wake or inject the agent."
                 .to_string(),
         )
     }
 
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutating
+    }
+
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
     }
 
     fn parameters(&self) -> Value {
@@ -73,23 +77,38 @@ impl Tool for RaiseTool {
                 ));
             }
         };
-        let item = ctx
-            .session
-            .db
-            .raise_assistant_inbox_item(ctx.session.id, summary, delivery)
-            .await?;
+        let operation_id = ctx
+            .current_tool_call_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("`raise` requires a durable tool-call identity"))?;
+        let durable_write = ctx.session.db.raise_assistant_inbox_item(
+            ctx.session.id,
+            operation_id,
+            summary,
+            delivery,
+        );
+        tokio::pin!(durable_write);
+        let item = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return Ok(ToolOutput::text(
+                    "raise was cancelled before its durable outcome was observed; retrying this tool call is idempotent",
+                ).with_unknown_host_effect());
+            }
+            result = &mut durable_write => result?,
+        };
 
         let delivery_text = match delivery {
             AssistantInboxDelivery::Immediate => {
                 "queued for the main thread's next idle turn boundary"
             }
             AssistantInboxDelivery::Defer => {
-                "queued for the main thread's next heartbeat or human turn"
+                "visible in the inbox and queued for the main thread's next human turn"
             }
             AssistantInboxDelivery::Notify => {
                 // TODO(remote): publish this durable notify item through the
                 // remote human-notification track without waking the agent.
-                "recorded for human notification; it will not wake the main agent"
+                "recorded in the local human-visible inbox; remote notification is unavailable and was not sent"
             }
         };
         Ok(ToolOutput::text(format!(

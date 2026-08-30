@@ -1272,6 +1272,16 @@ pub enum Request {
         limit: u32,
     },
 
+    /// Read the durable assistant inbox owned by one main project session.
+    /// Notify-only entries are included and remain visible until a future
+    /// explicit product action acknowledges them.
+    ReadAssistantInbox {
+        main_session_id: Uuid,
+        #[serde(default)]
+        include_delivered: bool,
+        limit: u32,
+    },
+
     /// Probe the durable terminal state of one idempotent user submission
     /// without changing the daemon's current attachment.
     ReadClientSubmissionReceipt {
@@ -4305,6 +4315,7 @@ macro_rules! request_variants {
             (Request::ResolveInterrupt { .. }, "resolve_interrupt");
             (Request::ListSessions { .. }, "list_sessions");
             (Request::ReadSessionMessages { .. }, "read_session_messages");
+            (Request::ReadAssistantInbox { .. }, "read_assistant_inbox");
             (Request::ReadClientSubmissionReceipt { .. }, "read_client_submission_receipt");
             (Request::ReadHistoryPage { .. }, "read_history_page");
             (Request::ReadSubagentHistoryPage { .. }, "read_subagent_history_page");
@@ -4644,6 +4655,7 @@ macro_rules! command {
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
             (Request::ListSessions { project_id, parent_session_id, assistant_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param]);
             (Request::ReadSessionMessages { session_id, before_seq, limit }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
+            (Request::ReadAssistantInbox { main_session_id, include_delivered, limit }, "read_assistant_inbox", session_row_reader(main_session_id), field(main_session_id), false, read_only, none, concurrent, none, "main_session_id:Uuid|include_delivered:bool|limit:u32", [main_session_id: Uuid => session, include_delivered: bool => param, limit: u32 => param]);
             (Request::ReadClientSubmissionReceipt { session_id, client_submission_id }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|client_submission_id:Uuid", [session_id: Uuid => session, client_submission_id: Uuid => param]);
             (Request::ReadHistoryPage { session_id, before_seq, limit }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadSubagentHistoryPage { session_id, task_call_id, label, before_seq, limit }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, task_call_id: String => param, label: String => param, before_seq: Option<i64> => param, limit: u32 => param]);

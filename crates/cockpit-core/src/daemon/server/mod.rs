@@ -445,6 +445,14 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_session_message(message, redact);
             }
         }
+        proto::Response::AssistantInbox {
+            main_session_id: _,
+            items,
+        } => {
+            for item in items {
+                scrub_string(&mut item.summary, redact);
+            }
+        }
         proto::Response::ClientSubmissionReceipt { .. } => {}
         proto::Response::HistoryPage {
             session_id: _,
@@ -1754,6 +1762,8 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         activity_state: _,
         archived_at_unix_ms: _,
         pin_count: _,
+        assistant_inbox_unread: _,
+        assistant_inbox_latest_source_session_id: _,
     } = summary;
     scrub_string(project_root, redact);
     scrub_option_string(title, redact);

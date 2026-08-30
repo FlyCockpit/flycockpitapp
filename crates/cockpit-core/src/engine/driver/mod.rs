@@ -1509,6 +1509,7 @@ struct ShadowBriefInFlight {
     handle: tokio::task::JoinHandle<crate::engine::compact_draft::CompactDraftOutcome>,
 }
 
+#[derive(Clone)]
 struct ShadowBriefReady {
     generation: u64,
     snapshot_history: Vec<Message>,

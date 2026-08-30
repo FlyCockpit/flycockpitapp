@@ -6,7 +6,10 @@
 
 use std::collections::HashMap;
 use std::io::{self};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use cockpit_client::DaemonClient;
@@ -25,12 +28,12 @@ use uuid::Uuid;
 use super::AcpTransportCounters;
 use super::adapter::AcpAdapter;
 use super::bridge::BridgeFacade;
-use super::classify::{InboundMessage, classify};
+use super::classify::{InboundMessage, InboundRequest, classify};
 use super::codec::{AcpLineReader, AcpLineWriter, FrameSink, write_diagnostic};
-use super::dispatch::{SessionIngress, SessionIngressError};
+use super::dispatch::{SessionIngress, SessionIngressError, validate_initialize};
 use super::dto::{SessionAdmissionDto, SessionLoadDto, SessionNewDto};
-use super::envelope::invalid_request;
 use super::envelope::notification;
+use super::envelope::{invalid_params, invalid_request, success_response};
 use super::registry::{ApprovalAck, ResolveCodeRootInterrupt};
 
 const DISCOVERY_PAGE_SIZE: u16 = 100;
@@ -43,46 +46,90 @@ pub async fn run() -> Result<()> {
 }
 
 fn run_blocking(handle: &Handle) -> Result<()> {
-    let mut reader = AcpLineReader::new(io::stdin());
     let mut stderr = io::stderr();
     let mut peer: Option<Peer> = None;
+    let (frames, frame_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = AcpLineReader::new(io::stdin());
+        let mut counters = AcpTransportCounters::default();
+        loop {
+            match reader.read_frame(&mut counters) {
+                Ok(Some(frame)) if frames.send(ReaderEvent::Frame(frame)).is_ok() => {}
+                Ok(Some(_)) | Ok(None) => {
+                    let _ = frames.send(ReaderEvent::Eof);
+                    break;
+                }
+                Err(error) => {
+                    let _ = frames.send(ReaderEvent::Error(error));
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
-        let mut counters = AcpTransportCounters::default();
-        let frame = match reader.read_frame(&mut counters) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(error) => {
+        match frame_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(ReaderEvent::Frame(frame)) => {
+                let mut counters = AcpTransportCounters::default();
+                if peer.is_none() {
+                    let Ok(InboundMessage::Request(request)) = classify(&frame.json) else {
+                        continue;
+                    };
+                    if request.method != "initialize" {
+                        if let Some(response) = invalid_request(Some(&request.id)) {
+                            AcpLineWriter::new(io::stdout())
+                                .write_json_value(&response, &mut counters)
+                                .map_err(|error| anyhow!(error))?;
+                        }
+                        continue;
+                    }
+                    if let Err(message) = validate_initialize(request.raw_params.as_deref()) {
+                        let response = invalid_params(&request.id, message);
+                        AcpLineWriter::new(io::stdout())
+                            .write_json_value(&response, &mut counters)
+                            .map_err(|error| anyhow!(error))?;
+                        continue;
+                    }
+                    let background_agents = background_agents_setting()?;
+                    let client = handle
+                        .block_on(super::acquire_ledger_owner(background_agents))
+                        .context("acquiring the socket daemon for ACP")?;
+                    peer = Some(Peer::new(handle.clone(), client, background_agents));
+                }
+                let peer = peer.as_mut().expect("initialized ACP peer");
+                let prompt = match classify(&frame.json) {
+                    Ok(InboundMessage::Request(request)) if request.method == "session/prompt" => {
+                        Some(request)
+                    }
+                    _ => None,
+                };
+                if let Some(response) = peer.adapter.handle_frame(&frame.json) {
+                    if let Some(request) = prompt.as_ref()
+                        && peer.defer_prompt_response(request, &response)?
+                    {
+                        // The original request remains active until the
+                        // session-specific daemon event settles this turn.
+                    } else {
+                        peer.adapter
+                            .write_protocol(&response)
+                            .map_err(|error| anyhow!(error))?;
+                    }
+                }
+            }
+            Ok(ReaderEvent::Eof) => break,
+            Ok(ReaderEvent::Error(error)) => {
                 write_diagnostic(&mut stderr, &error);
                 return Err(anyhow!(error));
             }
-        };
-        if peer.is_none() {
-            let Ok(InboundMessage::Request(request)) = classify(&frame.json) else {
-                continue;
-            };
-            if request.method != "initialize" {
-                if let Some(response) = invalid_request(Some(&request.id)) {
-                    AcpLineWriter::new(io::stdout())
-                        .write_json_value(&response, &mut counters)
-                        .map_err(|error| anyhow!(error))?;
-                }
-                continue;
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if let Some(peer) = peer.as_mut() {
+            peer.drain_deliveries()?;
+            peer.drain_turn_events()?;
+            if peer.adapter.connection_closed || peer.adapter.registry.connection_closed() {
+                break;
             }
-            let client = handle
-                .block_on(super::acquire_ledger_owner(background_agents_setting()?))
-                .context("acquiring the socket daemon for ACP")?;
-            peer = Some(Peer::new(handle.clone(), client));
-        }
-        let peer = peer.as_mut().expect("initialized ACP peer");
-        if let Some(response) = peer.adapter.handle_frame(&frame.json) {
-            peer.adapter
-                .write_protocol(&response)
-                .map_err(|error| anyhow!(error))?;
-        }
-        peer.drain_deliveries()?;
-        if peer.adapter.connection_closed || peer.adapter.registry.connection_closed() {
-            break;
         }
     }
     if let Some(mut peer) = peer {
@@ -90,6 +137,12 @@ fn run_blocking(handle: &Handle) -> Result<()> {
         peer.adapter.disconnect();
     }
     Ok(())
+}
+
+enum ReaderEvent {
+    Frame(super::codec::AcpFrame),
+    Eof,
+    Error(super::codec::AcpFrameError),
 }
 
 /// #116 owns the typed setting. This temporary reader uses its exact persisted
@@ -113,18 +166,29 @@ fn background_agents_setting() -> Result<bool> {
 
 #[derive(Clone)]
 struct Attachment {
+    client: DaemonClient,
     capability: CodeRootAttachmentCapabilityV1,
     cursor: cockpit_proto::CodeRootReplayCursorV1,
     rendered_initial: bool,
 }
 
+struct PendingPrompt {
+    request_id: super::raw_json::JsonRpcId,
+}
+
 struct State {
+    /// An unattached socket client used only for root discovery and to keep the
+    /// daemon lifetime acquired by `initialize` alive. Every ACP root receives
+    /// its own attached client below.
     client: DaemonClient,
+    background_agents: bool,
     logical_client_id: OpaqueAsciiId128V1,
     attachments: HashMap<String, Attachment>,
+    pending_prompts: HashMap<String, PendingPrompt>,
     permission_deliveries: HashMap<
         String,
         (
+            DaemonClient,
             CodeRootAttachmentCapabilityV1,
             cockpit_proto::CodeRootReplayCursorV1,
         ),
@@ -138,11 +202,13 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(handle: Handle, client: DaemonClient) -> Self {
+    fn new(handle: Handle, client: DaemonClient, background_agents: bool) -> Self {
         let state = Arc::new(Mutex::new(State {
             client,
+            background_agents,
             logical_client_id: opaque("client"),
             attachments: HashMap::new(),
+            pending_prompts: HashMap::new(),
             permission_deliveries: HashMap::new(),
         }));
         Self {
@@ -167,15 +233,14 @@ impl Peer {
             .cloned()
             .collect();
         for attachment in attachments {
-            let client = self.state.lock().expect("ACP state").client.clone();
-            let _ = self
-                .handle
-                .block_on(client.request_ok(Request::CloseAcpCodeRootAttachmentV1(
+            let _ = self.handle.block_on(attachment.client.request_ok(
+                Request::CloseAcpCodeRootAttachmentV1(
                     cockpit_proto::CloseAcpCodeRootAttachmentV1Request {
                         attachment_capability: attachment.capability,
                         client_request_id: opaque("close"),
                     },
-                )));
+                ),
+            ));
         }
     }
 
@@ -189,15 +254,14 @@ impl Peer {
             .map(|(session_id, attachment)| (session_id.clone(), attachment.clone()))
             .collect();
         for (session_id, attachment) in attachments {
-            let client = self.state.lock().expect("ACP state").client.clone();
             if !attachment.rendered_initial {
-                let response = self
-                    .handle
-                    .block_on(client.request_ok(Request::ReadCodeRootV1(
-                        ReadCodeRootV1Request {
-                            attachment_capability: attachment.capability.clone(),
-                        },
-                    )))?;
+                let response =
+                    self.handle
+                        .block_on(attachment.client.request_ok(Request::ReadCodeRootV1(
+                            ReadCodeRootV1Request {
+                                attachment_capability: attachment.capability.clone(),
+                            },
+                        )))?;
                 let Response::CodeRootRead(root) = response else {
                     return Err(anyhow!("unexpected ACP Code-root read response"));
                 };
@@ -219,57 +283,150 @@ impl Peer {
                     .expect("known attachment")
                     .rendered_initial = true;
             }
-            let client = self.state.lock().expect("ACP state").client.clone();
-            let response =
-                self.handle
-                    .block_on(client.request_ok(Request::ReadCodeRootDeliveriesV1(
-                        ReadCodeRootDeliveriesV1Request {
-                            attachment_capability: attachment.capability.clone(),
-                            after: Some(attachment.cursor),
-                            limit: DISCOVERY_PAGE_SIZE,
-                        },
-                    )))?;
-            let Response::CodeRootDeliveries(page) = response else {
-                return Err(anyhow!("unexpected ACP Code-root delivery response"));
-            };
-            for delivery in page.deliveries {
-                match delivery.payload {
-                    CodeRootDeliveryPayloadV1::History { entry } => {
-                        if let cockpit_proto::HistoryEntry::Assistant {
-                            text,
-                            presentation_text,
-                            ..
-                        } = entry
-                        {
-                            self.emit_assistant(&session_id, presentation_text.unwrap_or(text))?;
+            let mut cursor = attachment.cursor.clone();
+            loop {
+                let response = self.handle.block_on(attachment.client.request_ok(
+                    Request::ReadCodeRootDeliveriesV1(ReadCodeRootDeliveriesV1Request {
+                        attachment_capability: attachment.capability.clone(),
+                        after: Some(cursor.clone()),
+                        limit: DISCOVERY_PAGE_SIZE,
+                    }),
+                ))?;
+                let Response::CodeRootDeliveries(page) = response else {
+                    return Err(anyhow!("unexpected ACP Code-root delivery response"));
+                };
+                let count = page.deliveries.len();
+                for delivery in page.deliveries {
+                    match delivery.payload {
+                        CodeRootDeliveryPayloadV1::History { entry } => {
+                            if let cockpit_proto::HistoryEntry::Assistant {
+                                text,
+                                presentation_text,
+                                ..
+                            } = entry
+                            {
+                                self.emit_assistant(
+                                    &session_id,
+                                    presentation_text.unwrap_or(text),
+                                )?;
+                            }
+                        }
+                        CodeRootDeliveryPayloadV1::Attention { entry } => {
+                            self.issue_permission(
+                                &session_id,
+                                &attachment.client,
+                                &attachment.capability,
+                                delivery.delivery_id.to_string(),
+                                entry.decision_request_id.to_string(),
+                                entry.attention_id.to_string(),
+                                entry.options_contract_json,
+                                delivery.cursor.clone(),
+                            )?;
+                        }
+                        CodeRootDeliveryPayloadV1::RootStateChanged => {}
+                        CodeRootDeliveryPayloadV1::ClientIncompatible => {
+                            return Err(anyhow!("daemon marked an ACP Code root incompatible"));
                         }
                     }
-                    CodeRootDeliveryPayloadV1::Attention { entry } => {
-                        self.issue_permission(
-                            &session_id,
-                            &attachment.capability,
-                            delivery.delivery_id.to_string(),
-                            entry.decision_request_id.to_string(),
-                            entry.attention_id.to_string(),
-                            entry.options_contract_json,
-                            delivery.cursor.clone(),
-                        )?;
-                    }
-                    CodeRootDeliveryPayloadV1::RootStateChanged => {}
-                    CodeRootDeliveryPayloadV1::ClientIncompatible => {
-                        return Err(anyhow!("daemon marked an ACP Code root incompatible"));
-                    }
+                    cursor = delivery.cursor.clone();
+                    self.state
+                        .lock()
+                        .expect("ACP state")
+                        .attachments
+                        .get_mut(&session_id)
+                        .expect("known attachment")
+                        .cursor = delivery.cursor;
                 }
-                self.state
-                    .lock()
-                    .expect("ACP state")
-                    .attachments
-                    .get_mut(&session_id)
-                    .expect("known attachment")
-                    .cursor = delivery.cursor;
+                if count < usize::from(DISCOVERY_PAGE_SIZE) {
+                    break;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Suppress the optimistic jsonrpsee response only after the daemon has
+    /// accepted the prompt. The stored JSON-RPC id is completed from the
+    /// session's own event stream, not by a later unrelated stdin frame.
+    fn defer_prompt_response(&mut self, request: &InboundRequest, response: &str) -> Result<bool> {
+        let value: Value = serde_json::from_str(response).context("decoding prompt response")?;
+        if value.get("result").is_none() {
+            return Ok(false);
+        }
+        let raw = request
+            .raw_params
+            .as_deref()
+            .ok_or_else(|| anyhow!("prompt params missing after dispatch"))?;
+        let session_id = serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|params| {
+                params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| anyhow!("prompt session id missing after dispatch"))?;
+        self.state
+            .lock()
+            .expect("ACP state")
+            .pending_prompts
+            .insert(
+                session_id,
+                PendingPrompt {
+                    request_id: request.id.clone(),
+                },
+            );
+        Ok(true)
+    }
+
+    fn drain_turn_events(&mut self) -> Result<()> {
+        let attachments: Vec<_> = self
+            .state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .iter()
+            .map(|(session_id, attachment)| (session_id.clone(), attachment.client.clone()))
+            .collect();
+        for (session_id, client) in attachments {
+            loop {
+                let event = self.handle.block_on(async {
+                    tokio::time::timeout(Duration::from_millis(0), client.next_event())
+                        .await
+                        .ok()
+                        .flatten()
+                });
+                let Some(event) = event else { break };
+                if let cockpit_proto::Event::AgentIdle {
+                    session_id: root_id,
+                    reason,
+                    ..
+                } = event
+                    && root_id.to_string() == session_id
+                {
+                    self.complete_prompt(&session_id, stop_reason(&reason))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_prompt(&mut self, session_id: &str, stop_reason: &str) -> Result<()> {
+        let pending = self
+            .state
+            .lock()
+            .expect("ACP state")
+            .pending_prompts
+            .remove(session_id);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        self.adapter
+            .write_protocol(&success_response(
+                &pending.request_id,
+                json!({ "stopReason": stop_reason }),
+            ))
+            .map_err(|error| anyhow!(error))
     }
 
     fn emit_assistant(&mut self, session_id: &str, text: String) -> Result<()> {
@@ -291,6 +448,7 @@ impl Peer {
     fn issue_permission(
         &mut self,
         session_id: &str,
+        client: &DaemonClient,
         capability: &CodeRootAttachmentCapabilityV1,
         delivery_id: String,
         tool_call_id: String,
@@ -298,14 +456,33 @@ impl Peer {
         options_contract: String,
         cursor: cockpit_proto::CodeRootReplayCursorV1,
     ) -> Result<()> {
-        let options = permission_options(&options_contract)?;
+        let options = match permission_options(&options_contract) {
+            Ok(options) => options,
+            Err(error) => {
+                // ACP v1's permission response carries only one option id. A
+                // multi-select or free-text QuestionTool cannot be forged as
+                // a scalar choice; cancel the exact root rather than emit an
+                // unanswerable empty request or leave its turn parked.
+                self.emit_assistant(
+                    session_id,
+                    format!("Cockpit cannot represent this QuestionTool over ACP v1: {error}"),
+                )?;
+                self.handle
+                    .block_on(client.request_ok(Request::CancelTurn))
+                    .context("cancelling an ACP-unrepresentable QuestionTool")?;
+                return Ok(());
+            }
+        };
         let option_refs: Vec<_> = options.iter().map(String::as_str).collect();
         let params = super::registry::permission_params(session_id, &option_refs, &tool_call_id);
         self.state
             .lock()
             .expect("ACP state")
             .permission_deliveries
-            .insert(delivery_id.clone(), (capability.clone(), cursor));
+            .insert(
+                delivery_id.clone(),
+                (client.clone(), capability.clone(), cursor),
+            );
         self.adapter
             .registry
             .issue_and_write(
@@ -383,10 +560,18 @@ impl DaemonIngress {
         Ok(roots)
     }
 
-    fn install(&self, attachment: cockpit_proto::CodeRootAttachmentV1) {
+    fn attachment_client(&self) -> Result<DaemonClient> {
+        let background_agents = self.state.lock().expect("ACP state").background_agents;
+        self.handle
+            .block_on(super::acquire_ledger_owner(background_agents))
+            .context("opening an independent ACP Code-root attachment")
+    }
+
+    fn install(&self, attachment: cockpit_proto::CodeRootAttachmentV1, client: DaemonClient) {
         self.state.lock().expect("ACP state").attachments.insert(
             attachment.root_id.0.to_string(),
             Attachment {
+                client,
                 capability: attachment.attachment_capability,
                 cursor: attachment.replay_cursor,
                 rendered_initial: false,
@@ -409,6 +594,9 @@ impl SessionIngress for DaemonIngress {
             .to_ingress(&admission)
             .map_err(|_| SessionIngressError::InvalidAdmission)?;
         counters.bridge_conversions += 1;
+        let client = self
+            .attachment_client()
+            .map_err(|_| SessionIngressError::Unavailable)?;
         let attachment = match admission {
             SessionAdmissionDto::New(SessionNewDto { cwd, .. }) => {
                 let logical_client_id = self
@@ -418,7 +606,8 @@ impl SessionIngress for DaemonIngress {
                     .logical_client_id
                     .clone();
                 let response = self
-                    .call(Request::CreateCodeRootWithAcpIngressV1(
+                    .handle
+                    .block_on(client.request_ok(Request::CreateCodeRootWithAcpIngressV1(
                         CreateCodeRootWithAcpIngressV1Request {
                             base: CreateCodeRootV1Request {
                                 workspace_selector: CodeRootWorkspaceSelectorV1 {
@@ -430,7 +619,7 @@ impl SessionIngress for DaemonIngress {
                             },
                             ingress,
                         },
-                    ))
+                    )))
                     .map_err(|_| SessionIngressError::Unavailable)?;
                 let Response::CodeRootWithAcpIngressCreated(result) = response else {
                     return Err(SessionIngressError::Unavailable);
@@ -464,20 +653,23 @@ impl SessionIngress for DaemonIngress {
                     .logical_client_id
                     .clone();
                 let response = self
-                    .call(Request::AttachExistingCodeRootWithAcpIngressV1(
-                        AttachExistingCodeRootWithAcpIngressV1Request {
-                            base: AttachExistingCodeRootV1Request {
-                                root_id: root.root_id,
-                                capture_generation: root.capture_generation,
-                                logical_client_id,
-                                client_request_id: opaque("load"),
-                                replay_cursor: None,
-                                since_seq: None,
-                                options: self.options(),
+                    .handle
+                    .block_on(
+                        client.request_ok(Request::AttachExistingCodeRootWithAcpIngressV1(
+                            AttachExistingCodeRootWithAcpIngressV1Request {
+                                base: AttachExistingCodeRootV1Request {
+                                    root_id: root.root_id,
+                                    capture_generation: root.capture_generation,
+                                    logical_client_id,
+                                    client_request_id: opaque("load"),
+                                    replay_cursor: None,
+                                    since_seq: None,
+                                    options: self.options(),
+                                },
+                                ingress,
                             },
-                            ingress,
-                        },
-                    ))
+                        )),
+                    )
                     .map_err(|_| SessionIngressError::Unavailable)?;
                 let Response::CodeRootWithAcpIngressAttached(result) = response else {
                     return Err(SessionIngressError::Unavailable);
@@ -486,7 +678,7 @@ impl SessionIngress for DaemonIngress {
             }
         };
         let session_id = attachment.root_id.0.to_string();
-        self.install(attachment);
+        self.install(attachment, client);
         counters.daemon_mutations += 1;
         Ok(json!({ "sessionId": session_id }))
     }
@@ -517,10 +709,28 @@ impl SessionIngress for DaemonIngress {
 
     fn cancel(
         &mut self,
-        _raw: &str,
+        raw: &str,
         counters: &mut AcpTransportCounters,
     ) -> Result<Value, SessionIngressError> {
-        self.call(Request::CancelTurn)
+        let session_id = serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|params| {
+                params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or(SessionIngressError::InvalidAdmission)?;
+        let client = self
+            .state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .get(&session_id)
+            .map(|attachment| attachment.client.clone())
+            .ok_or(SessionIngressError::InvalidAdmission)?;
+        self.handle
+            .block_on(client.request_ok(Request::CancelTurn))
             .map_err(|_| SessionIngressError::Unavailable)?;
         counters.daemon_mutations += 1;
         Ok(Value::Null)
@@ -537,11 +747,19 @@ impl SessionIngress for DaemonIngress {
             .get("sessionId")
             .and_then(Value::as_str)
             .ok_or(SessionIngressError::InvalidAdmission)?;
-        if !self
+        let client = self
             .state
             .lock()
             .expect("ACP state")
             .attachments
+            .get(session_id)
+            .map(|attachment| attachment.client.clone())
+            .ok_or(SessionIngressError::InvalidAdmission)?;
+        if self
+            .state
+            .lock()
+            .expect("ACP state")
+            .pending_prompts
             .contains_key(session_id)
         {
             return Err(SessionIngressError::InvalidAdmission);
@@ -551,28 +769,32 @@ impl SessionIngress for DaemonIngress {
             .and_then(Value::as_array)
             .ok_or(SessionIngressError::InvalidAdmission)?
             .iter()
-            .map(|block| {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .filter(|_| block.get("type").and_then(Value::as_str) == Some("text"))
+            .map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => block.get("text").and_then(Value::as_str).map(str::to_owned),
+                Some("resource_link") => {
+                    let name = block.get("name").and_then(Value::as_str)?;
+                    let uri = block.get("uri").and_then(Value::as_str)?;
+                    Some(format!("Referenced resource: {name} ({uri})"))
+                }
+                _ => None,
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(SessionIngressError::InvalidAdmission)?
             .join("\n");
         let message =
             cockpit_proto::send_user_message_v2::SendUserMessageV2::text_only(Uuid::now_v7(), text);
-        self.call(Request::SendUserMessageV2 {
-            ingress: cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
-                Uuid::now_v7(),
-                session_id,
-                None,
-                None,
-                None,
-                message,
-            ),
-        })
-        .map_err(|_| SessionIngressError::Unavailable)?;
+        self.handle
+            .block_on(client.request_ok(Request::SendUserMessageV2 {
+                ingress: cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
+                    Uuid::now_v7(),
+                    session_id,
+                    None,
+                    None,
+                    None,
+                    message,
+                ),
+            }))
+            .map_err(|_| SessionIngressError::Unavailable)?;
         counters.daemon_mutations += 1;
         Ok(json!({ "stopReason": "end_turn" }))
     }
@@ -592,7 +814,17 @@ impl ResolveCodeRootInterrupt for DaemonResolve {
         &mut self,
         request: cockpit_proto::ResolveCodeRootInterruptV1,
     ) -> cockpit_proto::ResolveCodeRootInterruptResultV1 {
-        let client = self.state.lock().expect("ACP state").client.clone();
+        let client = self
+            .state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .values()
+            .find(|attachment| attachment.capability == request.attachment_capability)
+            .map(|attachment| attachment.client.clone());
+        let Some(client) = client else {
+            return cockpit_proto::ResolveCodeRootInterruptResultV1::Cancelled;
+        };
         match self
             .handle
             .block_on(client.request_ok(Request::ResolveCodeRootInterruptV1(request)))
@@ -614,12 +846,12 @@ impl DaemonAck {
 }
 impl ApprovalAck for DaemonAck {
     fn ack_approval_delivery(&mut self, delivery_id: &str) {
-        let (client, receipt) = {
+        let receipt = {
             let mut state = self.state.lock().expect("ACP state");
             let receipt = state.permission_deliveries.remove(delivery_id);
-            (state.client.clone(), receipt)
+            receipt
         };
-        let Some((capability, through)) = receipt else {
+        let Some((client, capability, through)) = receipt else {
             return;
         };
         let _ = self
@@ -639,6 +871,20 @@ fn opaque(kind: &str) -> OpaqueAsciiId128V1 {
         .expect("generated ACP id is bounded ASCII")
 }
 
+fn stop_reason(reason: &cockpit_proto::IdleReason) -> &'static str {
+    match reason {
+        cockpit_proto::IdleReason::Completed | cockpit_proto::IdleReason::GoalComplete => {
+            "end_turn"
+        }
+        cockpit_proto::IdleReason::BudgetLimited | cockpit_proto::IdleReason::UsageLimited => {
+            "max_turn_requests"
+        }
+        cockpit_proto::IdleReason::NeedsIntervention { .. }
+        | cockpit_proto::IdleReason::Error { .. } => "refusal",
+        cockpit_proto::IdleReason::Interrupted => "cancelled",
+    }
+}
+
 fn permission_options(contract: &str) -> Result<Vec<String>> {
     let parsed: Value =
         serde_json::from_str(contract).context("parsing Code-root decision options")?;
@@ -646,16 +892,55 @@ fn permission_options(contract: &str) -> Result<Vec<String>> {
         .get("options")
         .and_then(Value::as_array)
         .or_else(|| parsed.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !options.is_empty() {
+        return options.iter().map(permission_option_id).collect();
+    }
+    let questions = parsed
+        .get("interrupt_response_contract")
+        .and_then(|contract| contract.get("questions"))
+        .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("Code-root decision options are not an array"))?;
-    options
+    // ACP v1 permission outcomes name exactly one offered option. A linked
+    // QuestionTool can therefore be projected only when its durable contract
+    // is one single-select question with real choices. Do not emit an empty
+    // request for forms ACP cannot represent.
+    if questions.len() != 1 {
+        return Err(anyhow!(
+            "ACP cannot represent a multi-question continuation"
+        ));
+    }
+    if questions[0].get("kind").and_then(Value::as_str) != Some("single") {
+        return Err(anyhow!(
+            "ACP cannot represent a multi-select or free-text continuation"
+        ));
+    }
+    let option_ids = questions[0]
+        .get("option_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("QuestionTool continuation has no ACP choices"))?;
+    if option_ids.is_empty() {
+        return Err(anyhow!(
+            "ACP cannot represent a free-text-only continuation"
+        ));
+    }
+    option_ids
         .iter()
         .map(|option| {
             option
-                .get("id")
-                .or_else(|| option.get("option_id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("Code-root decision option has no id"))
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("QuestionTool option id is invalid"))
         })
         .collect()
+}
+
+fn permission_option_id(option: &Value) -> Result<String> {
+    option
+        .get("id")
+        .or_else(|| option.get("option_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Code-root decision option has no id"))
 }

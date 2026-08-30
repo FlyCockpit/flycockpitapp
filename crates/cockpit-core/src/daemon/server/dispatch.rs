@@ -6550,7 +6550,7 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::BadRequest,
                     message: "Code-root attention id is invalid".into(),
                 })?;
-            let decision_request_id = ctx
+            let decision = ctx
                 .db
                 .decision_attention_page(record.root_id.0, None, 256)
                 .await
@@ -6558,11 +6558,28 @@ async fn handle_serialized_request_impl(
                 .entries
                 .into_iter()
                 .find(|entry| entry.attention_id == attention_id)
-                .map(|entry| entry.decision.decision_request_id)
+                .map(|entry| entry.decision)
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "Code-root attention is no longer available".into(),
                 })?;
+            let decision_request_id = decision.decision_request_id;
+            let answer =
+                if serde_json::from_str::<serde_json::Value>(&decision.options_contract_json)
+                    .ok()
+                    .and_then(|contract| contract.get("interrupt_response_contract").cloned())
+                    .is_some()
+                {
+                    crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
+                        response: crate::db::wire::ResolveResponse::Single {
+                            selected_id: request.selected_choice.as_str().to_owned(),
+                        },
+                    }
+                } else {
+                    crate::agent_tree::PublicDecisionAnswer::option(
+                        request.selected_choice.as_str().to_owned(),
+                    )
+                };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             if !crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .begin_interrupt_resolution(&record.logical_client_id, &request.client_request_id)
@@ -6581,9 +6598,7 @@ async fn handle_serialized_request_impl(
                 .handle
                 .send_work(SessionWork::ResolveAgentDecision {
                     decision_request_id,
-                    answer: crate::agent_tree::PublicDecisionAnswer::option(
-                        request.selected_choice.as_str().to_owned(),
-                    ),
+                    answer,
                     code_root_receipt: Some(
                         crate::db::agent_tree_decisions::CodeRootInterruptReceiptWrite {
                             logical_client_id: record.logical_client_id.as_str().to_owned(),

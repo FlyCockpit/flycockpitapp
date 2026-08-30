@@ -180,6 +180,25 @@ fn acp_transport_initialize_capability_serialization() {
 }
 
 #[test]
+fn acp_transport_initialize_requires_a_positive_protocol_version() {
+    for params in [
+        "{}",
+        "[]",
+        r#"{"protocolVersion":0}"#,
+        r#"{"protocolVersion":"1"}"#,
+    ] {
+        let mut adapter = peer();
+        let response = send(
+            &mut adapter,
+            &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{params}}}"#),
+        )
+        .expect("malformed initialization receives an error");
+        assert!(response.contains("\"code\":-32602"));
+        assert_no_transport_mutation(&adapter.counters);
+    }
+}
+
+#[test]
 fn acp_transport_stdio_transcript_keeps_diagnostics_off_stdout() {
     let input = concat!(
         "not-json\n",

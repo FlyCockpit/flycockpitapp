@@ -39,7 +39,15 @@ impl Tool for StartBuildTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let force = parse_start_build_force(&args)?;
-        let Some(doc) = ctx.session.db.get_session_plan_doc(ctx.session.id).await? else {
+        let Some(doc) = ctx
+            .session
+            .db
+            .get_session_plan_doc_for_trust(
+                ctx.session.id,
+                crate::tools::session_search::caller_history_trust(ctx),
+            )
+            .await?
+        else {
             return Err(invalid_input(
                 "write a non-empty plan document before calling start_build",
             ));
@@ -242,7 +250,7 @@ mod tests {
             session_id,
             0,
             content,
-            crate::db::session_search::HistoryCallerTrust::Trusted,
+            crate::db::session_search::HistoryCallerTrust::Untrusted,
         )
         .await
         .unwrap()
@@ -373,6 +381,25 @@ mod tests {
         assert_eq!(events[0].0, "user_message");
         assert_eq!(events[0].1["text"], "Standalone implementation plan");
         assert_eq!(events[1].0, "user_note");
+    }
+
+    #[tokio::test]
+    async fn start_build_does_not_handoff_a_plan_hidden_by_model_trust() {
+        let tmp = TempDir::new().unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        db.write_session_plan_doc_if_revision(
+            ctx.session.id,
+            0,
+            "Trusted-only plan",
+            crate::db::session_search::HistoryCallerTrust::Trusted,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let error = StartBuildTool.call(Value::Null, &ctx).await.unwrap_err();
+        assert!(format!("{error:#}").contains("write a non-empty plan document"));
+        assert!(other_sessions(&db, ctx.session.id).await.is_empty());
     }
 
     #[tokio::test]

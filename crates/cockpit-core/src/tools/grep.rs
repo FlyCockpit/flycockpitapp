@@ -38,7 +38,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Regex content search confined to the current root or one `cockpit://` pseudofile; `cockpit://history/` uses bounded FTS discovery"
+        "Literal or regex content search confined to the current root or one `cockpit://` pseudofile; `cockpit://history/` uses bounded FTS discovery"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -47,7 +47,7 @@ impl Tool for GrepTool {
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search file contents for a regular expression within the current root and get back \
+            "Search file contents for literal text or a regular expression within the current root and get back \
              budgeted file:line matches. Use it to locate where a symbol, string, or pattern \
              appears. The search is hard-confined to the root — you cannot reach outside it. \
              Narrow with `path` to one subdirectory or file when you can, then `read` the \
@@ -61,7 +61,8 @@ impl Tool for GrepTool {
             "type": "object",
             "x-cockpit-primary-field": "pattern",
             "properties": {
-                "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "Regex to search for" },
+                "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "Text or regular expression to search for" },
+                "mode":             { "type": "string", "enum": ["literal", "regex"], "description": "Interpret `pattern` as literal text or a regular expression (default: regex)" },
                 "path":             { "type": "string", "x-cockpit-kind": "path", "description": "`path` subdirectory or file under the root (default: whole root)" },
                 "case_insensitive": { "type": "boolean", "description": "Case-insensitive match (default false)" }
             },
@@ -74,7 +75,8 @@ impl Tool for GrepTool {
             "type": "object",
             "x-cockpit-primary-field": "pattern",
             "properties": {
-                "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "The regular expression to search file contents for" },
+                "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "The literal text or regular expression to search file contents for" },
+                "mode":             { "type": "string", "enum": ["literal", "regex"], "description": "Interpret `pattern` as literal text or a regular expression (default: regex)" },
                 "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Optional `path` subdirectory or file under the package root to restrict the search to; omit to search the whole package. Cannot point outside the root" },
                 "case_insensitive": { "type": "boolean", "description": "When true, match case-insensitively; defaults to case-sensitive" }
             },
@@ -92,6 +94,10 @@ impl Tool for GrepTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid_input("`pattern` is required"))?
             .to_string();
+        let mode = args.get("mode").and_then(Value::as_str).unwrap_or("regex");
+        if !matches!(mode, "literal" | "regex") {
+            return Err(invalid_input("`mode` must be `literal` or `regex`"));
+        }
         let case_insensitive = args
             .get("case_insensitive")
             .and_then(Value::as_bool)
@@ -117,7 +123,11 @@ impl Tool for GrepTool {
         let guard_root = canonical_root.clone();
         let query = pattern.clone();
         let options = SearchOptions {
-            pattern,
+            pattern: if mode == "literal" {
+                regex::escape(&pattern)
+            } else {
+                pattern
+            },
             case_insensitive,
             columns: false,
             context: None,

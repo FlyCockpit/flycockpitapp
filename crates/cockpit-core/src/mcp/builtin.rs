@@ -2058,7 +2058,7 @@ mod tests {
     #[test]
     fn history_agent_tools_are_default_cockpit_mcp_functions() {
         let registry = default_registry();
-        for name in ["session_search", "session_read", "session_lineage_search"] {
+        for name in ["session_search", "session_lineage_search"] {
             let func = registry
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} should be a cockpit builtin function"));
@@ -2068,7 +2068,6 @@ mod tests {
                     "session_search" => {
                         Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>
                     }
-                    "session_read" => Arc::new(crate::tools::session_read::SessionReadTool),
                     "session_lineage_search" => {
                         Arc::new(crate::tools::session_search::SessionLineageSearchTool)
                     }
@@ -2322,15 +2321,15 @@ mod tests {
         let denied_registry = crate::engine::tool::ToolBox::new().mcp_builtin_registry();
         let denied = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()))
             .with_builtin_registry(denied_registry);
-        assert!(describe(&denied, "session_read").is_err());
-        assert!(search(&denied, "session_read").is_empty());
+        assert!(describe(&denied, "session_search").is_err());
+        assert!(search(&denied, "session_search").is_empty());
 
         let allowed_registry = crate::engine::tool::ToolBox::new()
-            .with(Arc::new(crate::tools::session_read::SessionReadTool))
+            .with(Arc::new(crate::tools::session_search::SessionSearchTool))
             .mcp_builtin_registry();
         let allowed = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()))
             .with_builtin_registry(allowed_registry);
-        assert!(describe(&allowed, "session_read").is_ok());
+        assert!(describe(&allowed, "session_search").is_ok());
     }
 
     #[tokio::test]

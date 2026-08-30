@@ -5641,13 +5641,59 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::Unavailable,
                     message: "ACP forwarded-MCP catalog composition is not available".to_string(),
                 })?;
-            let result = crate::daemon::acp_catalog_composition::create_route(
-                service.as_ref(),
-                &state.principal,
-                request,
-            )
+            let cwd = std::path::PathBuf::from(&request.base.workspace_selector.path);
+            service.validate_ingress(&cwd, &request.ingress)?;
+            let base_response = Box::pin(handle_serialized_request_impl(
+                request_id,
+                Request::CreateCodeRootV1(request.base.clone()),
+                state,
+                shared,
+                ctx,
+                effects,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            ))
             .await?;
-            Ok(Response::CodeRootWithAcpIngressCreated(result))
+            let Response::CodeRootCreated(base) = base_response else {
+                return Err(internal(anyhow::anyhow!(
+                    "base Code-root create returned an unexpected response"
+                )));
+            };
+            let capability = base.attachment.attachment_capability.clone();
+            let slot = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| internal(anyhow::anyhow!("created Code-root was not attached")))?
+                .handle
+                .forwarded_mcp_slot();
+            if let Err(error) = service.bind_catalog(
+                base.attachment.root_id.0,
+                &capability,
+                &cwd,
+                &request.ingress,
+                slot,
+            ) {
+                let _ = Box::pin(handle_serialized_request_impl(
+                    request_id,
+                    Request::CloseCodeRootAttachmentV1(
+                        proto::CloseCodeRootAttachmentV1Request {
+                            attachment_capability: capability,
+                            client_request_id: request.ingress.ingress_request_id.clone(),
+                        },
+                    ),
+                    state,
+                    shared,
+                    ctx,
+                    effects,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                ))
+                .await;
+                return Err(error);
+            }
+            Ok(Response::CodeRootWithAcpIngressCreated(
+                proto::CreateCodeRootWithAcpIngressV1Result { base },
+            ))
         }
 
         Request::AttachExistingCodeRootWithAcpIngressV1(request) => {
@@ -5658,13 +5704,69 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::Unavailable,
                     message: "ACP forwarded-MCP catalog composition is not available".to_string(),
                 })?;
-            let result = crate::daemon::acp_catalog_composition::attach_route(
-                service.as_ref(),
-                &state.principal,
-                request,
-            )
+            let cwd = std::path::PathBuf::from(
+                ctx.db
+                    .get_session(request.base.root_id.0)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: "Code root not found".to_string(),
+                    })?
+                    .project_root,
+            );
+            service.validate_ingress(&cwd, &request.ingress)?;
+            let base_response = Box::pin(handle_serialized_request_impl(
+                request_id,
+                Request::AttachExistingCodeRootV1(request.base.clone()),
+                state,
+                shared,
+                ctx,
+                effects,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            ))
             .await?;
-            Ok(Response::CodeRootWithAcpIngressAttached(result))
+            let Response::CodeRootAttached(base) = base_response else {
+                return Err(internal(anyhow::anyhow!(
+                    "base Code-root attach returned an unexpected response"
+                )));
+            };
+            let capability = base.attachment.attachment_capability.clone();
+            let slot = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| internal(anyhow::anyhow!("Code-root attach was not published")))?
+                .handle
+                .forwarded_mcp_slot();
+            if let Err(error) = service.bind_catalog(
+                base.attachment.root_id.0,
+                &capability,
+                &cwd,
+                &request.ingress,
+                slot,
+            ) {
+                let _ = Box::pin(handle_serialized_request_impl(
+                    request_id,
+                    Request::CloseCodeRootAttachmentV1(
+                        proto::CloseCodeRootAttachmentV1Request {
+                            attachment_capability: capability,
+                            client_request_id: request.ingress.ingress_request_id.clone(),
+                        },
+                    ),
+                    state,
+                    shared,
+                    ctx,
+                    effects,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                ))
+                .await;
+                return Err(error);
+            }
+            Ok(Response::CodeRootWithAcpIngressAttached(
+                proto::AttachExistingCodeRootWithAcpIngressV1Result { base },
+            ))
         }
 
         Request::CloseAcpCodeRootAttachmentV1(request) => {
@@ -5675,13 +5777,35 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::Unavailable,
                     message: "ACP forwarded-MCP catalog composition is not available".to_string(),
                 })?;
-            let result = crate::daemon::acp_catalog_composition::close_route(
-                service.as_ref(),
-                &state.principal,
-                request,
-            )
+            let root_id = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .record_for_capability(&request.attachment_capability)
+                .map_err(code_root_contract_error)?
+                .root_id;
+            let base_response = Box::pin(handle_serialized_request_impl(
+                request_id,
+                Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
+                    attachment_capability: request.attachment_capability.clone(),
+                    client_request_id: request.client_request_id.clone(),
+                }),
+                state,
+                shared,
+                ctx,
+                effects,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            ))
             .await?;
-            Ok(Response::AcpCodeRootAttachmentClosed(result))
+            let Response::CodeRootAttachmentClosed(base) = base_response else {
+                return Err(internal(anyhow::anyhow!(
+                    "base Code-root close returned an unexpected response"
+                )));
+            };
+            service.release_catalog(root_id.0, &request.attachment_capability);
+            Ok(Response::AcpCodeRootAttachmentClosed(
+                proto::CloseAcpCodeRootAttachmentV1Result {
+                    outcome: base.into(),
+                },
+            ))
         }
 
         Request::CreateCodeRootV1(request) => {

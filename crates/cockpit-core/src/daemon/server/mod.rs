@@ -2777,9 +2777,9 @@ impl DaemonContext {
             code_root_authority: Arc::new(StdMutex::new(
                 crate::daemon::code_roots::CodeRootAuthorityV1::default(),
             )),
-            // TODO(acp-session-scoped-monty-mcp-bridge): install the atomic
-            // catalog composition implementation during daemon construction.
-            acp_catalog_composition: None,
+            acp_catalog_composition: Some(Arc::new(
+                crate::daemon::acp_catalog_composition::DaemonAcpCatalogCompositionV1::default(),
+            )),
             paths,
             canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]

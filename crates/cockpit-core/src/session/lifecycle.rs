@@ -157,6 +157,7 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
+        let project_root = canonical_workspace_root(&project_root)?;
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
@@ -194,6 +195,7 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
+        let project_root = canonical_workspace_root(&project_root)?;
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
@@ -253,6 +255,7 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
+        let project_root = canonical_workspace_root(&project_root)?;
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
@@ -432,6 +435,12 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
         freshly_created: bool,
     ) -> Result<Self> {
+        let project_root = canonical_workspace_root(&project_root)
+            .context("canonicalizing persisted session workspace root")?;
+        anyhow::ensure!(
+            project_id_for(&project_root) == row.project_id,
+            "persisted session project id does not match canonical workspace root"
+        );
         let session_entry_mode = match row.session_entry_mode.as_str() {
             "code" => crate::daemon::proto::SessionEntryMode::Code,
             "assistant" => crate::daemon::proto::SessionEntryMode::Assistant,

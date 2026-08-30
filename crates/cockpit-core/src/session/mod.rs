@@ -1348,6 +1348,19 @@ pub fn project_id_for(root: &Path) -> String {
     hex
 }
 
+/// Resolve a workspace root to the single path spelling that may be persisted
+/// in session state or published in a workspace marker.
+fn canonical_workspace_root(project_root: &Path) -> Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(project_root)
+        .with_context(|| format!("canonicalizing workspace root `{}`", project_root.display()))?;
+    anyhow::ensure!(
+        canonical_root.is_dir(),
+        "workspace root `{}` is not a directory",
+        canonical_root.display()
+    );
+    Ok(canonical_root)
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WorkspaceDirMarker {
     project_id: String,
@@ -1407,7 +1420,12 @@ pub fn workspace_root_for_project_id(project_id: &str) -> Result<Option<PathBuf>
         marker.project_id == project_id,
         "workspace marker project id does not match directory"
     );
-    Ok(Some(PathBuf::from(marker.canonical_root)))
+    let canonical_root = PathBuf::from(marker.canonical_root);
+    anyhow::ensure!(
+        canonical_root.is_absolute(),
+        "workspace marker canonical root must be absolute"
+    );
+    Ok(Some(canonical_root))
 }
 
 fn workspace_scratch_dir_for_session(
@@ -1415,14 +1433,20 @@ fn workspace_scratch_dir_for_session(
     project_root: &Path,
     session_id: Uuid,
 ) -> Result<PathBuf> {
+    // The marker is the authoritative project_id -> path reverse map. Never
+    // publish a caller spelling here: relative paths and inaccessible roots
+    // would make its value cwd-dependent or noncanonical on later reads.
+    // Canonicalize before creating any durable workspace state so a failed
+    // session setup cannot leave a misleading workspace directory behind.
+    let canonical_root = canonical_workspace_root(project_root)?
+        .to_string_lossy()
+        .into_owned();
+
     let workspace_dir = workspace_dir_for_project_id(project_id)?;
     std::fs::create_dir_all(&workspace_dir)
         .with_context(|| format!("creating `{}`", workspace_dir.display()))?;
 
     let marker_path = workspace_dir.join(".workspace.json");
-    let canonical_root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let canonical_root = canonical_root.to_string_lossy().into_owned();
     let marker_lock = workspace_marker_lock(project_id);
     let _marker_guard = marker_lock
         .lock()
@@ -2393,17 +2417,19 @@ mod tests {
         let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let project_root = home.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
+        let supplied_root = project_root.join(".");
+        let canonical_root = std::fs::canonicalize(&project_root).unwrap();
         let db = Db::open_in_memory().unwrap();
         let a = Session::create_for_test(
             db.clone(),
-            project_root.clone(),
+            supplied_root.clone(),
             "builder",
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
         let b = Session::create_for_test(
-            db,
-            project_root.clone(),
+            db.clone(),
+            supplied_root,
             "builder",
             crate::session::test_redaction_key_resolver(),
         )
@@ -2417,9 +2443,21 @@ mod tests {
         );
         assert!(scratch_a.ends_with(Path::new("sessions").join(a.id.to_string())));
         assert!(scratch_b.ends_with(Path::new("sessions").join(b.id.to_string())));
+        assert_eq!(a.project_root, canonical_root);
+        let persisted = db
+            .blocking_write_for_sync_maintenance({
+                let session_id = a.id;
+                move |conn| crate::db::Db::get_session_conn(conn, session_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.project_root,
+            canonical_root.to_string_lossy().into_owned()
+        );
         assert_eq!(
             workspace_root_for_project_id(&a.project_id).unwrap(),
-            Some(std::fs::canonicalize(&project_root).unwrap())
+            Some(canonical_root)
         );
 
         a.end().unwrap();
@@ -2450,6 +2488,23 @@ mod tests {
         assert_eq!(
             workspace_root_for_project_id(&project_id).unwrap(),
             Some(std::fs::canonicalize(&project_root).unwrap())
+        );
+    }
+
+    #[test]
+    fn workspace_scratch_rejects_uncanonicalizable_project_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let missing_root = home.path().join("missing-project");
+        let project_id = project_id_for(&missing_root);
+
+        let error = workspace_scratch_dir_for_session(&project_id, &missing_root, Uuid::new_v4())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("canonicalizing workspace root"));
+        assert!(
+            !workspace_dir_for_project_id(&project_id).unwrap().exists(),
+            "failed workspace initialization must not publish durable state"
         );
     }
 

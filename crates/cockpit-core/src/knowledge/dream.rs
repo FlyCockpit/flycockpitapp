@@ -401,6 +401,24 @@ pub(crate) fn knowledge_dream_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+/// Full-run fence used by the daemon's manual and scheduled execution entry
+/// points. Keep this distinct from `knowledge_dream_lock`: the latter is the
+/// narrower apply/attachment transaction fence and is intentionally acquired
+/// by the Dream tool itself.
+pub(crate) fn knowledge_dream_run_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("knowledge dream run-lock registry poisoned");
+    if let Some(lock) = locks.get(kb_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(kb_id.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
 /// Deterministic instruction for the custom dream orchestrator turn. Native
 /// delegation policy already limits subagents to one layer; this prompt makes
 /// the partition/merge contract and cheap-read policy explicit.

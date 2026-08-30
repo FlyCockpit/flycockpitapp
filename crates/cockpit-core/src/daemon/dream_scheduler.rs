@@ -24,7 +24,9 @@ use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::session_search::HistoryCallerTrust;
 use crate::env_snapshot::EnvSnapshot;
-use crate::knowledge::dream::{history_caller_trust, resolve_dream_model};
+use crate::knowledge::dream::{
+    history_caller_trust, knowledge_dream_run_lock, resolve_dream_model,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const DREAM_TURN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -104,13 +106,20 @@ impl DreamScheduler {
                 .db
                 .knowledge_base_last_scheduled_at(&knowledge_base.id, &consumer_id)
                 .await?;
-            if !is_due(
+            let due = match is_due(
                 knowledge_base.dream_schedule.as_deref(),
                 last_scheduled,
                 now,
                 &knowledge_base.id,
                 &consumer_id,
-            )? {
+            ) {
+                Ok(due) => due,
+                Err(error) => {
+                    tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "knowledge dream schedule is invalid; skipping this knowledge base");
+                    continue;
+                }
+            };
+            if !due {
                 continue;
             }
             if !self.claim_in_flight(&knowledge_base.id).await {
@@ -126,39 +135,6 @@ impl DreamScheduler {
                 }
             };
             let caller_trust = history_caller_trust(&model, &providers);
-            let sources = match self
-                .db
-                .undreamed_sessions_for_knowledge_base(
-                    &knowledge_base.id,
-                    &consumer_id,
-                    caller_trust,
-                )
-                .await
-            {
-                Ok(sources) => sources,
-                Err(error) => {
-                    self.release_in_flight(&knowledge_base.id).await;
-                    tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "loading scheduled knowledge dream sources failed");
-                    continue;
-                }
-            };
-            if sources.is_empty() {
-                // A scheduled empty pass is still observable, but does not
-                // create a model session or invoke the dream agent.
-                let record = self
-                    .db
-                    .record_knowledge_dream_schedule_fire(
-                        &knowledge_base.id,
-                        &consumer_id,
-                        now,
-                        Some(now),
-                    )
-                    .await;
-                self.release_in_flight(&knowledge_base.id).await;
-                record?;
-                continue;
-            }
-
             let scheduler = self.clone();
             let knowledge_base = knowledge_base.clone();
             let consumer_id = consumer_id.clone();
@@ -170,125 +146,184 @@ impl DreamScheduler {
                 prompt_cache_retention: None,
             };
             tokio::spawn(async move {
-                let result = scheduler
-                    .run_dream_turn(&knowledge_base, model, caller_trust)
-                    .await;
-                if let Err(error) = &result {
-                    tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "scheduled knowledge dream failed");
-                }
-                if let Err(error) = scheduler
-                    .db
-                    .record_knowledge_dream_schedule_fire(
-                        &knowledge_base.id,
-                        &consumer_id,
-                        now,
-                        None,
-                    )
-                    .await
+                match run_knowledge_dream(
+                    &scheduler.db,
+                    &scheduler.registry,
+                    &scheduler.workspace_root,
+                    &knowledge_base,
+                    model,
+                    caller_trust,
+                    false,
+                    true,
+                )
+                .await
                 {
-                    tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled knowledge dream fire failed");
+                    Ok(DreamRunDisposition::Empty) => {
+                        if let Err(error) = scheduler
+                            .db
+                            .record_knowledge_dream_schedule_fire(
+                                &knowledge_base.id,
+                                &consumer_id,
+                                now,
+                                Some(now),
+                            )
+                            .await
+                        {
+                            tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled empty knowledge dream fire failed");
+                        }
+                    }
+                    Ok(DreamRunDisposition::Completed) => {
+                        if let Err(error) = scheduler
+                            .db
+                            .record_knowledge_dream_schedule_fire(
+                                &knowledge_base.id,
+                                &consumer_id,
+                                now,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled knowledge dream fire failed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "scheduled knowledge dream failed");
+                    }
                 }
                 scheduler.release_in_flight(&knowledge_base.id).await;
             });
         }
         Ok(())
     }
+}
 
-    async fn run_dream_turn(
-        &self,
-        knowledge_base: &KnowledgeBaseRegistryEntry,
-        model: ActiveModelRef,
-        caller_trust: HistoryCallerTrust,
-    ) -> Result<()> {
-        let handle = self
-            .registry
-            .attach(
-                None,
-                Some(self.workspace_root.clone()),
-                Some(model.clone()),
-                false,
-                Some(&model),
-                EnvSnapshot::from_process(EnvSnapshotSource::DaemonStart),
-                SessionEntryMode::Code,
-            )
-            .await
-            .context("starting scheduled Dream session")?;
-        let (agent_settled_tx, agent_settled_rx) = oneshot::channel();
-        handle
-            .send_work(SessionWork::SetAgent {
-                name: "Dream".to_string(),
-                durable_selection_committed: false,
-                respond_to: agent_settled_tx,
-            })
-            .await
-            .context("selecting Dream agent for scheduled knowledge dream")?;
-        agent_settled_rx
-            .await
-            .context("scheduled Dream session dropped agent selection")?
-            .map_err(anyhow::Error::msg)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DreamRunDisposition {
+    Empty,
+    Completed,
+}
 
-        let (respond_to, response_rx) = oneshot::channel();
-        handle
-            .send_work(SessionWork::UserMessage {
-                submission: Box::new(crate::engine::message::UserSubmission {
-                    origin: crate::engine::message::SubmissionOrigin::ScheduledJob,
-                    expected_model_state_generation: None,
-                    expected_model: None,
-                    kind: crate::engine::message::UserSubmissionKind::User,
-                    text: crate::knowledge::build_dream_prompt(&knowledge_base.id),
-                    display_text: None,
-                    tag_expansions: Vec::new(),
-                    images: Vec::new(),
-                    media: Vec::new(),
-                    forced_skill: None,
-                    origin_principal: Some("daemon_dream_scheduler".to_string()),
-                    job_id: Some(format!("knowledge-dream:{}", knowledge_base.id)),
-                    preflight_cleaned: None,
-                    queue_item_ids: Vec::new(),
-                    client_submissions: Vec::new(),
-                    queue_target: None,
-                    pending_terminal_disposition: None,
-                    run_invocation_id: None,
-                    delivery_class: QueueDeliveryClass::default(),
-                    delivery_class_override: None,
-                }),
-                #[cfg(feature = "remote")]
-                remote_operation: None,
-                artifact_admission: None,
-                respond_to,
-            })
-            .await
-            .context("dispatching scheduled Dream turn")?;
-        let (queued_item, _) = response_rx
-            .await
-            .context("scheduled Dream session dropped queue acknowledgement")?
-            .map_err(|error| anyhow::anyhow!(error.message))?;
-        let completion = handle.watch_turn(&queued_item.id.to_string());
-        match tokio::time::timeout(DREAM_TURN_TIMEOUT, completion).await {
-            Ok(Ok(TurnOutcome::Completed { .. })) => {}
-            Ok(Ok(TurnOutcome::Failed { error })) => {
-                anyhow::bail!("scheduled Dream session driver failed: {error}");
-            }
-            Ok(Err(_)) => anyhow::bail!("scheduled Dream session ended before its turn completed"),
-            Err(_) => anyhow::bail!("scheduled Dream turn timed out"),
-        }
-
-        let consumer = self.db.ensure_installation_identity().await?;
-        let remaining = self
-            .db
-            .undreamed_sessions_for_knowledge_base(
-                &knowledge_base.id,
-                consumer.as_hex(),
-                caller_trust,
-            )
-            .await?;
-        ensure!(
-            remaining.is_empty(),
-            "scheduled Dream did not apply every attached undreamed session"
-        );
-        Ok(())
+/// Execute one complete Dream turn under the daemon-wide per-KB execution
+/// fence. Both scheduled fires and manual CLI runs use this boundary, so they
+/// cannot perform duplicate source selection or concurrent model work.
+pub(crate) async fn run_knowledge_dream(
+    db: &Db,
+    registry: &SessionRegistry,
+    workspace_root: &std::path::Path,
+    knowledge_base: &KnowledgeBaseRegistryEntry,
+    model: ActiveModelRef,
+    caller_trust: HistoryCallerTrust,
+    no_sandbox: bool,
+    scheduled: bool,
+) -> Result<DreamRunDisposition> {
+    let _run_guard = knowledge_dream_run_lock(&knowledge_base.id)
+        .lock_owned()
+        .await;
+    let consumer = db.ensure_installation_identity().await?;
+    let sources = db
+        .undreamed_sessions_for_knowledge_base(&knowledge_base.id, consumer.as_hex(), caller_trust)
+        .await?;
+    if sources.is_empty() {
+        return Ok(DreamRunDisposition::Empty);
     }
 
+    let handle = registry
+        .attach(
+            None,
+            Some(workspace_root.to_path_buf()),
+            Some(model.clone()),
+            no_sandbox,
+            Some(&model),
+            EnvSnapshot::from_process(EnvSnapshotSource::DaemonStart),
+            SessionEntryMode::Code,
+        )
+        .await
+        .context("starting Dream session")?;
+    let (agent_settled_tx, agent_settled_rx) = oneshot::channel();
+    handle
+        .send_work(SessionWork::SetAgent {
+            name: "Dream".to_string(),
+            durable_selection_committed: false,
+            respond_to: agent_settled_tx,
+        })
+        .await
+        .context("selecting Dream agent")?;
+    agent_settled_rx
+        .await
+        .context("Dream session dropped agent selection")?
+        .map_err(anyhow::Error::msg)?;
+
+    let (respond_to, response_rx) = oneshot::channel();
+    handle
+        .send_work(SessionWork::UserMessage {
+            submission: Box::new(crate::engine::message::UserSubmission {
+                origin: if scheduled {
+                    crate::engine::message::SubmissionOrigin::ScheduledJob
+                } else {
+                    crate::engine::message::SubmissionOrigin::ExternalRoot
+                },
+                expected_model_state_generation: None,
+                expected_model: None,
+                kind: crate::engine::message::UserSubmissionKind::User,
+                text: crate::knowledge::build_dream_prompt(&knowledge_base.id),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                images: Vec::new(),
+                media: Vec::new(),
+                forced_skill: None,
+                origin_principal: scheduled.then(|| "daemon_dream_scheduler".to_string()),
+                job_id: scheduled.then(|| format!("knowledge-dream:{}", knowledge_base.id)),
+                preflight_cleaned: None,
+                queue_item_ids: Vec::new(),
+                client_submissions: Vec::new(),
+                queue_target: None,
+                pending_terminal_disposition: None,
+                run_invocation_id: None,
+                delivery_class: QueueDeliveryClass::default(),
+                delivery_class_override: None,
+            }),
+            #[cfg(feature = "remote")]
+            remote_operation: None,
+            artifact_admission: None,
+            respond_to,
+        })
+        .await
+        .context("dispatching Dream turn")?;
+    let (queued_item, _) = response_rx
+        .await
+        .context("Dream session dropped queue acknowledgement")?
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let turn_id = queued_item.id.to_string();
+    match tokio::time::timeout(DREAM_TURN_TIMEOUT, handle.watch_turn(&turn_id)).await {
+        Ok(Ok(TurnOutcome::Completed { .. })) => {}
+        Ok(Ok(TurnOutcome::Failed { error })) => {
+            anyhow::bail!("Dream session driver failed: {error}")
+        }
+        Ok(Err(_)) => anyhow::bail!("Dream session ended before its turn completed"),
+        Err(_) => {
+            handle
+                .send_work(SessionWork::Cancel)
+                .await
+                .context("cancelling timed-out Dream turn")?;
+            match handle.watch_turn(&turn_id).await {
+                Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Failed { .. }) | Err(_) => {
+                    anyhow::bail!("Dream turn timed out and was cancelled");
+                }
+            }
+        }
+    }
+
+    let remaining = db
+        .undreamed_sessions_for_knowledge_base(&knowledge_base.id, consumer.as_hex(), caller_trust)
+        .await?;
+    ensure!(
+        remaining.is_empty(),
+        "Dream did not apply every attached undreamed session"
+    );
+    Ok(DreamRunDisposition::Completed)
+}
+
+impl DreamScheduler {
     async fn claim_in_flight(&self, kb_id: &str) -> bool {
         self.in_flight.lock().await.insert(kb_id.to_owned())
     }
@@ -354,7 +389,29 @@ fn default_daily_is_due(last_scheduled_at: i64, now: i64, kb_id: &str, consumer_
     let scheduled_today = midnight
         .timestamp()
         .saturating_add(default_jitter_seconds(kb_id, consumer_id));
-    last_scheduled_at < scheduled_today && scheduled_today <= now
+    if scheduled_today <= now {
+        return last_scheduled_at < scheduled_today;
+    }
+    let Some(yesterday) = now_local.date_naive().pred_opt() else {
+        return false;
+    };
+    let Some(yesterday_midnight) = Local
+        .with_ymd_and_hms(
+            yesterday.year(),
+            yesterday.month(),
+            yesterday.day(),
+            0,
+            0,
+            0,
+        )
+        .earliest()
+    else {
+        return false;
+    };
+    last_scheduled_at
+        < yesterday_midnight
+            .timestamp()
+            .saturating_add(default_jitter_seconds(kb_id, consumer_id))
 }
 
 fn default_jitter_seconds(kb_id: &str, consumer_id: &str) -> i64 {

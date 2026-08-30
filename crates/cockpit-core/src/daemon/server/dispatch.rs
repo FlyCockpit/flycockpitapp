@@ -5761,6 +5761,69 @@ async fn handle_serialized_request_impl(
             Ok(Response::Ack)
         }
 
+        Request::RunKnowledgeDream {
+            project_root,
+            knowledge_base_id,
+            no_sandbox,
+        } => {
+            let cwd = std::fs::canonicalize(&project_root).map_err(|_| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "project_root must identify an existing canonical workspace".to_string(),
+            })?;
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                    .await
+                    .map_err(internal)?;
+            let (providers, extended) = ctx
+                .config_source()
+                .load_effective_for_daemon(&cwd, &trust_policy)
+                .map_err(daemon_config_error)?;
+            let knowledge_base = extended
+                .knowledge_bases
+                .iter()
+                .find(|entry| entry.id == knowledge_base_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "knowledge base `{knowledge_base_id}` is not configured for this workspace"
+                    ),
+                })?;
+            if !matches!(
+                &knowledge_base.source,
+                crate::config::extended::KnowledgeBaseSource::Local { .. }
+            ) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "remote knowledge-base dream submission is hosted and not implemented"
+                        .to_string(),
+                });
+            }
+            let model =
+                crate::knowledge::dream::resolve_dream_model(knowledge_base, &extended, &providers)
+                    .map_err(daemon_config_error)?;
+            let caller_trust = crate::knowledge::dream::history_caller_trust(&model, &providers);
+            let model = crate::config::providers::ActiveModelRef {
+                provider: model.provider,
+                model: model.model,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            };
+            crate::daemon::dream_scheduler::run_knowledge_dream(
+                &ctx.db,
+                &ctx.registry,
+                &cwd,
+                knowledge_base,
+                model,
+                caller_trust,
+                no_sandbox,
+                false,
+            )
+            .await
+            .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::KnowledgeDreamStatus {
             project_root,
             knowledge_base_id,

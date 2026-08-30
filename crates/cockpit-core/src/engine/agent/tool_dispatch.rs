@@ -2340,6 +2340,16 @@ async fn execute_ordinary_call_unscoped(
             return Err(error.into());
         }
     };
+    // A media reference cannot always be converted back to provider-native
+    // rich contents on restart. Persist this already-projected text fallback
+    // with the event so resume never falls back to the display/audit body.
+    let canonical_history_text = result.as_ref().ok().map(|output| {
+        model_result_contents
+            .as_ref()
+            .unwrap_or(&output.content)
+            .model_text()
+            .to_string()
+    });
 
     // Timeline event (Part B), sourced from / consistent with the
     // `tool_call_events` audit row above. The `call_id` here is the
@@ -2360,6 +2370,17 @@ async fn execute_ordinary_call_unscoped(
     });
     if let Some(canonical_output) = &canonical_history_output {
         event_data["canonical_output"] = canonical_output.clone();
+    }
+    if let Some(canonical_output_text) = &canonical_history_text {
+        event_data["canonical_output_text"] = canonical_output_text.clone().into();
+    }
+    if model_result_contents.as_ref().is_some_and(|projected| {
+        result
+            .as_ref()
+            .ok()
+            .is_some_and(|output| projected.parts() != output.content.parts())
+    }) {
+        event_data["model_projection_required"] = Value::Bool(true);
     }
     // Name-repair surfacing (§14): when the emitted tool NAME was repaired
     // (rebound or charset-sanitized), `tool` above is the wire/model form;
@@ -2687,6 +2708,9 @@ async fn execute_ordinary_call_unscoped(
                 }
             };
         }
+        if let Some(canonical_output_text) = &canonical_history_text {
+            completed_data["canonical_output_text"] = canonical_output_text.clone().into();
+        }
         if let Some(completed_data) = completed_data.as_object_mut() {
             completed_data.extend(result_metadata.clone());
         }
@@ -2829,20 +2853,38 @@ async fn execute_ordinary_call_unscoped(
             let output = result
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let projected_content = model_result_contents.as_ref().unwrap_or(&output.content);
+            anyhow::ensure!(
+                output.content.parts().len() == projected_content.parts().len(),
+                "model result projection changed media part cardinality"
+            );
             let mut handoffs = resolved_handoffs.iter();
             let mut tool_contents = Vec::new();
             let mut adjacent = Vec::new();
-            for part in output.content.parts() {
-                match part {
-                    crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+            for (part, projected_part) in
+                output.content.parts().iter().zip(projected_content.parts())
+            {
+                match (part, projected_part) {
+                    (
+                        crate::typed_media_result::CanonicalToolResultContent::Text { .. },
+                        crate::typed_media_result::CanonicalToolResultContent::Text { text },
+                    ) => {
                         tool_contents.push(rig::message::ToolResultContent::text(text.clone()));
                     }
-                    crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    (
+                        crate::typed_media_result::CanonicalToolResultContent::Json { .. },
+                        crate::typed_media_result::CanonicalToolResultContent::Json { value },
+                    ) => {
                         tool_contents.push(rig::message::ToolResultContent::json(value.clone()));
                     }
-                    crate::typed_media_result::CanonicalToolResultContent::MediaReference {
-                        reference,
-                    } => {
+                    (
+                        crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                            reference,
+                        },
+                        crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                            ..
+                        },
+                    ) => {
                         let handoff = handoffs
                             .next()
                             .context("media_reference_unavailable: missing resolved handoff")?;
@@ -2923,6 +2965,7 @@ async fn execute_ordinary_call_unscoped(
                             }
                         }
                     }
+                    _ => anyhow::bail!("model result projection changed media part kind"),
                 }
             }
             anyhow::ensure!(
@@ -3154,6 +3197,47 @@ mod tests {
 
         fn ledger_args(&self, _args: &Value) -> Value {
             serde_json::json!({ "literal": "[sealed literal omitted]" })
+        }
+    }
+
+    struct ModelEphemeralTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for ModelEphemeralTool {
+        fn name(&self) -> &str {
+            "model_ephemeral"
+        }
+
+        fn description(&self) -> &str {
+            "Test-only model history projection tool."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "visible": { "type": "string" },
+                    "secret": { "type": "string", "x-cockpit-model-ephemeral": true }
+                }
+            })
+        }
+
+        fn result_schema(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "visible": { "type": "string" },
+                    "secret": { "type": "string", "x-cockpit-model-ephemeral": true }
+                }
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            ToolOutput::canonical(vec![
+                crate::typed_media_result::CanonicalToolResultContent::Json {
+                    value: serde_json::json!({"visible": "kept result", "secret": "result sentinel"}),
+                },
+            ])
         }
     }
 
@@ -6092,6 +6176,92 @@ mod tests {
         );
         assert_eq!(row.wire_input_json, serde_json::json!({ "text": "hello" }));
         assert_eq!(row.output, "hello");
+    }
+
+    #[tokio::test]
+    async fn model_ephemeral_fields_are_bounded_in_live_and_restart_history() {
+        const ARG_SECRET: &str = "argument sentinel";
+        const RESULT_SECRET: &str = "result sentinel";
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ModelEphemeralTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "model_ephemeral",
+            serde_json::json!({"visible": "kept argument", "secret": ARG_SECRET}),
+        );
+        let mut live_history = Vec::new();
+        push_assistant_call(&mut live_history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut live_history,
+            &call,
+            "model_ephemeral",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let live_wire = format!("{live_history:?}");
+        assert!(!live_wire.contains(ARG_SECRET), "{live_wire}");
+        assert!(!live_wire.contains(RESULT_SECRET), "{live_wire}");
+        assert_eq!(
+            assistant_call_args(&live_history),
+            serde_json::json!({"visible": "kept argument"})
+        );
+
+        let row = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(row.original_input_json["secret"], ARG_SECRET);
+        assert!(row.wire_input_json.get("secret").is_none());
+        let event = session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_call")
+            .unwrap();
+        assert!(event.data.to_string().contains(RESULT_SECRET));
+        assert_eq!(event.data["model_projection_required"], true);
+        assert!(
+            !event.data["canonical_output_text"]
+                .to_string()
+                .contains(RESULT_SECRET)
+        );
+
+        let restarted =
+            crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+                .await
+                .unwrap()
+                .unwrap();
+        let restart_wire = format!("{:?}", restarted.history);
+        assert!(!restart_wire.contains(ARG_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains(RESULT_SECRET), "{restart_wire}");
+        assert!(restart_wire.contains("kept argument"), "{restart_wire}");
+        assert!(restart_wire.contains("kept result"), "{restart_wire}");
     }
 
     #[tokio::test]

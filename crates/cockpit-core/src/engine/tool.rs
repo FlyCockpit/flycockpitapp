@@ -32,57 +32,153 @@ pub use crate::daemon::proto::ToolFailKind;
 /// value cannot enter a later model request.
 pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
 
+/// Production consumer inventory for the marker contract:
+///
+/// - ordinary built-in and native/custom argument schemas are projected in
+///   `agent::tool_dispatch` before `wire_input_json` is stored; the provider
+///   choice and interrupted scheduler-continuation record are projected at
+///   their own model-history insertion boundaries in `agent::turn_phases`;
+/// - structured built-in and native/custom results are projected at the same
+///   boundary and the projected canonical result is the restart authority;
+/// - MCP dispatch is deliberately unchanged because MCP schemas/results do not
+///   participate in this host-owned marker contract;
+/// - the existing `ToolOutput` sandbox, exit-code, resource, and output-sidecar
+///   exclusions are expressed by `ToolOutput::result_schema` below.
+///
+/// This is an ownership/type bound over every production `wire_input_json`
+/// consumer. Deferred write/edit reconciliation reads that already-projected
+/// row before applying its separate lifecycle elision; verification recipes and
+/// compaction consume the same projected row. Escalation reads a prior `bash`
+/// row only (the built-in `bash` schema declares no marker), and schedule
+/// dispatch only copies scheduler-owned structural rows, whose fixed schemas
+/// are outside `Tool`. None of these later consumers reintroduces a display
+/// projection into model history.
+
 /// Strip fields declared with [`MODEL_EPHEMERAL_SCHEMA_KEY`] from a JSON value.
 ///
 /// The extension is intentionally a storage concern, not JSON-Schema
 /// validation vocabulary: providers still receive the complete input schema
-/// and may emit the field. We understand object properties and array items so
-/// native and custom tools can mark fields at any nesting depth. Unknown or
-/// malformed schema fragments fail closed to the existing no-op projection.
+/// and may emit the field. Local refs, definitions, compositions, object
+/// property selectors, and tuple/list arrays are followed recursively.
+/// Malformed or unresolvable projection schema fails closed by removing the
+/// value governed by that fragment.
 pub fn strip_model_ephemeral_fields(value: &Value, schema: &Value) -> Value {
+    project_model_value(value, schema, schema, 0).unwrap_or(Value::Null)
+}
+
+const MAX_MODEL_EPHEMERAL_SCHEMA_DEPTH: usize = 64;
+
+fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize) -> Option<Value> {
+    if depth > MAX_MODEL_EPHEMERAL_SCHEMA_DEPTH {
+        return None;
+    }
+    match schema {
+        Value::Bool(true) => return Some(value.clone()),
+        Value::Bool(false) => return None,
+        Value::Object(_) => {}
+        _ => return None,
+    }
     if schema
         .get(MODEL_EPHEMERAL_SCHEMA_KEY)
         .and_then(Value::as_bool)
         == Some(true)
     {
-        return Value::Null;
+        return None;
     }
 
-    match value {
+    // JSON Schema permits sibling constraints next to `$ref`. Apply the
+    // target first, then the local siblings, so a marker in either location
+    // cannot be hidden by reference resolution.
+    if let Some(reference) = schema.get("$ref") {
+        let reference = reference.as_str()?;
+        let pointer = reference.strip_prefix('#')?;
+        let target = root.pointer(pointer)?;
+        let projected = project_model_value(value, target, root, depth + 1)?;
+        let mut siblings = schema.as_object()?.clone();
+        siblings.remove("$ref");
+        return project_model_value(&projected, &Value::Object(siblings), root, depth + 1);
+    }
+
+    let mut projected = value.clone();
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword) {
+            let branches = branches.as_array()?;
+            if matches!(keyword, "anyOf" | "oneOf") && branches.is_empty() {
+                return None;
+            }
+            for branch in branches {
+                projected = project_model_value(&projected, branch, root, depth + 1)?;
+            }
+        }
+    }
+
+    match &projected {
         Value::Object(object) => {
-            let properties = schema.get("properties").and_then(Value::as_object);
+            let properties = match schema.get("properties") {
+                Some(value) => Some(value.as_object()?),
+                None => None,
+            };
+            let patterns = match schema.get("patternProperties") {
+                Some(value) => Some(value.as_object()?),
+                None => None,
+            };
+            let additional = schema.get("additionalProperties");
             let mut projected = serde_json::Map::with_capacity(object.len());
             for (name, field) in object {
-                let field_schema = properties.and_then(|properties| properties.get(name));
-                if field_schema.is_some_and(|field_schema| {
-                    field_schema
-                        .get(MODEL_EPHEMERAL_SCHEMA_KEY)
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                }) {
-                    continue;
+                let mut field_value = Some(field.clone());
+                let mut matched = false;
+                if let Some(field_schema) = properties.and_then(|properties| properties.get(name)) {
+                    matched = true;
+                    field_value = field_value.and_then(|value| {
+                        project_model_value(&value, field_schema, root, depth + 1)
+                    });
                 }
-                projected.insert(
-                    name.clone(),
-                    field_schema
-                        .map(|field_schema| strip_model_ephemeral_fields(field, field_schema))
-                        .unwrap_or_else(|| field.clone()),
-                );
+                if let Some(patterns) = patterns {
+                    for (pattern, field_schema) in patterns {
+                        let regex = regex::Regex::new(pattern).ok()?;
+                        if regex.is_match(name) {
+                            matched = true;
+                            field_value = field_value.and_then(|value| {
+                                project_model_value(&value, field_schema, root, depth + 1)
+                            });
+                        }
+                    }
+                }
+                if !matched && let Some(additional) = additional {
+                    field_value = match additional {
+                        Value::Bool(false) => None,
+                        Value::Bool(true) => field_value,
+                        schema => field_value
+                            .and_then(|value| project_model_value(&value, schema, root, depth + 1)),
+                    };
+                }
+                if let Some(field_value) = field_value {
+                    projected.insert(name.clone(), field_value);
+                }
             }
-            Value::Object(projected)
+            Some(Value::Object(projected))
         }
-        Value::Array(items) => schema
-            .get("items")
-            .map(|item_schema| {
-                Value::Array(
-                    items
-                        .iter()
-                        .map(|item| strip_model_ephemeral_fields(item, item_schema))
-                        .collect(),
-                )
-            })
-            .unwrap_or_else(|| value.clone()),
-        _ => value.clone(),
+        Value::Array(items) => {
+            let prefix = match schema.get("prefixItems") {
+                Some(value) => Some(value.as_array()?),
+                None => None,
+            };
+            let item_schema = schema.get("items");
+            let mut output = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let schema = prefix.and_then(|prefix| prefix.get(index)).or(item_schema);
+                let projected = match schema {
+                    Some(Value::Bool(false)) => None,
+                    Some(schema) => project_model_value(item, schema, root, depth + 1),
+                    None => Some(item.clone()),
+                };
+                if let Some(projected) = projected {
+                    output.push(projected);
+                }
+            }
+            Some(Value::Array(output))
+        }
+        _ => Some(projected),
     }
 }
 
@@ -466,6 +562,71 @@ mod model_ephemeral_tests {
             strip_model_ephemeral_fields(&metadata, &ToolOutput::result_schema()),
             json!({}),
             "the prior ToolOutput metadata exclusion is declarative"
+        );
+    }
+
+    #[test]
+    fn traverses_refs_compositions_defs_tuples_patterns_and_additional_fields() {
+        let schema = json!({
+            "$defs": {
+                "secret": { "x-cockpit-model-ephemeral": true },
+                "entry": {
+                    "allOf": [{
+                        "type": "object",
+                        "patternProperties": { "^private_": { "$ref": "#/$defs/secret" } },
+                        "additionalProperties": { "type": "string" }
+                    }]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "direct": { "$ref": "#/$defs/secret" },
+                "ref_sibling": {
+                    "$ref": "#/$defs/entry",
+                    "x-cockpit-model-ephemeral": true
+                },
+                "composed": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "$ref": "#/$defs/secret" }
+                    ]
+                },
+                "tuple": {
+                    "type": "array",
+                    "prefixItems": [
+                        { "type": "string" },
+                        { "$ref": "#/$defs/secret" }
+                    ],
+                    "items": { "$ref": "#/$defs/entry" }
+                }
+            },
+            "additionalProperties": { "$ref": "#/$defs/secret" }
+        });
+        assert_eq!(
+            strip_model_ephemeral_fields(
+                &json!({
+                    "direct": "drop",
+                    "ref_sibling": {"public": "drop"},
+                    "composed": "drop",
+                    "tuple": ["keep", "drop", {"public": "keep", "private_token": "drop"}],
+                    "unknown": "drop"
+                }),
+                &schema
+            ),
+            json!({"tuple": ["keep", {"public": "keep"}]})
+        );
+        assert_eq!(
+            strip_model_ephemeral_fields(
+                &json!({"secret": "drop"}),
+                &json!({"$ref": "#/$defs/missing"})
+            ),
+            Value::Null,
+            "an unresolved projection reference fails closed"
+        );
+        assert_eq!(
+            strip_model_ephemeral_fields(&json!({"secret": "drop"}), &json!({"properties": []})),
+            Value::Null,
+            "a malformed projection fragment fails closed"
         );
     }
 }

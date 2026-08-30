@@ -32,6 +32,9 @@ impl HistoryCallerTrust {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: Uuid,
+    /// Owning workspace identity. History-scope policy is applied above this
+    /// raw search layer before a hit is exposed to a caller.
+    pub project_id: String,
     pub short_id: Option<String>,
     pub title: Option<String>,
     /// `last_active_at_unix_ms` — the human-date source + recency
@@ -329,6 +332,7 @@ fn search_candidates_inner(
     let mut stmt = conn
         .prepare(
             "SELECT f.session_id AS session_id,
+                    s.project_id  AS project_id,
                     s.short_id    AS short_id,
                     s.title       AS title,
                     s.last_active_at_unix_ms AS last_active_at_unix_ms,
@@ -374,6 +378,7 @@ fn search_candidates_inner(
                 let sid: String = row.get("session_id")?;
                 Ok((
                     sid,
+                    row.get::<_, String>("project_id")?,
                     row.get::<_, Option<String>>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
                     row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -391,7 +396,7 @@ fn search_candidates_inner(
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
     for r in rows {
-        let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+        let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
             r.context("decoding search hit")?;
         let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
         if by_session.contains_key(&session_id) {
@@ -405,6 +410,7 @@ fn search_candidates_inner(
             session_id,
             SearchHit {
                 session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -441,8 +447,9 @@ fn search_candidates_in_sessions_inner(
     for session_id in session_ids {
         let mut stmt = conn
             .prepare(
-                "SELECT f.session_id AS session_id,
-                        s.short_id AS short_id,
+            "SELECT f.session_id AS session_id,
+                    s.project_id AS project_id,
+                    s.short_id AS short_id,
                         s.title AS title,
                         s.last_active_at_unix_ms AS last_active_at_unix_ms,
                         CASE f.row_kind
@@ -480,6 +487,7 @@ fn search_candidates_in_sessions_inner(
                     let sid: String = row.get("session_id")?;
                     Ok((
                         sid,
+                        row.get::<_, String>("project_id")?,
                         row.get::<_, Option<String>>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
                         row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -490,7 +498,7 @@ fn search_candidates_in_sessions_inner(
             )
             .context("querying lineage search")?;
         for row in rows {
-            let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+            let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
                 row.context("decoding lineage search hit")?;
             let hit_session_id =
                 Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
@@ -502,6 +510,7 @@ fn search_candidates_in_sessions_inner(
             };
             out.push(SearchHit {
                 session_id: hit_session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,

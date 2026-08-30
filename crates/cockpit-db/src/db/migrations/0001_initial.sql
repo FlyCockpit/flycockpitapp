@@ -4381,6 +4381,24 @@ CREATE TABLE workspace_trust (
 CREATE INDEX idx_workspace_trust_updated_at
     ON workspace_trust(updated_at_unix_ms DESC);
 
+-- ---- workspace history recall scope --------------------------------------------------------
+-- Independent from execution sandbox and workspace trust. Missing workspace
+-- rows are fail-closed (current workspace only). The machine default table is
+-- reserved for onboarding; no flow reads or writes it in v0.1 yet.
+CREATE TABLE workspace_history_scopes (
+    project_id TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 4096),
+    outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (outbound_enabled IN (0, 1)),
+    inbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (inbound_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE machine_history_scope_default (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cross_workspace_recall_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK (cross_workspace_recall_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
 -- ---- task delegations -----------------------------------------------------------------------
 -- Durable state for delegated `task` runs: one job per task call, one
 -- child row per labeled child run, plus pending steer messages and the

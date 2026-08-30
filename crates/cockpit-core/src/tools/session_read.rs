@@ -80,6 +80,7 @@ impl Tool for SessionReadTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        crate::tools::history_scope::require_recall_permission(ctx)?;
         ctx.session
             .db
             .fts5_available()
@@ -94,6 +95,7 @@ impl Tool for SessionReadTool {
             .ok_or_else(|| invalid_input("`short_id` is required"))?;
 
         let session_id = resolve_session(ctx, id_arg).await?;
+        crate::tools::history_scope::require_session_access(ctx, session_id).await?;
 
         let turns = ctx
             .session

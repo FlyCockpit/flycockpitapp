@@ -84,6 +84,7 @@ impl Tool for SessionSearchTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        crate::tools::history_scope::require_recall_permission(ctx)?;
         ctx.session
             .db
             .fts5_available()
@@ -122,7 +123,7 @@ impl Tool for SessionSearchTool {
         // ranking seam has room to reorder before we truncate (future
         // embedding re-ranker; identity today).
         let pool = (limit.saturating_mul(3)).clamp(limit, MAX_LIMIT * 3);
-        let hits = ctx
+        let mut hits = ctx
             .session
             .db
             .search_candidates_for_trust(
@@ -135,6 +136,25 @@ impl Tool for SessionSearchTool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
+
+        // The DB search layer deliberately remains policy-neutral. Filter its
+        // candidates before any title/snippet is exposed; missing decisions
+        // default to deny and sandbox mode is intentionally irrelevant.
+        if all_projects {
+            let mut allowed = Vec::with_capacity(hits.len());
+            for hit in hits {
+                if ctx
+                    .session
+                    .db
+                    .history_scope_allows(&ctx.session.project_id, &hit.project_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("session_search history scope: {e:#}"))?
+                {
+                    allowed.push(hit);
+                }
+            }
+            hits = allowed;
+        }
 
         if hits.is_empty() {
             let scope = if all_projects {

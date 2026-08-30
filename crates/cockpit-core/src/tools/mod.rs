@@ -28,6 +28,7 @@ pub mod escalate;
 pub mod glob;
 pub mod grep;
 pub mod harness;
+pub mod history_scope;
 pub mod intel;
 pub mod jq_shim;
 mod lock_wait;

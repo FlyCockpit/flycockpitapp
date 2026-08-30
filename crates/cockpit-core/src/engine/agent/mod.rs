@@ -416,9 +416,8 @@ pub struct Agent {
     /// fresh build for that candidate model (identity prefix + role body). `None`
     /// for non-assistant sessions.
     pub assistant_identity_prefix: Option<String>,
-    /// Source-tagged MCP catalog frozen at agent construction. Global and
-    /// workspace layers still refresh on file/generation change; the agent
-    /// package layer stays pinned until the agent is rebuilt.
+    /// Source-tagged MCP catalog frozen at agent construction and threaded
+    /// read-only through every `ToolCtx` built for this agent.
     pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 

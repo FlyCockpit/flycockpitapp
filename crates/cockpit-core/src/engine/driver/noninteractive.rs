@@ -10298,12 +10298,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         env_overlay: agent.env_overlay.clone(),
         config: config.clone(),
-        mcp_resolver: {
-            agent
-                .mcp_resolver
-                .observe_config_generation(config.snapshot().generation);
-            agent.mcp_resolver.clone()
-        },
+        mcp_resolver: agent.mcp_resolver.clone(),
     };
     let call = crate::engine::message::ToolCall {
         id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),

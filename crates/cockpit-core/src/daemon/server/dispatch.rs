@@ -14140,7 +14140,7 @@ async fn handle_serialized_request_impl(
                         .map_err(bad_config)?
                         .ok_or_else(|| bad_request(format!("agent `{agent}` was not found")))?;
                     let catalog = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
-                        &cwd, 0, &def,
+                        &cwd, &def,
                     )
                     .catalog();
                     let entry = catalog.servers.get(&server).ok_or_else(|| {
@@ -20185,7 +20185,7 @@ fn redacted_mcp_config_snapshot(
             continue;
         };
         let agent_catalog =
-            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, 0, &def).catalog();
+            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, &def).catalog();
         shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
             let shadowed_by = entry.shadowed_by?;
             if entry.source != crate::mcp::resolver::McpScope::Agent

@@ -1155,11 +1155,7 @@ fn mcp_resolver_for(
     args: &SpawnArgs,
     def: &crate::agents::AgentDef,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
-        args.cwd.clone(),
-        args.config.snapshot().generation,
-        def,
-    );
+    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(args.cwd.clone(), def);
     match args.mcp_parent_reachable.clone() {
         Some(parent) => resolver.with_parent_reachable(parent),
         None => resolver,
@@ -1169,10 +1165,7 @@ fn mcp_resolver_for(
 fn mcp_resolver_for_cwd(
     args: &SpawnArgs,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
-        args.cwd.clone(),
-        args.config.snapshot().generation,
-    )
+    crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(args.cwd.clone())
 }
 
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {

@@ -3,13 +3,11 @@
 //! Tool dispatch used to re-read every `mcp.json` layer on each `mcp` tool
 //! call via [`super::config::McpConfig::discover`]. The resolver is built
 //! once per agent construction (or test `ToolCtx`), tagged with the layer
-//! that defined each server, and refreshed when the underlying files or
-//! session config generation change.
+//! that defined each server, and remains fixed for that agent's lifetime.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::sync::Arc;
 
 use crate::config::dirs::ConfigDirKind;
 use crate::mcp::builtin::BUILTIN_SERVER_ID;
@@ -236,87 +234,27 @@ impl EffectiveCatalog {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LayerFingerprint {
-    path: PathBuf,
-    /// `(mtime_nanos, len)` when the file exists.
-    stamp: Option<(u128, u64)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CatalogFingerprint {
-    layers: Vec<LayerFingerprint>,
-    config_generation: u64,
-}
-
-struct CachedCatalog {
-    fingerprint: CatalogFingerprint,
-    catalog: Arc<EffectiveCatalog>,
-}
-
-/// Read-only resolver that caches the source-tagged catalog and rebuilds
-/// when layer files or the session config generation change.
+/// Read-only, source-tagged effective catalog resolved during agent
+/// construction. It deliberately owns no filesystem paths or config handle:
+/// once a root worker has admitted the catalog, every descendant receives the
+/// same immutable value through its `ToolCtx`.
 pub struct EffectiveCatalogResolver {
-    cwd: PathBuf,
-    config_generation: std::sync::atomic::AtomicU64,
-    /// Frozen agent-package `mcp.json`. Binding/package changes apply only
-    /// when the agent is rebuilt.
-    agent_layer: Option<McpConfig>,
-    agent_reserved_rejected: bool,
-    bindings: Vec<crate::agents::McpBinding>,
+    catalog: Arc<EffectiveCatalog>,
     parent_reachable: Option<BTreeSet<(String, String)>>,
-    inner: Mutex<Option<CachedCatalog>>,
 }
 
 impl EffectiveCatalogResolver {
     pub fn empty() -> Arc<Self> {
-        Arc::new(Self {
-            cwd: PathBuf::new(),
-            config_generation: std::sync::atomic::AtomicU64::new(0),
-            agent_layer: None,
-            agent_reserved_rejected: false,
-            bindings: Vec::new(),
-            parent_reachable: None,
-            inner: Mutex::new(Some(CachedCatalog {
-                fingerprint: CatalogFingerprint {
-                    layers: Vec::new(),
-                    config_generation: 0,
-                },
-                catalog: Arc::new(EffectiveCatalog::default()),
-            })),
-        })
+        Self::from_catalog(EffectiveCatalog::default())
     }
 
     pub fn for_cwd(cwd: impl Into<PathBuf>) -> Arc<Self> {
-        Arc::new(Self {
-            cwd: cwd.into(),
-            config_generation: std::sync::atomic::AtomicU64::new(0),
-            agent_layer: None,
-            agent_reserved_rejected: false,
-            bindings: Vec::new(),
-            parent_reachable: None,
-            inner: Mutex::new(None),
-        })
+        Self::resolved_for_agent_layer(cwd.into(), None, false, Vec::new(), None)
     }
 
-    pub fn with_config_generation(cwd: impl Into<PathBuf>, generation: u64) -> Arc<Self> {
-        Self::for_agent_layer(cwd, generation, None, false, Vec::new(), None)
-    }
-
-    pub fn for_agent(
-        cwd: impl Into<PathBuf>,
-        generation: u64,
-        def: &crate::agents::AgentDef,
-    ) -> Arc<Self> {
+    pub fn for_agent(cwd: impl Into<PathBuf>, def: &crate::agents::AgentDef) -> Arc<Self> {
         let (layer, reserved) = parse_agent_package_mcp(def);
-        Self::for_agent_layer(
-            cwd,
-            generation,
-            layer,
-            reserved,
-            def.mcp_bindings.clone(),
-            None,
-        )
+        Self::resolved_for_agent_layer(cwd.into(), layer, reserved, def.mcp_bindings.clone(), None)
     }
 
     /// Admission-time parent-reachable MCP bindings. `None` for a root
@@ -329,120 +267,42 @@ impl EffectiveCatalogResolver {
         self: &Arc<Self>,
         parent: BTreeSet<(String, String)>,
     ) -> Arc<Self> {
+        let mut catalog = (*self.catalog).clone();
+        catalog.intersect_parent_reachable(&parent);
         Arc::new(Self {
-            cwd: self.cwd.clone(),
-            config_generation: std::sync::atomic::AtomicU64::new(
-                self.config_generation
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            agent_layer: self.agent_layer.clone(),
-            agent_reserved_rejected: self.agent_reserved_rejected,
-            bindings: self.bindings.clone(),
+            catalog: Arc::new(catalog),
             parent_reachable: Some(parent),
-            inner: Mutex::new(None),
         })
     }
 
-    fn for_agent_layer(
-        cwd: impl Into<PathBuf>,
-        generation: u64,
+    fn resolved_for_agent_layer(
+        cwd: PathBuf,
         agent_layer: Option<McpConfig>,
         agent_reserved_rejected: bool,
         bindings: Vec<crate::agents::McpBinding>,
         parent_reachable: Option<BTreeSet<(String, String)>>,
     ) -> Arc<Self> {
+        let mut catalog = discover_effective_catalog_with_agent(&cwd, agent_layer.as_ref());
+        catalog.reserved_builtin_rejected |= agent_reserved_rejected;
+        catalog.apply_bindings(&bindings);
+        if let Some(parent) = &parent_reachable {
+            catalog.intersect_parent_reachable(parent);
+        }
         Arc::new(Self {
-            cwd: cwd.into(),
-            config_generation: std::sync::atomic::AtomicU64::new(generation),
-            agent_layer,
-            agent_reserved_rejected,
-            bindings,
+            catalog: Arc::new(catalog),
             parent_reachable,
-            inner: Mutex::new(None),
         })
     }
 
     pub fn from_catalog(catalog: EffectiveCatalog) -> Arc<Self> {
         Arc::new(Self {
-            cwd: PathBuf::new(),
-            config_generation: std::sync::atomic::AtomicU64::new(0),
-            agent_layer: None,
-            agent_reserved_rejected: catalog.reserved_builtin_rejected,
-            bindings: Vec::new(),
+            catalog: Arc::new(catalog),
             parent_reachable: None,
-            inner: Mutex::new(Some(CachedCatalog {
-                fingerprint: CatalogFingerprint {
-                    layers: Vec::new(),
-                    config_generation: 0,
-                },
-                catalog: Arc::new(catalog),
-            })),
         })
     }
 
-    pub fn observe_config_generation(&self, generation: u64) {
-        self.config_generation
-            .store(generation, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub fn catalog(&self) -> Arc<EffectiveCatalog> {
-        if self.cwd.as_os_str().is_empty() {
-            let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(cached) = guard.as_ref() {
-                return cached.catalog.clone();
-            }
-            return Arc::new(EffectiveCatalog::default());
-        }
-        let fingerprint = self.current_fingerprint();
-        {
-            let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(cached) = guard.as_ref()
-                && cached.fingerprint == fingerprint
-            {
-                return cached.catalog.clone();
-            }
-        }
-        let catalog = Arc::new(self.rebuild());
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        *guard = Some(CachedCatalog {
-            fingerprint,
-            catalog: catalog.clone(),
-        });
-        catalog
-    }
-
-    fn current_fingerprint(&self) -> CatalogFingerprint {
-        let layers = if self.cwd.as_os_str().is_empty() {
-            Vec::new()
-        } else {
-            crate::config::dirs::mcp_file_layers_for_load(&self.cwd)
-                .into_iter()
-                .map(|(_, path)| LayerFingerprint {
-                    stamp: file_stamp(&path),
-                    path,
-                })
-                .collect()
-        };
-        CatalogFingerprint {
-            layers,
-            config_generation: self
-                .config_generation
-                .load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-
-    fn rebuild(&self) -> EffectiveCatalog {
-        if self.cwd.as_os_str().is_empty() {
-            return EffectiveCatalog::default();
-        }
-        let mut catalog =
-            discover_effective_catalog_with_agent(&self.cwd, self.agent_layer.as_ref());
-        catalog.reserved_builtin_rejected |= self.agent_reserved_rejected;
-        catalog.apply_bindings(&self.bindings);
-        if let Some(parent) = &self.parent_reachable {
-            catalog.intersect_parent_reachable(parent);
-        }
-        catalog
+        self.catalog.clone()
     }
 }
 
@@ -483,17 +343,6 @@ fn parse_agent_package_mcp(def: &crate::agents::AgentDef) -> (Option<McpConfig>,
             (None, false)
         }
     }
-}
-
-fn file_stamp(path: &Path) -> Option<(u128, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some((mtime, meta.len()))
 }
 
 /// Discover global + workspace layers for `cwd` and merge them with
@@ -623,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_caches_until_fingerprint_changes() {
+    fn resolver_is_a_construction_time_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let project = tmp.path().join("repo");
@@ -645,13 +494,17 @@ mod tests {
                 r#"{ "servers": { "svc": { "transport": "streamable", "endpoint": "https://two/mcp" }, "extra": { "transport": "streamable", "endpoint": "https://extra/mcp" } } }"#,
             )
             .unwrap();
-            resolver.observe_config_generation(1);
             let third = resolver.catalog();
             assert_eq!(
                 third.servers["svc"].server.endpoint.as_deref(),
-                Some("https://two/mcp")
+                Some("https://one/mcp"),
+                "an active worker must keep its root-resolved catalog"
             );
-            assert!(third.servers.contains_key("extra"));
+            assert!(
+                !third.servers.contains_key("extra"),
+                "new on-disk entries become visible only to a newly built root catalog"
+            );
+            assert!(Arc::ptr_eq(&first, &third), "tool-time lookup is read-only");
         });
     }
 

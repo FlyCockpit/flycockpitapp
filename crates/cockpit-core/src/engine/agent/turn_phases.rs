@@ -3367,12 +3367,7 @@ pub(crate) async fn run_turn(
             )
         },
         config: config.clone(),
-        mcp_resolver: {
-            agent
-                .mcp_resolver
-                .observe_config_generation(config.snapshot().generation);
-            agent.mcp_resolver.clone()
-        },
+        mcp_resolver: agent.mcp_resolver.clone(),
     };
 
     // ── Capability-aware turn scheduler (issue #57) ──────────────────────
@@ -4111,12 +4106,7 @@ mod tests {
                 media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
                 ),
                 config: config.clone(),
-                mcp_resolver: {
-                    agent
-                        .mcp_resolver
-                        .observe_config_generation(config.snapshot().generation);
-                    agent.mcp_resolver.clone()
-                },
+                mcp_resolver: agent.mcp_resolver.clone(),
             },
             session,
             config,

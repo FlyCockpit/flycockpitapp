@@ -119,11 +119,16 @@ impl KnowledgeReadSnapshotStore {
     }
 
     fn retain(&mut self, contents: String, trust_required: bool, capacity: usize) -> Result<Uuid> {
-        if let Some((id, _)) = self.entries.iter().find(|(_, snapshot)| {
-            snapshot.contents == contents && snapshot.trust_required == trust_required
-        }) {
-            self.mark_knowledge_read_snapshot_recent(*id);
-            return Ok(*id);
+        if let Some(id) = self
+            .entries
+            .iter()
+            .find(|(_, snapshot)| {
+                snapshot.contents == contents && snapshot.trust_required == trust_required
+            })
+            .map(|(id, _)| *id)
+        {
+            self.mark_knowledge_read_snapshot_recent(id);
+            return Ok(id);
         }
         anyhow::ensure!(
             contents.len() <= capacity,

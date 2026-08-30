@@ -4898,6 +4898,24 @@ mod tests {
             })
             .await
             .unwrap();
+        let prune_session_id = session.session_id;
+        let prune_event_seq = prune.event_seq;
+        let artifact_fts_docs = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM session_fts_docs
+                      WHERE row_kind = 'artifact' AND session_id = ?1 AND seq = ?2",
+                    params![prune_session_id.to_string(), prune_event_seq],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_fts_docs, 2,
+            "every artifact from one owning event needs its own FTS document"
+        );
         let projections = db
             .text_artifact_projection_call_ids(session.session_id)
             .await

@@ -3227,7 +3227,6 @@ CREATE TABLE session_fts_docs (
         REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, artifact_id)
         REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    UNIQUE(row_kind, session_id, seq),
     UNIQUE(row_kind, session_id, artifact_id)
 );
 
@@ -3238,6 +3237,12 @@ CREATE UNIQUE INDEX session_fts_docs_one_title
 CREATE UNIQUE INDEX session_fts_docs_one_description
     ON session_fts_docs(session_id)
     WHERE row_kind = 'description';
+
+-- An event has at most one message or compaction document of a given kind,
+-- but it may own several separately-addressable artifact documents.
+CREATE UNIQUE INDEX session_fts_docs_one_non_artifact_event_kind
+    ON session_fts_docs(row_kind, session_id, seq)
+    WHERE row_kind <> 'artifact';
 
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);

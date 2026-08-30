@@ -9533,25 +9533,30 @@ impl Driver {
             .timestamp_millis()
             .saturating_sub(cache_send_identity.unix_millis)
             .max(0) as u64;
-        let elapsed = elapsed / 1_000;
-        if elapsed < after_secs {
+        let elapsed = std::time::Duration::from_millis(elapsed);
+        let original_delay = std::time::Duration::from_secs(after_secs);
+        let original_idle_window = std::time::Duration::from_secs(idle_window_secs);
+        if elapsed < original_delay {
             return Ok("skipped: before keep-warm deadline".to_string());
         }
-        let Some((last_send_identity, last_send_age)) = self.session.last_send_identity_and_age()
+        let Some((last_send_identity, last_send_elapsed)) =
+            self.session.last_send_identity_and_elapsed()
         else {
             return Ok("skipped: cache-producing send unavailable".to_string());
         };
-        if last_send_identity != cache_send_identity || last_send_age < after_secs {
+        if last_send_identity != cache_send_identity || last_send_elapsed < original_delay {
             return Ok("skipped: newer session activity".to_string());
         }
-        if elapsed >= idle_window_secs || last_send_age >= idle_window_secs {
+        if elapsed >= original_idle_window || last_send_elapsed >= original_idle_window {
             return Ok("skipped: idle window elapsed".to_string());
         }
         let Some((providers, provider, model_id)) = self.active_providers_config() else {
             return Ok("skipped: active endpoint unavailable".to_string());
         };
         let context = providers.resolve_context(&provider, &model_id);
-        if elapsed >= context.idle_window_secs || last_send_age >= context.idle_window_secs {
+        let live_idle_window = std::time::Duration::from_secs(context.idle_window_secs);
+        let idle_window = original_idle_window.min(live_idle_window);
+        if elapsed >= live_idle_window || last_send_elapsed >= idle_window {
             return Ok("skipped: idle window elapsed".to_string());
         }
         let decision = crate::keep_warm::decide(
@@ -9584,20 +9589,29 @@ impl Driver {
         };
         let active_target_id = self.active_queue_target_id();
         let call_id = uuid::Uuid::new_v4();
-        let refresh = tokio::time::timeout(
-            crate::engine::model::UtilityCallSite::KeepWarm.timeout(),
-            model.complete_captured(
-                &system,
-                &history,
-                Message::user("Respond only with OK."),
-                &[],
-                params,
-                &agent,
-                None,
-                &cancel,
-                None,
-            ),
+        // This is a hard execution fence, not just a pre-dispatch check. The
+        // provider receives `cancel`, so winning either deadline branch drops
+        // the in-flight future and aborts its request/stream immediately.
+        let remaining_idle_window = idle_window
+            .checked_sub(last_send_elapsed)
+            .expect("idle window was checked before keep-warm dispatch");
+        let refresh = model.complete_captured(
+            &system,
+            &history,
+            Message::user("Respond only with OK."),
+            &[],
+            params,
+            &agent,
+            None,
+            &cancel,
+            None,
         );
+        tokio::pin!(refresh);
+        let idle_deadline = tokio::time::sleep(remaining_idle_window);
+        tokio::pin!(idle_deadline);
+        let utility_deadline =
+            tokio::time::sleep(crate::engine::model::UtilityCallSite::KeepWarm.timeout());
+        tokio::pin!(utility_deadline);
         let refresh = tokio::select! {
             biased;
             has_user = input_queue.wait_for_pending_for(Some(&active_target_id)) => {
@@ -9608,9 +9622,16 @@ impl Driver {
                 return Ok("skipped: input queue closed".to_string());
             }
             _ = cancel.cancelled() => return Ok("skipped: keep-warm cancelled".to_string()),
-            result = refresh => result,
+            _ = &mut idle_deadline => {
+                cancel.cancel();
+                return Ok("skipped: idle window elapsed".to_string());
+            }
+            _ = &mut utility_deadline => {
+                cancel.cancel();
+                return Err("keep-warm request timed out".to_string());
+            }
+            result = &mut refresh => result,
         }
-        .map_err(|_| "keep-warm request timed out".to_string())?
         .map_err(|error| format!("keep-warm request failed: {error:#}"))?;
         let ((_, _, usage), captured, _) = refresh;
         let session_table = model.session_redact_table();

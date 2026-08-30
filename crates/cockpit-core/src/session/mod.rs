@@ -1019,14 +1019,18 @@ impl Session {
         self.last_send_at.lock().unwrap().map(|t| t.identity)
     }
 
-    /// Atomically snapshot the latest send's durable identity and its
-    /// monotonic age. Keep-warm uses this to prove that its job still belongs
-    /// to the cache-producing send rather than a later foreground request.
-    pub(crate) fn last_send_identity_and_age(&self) -> Option<(InferenceSendIdentity, u64)> {
+    /// Atomically snapshot the latest send's durable identity and exact
+    /// monotonic elapsed time. Keep-warm uses this to prove that its job
+    /// still belongs to the cache-producing send rather than a later
+    /// foreground request, and to enforce its idle deadline while a provider
+    /// request is in flight.
+    pub(crate) fn last_send_identity_and_elapsed(
+        &self,
+    ) -> Option<(InferenceSendIdentity, std::time::Duration)> {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| (t.identity, t.monotonic.elapsed().as_secs()))
+            .map(|t| (t.identity, t.monotonic.elapsed()))
     }
 
     #[cfg(test)]

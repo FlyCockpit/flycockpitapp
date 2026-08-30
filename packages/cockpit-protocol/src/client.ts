@@ -19,6 +19,9 @@ import {
   parseListSessionsResult,
   parseSessionLiveStatusResult,
   parseSessionMessagesResult,
+  parseStorageCleanupCompletedResult,
+  parseStorageCleanupPreviewResult,
+  parseStorageReportResult,
   parseUserMessageQueuedResult,
   type ResolveResponse,
   serverMessageSchema,
@@ -382,6 +385,29 @@ export class RemoteSessionClient {
   async sessionLiveStatus(session_ids: string[]) {
     return parseSessionLiveStatusResult(
       await this.send({ request: "session_live_status", params: { session_ids } }),
+    );
+  }
+
+  async getStorageReport() {
+    return parseStorageReportResult(await this.send({ request: "get_storage_report" }));
+  }
+
+  async dismissStorageManagementHint(expected_version: number) {
+    await this.send({
+      request: "mark_app_flag_seen",
+      params: { key: "storage_management_hint", expected_version },
+    });
+  }
+
+  async previewStorageCleanup(params: ParamsOf<"preview_storage_cleanup">) {
+    return parseStorageCleanupPreviewResult(
+      await this.send({ request: "preview_storage_cleanup", params }),
+    );
+  }
+
+  async executeStorageCleanup(preview_id: string) {
+    return parseStorageCleanupCompletedResult(
+      await this.send({ request: "execute_storage_cleanup", params: { preview_id } }),
     );
   }
 

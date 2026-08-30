@@ -1069,9 +1069,10 @@ impl Db {
             .await
     }
 
-    /// List inactive, non-archived sessions eligible for the conservative
-    /// "older than N days" storage action. User-renamed sessions are excluded
-    /// by default; callers may explicitly opt into including them.
+    /// List ended, non-archived sessions eligible for the conservative
+    /// "older than N days" storage action. User-renamed sessions and sessions
+    /// with at least one pinned message are excluded by default; callers may
+    /// explicitly opt into including both.
     pub async fn storage_sessions_older_than(
         &self,
         cutoff_unix_ms: i64,
@@ -1080,10 +1081,16 @@ impl Db {
         self.read(move |conn| {
             let mut statement = conn.prepare(
                 "SELECT session_id, project_id, title, last_active_at_unix_ms
-                   FROM sessions
+                  FROM sessions
                   WHERE archived_at_unix_ms IS NULL
+                    AND ended_at_unix_ms IS NOT NULL
                     AND last_active_at_unix_ms < ?1
-                    AND (?2 != 0 OR user_renamed = 0)
+                    AND (?2 != 0 OR (
+                        user_renamed = 0
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pins WHERE pins.session_id = sessions.session_id
+                        )
+                    ))
                   ORDER BY last_active_at_unix_ms ASC",
             )?;
             statement
@@ -1103,6 +1110,103 @@ impl Db {
                 .map_err(Into::into)
         })
         .await
+    }
+
+    /// Archive a storage-previewed batch only when every reviewed session is
+    /// still the same eligible, ended session. This check and the update share
+    /// one writer transaction, so a newly pinned, renamed, resumed, or
+    /// otherwise changed session causes the whole preview to fail closed.
+    pub async fn archive_storage_sessions_if_unchanged(
+        &self,
+        candidates: Vec<StorageSessionCandidate>,
+        include_renamed_or_pinned: bool,
+    ) -> Result<bool> {
+        let now_unix_ms = Utc::now().timestamp_millis();
+        self.transaction(move |conn| {
+            for candidate in &candidates {
+                let eligible: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM sessions
+                          WHERE session_id = ?1
+                            AND project_id = ?2
+                            AND last_active_at_unix_ms = ?3
+                            AND archived_at_unix_ms IS NULL
+                            AND ended_at_unix_ms IS NOT NULL
+                            AND (?4 != 0 OR (
+                                user_renamed = 0
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM pins WHERE pins.session_id = sessions.session_id
+                                )
+                            ))",
+                        params![
+                            candidate.session_id.to_string(),
+                            candidate.project_id,
+                            candidate.last_active_at_unix_ms,
+                            include_renamed_or_pinned as i64,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .context("revalidating storage archive preview")?;
+                if eligible.is_none() {
+                    return Ok(false);
+                }
+            }
+            for candidate in &candidates {
+                conn.execute(
+                    "UPDATE sessions SET archived_at_unix_ms = ?1 WHERE session_id = ?2",
+                    params![now_unix_ms, candidate.session_id.to_string()],
+                )
+                .context("archiving storage-previewed session")?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Permanently delete exactly the reviewed forest. The current recursive
+    /// subtree is compared inside the deletion transaction, before any root is
+    /// removed, so newly-created descendants or changed/reopened members make
+    /// the complete preview fail rather than widening a confirmed delete.
+    pub async fn delete_storage_sessions_if_unchanged(
+        &self,
+        roots: Vec<Uuid>,
+        expected: Vec<StorageSessionCandidate>,
+    ) -> Result<bool> {
+        let deleted = self
+            .transaction(move |conn| {
+                let mut actual = std::collections::BTreeSet::new();
+                for root in &roots {
+                    actual.extend(collect_subtree(conn, *root)?);
+                }
+                let expected_ids: std::collections::BTreeSet<_> = expected
+                    .iter()
+                    .map(|candidate| candidate.session_id)
+                    .collect();
+                if actual != expected_ids {
+                    return Ok(false);
+                }
+                for candidate in &expected {
+                    let Some(current) = get_session_inner(conn, candidate.session_id)? else {
+                        return Ok(false);
+                    };
+                    if current.project_id != candidate.project_id
+                        || current.last_active_at_unix_ms != candidate.last_active_at_unix_ms
+                        || current.ended_at_unix_ms.is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+                for root in &roots {
+                    delete_session_conn(conn, *root)?;
+                }
+                Ok(true)
+            })
+            .await?;
+        if deleted && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, "storage cleanup sidecar cleanup remains durably pending");
+        }
+        Ok(deleted)
     }
     /// Load the daemon-private authoritative project UUID. Absence is a
     /// fail-closed state for security receipts; callers must never synthesize

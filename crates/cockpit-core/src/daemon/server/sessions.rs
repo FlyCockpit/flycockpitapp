@@ -446,6 +446,7 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal)?;
     let mut scratch_dirs = Vec::with_capacity(subtree.len());
+    let mut result_blob_dirs = Vec::with_capacity(subtree.len());
     for member in subtree {
         let Some(member_session) = ctx.db.get_session(member).await.map_err(internal)? else {
             continue;
@@ -454,6 +455,8 @@ pub(super) async fn delete_session(
             crate::session::workspace_scratch_path_for_session(&member_session.project_id, member)
                 .map_err(internal)?,
         );
+        result_blob_dirs
+            .push(super::storage::result_blob_directory_for_session(member).map_err(internal)?);
     }
     prepare_session_deletion(ctx, session_id).await?;
     let now_wall_ms = super::run_invocation::wall_ms_now();
@@ -465,6 +468,26 @@ pub(super) async fn delete_session(
     ctx.db.delete_session(session_id).await.map_err(internal)?;
     for scratch_dir in scratch_dirs {
         remove_session_scratch(&scratch_dir).map_err(internal)?;
+    }
+    for result_blob_dir in result_blob_dirs {
+        remove_session_scratch(&result_blob_dir).map_err(internal)?;
+        match std::fs::symlink_metadata(&result_blob_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(internal(anyhow::anyhow!(
+                    "session deletion left result blobs at `{}`",
+                    result_blob_dir.display()
+                )));
+            }
+            Err(error) => {
+                return Err(internal(error.with_context(|| {
+                    format!(
+                        "verifying result-blob removal at `{}`",
+                        result_blob_dir.display()
+                    )
+                })));
+            }
+        }
     }
     Ok(Response::Ack)
 }

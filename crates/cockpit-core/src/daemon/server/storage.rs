@@ -3,12 +3,14 @@
 //! The UI receives measurements and single-use preview ids only. It never gets
 //! a path-shaped deletion API or a direct SQLite handle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{DaemonContext, ErrorCode, ErrorPayload, Response, internal};
@@ -18,9 +20,58 @@ const PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 struct StoredPreview {
-    preview: cockpit_proto::StorageCleanupPreview,
-    orphan_paths: Vec<PathBuf>,
+    cleanup: CleanupPlan,
     issued_at: Instant,
+}
+
+/// The mutable objects that a preview authorizes. This never crosses the
+/// protocol boundary: the wire preview stays presentation-only while the
+/// daemon retains the identity snapshots needed to reject a stale execution.
+#[derive(Clone)]
+enum CleanupPlan {
+    ArchiveSessions {
+        candidates: Vec<crate::db::sessions::StorageSessionCandidate>,
+        include_renamed_or_pinned: bool,
+    },
+    PermanentlyDeleteSessions {
+        roots: Vec<Uuid>,
+        candidates: Vec<crate::db::sessions::StorageSessionCandidate>,
+        directories: Vec<DirectorySnapshot>,
+    },
+    RemoveOrphanedWorkspaceStorage {
+        orphan_roots: Vec<PathBuf>,
+        directories: Vec<DirectorySnapshot>,
+    },
+}
+
+struct PreviewContents {
+    items: Vec<cockpit_proto::StorageCleanupItem>,
+    bytes_to_free: u64,
+    cleanup: CleanupPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectorySnapshot {
+    path: PathBuf,
+    entries: Vec<DirectorySnapshotEntry>,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectorySnapshotEntry {
+    relative_path: PathBuf,
+    kind: DirectoryEntryKind,
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+    digest: Option<[u8; 32]>,
+    symlink_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryEntryKind {
+    Directory,
+    File,
+    Symlink,
 }
 
 static PREVIEWS: OnceLock<Mutex<HashMap<Uuid, StoredPreview>>> = OnceLock::new();
@@ -34,16 +85,17 @@ pub(super) async fn report(ctx: &DaemonContext) -> Result<Response, ErrorPayload
     let total_bytes = categories.iter().fold(0_u64, |total, category| {
         total.saturating_add(category.total_bytes)
     });
-    let hint_seen = ctx
+    let hint_version = ctx
         .db
-        .app_flag_seen("storage-management-hint")
+        .read(|conn| crate::db::Db::app_flag_version_conn(conn, "storage-management-hint"))
         .await
         .map_err(internal)?;
     Ok(Response::StorageReport {
         total_bytes,
         categories,
         orphaned_workspace_storage,
-        show_management_hint: total_bytes > MANAGEMENT_HINT_BYTES && !hint_seen,
+        show_management_hint: total_bytes > MANAGEMENT_HINT_BYTES && hint_version == 0,
+        storage_management_hint_version: hint_version,
     })
 }
 
@@ -51,12 +103,12 @@ pub(super) async fn preview(
     ctx: &DaemonContext,
     target: cockpit_proto::StorageCleanupTarget,
 ) -> Result<Response, ErrorPayload> {
-    let (items, bytes_to_free, orphan_paths) = preview_target(ctx, &target).await?;
+    let contents = preview_target(ctx, &target).await?;
     let preview = cockpit_proto::StorageCleanupPreview {
         preview_id: Uuid::new_v4(),
         target,
-        items,
-        bytes_to_free,
+        items: contents.items,
+        bytes_to_free: contents.bytes_to_free,
     };
     let preview_id = preview.preview_id;
     let mut plans = previews()
@@ -66,8 +118,7 @@ pub(super) async fn preview(
     plans.insert(
         preview_id,
         StoredPreview {
-            preview: preview.clone(),
-            orphan_paths,
+            cleanup: contents.cleanup,
             issued_at: Instant::now(),
         },
     );
@@ -91,36 +142,61 @@ pub(super) async fn execute(
         plan
     };
 
-    match &plan.preview.target {
-        cockpit_proto::StorageCleanupTarget::ArchiveSessionsOlderThan { .. } => {
-            for item in &plan.preview.items {
-                let session_id = Uuid::parse_str(&item.label).map_err(|_| {
-                    internal(anyhow::anyhow!(
-                        "storage preview contains invalid session id"
-                    ))
-                })?;
-                super::sessions::archive_session(ctx, session_id, false).await?;
+    let bytes_freed = match plan.cleanup {
+        CleanupPlan::ArchiveSessions {
+            candidates,
+            include_renamed_or_pinned,
+        } => {
+            let unchanged = ctx
+                .db
+                .archive_storage_sessions_if_unchanged(candidates, include_renamed_or_pinned)
+                .await
+                .map_err(internal)?;
+            if !unchanged {
+                return Err(invalid_preview());
             }
+            0
         }
-        cockpit_proto::StorageCleanupTarget::PermanentlyDeleteSessions { .. } => {
-            for item in &plan.preview.items {
-                let session_id = Uuid::parse_str(&item.label).map_err(|_| {
-                    internal(anyhow::anyhow!(
-                        "storage preview contains invalid session id"
-                    ))
-                })?;
-                super::sessions::delete_session(ctx, session_id).await?;
+        CleanupPlan::PermanentlyDeleteSessions {
+            roots,
+            candidates,
+            directories,
+        } => {
+            verify_directory_snapshots(&directories).map_err(internal)?;
+            for root in &roots {
+                super::sessions::prepare_session_deletion(ctx, *root).await?;
+                ctx.db
+                    .terminalize_session_run_invocations(
+                        *root,
+                        super::run_invocation::wall_ms_now(),
+                    )
+                    .await
+                    .map_err(internal)?;
             }
-        }
-        cockpit_proto::StorageCleanupTarget::RemoveOrphanedWorkspaceStorage { .. } => {
-            for path in &plan.orphan_paths {
-                remove_previewed_directory(path).map_err(internal)?;
+            let unchanged = ctx
+                .db
+                .delete_storage_sessions_if_unchanged(roots, candidates)
+                .await
+                .map_err(internal)?;
+            if !unchanged {
+                return Err(invalid_preview());
             }
+            remove_previewed_directories(&directories).map_err(internal)?
         }
-    }
-    Ok(Response::StorageCleanupCompleted {
-        bytes_freed: plan.preview.bytes_to_free,
-    })
+        CleanupPlan::RemoveOrphanedWorkspaceStorage {
+            orphan_roots,
+            directories,
+        } => {
+            for root in orphan_roots {
+                if root.exists() {
+                    return Err(invalid_preview());
+                }
+            }
+            verify_directory_snapshots(&directories).map_err(internal)?;
+            remove_previewed_directories(&directories).map_err(internal)?
+        }
+    };
+    Ok(Response::StorageCleanupCompleted { bytes_freed })
 }
 
 fn invalid_preview() -> ErrorPayload {
@@ -134,7 +210,7 @@ fn invalid_preview() -> ErrorPayload {
 async fn preview_target(
     ctx: &DaemonContext,
     target: &cockpit_proto::StorageCleanupTarget,
-) -> Result<(Vec<cockpit_proto::StorageCleanupItem>, u64, Vec<PathBuf>), ErrorPayload> {
+) -> Result<PreviewContents, ErrorPayload> {
     match target {
         cockpit_proto::StorageCleanupTarget::ArchiveSessionsOlderThan {
             age_days,
@@ -150,45 +226,121 @@ async fn preview_target(
                 .await
                 .map_err(internal)?;
             let items = candidates
-                .into_iter()
+                .iter()
                 .map(|candidate| cockpit_proto::StorageCleanupItem {
-                    // Session id is opaque and is revalidated by the daemon at execution.
+                    // Session id is opaque and is atomically revalidated by the
+                    // daemon at execution with its reviewed state.
                     label: candidate.session_id.to_string(),
                     bytes: 0,
                     last_used_at_unix_ms: Some(candidate.last_active_at_unix_ms),
                 })
                 .collect();
-            Ok((items, 0, Vec::new()))
+            Ok(PreviewContents {
+                items,
+                bytes_to_free: 0,
+                cleanup: CleanupPlan::ArchiveSessions {
+                    candidates,
+                    include_renamed_or_pinned: *include_renamed_or_pinned,
+                },
+            })
         }
         cockpit_proto::StorageCleanupTarget::PermanentlyDeleteSessions { session_ids } => {
-            let mut items = Vec::with_capacity(session_ids.len());
-            let mut bytes_to_free = 0_u64;
+            let mut selected = HashSet::new();
+            let mut subtrees = Vec::with_capacity(session_ids.len());
             for session_id in session_ids {
-                let Some(session) = ctx.db.get_session(*session_id).await.map_err(internal)? else {
+                if !selected.insert(*session_id) {
+                    continue;
+                }
+                let subtree = ctx
+                    .db
+                    .session_subtree_ids(*session_id)
+                    .await
+                    .map_err(internal)?;
+                if subtree.is_empty() {
                     return Err(ErrorPayload {
                         code: ErrorCode::UnknownSession,
                         message: format!("unknown session {session_id}"),
                     });
+                }
+                subtrees.push((*session_id, subtree));
+            }
+            // A selected ancestor already covers a selected descendant. Keep a
+            // canonical forest so execution cannot delete a root and then
+            // silently no-op a second reviewed root.
+            let roots: Vec<_> = subtrees
+                .iter()
+                .filter_map(|(root, _)| {
+                    let covered_by_another_root = subtrees
+                        .iter()
+                        .any(|(other_root, subtree)| other_root != root && subtree.contains(root));
+                    (!covered_by_another_root).then_some(*root)
+                })
+                .collect();
+            let mut candidate_ids = HashSet::new();
+            for (_, subtree) in &subtrees {
+                candidate_ids.extend(subtree.iter().copied());
+            }
+            let mut session_storage = Vec::with_capacity(candidate_ids.len());
+            let mut directories = Vec::with_capacity(candidate_ids.len().saturating_mul(2));
+            for session_id in candidate_ids {
+                let Some(session) = ctx.db.get_session(session_id).await.map_err(internal)? else {
+                    return Err(invalid_preview());
                 };
+                if session.ended_at_unix_ms.is_none() {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!("session {session_id} is active; end it before deleting"),
+                    });
+                }
                 let scratch = crate::session::workspace_scratch_path_for_session(
                     &session.project_id,
-                    *session_id,
+                    session_id,
                 )
                 .map_err(internal)?;
-                let bytes = directory_bytes(&scratch).map_err(internal)?;
+                let result_blobs =
+                    result_blob_directory_for_session(session_id).map_err(internal)?;
+                let scratch_snapshot = directory_snapshot(scratch).map_err(internal)?;
+                let result_blob_snapshot = directory_snapshot(result_blobs).map_err(internal)?;
+                let candidate = crate::db::sessions::StorageSessionCandidate {
+                    session_id,
+                    project_id: session.project_id,
+                    title: session.title,
+                    last_active_at_unix_ms: session.last_active_at_unix_ms,
+                };
+                session_storage.push((candidate, scratch_snapshot, result_blob_snapshot));
+            }
+            session_storage.sort_by_key(|(candidate, _, _)| candidate.session_id);
+            let mut candidates = Vec::with_capacity(session_storage.len());
+            let mut items = Vec::with_capacity(session_storage.len());
+            let mut bytes_to_free = 0_u64;
+            for (candidate, scratch_snapshot, result_blob_snapshot) in session_storage {
+                let bytes = scratch_snapshot
+                    .bytes
+                    .saturating_add(result_blob_snapshot.bytes);
                 bytes_to_free = bytes_to_free.saturating_add(bytes);
                 items.push(cockpit_proto::StorageCleanupItem {
-                    label: session_id.to_string(),
+                    label: candidate.session_id.to_string(),
                     bytes,
-                    last_used_at_unix_ms: Some(session.last_active_at_unix_ms),
+                    last_used_at_unix_ms: Some(candidate.last_active_at_unix_ms),
                 });
+                candidates.push(candidate);
+                directories.extend([scratch_snapshot, result_blob_snapshot]);
             }
-            Ok((items, bytes_to_free, Vec::new()))
+            Ok(PreviewContents {
+                items,
+                bytes_to_free,
+                cleanup: CleanupPlan::PermanentlyDeleteSessions {
+                    roots,
+                    candidates,
+                    directories,
+                },
+            })
         }
         cockpit_proto::StorageCleanupTarget::RemoveOrphanedWorkspaceStorage { project_ids } => {
             let mut items = Vec::new();
             let mut bytes_to_free = 0_u64;
-            let mut paths = Vec::new();
+            let mut orphan_roots = Vec::new();
+            let mut directories = Vec::new();
             for project_id in project_ids {
                 let Some((root, last_used_at_unix_ms)) =
                     crate::session::workspace_storage_details_for_project_id(project_id)
@@ -205,18 +357,28 @@ async fn preview_target(
                     crate::session::workspace_dir_for_project_id(project_id).map_err(internal)?;
                 let local_config =
                     cockpit_config::config::dirs::local_config_dir_for(&root).map_err(internal)?;
-                let bytes = directory_bytes(&workspace)
-                    .map_err(internal)?
-                    .saturating_add(directory_bytes(&local_config).map_err(internal)?);
+                let workspace_snapshot = directory_snapshot(workspace).map_err(internal)?;
+                let local_config_snapshot = directory_snapshot(local_config).map_err(internal)?;
+                let bytes = workspace_snapshot
+                    .bytes
+                    .saturating_add(local_config_snapshot.bytes);
                 bytes_to_free = bytes_to_free.saturating_add(bytes);
                 items.push(cockpit_proto::StorageCleanupItem {
                     label: project_id.clone(),
                     bytes,
                     last_used_at_unix_ms: Some(last_used_at_unix_ms),
                 });
-                paths.extend([workspace, local_config]);
+                orphan_roots.push(root);
+                directories.extend([workspace_snapshot, local_config_snapshot]);
             }
-            Ok((items, bytes_to_free, paths))
+            Ok(PreviewContents {
+                items,
+                bytes_to_free,
+                cleanup: CleanupPlan::RemoveOrphanedWorkspaceStorage {
+                    orphan_roots,
+                    directories,
+                },
+            })
         }
     }
 }
@@ -357,6 +519,130 @@ fn directory_bytes(path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// The per-session result-blob namespace. Result writers must place a
+/// session's files below this opaque id directory so permanent session deletion
+/// has one unambiguous, daemon-owned filesystem target.
+pub(super) fn result_blob_directory_for_session(session_id: Uuid) -> Result<PathBuf> {
+    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
+        .join("result-blobs")
+        .join(session_id.to_string()))
+}
+
+fn directory_snapshot(path: PathBuf) -> Result<DirectorySnapshot> {
+    let root_metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DirectorySnapshot {
+                path,
+                entries: Vec::new(),
+                bytes: 0,
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting `{}`", path.display()));
+        }
+    };
+    ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "refusing to snapshot non-directory storage target `{}`",
+        path.display()
+    );
+    let mut entries = Vec::new();
+    let mut bytes = 0_u64;
+    for entry in walkdir::WalkDir::new(&path).follow_links(false) {
+        let entry = entry.with_context(|| format!("walking `{}`", path.display()))?;
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(entry_path)
+            .with_context(|| format!("inspecting `{}`", entry_path.display()))?;
+        let kind = if metadata.file_type().is_dir() {
+            DirectoryEntryKind::Directory
+        } else if metadata.file_type().is_file() {
+            DirectoryEntryKind::File
+        } else if metadata.file_type().is_symlink() {
+            DirectoryEntryKind::Symlink
+        } else {
+            anyhow::bail!(
+                "refusing to snapshot unsupported storage entry `{}`",
+                entry_path.display()
+            );
+        };
+        let digest = if kind == DirectoryEntryKind::File {
+            let mut file = std::fs::File::open(entry_path)
+                .with_context(|| format!("opening `{}`", entry_path.display()))?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("reading `{}`", entry_path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            bytes = bytes.saturating_add(metadata.len());
+            Some(hasher.finalize().into())
+        } else {
+            None
+        };
+        let symlink_target = (kind == DirectoryEntryKind::Symlink)
+            .then(|| std::fs::read_link(entry_path))
+            .transpose()
+            .with_context(|| format!("reading symlink `{}`", entry_path.display()))?;
+        entries.push(DirectorySnapshotEntry {
+            relative_path: entry_path
+                .strip_prefix(&path)
+                .context("stripping storage snapshot prefix")?
+                .to_path_buf(),
+            kind,
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            digest,
+            symlink_target,
+        });
+    }
+    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(DirectorySnapshot {
+        path,
+        entries,
+        bytes,
+    })
+}
+
+fn verify_directory_snapshots(snapshots: &[DirectorySnapshot]) -> Result<()> {
+    for snapshot in snapshots {
+        ensure!(
+            directory_snapshot(snapshot.path.clone())? == *snapshot,
+            "storage target changed after preview: `{}`",
+            snapshot.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_previewed_directories(snapshots: &[DirectorySnapshot]) -> Result<u64> {
+    let mut bytes_freed = 0_u64;
+    for snapshot in snapshots {
+        // Recheck at the last possible point before removal. The initial
+        // all-target preflight above prevents a later stale target from causing
+        // a partial cleanup; this second check closes ordinary re-entry while
+        // earlier targets are being removed.
+        ensure!(
+            directory_snapshot(snapshot.path.clone())? == *snapshot,
+            "storage target changed after preview: `{}`",
+            snapshot.path.display()
+        );
+        remove_previewed_directory(&snapshot.path)?;
+        ensure!(
+            directory_is_absent(&snapshot.path)?,
+            "storage target remains after removal: `{}`",
+            snapshot.path.display()
+        );
+        bytes_freed = bytes_freed.saturating_add(snapshot.bytes);
+    }
+    Ok(bytes_freed)
+}
+
 fn remove_previewed_directory(path: &Path) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -371,4 +657,12 @@ fn remove_previewed_directory(path: &Path) -> Result<()> {
         path.display()
     );
     std::fs::remove_dir_all(path).with_context(|| format!("removing `{}`", path.display()))
+}
+
+fn directory_is_absent(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("inspecting `{}`", path.display())),
+    }
 }

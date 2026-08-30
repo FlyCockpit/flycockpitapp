@@ -647,6 +647,7 @@ pub enum Response {
         categories: Vec<StorageCategoryUsage>,
         orphaned_workspace_storage: Vec<StorageCleanupItem>,
         show_management_hint: bool,
+        storage_management_hint_version: u64,
     },
     StorageCleanupPreview {
         preview: StorageCleanupPreview,

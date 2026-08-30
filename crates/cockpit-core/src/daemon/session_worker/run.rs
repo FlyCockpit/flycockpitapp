@@ -5694,9 +5694,12 @@ impl StartupWorkInbox {
     }
 
     fn has_live_work(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|work| !matches!(work, SessionWork::Cancel | SessionWork::Shutdown { .. }))
+        self.pending.iter().any(|work| {
+            !matches!(
+                work,
+                SessionWork::Cancel | SessionWork::CancelAll | SessionWork::Shutdown { .. }
+            )
+        })
     }
 
     fn has_shutdown(&self) -> bool {
@@ -5783,6 +5786,12 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         SessionWork::RepairResume { respond_to } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
+        SessionWork::PrepareResumeCompaction { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::ResumeFromCompaction { respond_to } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
         SessionWork::SetRedaction { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
@@ -5793,6 +5802,12 @@ fn reject_unstarted_startup_work(work: SessionWork) {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
         SessionWork::SetLongcache { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::KeepWarm {
+            cancel, respond_to, ..
+        } => {
+            cancel.cancel();
             let _ = respond_to.send(Err(STOPPED.into()));
         }
         SessionWork::AuthorizeHostCapabilitiesRefresh { respond_to } => {
@@ -5820,6 +5835,7 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::SetDelegationRecursion { .. }
         | SessionWork::SetTandemModels { .. }
         | SessionWork::CancelSchedule { .. }
+        | SessionWork::CancelAll
         | SessionWork::Prune
         | SessionWork::Compact
         | SessionWork::Pin { .. } => {}
@@ -5868,6 +5884,7 @@ mod startup_work_inbox_tests {
         match work {
             SessionWork::UserMessage { submission, .. } => Some(submission.text.as_str()),
             SessionWork::Cancel => Some("cancel"),
+            SessionWork::CancelAll => Some("cancel all"),
             SessionWork::Shutdown { .. } => Some("shutdown"),
             _ => None,
         }
@@ -6346,6 +6363,10 @@ pub(super) async fn run_worker(
         // it gets the cross-session recall tools.
         interactive: true,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(
+            project_root.clone(),
+        )
+        .catalog(),
         // Root-selection provenance: an explicit fresh choice or an installed
         // root's persisted resume choice must pass through vNext slot /
         // derived-definition validation. Legacy plan-level pins retain their
@@ -9861,6 +9882,35 @@ pub(super) async fn run_worker(
                         break WorkerStop::DriverFailed;
                     }
                 }
+                SessionWork::KeepWarm {
+                    cache_send_at_unix_millis,
+                    cache_send_id,
+                    after_secs,
+                    idle_window_secs,
+                    cancel,
+                    respond_to,
+                } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::KeepWarm {
+                            cache_send_at_unix_millis,
+                            cache_send_id,
+                            after_secs,
+                            idle_window_secs,
+                            cancel,
+                            respond_to,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
                 SessionWork::ProbeUserMessage {
                     client_submission_id,
                     wire_fingerprint,
@@ -11385,7 +11435,7 @@ pub(super) async fn run_worker(
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
                 }
-                SessionWork::Cancel => {
+                work @ (SessionWork::Cancel | SessionWork::CancelAll) => {
                     // User ctrl+c (`CancelTurn`). Fire the in-flight run's
                     // cancellation token: the driver's `turn` aborts the
                     // streaming inference (returning an `InferenceCancelled`
@@ -11429,6 +11479,15 @@ pub(super) async fn run_worker(
                                         .to_string(),
                                 },
                             ),
+                        }
+                    }
+                    if matches!(work, SessionWork::CancelAll) {
+                        if job_cmd_tx
+                            .send(crate::engine::schedule::ScheduleCommand::CancelAll)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(session_id = %session_id, "job command channel closed");
                         }
                     }
                 }
@@ -12966,14 +13025,19 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    match session.credential_store().and_then(|store| {
+                    let new_table = session.credential_store().and_then(|store| {
                         crate::redact::RedactionTable::build_with_env_and_credential_store(
                             &effective_redact,
                             &project_root,
                             &session_env,
                             &store,
                         )
-                    }) {
+                    });
+                    let new_table = match new_table {
+                        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
+                        Err(error) => Err(error),
+                    };
+                    match new_table {
                         Ok(new_table) => {
                             // H1: read the LATEST table, union, persist, and swap
                             // under the per-session redaction-table write lock so
@@ -13316,6 +13380,56 @@ pub(super) async fn run_worker(
                     {
                         break WorkerStop::DriverFailed;
                     }
+                }
+                SessionWork::PrepareResumeCompaction {
+                    idle_for_secs,
+                    respond_to,
+                } => {
+                    let (driver_respond_to, driver_response_rx) = oneshot::channel();
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::PrepareResumeCompaction {
+                            idle_for_secs,
+                            respond_to: driver_respond_to,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send(Err("driver is unavailable".to_string()));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let result = driver_response_rx.await.unwrap_or_else(|error| {
+                        Err(format!("driver resume preparation failed: {error}"))
+                    });
+                    let _ = respond_to.send(result);
+                }
+                SessionWork::ResumeFromCompaction { respond_to } => {
+                    let (driver_respond_to, driver_response_rx) = oneshot::channel();
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::ResumeFromCompaction {
+                            respond_to: driver_respond_to,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send(Err("driver is unavailable".to_string()));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let result = driver_response_rx.await.unwrap_or_else(|error| {
+                        Err(format!("driver resume compaction failed: {error}"))
+                    });
+                    let _ = respond_to.send(result);
                 }
                 SessionWork::Pin { text } => {
                     if !send_driver_control_or_fail(

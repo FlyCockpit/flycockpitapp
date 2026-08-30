@@ -32,7 +32,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read; prefer `edit` for small changes"
+        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
     }
 
     fn verbose_description(&self) -> Option<String> {
@@ -56,7 +56,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "x-cockpit-kind": "path", "x-cockpit-may-create": true, "x-cockpit-aliases": ["file_path", "filePath", "filepath", "pathname", "target_file", "file", "absolute_path"], "description": "Path to write" },
-                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "Entire new file content" }
+                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "Entire new file content" },
+                "expected_revision": { "type": "integer", "description": "Required to replace an existing `cockpit://.../plan`; use the revision returned by read. Ignored for host files." }
             },
             "required": ["path", "content"]
         })
@@ -67,7 +68,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path":    { "type": "string", "x-cockpit-kind": "path", "x-cockpit-may-create": true, "x-cockpit-aliases": ["file_path", "filePath", "filepath", "pathname", "target_file", "file", "absolute_path"], "description": "Path to create or overwrite, absolute or relative to the session working directory; existing files must be the same file you previously locked/read" },
-                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" }
+                "content": { "type": "string", "x-cockpit-aliases": ["text", "body", "data", "contents", "fileContent"], "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" },
+                "expected_revision": { "type": "integer", "description": "For an existing `cockpit://.../plan`, the revision returned by read; ignored for host files." }
             },
             "required": ["path", "content"]
         }))
@@ -79,6 +81,11 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // The recall provider owns its sole writable pseudofile (plan) and
+        // must run before every host-path guard.
+        if let Some(output) = crate::tools::recall::write(&args, ctx).await? {
+            return Ok(output);
+        }
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)
@@ -1664,7 +1671,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(&canonical);
+        let project_id = crate::session::project_id_for(&canonical).unwrap();
         let project_root = canonical.display().to_string();
         let session_row = db
             .write(move |conn| {
@@ -1698,6 +1705,7 @@ mod tests {
         );
         let ctx = ToolCtx {
             agent_id: "helper".to_string(),
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "helper".to_string(),
             write_scope: None,

@@ -754,11 +754,6 @@ impl App {
                     pane.pointer_new_note();
                 }
             }
-            crate::tui::button::ButtonDispatch::DaemonPrompt { index } => {
-                if let Some(prompt) = self.daemon_prompt.as_mut() {
-                    prompt.pointer_select(index);
-                }
-            }
             crate::tui::button::ButtonDispatch::QuestionAction { index } => {
                 if let Some(dialog) = self.question_dialog.as_mut() {
                     let _ = (dialog, index);
@@ -913,7 +908,6 @@ impl App {
     fn transcript_hover_suppressed(&self) -> bool {
         self.dialog.is_active()
             || self.question_dialog.is_some()
-            || self.daemon_prompt.is_some()
             || self.context_menu.is_some()
             || self.keys_overlay.is_some()
             || matches!(self.overlay, Overlay::ModelPicker(_))
@@ -2347,7 +2341,6 @@ mod affordance_hover_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.mouse_capture = true;
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.chat_area = Some(Rect::new(5, 10, 20, 5));
         app.chat_row_meta = vec![
@@ -2406,7 +2399,6 @@ mod affordance_hover_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.mouse_capture = true;
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         let id = uuid::Uuid::new_v4();
         app.queue_row_hits = vec![(id, Rect::new(2, 7, 30, 1))];
@@ -2433,7 +2425,6 @@ mod affordance_hover_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.mouse_capture = true;
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.input_area = Some(Rect::new(0, 5, 40, 3));
         app.queue_focus = Some(uuid::Uuid::new_v4());
@@ -2453,7 +2444,6 @@ mod affordance_hover_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.mouse_capture = true;
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.chat_area = Some(Rect::new(5, 10, 40, 1));
         let mut row = meta(Some(7), None, None, None);

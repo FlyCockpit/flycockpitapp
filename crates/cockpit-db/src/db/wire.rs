@@ -35,6 +35,8 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_principal: Option<String>,

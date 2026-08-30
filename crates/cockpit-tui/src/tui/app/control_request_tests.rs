@@ -12,11 +12,11 @@ use cockpit_client::presentation::{
 };
 use cockpit_core::config::extended::ApprovalMode;
 use cockpit_proto::{Request, Response};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app
 }
@@ -137,6 +137,25 @@ fn control_request_without_runner_reports_not_delivered() {
     );
 }
 
+#[test]
+fn resume_compaction_enter_keeps_the_displayed_full_history_default() {
+    let mut app = app();
+    app.pending_resume_compaction_confirm = true;
+
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+    assert!(
+        !app.pending_resume_compaction_confirm,
+        "Enter must resolve the choice rather than leave the confirmation armed"
+    );
+    assert_eq!(
+        history_lines(&app),
+        vec!["Resume: keeping full conversation."],
+        "Enter must accept the displayed full-history default without dispatching compaction"
+    );
+    assert!(app.pending_control_requests.is_empty());
+}
+
 #[tokio::test]
 async fn control_request_daemon_error_reports_rejected() {
     let mut app = app();
@@ -223,6 +242,16 @@ fn control_response_outcome_table() {
     assert!(matches!(
         control_response_outcome(Err("daemon error".to_string())),
         ControlRequestOutcome::Rejected(message) if message == "daemon error"
+    ));
+    assert!(matches!(
+        control_response_outcome(Ok(Response::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        })),
+        ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        }
     ));
 }
 

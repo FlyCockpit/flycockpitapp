@@ -148,6 +148,22 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
 }
 
 impl Session {
+    /// Derive a session project id. Production sessions always prove the
+    /// workspace directory identity; synthetic test roots retain a separate,
+    /// deterministic test-only namespace and never publish workspace state.
+    fn project_id_for_session_root(
+        project_root: &Path,
+        initialize_workspace_scratch: bool,
+    ) -> Result<String> {
+        if initialize_workspace_scratch {
+            return project_id_for(project_root);
+        }
+        Ok(super::project_id_from_workspace_object(&format!(
+            "cockpit-synthetic-test-workspace-root-v1\\0{}",
+            project_root.display()
+        )))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_workspace_root(project_root: PathBuf) -> (PathBuf, bool) {
         // Test fixtures commonly use stable synthetic paths (for example
@@ -168,7 +184,8 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
-        let project_id = project_id_for(&project_root);
+        let project_id =
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -209,7 +226,8 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
-        let project_id = project_id_for(&project_root);
+        let project_id =
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -249,7 +267,8 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
-        let project_id = project_id_for(&project_root);
+        let project_id =
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -354,7 +373,7 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let project_root = canonical_workspace_root(&project_root)?;
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -392,7 +411,7 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let project_root = canonical_workspace_root(&project_root)?;
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -452,7 +471,7 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let project_root = canonical_workspace_root(&project_root)?;
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -643,7 +662,8 @@ impl Session {
             std::fs::canonicalize(&project_root).unwrap_or(project_root)
         };
         anyhow::ensure!(
-            project_id_for(&project_root) == row.project_id,
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
+                == row.project_id,
             "persisted session project id does not match canonical workspace root"
         );
         let session_entry_mode = match row.session_entry_mode.as_str() {
@@ -736,6 +756,7 @@ impl Session {
             btw_parent_session_id: row.btw_parent_session_id,
             btw_tangent: row.btw_tangent,
             title: Mutex::new(row.title),
+            description: Mutex::new(row.description),
             user_renamed: Mutex::new(row.user_renamed),
             active_agent: Mutex::new(row.active_agent),
             model_selection: Mutex::new(model_selection),
@@ -750,10 +771,12 @@ impl Session {
             user_content_turns: AtomicUsize::new(user_content_turns),
             title_stage: AtomicU8::new(normalize_title_slot(row.title_stage)),
             title_nudge_slot_pending: AtomicU8::new(0),
+            pending_metadata_fork: Mutex::new(None),
             compact_self_nudge_stage: AtomicU8::new(0),
             title_failure_noticed: std::sync::atomic::AtomicBool::new(false),
             redaction_placeholder_noticed: std::sync::atomic::AtomicBool::new(false),
             last_usage: Mutex::new(None),
+            last_cache_hit_endpoint: Mutex::new(None),
             last_send_at: Mutex::new(None),
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),

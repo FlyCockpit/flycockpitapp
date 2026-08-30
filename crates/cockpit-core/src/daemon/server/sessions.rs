@@ -10,9 +10,9 @@ pub(super) async fn list_sessions(
 ) -> std::result::Result<Response, ErrorPayload> {
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
-    // and the TUI's daemonless direct-DB fallback produce the same shape
+    // and the TUI's unavailable-connection fallback produce the same shape
     // (ordering / scoping / fork-grouping). The daemon adds its live
-    // processing overlay below; daemonless readers still get the durable
+    // processing overlay below; disconnected readers still get the durable
     // DB-derived state.
     let db = ctx.db.clone();
     let mut sessions = db
@@ -428,9 +428,6 @@ pub(super) async fn delete_session(
         }
         Err(e) => return Err(internal(e)),
     };
-    // A permanent delete never stops and deletes a live session implicitly.
-    // There is one launch protocol contract, so this invariant is not
-    // negotiated or downgraded for historical clients.
     if session.ended_at_unix_ms.is_none() {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -580,7 +577,7 @@ pub(super) async fn prepare_session_deletion(
     // that cannot run inside the SQLite ledger transaction, and it is idempotent
     // / reconcilable: a later ledger failure leaves the retry safe because the
     // reconcile pass re-runs it. Run it before either delete path.
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         storage
             .begin_session_deletion_cleanup(session_id, now_wall_ms)
             .await
@@ -749,8 +746,8 @@ pub(super) fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
 
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
-) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
-    ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
+) -> std::result::Result<DaemonSchedulerHandle, ErrorPayload> {
+    ctx.scheduler().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),
     })
@@ -792,6 +789,7 @@ mod sessions_activity_tests {
             turns: 0,
             active_agent: "Build".into(),
             title: None,
+            description: None,
             parent_session_id: None,
             created_by_principal: None,
             shared_with_collaborators: false,

@@ -235,7 +235,7 @@ pub(crate) fn native_access_effect(path: &Path, required: SandboxPathAccess) -> 
 /// ambient authority for the first metadata/read/write/LSP access.  Every
 /// native caller invokes this immediately before its first host access, after
 /// its other gates.  Outside a host-approval handoff this is intentionally a
-/// no-op, preserving in-boundary and daemonless callers.
+/// no-op, preserving in-boundary and isolated callers.
 pub(crate) async fn recheck_native_access_effect_boundary(
     path: &Path,
     required: SandboxPathAccess,
@@ -722,6 +722,7 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,

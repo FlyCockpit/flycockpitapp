@@ -58,6 +58,14 @@ pub enum Response {
         reason: Option<String>,
     },
 
+    /// Authoritative state used by the client exit guard. This is deliberately
+    /// an attached-session response so the worker's live state and the owner
+    /// lifetime come from one daemon decision point.
+    ExitGuardStatus {
+        ephemeral_owner: bool,
+        has_live_work: bool,
+    },
+
     /// A user message was accepted by the session worker. `status = queued`
     /// means it is still removable; `status = folding` means it has already
     /// crossed the driver boundary and remove requests will not apply.
@@ -1425,6 +1433,7 @@ macro_rules! response_variants {
             (Response::MediaUploadStatus(..), "media_upload_status");
             (Response::ConfigRefreshed { .. }, "config_refreshed");
             (Response::RestartDecision { .. }, "restart_decision");
+            (Response::ExitGuardStatus { .. }, "exit_guard_status");
             (Response::UserMessageQueued { .. }, "user_message_queued");
             (Response::DelegationSteer { .. }, "delegation_steer");
             (Response::AttachmentUploadStarted { .. }, "attachment_upload_started");

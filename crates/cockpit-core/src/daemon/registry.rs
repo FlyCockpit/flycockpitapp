@@ -2483,8 +2483,8 @@ impl SessionRegistry {
             .live
             .values()
             .any(|entry| {
-                let (has_schedules, processing, _tool_running) = entry.handle.live_status();
-                has_schedules || processing
+                let (has_schedules, processing, tool_running) = entry.handle.live_status();
+                has_schedules || processing || tool_running
             })
     }
 

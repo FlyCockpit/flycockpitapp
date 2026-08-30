@@ -829,6 +829,8 @@ const requestParamSchemas = {
     .strict(),
   promote_to_persistent: z.undefined(),
   cancel_all_session_work: z.undefined(),
+  exit_guard_status: z.undefined(),
+  release_exit_guard: z.undefined(),
   restart_if_idle: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
@@ -1102,6 +1104,8 @@ const clientRequestVariants = [
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("promote_to_persistent"),
   requestVariantNoParams("cancel_all_session_work"),
+  requestVariantNoParams("exit_guard_status"),
+  requestVariantNoParams("release_exit_guard"),
   requestVariantNoParams("restart_if_idle"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
@@ -1238,6 +1242,7 @@ export const responseNameSchema = z.enum([
   "session_setup_snapshot",
   "models",
   "restart_decision",
+  "exit_guard_status",
   "run_invocation_status",
   "remote_operation_status",
   "run_invocation_cancel_result",
@@ -1982,6 +1987,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   responseVariant(
     "restart_decision",
     z.object({ will_restart: z.boolean(), reason: z.string().optional() }).passthrough(),
+  ),
+  responseVariant(
+    "exit_guard_status",
+    z.object({ ephemeral_owner: z.boolean(), has_live_work: z.boolean() }).passthrough(),
   ),
   responseVariant(
     "fs_list",

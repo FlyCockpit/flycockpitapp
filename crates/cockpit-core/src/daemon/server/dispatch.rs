@@ -9001,16 +9001,47 @@ async fn handle_serialized_request_impl(
         }
 
         Request::CancelAllSessionWork => {
-            let att = require_attached(state)?;
-            att.handle
-                .send_work(SessionWork::CancelAll)
-                .await
-                .map_err(session_work_error)?;
+            {
+                let att = require_attached(state)?;
+                att.handle
+                    .send_work(SessionWork::CancelAll)
+                    .await
+                    .map_err(session_work_error)?;
+            }
+            ctx.release_exit_guard_reservation(state);
             Ok(Response::Ack)
         }
 
         Request::PromoteToPersistent => {
-            ctx.promote_to_persistent().map_err(internal)?;
+            ctx.promote_to_persistent(state.exit_guard_reservation.as_ref())
+                .map_err(internal)?;
+            state.exit_guard_reservation = None;
+            Ok(Response::Ack)
+        }
+
+        Request::ExitGuardStatus => {
+            // Serialize the lifetime classification with promotion and sample
+            // the attached worker directly. Clients must not infer either
+            // half from discovery or their local event projection.
+            let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
+            let (has_schedules, processing, tool_running) = {
+                let attached = require_attached(state)?;
+                attached.handle.live_status()
+            };
+            let has_live_work = has_schedules || processing || tool_running;
+            let ephemeral_owner = ctx.is_ephemeral_lifetime();
+            if ephemeral_owner && has_live_work {
+                ctx.reserve_exit_guard(state).map_err(internal)?;
+            }
+            Ok(Response::ExitGuardStatus {
+                ephemeral_owner,
+                has_live_work,
+            })
+        }
+
+        Request::ReleaseExitGuard => {
+            require_attached(state)?;
+            ctx.release_exit_guard_reservation(state);
             Ok(Response::Ack)
         }
 

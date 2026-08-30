@@ -988,7 +988,17 @@ pub(crate) async fn pump_events(
                         writeln!(stderr, "{}", second_interrupt_unknown_guidance(id))?;
                         return Ok(130);
                     }
-                    if crate::daemon::discover().await.paths.ephemeral {
+                    let proto::Response::ExitGuardStatus {
+                        ephemeral_owner,
+                        has_live_work,
+                    } = client
+                        .request_ok(Request::ExitGuardStatus)
+                        .await
+                        .context("reading authoritative daemon exit state")?
+                    else {
+                        anyhow::bail!("unexpected daemon exit-state response");
+                    };
+                    if has_live_work && ephemeral_owner {
                         match prompt_run_exit_choice(&mut stderr)? {
                             RunExitChoice::Background => {
                                 client
@@ -1010,16 +1020,16 @@ pub(crate) async fn pump_events(
                                     .context("cancelling all attached session work")?;
                             }
                         }
-                    } else {
+                    } else if has_live_work {
                         writeln!(
                             stderr,
                             "This session is still running in the background; reattach with cockpit run --session {session_id}"
                         )?;
                         return Ok(130);
                     }
-                    // Reconcile the interrupted invocation after the explicit
-                    // StopAll request. Normal Ctrl-C cancellation remains
-                    // invocation-scoped inside this helper.
+                    // Either StopAll was explicitly selected, or the daemon
+                    // confirmed no live work at detach time. Normal Ctrl-C
+                    // cancellation remains invocation-scoped in this helper.
                     return reconcile_after_interrupt(client, id, format, &mut stderr).await;
                 }
                 return Ok(130);

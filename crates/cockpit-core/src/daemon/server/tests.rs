@@ -7950,21 +7950,27 @@ fn persistent_test_ctx() -> Arc<DaemonContext> {
 
 #[test]
 #[cfg(feature = "extended")]
-fn ephemeral_promotion_provisions_scheduler_before_persistent_publication() {
+fn preparing_ephemeral_promotion_keeps_persistent_services_private() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
     let ctx = test_ctx();
     assert!(ctx.scheduler().is_none());
     assert!(ctx.registry.scheduler().is_none());
 
-    // `promote_to_persistent` invokes this while holding its publication/reaper
-    // decision lock, before it writes the persistent endpoint record.
-    ctx.install_persistent_scheduler();
-
-    assert!(ctx.scheduler().is_some());
-    assert!(ctx.registry.scheduler().is_some());
+    // Preparation may allocate/open private resources, but must not register a
+    // scheduler or start a worker before endpoint/lifetime publication commits.
+    let prepared = ctx
+        .prepare_persistent_services()
+        .expect("prepare persistent services");
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+    assert!(ctx.registry.resource_scheduler().is_none());
+    drop(prepared);
 }
 
 #[test]
-fn failed_persistent_endpoint_publication_removes_promoted_services() {
+fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
     let env = crate::test_env::lock();
     let data = tempfile::tempdir().expect("temporary XDG data directory");
     env.set_var("XDG_DATA_HOME", data.path());
@@ -7973,7 +7979,7 @@ fn failed_persistent_endpoint_publication_removes_promoted_services() {
     ctx.persistent_endpoint_publication_failure
         .store(true, std::sync::atomic::Ordering::Release);
 
-    assert!(ctx.promote_to_persistent().is_err());
+    assert!(ctx.promote_to_persistent(None).is_err());
     assert!(ctx.is_ephemeral_lifetime());
     assert!(ctx.scheduler().is_none());
     assert!(ctx.registry.scheduler().is_none());
@@ -7986,6 +7992,28 @@ fn failed_persistent_endpoint_publication_removes_promoted_services() {
             .image_generation_worker
             .is_none()
     );
+}
+
+#[test]
+fn live_exit_guard_reservation_blocks_another_clients_promotion_until_released() {
+    let ctx = test_ctx();
+    let mut deciding_client = MutableClientState::detached_for_test();
+    ctx.reserve_exit_guard(&mut deciding_client)
+        .expect("reserve live exit decision");
+
+    let error = ctx
+        .promote_to_persistent(None)
+        .expect_err("another client cannot promote during an exit decision");
+    assert!(
+        error
+            .to_string()
+            .contains("another client is deciding how to detach"),
+        "promotion must be fenced until the deciding client resolves or disconnects"
+    );
+
+    ctx.release_exit_guard_reservation(&mut deciding_client);
+    ctx.require_exit_guard_promotion_owner(None)
+        .expect("releasing the prompt lets another client promote");
 }
 
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
@@ -17315,6 +17343,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_guidance_proposals"
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
+        | "exit_guard_status"
+        | "release_exit_guard"
         | "stop_daemon"
         | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
         "count_pinned_messages"
@@ -17890,6 +17920,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
+        authz_owner_only("exit_guard_status"),
+        authz_owner_only("release_exit_guard"),
         authz_owner_only("get_local_operation_settlement"),
     ]
 }
@@ -18718,6 +18750,8 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "repair_resume"
             | "cancel_turn"
             | "cancel_all_session_work"
+            | "exit_guard_status"
+            | "release_exit_guard"
             | "resolve_interrupt"
             | "resolve_agent_decision"
             | "apply_agent_session_override"
@@ -19053,6 +19087,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "cancel_turn" => Request::CancelTurn,
         "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "fs_list" => Request::FsList {
             project_root: root,
             path: ".".into(),
@@ -21731,6 +21767,8 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
         "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::from_u128(2),
             response: proto::ResolveResponse::Cancel,
@@ -22368,6 +22406,8 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "cancel_turn" => Request::CancelTurn,
         "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::new_v4(),
             response: proto::ResolveResponse::Cancel,
@@ -25912,6 +25952,20 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ExitGuardStatus,
+            kind: "exit_guard_status",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReleaseExitGuard,
+            kind: "release_exit_guard",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: false,
         },
         CommandMetadataCase {
             request: Request::FsList {
@@ -33245,6 +33299,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
+        exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
         ephemeral_lifetime: std::sync::atomic::AtomicBool::new(base.is_ephemeral_lifetime()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
@@ -33464,6 +33519,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
+        exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
         ephemeral_lifetime: std::sync::atomic::AtomicBool::new(base.is_ephemeral_lifetime()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),

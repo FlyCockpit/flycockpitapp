@@ -2065,13 +2065,32 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
 #[cfg(any(unix, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
-    mut try_reap: impl FnMut() -> bool,
+    mut try_reap: impl FnMut() -> server::EphemeralReapDecision,
 ) {
     loop {
         let observed = *presence.borrow_and_update();
-        if observed.has_lifetime_client && observed.count == 0 && try_reap() {
-            tracing::info!("ephemeral daemon lost its final client; beginning teardown");
-            return;
+        if observed.has_lifetime_client && observed.count == 0 {
+            match try_reap() {
+                server::EphemeralReapDecision::Shutdown => {
+                    tracing::info!("ephemeral daemon lost its final client; beginning teardown");
+                    return;
+                }
+                server::EphemeralReapDecision::Persistent => return,
+                // A detach-time snapshot may race a worker becoming live after
+                // the client receives its response. Never tear that work down;
+                // wait for it to settle before completing ephemeral teardown.
+                server::EphemeralReapDecision::WaitingForLiveWork => {
+                    tokio::select! {
+                        changed = presence.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                    continue;
+                }
+            }
         }
         if presence.changed().await.is_err() {
             return;
@@ -2773,7 +2792,7 @@ mod tests {
         let reaped_c = reaped.clone();
         let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
             reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-            true
+            server::EphemeralReapDecision::Shutdown
         }));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -2797,10 +2816,10 @@ mod tests {
         let reaped_for_reaper = reaped.clone();
         let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
             if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
-                return false;
+                return server::EphemeralReapDecision::Persistent;
             }
             reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
-            true
+            server::EphemeralReapDecision::Shutdown
         }));
 
         presence_tx.send_modify(|presence| {
@@ -2813,6 +2832,41 @@ mod tests {
 
         assert!(!reaped.load(std::sync::atomic::Ordering::SeqCst));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn ephemeral_reaper_waits_for_live_work_that_races_last_detach() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper_live = live.clone();
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            if reaper_live.load(std::sync::atomic::Ordering::Acquire) {
+                return server::EphemeralReapDecision::WaitingForLiveWork;
+            }
+            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+            server::EphemeralReapDecision::Shutdown
+        }));
+
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::Acquire),
+            "last-client teardown must not destroy daemon-owned live work"
+        );
+
+        live.store(false, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("reaper retries after live work settles")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2829,10 +2883,10 @@ mod tests {
         let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
             let _decision = crate::sync::lock_or_recover(&reaper_decision);
             if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
-                return false;
+                return server::EphemeralReapDecision::Persistent;
             }
             reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
-            true
+            server::EphemeralReapDecision::Shutdown
         }));
 
         presence_tx.send_modify(|presence| {

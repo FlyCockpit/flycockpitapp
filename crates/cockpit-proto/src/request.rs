@@ -1020,6 +1020,15 @@ pub enum Request {
     /// explicit user choice behind "Run in background" during detach.
     PromoteToPersistent,
 
+    /// Authoritative attached-session snapshot used immediately before a
+    /// client detaches. The daemon, not a UI projection, decides whether live
+    /// work exists and reports the lifetime of this exact owner.
+    ExitGuardStatus,
+
+    /// Release this attached client's pending exit-guard decision without
+    /// changing daemon lifetime. Used when the client dismisses the prompt.
+    ReleaseExitGuard,
+
     FsList {
         project_root: String,
         path: String,
@@ -4113,6 +4122,8 @@ macro_rules! request_variants {
             (Request::CancelTurn, "cancel_turn");
             (Request::CancelAllSessionWork, "cancel_all_session_work");
             (Request::PromoteToPersistent, "promote_to_persistent");
+            (Request::ExitGuardStatus, "exit_guard_status");
+            (Request::ReleaseExitGuard, "release_exit_guard");
             (Request::FsList { .. }, "fs_list");
             (Request::FsStat { .. }, "fs_stat");
             (Request::FsRead { .. }, "fs_read");
@@ -4427,6 +4438,8 @@ macro_rules! command {
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::CancelAllSessionWork, "cancel_all_session_work", owner_only, attached, true, local_only, none, serialized, none, "-", []);
             (Request::PromoteToPersistent, "promote_to_persistent", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::ExitGuardStatus, "exit_guard_status", owner_only, attached, false, local_only, none, serialized, none, "-", []);
+            (Request::ReleaseExitGuard, "release_exit_guard", owner_only, attached, false, local_only, none, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
             (Request::FsStat { project_root, path }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::FsRead { project_root, path, base64 }, "fs_read", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|base64:bool", [project_root: String => project_root, path: String => file_existing(project_root), base64: bool => param]);

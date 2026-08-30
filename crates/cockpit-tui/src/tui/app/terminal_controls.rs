@@ -31,37 +31,40 @@ impl App {
                 ToastKind::Info,
             );
             false
-        } else if self.has_live_work_for_exit_guard() {
-            if self.exit_owner_is_ephemeral() {
-                self.open_exit_guard_prompt();
-                false
-            } else {
-                let notice = format!(
-                    "This session is still running in the background; reattach with {}",
-                    self.exit_reattach_command()
-                );
-                self.exit_notice = Some(notice.clone());
-                self.show_toast(notice, ToastKind::Info);
-                true
-            }
         } else {
-            true
+            // This response is the detach-time authority: local `busy` and
+            // schedule projections can lag the worker that owns the work.
+            // Keep the client attached until its daemon snapshot arrives.
+            if !self
+                .agent_runner
+                .as_ref()
+                .is_some_and(|runner| runner.is_ok())
+            {
+                return true;
+            }
+            self.send_daemon_request(
+                "exit check",
+                cockpit_proto::Request::ExitGuardStatus,
+                ControlApplied::ExitGuardStatus,
+            );
+            false
         }
     }
 
-    fn has_live_work_for_exit_guard(&self) -> bool {
-        self.busy || !self.active_schedules.is_empty()
-    }
-
-    fn exit_owner_is_ephemeral(&self) -> bool {
-        self.agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
-            .is_some_and(|runner| {
-                runner
-                    .ephemeral_owner
-                    .load(std::sync::atomic::Ordering::Acquire)
-            })
+    pub(super) fn apply_exit_guard_status(&mut self, ephemeral_owner: bool, has_live_work: bool) {
+        if !has_live_work {
+            self.exit_requested = true;
+        } else if ephemeral_owner {
+            self.open_exit_guard_prompt();
+        } else {
+            let notice = format!(
+                "This session is still running in the background; reattach with {}",
+                self.exit_reattach_command()
+            );
+            self.exit_notice = Some(notice.clone());
+            self.show_toast(notice, ToastKind::Info);
+            self.exit_requested = true;
+        }
     }
 
     pub(super) fn exit_reattach_command(&self) -> String {
@@ -134,7 +137,14 @@ impl App {
                 cockpit_proto::Request::PromoteToPersistent,
                 ControlApplied::ExitAfterBackgroundPromotion,
             ),
-            _ => self.show_toast("Exit cancelled", ToastKind::Info),
+            _ => {
+                self.send_daemon_request(
+                    "cancel exit",
+                    cockpit_proto::Request::ReleaseExitGuard,
+                    ControlApplied::None,
+                );
+                self.show_toast("Exit cancelled", ToastKind::Info);
+            }
         }
     }
 

@@ -506,11 +506,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('d'))
         {
-            return if self.ctrl_d_can_exit_immediately() || self.has_live_work_for_exit_guard() {
-                self.request_guarded_exit()
-            } else {
-                self.handle_ctrl_c()
-            };
+            return self.request_guarded_exit();
         }
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -1415,28 +1411,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    fn ctrl_d_can_exit_immediately(&self) -> bool {
-        self.composer.is_empty()
-            && !self.busy
-            && self.queue.is_empty()
-            && self.pending.is_none()
-            && self.active_schedules.is_empty()
-            && matches!(self.dialog, Dialog::None)
-            && !self.overlay.is_open()
-            && self.question_dialog.is_none()
-            && self.pending_local_choice.is_none()
-            && !self.pending_prune_confirm
-            && self.pending_stop_confirm.is_none()
-            && self.pending_compact.is_none()
-            && self.pending_mcp_local.is_none()
-            && !self.pending_external_edit
-            && self.context_menu.is_none()
-            && self.pane.is_none()
-            && self.pin_pick.is_none()
-            && self.pins_review.is_none()
-            && self.keys_overlay.is_none()
     }
 
     pub(super) fn handle_key_insert(&mut self, key: KeyEvent) -> bool {

@@ -700,6 +700,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             will_restart: _,
             reason: _,
         } => {}
+        proto::Response::ExitGuardStatus {
+            ephemeral_owner: _,
+            has_live_work: _,
+        } => {}
         proto::Response::CaffeinateState {
             active: _,
             lid_close_guaranteed: _,
@@ -2347,6 +2351,28 @@ struct PromotedPersistentServices {
     image_generation_worker: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Fallible persistent-only resources prepared before an ephemeral owner is
+/// published as persistent. Nothing in this bundle is registered with the
+/// daemon or starts a task, so a failed endpoint publication cannot expose a
+/// durable admission path or dispatch external work.
+struct PreparedPersistentServices {
+    resource_scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
+    media_storage_recovery: Arc<crate::media_storage::MediaStorageRecovery>,
+    #[cfg(feature = "extended")]
+    image_generation_artifact_root:
+        Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
+}
+
+/// The last-client reaper must distinguish a completed shutdown decision from
+/// a persistent promotion and from live work that has to drain before the
+/// ephemeral owner may terminate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EphemeralReapDecision {
+    Shutdown,
+    Persistent,
+    WaitingForLiveWork,
+}
+
 impl PromotedPersistentServices {
     fn empty() -> Self {
         Self {
@@ -2409,6 +2435,12 @@ pub struct DaemonContext {
     /// Serializes idle restart decisions so exactly one client can pair
     /// "daemon is idle" with the monotonic shutdown-gate transition.
     pub(crate) restart_decision: StdMutex<()>,
+    /// A live-work exit prompt reserves the ephemeral lifetime decision for
+    /// its attached client. The daemon retains only a `Weak`: transport
+    /// teardown releases the reservation automatically, while another client
+    /// cannot promote between the authoritative status response and that
+    /// client's prompt/choice.
+    exit_guard_reservation: StdMutex<std::sync::Weak<()>>,
     /// Mutable owner lifetime. An ephemeral owner may be promoted in place
     /// while work is live; the last-client reaper consults this instead of the
     /// boot-time path marker.
@@ -2566,26 +2598,78 @@ impl DaemonContext {
     /// Promote this exact live owner without draining its workers. The endpoint
     /// record and reaper gate transition together under the restart decision
     /// lock, so last-client teardown cannot race the user choice.
-    pub(crate) fn promote_to_persistent(&self) -> Result<bool> {
+    pub(crate) fn promote_to_persistent(
+        &self,
+        exit_guard_reservation: Option<&Arc<()>>,
+    ) -> Result<bool> {
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        self.require_exit_guard_promotion_owner(exit_guard_reservation)?;
         if !self.is_ephemeral_lifetime() {
             return Ok(false);
         }
-        self.install_persistent_services()?;
+        let services = self.prepare_persistent_services()?;
         let mut persistent_paths = self.paths.clone();
         persistent_paths.ephemeral = false;
+        self.write_persistent_endpoint_record(&persistent_paths)?;
+        // The endpoint and lifetime state form the publication boundary. Only
+        // after both commit may any scheduler, media authority, or worker be
+        // made visible or started.
         self.ephemeral_lifetime.store(false, Ordering::Release);
-        if let Err(error) = self.write_persistent_endpoint_record(&persistent_paths) {
-            // No client has been told about the transition and the persistent
-            // endpoint was not published, so preserve the old reap contract.
-            self.remove_persistent_services();
-            self.ephemeral_lifetime.store(true, Ordering::Release);
-            return Err(error);
-        }
+        self.activate_persistent_services(services);
+        self.clear_exit_guard_reservation(exit_guard_reservation);
         self.broadcast_global(proto::Event::DaemonLifetimeChanged {
             ephemeral_owner: false,
         });
         Ok(true)
+    }
+
+    fn reserve_exit_guard(&self, client_state: &mut MutableClientState) -> Result<()> {
+        let mut reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
+        if let Some(active) = reservation.upgrade() {
+            if client_state
+                .exit_guard_reservation
+                .as_ref()
+                .is_some_and(|owned| Arc::ptr_eq(owned, &active))
+            {
+                return Ok(());
+            }
+            anyhow::bail!("another client is deciding how to detach live ephemeral work");
+        }
+        let owned = Arc::new(());
+        *reservation = Arc::downgrade(&owned);
+        client_state.exit_guard_reservation = Some(owned);
+        Ok(())
+    }
+
+    fn require_exit_guard_promotion_owner(
+        &self,
+        client_reservation: Option<&Arc<()>>,
+    ) -> Result<()> {
+        let reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
+        let Some(active) = reservation.upgrade() else {
+            return Ok(());
+        };
+        if client_reservation.is_some_and(|owned| Arc::ptr_eq(owned, &active)) {
+            Ok(())
+        } else {
+            anyhow::bail!("another client is deciding how to detach live ephemeral work");
+        }
+    }
+
+    fn clear_exit_guard_reservation(&self, client_reservation: Option<&Arc<()>>) {
+        let mut reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
+        let Some(active) = reservation.upgrade() else {
+            return;
+        };
+        if client_reservation.is_some_and(|owned| Arc::ptr_eq(owned, &active)) {
+            *reservation = std::sync::Weak::new();
+        }
+    }
+
+    pub(crate) fn release_exit_guard_reservation(&self, client_state: &mut MutableClientState) {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        self.clear_exit_guard_reservation(client_state.exit_guard_reservation.as_ref());
+        client_state.exit_guard_reservation = None;
     }
 
     /// Return the currently installed durable scheduler without retaining the
@@ -2594,10 +2678,9 @@ impl DaemonContext {
         crate::sync::lock_or_recover(&self.scheduler).clone()
     }
 
-    /// Provision the service that differentiates a persistent owner from an
-    /// ephemeral one. The restart-decision lock serializes this with endpoint
-    /// publication, so clients cannot discover a persistent owner before its
-    /// scheduler and worker-facing registry handle exist.
+    /// Start the durable scheduler after the persistent publication boundary
+    /// has committed. Starting it earlier would let a promotion that later
+    /// fails endpoint publication execute durable jobs as an ephemeral owner.
     fn install_persistent_scheduler(&self) {
         let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
         if scheduler.is_some() {
@@ -2609,7 +2692,7 @@ impl DaemonContext {
         }
     }
 
-    fn install_persistent_services(&self) -> Result<()> {
+    fn prepare_persistent_services(&self) -> Result<PreparedPersistentServices> {
         let resource_scheduler =
             Arc::new(crate::engine::resource_scheduler::ResourceScheduler::new(
                 ExtendedConfig::default().resource_scheduler,
@@ -2625,64 +2708,64 @@ impl DaemonContext {
             .context("opening persistent media storage")?,
         );
         #[cfg(feature = "extended")]
-        let image_generation_worker = {
+        let image_generation_artifact_root = {
             let root = crate::config::resolve::cockpit_data_dir()
                 .context("resolving image generation artifact root")?
                 .join("image-artifacts");
             cockpit_host::private_fs::ensure_private_dir(&root)
                 .context("creating private image generation artifact root")?;
-            let artifact_root = Arc::new(
+            Arc::new(
                 crate::image_generation_job::open_image_generation_artifact_root(&root)
                     .context("opening image generation artifact root")?,
-            );
-            let dispatch = self.registry.image_generation_dispatch_registry();
-            crate::daemon::image_generation_worker::spawn_image_generation_worker(
-                self.db.clone(),
-                self.image_generation_boot_id,
-                self.started_at,
-                dispatch.adapter_map(),
-                Arc::new(dispatch.clone()),
-                Arc::new(dispatch),
-                artifact_root,
-                self.shutdown.clone(),
             )
         };
+        Ok(PreparedPersistentServices {
+            resource_scheduler,
+            media_storage_recovery: media_storage,
+            #[cfg(feature = "extended")]
+            image_generation_artifact_root,
+        })
+    }
+
+    /// Publish prepared persistent services only after `promote_to_persistent`
+    /// has committed endpoint and lifetime state while holding
+    /// `restart_decision`.
+    fn activate_persistent_services(&self, services: PreparedPersistentServices) {
         self.registry
-            .set_resource_scheduler(Some(resource_scheduler));
+            .set_resource_scheduler(Some(services.resource_scheduler));
         self.install_persistent_scheduler();
         self.registry
-            .set_media_storage_recovery(Some(media_storage.clone()));
-        self.registry
-            .set_message_media_authority(media_storage.clone(), self.media_ledger.clone());
+            .set_media_storage_recovery(Some(services.media_storage_recovery.clone()));
+        self.registry.set_message_media_authority(
+            services.media_storage_recovery.clone(),
+            self.media_ledger.clone(),
+        );
         if let Some(secure_key) = self.secure_key.clone() {
             self.registry.set_tool_media_runtime(Arc::new(
                 crate::tool_media_authority::runtime::ToolMediaRuntime::new(
                     secure_key,
-                    media_storage.clone(),
+                    services.media_storage_recovery.clone(),
                 ),
             ));
         }
-        let mut services = crate::sync::lock_or_recover(&self.promoted_persistent_services);
-        services.media_storage_recovery = Some(media_storage);
+        let mut promoted_services =
+            crate::sync::lock_or_recover(&self.promoted_persistent_services);
+        promoted_services.media_storage_recovery = Some(services.media_storage_recovery);
         #[cfg(feature = "extended")]
         {
-            services.image_generation_worker = Some(image_generation_worker);
-        }
-        Ok(())
-    }
-
-    fn remove_persistent_services(&self) {
-        self.registry.set_resource_scheduler(None);
-        self.registry.clear_scheduler();
-        self.registry.set_media_storage_recovery(None);
-        self.registry.clear_message_media_authority();
-        self.registry.clear_tool_media_runtime();
-        *crate::sync::lock_or_recover(&self.scheduler) = None;
-        let mut services = crate::sync::lock_or_recover(&self.promoted_persistent_services);
-        services.media_storage_recovery = None;
-        #[cfg(feature = "extended")]
-        if let Some(worker) = services.image_generation_worker.take() {
-            worker.abort();
+            let dispatch = self.registry.image_generation_dispatch_registry();
+            promoted_services.image_generation_worker = Some(
+                crate::daemon::image_generation_worker::spawn_image_generation_worker(
+                    self.db.clone(),
+                    self.image_generation_boot_id,
+                    self.started_at,
+                    dispatch.adapter_map(),
+                    Arc::new(dispatch.clone()),
+                    Arc::new(dispatch),
+                    services.image_generation_artifact_root,
+                    self.shutdown.clone(),
+                ),
+            );
         }
     }
 
@@ -2713,13 +2796,16 @@ impl DaemonContext {
     /// check and shutdown transition in that critical section means a
     /// promotion response cannot acknowledge a surviving owner and then lose
     /// it to a stale zero-client observation.
-    pub(crate) fn reap_ephemeral_last_client(self: &Arc<Self>) -> bool {
+    pub(crate) fn reap_ephemeral_last_client(self: &Arc<Self>) -> EphemeralReapDecision {
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
         if !self.is_ephemeral_lifetime() {
-            return false;
+            return EphemeralReapDecision::Persistent;
+        }
+        if self.registry.any_agent_running() {
+            return EphemeralReapDecision::WaitingForLiveWork;
         }
         request_shutdown(self);
-        true
+        EphemeralReapDecision::Shutdown
     }
 
     fn caffeinate_state_event(&self) -> proto::Event {
@@ -2945,6 +3031,7 @@ impl DaemonContext {
             client_presence,
             shutdown,
             restart_decision: StdMutex::new(()),
+            exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
             ephemeral_lifetime: AtomicBool::new(ephemeral_lifetime),
             shutdown_grace_override: StdMutex::new(None),
             env_baseline: Arc::new(std::sync::RwLock::new(EnvSnapshot::from_process(
@@ -4888,6 +4975,7 @@ struct MutableClientState {
     upload_limits: AttachmentUploadLimits,
     terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
+    exit_guard_reservation: Option<Arc<()>>,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -4992,6 +5080,7 @@ impl MutableClientState {
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host,
+            exit_guard_reservation: None,
         }
     }
 

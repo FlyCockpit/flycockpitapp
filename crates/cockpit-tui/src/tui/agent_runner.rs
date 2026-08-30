@@ -3224,6 +3224,13 @@ pub(crate) fn control_response_outcome(result: Result<Response, String>) -> Cont
         Ok(Response::HostCapabilities { snapshot }) => ControlRequestOutcome::HostCapabilities {
             snapshot: Box::new(snapshot),
         },
+        Ok(Response::ExitGuardStatus {
+            ephemeral_owner,
+            has_live_work,
+        }) => ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner,
+            has_live_work,
+        },
         Ok(_) => ControlRequestOutcome::Applied,
         Err(error) => ControlRequestOutcome::Rejected(error),
     }

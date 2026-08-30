@@ -868,6 +868,19 @@ impl App {
                 self.apply_host_capabilities(*snapshot);
                 self.apply_control_success(pending.applied);
             }
+            ControlRequestOutcome::ExitGuardStatus {
+                ephemeral_owner,
+                has_live_work,
+            } => {
+                if matches!(pending.applied, ControlApplied::ExitGuardStatus) {
+                    self.apply_exit_guard_status(ephemeral_owner, has_live_work);
+                } else {
+                    self.push_plain(format!(
+                        "{}: daemon returned an unexpected exit-guard response",
+                        pending.label
+                    ));
+                }
+            }
             ControlRequestOutcome::Rejected(error) => {
                 if refresh_session_setup_on_failure {
                     self.request_session_setup_snapshot_refresh();

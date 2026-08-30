@@ -284,9 +284,21 @@ fn busy_ctrl_d_uses_guarded_quit_path() {
 
     assert!(!exit, "first busy ctrl+d should guard instead of exiting");
     assert!(app.ctrl_c_armed_at.is_none(), "ctrl+d must not arm ctrl+c");
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_client::presentation::ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        },
+    );
     assert!(
         app.question_dialog.is_some(),
-        "busy ephemeral ctrl+d must offer the exit choice"
+        "daemon-confirmed busy ephemeral ctrl+d must offer the exit choice"
     );
     assert_eq!(
         app.queue.len(),
@@ -320,6 +332,18 @@ fn scheduled_work_ctrl_d_uses_guarded_quit_path() {
     assert!(
         !exit,
         "ctrl+d should not directly exit while scheduled/background work exists"
+    );
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_client::presentation::ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        },
     );
     assert!(app.question_dialog.is_some());
     assert!(app.ctrl_c_armed_at.is_none());
@@ -410,7 +434,7 @@ fn exit_routes_share_the_app_wide_authority_gate() {
             || terminal_controls
                 .contains("CtrlCAction::Exit => {\n                self.request_guarded_exit()")
     );
-    assert!(input.contains("self.has_live_work_for_exit_guard()"));
+    assert!(input.contains("return self.request_guarded_exit();"));
     assert!(
         slash.contains(
             "fn run_exit(app: &mut App, _: &str) -> bool {\n    app.request_guarded_exit()"

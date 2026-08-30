@@ -452,6 +452,7 @@ pub(crate) enum ControlApplied {
         text: String,
     },
     RepairResume,
+    ExitGuardStatus,
     ExitAfterStoppingWork,
     ExitAfterBackgroundPromotion,
     /// Settings Behavior tokenizer refresh confirmation (correlated

@@ -1045,9 +1045,9 @@ impl SessionRegistry {
             .next()
             .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a session id"))?
             .parse::<uuid::Uuid>()?;
-        let armed_at_unix_secs = parts
+        let cache_send_at_unix_millis = parts
             .next()
-            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing an arm time"))?
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a cache-send time"))?
             .parse::<i64>()?;
         let after_secs = parts
             .next()
@@ -1085,7 +1085,7 @@ impl SessionRegistry {
         let (respond_to, response) = tokio::sync::oneshot::channel();
         handle
             .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
-                armed_at_unix_secs,
+                cache_send_at_unix_millis,
                 after_secs,
                 idle_window_secs,
                 cancel,

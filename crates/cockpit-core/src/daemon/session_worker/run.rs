@@ -9867,7 +9867,7 @@ pub(super) async fn run_worker(
                     }
                 }
                 SessionWork::KeepWarm {
-                    armed_at_unix_secs,
+                    cache_send_at_unix_millis,
                     after_secs,
                     idle_window_secs,
                     cancel,
@@ -9876,7 +9876,7 @@ pub(super) async fn run_worker(
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::KeepWarm {
-                            armed_at_unix_secs,
+                            cache_send_at_unix_millis,
                             after_secs,
                             idle_window_secs,
                             cancel,

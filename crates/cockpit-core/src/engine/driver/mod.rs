@@ -93,7 +93,7 @@ pub enum DriverControl {
     /// Send one non-mutating prompt-cache refresh while the session remains in
     /// the idle window. This is cost-only and carries no resume semantics.
     KeepWarm {
-        armed_at_unix_secs: i64,
+        cache_send_at_unix_millis: i64,
         after_secs: u64,
         idle_window_secs: u64,
         cancel: tokio_util::sync::CancellationToken,
@@ -5744,7 +5744,7 @@ impl Driver {
                 }
             }
             DriverControl::KeepWarm {
-                armed_at_unix_secs,
+                cache_send_at_unix_millis,
                 after_secs,
                 idle_window_secs,
                 cancel,
@@ -5752,7 +5752,7 @@ impl Driver {
             } => {
                 let _ = respond_to.send(
                     self.run_keep_warm(
-                        armed_at_unix_secs,
+                        cache_send_at_unix_millis,
                         after_secs,
                         idle_window_secs,
                         cancel,
@@ -9447,20 +9447,29 @@ impl Driver {
                     tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
                     return;
                 };
-                let armed_at_unix_secs = chrono::Utc::now().timestamp();
+                let Some(cache_send_at_unix_millis) = self.session.last_send_unix_millis() else {
+                    // An observed cache hit necessarily follows a foreground
+                    // send in production. If that in-memory send marker is
+                    // absent (for example after a worker restart), fail
+                    // closed rather than inventing a later idle origin.
+                    return;
+                };
                 let unique_millis = chrono::Utc::now().timestamp_millis();
                 let job = crate::daemon::proto::ScheduledJobCreate {
                     id: format!(
                         "keep-warm.{}.{}.{}.{}.{}",
                         self.session.id.simple(),
-                        armed_at_unix_secs,
+                        cache_send_at_unix_millis,
                         schedule.after_secs,
                         schedule.idle_window_secs,
                         unique_millis,
                     ),
                     owner: "system:keep_warm".to_string(),
                     schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
-                        at: armed_at_unix_secs.saturating_add(schedule.after_secs as i64),
+                        at: cache_send_at_unix_millis
+                            .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
+                            .saturating_add(999)
+                            .div_euclid(1_000),
                     },
                     payload: crate::daemon::proto::ScheduledJobPayload::Callback {
                         subsystem: "keep_warm".to_string(),
@@ -9503,37 +9512,43 @@ impl Driver {
 
     /// Execute the one-shot cache refresh without appending a user or
     /// assistant message. A stale job fails closed: it cannot run before its
-    /// arm time, after the original idle window, or after a later inference
-    /// has reset the cache activity clock.
+    /// delay from the cache-producing inference send, after either the
+    /// original or live idle window, or after a later inference has reset the
+    /// cache activity clock.
     async fn run_keep_warm(
         &mut self,
-        armed_at_unix_secs: i64,
+        cache_send_at_unix_millis: i64,
         after_secs: u64,
         idle_window_secs: u64,
         cancel: tokio_util::sync::CancellationToken,
         input_queue: &crate::engine::message::UserSubmissionQueue,
     ) -> std::result::Result<String, String> {
         let elapsed = chrono::Utc::now()
-            .timestamp()
-            .saturating_sub(armed_at_unix_secs)
+            .timestamp_millis()
+            .saturating_sub(cache_send_at_unix_millis)
             .max(0) as u64;
+        let elapsed = elapsed / 1_000;
         if elapsed < after_secs {
             return Ok("skipped: before keep-warm deadline".to_string());
         }
-        if elapsed >= idle_window_secs {
-            return Ok("skipped: idle window elapsed".to_string());
-        }
-        if self
-            .session
-            .seconds_since_last_send()
-            .is_none_or(|age| age < after_secs)
-        {
+        let Some((last_send_at_unix_millis, last_send_age)) =
+            self.session.last_send_identity_and_age()
+        else {
+            return Ok("skipped: cache-producing send unavailable".to_string());
+        };
+        if last_send_at_unix_millis != cache_send_at_unix_millis || last_send_age < after_secs {
             return Ok("skipped: newer session activity".to_string());
+        }
+        if elapsed >= idle_window_secs || last_send_age >= idle_window_secs {
+            return Ok("skipped: idle window elapsed".to_string());
         }
         let Some((providers, provider, model_id)) = self.active_providers_config() else {
             return Ok("skipped: active endpoint unavailable".to_string());
         };
         let context = providers.resolve_context(&provider, &model_id);
+        if elapsed >= context.idle_window_secs || last_send_age >= context.idle_window_secs {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
         let decision = crate::keep_warm::decide(
             context.keep_warm,
             context.idle_window_secs,

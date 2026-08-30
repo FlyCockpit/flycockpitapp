@@ -397,11 +397,12 @@ pub struct Session {
     /// a session-wide estimate, but keep-warm is authorized only by a hit from
     /// the endpoint it is about to refresh.
     last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
-    /// Wall-clock instant of the most recent inference send. Stamped by
-    /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
-    /// it to decide whether the provider's prompt-cache TTL has elapsed.
-    /// In-memory only — a resumed session re-warms naturally.
-    last_send_at: Mutex<Option<std::time::Instant>>,
+    /// Monotonic and wall-clock instants of the most recent inference send.
+    /// The cache-cold predicate uses the monotonic instant, while the
+    /// daemon-scheduled keep-warm callback carries the wall-clock timestamp
+    /// across its durable job boundary. In-memory only — a resumed session
+    /// re-warms naturally.
+    last_send_at: Mutex<Option<InferenceSendTime>>,
     /// User messages pinned via `/pin` (GOALS §10 / `plan.md` T6.e):
     /// must-survive content injected verbatim into the `/compact`
     /// handoff, never summarized. In pin order.
@@ -484,6 +485,12 @@ struct LastToolCall {
 struct LastRecoverableToolCall {
     signature: String,
     message: String,
+}
+
+#[derive(Clone, Copy)]
+struct InferenceSendTime {
+    monotonic: std::time::Instant,
+    unix_millis: i64,
 }
 
 /// Shared test-only redaction key resolver for constructing `Session`s in unit
@@ -976,10 +983,14 @@ impl Session {
     }
 
     /// Stamp "an inference send just happened now." Drives the cache-TTL
-    /// arm of the cache-cold predicate (GOALS §10). Called once per
+    /// arm of the cache-cold predicate (GOALS §10) and establishes the
+    /// absolute origin of a keep-warm idle window. Called once per
     /// `model.complete` round-trip.
     pub fn note_send(&self) {
-        *self.last_send_at.lock().unwrap() = Some(std::time::Instant::now());
+        *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
+            monotonic: std::time::Instant::now(),
+            unix_millis: chrono::Utc::now().timestamp_millis(),
+        });
     }
 
     /// Seconds since the last inference send, or `None` if no send has
@@ -989,7 +1000,38 @@ impl Session {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| t.monotonic.elapsed().as_secs())
+    }
+
+    /// Wall-clock timestamp of the latest inference send. This is only for
+    /// a daemon job's durable identity and deadline; elapsed-time policy must
+    /// continue to use [`Self::seconds_since_last_send`] while the session is
+    /// live.
+    pub fn last_send_unix_millis(&self) -> Option<i64> {
+        self.last_send_at.lock().unwrap().map(|t| t.unix_millis)
+    }
+
+    /// Atomically snapshot the latest send's durable identity and its
+    /// monotonic age. Keep-warm uses this to prove that its job still belongs
+    /// to the cache-producing send rather than a later foreground request.
+    pub fn last_send_identity_and_age(&self) -> Option<(i64, u64)> {
+        self.last_send_at
+            .lock()
+            .unwrap()
+            .map(|t| (t.unix_millis, t.monotonic.elapsed().as_secs()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_send_at_for_test(&self, elapsed: std::time::Duration) {
+        let elapsed_millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
+            monotonic: std::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(std::time::Instant::now),
+            unix_millis: chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(elapsed_millis),
+        });
     }
 
     /// Record a dispatched tool call's loop-guard `signature` and return

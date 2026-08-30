@@ -2174,7 +2174,7 @@ pub enum SessionWork {
     /// A daemon-scheduled, observed-hit-gated cache refresh. It is never a
     /// user message and never advances away/resume activity.
     KeepWarm {
-        armed_at_unix_secs: i64,
+        cache_send_at_unix_millis: i64,
         after_secs: u64,
         idle_window_secs: u64,
         cancel: tokio_util::sync::CancellationToken,

@@ -1064,6 +1064,12 @@ pub(crate) fn materialize_tool_by_name(
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
+        "history_search" if def.is_some_and(|def| def.name == "knowledge") => tb.with(Arc::new(
+            crate::knowledge::FreshKnowledgeHistorySearchTool::new(
+                def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                    .cloned(),
+            ),
+        )),
         "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
         "semantic_search" => tb.with(Arc::new(crate::knowledge::SemanticSearchTool::new(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)

@@ -5418,6 +5418,234 @@ struct SemanticSearchArgs {
     limit: Option<usize>,
 }
 
+/// The `knowledge` specialist's history-search surface.  This keeps the KB
+/// retrieval primitives focused on KB content while restoring the bounded
+/// session freshness check that makes its synthesis equivalent to the former
+/// composite retrieval tool.
+pub(crate) struct FreshKnowledgeHistorySearchTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+impl FreshKnowledgeHistorySearchTool {
+    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            allowed_knowledge_bases,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FreshKnowledgeHistorySearchTool {
+    fn name(&self) -> &str {
+        "history_search"
+    }
+
+    fn description(&self) -> &str {
+        "search bounded, trust-filtered session updates that may be newer than attached knowledge bases"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Search this project's matching sessions after the oldest relevant attached-KB dream boundary. If any attached KB has no boundary, search conservatively because no session history can yet be proven dreamed. Results are bounded, trust-filtered session citations."
+                .to_string(),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "session-history search query" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum fresh-session citations" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: SemanticSearchArgs = typed_args(args)?;
+        if args.query.trim().is_empty() {
+            return Err(invalid_input("history_search query must not be empty"));
+        }
+        let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        validate_dream_models(&extended, &providers)?;
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
+        if bundles.bundles.is_empty() {
+            if !bundles.denied_knowledge_base_ids.is_empty() {
+                return Err(anyhow::anyhow!(knowledge_access_denied_message(
+                    &bundles.denied_knowledge_base_ids
+                )));
+            }
+            return Ok(ToolOutput::text(
+                "No attached knowledge bundles are available; no fresh-session subset was searched.",
+            ));
+        }
+        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
+        let freshness =
+            retrieve_undreamed_session_hits(&bundles.bundles, &args.query, limit, ctx).await?;
+        Ok(ToolOutput::text(render_fresh_session_retrieval(
+            &freshness,
+            ctx.redact.as_ref(),
+        )))
+    }
+}
+
+struct FreshSessionRetrieval {
+    hits: Vec<crate::db::session_search::SearchHit>,
+    boundary_knowledge_bases: Vec<String>,
+    oldest_boundary_session_event_seq: Option<i64>,
+    missing_boundary_knowledge_bases: Vec<String>,
+}
+
+async fn retrieve_undreamed_session_hits(
+    bundles: &[AttachedKnowledgeBase],
+    query: &str,
+    limit: usize,
+    ctx: &ToolCtx,
+) -> Result<FreshSessionRetrieval> {
+    let project_uuid = ctx
+        .session
+        .db
+        .authoritative_project_uuid(&ctx.session.project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
+    let mut boundary_knowledge_bases = Vec::new();
+    let mut missing_boundary_knowledge_bases = Vec::new();
+    let mut oldest_boundary_session_event_seq = None;
+    for bundle in bundles {
+        match ctx
+            .session
+            .db
+            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                project_uuid,
+                knowledge_base_attachment_id: bundle.entry.attachment_id(),
+            })
+            .await?
+        {
+            Some(boundary) => {
+                boundary_knowledge_bases.push(bundle.entry.id.clone());
+                oldest_boundary_session_event_seq = Some(
+                    oldest_boundary_session_event_seq
+                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
+                        .unwrap_or(boundary.last_dreamed_session_event_seq),
+                );
+            }
+            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
+        }
+    }
+
+    // A missing ordering boundary is not evidence that history has been
+    // dreamed. Search conservatively until every attached KB provides the
+    // durable event-sequence boundary; after that, the oldest boundary bounds
+    // the shared candidate set without timestamp ambiguity.
+    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
+        match oldest_boundary_session_event_seq {
+            Some(boundary) => (Some(boundary), true),
+            None => (None, false),
+        }
+    } else {
+        (None, true)
+    };
+    let hits = if search_enabled {
+        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
+        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
+        let hits = match after_session_event_seq {
+            Some(boundary) => {
+                ctx.session
+                    .db
+                    .search_candidates_after_session_event_seq_for_trust(
+                        query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        boundary,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+            None => {
+                ctx.session
+                    .db
+                    .search_candidates_for_trust(
+                        query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        None,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+        };
+        hits.into_iter().take(limit).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(FreshSessionRetrieval {
+        hits,
+        boundary_knowledge_bases,
+        oldest_boundary_session_event_seq,
+        missing_boundary_knowledge_bases,
+    })
+}
+
+fn render_fresh_session_retrieval(
+    freshness: &FreshSessionRetrieval,
+    redact: &RedactionTable,
+) -> String {
+    let mut out = String::from("history_search fresh-session results:\n");
+    if !freshness.missing_boundary_knowledge_bases.is_empty() {
+        out.push_str(
+            "No dream ordering boundary is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
+        );
+    } else if let Some(boundary) = freshness.oldest_boundary_session_event_seq {
+        out.push_str("Searched this project's sessions with events after dream boundary sequence ");
+        out.push_str(&boundary.to_string());
+        out.push_str(" for KB(s) ");
+        out.push_str(&freshness.boundary_knowledge_bases.join(", "));
+        out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
+    } else {
+        out.push_str("No eligible fresh-session boundary is available.\n");
+    }
+    if !freshness.missing_boundary_knowledge_bases.is_empty() {
+        out.push_str("KB(s) without a dream ordering boundary: ");
+        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
+        out.push_str(".\n");
+    }
+    if freshness.hits.is_empty() {
+        out.push_str("- No matching undreamed-session updates.\n");
+    } else {
+        out.push_str("Undreamed-session citations:\n");
+        for hit in &freshness.hits {
+            let fallback_reference = hit.session_id.to_string();
+            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
+            out.push_str("- session ");
+            out.push_str(reference);
+            out.push_str(" — ");
+            out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
+            out.push_str(" — ");
+            out.push_str(&short_summary(&hit.snippet));
+            out.push_str(" [session ref: ");
+            out.push_str(&hit.session_id.to_string());
+            out.push_str("]\n");
+        }
+    }
+    redact.scrub(&out)
+}
+
 #[async_trait]
 impl Tool for SemanticSearchTool {
     fn name(&self) -> &str {
@@ -5911,6 +6139,158 @@ mod tests {
             0.0
         };
         vec![exact_anchor, deploy, incident]
+    }
+
+    #[test]
+    fn fresh_session_retrieval_renders_cited_updates() {
+        let session_id = uuid::Uuid::new_v4();
+        let freshness = FreshSessionRetrieval {
+            hits: vec![crate::db::session_search::SearchHit {
+                session_id,
+                project_id: "project".to_string(),
+                short_id: Some("ab12cd".to_string()),
+                title: Some("Recent deploy discussion".to_string()),
+                last_active_at_unix_ms: 101,
+                snippet: "The rollout is waiting for approval.".to_string(),
+                bm25: -1.0,
+            }],
+            boundary_knowledge_bases: vec!["project".to_string()],
+            oldest_boundary_session_event_seq: Some(100),
+            missing_boundary_knowledge_bases: Vec::new(),
+        };
+
+        let rendered = render_fresh_session_retrieval(&freshness, &RedactionTable::empty());
+        assert!(rendered.contains("dream boundary sequence 100"));
+        assert!(rendered.contains("session ab12cd"));
+        assert!(rendered.contains(&session_id.to_string()));
+        assert!(rendered.contains("may not yet be dreamed"));
+    }
+
+    #[tokio::test]
+    async fn fresh_session_retrieval_includes_current_session_before_the_first_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "current session has the windfall launch decision" }),
+            )
+            .await
+            .unwrap();
+        let entry = project_knowledge_registry_entry();
+        let bundles = vec![AttachedKnowledgeBase {
+            provider: Arc::new(RemoteKb {
+                entry: entry.clone(),
+            }),
+            entry,
+            sealed_id: crate::sealed::SealedKnowledgeBaseId::parse(
+                "4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9",
+            )
+            .unwrap(),
+        }];
+
+        let freshness = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            freshness.missing_boundary_knowledge_bases,
+            vec!["project".to_string()]
+        );
+        assert!(
+            freshness
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == ctx.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_session_retrieval_uses_the_event_sequence_boundary_not_a_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let entry = project_knowledge_registry_entry();
+        let bundles = vec![AttachedKnowledgeBase {
+            provider: Arc::new(RemoteKb {
+                entry: entry.clone(),
+            }),
+            entry,
+            sealed_id: crate::sealed::SealedKnowledgeBaseId::parse(
+                "4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9",
+            )
+            .unwrap(),
+        }];
+        let first = ctx
+            .session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "windfall decision before dream" }),
+            )
+            .await
+            .unwrap();
+        let project_uuid = ctx
+            .session
+            .db
+            .authoritative_project_uuid(&ctx.session.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let boundary = ctx
+            .session
+            .db
+            .snapshot_knowledge_dream_boundary(project_uuid)
+            .await
+            .unwrap();
+        assert_eq!(boundary, first);
+        ctx.session
+            .db
+            .record_knowledge_dream_boundary(
+                crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                    project_uuid,
+                    knowledge_base_attachment_id: bundles[0].entry.attachment_id(),
+                },
+                boundary,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let before_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+        assert!(before_later_event.hits.is_empty());
+
+        let later = ctx
+            .session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "post-dream activity" }),
+            )
+            .await
+            .unwrap();
+        assert!(later > boundary);
+
+        let after_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+        assert!(
+            after_later_event
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == ctx.session.id)
+        );
     }
 
     #[tokio::test]

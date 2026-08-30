@@ -557,7 +557,12 @@ fn knowledge_def() -> AgentDef {
         "knowledge",
         "Read-only knowledge retrieval specialist; composes cited KB search primitives and reads into a concise synthesis.",
         AgentMode::Subagent,
-        &["read", "semantic_search", "structured_search"],
+        &[
+            "read",
+            "semantic_search",
+            "structured_search",
+            "history_search",
+        ],
         crate::engine::builtin::KNOWLEDGE_PROMPT,
         None,
     )
@@ -1065,6 +1070,7 @@ mod tests {
                 "read".to_string(),
                 "semantic_search".to_string(),
                 "structured_search".to_string(),
+                "history_search".to_string(),
             ]),
             "the KB specialist receives only native read and its read-only search primitives"
         );
@@ -1079,8 +1085,10 @@ mod tests {
             );
         }
         assert!(
-            def.prompt.contains("semantic_search") && def.prompt.contains("structured_search"),
-            "the specialist prompt must direct retrieval through both provider-backed search primitives"
+            def.prompt.contains("semantic_search")
+                && def.prompt.contains("structured_search")
+                && def.prompt.contains("history_search"),
+            "the specialist prompt must direct retrieval through both provider-backed search primitives and bounded fresh-session recall"
         );
     }
 }

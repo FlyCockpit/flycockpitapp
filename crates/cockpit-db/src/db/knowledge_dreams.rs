@@ -174,13 +174,19 @@ impl Db {
 }
 
 fn validate_kb_id(value: &str) -> Result<()> {
-    ensure!(!value.trim().is_empty(), "knowledge base id must not be empty");
+    ensure!(
+        !value.trim().is_empty(),
+        "knowledge base id must not be empty"
+    );
     ensure!(value.len() <= 255, "knowledge base id is too long");
     Ok(())
 }
 
 fn validate_consumer_id(value: &str) -> Result<()> {
-    ensure!(!value.trim().is_empty(), "dream consumer id must not be empty");
+    ensure!(
+        !value.trim().is_empty(),
+        "dream consumer id must not be empty"
+    );
     ensure!(value.len() <= 255, "dream consumer id is too long");
     Ok(())
 }

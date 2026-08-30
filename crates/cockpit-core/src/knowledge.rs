@@ -115,6 +115,7 @@ pub(crate) struct KnowledgeConcept {
     pub path: PathBuf,
     #[serde(rename = "type")]
     pub concept_type: String,
+    pub provenance: dream::ConceptProvenance,
     pub frontmatter: BTreeMap<String, String>,
     pub body: String,
     pub citations: Vec<Citation>,
@@ -2018,6 +2019,10 @@ fn parse_bundle_snapshot(
 pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
     let mut frontmatter = concept.frontmatter.clone();
     frontmatter.insert("type".to_string(), concept.concept_type.clone());
+    frontmatter.insert(
+        "provenance".to_string(),
+        concept.provenance.as_str().to_string(),
+    );
     if let Some(valid_from) = &concept.valid_from {
         frontmatter.insert("valid_from".to_string(), valid_from.clone());
     }
@@ -2072,6 +2077,19 @@ fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<Knowledg
             root.join(&rel).display()
         );
     };
+    let provenance = match frontmatter.get("provenance").map(String::as_str) {
+        Some("human") => dream::ConceptProvenance::Human,
+        Some("agent") => dream::ConceptProvenance::Agent,
+        Some("dream") => dream::ConceptProvenance::Dream,
+        Some(other) => bail!(
+            "knowledge concept {} has invalid provenance `{other}`",
+            root.join(&rel).display()
+        ),
+        None => bail!(
+            "knowledge concept {} is missing required `provenance` frontmatter",
+            root.join(&rel).display()
+        ),
+    };
     let (body, citations) = split_citations(markdown);
     let id = frontmatter
         .get("id")
@@ -2081,6 +2099,7 @@ fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<Knowledg
         id,
         path: rel,
         concept_type,
+        provenance,
         valid_from: frontmatter.get("valid_from").cloned(),
         supersedes: parse_string_list(frontmatter.get("supersedes")),
         invalidated_by: frontmatter.get("invalidated_by").cloned(),
@@ -3735,9 +3754,9 @@ pub(crate) async fn with_memory_search_if_attached(
                 executing_model: executing_model.to_string(),
             }))
             .with(Arc::new(KnowledgeDreamApplyTool {
-            allowed_knowledge_bases,
-            executing_model: executing_model.to_string(),
-        }))
+                allowed_knowledge_bases,
+                executing_model: executing_model.to_string(),
+            }))
     } else {
         toolbox
             .without(KNOWLEDGE_DREAM_SOURCES_TOOL_NAME)
@@ -3838,10 +3857,7 @@ impl Tool for KnowledgeDreamSourcesTool {
         let mut sources = ctx
             .session
             .db
-            .undreamed_sessions_for_knowledge_base(
-                &knowledge_base.entry.id,
-                consumer.as_hex(),
-            )
+            .undreamed_sessions_for_knowledge_base(&knowledge_base.entry.id, consumer.as_hex())
             .await?;
         let redaction_base = ctx
             .session
@@ -3865,7 +3881,9 @@ impl Tool for KnowledgeDreamSourcesTool {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(ToolOutput::text(serde_json::to_string_pretty(&presentation)?))
+        Ok(ToolOutput::text(serde_json::to_string_pretty(
+            &presentation,
+        )?))
     }
 }
 
@@ -3981,16 +3999,16 @@ impl Tool for KnowledgeDreamApplyTool {
         let engine = dream::DreamEngine::new(ctx.session.clone());
         let outcome = engine
             .apply_orchestrated_change_set(
-            &entry,
-            &extended,
-            &providers,
-            &self.executing_model,
-            &ctx.redact,
-            change_set,
-            &sink,
-            cancel.cancel.clone(),
-        )
-        .await?;
+                &entry,
+                &extended,
+                &providers,
+                &self.executing_model,
+                &ctx.redact,
+                change_set,
+                &sink,
+                cancel.cancel.clone(),
+            )
+            .await?;
         Ok(render_dream_run_outcome(outcome))
     }
 }
@@ -4029,7 +4047,10 @@ fn dream_write_cancellation(ctx: &ToolCtx) -> DreamWriteCancellation {
     }
 }
 
-pub(super) fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<()> {
+pub(super) fn apply_knowledge_dream_writes(
+    root: &Path,
+    writes: &[KnowledgeDreamWrite],
+) -> Result<()> {
     // Git provides the rollback boundary for a tracked KB.  Git is optional,
     // though, so preserve the exact pre-write file set here as well: a later
     // write failure or a failed OKF validation must not leave a Git-absent KB
@@ -4346,6 +4367,7 @@ mod tests {
             root.join("deploy.md"),
             r#"---
 type: decision
+provenance: human
 valid_from: 2026-07-16
 supersedes:
   - old-deploy
@@ -4364,6 +4386,7 @@ Release handoff should use the green deploy pipeline and wait for health checks.
             root.join("error.md"),
             r#"---
 type: incident
+provenance: human
 ---
 
 If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
@@ -4404,12 +4427,12 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         fs::write(tmp.path().join("notes.md"), "plain markdown is ignored").unwrap();
         fs::write(
             tmp.path().join("unknown.md"),
-            "---\ntype: made-up\nunknown: yes\n---\n\nBroken [[missing]] link.",
+            "---\ntype: made-up\nprovenance: agent\nunknown: yes\n---\n\nBroken [[missing]] link.",
         )
         .unwrap();
         fs::write(
             tmp.path().join("missing-type.md"),
-            "---\nid: nope\n---\n\nbody",
+            "---\nid: nope\nprovenance: human\n---\n\nbody",
         )
         .unwrap();
 
@@ -4432,6 +4455,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             id: "catalog".to_string(),
             path: PathBuf::from("catalog.md"),
             concept_type: "catalog".to_string(),
+            provenance: dream::ConceptProvenance::Agent,
             frontmatter,
             body: String::new(),
             citations: Vec::new(),
@@ -4464,6 +4488,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             concept_dir.join("structured.md"),
             r#"---
 type: catalog
+provenance: agent
 title: Inventory
 description: Current inventory
 resource: inventory.csv
@@ -5369,7 +5394,7 @@ timestamp: 2026-08-29T12:00:00Z
     fn write_dream_concept(root: &Path, name: &str, body: &str) {
         fs::write(
             root.join(format!("{name}.md")),
-            format!("---\ntype: memory\n---\n\n{body}\n"),
+            format!("---\ntype: memory\nprovenance: dream\n---\n\n{body}\n"),
         )
         .unwrap();
     }

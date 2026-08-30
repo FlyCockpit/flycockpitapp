@@ -20,9 +20,7 @@ use super::{
     KnowledgeDreamWrite, apply_knowledge_dream_writes, apply_registered_knowledge_dream,
     parse_bundle,
 };
-use crate::config::extended::{
-    ExtendedConfig, KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
-};
+use crate::config::extended::{ExtendedConfig, KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
 use crate::config::providers::{ModelTrust, ProvidersConfig};
 use crate::db::knowledge_dreams::DreamSessionSource;
 use crate::redact::RedactionTable;
@@ -37,7 +35,7 @@ pub enum ConceptProvenance {
 }
 
 impl ConceptProvenance {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Human => "human",
             Self::Agent => "agent",
@@ -149,6 +147,11 @@ pub struct LocalGitSink {
     config: ExtendedConfig,
 }
 
+/// TODO(hosted dream service): add `RemoteSink` when hosted KB writes can
+/// submit authenticated change sets to the server. It deliberately has no
+/// launch implementation; `LocalGitSink` is the sole current sink.
+pub struct RemoteSink;
+
 impl LocalGitSink {
     pub fn new(
         session: Arc<Session>,
@@ -203,7 +206,7 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
         .collect();
     for upsert in &change_set.upserts {
         if let Some(concept) = by_id.get(upsert.id.as_str())
-            && concept.frontmatter.get("provenance").map(String::as_str) == Some("human")
+            && concept.provenance == ConceptProvenance::Human
         {
             bail!(
                 "dream cannot modify human-provenance concept `{}`",
@@ -218,7 +221,10 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
         .map(|upsert| {
             let mut frontmatter = BTreeMap::new();
             frontmatter.insert("id".to_owned(), upsert.id.clone());
-            frontmatter.insert("provenance".to_owned(), ConceptProvenance::Dream.as_str().to_owned());
+            frontmatter.insert(
+                "provenance".to_owned(),
+                ConceptProvenance::Dream.as_str().to_owned(),
+            );
             if let Some(title) = &upsert.title {
                 frontmatter.insert("title".to_owned(), title.clone());
             }
@@ -226,6 +232,7 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
                 id: upsert.id.clone(),
                 path: PathBuf::from(format!("{}.md", upsert.id)),
                 concept_type: upsert.concept_type.clone(),
+                provenance: ConceptProvenance::Dream,
                 frontmatter,
                 body: upsert.body.clone(),
                 citations: upsert.citations.clone(),
@@ -239,6 +246,25 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
             }
         })
         .collect::<Vec<_>>();
+    ensure!(
+        writes.len() <= super::MAX_KNOWLEDGE_FILES,
+        "dream change set exceeds the knowledge file-count limit"
+    );
+    let mut total_bytes = 0_usize;
+    for write in &writes {
+        ensure!(
+            write.content.len() <= super::MAX_KNOWLEDGE_FILE_BYTES,
+            "dream concept `{}` exceeds the knowledge file size limit",
+            write.path
+        );
+        total_bytes = total_bytes
+            .checked_add(write.content.len())
+            .context("dream change-set size overflow")?;
+    }
+    ensure!(
+        total_bytes <= super::MAX_KNOWLEDGE_TOTAL_BYTES,
+        "dream change set exceeds the aggregate knowledge size limit"
+    );
     apply_knowledge_dream_writes(root, &writes)
 }
 
@@ -329,11 +355,7 @@ impl DreamEngine {
             .collect::<Vec<_>>();
         self.session
             .db
-            .record_knowledge_dream_completion(
-                &knowledge_base.id,
-                consumer.as_hex(),
-                &source_ids,
-            )
+            .record_knowledge_dream_completion(&knowledge_base.id, consumer.as_hex(), &source_ids)
             .await?;
         Ok(DreamRunOutcome::Applied {
             sessions_dreamed: source_ids.len(),
@@ -374,10 +396,7 @@ pub fn build_dream_prompt(knowledge_base_id: &str) -> String {
     )
 }
 
-fn validate_exact_source_set(
-    expected: &[DreamSessionSource],
-    submitted: &[Uuid],
-) -> Result<()> {
+fn validate_exact_source_set(expected: &[DreamSessionSource], submitted: &[Uuid]) -> Result<()> {
     let expected = expected
         .iter()
         .map(|source| source.session_id)
@@ -415,7 +434,10 @@ fn redact_and_validate_change_set(
             citation.target = redaction.scrub(&citation.target);
         }
         ensure!(valid_concept_id(&upsert.id), "invalid dream concept id");
-        ensure!(!upsert.concept_type.trim().is_empty(), "concept type is empty");
+        ensure!(
+            !upsert.concept_type.trim().is_empty(),
+            "concept type is empty"
+        );
         ensure!(ids.insert(upsert.id.clone()), "duplicate dream concept id");
     }
     Ok(change_set)
@@ -432,9 +454,7 @@ fn valid_concept_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::extended::{
-        KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
-    };
+    use crate::config::extended::{KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy};
     use crate::config::providers::{ModelEntry, ProviderEntry};
 
     fn entry(trust_required: bool) -> KnowledgeBaseRegistryEntry {
@@ -482,10 +502,17 @@ mod tests {
                 .reference(),
             "p:dream"
         );
+        let mut overridden = entry(false);
+        overridden.dream_model = Some("p:kb-specific".into());
+        assert_eq!(
+            resolve_dream_model(&overridden, &config, &providers(ModelTrust::Untrusted))
+                .unwrap()
+                .reference(),
+            "p:kb-specific"
+        );
         config.knowledge_bases.clear();
         assert!(
-            resolve_dream_model(&entry(true), &config, &providers(ModelTrust::Untrusted))
-                .is_err()
+            resolve_dream_model(&entry(true), &config, &providers(ModelTrust::Untrusted)).is_err()
         );
         assert!(
             resolve_dream_model(&entry(true), &config, &providers(ModelTrust::Trusted)).is_ok()

@@ -68,6 +68,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     // commit/defer boundary, so it must not claim the dispatcher's stronger
     // cleanup-before-return cancellation contract.
     ToolTimeoutSafety::abandon_safe("knowledge_dream_apply"),
+    ToolTimeoutSafety::abandon_safe("knowledge_dream_sources"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),
     ToolTimeoutSafety::abandon_safe("plan_edit"),

@@ -3406,6 +3406,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         ),
         interactive: true,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd).catalog(),
         model_override: None,
         delegation_model: None,
         delegated: false,

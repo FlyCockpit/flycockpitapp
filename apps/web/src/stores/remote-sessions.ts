@@ -48,6 +48,7 @@ export type WebSessionSummary = {
   projectId: string;
   projectRoot: string;
   title: string;
+  description?: string;
   shortId?: string;
   status: string;
   archived: boolean;
@@ -705,6 +706,7 @@ export function toWebSessionSummary(session: WireSessionSummary): WebSessionSumm
     projectId: session.project_id,
     projectRoot: session.project_root,
     title: session.title ?? session.short_id ?? session.session_id,
+    description: session.description ?? undefined,
     shortId: session.short_id,
     status: stringField(raw, "activity_state") ?? "idle",
     archived: booleanField(raw, "archived") ?? false,

@@ -186,6 +186,8 @@ pub struct SessionRow {
     pub fork_point_turn_id: Option<String>,
     /// Auto-generated or user-set title (GOALS §17d).
     pub title: Option<String>,
+    /// Cache-reusing metadata fork's one-sentence session context.
+    pub description: Option<String>,
     /// `true` when the user has manually set [`title`]. Locks out the
     /// utility-model auto-titling pass.
     pub user_renamed: bool,
@@ -217,6 +219,8 @@ pub struct SessionRow {
     /// slot (`0`, `1`, `2`, `4`, `8`, or `16`). Persisted so a resumed session
     /// does not repeat the same automatic utility call.
     pub title_stage: i64,
+    /// Monotonic durable ownership fence for a same-model metadata fork.
+    pub metadata_fork_generation: i64,
     /// Durable one-shot post-auto-title-failure recovery nudge latch (issue
     /// #23). Defaults [`TitleRecoveryNudgeState::None`]; never inherited by a
     /// fork/tangent/copy, and cleared whenever a title is successfully stored.
@@ -288,6 +292,7 @@ impl SessionRow {
             parent_session_id,
             fork_point_turn_id: row.get("fork_point_turn_id")?,
             title: row.get("title")?,
+            description: row.get("description")?,
             user_renamed: user_renamed != 0,
             last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
             archived_at_unix_ms: row.get("archived_at_unix_ms")?,
@@ -296,6 +301,7 @@ impl SessionRow {
             btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
             user_content_tokens: row.get("user_content_tokens")?,
             title_stage: row.get("title_stage")?,
+            metadata_fork_generation: row.get("metadata_fork_generation")?,
             title_recovery_nudge_state: nudge_state_from_sql(
                 row.get("title_recovery_nudge_state")?,
             )?,
@@ -448,8 +454,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
-          assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+          assistant_name, created_by_principal, shared_with_collaborators, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -473,6 +479,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.assistant_name,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
+            row.description,
         ],
     )?;
     Ok(())
@@ -510,11 +517,11 @@ fn execute_fork_insert(
           parent_session_id, fork_point_turn_id,
           provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
-          title_recovery_nudge_state,
+          metadata_fork_generation, title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
-          model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+          model_system_prompt_snapshot_json, assistant_name, active_model_revision, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -534,6 +541,7 @@ fn execute_fork_insert(
             row.ephemeral as i64,
             row.user_content_tokens,
             row.title_stage,
+            row.metadata_fork_generation,
             row.title_recovery_nudge_state.as_i64(),
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
@@ -546,6 +554,7 @@ fn execute_fork_insert(
             row.model_system_prompt_snapshot_json,
             row.assistant_name,
             row.active_model_revision,
+            row.description,
         ],
     )?;
     Ok(())
@@ -658,6 +667,7 @@ fn build_session_row(
         parent_session_id: None,
         fork_point_turn_id: None,
         title: None,
+        description: None,
         user_renamed: false,
         last_viewed_at_unix_ms: None,
         archived_at_unix_ms: None,
@@ -666,6 +676,7 @@ fn build_session_row(
         btw_tangent: false,
         user_content_tokens: 0,
         title_stage: 0,
+        metadata_fork_generation: 0,
         // A brand-new session never carries a recovery nudge.
         title_recovery_nudge_state: TitleRecoveryNudgeState::None,
         guidance_baseline_path: None,
@@ -1343,6 +1354,7 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: None,
             title: None,
+            description: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1355,6 +1367,7 @@ impl Db {
                 parent.user_content_tokens
             },
             title_stage: if tangent { 0 } else { parent.title_stage },
+            metadata_fork_generation: 0,
             // A `/btw` fork is a distinct session: never inherit the
             // parent's unconsumed recovery nudge (tangent or seeded).
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
@@ -1500,6 +1513,7 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: fork_point_turn_id.clone(),
             title: None,
+            description: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1508,6 +1522,7 @@ impl Db {
             btw_tangent: false,
             user_content_tokens: parent.user_content_tokens,
             title_stage: parent.title_stage,
+            metadata_fork_generation: 0,
             // A fork (plain or ephemeral `/side`) is a distinct session:
             // never inherit the parent's unconsumed recovery nudge.
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
@@ -1735,6 +1750,75 @@ impl Db {
             )
             .context("setting auto title")?;
         Ok(affected > 0)
+    }
+
+    /// Atomically set generated session metadata. Only the ephemeral
+    /// self-metadata fork calls this; it cannot overwrite a manual title or
+    /// mutate a throwaway session.
+    pub fn set_auto_session_metadata_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        title: &str,
+        description: &str,
+        expected_user_content_tokens: i64,
+        expected_metadata_fork_generation: i64,
+    ) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions
+                 SET title = ?1, description = ?2, title_recovery_nudge_state = 0
+                 WHERE session_id = ?3 AND user_renamed = 0 AND ephemeral = 0
+                   AND user_content_tokens = ?4
+                   AND metadata_fork_generation = ?5",
+                params![
+                    title,
+                    description,
+                    session_id.to_string(),
+                    expected_user_content_tokens,
+                    expected_metadata_fork_generation,
+                ],
+            )
+            .context("setting auto session metadata")?;
+        Ok(affected > 0)
+    }
+
+    /// Claim a distinct durable metadata-fork generation. A later claim or
+    /// revocation invalidates every previous fork before it can publish.
+    pub fn activate_metadata_fork_conn(conn: &Connection, session_id: Uuid) -> Result<i64> {
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                SET metadata_fork_generation = metadata_fork_generation + 1
+              WHERE session_id = ?1",
+                params![session_id.to_string()],
+            )
+            .context("activating metadata fork")?;
+        ensure!(changed == 1, "activating metadata fork: session not found");
+        conn.query_row(
+            "SELECT metadata_fork_generation FROM sessions WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("reading activated metadata fork generation")
+    }
+
+    /// Revoke a fork only while it owns the expected generation. This and the
+    /// generated write serialize through SQLite, so cancellation/drain owns a
+    /// durable linearization point rather than an advisory pre-write check.
+    pub fn revoke_metadata_fork_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                    SET metadata_fork_generation = metadata_fork_generation + 1
+                  WHERE session_id = ?1 AND metadata_fork_generation = ?2",
+                params![session_id.to_string(), expected_generation],
+            )
+            .context("revoking metadata fork")?;
+        Ok(changed == 1)
     }
 
     pub async fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
@@ -2716,7 +2800,7 @@ impl Db {
 
     /// Assemble the `/sessions` browser rows for one level, the single
     /// source of truth shared by the daemon's `ListSessions` handler and
-    /// the TUI's daemonless direct-DB fallback. The level selection
+    /// the TUI's disconnected direct-DB fallback. The level selection
     /// mirrors the RPC contract:
     ///
     /// - `parent_session_id = Some(p)` → the direct forks of `p`
@@ -2728,7 +2812,7 @@ impl Db {
     /// (`latest_activity_at`), and open-interrupt count. Live-only fields
     /// (running/processing) are *not* part of this method — callers
     /// attach them separately (the daemon from its registry, the TUI
-    /// daemonless path not at all). A per-row auxiliary-query miss
+    /// disconnected path not at all). A per-row auxiliary-query miss
     /// degrades that field to its empty default rather than failing the
     /// whole list, matching the daemon handler's best-effort behavior.
     pub async fn list_session_summaries(
@@ -2801,6 +2885,7 @@ impl Db {
                 turns: 0, // wire up when we track turn count
                 active_agent: row.active_agent,
                 title: row.title,
+                description: row.description,
                 parent_session_id: row.parent_session_id,
                 fork_count,
                 descendant_count,
@@ -4863,7 +4948,7 @@ mod tests {
     #[tokio::test]
     async fn list_session_summaries_scopes_orders_and_groups_forks() {
         // The factored query is the single source of truth for the
-        // `/sessions` browser (daemon RPC + TUI daemonless). Assert the
+        // `/sessions` browser (daemon RPC + TUI disconnected fallback). Assert the
         // three level selections produce the same shape the daemon handler
         // used: project-scoped roots newest-first, forks grouped under a
         // parent, fork/descendant counts, and the all-projects fallback.
@@ -5160,7 +5245,7 @@ mod tests {
         let recent = db.most_recent_open_session_for("p").await.unwrap().unwrap();
         assert_eq!(recent.session_id, root.session_id);
 
-        // Browser summaries (the daemon + daemonless shared path).
+        // Browser summaries (the daemon + disconnected shared path).
         let summaries = db
             .list_session_summaries(Some("p"), None, 100)
             .await

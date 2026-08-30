@@ -358,9 +358,15 @@ async fn dispatch(
                 let skip_prepare_for_stub = false;
                 if !skip_prepare_for_stub {
                     let prepared = entry
-                        .server
+                        .persistent_server()
+                        .expect("external catalog entries always have persistent server configuration")
                         .with_selected_profile(&server, &entry.profile)
-                        .unwrap_or_else(|_| entry.server.clone());
+                        .unwrap_or_else(|_| {
+                            entry
+                                .persistent_server()
+                                .expect("external catalog entries always have persistent server configuration")
+                                .clone()
+                        });
                     match crate::mcp::invoke_prep::prepare_invoke_args_identified(
                         &server,
                         &prepared,
@@ -371,7 +377,7 @@ async fn dispatch(
                         super::catalog::connect_context(host)
                             .with_profile(entry.profile.clone())
                             .with_agent_bound(entry.agent_bound),
-                        entry.source,
+                        entry.source(),
                         &entry.profile,
                         entry.agent_bound,
                     )

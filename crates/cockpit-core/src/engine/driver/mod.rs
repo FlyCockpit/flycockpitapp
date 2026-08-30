@@ -4464,12 +4464,7 @@ impl Driver {
             },
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
-            mcp_resolver: {
-                agent
-                    .mcp_resolver
-                    .observe_config_generation(self.config.snapshot().generation);
-                agent.mcp_resolver.clone()
-            },
+            mcp_resolver: agent.mcp_resolver.clone(),
         };
         let call = crate::engine::message::ToolCall {
             id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -11673,8 +11668,25 @@ impl Driver {
         // The title accounting is based on the exact authored source, while
         // the detached utility request gets only a bounded prefix. In
         // particular it must not independently expand an 8MiB artifact.
-        let title_action = self.session.note_user_content(&canonical_user_text);
-        if !matches!(title_action, crate::session::TitleAction::None) {
+        // The same-model path is the fallback with no utility title model and
+        // an explicit preference when both are available. It is launched only
+        // after the foreground prompt is assembled below, so its prefix is the
+        // foreground history plus that exact prompt and it remains invisible to
+        // the main conversation.
+        let (extended, providers) = self.config.configs();
+        let use_session_model_metadata =
+            extended.auto_title_with_session_model || extended.auto_title_model_ref().is_none();
+        let (title_action, mut metadata_work) = if use_session_model_metadata {
+            (
+                crate::session::TitleAction::None,
+                self.session
+                    .note_user_content_for_metadata(&canonical_user_text),
+            )
+        } else {
+            (self.session.note_user_content(&canonical_user_text), None)
+        };
+        if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
+        {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {
                 crate::engine::text_artifact_frame::bounded_utf8_prefix(
@@ -11685,10 +11697,8 @@ impl Driver {
             } else {
                 user_text.clone()
             };
-            // Resolve auto-title config from the turn-pinned snapshot before the
-            // detached task spawns, rather than re-reading disk inside it
-            // (`engine-config-snapshot-adoption`).
-            let (extended, providers) = self.config.configs();
+            // Config was resolved from the turn-pinned snapshot before the
+            // detached task spawned (`engine-config-snapshot-adoption`).
             // Thread the session's effective redaction table so the detached
             // auto-title call routes through the same non-bypassable scrub
             // chokepoint as the foreground turn (GOALS §7).
@@ -12069,6 +12079,13 @@ impl Driver {
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                if is_root && let Some(work) = metadata_work.take() {
+                    // The turn phase consumes this only after it has assembled
+                    // and successfully dispatched the foreground request. That
+                    // gives the fork the exact post-prune prefix and a real
+                    // cache-warming ordering edge.
+                    self.session.queue_metadata_fork(work);
+                }
                 let foreground_queue = crate::engine::agent::ForegroundQueueBridge {
                     queue: input_rx.clone(),
                     target: self.active_queue_target(),
@@ -14082,6 +14099,7 @@ impl Driver {
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
             mcp_parent_reachable: None,
+            mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),
             // Root construction may consume explicit/resumed selection
             // provenance or a legacy plan-level override. vNext children
             // discard it at the delegated-spawn boundary and resolve their own
@@ -14176,7 +14194,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             ..self.spawn_args(interactive)
         }
     }
@@ -14251,7 +14269,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
             ..self.spawn_args(interactive)
         }

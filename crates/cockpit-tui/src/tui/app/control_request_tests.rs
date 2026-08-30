@@ -17,7 +17,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app
 }
@@ -243,6 +242,16 @@ fn control_response_outcome_table() {
     assert!(matches!(
         control_response_outcome(Err("daemon error".to_string())),
         ControlRequestOutcome::Rejected(message) if message == "daemon error"
+    ));
+    assert!(matches!(
+        control_response_outcome(Ok(Response::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        })),
+        ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        }
     ));
 }
 

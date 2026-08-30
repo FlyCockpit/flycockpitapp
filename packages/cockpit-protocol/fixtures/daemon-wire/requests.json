@@ -164,15 +164,6 @@
     "request": "fs_write",
     "v": 21
   },
-  "get_app_flag": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": {
-      "key": "daemon_autostart_notice"
-    },
-    "request": "get_app_flag",
-    "v": 21
-  },
   "get_inventory_bundle": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
@@ -243,16 +234,6 @@
       "project_id": "project_id-fixture"
     },
     "request": "list_sessions",
-    "v": 21
-  },
-  "mark_app_flag_seen": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": {
-      "expected_version": 7,
-      "key": "daemon_autostart_notice"
-    },
-    "request": "mark_app_flag_seen",
     "v": 21
   },
   "read_bulk_transfer_chunk": {

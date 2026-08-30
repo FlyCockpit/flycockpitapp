@@ -1300,14 +1300,12 @@ impl Db {
                     && owner.task_delegation_child_uuid.is_none(),
                 "root continuation owner is not the session root"
             );
-            let runtime_key: Option<String> = conn
-                .query_row(
-                    "SELECT runtime_key FROM agent_instances
-                      WHERE session_id = ?1 AND agent_instance_id = ?2",
-                    params![session_id.to_string(), agent_instance_id.to_string()],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?;
+            let runtime_key: Option<String> = conn.query_row(
+                "SELECT runtime_key FROM agent_instances
+                  WHERE session_id = ?1 AND agent_instance_id = ?2",
+                params![session_id.to_string(), agent_instance_id.to_string()],
+                |row| row.get(0),
+            )?;
             ensure!(
                 runtime_key.as_deref() == Some("session-root"),
                 "root continuation owner does not carry the daemon root identity"

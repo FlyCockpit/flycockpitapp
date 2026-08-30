@@ -5671,9 +5671,8 @@ async fn handle_serialized_request_impl(
             crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .preflight_new_attachment()
                 .map_err(code_root_contract_error)?;
-            let canonical = crate::daemon::fs_api::canonical_project_root(
-                &request.workspace_selector.path,
-            )?;
+            let canonical =
+                crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?;
             let options = request.options.clone();
             let principal = state.principal.clone();
             let attached = Box::pin(attach(
@@ -5701,9 +5700,8 @@ async fn handle_serialized_request_impl(
             if let Some(attached) = state.attached.as_ref() {
                 attached.handle.persist_if_needed().map_err(internal)?;
             }
-            let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
-                ctx.db.clone(),
-            );
+            let writer =
+                crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
             let initial = writer
                 .write_root_state_changed(root.root_id)
                 .await
@@ -5804,9 +5802,8 @@ async fn handle_serialized_request_impl(
             if let Some(attached) = state.attached.as_ref() {
                 scrub_code_root_read(&mut root, &attached.handle.redaction_table());
             }
-            let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
-                ctx.db.clone(),
-            );
+            let writer =
+                crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
             let initial = writer
                 .write_root_state_changed(root.root_id)
                 .await
@@ -5881,20 +5878,21 @@ async fn handle_serialized_request_impl(
                 }
                 (root_id, outcome)
             };
-            debug_assert!(state
-                .attached
-                .as_ref()
-                .is_some_and(|attached| attached.handle.session_id == root_id.0));
+            debug_assert!(
+                state
+                    .attached
+                    .as_ref()
+                    .is_some_and(|attached| attached.handle.session_id == root_id.0)
+            );
             drain_client_attachment_ownership(state, ctx, "Code-root attachment close").await?;
             Ok(Response::CodeRootAttachmentClosed(outcome))
         }
 
         Request::DiscoverCodeRootsV1(request) => {
-            let canonical = crate::daemon::fs_api::canonical_project_root(
-                &request.workspace_selector.path,
-            )?
-            .to_string_lossy()
-            .into_owned();
+            let canonical =
+                crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?
+                    .to_string_lossy()
+                    .into_owned();
             let result = if let Some(cursor) = &request.cursor {
                 crate::sync::lock_or_recover(&ctx.code_root_authority)
                     .continue_discovery(
@@ -5934,12 +5932,7 @@ async fn handle_serialized_request_impl(
                     });
                 }
                 crate::sync::lock_or_recover(&ctx.code_root_authority)
-                    .begin_discovery(
-                        canonical,
-                        request.logical_client_id,
-                        roots,
-                        request.limit,
-                    )
+                    .begin_discovery(canonical, request.logical_client_id, roots, request.limit)
                     .map_err(code_root_contract_error)?
             };
             Ok(Response::CodeRootsDiscovered(result))
@@ -5953,9 +5946,7 @@ async fn handle_serialized_request_impl(
             let attached = require_attached(state)?;
             ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
             let root = code_root_read_snapshot(ctx, attached, record.root_id).await?;
-            Ok(Response::CodeRootRead(proto::ReadCodeRootV1Result {
-                root,
-            }))
+            Ok(Response::CodeRootRead(proto::ReadCodeRootV1Result { root }))
         }
 
         Request::ReadCodeRootDeliveriesV1(request) => {
@@ -5967,9 +5958,8 @@ async fn handle_serialized_request_impl(
             ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
             let mut projection = code_root_read_snapshot(ctx, attached, record.root_id).await?;
             scrub_code_root_read(&mut projection, &attached.handle.redaction_table());
-            let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
-                ctx.db.clone(),
-            );
+            let writer =
+                crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
             for entry in projection.history {
                 writer
                     .write_history(record.root_id, entry)
@@ -6054,12 +6044,11 @@ async fn handle_serialized_request_impl(
                 .clone();
             let attached = require_attached(state)?;
             ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
-            let attention_id = Uuid::parse_str(request.attention_id.as_str()).map_err(|_| {
-                ErrorPayload {
+            let attention_id =
+                Uuid::parse_str(request.attention_id.as_str()).map_err(|_| ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "Code-root attention id is invalid".into(),
-                }
-            })?;
+                })?;
             let decision_request_id = ctx
                 .db
                 .decision_attention_page(record.root_id.0, None, 256)
@@ -26556,9 +26545,8 @@ async fn code_root_read_snapshot(
     let history = ctx
         .db
         .read(move |conn| {
-            let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
-                conn, root_id.0, &extended,
-            );
+            let root_agent =
+                crate::daemon::session_worker::resolve_root_agent_conn(conn, root_id.0, &extended);
             crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
                 conn,
                 root_id.0,

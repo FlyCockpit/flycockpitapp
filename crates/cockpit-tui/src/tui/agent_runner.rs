@@ -2080,8 +2080,8 @@ where
         Some(ctx.env_snapshot.clone()),
     );
     let response = send_request(request)
-    .await
-    .map_err(|e| format!("attach: {e}"))?;
+        .await
+        .map_err(|e| format!("attach: {e}"))?;
     let outcome = match response.map(Response::into_first_party_attached) {
         Ok(Response::Attached {
             session_id,

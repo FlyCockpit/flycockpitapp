@@ -154,8 +154,7 @@ impl App {
         let worker_cwd = cwd.clone();
         // Route selection is structural: Code uses the closed Code-root API,
         // while generic attach can represent only Assistant/Computer.
-        let requested_session_entry_mode =
-            Some(self.session_mode.unwrap_or(SessionMode::Code));
+        let requested_session_entry_mode = Some(self.session_mode.unwrap_or(SessionMode::Code));
         let action_id = self
             .async_actions
             .start(

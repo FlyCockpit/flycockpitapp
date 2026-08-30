@@ -155,7 +155,9 @@ impl Db {
         ensure!(
             !logical_client_id.is_empty()
                 && logical_client_id.len() <= 128
-                && logical_client_id.bytes().all(|byte| byte.is_ascii_graphic()),
+                && logical_client_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic()),
             "invalid Code-root logical client id"
         );
         let logical_client_id = logical_client_id.to_owned();
@@ -199,7 +201,9 @@ impl Db {
         ensure!(
             !logical_client_id.is_empty()
                 && logical_client_id.len() <= 128
-                && logical_client_id.bytes().all(|byte| byte.is_ascii_graphic()),
+                && logical_client_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic()),
             "invalid Code-root logical client id"
         );
         let logical_client_id = logical_client_id.to_owned();
@@ -235,7 +239,10 @@ fn validate_projection_input(kind: &str, payload_json: &str) -> Result<()> {
     );
     let payload: serde_json::Value =
         serde_json::from_str(payload_json).context("parsing Code-root projection payload")?;
-    ensure!(payload.is_object(), "Code-root projection payload must be an object");
+    ensure!(
+        payload.is_object(),
+        "Code-root projection payload must be an object"
+    );
     Ok(())
 }
 

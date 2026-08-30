@@ -250,7 +250,10 @@ impl CodeRootAuthorityV1 {
                 client_request_id.as_str().to_owned(),
                 route,
             ),
-            IdempotencyReceipt { fingerprint, result },
+            IdempotencyReceipt {
+                fingerprint,
+                result,
+            },
         );
         Ok(())
     }
@@ -484,11 +487,8 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         root_id: proto::CodeRootIdV1,
         entry: proto::HistoryEntry,
     ) -> Result<proto::CodeRootDeliveryV1> {
-        self.write(
-            root_id,
-            proto::CodeRootDeliveryPayloadV1::History { entry },
-        )
-        .await
+        self.write(root_id, proto::CodeRootDeliveryPayloadV1::History { entry })
+            .await
     }
 
     async fn write_attention(
@@ -507,10 +507,7 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         &self,
         root_id: proto::CodeRootIdV1,
     ) -> Result<proto::CodeRootDeliveryV1> {
-        self.write(
-            root_id,
-            proto::CodeRootDeliveryPayloadV1::RootStateChanged,
-        )
-        .await
+        self.write(root_id, proto::CodeRootDeliveryPayloadV1::RootStateChanged)
+            .await
     }
 }

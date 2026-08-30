@@ -424,8 +424,14 @@ export const codeRootAttachmentCapabilityV1Schema = z
   .min(1)
   .max(128)
   .regex(/^[\x21-\x7e]+$/);
-export const codeRootReplayCursorV1Schema = z.string().length(32).regex(/^[0-9a-f]+$/);
-export const codeRootDiscoveryCursorV1Schema = z.string().length(32).regex(/^[0-9a-f]+$/);
+export const codeRootReplayCursorV1Schema = z
+  .string()
+  .length(32)
+  .regex(/^[0-9a-f]+$/);
+export const codeRootDiscoveryCursorV1Schema = z
+  .string()
+  .length(32)
+  .regex(/^[0-9a-f]+$/);
 export const codeRootAttachOptionsV1Schema = z
   .object({
     initial_model: activeModelRefSchema.optional(),
@@ -501,9 +507,7 @@ export type CloseCodeRootAttachmentV1Request = z.infer<
 >;
 export type DiscoverCodeRootsV1Request = z.infer<typeof discoverCodeRootsV1RequestSchema>;
 export type ReadCodeRootV1Request = z.infer<typeof readCodeRootV1RequestSchema>;
-export type ReadCodeRootDeliveriesV1Request = z.infer<
-  typeof readCodeRootDeliveriesV1RequestSchema
->;
+export type ReadCodeRootDeliveriesV1Request = z.infer<typeof readCodeRootDeliveriesV1RequestSchema>;
 export type AckCodeRootDeliveriesV1Request = z.infer<typeof ackCodeRootDeliveriesV1RequestSchema>;
 export type ResolveCodeRootInterruptV1 = z.infer<typeof resolveCodeRootInterruptV1Schema>;
 const activeModelSwitchTriggerSchema = z.enum(["picker", "quick", "cycle", "daemon"]);
@@ -1174,12 +1178,18 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 const clientRequestVariants = [
   requestVariant("create_code_root_v1", requestParamSchemas.create_code_root_v1),
   requestVariant("attach_existing_code_root_v1", requestParamSchemas.attach_existing_code_root_v1),
-  requestVariant("close_code_root_attachment_v1", requestParamSchemas.close_code_root_attachment_v1),
+  requestVariant(
+    "close_code_root_attachment_v1",
+    requestParamSchemas.close_code_root_attachment_v1,
+  ),
   requestVariant("discover_code_roots_v1", requestParamSchemas.discover_code_roots_v1),
   requestVariant("read_code_root_v1", requestParamSchemas.read_code_root_v1),
   requestVariant("read_code_root_deliveries_v1", requestParamSchemas.read_code_root_deliveries_v1),
   requestVariant("ack_code_root_deliveries_v1", requestParamSchemas.ack_code_root_deliveries_v1),
-  requestVariant("resolve_code_root_interrupt_v1", requestParamSchemas.resolve_code_root_interrupt_v1),
+  requestVariant(
+    "resolve_code_root_interrupt_v1",
+    requestParamSchemas.resolve_code_root_interrupt_v1,
+  ),
   requestVariant("get_app_flag", requestParamSchemas.get_app_flag),
   requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
   requestVariant("mark_app_flag_seen", requestParamSchemas.mark_app_flag_seen),
@@ -1337,6 +1347,14 @@ export const responseNameSchema = z.enum([
   "assistant_session_resolved",
   "config_refreshed",
   "attached",
+  "code_root_created",
+  "code_root_attached",
+  "code_root_attachment_closed",
+  "code_roots_discovered",
+  "code_root_read",
+  "code_root_deliveries",
+  "code_root_deliveries_acked",
+  "code_root_interrupt_resolved",
   "forked",
   "fs_list",
   "fs_read",
@@ -2064,11 +2082,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                   .strict()
                   .optional(),
                 locked_reason: z
-                  .enum([
-                    "terminal",
-                    "inherited_from_profile",
-                    "host_policy",
-                  ])
+                  .enum(["terminal", "inherited_from_profile", "host_policy"])
                   .optional(),
               })
               .strict()
@@ -2080,7 +2094,9 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                     name: z.string().min(1),
                     tier: z.enum(["enabled", "discoverable", "disabled"]),
                     locked: z.boolean().optional(),
-                    legal_tiers: z.array(z.enum(["enabled", "discoverable", "disabled"])).optional(),
+                    legal_tiers: z
+                      .array(z.enum(["enabled", "discoverable", "disabled"]))
+                      .optional(),
                     family: z.string().optional(),
                   })
                   .strict(),

@@ -178,12 +178,8 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
-        proto::Response::CodeRootCreated(result) => {
-            scrub_code_root_read(&mut result.root, redact)
-        }
-        proto::Response::CodeRootAttached(result) => {
-            scrub_code_root_read(&mut result.root, redact)
-        }
+        proto::Response::CodeRootCreated(result) => scrub_code_root_read(&mut result.root, redact),
+        proto::Response::CodeRootAttached(result) => scrub_code_root_read(&mut result.root, redact),
         proto::Response::CodeRootRead(result) => scrub_code_root_read(&mut result.root, redact),
         proto::Response::CodeRootsDiscovered(result) => {
             for root in &mut result.roots {
@@ -2377,8 +2373,7 @@ pub struct DaemonContext {
     pub registry: SessionRegistry,
     /// Boot-local Code-root capabilities, frozen discovery snapshots, and
     /// bounded idempotency receipts. Durable replay/ACK state lives in Db.
-    pub(crate) code_root_authority:
-        Arc<StdMutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
+    pub(crate) code_root_authority: Arc<StdMutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
     pub paths: DaemonPaths,
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.

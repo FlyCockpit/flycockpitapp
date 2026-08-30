@@ -70,10 +70,7 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
     let connected = probe_or_spawn(mode).await?;
     #[cfg(unix)]
     {
-        if !matches!(
-            &connected.endpoint,
-            cockpit_client::ClientEndpoint::Wire(_)
-        ) {
+        if !matches!(&connected.endpoint, cockpit_client::ClientEndpoint::Wire(_)) {
             anyhow::bail!("ACP requires a discoverable socket ledger owner");
         }
         return Ok(connected.client);

@@ -83,7 +83,9 @@ impl CodeRootAttachmentCapabilityV1 {
 
     pub fn new_opaque(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err("attachment capability must be bounded printable ASCII".to_string());
         }
@@ -351,8 +353,12 @@ pub struct ReadCodeRootV1Result {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CodeRootDeliveryPayloadV1 {
-    History { entry: crate::HistoryEntry },
-    Attention { entry: crate::AgentDecisionAttention },
+    History {
+        entry: crate::HistoryEntry,
+    },
+    Attention {
+        entry: crate::AgentDecisionAttention,
+    },
     RootStateChanged,
     ClientIncompatible,
 }

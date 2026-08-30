@@ -171,10 +171,22 @@ impl App {
                             )
                             .await
                         }
-                        None => {
-                            agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                        None => match requested_session_id {
+                            Some(session_id) => {
+                                agent_runner::attach_to_session(
+                                    &worker_cwd,
+                                    session_id,
+                                    no_sandbox,
+                                    lifecycle,
+                                    intent,
+                                )
                                 .await
-                        }
+                            }
+                            None => {
+                                agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                                    .await
+                            }
+                        },
                     }?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },

@@ -339,6 +339,8 @@ pub enum AsyncActionPayload {
     AssistantSessionResolved {
         session_id: uuid::Uuid,
         source_session_id: Option<uuid::Uuid>,
+        startup_notice: Option<String>,
+        promoted_from_ephemeral: bool,
     },
     StatsRollup(crate::tui::stats_pane::StatsPaneFetchResult),
     GitDiff(crate::tui::diff_pane::DiffPaneFetchResult),

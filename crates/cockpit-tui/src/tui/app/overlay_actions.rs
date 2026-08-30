@@ -364,6 +364,7 @@ mod notes_lifecycle_tests {
                     owns_daemon: false,
                     socket: std::path::PathBuf::from("in-process"),
                     startup_notice: None,
+                    promoted_from_ephemeral: false,
                 }))
                 .is_ok()
         );

@@ -130,6 +130,30 @@ async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
         .unwrap();
 }
 
+async fn accept_restart_if_idle(daemon: &mut ProtoStream<UnixStream>) {
+    let id = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::RestartIfIdle,
+                ..
+            } => id,
+            other => panic!("expected RestartIfIdle, got {other:?}"),
+        },
+        other => panic!("expected RestartIfIdle envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            id,
+            Response::RestartDecision {
+                will_restart: true,
+                reason: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn negotiation_parses_daemon_hello_on_connect() {
     let (_dir, socket, listener) = bind_test_socket();
@@ -343,6 +367,165 @@ async fn in_process_auto_promote_hellos_without_os_socket() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn accepted_assistant_promotion_replaces_the_ephemeral_owner_with_persistent() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
+    let _promote = crate::daemon::enable_in_process_auto_promote();
+
+    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
+    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion");
+    let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
+    let socket = paths.socket.clone();
+    let predecessor = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept promotion client");
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
+        accept_restart_if_idle(&mut daemon).await;
+        drop(daemon);
+        drop(listener);
+        std::fs::remove_file(&socket).expect("release accepted predecessor socket");
+    });
+
+    let promoted = promote_ephemeral_owner(&paths, None)
+        .await
+        .expect("accepted promotion must acquire a persistent replacement");
+
+    assert!(promoted.promoted_from_ephemeral);
+    assert!(!promoted.owns_daemon);
+    promoted
+        .client
+        .request_ok(Request::DaemonStatus)
+        .await
+        .expect("persistent replacement answers DaemonStatus");
+    predecessor.await.expect("predecessor task");
+}
+
+#[test]
+fn promoted_lifecycle_resolution_preserves_an_independent_startup_notice() {
+    let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
+    let (_events_tx, events) = tokio::sync::mpsc::channel(1);
+    let resolution = lifecycle_resolution(ConnectedDaemon {
+        client: DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events,
+        }),
+        endpoint: cockpit_client::ClientEndpoint::Wire(PathBuf::from("persistent.sock")),
+        owns_daemon: false,
+        socket: PathBuf::from("persistent.sock"),
+        startup_notice: Some("daemon version skew resolved".to_string()),
+        promoted_from_ephemeral: true,
+    });
+
+    assert_eq!(
+        resolution.startup_notice.as_deref(),
+        Some("daemon version skew resolved")
+    );
+    assert!(
+        resolution.promoted_from_ephemeral,
+        "the TUI must receive the ownership transition even when startup text is present"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
+    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
+    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion-timeout");
+    let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
+    let socket = paths.socket.clone();
+    let predecessor = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept promotion client");
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
+        accept_restart_if_idle(&mut daemon).await;
+        drop(daemon);
+        drop(listener);
+        std::fs::remove_file(&socket).expect("release accepted predecessor socket");
+    });
+
+    let (lifecycle, requests) = cockpit_client::LifecycleClient::channel(2);
+    let resolution_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host = tokio::spawn({
+        let paths = paths.clone();
+        let resolution_count = std::sync::Arc::clone(&resolution_count);
+        async move {
+            serve_lifecycle_requests_with(
+                requests,
+                move |request| -> LifecycleResolutionFuture<'_> {
+                    let paths = paths.clone();
+                    let attempt =
+                        resolution_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async move {
+                        if attempt == 0 {
+                            assert_eq!(
+                                request.intent,
+                                cockpit_client::LifecycleIntent::PromoteToPersistent
+                            );
+                            let recovery = PromotionRecoveryPolicy {
+                                replacement_timeout: Duration::ZERO,
+                                predecessor_release_timeout: Duration::ZERO,
+                            };
+                            let connected = promote_ephemeral_owner_with_recovery_policy(
+                                &paths,
+                                Some(request),
+                                recovery,
+                            )
+                            .await?;
+                            Ok(lifecycle_resolution(connected))
+                        } else {
+                            Ok(cockpit_client::LifecycleResolution {
+                                endpoint: cockpit_client::ClientEndpoint::Wire(
+                                    paths.socket.clone(),
+                                ),
+                                owns_daemon: false,
+                                socket: paths.socket.clone(),
+                                startup_notice: Some("later lifecycle notice".to_string()),
+                                promoted_from_ephemeral: false,
+                            })
+                        }
+                    })
+                },
+            )
+            .await
+        }
+    });
+
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(1),
+        lifecycle.resolve(cockpit_client::LifecycleIntent::PromoteToPersistent),
+    )
+    .await
+    .expect("accepted promotion recovery must reach a terminal result")
+    .expect_err("expired accepted-handoff deadline must reject the promotion");
+    assert!(
+        terminal.contains("persistent Assistant daemon replacement"),
+        "terminal policy must remain observable through lifecycle resolution"
+    );
+
+    let later = lifecycle
+        .resolve(cockpit_client::LifecycleIntent::AttachOrPersistent)
+        .await
+        .expect("terminal promotion failure must not wedge the lifecycle host");
+    assert_eq!(
+        later.startup_notice.as_deref(),
+        Some("later lifecycle notice")
+    );
+    assert_eq!(
+        resolution_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the serialized host must accept a request after the terminal recovery failure"
+    );
+
+    drop(lifecycle);
+    host.await
+        .expect("lifecycle host task")
+        .expect("lifecycle host");
+    predecessor.await.expect("predecessor task");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn boot_test_persistent_daemon_hellos_without_os_socket() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let runtime = env.path().expect("isolated runtime root").join("runtime");
@@ -394,6 +577,10 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
     assert_eq!(
         mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
         LifecycleMode::AttachOrEphemeral
+    );
+    assert_eq!(
+        mode_for_intent(cockpit_client::LifecycleIntent::PromoteToPersistent),
+        LifecycleMode::PromoteToPersistent
     );
 }
 

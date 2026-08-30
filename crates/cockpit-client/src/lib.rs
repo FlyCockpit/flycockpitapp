@@ -173,6 +173,9 @@ pub enum LifecycleIntent {
     /// Attach to the current owner, or start a reference-counted ephemeral
     /// owner at the shared ledger socket.
     AttachOrEphemeral,
+    /// Require a persistent owner. If the shared ledger is currently owned by
+    /// an ephemeral daemon, the lifecycle host promotes it before returning.
+    PromoteToPersistent,
 }
 
 impl LifecycleIntent {
@@ -180,6 +183,7 @@ impl LifecycleIntent {
         match self {
             Self::AttachOrPersistent => 0,
             Self::AttachOrEphemeral => 1,
+            Self::PromoteToPersistent => 2,
         }
     }
 
@@ -187,16 +191,22 @@ impl LifecycleIntent {
         match value {
             0 => Self::AttachOrPersistent,
             1 => Self::AttachOrEphemeral,
+            2 => Self::PromoteToPersistent,
             _ => unreachable!("invalid lifecycle intent"),
         }
     }
 }
 
+#[derive(Debug)]
 pub struct LifecycleResolution {
     pub endpoint: ClientEndpoint,
     pub owns_daemon: bool,
     pub socket: PathBuf,
     pub startup_notice: Option<String>,
+    /// The lifecycle host replaced an ephemeral owner while resolving this
+    /// request. This is an ownership transition, not presentation text: a
+    /// caller holding a client for the predecessor must reconnect.
+    pub promoted_from_ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1935,6 +1945,7 @@ mod tests {
                     owns_daemon: true,
                     socket: PathBuf::from("in-process"),
                     startup_notice: None,
+                    promoted_from_ephemeral: false,
                 }))
                 .is_ok()
         );

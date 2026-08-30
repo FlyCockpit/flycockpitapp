@@ -7848,6 +7848,11 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept assistant sessions; assistant sessions require a persistent daemon owner",
+                ));
+            }
             let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
@@ -8752,6 +8757,11 @@ async fn handle_serialized_request_impl(
             no_sandbox,
             env_snapshot,
         } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept assistant sessions; assistant sessions require a persistent daemon owner",
+                ));
+            }
             let env_snapshot = env_snapshot.map(EnvSnapshot::from_wire).unwrap_or_else(|| {
                 ctx.env_baseline
                     .read()
@@ -26048,6 +26058,15 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
+    // A durable Assistant owns background work. Frontends resolve its owner
+    // through PromoteToPersistent before Attach; keep this server boundary as
+    // the final fail-closed fence for any future generic resume path.
+    if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.paths.ephemeral {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "Assistant sessions require a persistent daemon owner".into(),
+        });
+    }
     // Terminal results for transactions this attach converged. Delivered
     // through the worker below, once a handle exists to stamp the generation.
     let recovered_default_transactions;

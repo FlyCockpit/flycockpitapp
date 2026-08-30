@@ -232,6 +232,9 @@ pub(crate) struct RunPumpOptions<'a> {
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) approve: &'a [GrantKind],
     pub(crate) image_data: &'a [Vec<u8>],
+    /// A generic session resume promoted its daemon before Attach established
+    /// the durable mode. Presentation remains deferred until that response.
+    pub(crate) assistant_promotion_notice: bool,
     /// When set, `cockpit run` marks the submission as a durable run
     /// invocation. `init`/`learn` leave this `None` (unbounded, no state).
     pub(crate) run_invocation_options: Option<proto::RunInvocationOptions>,
@@ -254,35 +257,43 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
 
     let seed_unset_trust = args.cwd.is_none() && project_alias.is_none();
 
-    let result = crate::daemon::client::run_one_shot_daemon(|client| {
-        Box::pin(async move {
-            // Preflight via daemon RPCs — the CLI never opens SQLite.
-            emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd, seed_unset_trust)
+    // A session id is mode-blind until Attach reads its durable row. Acquire
+    // a persistent-capable owner first so an Assistant resume cannot enter a
+    // private one-shot daemon; Code and Computer remain valid persistent
+    // sessions as well.
+    let result = if args.session.is_some() {
+        crate::daemon::client::run_assistant_daemon(move |client, promoted_from_ephemeral| {
+            Box::pin(async move {
+                run_with_daemon(
+                    client,
+                    &args,
+                    prompt,
+                    no_sandbox,
+                    &cwd,
+                    seed_unset_trust,
+                    promoted_from_ephemeral,
+                )
                 .await
-                .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
-            let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
-                .await
-                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-            let image_files = resolve_attachment_paths(&cwd, &args.file)
-                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-            let image_data = load_and_validate_images(&image_files).map_err(|error| {
-                RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
-            })?;
-
-            run_turn(
-                &client,
-                &args,
-                prompt,
-                no_sandbox,
-                &cwd,
-                requested_session,
-                &image_data,
-            )
-            .await
+            })
         })
-    })
-    .await;
+        .await
+    } else {
+        crate::daemon::client::run_one_shot_daemon(move |client| {
+            Box::pin(async move {
+                run_with_daemon(
+                    client,
+                    &args,
+                    prompt,
+                    no_sandbox,
+                    &cwd,
+                    seed_unset_trust,
+                    false,
+                )
+                .await
+            })
+        })
+        .await
+    };
 
     let result = match result {
         Err(OwnedDaemonRunError::Connect(error)) => {
@@ -372,6 +383,41 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     Ok(())
 }
 
+async fn run_with_daemon(
+    client: ScopedDaemonClient<'_>,
+    args: &RunArgs,
+    prompt: String,
+    no_sandbox: bool,
+    cwd: &Path,
+    seed_unset_trust: bool,
+    promoted_from_ephemeral: bool,
+) -> Result<i32> {
+    // Preflight via daemon RPCs — the CLI never opens SQLite.
+    emit_org_logging_indicator_via_daemon(&client, cwd).await;
+    enforce_noninteractive_workspace_trust_via_daemon(&client, cwd, seed_unset_trust)
+        .await
+        .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+    let requested_session = resolve_requested_session_via_daemon(args, &client, cwd)
+        .await
+        .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+    let image_files = resolve_attachment_paths(cwd, &args.file)
+        .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+    let image_data = load_and_validate_images(&image_files)
+        .map_err(|error| RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}")))?;
+
+    run_turn(
+        &client,
+        args,
+        prompt,
+        no_sandbox,
+        cwd,
+        requested_session,
+        &image_data,
+        promoted_from_ephemeral,
+    )
+    .await
+}
+
 #[cfg(test)]
 fn finish_owned_run<T>(
     command: anyhow::Result<T>,
@@ -397,6 +443,7 @@ async fn run_turn(
     project_root: &Path,
     requested_session: Option<Uuid>,
     image_data: &[Vec<u8>],
+    promoted_from_ephemeral: bool,
 ) -> Result<i32> {
     attach_send_pump(
         client,
@@ -412,6 +459,7 @@ async fn run_turn(
             project_root: Some(project_root),
             approve: &args.approve,
             image_data,
+            assistant_promotion_notice: promoted_from_ephemeral,
             run_invocation_options: Some(args.run_invocation_options()),
         },
     )
@@ -498,12 +546,17 @@ pub(crate) async fn attach_send_pump(
         }
         Err(error) => anyhow::bail!("daemon error: {error}"),
     };
-    let (session_id, repair_required) = match attached {
+    let (session_id, session_entry_mode, repair_required) = match attached {
         Response::Attached {
             session_id,
+            session_entry_mode,
             repair_required,
             ..
-        } => (session_id, repair_required.map(|repair| *repair)),
+        } => (
+            session_id,
+            session_entry_mode,
+            repair_required.map(|repair| *repair),
+        ),
         other => anyhow::bail!("unexpected attach response: {other:?}"),
     };
     let mut stdout = std::io::stdout().lock();
@@ -517,6 +570,14 @@ pub(crate) async fn attach_send_pump(
     )?;
     drop(stdout);
     drop(stderr);
+    if options.assistant_promotion_notice
+        && session_entry_mode == proto::SessionEntryMode::Assistant
+    {
+        eprintln!(
+            "{}",
+            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
+        );
+    }
     if requested_session.is_some()
         && let Some(repair) = repair_required
     {

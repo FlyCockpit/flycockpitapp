@@ -329,6 +329,17 @@ pub fn open_config_directory_nofollow(path: &std::path::Path) -> anyhow::Result<
     files::open_directory_handle_nofollow(path)
 }
 
+/// Check whether a retained directory handle still denotes the directory at
+/// `path`. This is intended for the narrow window while constructing a
+/// descriptor from a pathname; callers must continue using the retained
+/// handle after the check rather than reopening the path.
+pub fn directory_handle_matches_path(
+    directory: &std::fs::File,
+    path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    files::directory_handle_matches_path(directory, path)
+}
+
 /// Read one bounded regular-file leaf relative to a retained directory.
 /// Path replacement after the directory was opened cannot redirect this read.
 pub fn read_config_leaf_from_retained_directory(
@@ -337,6 +348,18 @@ pub fn read_config_leaf_from_retained_directory(
     max_bytes: usize,
 ) -> anyhow::Result<Vec<u8>> {
     files::read_leaf_from_directory_handle(directory, leaf, max_bytes)
+}
+
+/// Read one bounded regular-file leaf relative to a retained directory and
+/// return the stable identity of the exact object whose bytes were captured.
+/// This prevents callers from authenticating a path lookup and then consuming
+/// a replacement leaf.
+pub fn read_config_leaf_from_retained_directory_with_identity(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> anyhow::Result<(Vec<u8>, TerminalIngressFileIdentity)> {
+    files::read_leaf_from_directory_handle_with_identity(directory, leaf, max_bytes)
 }
 
 /// Read one bounded regular file below an already-retained directory without
@@ -372,11 +395,11 @@ pub fn snapshot_markdown_tree_nofollow(
     )
 }
 
-/// Snapshot Markdown descendants through an already-retained root directory.
-/// This lets callers read related source files from the exact same filesystem
-/// generation instead of reopening a mutable absolute path after the snapshot.
+/// Snapshot Markdown below an already-retained directory. Descendants are
+/// opened component-relative without following links, so a later replacement
+/// of the directory's path cannot redirect the captured source.
 pub fn snapshot_markdown_tree_from_retained_directory_nofollow(
-    root: &std::fs::File,
+    directory: &std::fs::File,
     max_files: usize,
     max_entries: usize,
     max_depth: usize,
@@ -384,7 +407,7 @@ pub fn snapshot_markdown_tree_from_retained_directory_nofollow(
     max_total_bytes: usize,
 ) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
     files::snapshot_markdown_tree_from_retained_directory_nofollow(
-        root,
+        directory,
         max_files,
         max_entries,
         max_depth,

@@ -247,10 +247,11 @@ fn ordinary_vnext_child_rebuild_pins_its_parent_named_running_model() {
 fn ordinary_vnext_child_rebuild_keeps_parent_mcp_intersection() {
     let (mut driver, _tmp) = model_switch_driver();
     push_test_child(&mut driver, Vec::new());
-    let parent_reachable = std::collections::BTreeSet::from([(
-        "reachable".to_string(),
-        crate::mcp::config::DEFAULT_PROFILE.to_string(),
-    )]);
+    let parent_reachable = driver.stack[0]
+        .agent
+        .mcp_resolver
+        .catalog()
+        .admitted_entries();
     {
         let child = Arc::make_mut(&mut driver.stack[1].agent);
         child.mcp_resolver = child
@@ -918,7 +919,7 @@ async fn live_model_switch_routes_next_request_to_new_model() {
         "rebuilt foreground Build must preserve interactive direct `todo` tool: {names:?}"
     );
     let discoverable = driver.stack[0].agent.tools.discoverable_mcp_tool_names();
-    for tool in ["session_read", "session_search"] {
+    for tool in ["history_search"] {
         assert!(
             discoverable.iter().any(|name| name == tool),
             "rebuilt foreground Build must preserve interactive discoverable `{tool}` tool: {discoverable:?}"

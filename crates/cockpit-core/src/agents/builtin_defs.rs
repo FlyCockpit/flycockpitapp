@@ -32,6 +32,7 @@ pub const BUILTIN_AGENT_NAMES: &[&str] = &[
     "builder",
     "explore",
     "history",
+    "knowledge",
     "deepthink",
     "scout",
     "Plan",
@@ -107,6 +108,7 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
         "builder" => Some(builder_def()),
         "explore" => Some(explore_def()),
         "history" => Some(history_def()),
+        "knowledge" => Some(knowledge_def()),
         "deepthink" => Some(deepthink_def()),
         "scout" => Some(scout_def()),
         "Plan" => Some(plan_def()),
@@ -224,6 +226,8 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
             def.context_policy = Some(ContextPolicy {
                 auto_compact_pct: Some(60),
                 inline_caps: Some(InlineCapsProfile::Conservative),
+                artifact_spill_bytes: None,
+                artifact_preview_lines: None,
             });
             // No extra capabilities — the conservative preset.
         }
@@ -263,9 +267,16 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     // tool grant: the daemon still intersects them with its host policy and
     // resolves the portable ids uniquely before launch.
     let children: &[&str] = match name {
-        "Build" | "Careful" => &["builder", "explore", "history", "deepthink", "scout"],
+        "Build" | "Careful" => &[
+            "builder",
+            "explore",
+            "history",
+            "knowledge",
+            "deepthink",
+            "scout",
+        ],
         "Dream" => &["dream-worker"],
-        "Plan" => &["explore", "history"],
+        "Plan" => &["explore", "history", "knowledge"],
         "Multireview" => &["scout"],
         "builder" | "bee" => &["explore"],
         _ => &[],
@@ -336,9 +347,7 @@ fn careful_def() -> AgentDef {
             "skill",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
+            "history_search",
             "todo",
             "webfetch",
             "websearch",
@@ -415,12 +424,12 @@ fn build_def() -> AgentDef {
         "task".to_string(),
         ToolDescriptionSpec::WithVerbose {
             text:
-                "Delegate substantive feature work to a subagent (builder writes, explore investigates); handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates, knowledge retrieves cited KB context); handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
-                 well-scoped piece to `builder` to write/edit files, or to `explore` for \
-                 read-only investigation, with a complete standalone brief (goal, constraints, \
+                 well-scoped piece to `builder` to write/edit files, `explore` for \
+                 read-only investigation, or `knowledge` for cited KB retrieval, with a complete standalone brief (goal, constraints, \
                  exact files, what \"done\" looks like). Use @file, @file:XX-YY, @dir/, and \
                  /skill tags in handoff prompts when the child needs source or skill context. \
                  Each `builder` task is one \
@@ -531,19 +540,28 @@ fn history_def() -> AgentDef {
         "history",
         "Read-only recall worker; searches prior sessions and compaction lineage, then reports relevant excerpts.",
         AgentMode::Subagent,
-        &[
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ],
+        &["read", "history_search"],
         crate::engine::builtin::HISTORY_PROMPT,
         None,
     );
-    for tool in ["session_search", "session_read", "session_lineage_search"] {
+    for tool in ["history_search"] {
         def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
     }
     def
+}
+
+/// `knowledge` — a read-only retrieval specialist. It has no direct KB write
+/// surface: `knowledge_retrieve` reads attached KBs through `KbProvider` and
+/// consults only the dream-bounded fresh-session subset.
+fn knowledge_def() -> AgentDef {
+    def_with_normal(
+        "knowledge",
+        "Read-only knowledge retrieval specialist; returns a cited synthesis from attached KBs and bounded fresh sessions.",
+        AgentMode::Subagent,
+        &["knowledge_retrieve"],
+        crate::engine::builtin::KNOWLEDGE_PROMPT,
+        None,
+    )
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It receives only its
@@ -582,13 +600,13 @@ fn scout_def() -> AgentDef {
     )
 }
 
-/// `Plan` — the user-facing read-only planning agent. It investigates,
+/// `Plan` — the user-facing planning agent. It investigates,
 /// maintains a virtual session plan document, and hands it to `Build`.
 /// Tool surface mirrors [`crate::engine::builtin::plan`].
 fn plan_def() -> AgentDef {
     def_with_normal(
         "Plan",
-        "Read-only planning agent; maintains a virtual plan document and hands it to Build.",
+        "Planning agent; maintains a virtual plan document and hands it to Build.",
         AgentMode::Primary,
         &[
             "read",
@@ -600,9 +618,7 @@ fn plan_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
-            "plan_read",
-            "plan_write",
-            "plan_edit",
+            "write",
             "start_build",
             "question",
             "skill",
@@ -684,12 +700,7 @@ fn dream_def() -> AgentDef {
         "Dream",
         "Governed knowledge-dream orchestrator; it may delegate only to the read-only dream worker.",
         AgentMode::Primary,
-        &[
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ],
+        &["read", "history_search"],
         crate::engine::builtin::DREAM_PROMPT,
     )
 }
@@ -702,13 +713,7 @@ fn dream_worker_def() -> AgentDef {
         "dream-worker",
         "Read-only knowledge-dream evidence worker; returns proposed concept upserts to Dream.",
         AgentMode::Subagent,
-        &[
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-            "return",
-        ],
+        &["read", "history_search", "return"],
         crate::engine::builtin::DREAM_WORKER_PROMPT,
     )
 }
@@ -1035,12 +1040,7 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"history"));
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in [
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ] {
+        for tool in ["read", "history_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in ["task", "spawn", "handoff", "write", "edit", "unlock"] {
@@ -1049,8 +1049,35 @@ mod tests {
                 "{forbidden} must not be granted"
             );
         }
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
+    }
+
+    #[test]
+    fn knowledge_agent_def_is_read_only_retrieval_leaf() {
+        let def = embedded_default("knowledge").expect("knowledge embedded default");
+        assert_eq!(def.name, "knowledge");
+        assert_eq!(def.mode, AgentMode::Subagent);
+        assert!(BUILTIN_AGENT_NAMES.contains(&"knowledge"));
+        assert_eq!(
+            def.tools,
+            Some(vec!["knowledge_retrieve".to_string()]),
+            "the KB specialist receives only its read-only composite retrieval tool"
+        );
+        for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
+            assert!(
+                !def.tools
+                    .as_ref()
+                    .expect("knowledge tools")
+                    .iter()
+                    .any(|tool| tool == forbidden),
+                "knowledge must not receive `{forbidden}`"
+            );
+        }
+        assert!(
+            def.prompt.contains("knowledge_retrieve"),
+            "the specialist prompt must direct every request through provider-backed retrieval"
+        );
     }
 }

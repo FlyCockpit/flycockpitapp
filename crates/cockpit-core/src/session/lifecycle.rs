@@ -148,6 +148,221 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
 }
 
 impl Session {
+    /// Derive a session project id. Production sessions always prove the
+    /// workspace directory identity; synthetic test roots retain a separate,
+    /// deterministic test-only namespace and never publish workspace state.
+    fn project_id_for_session_root(
+        project_root: &Path,
+        initialize_workspace_scratch: bool,
+    ) -> Result<String> {
+        if initialize_workspace_scratch {
+            return project_id_for(project_root);
+        }
+        Ok(super::project_id_from_workspace_object(&format!(
+            "cockpit-synthetic-test-workspace-root-v1\\0{}",
+            project_root.display()
+        )))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_workspace_root(project_root: PathBuf) -> (PathBuf, bool) {
+        // Test fixtures commonly use stable synthetic paths (for example
+        // `/proj`) to exercise path policy without creating host files.
+        // Prefer production identity when the fixture root exists.
+        match std::fs::canonicalize(&project_root) {
+            Ok(canonical_root) => (canonical_root, true),
+            Err(_) => (project_root, false),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_with_test_workspace_root(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
+        let project_id =
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?;
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let mut row = db.blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::build_new_session_row_conn(
+                conn,
+                &project_id_for_db,
+                &project_root_for_db,
+                &active_agent_for_db,
+            )
+        })?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let row_for_db = row.clone();
+        let row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::insert_session_row_conn(conn, &row_for_db)
+            })
+            .context("creating test session row")?;
+        Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+            true,
+            initialize_workspace_scratch,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_deferred_with_test_workspace_root(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
+        let project_id =
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?;
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let mut row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::build_new_session_row_conn(
+                    conn,
+                    &project_id_for_db,
+                    &project_root_for_db,
+                    &active_agent_for_db,
+                )
+            })
+            .context("building deferred test session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            initialize_workspace_scratch,
+        )?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_assistant_deferred_with_test_workspace_root(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        assistant_name: &str,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
+        let project_id =
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?;
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let assistant_name_for_db = assistant_name.to_string();
+        let mut row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::build_new_assistant_session_row_conn(
+                    conn,
+                    &project_id_for_db,
+                    &project_root_for_db,
+                    &active_agent_for_db,
+                    &assistant_name_for_db,
+                )
+            })
+            .context("building deferred assistant test session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            initialize_workspace_scratch,
+        )?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_fork_with_test_workspace_root(
+        db: Db,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::create_fork_conn(
+                    conn,
+                    parent_session_id,
+                    fork_point_turn_id,
+                    false,
+                    Uuid::new_v4(),
+                    Utc::now().timestamp_millis(),
+                )
+            })
+            .context("creating test fork session row")?;
+        copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
+            .context("copying vault sealed values and redaction table into test fork")?;
+        let (project_root, initialize_workspace_scratch) =
+            Self::test_workspace_root(PathBuf::from(&row.project_root));
+        Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+            false,
+            initialize_workspace_scratch,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resume_with_test_workspace_root(
+        db: Db,
+        session_id: Uuid,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Option<Self>> {
+        let Some(row) = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::get_session_conn(conn, session_id)
+            })
+            .context("fetching test session")?
+        else {
+            return Ok(None);
+        };
+        let (project_root, initialize_workspace_scratch) =
+            Self::test_workspace_root(PathBuf::from(&row.project_root));
+        Ok(Some(Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+            false,
+            initialize_workspace_scratch,
+        )?))
+    }
+
     /// Create a brand-new session, inserting its row in the DB.
     #[allow(dead_code)]
     pub fn create(
@@ -157,7 +372,8 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let project_id = project_id_for(&project_root);
+        let project_root = canonical_workspace_root(&project_root)?;
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -178,7 +394,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault, true)
+        Self::from_row(db, project_root, row, resolver, vault, true, true)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -194,7 +410,8 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let project_id = project_id_for(&project_root);
+        let project_root = canonical_workspace_root(&project_root)?;
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -211,7 +428,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -269,7 +486,8 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let project_id = project_id_for(&project_root);
+        let project_root = canonical_workspace_root(&project_root)?;
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -288,7 +506,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -410,7 +628,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault, false)
+        Self::from_row(db, project_root, row, resolver, vault, false, true)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -437,6 +655,7 @@ impl Session {
             resolver,
             vault,
             false,
+            true,
         )?))
     }
 
@@ -447,7 +666,22 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
         freshly_created: bool,
+        initialize_workspace_scratch: bool,
     ) -> Result<Self> {
+        let project_root = if initialize_workspace_scratch {
+            canonical_workspace_root(&project_root)
+                .context("canonicalizing persisted session workspace root")?
+        } else {
+            // Test-support constructors deliberately permit synthetic roots
+            // such as `/proj`. Preserve canonicalization when possible so
+            // fixtures using real roots keep production-equivalent identity.
+            std::fs::canonicalize(&project_root).unwrap_or(project_root)
+        };
+        anyhow::ensure!(
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
+                == row.project_id,
+            "persisted session project id does not match canonical workspace root"
+        );
         let session_entry_mode = match row.session_entry_mode.as_str() {
             "code" => crate::daemon::proto::SessionEntryMode::Code,
             "assistant" => crate::daemon::proto::SessionEntryMode::Assistant,
@@ -497,6 +731,19 @@ impl Session {
             None => load_redaction_table_from_vault(&vault, row.session_id)
                 .context("loading vault redaction table while resuming session")?,
         };
+        // Durable workspace scratch is a required production session
+        // capability. Test-support sessions with synthetic roots receive the
+        // same per-session path but must not publish a reverse-map marker for
+        // a root that cannot be canonicalized.
+        let workspace_scratch_dir = if initialize_workspace_scratch {
+            workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
+                .context("initializing required durable workspace scratch")?
+        } else {
+            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)?;
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
+            path
+        };
         Ok(Self {
             id: row.session_id,
             project_id: row.project_id,
@@ -527,6 +774,7 @@ impl Session {
             btw_parent_session_id: row.btw_parent_session_id,
             btw_tangent: row.btw_tangent,
             title: Mutex::new(row.title),
+            description: Mutex::new(row.description),
             user_renamed: Mutex::new(row.user_renamed),
             active_agent: Mutex::new(row.active_agent),
             model_selection: Mutex::new(model_selection),
@@ -541,14 +789,17 @@ impl Session {
             user_content_turns: AtomicUsize::new(user_content_turns),
             title_stage: AtomicU8::new(normalize_title_slot(row.title_stage)),
             title_nudge_slot_pending: AtomicU8::new(0),
+            pending_metadata_fork: Mutex::new(None),
             compact_self_nudge_stage: AtomicU8::new(0),
             title_failure_noticed: std::sync::atomic::AtomicBool::new(false),
             redaction_placeholder_noticed: std::sync::atomic::AtomicBool::new(false),
             last_usage: Mutex::new(None),
+            last_cache_hit_endpoint: Mutex::new(None),
             last_send_at: Mutex::new(None),
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
+            workspace_scratch_dir,
             host_shim_dir: Mutex::new(None),
             sandbox_mode: AtomicU8::new(sandbox_mode_to_u8(
                 crate::tools::sandbox_mode::SandboxMode::Sandbox,
@@ -605,6 +856,17 @@ impl Session {
                 None
             }
         }
+    }
+
+    /// Durable, private-to-this-session scratch below the workspace's Cockpit
+    /// state directory. The containing workspace directory is keyed by the
+    /// existing `project_id` and carries a marker that lets maintenance code
+    /// recover the canonical project root without enumerating the filesystem.
+    ///
+    /// This is intentionally separate from [`Self::tmp_dir`]: ending or
+    /// dropping a session removes only the ephemeral system-temp directory.
+    pub fn workspace_scratch_dir(&self) -> PathBuf {
+        self.workspace_scratch_dir.clone()
     }
 
     /// Per-session host shim directory under the Cockpit data dir. Used for
@@ -687,77 +949,37 @@ impl Session {
         }
     }
 
-    /// Build the mandatory redaction base for a cross-session reader. The live
-    /// reader table alone is insufficient after environment values rotate: its
-    /// persisted entries and protected-history literals must remain covered.
-    pub(crate) async fn with_machine_scoped_sealed_redactions(
+    /// Load a session's durable redaction table through this daemon-owned
+    /// session's vault handle. Cross-session readers must fold this table into
+    /// their own redactor before returning any target-owned history.
+    ///
+    /// The database column remains a legacy import projection; production
+    /// persistence keeps the table in the vault. A malformed persisted table
+    /// is an error rather than a reason to return target content unredacted.
+    pub(crate) async fn persisted_redaction_table_for_session(
         &self,
-        reader_redaction: &crate::redact::RedactionTable,
-    ) -> Result<crate::redact::RedactionTable> {
-        self.recall_redaction_table_from_base(reader_redaction, self.id)
-            .await
-    }
-
-    /// Extend a cross-session redaction base with a source session's durable
-    /// material. This uses the session's injected vault and key resolver, so a
-    /// missing or unreadable protected history fails closed rather than
-    /// silently weakening durable dream output redaction.
-    pub(crate) async fn recall_redaction_table_from_base(
-        &self,
-        base: &crate::redact::RedactionTable,
-        source_session_id: uuid::Uuid,
-    ) -> Result<crate::redact::RedactionTable> {
-        let persisted =
-            if source_session_id == self.id {
-                self.persisted_redaction_table()?
-            } else {
-                match load_redaction_table_from_vault(&self.secret_vault, source_session_id)? {
-                Some(json) => Some(
-                    crate::redact::RedactionTable::from_persisted_json(&json).with_context(|| {
-                        format!(
-                            "loading persisted redaction table for session {source_session_id}"
-                        )
-                    })?,
-                ),
-                None => None,
-            }
-            };
-        let mut redaction = match persisted {
-            Some(persisted) => base
-                .union(&persisted)
-                .context("unioning persisted session redaction table")?,
-            None => base.clone(),
-        };
-
-        crate::redact::protected_redaction_history::warm_all_redaction_key_versions(
-            self.redaction_key_resolver.as_ref(),
-        )
-        .await
-        .context("warming protected redaction-history keys for dream recall")?;
-        let resolver = self.redaction_key_resolver.clone();
-        let source_key = source_session_id.to_string();
-        let literals = self
-            .db
-            .read(move |conn| {
-                crate::redact::protected_redaction_history::rehydrate_session_literals_conn(
-                    resolver.as_ref(),
-                    conn,
-                    &source_key,
-                )
-            })
-            .await
-            .with_context(|| {
-                format!("rehydrating protected redaction history for session {source_session_id}")
-            })?;
-        for literal in literals {
-            redaction = redaction
-                .with_forced_literal(
-                    literal.to_string(),
-                    "protected_redaction_history".to_string(),
-                )
-                .context("folding protected redaction-history literal")?;
+        reader_project: &str,
+        session_id: uuid::Uuid,
+    ) -> Result<Option<crate::redact::RedactionTable>> {
+        if session_id == self.id {
+            return self.persisted_redaction_table();
         }
-        Ok(redaction.enforced())
+        let Some(redaction_table_json) = self
+            .db
+            .session_redaction_table_json_for_reader_project(reader_project, session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let json = match redaction_table_json.filter(|json| !json.is_empty()) {
+            Some(json) => Some(json),
+            None => load_redaction_table_from_vault(&self.secret_vault, session_id)?,
+        };
+        json.map(|json| {
+            crate::redact::RedactionTable::from_persisted_json(&json)
+                .context("loading persisted target-session redaction table")
+        })
+        .transpose()
     }
 
     /// Legacy file-origin markers are used only to warn when a resumed

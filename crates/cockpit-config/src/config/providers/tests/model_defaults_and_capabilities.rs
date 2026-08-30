@@ -1431,6 +1431,7 @@ fn merge_preserves_model_override_fields_on_matching_fetched_id() {
         compact_shadow_margin_pct: 10,
         auto_prune_pct: 45,
         auto_prune_prunable_pct: 20,
+        ..ContextConfig::default()
     });
     existing.timeout = Some(TimeoutConfig {
         ttft_secs: 77,

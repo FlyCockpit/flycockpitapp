@@ -54,6 +54,9 @@ pub enum SecretVaultKind {
     SubscriptionAck,
     SealedCompartment,
     SessionSealedValue,
+    /// KB-scoped sealed material. The item id is an opaque reference id
+    /// namespaced by a validated KB id; neither is derived from the literal.
+    KnowledgeBaseSealedValue,
     RedactionTable,
 }
 
@@ -83,6 +86,7 @@ impl SecretVaultKind {
             Self::SubscriptionAck => "subscription_ack",
             Self::SealedCompartment => "sealed_compartment",
             Self::SessionSealedValue => "session_sealed_value",
+            Self::KnowledgeBaseSealedValue => "knowledge_base_sealed_value",
             Self::RedactionTable => "redaction_table",
         }
     }
@@ -98,6 +102,7 @@ impl SecretVaultKind {
             "subscription_ack" => Ok(Self::SubscriptionAck),
             "sealed_compartment" => Ok(Self::SealedCompartment),
             "session_sealed_value" => Ok(Self::SessionSealedValue),
+            "knowledge_base_sealed_value" => Ok(Self::KnowledgeBaseSealedValue),
             "redaction_table" => Ok(Self::RedactionTable),
             other => bail!("unknown secret vault kind: {other}"),
         }
@@ -553,8 +558,11 @@ pub fn list_item_ids_conn(
     conn: &rusqlite::Connection,
     kind: SecretVaultKind,
 ) -> Result<Vec<String>> {
-    if kind == SecretVaultKind::SealedCompartment {
-        bail!("sealed compartment listing is not exposed");
+    if matches!(
+        kind,
+        SecretVaultKind::SealedCompartment | SecretVaultKind::KnowledgeBaseSealedValue
+    ) {
+        bail!("sealed literal listing is not exposed");
     }
     let mut stmt = conn
         .prepare("SELECT item_id FROM secret_vault_items WHERE kind = ?1 ORDER BY item_id ASC")?;
@@ -667,7 +675,7 @@ pub fn list_items_conn(conn: &rusqlite::Connection) -> Result<Vec<SecretVaultIte
     let mut stmt = conn.prepare(
         "SELECT kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision
          FROM secret_vault_items
-         WHERE kind != 'sealed_compartment'
+         WHERE kind NOT IN ('sealed_compartment', 'knowledge_base_sealed_value')
          ORDER BY kind ASC, item_id ASC",
     )?;
     let rows = stmt.query_map([], map_item_row)?;

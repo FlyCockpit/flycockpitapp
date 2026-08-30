@@ -230,17 +230,16 @@ const originCode = (origin: UserMessageOrigin): number => {
   return code;
 };
 const originFromCode = (code: number): UserMessageOrigin => {
-  const origin =
-    ({
-      1: "external_root",
-      2: "goal_continuation",
-      3: "scheduled_job",
-      4: "auto_continue",
-      5: "retry_recovery",
-      6: "tool_result",
-      7: "compact_notice",
-      8: "internal",
-    })[code as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8] as UserMessageOrigin | undefined;
+  const origin = {
+    1: "external_root",
+    2: "goal_continuation",
+    3: "scheduled_job",
+    4: "auto_continue",
+    5: "retry_recovery",
+    6: "tool_result",
+    7: "compact_notice",
+    8: "internal",
+  }[code as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8] as UserMessageOrigin | undefined;
   if (!origin) throw new Error("invalid user message origin");
   return origin;
 };
@@ -288,10 +287,7 @@ function validate(v: CanonicalSendUserMessageV2) {
     v.request.delivery_class_override !== "held"
   )
     throw new Error("invalid delivery class override");
-  if (
-    (v.request.resolved_delivery_class === null) !==
-    (v.request.resolved_queue_target === null)
-  )
+  if ((v.request.resolved_delivery_class === null) !== (v.request.resolved_queue_target === null))
     throw new Error("resolved queue admission is incomplete");
   if (v.request.resolved_queue_target !== null) {
     const target = v.request.resolved_queue_target;
@@ -301,21 +297,11 @@ function validate(v: CanonicalSendUserMessageV2) {
       "fcm2_empty_queue_target_id",
       "fcm2_queue_target_id_too_long",
     );
-    boundedFieldBytes(
-      target.agent,
-      1024,
-      null,
-      "fcm2_queue_target_agent_too_long",
-    );
+    boundedFieldBytes(target.agent, 1024, null, "fcm2_queue_target_agent_too_long");
     if (target.depth < 0n || target.depth > 0xffffffffffffffffn)
       throw new Error("queue target depth exceeds u64");
     if (target.task_call_id !== null)
-      boundedFieldBytes(
-        target.task_call_id,
-        4096,
-        null,
-        "fcm2_queue_target_task_call_id_too_long",
-      );
+      boundedFieldBytes(target.task_call_id, 4096, null, "fcm2_queue_target_task_call_id_too_long");
   }
   if (v.request.attachments.length > 16) throw new Error("too many attachments");
   const ids = new Set<string>();
@@ -506,7 +492,8 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
   const forced_skill = fp ? r.text16() : null;
   const cp = r.u8();
   if (cp > 2) throw new Error("invalid delivery class override");
-  const delivery_class_override = cp === 0 ? null : cp === 1 ? "steering" : "held";
+  const delivery_class_override: "steering" | "held" | null =
+    cp === 0 ? null : cp === 1 ? "steering" : "held";
   const rp = r.u8();
   if (rp > 1) throw new Error("invalid resolved queue admission presence");
   let resolved_delivery_class: "steering" | "held" | null = null;

@@ -182,6 +182,12 @@ pub fn authorize_sealed_use(
     if record.record_id != request.sealed_value_id.to_string() {
         return Err(SealedUseDenied);
     }
+    // KB-scoped values are reference-resolved at KB read time. They never
+    // enter the action-grant runtime, whose endpoint scopes are sessions and
+    // projects; accepting one here would create an unintended second resolver.
+    if record.scope == SealedScopeKind::KnowledgeBase {
+        return Err(SealedUseDenied);
+    }
 
     // Global reach is an explicit Owner grant to this canonical project.
     if record.scope == SealedScopeKind::Global && !inputs.global_reaches_project {

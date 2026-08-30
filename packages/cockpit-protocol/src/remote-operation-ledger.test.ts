@@ -39,16 +39,13 @@ describe("remote operation classification fixture", () => {
         evidence: null,
       });
     }
-    for (const tag of ["mark_app_flag_seen"]) {
-      expect(byTag.get(tag)).toMatchObject({
-        class: "local_only",
-        strategy: "none",
-        evidence: null,
-      });
-    }
     // Reclassified from local_only to owner-remoted by cli-existing-rpc-commands-via-daemon:
     // these consumed product RPCs now reserve a remote operation.
-    for (const tag of ["resolve_assistant_session", "set_workspace_trust"]) {
+    for (const tag of [
+      "resolve_assistant_session",
+      "set_workspace_trust",
+      "set_workspace_history_scope",
+    ]) {
       expect(byTag.get(tag)).toMatchObject({
         class: "transactional_mutation",
         strategy: "sql_transaction",
@@ -84,7 +81,6 @@ describe("remote operation classification fixture", () => {
       strategy: "durable_desired_state",
       evidence: "desired_state_generation_and_observed_digest",
     });
-    expect(byTag.get("mark_app_flag_seen")?.fcorSchema).toBe("key:AppFlagKey|expected_version:u64");
     expect(byTag.get("fs_rename")?.fcorSchema).toBe(
       "project_root:String|from_path:String|to_path:String",
     );

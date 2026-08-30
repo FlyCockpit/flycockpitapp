@@ -343,7 +343,6 @@ fn tui_button_inventory_is_complete() {
             .any(|item| item.surface == "first_run_complete")
     );
     assert!(inventory.iter().any(|item| item.surface == "question"));
-    assert!(inventory.iter().any(|item| item.surface == "daemon_prompt"));
     assert!(inventory.iter().any(|item| item.surface == "context_menu"));
     assert!(
         !inventory

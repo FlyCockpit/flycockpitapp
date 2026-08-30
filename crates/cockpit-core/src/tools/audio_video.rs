@@ -1073,6 +1073,9 @@ async fn dispatch_av_tool(
     // Parse every semantic argument before source admission. A later invalid
     // interval/sampling/index must never leave a fetched or persisted source.
     let parsed = parse_semantic_args(&args, kind)?;
+    if let NestedMediaSource::Path(path) = &parsed.source {
+        crate::knowledge::ensure_local_knowledge_media_path_access(ctx, path)?;
+    }
     // Live authority first. An unavailable snapshot stores Unknown
     // modalities as placeholders, not a model-capability diagnosis, so
     // extractors must not fail as `model_capability_unknown` before this

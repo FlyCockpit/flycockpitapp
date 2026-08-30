@@ -624,28 +624,23 @@ enum PreparedKnowledgeGit {
     Active {
         branch: String,
         remote: Option<String>,
+        restore_branch: Option<String>,
     },
     Skipped(String),
     Deferred(String),
 }
 
-/// Serialize write runs in this daemon.  Git's own index lock protects each
-/// individual subprocess, but it cannot cover the fetch -> apply -> commit
-/// sequence.  The per-KB advisory lock does, while leaving different KBs
-/// independent.
-fn knowledge_write_lock(root: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let identity = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let mut locks = locks
-        .lock()
-        .expect("knowledge write lock registry poisoned");
-    if let Some(lock) = locks.get(&identity).and_then(Weak::upgrade) {
-        return lock;
+/// Acquire the same stable, cross-process KB fence used by sidecar rebuilds.
+/// The fence covers the full fetch -> apply -> commit -> push transaction;
+/// Git's index locks only protect individual subprocesses.
+fn acquire_knowledge_write_process_lock(root: &Path) -> Result<SidecarProcessLock> {
+    let sidecars = KbSidecars::in_root(root).canonicalized()?;
+    loop {
+        if let Some(lock) = SidecarProcessLock::try_acquire(&sidecars)? {
+            return Ok(lock);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(identity, Arc::downgrade(&lock));
-    lock
 }
 
 /// Apply a dream's OKF mutation inside the KB's Git transaction boundary.
@@ -664,32 +659,108 @@ where
 {
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
-    let lock = knowledge_write_lock(root);
-    let _guard = lock.lock().expect("knowledge write lock poisoned");
-    let prepared = prepare_knowledge_git(root, merge_policy, &dream.knowledge_base_id);
+    // Do not perform Git setup or a model write under a process-local mutex:
+    // separate daemons must serialize this transaction too. If the private
+    // fence cannot be established, the write still proceeds but Git history
+    // is explicitly deferred rather than racing another daemon.
+    let process_lock = acquire_knowledge_write_process_lock(root);
+    let prepared = match &process_lock {
+        Ok(_) => prepare_knowledge_git(root, merge_policy, &dream.knowledge_base_id),
+        Err(error) => PreparedKnowledgeGit::Deferred(format!(
+            "acquiring the knowledge Git transaction lock failed: {error}"
+        )),
+    };
+
+    let before_paths = match &prepared {
+        PreparedKnowledgeGit::Active { .. } => match versioned_knowledge_paths(root) {
+            Ok(paths) => Some(paths),
+            Err(error) => {
+                // Parsing the pre-write bundle is required to record deletions
+                // without guessing at arbitrary worktree files.
+                let applied = apply();
+                if let PreparedKnowledgeGit::Active {
+                    restore_branch: Some(restore_branch),
+                    ..
+                } = &prepared
+                {
+                    let _ = restore_knowledge_branch(root, restore_branch);
+                }
+                applied?;
+                return Ok(KnowledgeDreamGitOutcome::Deferred {
+                    branch: None,
+                    commit: None,
+                    reason: format!("validating existing knowledge for Git failed: {error}"),
+                });
+            }
+        },
+        _ => None,
+    };
 
     // The model write is the authority.  Git setup/synchronization failures
     // must not turn an otherwise usable local KB into a read-only feature.
-    apply()?;
+    let applied = apply();
+    if let Err(error) = applied {
+        if let PreparedKnowledgeGit::Active {
+            restore_branch: Some(restore_branch),
+            ..
+        } = &prepared
+        {
+            // The apply closure can fail after a review branch was selected.
+            // Best-effort restoration preserves the accepted branch whenever
+            // Git can safely switch back; an uncommitted failed write remains
+            // visible as dirty state and prevents a later dream from taking it.
+            let _ = restore_knowledge_branch(root, restore_branch);
+        }
+        return Err(error);
+    }
 
-    match prepared {
+    let outcome = match prepared {
         PreparedKnowledgeGit::Skipped(reason) => Ok(KnowledgeDreamGitOutcome::Skipped { reason }),
         PreparedKnowledgeGit::Deferred(reason) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: None,
             commit: None,
             reason,
         }),
-        PreparedKnowledgeGit::Active { branch, remote } => {
-            match commit_knowledge_dream(root, &branch, remote.as_deref(), dream) {
+        PreparedKnowledgeGit::Active {
+            branch,
+            remote,
+            restore_branch,
+        } => {
+            let outcome = match commit_knowledge_dream(
+                root,
+                &branch,
+                remote.as_deref(),
+                dream,
+                before_paths
+                    .as_ref()
+                    .expect("active Git preparation has a baseline"),
+            ) {
                 Ok(outcome) => Ok(outcome),
                 Err(error) => Ok(KnowledgeDreamGitOutcome::Deferred {
-                    branch: Some(branch),
+                    branch: Some(branch.clone()),
                     commit: None,
                     reason: format!("recording dream history failed: {error}"),
                 }),
+            };
+            if let Some(restore_branch) = restore_branch
+                && let Err(error) = restore_knowledge_branch(root, &restore_branch)
+            {
+                let commit = outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(|outcome| dream_outcome_commit(outcome));
+                return Ok(KnowledgeDreamGitOutcome::Deferred {
+                    branch: Some(branch),
+                    commit,
+                    reason: format!(
+                        "restoring the knowledge base branch after review failed: {error}"
+                    ),
+                });
             }
+            outcome
         }
-    }
+    };
+    outcome
 }
 
 fn prepare_knowledge_git(
@@ -697,11 +768,26 @@ fn prepare_knowledge_git(
     merge_policy: KnowledgeBaseMergePolicy,
     knowledge_base_id: &str,
 ) -> PreparedKnowledgeGit {
-    let probe = match crate::git::run_git(root, &["rev-parse", "--is-inside-work-tree"]) {
+    let probe = match crate::git::run_git(root, &["rev-parse", "--show-toplevel"]) {
         Ok(probe) => probe,
         Err(error) => return PreparedKnowledgeGit::Skipped(format!("Git is unavailable: {error}")),
     };
-    if !probe.success {
+    let root_identity = match fs::canonicalize(root) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return PreparedKnowledgeGit::Deferred(format!(
+                "resolving the knowledge base root failed: {error}"
+            ));
+        }
+    };
+    let uses_enclosing_worktree = probe.success
+        && fs::canonicalize(probe.stdout.trim())
+            .map(|worktree| worktree != root_identity)
+            .unwrap_or(true);
+    if !probe.success || uses_enclosing_worktree {
+        // A KB nested in a user project must become a nested repository of
+        // its own. Never fetch, checkout, or commit through the enclosing
+        // worktree just because Git happened to find it from this path.
         let initialized = match crate::git::run_git(root, &["init", "-q"]) {
             Ok(initialized) => initialized,
             Err(error) => {
@@ -744,7 +830,30 @@ fn prepare_knowledge_git(
         ));
     }
 
-    let branch = match knowledge_git_branch(root) {
+    let has_head = match knowledge_git_has_head(root) {
+        Ok(has_head) => has_head,
+        Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+    };
+    if !has_head && let Err(error) = initialize_knowledge_git_history(root, knowledge_base_id) {
+        return PreparedKnowledgeGit::Deferred(error.to_string());
+    }
+
+    // A clean worktree is required for every run, including local-only KBs.
+    // This prevents any pre-existing manual change from being staged under a
+    // dream's audit message. Newly initialized KBs first receive the explicit
+    // initialization commit above, so their existing valid content is not
+    // misattributed to the first dream either.
+    let clean = match knowledge_git_worktree_clean(root) {
+        Ok(clean) => clean,
+        Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+    };
+    if !clean {
+        return PreparedKnowledgeGit::Deferred(
+            "knowledge repository has local changes; deferring dream history".to_string(),
+        );
+    }
+
+    let current_branch = match knowledge_git_branch(root) {
         Ok(branch) => branch,
         Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
     };
@@ -752,37 +861,28 @@ fn prepare_knowledge_git(
         Ok(remote) => remote,
         Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
     };
-    let has_head = match knowledge_git_has_head(root) {
-        Ok(has_head) => has_head,
+    let branch = match knowledge_git_base_branch(root, &current_branch) {
+        Ok(branch) => branch,
         Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
     };
-
-    if remote.is_some() {
-        // Rebase and checkout are only safe before the model writes, and only
-        // when no existing user changes could be displaced.
-        if has_head {
-            let clean = match knowledge_git_worktree_clean(root) {
-                Ok(clean) => clean,
-                Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
-            };
-            if !clean {
-                return PreparedKnowledgeGit::Deferred(
-                    "knowledge repository has local changes; deferring remote dream sync"
-                        .to_string(),
-                );
-            }
+    if current_branch != branch {
+        if let Err(error) = restore_knowledge_branch(root, &branch) {
+            return PreparedKnowledgeGit::Deferred(error.to_string());
         }
-        let remote_name = remote.as_deref().expect("checked above");
+    }
+
+    if let Some(remote_name) = remote.as_deref() {
         if let Err(error) = knowledge_git_fetch(root, remote_name) {
             return PreparedKnowledgeGit::Deferred(error.to_string());
         }
     }
 
+    let restore_branch = branch.clone();
     let branch = match merge_policy {
         KnowledgeBaseMergePolicy::Auto => {
             if let Some(remote_name) = remote.as_deref()
                 && let Err(error) =
-                    knowledge_git_rebase_remote_branch(root, remote_name, &branch, has_head)
+                    knowledge_git_rebase_remote_branch(root, remote_name, &branch, true)
             {
                 return PreparedKnowledgeGit::Deferred(error.to_string());
             }
@@ -816,7 +916,12 @@ fn prepare_knowledge_git(
         }
     };
 
-    PreparedKnowledgeGit::Active { branch, remote }
+    PreparedKnowledgeGit::Active {
+        restore_branch: (merge_policy == KnowledgeBaseMergePolicy::Review)
+            .then_some(restore_branch),
+        branch,
+        remote,
+    }
 }
 
 fn commit_knowledge_dream(
@@ -824,6 +929,7 @@ fn commit_knowledge_dream(
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
+    before_paths: &BTreeSet<PathBuf>,
 ) -> Result<KnowledgeDreamGitOutcome> {
     let paths = match versioned_knowledge_paths(root) {
         Ok(paths) => paths,
@@ -835,6 +941,7 @@ fn commit_knowledge_dream(
             });
         }
     };
+    let paths: BTreeSet<_> = paths.union(before_paths).cloned().collect();
     if paths.is_empty() {
         return Ok(KnowledgeDreamGitOutcome::NoChanges {
             branch: branch.to_string(),
@@ -966,25 +1073,86 @@ fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
     Ok(paths)
 }
 
-fn structured_dream_commit_message(dream: &KnowledgeDreamCommit) -> String {
-    fn field(value: &str) -> String {
-        value
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("-")
+/// Record the KB's pre-dream source state separately from dream output. This
+/// runs only for a newly initialized repository, before the dream callback,
+/// so ordinary local edits cannot be silently attributed to that dream.
+fn initialize_knowledge_git_history(root: &Path, knowledge_base_id: &str) -> Result<()> {
+    let paths = versioned_knowledge_paths(root)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut add_args = vec!["add".to_string(), "--".to_string()];
+    add_args.extend(paths.iter().map(|path| rel_string(path)));
+    let add_refs: Vec<_> = add_args.iter().map(String::as_str).collect();
+    let add = knowledge_git(root, &add_refs)?;
+    if !add.success {
+        bail!(
+            "staging the initial knowledge snapshot failed: {}",
+            add.stderr.trim()
+        );
     }
 
+    let message = format!(
+        "knowledge(kb={}): initialize repository",
+        git_message_field(knowledge_base_id)
+    );
+    let mut commit_args = vec![
+        "-c".to_string(),
+        "user.name=Flycockpit".to_string(),
+        "-c".to_string(),
+        "user.email=knowledge@flycockpit.invalid".to_string(),
+        "-c".to_string(),
+        "commit.gpgSign=false".to_string(),
+        "commit".to_string(),
+        "--only".to_string(),
+        "-m".to_string(),
+        message,
+        "--".to_string(),
+    ];
+    commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
+    let committed = knowledge_git(root, &commit_refs)?;
+    if !committed.success {
+        bail!(
+            "committing the initial knowledge snapshot failed: {}",
+            committed.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn structured_dream_commit_message(dream: &KnowledgeDreamCommit) -> String {
     format!(
         "dream(kb={}): sessions={} model={} concepts={} data_files={}",
-        field(&dream.knowledge_base_id),
+        git_message_field(&dream.knowledge_base_id),
         dream.sessions_dreamed,
-        field(&dream.model),
+        git_message_field(&dream.model),
         dream.concepts_written,
         dream.data_files_written,
     )
+}
+
+fn git_message_field(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn dream_outcome_commit(outcome: &KnowledgeDreamGitOutcome) -> Option<String> {
+    match outcome {
+        KnowledgeDreamGitOutcome::Committed { commit, .. }
+        | KnowledgeDreamGitOutcome::Deferred {
+            commit: Some(commit),
+            ..
+        } => Some(commit.clone()),
+        KnowledgeDreamGitOutcome::Skipped { .. }
+        | KnowledgeDreamGitOutcome::NoChanges { .. }
+        | KnowledgeDreamGitOutcome::Deferred { commit: None, .. } => None,
+    }
 }
 
 fn knowledge_git(root: &Path, args: &[&str]) -> Result<crate::git::GitOutcome> {
@@ -1002,6 +1170,32 @@ fn knowledge_git_branch(root: &Path) -> Result<String> {
         bail!("knowledge repository reported an invalid branch name");
     }
     Ok(branch.to_string())
+}
+
+/// The accepted KB branch is `main` whenever it exists. This makes a prior
+/// review proposal unable to become the base of a later auto or review run.
+/// Older repositories without `main` retain their current checked-out branch
+/// as the explicit fallback rather than guessing at a branch name.
+fn knowledge_git_base_branch(root: &Path, current_branch: &str) -> Result<String> {
+    let main = knowledge_git(
+        root,
+        &["show-ref", "--verify", "--quiet", "refs/heads/main"],
+    )?;
+    if main.success {
+        return Ok("main".to_string());
+    }
+    Ok(current_branch.to_string())
+}
+
+fn restore_knowledge_branch(root: &Path, branch: &str) -> Result<()> {
+    let checkout = knowledge_git(root, &["checkout", "-q", branch])?;
+    if !checkout.success {
+        bail!(
+            "checking out the accepted knowledge branch `{branch}` failed: {}",
+            checkout.stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn knowledge_git_remote(root: &Path) -> Result<Option<String>> {
@@ -4471,8 +4665,166 @@ timestamp: 2026-08-29T12:00:00Z
         };
         assert!(!pushed);
         assert!(branch.starts_with("cockpit/dream/team/"));
-        assert_ne!(
+        assert_eq!(
             crate::git::current_branch(tmp.path()).unwrap().as_deref(),
+            Some("main"),
+            "review output must not become the working base for a later dream"
+        );
+    }
+
+    #[test]
+    fn an_auto_dream_after_review_starts_from_the_accepted_branch() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let review = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Review,
+            &test_dream("team"),
+            || {
+                configure_knowledge_git(tmp.path());
+                write_dream_concept(tmp.path(), "review-only", "Pending review.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        let KnowledgeDreamGitOutcome::Committed {
+            branch: review_branch,
+            ..
+        } = review
+        else {
+            panic!("review dream must commit");
+        };
+
+        let auto = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("team"),
+            || {
+                write_dream_concept(tmp.path(), "accepted-base", "Accepted-base dream.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            auto,
+            KnowledgeDreamGitOutcome::Committed { ref branch, .. } if branch == "main"
+        ));
+        let ancestor = crate::git::run_git(
+            tmp.path(),
+            &["merge-base", "--is-ancestor", &review_branch, "main"],
+        )
+        .unwrap();
+        assert!(
+            !ancestor.success,
+            "accepted history must not include the pending review branch"
+        );
+    }
+
+    #[test]
+    fn deleted_knowledge_paths_are_staged_in_the_dream_commit() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                configure_knowledge_git(tmp.path());
+                write_dream_concept(tmp.path(), "obsolete", "To be removed.");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let outcome = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                fs::remove_file(tmp.path().join("obsolete.md")).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        let changed = crate::git::run_git_checked(
+            tmp.path(),
+            &["show", "--format=", "--name-status", "HEAD"],
+        )
+        .unwrap();
+        assert!(changed.contains("D\tobsolete.md"));
+    }
+
+    #[test]
+    fn local_manual_edits_are_not_committed_as_a_later_dream() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                configure_knowledge_git(tmp.path());
+                write_dream_concept(tmp.path(), "first", "First dream.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        write_dream_concept(tmp.path(), "manual", "Manual knowledge.");
+
+        let outcome = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                write_dream_concept(tmp.path(), "must-not-commit", "Deferred dream.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, KnowledgeDreamGitOutcome::Deferred { .. }));
+        let history =
+            crate::git::run_git_checked(tmp.path(), &["log", "--format=%s", "-1"]).unwrap();
+        assert!(history.contains("dream(kb=personal)"));
+        let status = crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"]).unwrap();
+        assert!(status.contains("manual.md"));
+        assert!(status.contains("must-not-commit.md"));
+    }
+
+    #[test]
+    fn nested_knowledge_base_initializes_its_own_repository() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        crate::git::run_git_checked(&workspace, &["init", "-q", "-b", "main"]).unwrap();
+        let root = workspace.join(".cockpit/knowledge");
+        write_bundle(&root);
+
+        let outcome = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("project"),
+            || {
+                configure_knowledge_git(&root);
+                write_dream_concept(&root, "isolated", "KB-only history.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        let kb_top = crate::git::run_git_checked(&root, &["rev-parse", "--show-toplevel"]).unwrap();
+        assert_eq!(
+            fs::canonicalize(kb_top.trim()).unwrap(),
+            fs::canonicalize(&root).unwrap()
+        );
+        assert_eq!(
+            crate::git::current_branch(&workspace).unwrap().as_deref(),
             Some("main")
         );
     }

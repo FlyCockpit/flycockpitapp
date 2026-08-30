@@ -49,6 +49,7 @@ enum HistorySearchScope {
     Lineage,
     CurrentArtifacts,
     AllProjects,
+    Threads,
 }
 
 impl HistorySearchScope {
@@ -58,8 +59,9 @@ impl HistorySearchScope {
             "lineage" => Ok(Self::Lineage),
             "current-artifacts" => Ok(Self::CurrentArtifacts),
             "all-projects" => Ok(Self::AllProjects),
+            "threads" => Ok(Self::Threads),
             _ => Err(invalid_input(
-                "`scope` must be `past`, `lineage`, `current-artifacts`, or `all-projects`",
+                "`scope` must be `past`, `lineage`, `current-artifacts`, `all-projects`, or `threads`",
             )),
         }
     }
@@ -85,7 +87,8 @@ impl Tool for HistorySearchTool {
              relevant history, each with a bounded FTS snippet and a `cockpit://` target. Choose \
              `past` for earlier sessions in this workspace, `lineage` for compaction predecessors \
              plus the current session, `current-artifacts` for the current session's text artifacts, \
-             or `all-projects` for consent-permitted cross-workspace recall. Read one returned \
+             or `all-projects` for consent-permitted cross-workspace recall. Choose `threads` to \
+             list your assistant threads by recency, or search them by keyword. Read one returned \
              pseudofile for details; this tool never recursively scans transcripts. Narrow large \
              result sets with `since` (only sessions active after a date)."
                 .to_string(),
@@ -97,12 +100,12 @@ impl Tool for HistorySearchTool {
             "type": "object",
             "properties": {
                 "query":      { "type": "string", "description": "FTS keyword search text" },
-                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects"], "description": "Recall area (default `past`)" },
+                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects", "threads"], "description": "Recall area (default `past`); `threads` may omit query to list by recency" },
                 "limit":      { "type": "integer", "description": "Max threads (default 10, max 50)" },
                 "since":      { "type": "string", "description": "RFC3339/`YYYY-MM-DD` lower bound on last activity; applies to past scopes" },
                 "include_tool_events": { "type": "boolean", "description": "For `lineage`, also scan bounded tool-event JSON" }
             },
-            "required": ["query"]
+            "required": []
         })
     }
 
@@ -111,12 +114,12 @@ impl Tool for HistorySearchTool {
             "type": "object",
             "properties": {
                 "query":      { "type": "string", "description": "Literal keywords to search indexed titles, descriptions, messages, compactions, or artifacts" },
-                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects"], "description": "`past` excludes the current session; `lineage` includes it; `current-artifacts` returns artifact pseudofiles; `all-projects` requires two-way workspace consent" },
+                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects", "threads"], "description": "`past` excludes the current session; `lineage` includes it; `current-artifacts` returns artifact pseudofiles; `all-projects` requires two-way workspace consent; `threads` lists/searches this assistant's threads" },
                 "limit":      { "type": "integer", "description": "Maximum number of matching targets to return; defaults to 10, maximum 50" },
                 "since":      { "type": "string", "description": "Optional lower bound on last activity for past scopes" },
                 "include_tool_events": { "type": "boolean", "description": "For `lineage`, scan a bounded set of tool-event JSON rows (default true)" }
             },
-            "required": ["query"]
+            "required": []
         }))
     }
 
@@ -137,8 +140,10 @@ impl Tool for HistorySearchTool {
             .get("query")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|q| !q.is_empty())
-            .ok_or_else(|| invalid_input("`query` is required"))?;
+            .filter(|q| !q.is_empty());
+        if query.is_none() && scope != HistorySearchScope::Threads {
+            return Err(invalid_input("`query` is required outside `threads` scope"));
+        }
 
         let dream_scope = established_dream_read_scope(ctx)?;
         ensure!(
@@ -159,7 +164,52 @@ impl Tool for HistorySearchTool {
 
         let trust = caller_history_trust(ctx);
         match scope {
+            HistorySearchScope::Threads => {
+                let session = ctx
+                    .session
+                    .db
+                    .get_session(ctx.session.id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?
+                    .ok_or_else(|| invalid_input("current session no longer exists"))?;
+                let assistant_name = session.assistant_name.ok_or_else(|| {
+                    invalid_input("`threads` is available only from an assistant session")
+                })?;
+                if let Some(query) = query {
+                    let hits = ctx
+                        .session
+                        .db
+                        .search_assistant_candidates_for_trust(
+                            query,
+                            &assistant_name,
+                            &ctx.session.project_id,
+                            Some(ctx.session.id),
+                            since,
+                            limit,
+                            trust,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                    render_session_hits(query, &hits, limit, false, ctx).await
+                } else {
+                    let threads = ctx
+                        .session
+                        .db
+                        .list_sessions_for_assistant(&assistant_name, false, limit)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?
+                        .into_iter()
+                        .filter(|thread| {
+                            thread.project_id == ctx.session.project_id
+                                && thread.parent_session_id.is_some()
+                                && thread.archived_at_unix_ms.is_none()
+                        })
+                        .collect::<Vec<_>>();
+                    render_thread_list(threads, ctx).await
+                }
+            }
             HistorySearchScope::CurrentArtifacts => {
+                let query = query.expect("non-thread scopes require query");
                 let hits = ctx
                     .session
                     .db
@@ -190,6 +240,7 @@ impl Tool for HistorySearchTool {
                 Ok(ToolOutput::text(out))
             }
             HistorySearchScope::Lineage => {
+                let query = query.expect("non-thread scopes require query");
                 let lineage = ctx
                     .session
                     .db
@@ -232,6 +283,7 @@ impl Tool for HistorySearchTool {
                 render_lineage(query, hits, scan, limit, ctx).await
             }
             HistorySearchScope::Past | HistorySearchScope::AllProjects => {
+                let query = query.expect("non-thread scopes require query");
                 if let Some(scope) = dream_scope {
                     // Attachment membership participates in the FTS query, so
                     // ranking and the bounded result set can never include an
@@ -339,6 +391,55 @@ async fn render_session_hits(
         return Err(invalid_input(
             "history access changed before results could be returned",
         ));
+    }
+    Ok(ToolOutput::text(out))
+}
+
+/// Render the no-query assistant thread list. `list_sessions_for_assistant`
+/// already orders by `last_active_at_unix_ms DESC`; keep that order rather
+/// than applying relevance ranking when the user only asked to browse.
+async fn render_thread_list(
+    threads: Vec<crate::db::sessions::SessionRow>,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    if threads.is_empty() {
+        return Ok(ToolOutput::text("No assistant threads in this workspace."));
+    }
+    let ids = threads.iter().map(|thread| thread.session_id).collect::<Vec<_>>();
+    if !ctx
+        .session
+        .db
+        .sessions_access_allowed(&ctx.session.project_id, &ids)
+        .await?
+    {
+        return Err(invalid_input(
+            "history access changed before thread results could be returned",
+        ));
+    }
+
+    let mut out = String::from("Assistant threads (most recently updated first):\n");
+    for thread in threads {
+        let id = thread
+            .short_id
+            .unwrap_or_else(|| thread.session_id.to_string());
+        let title = redact_target_text(
+            ctx,
+            thread.session_id,
+            thread.title.as_deref().unwrap_or("(untitled)"),
+        )
+        .await?;
+        let description = match thread.description.as_deref() {
+            Some(description) => redact_target_text(ctx, thread.session_id, description).await?,
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "cockpit://session/{id}/transcript  {}  {}\n",
+            human_date(thread.last_active_at_unix_ms),
+            title.trim()
+        ));
+        if !description.trim().is_empty() {
+            out.push_str(&format!("    {}\n", description.trim()));
+        }
     }
     Ok(ToolOutput::text(out))
 }
@@ -749,6 +850,10 @@ mod tests {
         assert_eq!(
             HistorySearchScope::parse(&json!({})).unwrap(),
             HistorySearchScope::Past
+        );
+        assert_eq!(
+            HistorySearchScope::parse(&json!({ "scope": "threads" })).unwrap(),
+            HistorySearchScope::Threads
         );
         assert!(HistorySearchScope::parse(&json!({ "scope": "invalid" })).is_err());
     }

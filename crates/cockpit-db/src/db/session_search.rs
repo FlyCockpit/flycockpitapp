@@ -158,6 +158,43 @@ impl Db {
                 caller_trust,
                 None,
                 None,
+                None,
+                false,
+            )
+        })
+        .await
+    }
+
+    /// FTS candidates belonging to one assistant, used by its persistent
+    /// thread browser. The assistant predicate participates in SQL ranking so
+    /// unrelated conversations cannot consume the bounded result pool.
+    pub async fn search_assistant_candidates_for_trust(
+        &self,
+        query: &str,
+        assistant_name: &str,
+        project_id: &str,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let assistant_name = assistant_name.to_string();
+        let project_id = project_id.to_string();
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                Some(&project_id),
+                exclude_session,
+                since,
+                None,
+                pool,
+                caller_trust,
+                None,
+                None,
+                Some(&assistant_name),
+                true,
             )
         })
         .await
@@ -189,6 +226,8 @@ impl Db {
                 caller_trust,
                 Some(&session_ids),
                 None,
+                None,
+                false,
             )
         })
         .await
@@ -220,6 +259,8 @@ impl Db {
                 caller_trust,
                 None,
                 None,
+                None,
+                false,
             )
         })
         .await
@@ -252,6 +293,8 @@ impl Db {
                 caller_trust,
                 None,
                 Some(&reader_project),
+                None,
+                false,
             )
         })
         .await
@@ -513,6 +556,8 @@ fn search_candidates_inner(
     caller_trust: HistoryCallerTrust,
     allowed_session_ids: Option<&[Uuid]>,
     reader_project: Option<&str>,
+    assistant_name: Option<&str>,
+    child_only: bool,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
         return Ok(Vec::new());
@@ -583,6 +628,8 @@ fn search_candidates_inner(
                                      WHERE target.project_id = s.project_id
                                        AND target.inbound_enabled = 1)))
                 AND (?8 IS NULL OR f.session_id IN (SELECT value FROM json_each(?8)))
+                AND (?9 IS NULL OR s.assistant_name = ?9)
+                AND (?10 = 0 OR s.parent_session_id IS NOT NULL)
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
@@ -603,6 +650,8 @@ fn search_candidates_inner(
                 caller_trust.can_read_trusted(),
                 reader_project,
                 allowed_session_ids,
+                assistant_name,
+                child_only,
             ],
             |row| {
                 let sid: String = row.get("session_id")?;

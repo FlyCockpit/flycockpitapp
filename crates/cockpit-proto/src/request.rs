@@ -5250,6 +5250,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discover_code_roots_omitted_selector_round_trips_across_cursor_pages() {
+        let first_page_wire = serde_json::json!({
+            "request": "discover_code_roots_v1",
+            "params": {
+                "logical_client_id": "discover-all-workspaces",
+                "limit": 25,
+            },
+        });
+        let first_page: Request = serde_json::from_value(first_page_wire.clone()).unwrap();
+        let Request::DiscoverCodeRootsV1(first_page) = first_page else {
+            panic!("discover_code_roots_v1 must deserialize to its typed request");
+        };
+        assert_eq!(first_page.workspace_selector, None);
+        assert_eq!(first_page.cursor, None);
+        Request::DiscoverCodeRootsV1(first_page.clone())
+            .validate_semantics()
+            .expect("an unfiltered first discovery page must validate");
+        assert_eq!(
+            serde_json::to_value(Request::DiscoverCodeRootsV1(first_page)).unwrap(),
+            first_page_wire,
+            "an absent selector must remain omitted on the first page wire"
+        );
+
+        let next_cursor = crate::CodeRootDiscoveryCursorV1::from_daemon_random(Uuid::from_u128(1));
+        let cursor_value = next_cursor.expose_opaque().to_owned();
+        let first_page_result = crate::DiscoverCodeRootsV1Result {
+            roots: Vec::new(),
+            next_cursor: Some(next_cursor),
+        };
+        let first_page_result_wire = serde_json::to_value(first_page_result).unwrap();
+        assert_eq!(
+            first_page_result_wire["next_cursor"],
+            serde_json::Value::String(cursor_value.clone()),
+            "the page result supplies the opaque cursor for the next request"
+        );
+
+        let second_page_wire = serde_json::json!({
+            "request": "discover_code_roots_v1",
+            "params": {
+                "logical_client_id": "discover-all-workspaces",
+                "cursor": first_page_result_wire["next_cursor"].clone(),
+                "limit": 25,
+            },
+        });
+        let second_page: Request = serde_json::from_value(second_page_wire.clone()).unwrap();
+        let Request::DiscoverCodeRootsV1(second_page) = second_page else {
+            panic!("cursor page must deserialize to discover_code_roots_v1");
+        };
+        assert_eq!(second_page.workspace_selector, None);
+        assert_eq!(
+            second_page
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.expose_opaque()),
+            Some(cursor_value.as_str())
+        );
+        Request::DiscoverCodeRootsV1(second_page.clone())
+            .validate_semantics()
+            .expect("an unfiltered cursor discovery page must validate");
+        assert_eq!(
+            serde_json::to_value(Request::DiscoverCodeRootsV1(second_page)).unwrap(),
+            second_page_wire,
+            "an absent selector must remain omitted after binding a cursor"
+        );
+    }
+
     #[cfg(feature = "remote")]
     #[test]
     fn optional_sensitive_wire_payload_fcor_is_exactly_digest_redacted() {

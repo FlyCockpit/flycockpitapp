@@ -18,6 +18,7 @@ pub mod child_failure;
 pub mod client;
 pub mod config;
 pub mod device;
+pub mod forwarded;
 pub mod invoke_prep;
 pub mod protocol;
 pub mod resolver;

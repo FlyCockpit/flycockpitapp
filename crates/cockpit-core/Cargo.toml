@@ -65,6 +65,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 image = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+url.workspace = true
 # Workspace: `rig-core` aliased as `rig` — portable contracts + transport only.
 rig = { workspace = true }
 httpdate = "1"

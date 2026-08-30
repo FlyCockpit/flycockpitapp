@@ -89,6 +89,10 @@ pub struct EffectiveCatalog {
 }
 
 impl EffectiveCatalog {
+    pub fn server_names(&self) -> impl Iterator<Item = &str> {
+        self.servers.keys().map(String::as_str)
+    }
+
     /// Wrap a pre-merged [`McpConfig`] as workspace-scoped entries. Used by
     /// tests and non-tool callers that already have a merged document.
     pub fn from_mcp_config(cfg: &McpConfig) -> Self {

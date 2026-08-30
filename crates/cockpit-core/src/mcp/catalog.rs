@@ -101,6 +101,36 @@ async fn list_tools_for_entry(
     .await
 }
 
+fn forwarded_catalog(
+    host: &HostContext,
+) -> Option<std::sync::Arc<super::forwarded::AcpForwardedMcpCatalogV1>> {
+    host.native_tool_ctx
+        .as_ref()
+        .and_then(|ctx| ctx.session.forwarded_mcp_catalog())
+}
+
+async fn list_tools_for_forwarded(
+    epoch: &super::forwarded::AcpForwardedMcpCatalogV1,
+    entry: &super::forwarded::AcpForwardedMcpEntryV1,
+    context: McpConnectContext,
+) -> Result<Vec<ToolDescriptor>> {
+    epoch.recheck_effect_gate()?;
+    if let Some(cached) = epoch.cached_tools(entry.name()) {
+        return Ok((*cached).clone());
+    }
+    let mut connection = client::connect_forwarded(entry, epoch, context).await?;
+    epoch.recheck_effect_gate()?;
+    let tools = connection
+        .list_tools()
+        .await?
+        .into_iter()
+        .map(sanitize_tool_descriptor)
+        .collect::<Vec<_>>();
+    epoch.recheck_effect_gate()?;
+    epoch.cache_tools(entry.name(), tools.clone());
+    Ok(tools)
+}
+
 fn catalog_view(cfg: &McpConfig, host: &HostContext) -> EffectiveCatalog {
     host.effective_catalog(cfg)
 }
@@ -128,6 +158,23 @@ pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<Sea
                     tool: tool.name,
                     description: first_line(&tool.description),
                 });
+            }
+        }
+    }
+    if let Some(epoch) = forwarded_catalog(host) {
+        for (name, entry) in epoch.entries() {
+            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await {
+                Ok(tools) => tools,
+                Err(_) => continue,
+            };
+            for tool in tools {
+                if q.is_empty() || matches(&q, name, &tool) {
+                    hits.push(SearchHit {
+                        server: name.to_string(),
+                        tool: tool.name,
+                        description: first_line(&tool.description),
+                    });
+                }
             }
         }
     }
@@ -168,6 +215,23 @@ pub async fn grep_tool_names(
             }
         }
     }
+    if let Some(epoch) = forwarded_catalog(host) {
+        for (name, entry) in epoch.entries() {
+            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await {
+                Ok(tools) => tools,
+                Err(_) => continue,
+            };
+            for tool in tools {
+                if re.is_match(&tool.name) {
+                    hits.push(SearchHit {
+                        server: name.to_string(),
+                        tool: tool.name,
+                        description: first_line(&tool.description),
+                    });
+                }
+            }
+        }
+    }
     Ok(cap_search_hits(hits))
 }
 
@@ -193,6 +257,17 @@ pub async fn grep_tool_definitions(
             push_definition_hit(&mut hits, &re, name, &tool);
         }
     }
+    if let Some(epoch) = forwarded_catalog(host) {
+        for (name, entry) in epoch.entries() {
+            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await {
+                Ok(tools) => tools,
+                Err(_) => continue,
+            };
+            for tool in tools {
+                push_definition_hit(&mut hits, &re, name, &tool);
+            }
+        }
+    }
     Ok(cap_definition_hits(hits))
 }
 
@@ -206,6 +281,15 @@ pub async fn describe(
 ) -> Result<ToolDescriptor> {
     if builtin::is_builtin_server(server) {
         return builtin::describe(host, tool);
+    }
+    if let Some(epoch) = forwarded_catalog(host)
+        && let Some(entry) = epoch.entry(server)
+    {
+        let tools = list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await?;
+        return tools
+            .into_iter()
+            .find(|descriptor| descriptor.name == tool)
+            .ok_or_else(|| anyhow::anyhow!("unknown MCP tool `{server}.{tool}`"));
     }
     let catalog = catalog_view(cfg, host);
     let Some(entry) = catalog.get(server) else {
@@ -311,6 +395,11 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
+    if let Some(epoch) = forwarded_catalog(host)
+        && let Some(entry) = epoch.entry(server)
+    {
+        return invoke_forwarded(host, epoch, entry, tool, args).await;
+    }
     let catalog = catalog_view(cfg, host);
     let Some(entry) = catalog.get(server) else {
         if let Some(suggestion) = crate::mcp::suggest::closest_server(
@@ -411,6 +500,92 @@ pub async fn invoke(
     )
     .await?;
     conn.call_tool(tool, args).await
+}
+
+async fn invoke_forwarded(
+    host: &HostContext,
+    epoch: std::sync::Arc<super::forwarded::AcpForwardedMcpCatalogV1>,
+    entry: std::sync::Arc<super::forwarded::AcpForwardedMcpEntryV1>,
+    tool: &str,
+    args: Value,
+) -> Result<Value> {
+    epoch.recheck_effect_gate()?;
+    let tools = list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await?;
+    if !tools.iter().any(|descriptor| descriptor.name == tool) {
+        bail!("unknown MCP tool `{}.{tool}`", entry.name());
+    }
+    let decision = match epoch.grant(entry.name(), tool) {
+        Some(super::forwarded::EpochGrantDecision::Allow) => crate::approval::Decision::Allow {
+            scope: crate::approval::store::Scope::Session,
+        },
+        Some(super::forwarded::EpochGrantDecision::Reject) => {
+            crate::approval::Decision::StandingReject {
+                scope: crate::approval::store::Scope::Session,
+            }
+        }
+        None => {
+            let Some(ctx) = host.native_tool_ctx.as_ref() else {
+                return Ok(mcp_tool_denial(entry.name(), tool, true));
+            };
+            let Some(approver) = ctx.approver.as_ref() else {
+                return Ok(mcp_tool_denial(entry.name(), tool, true));
+            };
+            approver
+                .authorize(crate::approval::AuthorizationRequest::ForwardedMcpTool {
+                    server: entry.name(),
+                    tool,
+                    transport: entry.transport_kind(),
+                    identity: &entry.safe_display_identity(),
+                })
+                .await?
+        }
+    };
+    match decision {
+        crate::approval::Decision::Allow { scope } => {
+            if scope == crate::approval::store::Scope::Session {
+                epoch.record_epoch_grant(
+                    entry.name(),
+                    tool,
+                    super::forwarded::EpochGrantDecision::Allow,
+                )?;
+            }
+        }
+        crate::approval::Decision::StandingReject { scope } => {
+            if scope == crate::approval::store::Scope::Session {
+                epoch.record_epoch_grant(
+                    entry.name(),
+                    tool,
+                    super::forwarded::EpochGrantDecision::Reject,
+                )?;
+            }
+            return Ok(mcp_tool_standing_reject_denial(entry.name(), tool, scope));
+        }
+        crate::approval::Decision::Deny => {
+            return Ok(mcp_tool_denial(entry.name(), tool, false));
+        }
+        crate::approval::Decision::NoninteractiveDeny => {
+            return Ok(mcp_tool_denial(entry.name(), tool, true));
+        }
+    }
+    #[cfg(test)]
+    if let Some(result) = host.test_external_invoke(entry.name(), tool, args.clone()) {
+        return result;
+    }
+    epoch.recheck_effect_gate()?;
+    let mut connection = client::connect_forwarded(&entry, &epoch, connect_context(host)).await?;
+    epoch.recheck_effect_gate()?;
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "acp_forwarded_mcp_tools_call",
+        &[serde_json::json!({
+            "source": super::forwarded::SOURCE_ACP_FORWARDED,
+            "epoch": epoch.epoch(),
+            "server": entry.name(),
+            "tool": tool,
+        })],
+    )
+    .await?;
+    epoch.recheck_effect_gate()?;
+    connection.call_tool(tool, args).await
 }
 
 pub(crate) fn connect_context(host: &HostContext) -> McpConnectContext {

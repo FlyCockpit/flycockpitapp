@@ -133,6 +133,107 @@ impl McpConnectContext {
             abandon_scope: self.stdio_abandon_scope.clone(),
         }
     }
+
+    async fn authorize_forwarded_connect(
+        &self,
+        entry: &crate::mcp::forwarded::AcpForwardedMcpEntryV1,
+        epoch: &crate::mcp::forwarded::AcpForwardedMcpCatalogV1,
+    ) -> Result<()> {
+        epoch.recheck_effect_gate()?;
+        match epoch.grant(entry.name(), "__connect__") {
+            Some(crate::mcp::forwarded::EpochGrantDecision::Allow) => return Ok(()),
+            Some(crate::mcp::forwarded::EpochGrantDecision::Reject) => {
+                bail!("editor-forwarded MCP connection was rejected for this epoch")
+            }
+            None => {}
+        }
+        let Some(approver) = self.approver.as_ref() else {
+            bail!("editor-forwarded MCP connection refused: no approval client is attached");
+        };
+        let identity = entry.safe_display_identity();
+        match approver
+            .authorize(AuthorizationRequest::ForwardedMcpServerConnect {
+                server: entry.name(),
+                transport: entry.transport_kind(),
+                identity: &identity,
+            })
+            .await?
+        {
+            Decision::Allow { scope } => {
+                if scope == crate::approval::store::Scope::Session {
+                    epoch.record_epoch_grant(
+                        entry.name(),
+                        "__connect__",
+                        crate::mcp::forwarded::EpochGrantDecision::Allow,
+                    )?;
+                }
+                epoch.recheck_effect_gate()
+            }
+            Decision::NoninteractiveDeny => bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL),
+            Decision::StandingReject {
+                scope: crate::approval::store::Scope::Session,
+            } => {
+                epoch.record_epoch_grant(
+                    entry.name(),
+                    "__connect__",
+                    crate::mcp::forwarded::EpochGrantDecision::Reject,
+                )?;
+                bail!("editor-forwarded MCP connection was rejected for this epoch")
+            }
+            Decision::Deny | Decision::StandingReject { .. } => {
+                bail!("editor-forwarded MCP connection was not approved")
+            }
+        }
+    }
+}
+
+/// Connect a validated ACP-forwarded entry without credential resolution or
+/// persistent configuration/cache participation.
+pub async fn connect_forwarded(
+    entry: &crate::mcp::forwarded::AcpForwardedMcpEntryV1,
+    epoch: &crate::mcp::forwarded::AcpForwardedMcpCatalogV1,
+    context: McpConnectContext,
+) -> Result<Box<dyn McpClient>> {
+    context.authorize_forwarded_connect(entry, epoch).await?;
+    epoch.recheck_effect_gate()?;
+    let timeouts = McpTimeouts::from_secs(10, 120);
+    let mut client: Box<dyn McpClient> = match entry.transport() {
+        crate::mcp::forwarded::AcpForwardedTransportV1::Stdio(stdio) => {
+            crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                "acp_forwarded_mcp_stdio_spawn",
+                &[serde_json::json!({
+                    "source": crate::mcp::forwarded::SOURCE_ACP_FORWARDED,
+                    "epoch": epoch.epoch(),
+                    "server": entry.name(),
+                    "transport": "stdio",
+                })],
+            )
+            .await?;
+            epoch.recheck_effect_gate()?;
+            Box::new(StdioClient::spawn(
+                entry.name(),
+                stdio.command().to_str().ok_or_else(|| {
+                    anyhow::anyhow!("acp_mcp_stdio_command_not_utf8")
+                })?,
+                stdio.args(),
+                stdio.env(),
+                timeouts,
+                context.stdio_runtime(),
+            )?)
+        }
+        crate::mcp::forwarded::AcpForwardedTransportV1::Http(remote) => Box::new(
+            HttpClient::new(remote.url(), remote.headers().clone(), timeouts)?,
+        ),
+        crate::mcp::forwarded::AcpForwardedTransportV1::Sse(remote) => Box::new(
+            SseClient::new(remote.url(), remote.headers().clone(), timeouts)?,
+        ),
+    };
+    epoch.recheck_effect_gate()?;
+    tokio::time::timeout(timeouts.connect, client.initialize())
+        .await
+        .map_err(|_| anyhow::anyhow!("editor-forwarded MCP initialize timed out"))??;
+    epoch.recheck_effect_gate()?;
+    Ok(client)
 }
 
 fn server_requires_secret_store(cfg: &ServerConfig) -> bool {

@@ -4265,7 +4265,7 @@ pub(crate) async fn boot_with_db(
             .context("reconciling abandoned media component leases")?;
         // Boot is recovery-only: crash-resume the same three calls the periodic
         // tick owns for long-lived daemons. Abandoned leases stay boot-only.
-        run_media_retention_sweep(storage, now_unix_ms)
+        run_media_retention_sweep(&storage, now_unix_ms)
             .await
             .context("media retention recovery")?;
     }
@@ -4927,7 +4927,7 @@ async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
     let Some(storage) = ctx.active_media_storage_recovery() else {
         return;
     };
-    if let Err(error) = run_media_retention_sweep(storage, now_unix_ms).await {
+    if let Err(error) = run_media_retention_sweep(&storage, now_unix_ms).await {
         tracing::warn!(error = %error, "media retention tick failed");
     }
 }

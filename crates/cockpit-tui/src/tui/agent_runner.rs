@@ -2937,6 +2937,7 @@ async fn try_spawn_inner(
         let skill_refresh_tx = skill_refresh_tx.clone();
         let awaiting_durable = awaiting_durable.clone();
         let attachment_ready_tx = attachment_ready_tx.clone();
+        let event_ephemeral_owner = ephemeral_owner.clone();
         let transition_gate = transition_gate.clone();
         let driver = LocalReconnectDriver {
             endpoint: endpoint.clone(),
@@ -2965,7 +2966,7 @@ async fn try_spawn_inner(
                 attach_context: attach_context.clone(),
                 attachment_epoch: attachment_epoch.clone(),
                 session_id_state: session_id_state.clone(),
-                ephemeral_owner: ephemeral_owner.clone(),
+                ephemeral_owner: event_ephemeral_owner,
                 skill_refresh_tx,
                 skill_refresh_generation: 0,
                 transition_gate: transition_gate.clone(),
@@ -5213,6 +5214,7 @@ mod tests {
                 attach_context,
                 attachment_epoch,
                 session_id_state: Arc::new(Mutex::new(session_id)),
+                ephemeral_owner: Arc::new(AtomicBool::new(false)),
                 skill_refresh_tx,
                 skill_refresh_generation: 0,
                 transition_gate: Arc::new(AsyncMutex::new(())),

@@ -279,6 +279,7 @@ impl DaemonScheduler {
         start_gate: Option<watch::Receiver<bool>>,
     ) -> DaemonSchedulerHandle {
         let (wake_tx, wake_rx) = watch::channel(0u64);
+        let scheduler = self.clone();
         let task = tokio::spawn(async move {
             if let Some(mut start_gate) = start_gate {
                 while !*start_gate.borrow_and_update() {
@@ -287,7 +288,7 @@ impl DaemonScheduler {
                     }
                 }
             }
-            run_scheduler_loop(self.clone(), sleeper, wake_rx, shutdown).await;
+            run_scheduler_loop(scheduler, sleeper, wake_rx, shutdown).await;
         });
         let handle = DaemonSchedulerHandle {
             scheduler: self,

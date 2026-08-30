@@ -1096,6 +1096,9 @@ impl App {
         match applied {
             ControlApplied::None => {}
             ControlApplied::ModelSelection { .. } => {}
+            // ExitGuardStatus has a dedicated response payload that controls
+            // the exit path in `apply_control_request_outcome`.
+            ControlApplied::ExitGuardStatus => {}
             ControlApplied::CacheBreakWarning => {
                 if let Some(warning) = self.cache_break_warning() {
                     self.push_plain(warning);

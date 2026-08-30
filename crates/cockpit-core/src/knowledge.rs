@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -149,7 +150,6 @@ struct LocalKb {
     root: PathBuf,
     snapshot: Option<KnowledgeBundle>,
     sidecars: KbSidecars,
-    sidecar_lock: Arc<tokio::sync::Mutex<()>>,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -165,6 +165,35 @@ impl KbSidecars {
             embeddings: root.join(EMBEDDINGS_FILE),
             index: root.join(INDEX_FILE),
         }
+    }
+
+    /// Resolve the already-existing parent directories before using sidecar
+    /// paths as an identity. Registry entries may spell one KB through a
+    /// symlink or a lexical alias; the sidecar filenames themselves are not
+    /// allowed to be symlinks and are checked separately when opened.
+    fn canonicalized(&self) -> Result<Self> {
+        fn canonical_sidecar(path: &Path) -> Result<PathBuf> {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .context("knowledge sidecar has no parent directory")?;
+            let name = path
+                .file_name()
+                .context("knowledge sidecar has no file name")?;
+            Ok(fs::canonicalize(parent)
+                .with_context(|| {
+                    format!(
+                        "canonicalizing knowledge sidecar parent {}",
+                        parent.display()
+                    )
+                })?
+                .join(name))
+        }
+
+        Ok(Self {
+            embeddings: canonical_sidecar(&self.embeddings)?,
+            index: canonical_sidecar(&self.index)?,
+        })
     }
 }
 
@@ -182,15 +211,149 @@ fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+/// Process-wide ownership of a KB sidecar while a provider call is in flight.
+///
+/// `flock` (Unix) and `LockFileEx` (Windows) are released by the operating
+/// system if a daemon dies, unlike a create-new sentinel. The locked file is
+/// `embeddings.sqlite` itself, so this does not create a third derived file
+/// that could escape the Git exclusion invariant.
+struct SidecarProcessLock {
+    file: fs::File,
+}
+
+impl SidecarProcessLock {
+    fn try_acquire(sidecar: &Path) -> Result<Option<Self>> {
+        let file = open_private_sidecar_file(sidecar, "knowledge embeddings sidecar")?;
+        match try_lock_sidecar_file(&file)? {
+            true => Ok(Some(Self { file })),
+            false => Ok(None),
+        }
+    }
+}
+
+impl Drop for SidecarProcessLock {
+    fn drop(&mut self) {
+        if let Err(error) = unlock_sidecar_file(&self.file) {
+            tracing::warn!(%error, "releasing knowledge sidecar process lock failed");
+        }
+    }
+}
+
+async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarProcessLock> {
+    loop {
+        if let Some(lock) = SidecarProcessLock::try_acquire(&sidecars.embeddings)? {
+            return Ok(lock);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_sidecar_file(file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `file` stays open for the lifetime of SidecarProcessLock. flock
+    // is advisory, non-blocking, and operates on this valid file descriptor.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.kind() {
+        io::ErrorKind::WouldBlock => Ok(false),
+        _ => Err(error).context("locking knowledge embeddings sidecar"),
+    }
+}
+
+#[cfg(unix)]
+fn unlock_sidecar_file(file: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: this is the matching unlock for a lock acquired on `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_sidecar_file(file: &fs::File) -> Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: the file handle remains live in SidecarProcessLock; the zeroed
+    // OVERLAPPED selects the first byte, outside SQLite's locking byte range.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(error).context("locking knowledge embeddings sidecar")
+    }
+}
+
+#[cfg(windows)]
+fn unlock_sidecar_file(file: &fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: this is the matching region and handle for LockFileEx above.
+    if unsafe { UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_lock_sidecar_file(_file: &fs::File) -> Result<bool> {
+    bail!("knowledge sidecar process locking is unsupported on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_sidecar_file(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 fn has_git_marker_in_ancestors(root: &Path) -> bool {
-    root.ancestors()
-        .any(|ancestor| ancestor.join(".git").exists())
+    let contains_git_marker = |path: &Path| {
+        path.ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+    };
+    contains_git_marker(root)
+        || fs::canonicalize(root).is_ok_and(|canonical_root| contains_git_marker(&canonical_root))
 }
 
 fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
+    // Sidecars were canonicalized for lock identity. Resolve the KB root the
+    // same way before deciding which artifacts are inside a Git worktree.
+    // Assistant snapshot roots are synthetic (`assistant://...`) and simply
+    // remain outside their private cache sidecars.
+    let sidecar_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let sidecar_paths: Vec<_> = [&sidecars.embeddings, &sidecars.index]
         .into_iter()
-        .filter_map(|path| path.strip_prefix(root).ok())
+        .filter_map(|path| path.strip_prefix(&sidecar_root).ok())
         .collect();
     // Assistant sidecars deliberately live in Flycockpit's private cache, not
     // in the installed assistant bundle. There is nothing in that source tree
@@ -246,11 +409,31 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
         format!("{prefix}/")
     };
     let mut rules = String::from("# Flycockpit generated knowledge sidecars\n");
-    for path in sidecar_paths {
+    for path in &sidecar_paths {
         rules.push('/');
         rules.push_str(&root_prefix);
         rules.push_str(&rel_string(path));
         rules.push('\n');
+    }
+
+    // Ignore rules do not apply retroactively to an index entry. Refuse before
+    // SQLite can mutate a committed derived artifact; removing it from Git is
+    // an explicit repository-owner action, never an implicit side effect.
+    for path in &sidecar_paths {
+        let repository_path = format!("{root_prefix}{}", rel_string(path));
+        let repository_pathspec = format!(":/{repository_path}");
+        let tracked = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "--error-unmatch", "--", &repository_pathspec])
+            .output()
+            .context("checking whether knowledge sidecar is tracked by Git")?;
+        if tracked.status.success() {
+            bail!(
+                "knowledge sidecar {} is tracked by Git; remove it from the repository before using this knowledge base",
+                repository_path
+            );
+        }
     }
     let existing = match fs::read_to_string(&exclude_path) {
         Ok(existing) => existing,
@@ -273,6 +456,7 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
         file.write_all(rules.as_bytes())?;
         file.sync_data()?;
     }
+
     Ok(())
 }
 
@@ -292,7 +476,6 @@ impl LocalKb {
             entry,
             root,
             snapshot,
-            sidecar_lock: sidecar_lock(&sidecars),
             sidecars,
             embedder,
         }
@@ -396,12 +579,17 @@ impl KbProvider for LocalKb {
         if query_vector.is_empty() {
             bail!("embedding query returned an empty vector");
         }
-        let _sidecar_guard = self.sidecar_lock.lock().await;
+        // A missing KB remains reportable as unavailable. Once it exists,
+        // canonicalize its sidecars immediately before locking so aliases in
+        // registry entries converge on one in-process identity.
+        let sidecars = self.sidecars.canonicalized()?;
+        let sidecar_lock = sidecar_lock(&sidecars);
+        let _sidecar_guard = sidecar_lock.lock().await;
         let (index, _) = match &self.snapshot {
             Some(snapshot) => {
                 KnowledgeIndex::open_snapshot_locked(
                     snapshot.clone(),
-                    self.sidecars.clone(),
+                    sidecars.clone(),
                     embedder,
                     Some(query_vector.len()),
                 )
@@ -411,7 +599,7 @@ impl KbProvider for LocalKb {
                 let bundle = parse_bundle(&self.root)?;
                 KnowledgeIndex::open_snapshot_locked(
                     bundle,
-                    self.sidecars.clone(),
+                    sidecars,
                     embedder,
                     Some(query_vector.len()),
                 )
@@ -811,7 +999,7 @@ impl KnowledgeIndex {
     ) -> Result<(Self, IndexStats)> {
         let root = root.as_ref().to_path_buf();
         let bundle = parse_bundle(&root)?;
-        let sidecars = KbSidecars::in_root(&root);
+        let sidecars = KbSidecars::in_root(&bundle.root).canonicalized()?;
         let lock = sidecar_lock(&sidecars);
         let _guard = lock.lock().await;
         Self::open_snapshot_locked(bundle, sidecars, embedder, query_dimensions).await
@@ -827,6 +1015,11 @@ impl KnowledgeIndex {
         query_dimensions: Option<usize>,
     ) -> Result<(Self, IndexStats)> {
         ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
+        // This process-level lock is retained across the provider await in
+        // `sync_embeddings`. It complements the in-process Tokio mutex held
+        // by the caller and makes different daemon data directories serialize
+        // their paid work against the same external KB.
+        let _process_lock = acquire_process_sidecar_lock(&sidecars).await?;
         let index = open_index_connection(&sidecars.index)?;
         ensure_index_schema(&index)?;
         rebuild_index(&index, &bundle)?;
@@ -869,19 +1062,9 @@ impl KnowledgeIndex {
         let merged = rrf_merge(&self.index, vector_arm, keyword_arm, limit)?;
         Ok(merged)
     }
-
-    #[cfg(test)]
-    fn set_logic_version_for_test(&self, version: i64) -> Result<()> {
-        self.index.execute(
-            "INSERT INTO intel_meta(key, value) VALUES('index_logic_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![version.to_string()],
-        )?;
-        Ok(())
-    }
 }
 
-fn open_private_sidecar_connection(sidecar: &Path, label: &str) -> Result<Connection> {
+fn open_private_sidecar_file(sidecar: &Path, label: &str) -> Result<fs::File> {
     if !sidecar.exists() {
         match cockpit_host::private_fs::write_private_file_exclusive(sidecar, b"") {
             Ok(()) => {}
@@ -897,6 +1080,15 @@ fn open_private_sidecar_connection(sidecar: &Path, label: &str) -> Result<Connec
         cockpit_host::private_fs::repair_private_file(sidecar, label)
             .map_err(anyhow::Error::from)?;
     }
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sidecar)
+        .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))
+}
+
+fn open_private_sidecar_connection(sidecar: &Path, label: &str) -> Result<Connection> {
+    let _file = open_private_sidecar_file(sidecar, label)?;
     Connection::open(sidecar)
         .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))
 }
@@ -925,6 +1117,23 @@ fn load_sqlite_vec_for_sidecar(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_index_schema(conn: &Connection) -> Result<()> {
+    if stored_index_logic_version(conn)? != Some(INDEX_LOGIC_VERSION) {
+        // The index is deliberately disposable. A version mismatch means its
+        // table layout is not trustworthy, so discard every schema object we
+        // own before recreating the current projection. Do not apply a
+        // migration here: only embeddings.sqlite preserves paid state.
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS structured_values;
+            DROP TABLE IF EXISTS structured_rows;
+            DROP TABLE IF EXISTS chunks_fts;
+            DROP TABLE IF EXISTS chunks;
+            DROP TABLE IF EXISTS concept_frontmatter;
+            DROP TABLE IF EXISTS concepts;
+            DROP TABLE IF EXISTS intel_meta;
+            "#,
+        )?;
+    }
     conn.execute_batch(
         r#"
         PRAGMA foreign_keys = ON;
@@ -992,6 +1201,20 @@ fn ensure_index_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
     Ok(())
+}
+
+fn stored_index_logic_version(conn: &Connection) -> Result<Option<i64>> {
+    if !table_exists(conn, "intel_meta")? {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT value FROM intel_meta WHERE key='index_logic_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok()))
 }
 
 fn ensure_embeddings_schema(conn: &Connection) -> Result<()> {
@@ -2589,19 +2812,68 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[tokio::test]
+    async fn local_git_knowledge_rejects_tracked_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let init = Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let _ = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["add", "--", EMBEDDINGS_FILE, INDEX_FILE])
+            .status()
+            .unwrap();
+        assert!(add.success());
+
+        let error = match KnowledgeIndex::open(tmp.path(), mock_embedder()).await {
+            Ok(_) => panic!("tracked sidecars must be rejected before opening"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("is tracked by Git"), "{error:#}");
+    }
+
+    #[tokio::test]
     async fn index_version_bump_rebuilds_only_disposable_index() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
         let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
             .await
             .unwrap();
-        index.set_logic_version_for_test(0).unwrap();
         drop(index);
+        fs::remove_file(tmp.path().join(INDEX_FILE)).unwrap();
+        let stale = Connection::open(tmp.path().join(INDEX_FILE)).unwrap();
+        stale
+            .execute_batch(
+                "CREATE TABLE intel_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO intel_meta(key, value) VALUES('index_logic_version', '0'); \
+                 CREATE TABLE concepts (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        drop(stale);
+
         let (_, stats) = KnowledgeIndex::open(tmp.path(), mock_embedder())
             .await
             .unwrap();
         assert_eq!(stats.embedded_chunks, 0, "{stats:?}");
         assert_eq!(stats.reused_files, 2);
+        let current = Connection::open(tmp.path().join(INDEX_FILE)).unwrap();
+        let has_current_concept_schema: bool = current
+            .prepare("PRAGMA table_info(concepts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "frontmatter_json");
+        assert!(has_current_concept_schema);
     }
 
     #[tokio::test]
@@ -2692,6 +2964,28 @@ timestamp: 2026-08-29T12:00:00Z
         let (first, second) = tokio::join!(
             KnowledgeIndex::open(root.clone(), embedder.clone()),
             KnowledgeIndex::open(root, embedder),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let expected = first.1.embedded_chunks.max(second.1.embedded_chunks);
+        assert_eq!(calls.load(Ordering::SeqCst), expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_index_opens_through_symlink_alias_embed_each_chunk_once() {
+        let tmp = TempDir::new().unwrap();
+        let aliases = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let alias = aliases.path().join("knowledge-alias");
+        std::os::unix::fs::symlink(tmp.path(), &alias).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Embedder> = Arc::new(SlowCountingEmbedder {
+            calls: calls.clone(),
+        });
+        let (first, second) = tokio::join!(
+            KnowledgeIndex::open(tmp.path(), embedder.clone()),
+            KnowledgeIndex::open(alias, embedder),
         );
         let first = first.unwrap();
         let second = second.unwrap();

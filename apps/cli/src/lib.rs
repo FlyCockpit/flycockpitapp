@@ -765,7 +765,8 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
     }
     !matches!(
         command,
-        Some(Command::Debug(_))
+        Some(Command::Acp)
+            | Some(Command::Debug(_))
             | Some(Command::Doctor(_))
             | Some(Command::Invocation(_))
             | Some(Command::Daemon(
@@ -836,6 +837,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     }
 
     match cli.command {
+        Some(Command::Acp) => commands::acp::run().await,
         Some(Command::Ask(args)) => commands::ask::run(args).await,
         Some(Command::Run(args)) => {
             commands::run::run(args, cli.no_sandbox, cli.project.as_deref()).await

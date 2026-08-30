@@ -41,7 +41,7 @@ const empty = {
 
 const attachFixture = {
   session_id: sessionId,
-  session_entry_mode: "code" as const,
+  session_entry_mode: "assistant" as const,
   short_id: "s1",
   project_root: "/work/app",
   project_id: "project_1",
@@ -1293,8 +1293,22 @@ describe("remote session reducers", () => {
     const setAgent = vi.fn().mockResolvedValue(undefined);
     const renameSession = vi.fn().mockResolvedValue(undefined);
     const client = { attach, renameSession, setAgent };
+    const initial = withDetail();
     useRemoteSessionsStore.setState({
-      instances: { i1: withDetail() },
+      instances: {
+        i1: {
+          ...initial,
+          sessionsByProject: {
+            "/work/app": [
+              initial.detailsBySession[sessionId].summary,
+              {
+                ...initial.detailsBySession[sessionId].summary,
+                sessionId: selectedSession,
+              },
+            ],
+          },
+        },
+      },
       clients: { i1: client as never },
     });
 
@@ -1382,12 +1396,13 @@ describe("remote session reducers", () => {
     expect(attach).toHaveBeenNthCalledWith(1, {
       project_root: "/work/new-project",
       interactive: true,
-      session_entry_mode: "code",
+      session_entry_mode: "assistant",
       initial_model: undefined,
     });
     expect(attach).toHaveBeenNthCalledWith(2, {
       session_id: sessionId,
       interactive: true,
+      session_entry_mode: "assistant",
     });
     expect(useRemoteSessionsStore.getState().instances.i1.attachment).toEqual({
       connectionEpoch: 1,

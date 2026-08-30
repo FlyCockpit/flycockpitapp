@@ -48,6 +48,7 @@ export type WebProjectRow = {
 
 export type WebSessionSummary = {
   sessionId: string;
+  sessionEntryMode: WireSessionSummary["session_entry_mode"];
   projectId: string;
   projectRoot: string;
   title: string;
@@ -716,6 +717,7 @@ export function toWebSessionSummary(session: WireSessionSummary): WebSessionSumm
   const createdByPrincipal = stringField(raw, "created_by_principal");
   return {
     sessionId: session.session_id,
+    sessionEntryMode: session.session_entry_mode,
     projectId: session.project_id,
     projectRoot: session.project_root,
     title: session.title ?? session.short_id ?? session.session_id,
@@ -863,6 +865,7 @@ function attachSummary(
 ): WebSessionSummary {
   return {
     sessionId: attach.session_id,
+    sessionEntryMode: attach.session_entry_mode,
     projectId: attach.project_id,
     projectRoot: attach.project_root,
     title: current?.title ?? attach.short_id,
@@ -1978,6 +1981,25 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     const client = initial.clients[instanceId];
     const remote = initial.instances[instanceId];
     if (!client || remote?.status !== "connected") return;
+    const session =
+      Object.values(remote.sessionsByProject)
+        .flat()
+        .find((candidate) => candidate.sessionId === sessionId) ??
+      remote.detailsBySession[sessionId]?.summary;
+    if (!session || session.sessionEntryMode === "code") {
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) => ({
+          ...current,
+          attachment: {
+            connectionEpoch: remote.attachment.connectionEpoch,
+            phase: "failed",
+            sessionId,
+            error: "This client can attach only assistant or computer sessions.",
+          },
+        })),
+      }));
+      return;
+    }
 
     const connectionEpoch = remote.attachment.connectionEpoch;
     const coordinator = webAttachCoordinator(instanceId);
@@ -1994,6 +2016,7 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
       const result = await client.attach({
         session_id: sessionId,
         interactive: true,
+        session_entry_mode: session.sessionEntryMode,
       });
       if (!isCurrent()) return;
       if (result.session_id !== sessionId) {
@@ -2118,7 +2141,7 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
       const result = await client.attach({
         project_root: input.projectRoot,
         interactive: true,
-        session_entry_mode: "code",
+        session_entry_mode: "assistant",
         initial_model: input.initialModel,
       });
       if (!isCurrent() || !coordinator.bindSession(attempt, result.session_id)) {

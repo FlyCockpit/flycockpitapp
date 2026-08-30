@@ -15,15 +15,17 @@ use super::dispatch::{
     dispatch_request, elicitation_is_rejected, is_request_only_session_method, is_session_method,
 };
 use super::envelope::{invalid_request, parse_error};
-use super::registry::{ApprovalAck, OutboundPermissionRegistry, ResolveCodeRootInterrupt};
+use super::registry::{
+    ApprovalAck, InboundPermissionFailure, OutboundPermissionRegistry, ResolveCodeRootInterrupt,
+};
 
-/// The only protocol-semantic non-success stdio exit. It means the editor
-/// selected an issued permission option, but its durable delivery had already
-/// reached a conflicting closed state, so the ACP session must fail rather
-/// than acknowledge or fabricate a response.
+/// Protocol-semantic non-success stdio exits for permission outcomes that
+/// cannot be durably settled. The ACP session must fail rather than claim a
+/// resolution or cancellation that Cockpit could not establish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcpPeerExitError {
     ClosedPermissionRefusal(cockpit_proto::ResolveCodeRootInterruptResultV1),
+    PermissionCancellationFailed,
 }
 
 impl std::fmt::Display for AcpPeerExitError {
@@ -31,6 +33,9 @@ impl std::fmt::Display for AcpPeerExitError {
         match self {
             Self::ClosedPermissionRefusal(outcome) => {
                 write!(f, "ACP permission delivery was closed: {outcome:?}")
+            }
+            Self::PermissionCancellationFailed => {
+                f.write_str("ACP permission cancellation could not settle the daemon turn")
             }
         }
     }
@@ -98,7 +103,7 @@ where
                 invalid_request(request_id.as_ref())
             }
             Ok(InboundMessage::Response(response)) => {
-                if let Some(outcome) = self.registry.on_inbound_response(
+                if let Err(error) = self.registry.on_inbound_response(
                     &response.id,
                     response.result.as_ref(),
                     &response.raw,
@@ -107,7 +112,14 @@ where
                     &mut self.sink,
                     &mut self.counters,
                 ) {
-                    self.closed_refusal = Some(AcpPeerExitError::ClosedPermissionRefusal(outcome));
+                    self.closed_refusal = Some(match error {
+                        InboundPermissionFailure::ClosedPermissionRefusal(outcome) => {
+                            AcpPeerExitError::ClosedPermissionRefusal(outcome)
+                        }
+                        InboundPermissionFailure::CancelTurnFailed => {
+                            AcpPeerExitError::PermissionCancellationFailed
+                        }
+                    });
                     self.connection_closed = true;
                     self.registry.on_disconnect(&mut self.counters);
                 }
@@ -174,6 +186,10 @@ where
     pub fn disconnect(&mut self) {
         self.connection_closed = true;
         self.registry.on_disconnect(&mut self.counters);
+    }
+
+    pub(crate) fn peer_exit_error(&self) -> Option<AcpPeerExitError> {
+        self.closed_refusal
     }
 }
 

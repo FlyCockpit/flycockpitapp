@@ -9,6 +9,7 @@ import {
 
 const session = (createdBy: WebSessionSummary["createdBy"]): WebSessionSummary => ({
   sessionId: "11111111-1111-4111-8111-111111111111",
+  sessionEntryMode: "assistant",
   projectId: "repo",
   projectRoot: "/repo",
   title: "Fix checkout",

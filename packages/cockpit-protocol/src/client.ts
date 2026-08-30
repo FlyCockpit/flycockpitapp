@@ -4,7 +4,6 @@ import {
   RELAY_ENVELOPE_VERSION,
 } from "@flycockpit/relay-protocol/envelopes";
 import {
-  type ActiveModelRef,
   type ClientRequest,
   createClientSubmissionId,
   createEnvelope,
@@ -72,20 +71,12 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
  * text still stages through `send_user_message_bulk`. There is no legacy
  * image-reference field.
  */
-export type SendUserMessageParams = {
-  client_submission_id: string;
-  expected_model_state_generation?: number;
-  expected_model?: ActiveModelRef;
+export type SendUserMessageParams = Omit<
+  ParamsOf<"send_user_message_bulk">,
+  "origin" | "transfer" | "display_transfer" | "display_text"
+> & {
   text: string;
   display_text?: string;
-  tag_expansions?: Record<string, unknown>[];
-  forced_skill?: string;
-  delivery_class_override?: "steering" | "held";
-  run_invocation_options?: {
-    max_turns?: number;
-    timeout_ms?: number;
-    approval_mode?: "manual" | "auto" | "yolo";
-  };
 };
 
 const INLINE_USER_MESSAGE_BYTES = 64 * 1024;

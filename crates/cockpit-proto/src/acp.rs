@@ -259,7 +259,10 @@ pub enum CloseCodeRootAttachmentV1Result {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoverCodeRootsV1Request {
-    pub workspace_selector: CodeRootWorkspaceSelectorV1,
+    /// An absent selector discovers Code roots across every workspace. A
+    /// selector is a filter, not a required launch-directory scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_selector: Option<CodeRootWorkspaceSelectorV1>,
     pub logical_client_id: OpaqueAsciiId128V1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<CodeRootDiscoveryCursorV1>,

@@ -158,7 +158,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
         ingress: "local_owner_direct",
         operation_id: envelope.operation_id,
         session_locator: envelope.session_locator,
-        request,
+        request: envelope.request,
       }),
     ).toThrow("user-message ingress origin must be external_root");
     expect(() =>
@@ -168,7 +168,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
         {
           ingress: "authenticated_remote_operation",
           session_locator: envelope.session_locator,
-          request,
+          request: envelope.request,
         },
         { id: new Uint8Array(16).fill(42), generation: 9n },
       ),

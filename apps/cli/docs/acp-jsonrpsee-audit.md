@@ -139,12 +139,13 @@ registry, and they assume jsonrpsee-owned transports.
 3. Inbound responses are classified by the owned envelope parser and looked
    up in that registry *before* jsonrpsee method routing.
 4. jsonrpsee `RpcModule` handles only **inbound** client → agent requests
-   and notifications (`initialize`, `session/new`, `session/load`,
-   `session/cancel`, …). Until editor-session adaptation has an owned daemon
-   API, the session methods fail closed through an unavailable ingress seam;
-   `initialize` does not advertise load, prompt, or MCP capabilities, and an
-   unsupported session notification closes the peer rather than being treated
-   as a successful cancellation.
+   and notifications (`initialize`, `session/list`, `session/new`,
+   `session/load`, `session/cancel`, …). `cockpit acp` composes its ingress
+   with the socket-daemon Code-root routes; default/test callers without that
+   owner still fail closed. `initialize` advertises Code-root session loading
+   and listing, while prompt and forwarded-MCP admission stay on the same
+   daemon-owned bridge boundary. Unsupported session notifications close the
+   peer rather than being treated as successful cancellation.
 
 This extension is the documented bidirectional gap, not a silent substitute
 for jsonrpsee. Unstable elicitation (`elicitation/create`,

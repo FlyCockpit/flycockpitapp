@@ -6442,15 +6442,19 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DiscoverCodeRootsV1(request) => {
-            let canonical =
-                crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?
-                    .to_string_lossy()
-                    .into_owned();
+            let canonical = request
+                .workspace_selector
+                .as_ref()
+                .map(|selector| {
+                    crate::daemon::fs_api::canonical_project_root(&selector.path)
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .transpose()?;
             let result = if let Some(cursor) = &request.cursor {
                 crate::sync::lock_or_recover(&ctx.code_root_authority)
                     .continue_discovery(
                         cursor,
-                        &canonical,
+                        canonical.as_deref(),
                         &request.logical_client_id,
                         request.limit,
                     )
@@ -6463,7 +6467,11 @@ async fn handle_serialized_request_impl(
                     .map_err(internal)?;
                 let mut roots = Vec::new();
                 for row in rows {
-                    if row.session_entry_mode != "code" || row.project_root != canonical {
+                    if row.session_entry_mode != "code"
+                        || canonical
+                            .as_ref()
+                            .is_some_and(|workspace| row.project_root != *workspace)
+                    {
                         continue;
                     }
                     let lifecycle = if row.archived_at_unix_ms.is_some() {
@@ -6641,7 +6649,7 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::BadRequest,
                     message: "Code-root attention id is invalid".into(),
                 })?;
-            let decision_request_id = ctx
+            let decision = ctx
                 .db
                 .decision_attention_page(record.root_id.0, None, 256)
                 .await
@@ -6649,11 +6657,28 @@ async fn handle_serialized_request_impl(
                 .entries
                 .into_iter()
                 .find(|entry| entry.attention_id == attention_id)
-                .map(|entry| entry.decision.decision_request_id)
+                .map(|entry| entry.decision)
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "Code-root attention is no longer available".into(),
                 })?;
+            let decision_request_id = decision.decision_request_id;
+            let answer =
+                if serde_json::from_str::<serde_json::Value>(&decision.options_contract_json)
+                    .ok()
+                    .and_then(|contract| contract.get("interrupt_response_contract").cloned())
+                    .is_some()
+                {
+                    crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
+                        response: crate::db::wire::ResolveResponse::Single {
+                            selected_id: request.selected_choice.as_str().to_owned(),
+                        },
+                    }
+                } else {
+                    crate::agent_tree::PublicDecisionAnswer::option(
+                        request.selected_choice.as_str().to_owned(),
+                    )
+                };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             if !crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .begin_interrupt_resolution(&record.logical_client_id, &request.client_request_id)
@@ -6672,9 +6697,7 @@ async fn handle_serialized_request_impl(
                 .handle
                 .send_work(SessionWork::ResolveAgentDecision {
                     decision_request_id,
-                    answer: crate::agent_tree::PublicDecisionAnswer::option(
-                        request.selected_choice.as_str().to_owned(),
-                    ),
+                    answer,
                     code_root_receipt: Some(
                         crate::db::agent_tree_decisions::CodeRootInterruptReceiptWrite {
                             logical_client_id: record.logical_client_id.as_str().to_owned(),

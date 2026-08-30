@@ -64,6 +64,7 @@ impl fmt::Display for RemovedCommandError {
 
 impl std::error::Error for RemovedCommandError {}
 
+pub mod acp;
 pub mod agent;
 pub mod ask;
 pub mod assistant;

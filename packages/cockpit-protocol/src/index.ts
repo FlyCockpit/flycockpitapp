@@ -590,7 +590,10 @@ export const closeAcpCodeRootAttachmentV1RequestSchema = z
   .strict();
 export const discoverCodeRootsV1RequestSchema = z
   .object({
-    workspace_selector: z.object({ path: z.string().min(1).max(32768) }).strict(),
+    workspace_selector: z
+      .object({ path: z.string().min(1).max(32768) })
+      .strict()
+      .optional(),
     logical_client_id: opaqueAsciiId128V1Schema,
     cursor: codeRootDiscoveryCursorV1Schema.optional(),
     limit: z.number().int().min(1).max(100),

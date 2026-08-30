@@ -184,6 +184,26 @@ impl Inner {
 
 pub trait ResolveCodeRootInterrupt {
     fn resolve(&mut self, request: ResolveCodeRootInterruptV1) -> ResolveCodeRootInterruptResultV1;
+
+    /// Abort the turn that owns a permission request the ACP peer cancelled.
+    ///
+    /// A cancelled ACP response is terminal for the editor, but the daemon is
+    /// still blocked on its attention until this is sent.
+    fn cancel_turn(
+        &mut self,
+        attachment_capability: cockpit_proto::CodeRootAttachmentCapabilityV1,
+    ) -> Result<(), CancelTurnError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelTurnError {
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundPermissionFailure {
+    ClosedPermissionRefusal(ResolveCodeRootInterruptResultV1),
+    CancelTurnFailed,
 }
 
 pub trait ApprovalAck {
@@ -193,6 +213,8 @@ pub trait ApprovalAck {
 #[derive(Debug, Default)]
 pub struct RecordingResolve {
     pub calls: Vec<ResolveCodeRootInterruptV1>,
+    pub cancelled_attachments: Vec<cockpit_proto::CodeRootAttachmentCapabilityV1>,
+    pub cancel_next: Option<CancelTurnError>,
     pub next: Option<ResolveCodeRootInterruptResultV1>,
 }
 
@@ -201,6 +223,14 @@ impl ResolveCodeRootInterrupt for RecordingResolve {
         self.calls.push(request);
         self.next
             .unwrap_or(ResolveCodeRootInterruptResultV1::Accepted)
+    }
+
+    fn cancel_turn(
+        &mut self,
+        attachment_capability: cockpit_proto::CodeRootAttachmentCapabilityV1,
+    ) -> Result<(), CancelTurnError> {
+        self.cancelled_attachments.push(attachment_capability);
+        self.cancel_next.take().map_or(Ok(()), Err)
     }
 }
 
@@ -415,27 +445,36 @@ impl OutboundPermissionRegistry {
         ack: &mut dyn ApprovalAck,
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
-    ) -> Option<ResolveCodeRootInterruptResultV1> {
+    ) -> Result<(), InboundPermissionFailure> {
         let JsonRpcId::String(request_id) = id else {
-            return None;
+            return Ok(());
         };
         let parsed = match result.and_then(|node| parse_permission_outcome(node, input)) {
             Some(parsed) => parsed,
-            None => return None,
+            None => return Ok(()),
         };
-        let resolve_request = {
+        let action = {
             let _gate = self.gate.lock().expect("registry gate");
             let mut inner = self.inner.lock().expect("registry");
             match parsed {
                 PermissionOutcome::Cancelled => {
-                    let issued = inner
-                        .entries
-                        .get(request_id)
-                        .is_some_and(|entry| entry.state == PermissionStateName::Issued);
-                    if issued {
-                        let _ = inner.release_by_id(request_id, EdgeReason::AcpCancelled);
+                    let Some(attachment) = inner.entries.get(request_id).and_then(|entry| {
+                        (entry.state == PermissionStateName::Issued)
+                            .then(|| entry.attachment.clone())
+                    }) else {
+                        return Ok(());
+                    };
+                    if !inner.apply_edge(
+                        request_id,
+                        PermissionStateName::Cancelling,
+                        EdgeReason::AcpCancelled,
+                    ) {
+                        return Ok(());
                     }
-                    return None;
+                    Some(InboundPermissionAction::Cancel(
+                        cockpit_proto::CodeRootAttachmentCapabilityV1::new_opaque(attachment)
+                            .expect("registry attachment identity is bounded ASCII"),
+                    ))
                 }
                 PermissionOutcome::Selected(choice) => {
                     let admissible = inner.entries.get(request_id).is_some_and(|entry| {
@@ -443,43 +482,57 @@ impl OutboundPermissionRegistry {
                             && entry.issued_options.contains(&choice)
                     });
                     if !admissible {
-                        return None;
+                        return Ok(());
                     }
                     if !inner.apply_edge(
                         request_id,
                         PermissionStateName::TerminalReserved,
                         EdgeReason::SelectedResponse,
                     ) {
-                        return None;
+                        return Ok(());
                     }
                     let Some(entry) = inner.entries.get_mut(request_id) else {
-                        return None;
+                        return Ok(());
                     };
                     entry.selected_choice = Some(choice.clone());
                     let resolve_request_id = format!("acp:{request_id}");
                     entry.resolve_request_id = Some(resolve_request_id.clone());
-                    Some(ResolveCodeRootInterruptV1 {
-                        attachment_capability:
-                            cockpit_proto::CodeRootAttachmentCapabilityV1::new_opaque(
-                                entry.attachment.clone(),
+                    Some(InboundPermissionAction::Resolve(
+                        ResolveCodeRootInterruptV1 {
+                            attachment_capability:
+                                cockpit_proto::CodeRootAttachmentCapabilityV1::new_opaque(
+                                    entry.attachment.clone(),
+                                )
+                                .expect("registry attachment identity is bounded ASCII"),
+                            attention_id: cockpit_proto::OpaqueAsciiId128V1::new(
+                                entry.attention_id.clone(),
                             )
-                            .expect("registry attachment identity is bounded ASCII"),
-                        attention_id: cockpit_proto::OpaqueAsciiId128V1::new(
-                            entry.attention_id.clone(),
-                        )
-                        .expect("registry attention identity is bounded ASCII"),
-                        client_request_id: cockpit_proto::OpaqueAsciiId128V1::new(
-                            resolve_request_id,
-                        )
-                        .expect("derived resolve id is bounded ASCII"),
-                        selected_choice: cockpit_proto::OpaqueAsciiId128V1::new(choice)
-                            .expect("issued choice is bounded ASCII"),
-                    })
+                            .expect("registry attention identity is bounded ASCII"),
+                            client_request_id: cockpit_proto::OpaqueAsciiId128V1::new(
+                                resolve_request_id,
+                            )
+                            .expect("derived resolve id is bounded ASCII"),
+                            selected_choice: cockpit_proto::OpaqueAsciiId128V1::new(choice)
+                                .expect("issued choice is bounded ASCII"),
+                        },
+                    ))
                 }
             }
         };
-        let Some(resolve_request) = resolve_request else {
-            return None;
+        let Some(action) = action else {
+            return Ok(());
+        };
+        let resolve_request = match action {
+            InboundPermissionAction::Cancel(attachment_capability) => {
+                if resolve.cancel_turn(attachment_capability).is_err() {
+                    return Err(InboundPermissionFailure::CancelTurnFailed);
+                }
+                let _gate = self.gate.lock().expect("registry gate");
+                let mut inner = self.inner.lock().expect("registry");
+                let _ = inner.release_by_id(request_id, EdgeReason::AcpCancelled);
+                return Ok(());
+            }
+            InboundPermissionAction::Resolve(resolve_request) => resolve_request,
         };
         {
             let _gate = self.gate.lock().expect("registry gate");
@@ -489,7 +542,7 @@ impl OutboundPermissionRegistry {
                 PermissionStateName::Resolving,
                 EdgeReason::ResolveStart,
             ) {
-                return None;
+                return Ok(());
             }
         }
         counters.resolve_calls += 1;
@@ -498,10 +551,10 @@ impl OutboundPermissionRegistry {
         let mut inner = self.inner.lock().expect("registry");
         let delivery_id = {
             let Some(entry) = inner.entries.get_mut(request_id) else {
-                return None;
+                return Ok(());
             };
             if entry.state != PermissionStateName::Resolving {
-                return None;
+                return Ok(());
             }
             entry.daemon_outcome = Some(outcome);
             entry.delivery_id.clone()
@@ -511,7 +564,7 @@ impl OutboundPermissionRegistry {
             PermissionStateName::Terminal,
             EdgeReason::DaemonOutcome,
         ) {
-            return None;
+            return Ok(());
         }
         let closed_refusal = match outcome {
             ResolveCodeRootInterruptResultV1::Accepted
@@ -529,7 +582,10 @@ impl OutboundPermissionRegistry {
             }
         };
         let _ = sink;
-        closed_refusal
+        match closed_refusal {
+            Some(outcome) => Err(InboundPermissionFailure::ClosedPermissionRefusal(outcome)),
+            None => Ok(()),
+        }
     }
 
     pub fn on_disconnect(&self, counters: &mut AcpTransportCounters) {
@@ -555,14 +611,26 @@ impl OutboundPermissionRegistry {
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
     ) {
+        self.on_daemon_terminal_for_attachment(None, sink, counters);
+    }
+
+    /// Cancel issued permission requests for a daemon-terminal attachment.
+    /// An absent attachment denotes a terminal connection and closes every
+    /// outstanding request, preserving the original daemon-terminal path.
+    pub fn on_daemon_terminal_for_attachment(
+        &self,
+        attachment: Option<&str>,
+        sink: &mut dyn FrameSink,
+        counters: &mut AcpTransportCounters,
+    ) {
         let _gate = self.gate.lock().expect("registry gate");
         let mut inner = self.inner.lock().expect("registry");
         let ids: Vec<String> = inner.entries.keys().cloned().collect();
         for id in ids {
-            let issued = inner
-                .entries
-                .get(&id)
-                .is_some_and(|entry| entry.state == PermissionStateName::Issued);
+            let issued = inner.entries.get(&id).is_some_and(|entry| {
+                entry.state == PermissionStateName::Issued
+                    && attachment.is_none_or(|attachment| entry.attachment == attachment)
+            });
             if !issued {
                 continue;
             }
@@ -650,7 +718,8 @@ impl OutboundPermissionRegistry {
             (TerminalReserved, Resolving, EdgeReason::ResolveStart) => true,
             (Resolving, Terminal, EdgeReason::DaemonOutcome) => true,
             (Terminal, Released, EdgeReason::AckOrClose) => true,
-            (Issued, Released, EdgeReason::AcpCancelled) => true,
+            (Issued, Cancelling, EdgeReason::AcpCancelled) => true,
+            (Cancelling, Released, EdgeReason::AcpCancelled) => true,
             _ => false,
         }
     }
@@ -691,6 +760,11 @@ pub struct ReservedPermission {
 enum PermissionOutcome {
     Selected(String),
     Cancelled,
+}
+
+enum InboundPermissionAction {
+    Resolve(ResolveCodeRootInterruptV1),
+    Cancel(cockpit_proto::CodeRootAttachmentCapabilityV1),
 }
 
 fn allocate_id(inner: &mut Inner) -> String {

@@ -2,10 +2,9 @@
 //!
 //! Cockpit's parser gates each frame and retains raw `params`; the admitted
 //! request is then routed through jsonrpsee's raw-request dispatch API. The
-//! production transport deliberately has no session ingress owner yet, so its
-//! session methods fail closed. Tests can inject a recording owner to exercise
-//! the DTO-to-bridge conversion seam without pretending that a daemon API
-//! exists.
+//! the default module fails closed when no ingress owner is supplied. The
+//! `cockpit acp` command supplies the socket-daemon Code-root ingress; tests
+//! can inject a recording owner to exercise the DTO-to-bridge seam.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +14,7 @@ use jsonrpsee_types::{ErrorObjectOwned, Params};
 use super::AcpTransportCounters;
 use super::classify::InboundRequest;
 use super::dto::{SessionAdmissionDto, decode_session_load, decode_session_new, initialize_result};
+use super::envelope::{invalid_params as invalid_params_response, success_response};
 use super::raw_json::parse_frame;
 
 /// If this fails to type-check, return the transport-selection prompt.
@@ -27,6 +27,7 @@ const JSONRPSEE_RAW_PARAMS_API: for<'a, 'p> fn(&'a Params<'p>) -> Option<&'a str
 
 const INBOUND_METHODS: &[&str] = &[
     "initialize",
+    "session/list",
     "session/new",
     "session/load",
     "session/cancel",
@@ -59,6 +60,12 @@ pub trait SessionIngress: Send {
         counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError>;
 
+    fn list(
+        &mut self,
+        raw_params: &str,
+        counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError>;
+
     fn cancel(
         &mut self,
         raw_params: &str,
@@ -72,7 +79,7 @@ pub trait SessionIngress: Send {
     ) -> Result<serde_json::Value, SessionIngressError>;
 }
 
-/// The only production owner until the out-of-scope daemon adaptation lands.
+/// Fail-closed owner for callers that do not compose a daemon ingress.
 #[derive(Debug, Default)]
 pub struct UnavailableSessionIngress;
 
@@ -84,6 +91,14 @@ impl SessionIngress for UnavailableSessionIngress {
     fn admit(
         &mut self,
         _admission: SessionAdmissionDto,
+        _counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError> {
+        Err(SessionIngressError::Unavailable)
+    }
+
+    fn list(
+        &mut self,
+        _raw_params: &str,
         _counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError> {
         Err(SessionIngressError::Unavailable)
@@ -131,11 +146,32 @@ fn build_rpc_module_from_arc<I: SessionIngress + 'static>(
 ) -> RpcModule<DispatchContext<I>> {
     let mut module = RpcModule::from_arc(context);
     module
-        .register_method("initialize", |params, _, _| {
-            let _ = JSONRPSEE_RAW_PARAMS_API(&params);
+        .register_method("initialize", |params, context, _| {
+            let raw = context
+                .raw_params
+                .clone()
+                .or_else(|| JSONRPSEE_RAW_PARAMS_API(&params).map(str::to_string));
+            validate_initialize(raw.as_deref()).map_err(invalid_params)?;
             Ok::<_, ErrorObjectOwned>(initialize_result())
         })
         .expect("initialize is unique");
+    module
+        .register_method("session/list", |params, context, _| {
+            let raw = context
+                .raw_params
+                .clone()
+                .or_else(|| JSONRPSEE_RAW_PARAMS_API(&params).map(str::to_string))
+                .unwrap_or_else(|| "{}".to_string());
+            ensure_session_ingress_available(context)?;
+            let mut counters = context.counters.lock().expect("dispatch counters");
+            context
+                .session_ingress
+                .lock()
+                .expect("session ingress")
+                .list(&raw, &mut counters)
+                .map_err(ingress_error)
+        })
+        .expect("session/list is unique");
     module
         .register_method("session/new", |params, context, _| {
             let raw = required_raw_params(&params, context)?;
@@ -261,11 +297,32 @@ pub enum DispatchResult {
     NoResponse,
 }
 
+/// Validate required initialization parameters before any caller acquires the
+/// daemon. A supported server may still negotiate its latest version with an
+/// older client; an absent or malformed protocol version is never a launch.
+pub fn validate_initialize(raw_params: Option<&str>) -> Result<(), &'static str> {
+    let raw = raw_params.ok_or("params required")?;
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| "params invalid")?;
+    value
+        .as_object()
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| *version > 0)
+        .ok_or("protocolVersion required")?;
+    Ok(())
+}
+
 pub fn dispatch_request<I: SessionIngress + 'static>(
     request: &InboundRequest,
     session_ingress: Arc<Mutex<I>>,
     counters: &mut AcpTransportCounters,
 ) -> DispatchResult {
+    if request.method == "initialize" {
+        return match validate_initialize(request.raw_params.as_deref()) {
+            Ok(()) => DispatchResult::Response(success_response(&request.id, initialize_result())),
+            Err(message) => DispatchResult::Response(invalid_params_response(&request.id, message)),
+        };
+    }
     let context = Arc::new(DispatchContext {
         counters: Mutex::new(AcpTransportCounters::default()),
         session_ingress,

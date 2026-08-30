@@ -145,6 +145,7 @@ export default function ProjectSessions() {
   const [daemonState, setDaemonState] = useState(emptyNativeDaemonState);
   const [activeModel, setActiveModel] = useState<ReturnType<typeof activeModelView> | null>(null);
   const selectedSessionRef = useRef<string | null>(initialSession ?? null);
+  const sessionsRef = useRef<SessionSummary[]>([]);
   const historyRef = useRef<NativeHistoryEntry[]>([]);
   const historyPagingRef = useRef<NativeHistoryPagingState>(emptyNativeHistoryPagingState());
   const daemonStateRef = useRef(emptyNativeDaemonState);
@@ -352,6 +353,12 @@ export default function ProjectSessions() {
     const attachClient = clientRef.current;
     const attachEpoch = connectionEpochRef.current;
     if (!attachClient || statusRef.current !== "connected") return;
+    const session = sessionsRef.current.find((candidate) => candidate.session_id === sessionId);
+    if (!session) return;
+    if (session.session_entry_mode === "code") {
+      setError("Code sessions cannot be opened in the native app.");
+      return;
+    }
     const coordinator = attachCoordinatorRef.current;
     if (!coordinator.needsAttach(attachClient, attachEpoch, sessionId)) return;
     // Switching sessions invalidates any in-flight older-page request.
@@ -364,7 +371,11 @@ export default function ProjectSessions() {
     setAttachingSessionId(sessionId);
     setError(null);
     try {
-      const result = await attachClient.attach({ session_id: sessionId, interactive: true });
+      const result = await attachClient.attach({
+        session_id: sessionId,
+        interactive: true,
+        session_entry_mode: session.session_entry_mode,
+      });
       if (!attemptIsCurrent()) return;
       const acceptedIds = clientSubmissionIdsFromHistory(result.history);
       const nextHistory = restoreRetainedUserMessagesAfterAttach(
@@ -450,6 +461,7 @@ export default function ProjectSessions() {
         statusRef.current !== "connected"
       )
         return;
+      sessionsRef.current = result.sessions;
       setSessions(result.sessions);
       const nextSession = selectedSessionRef.current ?? result.sessions[0]?.session_id ?? null;
       setSelectedSessionId(nextSession);

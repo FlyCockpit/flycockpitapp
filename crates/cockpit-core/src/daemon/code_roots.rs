@@ -83,7 +83,7 @@ struct CodeRootRequestInFlight {
 
 #[derive(Debug, Clone)]
 struct DiscoverySnapshot {
-    workspace_path: String,
+    workspace_path: Option<String>,
     logical_client_id: proto::OpaqueAsciiId128V1,
     roots: Vec<proto::CodeRootSummaryV1>,
     offset: usize,
@@ -515,7 +515,7 @@ impl CodeRootAuthorityV1 {
 
     pub fn begin_discovery(
         &mut self,
-        workspace_path: String,
+        workspace_path: Option<String>,
         logical_client_id: proto::OpaqueAsciiId128V1,
         roots: Vec<proto::CodeRootSummaryV1>,
         limit: u16,
@@ -551,7 +551,7 @@ impl CodeRootAuthorityV1 {
     pub fn continue_discovery(
         &mut self,
         cursor: &proto::CodeRootDiscoveryCursorV1,
-        workspace_path: &str,
+        workspace_path: Option<&str>,
         logical_client_id: &proto::OpaqueAsciiId128V1,
         limit: u16,
     ) -> Result<proto::DiscoverCodeRootsV1Result> {
@@ -561,7 +561,7 @@ impl CodeRootAuthorityV1 {
             .discovery
             .get_mut(&key)
             .context("unknown or expired Code-root discovery cursor")?;
-        if snapshot.workspace_path != workspace_path
+        if snapshot.workspace_path.as_deref() != workspace_path
             || snapshot.logical_client_id != *logical_client_id
         {
             bail!("Code-root discovery cursor does not match this request");

@@ -65,11 +65,20 @@ pub(crate) enum CodeRootRequestStart<T> {
     InFlight,
 }
 
+/// The dispatch guard owns an active request. A bound create becomes
+/// recoverable only after that guard is dropped, when the original future can
+/// no longer own any further side effects.
+#[derive(Debug, Clone, Copy)]
+enum CodeRootRequestLiveness {
+    Active,
+    Recoverable { since: Instant },
+}
+
 #[derive(Debug, Clone)]
 struct CodeRootRequestInFlight {
     fingerprint: [u8; 32],
     created_root_id: Option<proto::CodeRootIdV1>,
-    started_at: Instant,
+    liveness: CodeRootRequestLiveness,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +111,16 @@ impl CodeRootAuthorityV1 {
         self.idempotency
             .retain(|_, receipt| now.duration_since(receipt.recorded_at) < IDEMPOTENCY_RECEIPT_TTL);
         self.code_root_requests_in_flight
-            .retain(|_, request| now.duration_since(request.started_at) < IDEMPOTENCY_RECEIPT_TTL);
+            .retain(|_, request| match request.liveness {
+                // An active dispatch guard is the ownership proof. It must
+                // never be reaped merely because an awaited operation is
+                // slow, otherwise a retry could acquire the same identity
+                // while the original future still owns side effects.
+                CodeRootRequestLiveness::Active => true,
+                CodeRootRequestLiveness::Recoverable { since } => {
+                    now.duration_since(since) < IDEMPOTENCY_RECEIPT_TTL
+                }
+            });
         self.discovery
             .retain(|_, snapshot| now < snapshot.expires_at);
     }
@@ -116,9 +134,6 @@ impl CodeRootAuthorityV1 {
             .count();
         if open_attachments + self.attachment_reservations.len() >= MAX_ATTACHMENTS {
             bail!("Code-root attachment capacity exhausted");
-        }
-        if self.idempotency.len() + self.attachment_reservations.len() >= MAX_IDEMPOTENCY_RECEIPTS {
-            bail!("Code-root idempotency capacity exhausted");
         }
         let reservation = Uuid::new_v4().simple().to_string();
         self.attachment_reservations.insert(reservation.clone());
@@ -148,21 +163,35 @@ impl CodeRootAuthorityV1 {
             client_request_id.as_str().to_owned(),
             route,
         );
-        if let Some(in_flight) = self.code_root_requests_in_flight.get(&key) {
+        if let Some(in_flight) = self.code_root_requests_in_flight.get_mut(&key) {
             if in_flight.fingerprint != fingerprint {
                 bail!("Code-root idempotency conflict");
             }
-            if let Some(root_id) = in_flight.created_root_id {
-                return Ok(CodeRootRequestStart::Recovering(root_id));
+            match in_flight.liveness {
+                CodeRootRequestLiveness::Active => return Ok(CodeRootRequestStart::InFlight),
+                CodeRootRequestLiveness::Recoverable { .. } => {
+                    let root_id = in_flight
+                        .created_root_id
+                        .context("unbound Code-root request cannot be recovered")?;
+                    // This retry now owns recovery work. A second retry must
+                    // wait for it rather than concurrently attach/project the
+                    // same root.
+                    in_flight.liveness = CodeRootRequestLiveness::Active;
+                    return Ok(CodeRootRequestStart::Recovering(root_id));
+                }
             }
-            return Ok(CodeRootRequestStart::InFlight);
+        }
+        if self.idempotency.len() + self.code_root_requests_in_flight.len()
+            >= MAX_IDEMPOTENCY_RECEIPTS
+        {
+            bail!("Code-root idempotency capacity exhausted");
         }
         self.code_root_requests_in_flight.insert(
             key,
             CodeRootRequestInFlight {
                 fingerprint,
                 created_root_id: None,
-                started_at: Instant::now(),
+                liveness: CodeRootRequestLiveness::Active,
             },
         );
         Ok(CodeRootRequestStart::Started)
@@ -226,10 +255,11 @@ impl CodeRootAuthorityV1 {
     }
 
     /// An unbound request has not created a root, so it is safe to let an
-    /// error/cancellation relinquish its identity.  Once `created_root_id` is
-    /// bound, keep the fence until its receipt is completed (or expires): an
-    /// exact retry will recover that root rather than create a second one.
-    pub fn abandon_unbound_code_root_request(
+    /// error/cancellation relinquish its identity. Once `created_root_id` is
+    /// bound, a dropped guard leaves a bounded recovery association. Active
+    /// guards are never reaped: their lifetime is the proof that the current
+    /// future still owns its side effects.
+    pub fn abandon_code_root_request(
         &mut self,
         logical_client_id: &proto::OpaqueAsciiId128V1,
         client_request_id: &proto::OpaqueAsciiId128V1,
@@ -240,11 +270,14 @@ impl CodeRootAuthorityV1 {
             client_request_id.as_str().to_owned(),
             route,
         );
-        if self
-            .code_root_requests_in_flight
-            .get(&key)
-            .is_some_and(|request| request.created_root_id.is_none())
-        {
+        let Some(request) = self.code_root_requests_in_flight.get_mut(&key) else {
+            return;
+        };
+        if request.created_root_id.is_some() {
+            request.liveness = CodeRootRequestLiveness::Recoverable {
+                since: Instant::now(),
+            };
+        } else {
             self.code_root_requests_in_flight.remove(&key);
         }
     }
@@ -302,7 +335,9 @@ impl CodeRootAuthorityV1 {
 
     pub fn preflight_idempotency(&mut self) -> Result<()> {
         self.reap_expired(Instant::now());
-        if self.idempotency.len() >= MAX_IDEMPOTENCY_RECEIPTS {
+        if self.idempotency.len() + self.code_root_requests_in_flight.len()
+            >= MAX_IDEMPOTENCY_RECEIPTS
+        {
             bail!("Code-root idempotency capacity exhausted");
         }
         Ok(())
@@ -691,6 +726,32 @@ impl CodeRootAuthorityV1 {
         }
     }
 
+    /// Claims the ACK identity before its durable cursor write. The claim is
+    /// also counted as a pending receipt, so a successful durable ACK always
+    /// has room to record the replay result before releasing its owner.
+    pub fn start_ack(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        request: &proto::AckCodeRootDeliveriesV1Request,
+    ) -> Result<CodeRootRequestStart<proto::AckCodeRootDeliveriesV1Result>> {
+        match self.start_request(
+            logical_client_id,
+            &request.client_request_id,
+            "ack",
+            request_fingerprint(request)?,
+        )? {
+            CodeRootRequestStart::Started => Ok(CodeRootRequestStart::Started),
+            CodeRootRequestStart::InFlight => Ok(CodeRootRequestStart::InFlight),
+            CodeRootRequestStart::Replayed(IdempotencyResult::Ack(result)) => {
+                Ok(CodeRootRequestStart::Replayed(result))
+            }
+            CodeRootRequestStart::Recovering(_) => {
+                bail!("invalid recovered Code-root ACK request")
+            }
+            CodeRootRequestStart::Replayed(_) => bail!("invalid Code-root idempotency receipt"),
+        }
+    }
+
     pub fn record_ack(
         &mut self,
         logical_client_id: &proto::OpaqueAsciiId128V1,
@@ -891,7 +952,7 @@ mod tests {
                 root_id,
             )
             .unwrap();
-        authority.abandon_unbound_code_root_request(
+        authority.abandon_code_root_request(
             &request.logical_client_id,
             &request.client_request_id,
             "create",
@@ -901,6 +962,90 @@ mod tests {
             authority.start_create(&request).unwrap(),
             CodeRootRequestStart::Recovering(recovered) if recovered == root_id
         ));
+    }
+
+    #[test]
+    fn active_request_fence_outlives_the_recovery_ttl() {
+        let request = create_request();
+        let root_id = proto::CodeRootIdV1(Uuid::new_v4());
+        let mut authority = CodeRootAuthorityV1::default();
+
+        assert!(matches!(
+            authority.start_create(&request).unwrap(),
+            CodeRootRequestStart::Started
+        ));
+        authority
+            .bind_created_root(
+                &request.logical_client_id,
+                &request.client_request_id,
+                root_id,
+            )
+            .unwrap();
+        authority.reap_expired(Instant::now() + IDEMPOTENCY_RECEIPT_TTL + Duration::from_secs(1));
+
+        assert!(matches!(
+            authority.start_create(&request).unwrap(),
+            CodeRootRequestStart::InFlight
+        ));
+    }
+
+    #[test]
+    fn dropped_bound_request_becomes_recoverable_then_expires() {
+        let request = create_request();
+        let root_id = proto::CodeRootIdV1(Uuid::new_v4());
+        let mut authority = CodeRootAuthorityV1::default();
+
+        assert!(matches!(
+            authority.start_create(&request).unwrap(),
+            CodeRootRequestStart::Started
+        ));
+        authority
+            .bind_created_root(
+                &request.logical_client_id,
+                &request.client_request_id,
+                root_id,
+            )
+            .unwrap();
+        authority.abandon_code_root_request(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "create",
+        );
+        authority.reap_expired(Instant::now() + IDEMPOTENCY_RECEIPT_TTL + Duration::from_secs(1));
+
+        assert!(matches!(
+            authority.start_create(&request).unwrap(),
+            CodeRootRequestStart::Started
+        ));
+    }
+
+    #[test]
+    fn ack_claim_is_first_wins_until_its_receipt_is_recorded() {
+        let logical_client_id = proto::OpaqueAsciiId128V1::new("client").unwrap();
+        let request = proto::AckCodeRootDeliveriesV1Request {
+            attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                Uuid::new_v4(),
+            ),
+            through: proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::new_v4()),
+            client_request_id: proto::OpaqueAsciiId128V1::new("request").unwrap(),
+        };
+        let mut authority = CodeRootAuthorityV1::default();
+
+        assert!(matches!(
+            authority.start_ack(&logical_client_id, &request).unwrap(),
+            CodeRootRequestStart::Started
+        ));
+        assert!(matches!(
+            authority.start_ack(&logical_client_id, &request).unwrap(),
+            CodeRootRequestStart::InFlight
+        ));
+        let mut conflicting = request.clone();
+        conflicting.through = proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::new_v4());
+        assert!(
+            authority
+                .start_ack(&logical_client_id, &conflicting)
+                .is_err()
+        );
     }
 
     #[test]

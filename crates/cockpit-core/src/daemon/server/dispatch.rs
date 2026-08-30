@@ -5698,10 +5698,10 @@ async fn handle_serialized_request_impl(
                         logical_client_id: request.logical_client_id.clone(),
                         client_request_id: request.client_request_id.clone(),
                     });
-            // Reserve before any async session or durable-projection work.
-            // The reservation covers both the open capability and its
-            // idempotency receipt, so concurrent clients cannot all perform
-            // side effects after passing a stale capacity observation.
+            // Reserve attachment capacity before any async session or
+            // durable-projection work. The request fence already reserves
+            // idempotency-receipt capacity, so concurrent clients cannot all
+            // perform side effects after a stale capacity observation.
             let reservation = crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .reserve_new_attachment()
                 .map_err(code_root_contract_error)?;
@@ -6137,15 +6137,37 @@ async fn handle_serialized_request_impl(
                 .authenticate(&request.attachment_capability)
                 .map_err(code_root_contract_error)?
                 .clone();
-            if let Some(result) = crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .replay_ack(&record.logical_client_id, &request)
+            match crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .start_ack(&record.logical_client_id, &request)
                 .map_err(code_root_contract_error)?
             {
-                return Ok(Response::CodeRootDeliveriesAcked(result));
+                crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
+                    return Ok(Response::CodeRootDeliveriesAcked(result));
+                }
+                crate::daemon::code_roots::CodeRootRequestStart::InFlight => {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message:
+                            "Code-root delivery ACK is already in progress; retry the same request"
+                                .into(),
+                    });
+                }
+                crate::daemon::code_roots::CodeRootRequestStart::Recovering(_) => {
+                    return Err(code_root_contract_error(anyhow::anyhow!(
+                        "invalid recovered Code-root ACK request"
+                    )));
+                }
+                crate::daemon::code_roots::CodeRootRequestStart::Started => {}
             }
-            crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .preflight_idempotency()
-                .map_err(code_root_contract_error)?;
+            // This guard holds the first-wins claim across the durable cursor
+            // write and its receipt. Dropping a cancelled dispatch releases
+            // an unbound ACK claim; a retry can then safely take ownership.
+            let _request_guard = CodeRootRequestGuard::new(
+                &ctx.code_root_authority,
+                record.logical_client_id.clone(),
+                request.client_request_id.clone(),
+                "ack",
+            );
             ctx.db
                 .acknowledge_code_root_projection(
                     record.root_id.0,
@@ -6161,6 +6183,11 @@ async fn handle_serialized_request_impl(
             crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .record_ack(&record.logical_client_id, &request, result.clone())
                 .map_err(code_root_contract_error)?;
+            crate::sync::lock_or_recover(&ctx.code_root_authority).finish_code_root_request(
+                &record.logical_client_id,
+                &request.client_request_id,
+                "ack",
+            );
             Ok(Response::CodeRootDeliveriesAcked(result))
         }
 
@@ -26696,10 +26723,11 @@ impl Drop for CodeRootAttachmentReservationGuard<'_> {
     }
 }
 
-/// Owns a create/attach idempotency fence while no Code root has been bound.
-/// Once create has bound a newly-created root, cancellation deliberately
-/// retains the fence so an exact retry resumes that root; a successful receipt
-/// explicitly finishes it. The fence is separate from attachment capacity.
+/// Owns a create, attach, or ACK idempotency fence while its dispatch future
+/// may still own side effects. Once create has bound a newly-created root,
+/// cancellation deliberately retains a bounded recovery association so an
+/// exact retry resumes that root; a successful receipt explicitly finishes
+/// it. The fence is separate from attachment capacity.
 struct CodeRootRequestGuard<'a> {
     authority: &'a std::sync::Arc<std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
     logical_client_id: proto::OpaqueAsciiId128V1,
@@ -26732,7 +26760,7 @@ impl<'a> CodeRootRequestGuard<'a> {
 
 impl Drop for CodeRootRequestGuard<'_> {
     fn drop(&mut self) {
-        crate::sync::lock_or_recover(self.authority).abandon_unbound_code_root_request(
+        crate::sync::lock_or_recover(self.authority).abandon_code_root_request(
             &self.logical_client_id,
             &self.client_request_id,
             self.route,

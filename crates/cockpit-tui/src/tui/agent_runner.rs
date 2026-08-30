@@ -3313,6 +3313,45 @@ fn daemon_request_blocking(
     }
 }
 
+/// Resolve an Assistant session through a persistent lifecycle acquisition.
+/// Code and Computer session work uses the configured default lifetime; an
+/// Assistant is durable background work and therefore promotes an idle
+/// ephemeral owner before its session row is opened or created.
+pub(crate) fn resolve_assistant_session_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+    request: Request,
+) -> Result<(Response, Option<String>), String> {
+    #[cfg(test)]
+    {
+        let _ = lifecycle;
+        return crate::tui::settings::test_daemon_request(request).map(|response| (response, None));
+    }
+    #[cfg(not(test))]
+    {
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let resolved = lifecycle
+                    .resolve(LifecycleIntent::PromoteToPersistent)
+                    .await
+                    .map_err(|error| format!("daemon lifecycle: {error}"))?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)
+                    .await
+                    .map_err(|error| format!("daemon connect: {error}"))?;
+                let response = client
+                    .request_ok(request)
+                    .await
+                    .map_err(|error| format!("daemon request: {error}"))?;
+                let promotion_notice = resolved.startup_notice.filter(|notice| {
+                    notice == cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
+                });
+                Ok((response, promotion_notice))
+            })
+        })
+    }
+}
+
 /// Blocking daemon transport for an [`AsyncActionRunner::start_blocking`]
 /// worker only. Naming this boundary distinctly lets source ratchets forbid
 /// accidental use from reducers and the async event-loop thread.

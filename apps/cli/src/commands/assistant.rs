@@ -470,6 +470,12 @@ async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Re
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant chat")?;
+    if daemon.promoted_from_ephemeral() {
+        eprintln!(
+            "{}",
+            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
+        );
+    }
     let response = daemon
         .client
         .request(Request::ResolveAssistantSession {

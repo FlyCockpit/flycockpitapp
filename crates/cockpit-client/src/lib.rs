@@ -173,6 +173,9 @@ pub enum LifecycleIntent {
     /// Attach to the current owner, or start a reference-counted ephemeral
     /// owner at the shared ledger socket.
     AttachOrEphemeral,
+    /// Require a persistent owner. If the shared ledger is currently owned by
+    /// an ephemeral daemon, the lifecycle host promotes it before returning.
+    PromoteToPersistent,
 }
 
 impl LifecycleIntent {
@@ -180,6 +183,7 @@ impl LifecycleIntent {
         match self {
             Self::AttachOrPersistent => 0,
             Self::AttachOrEphemeral => 1,
+            Self::PromoteToPersistent => 2,
         }
     }
 
@@ -187,6 +191,7 @@ impl LifecycleIntent {
         match value {
             0 => Self::AttachOrPersistent,
             1 => Self::AttachOrEphemeral,
+            2 => Self::PromoteToPersistent,
             _ => unreachable!("invalid lifecycle intent"),
         }
     }

@@ -7848,6 +7848,11 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept assistant sessions; assistant sessions require a persistent daemon owner",
+                ));
+            }
             let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
@@ -8752,6 +8757,11 @@ async fn handle_serialized_request_impl(
             no_sandbox,
             env_snapshot,
         } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept assistant sessions; assistant sessions require a persistent daemon owner",
+                ));
+            }
             let env_snapshot = env_snapshot.map(EnvSnapshot::from_wire).unwrap_or_else(|| {
                 ctx.env_baseline
                     .read()

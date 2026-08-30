@@ -1276,6 +1276,18 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
             description: "helper".into(),
             prompt: "help".into(),
         },
+        Request::ResolveAssistantSession {
+            assistant_id: "helper-bot".into(),
+            project_root: "/repo".into(),
+            mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+        },
+        Request::CreateAssistantSession {
+            name: "helper-bot".into(),
+            project_root: "/repo".into(),
+            initial_model: None,
+            no_sandbox: false,
+            env_snapshot: None,
+        },
     ];
     for request in mutations {
         let mut state = owner_state();
@@ -23718,7 +23730,7 @@ async fn create_test_assistant(
 #[cfg(unix)]
 async fn assert_create_assistant_session_happy() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let ctx = test_ctx();
+    let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     ctx.db

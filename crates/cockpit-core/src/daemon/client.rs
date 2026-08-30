@@ -13,6 +13,11 @@ use crate::daemon::proto::{self, Request};
 
 const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One-line presentation notice emitted after an Assistant promotes the
+/// shared ledger owner from ephemeral to persistent mode.
+pub const ASSISTANT_PERSISTENCE_NOTICE: &str =
+    "Assistants run in the background; keeping Cockpit running";
+
 fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
     match intent {
         cockpit_client::LifecycleIntent::AttachOrPersistent => {
@@ -21,6 +26,7 @@ fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
         cockpit_client::LifecycleIntent::AttachOrEphemeral => {
             LifecycleMode::from_background_agents(false)
         }
+        cockpit_client::LifecycleIntent::PromoteToPersistent => LifecycleMode::PromoteToPersistent,
     }
 }
 
@@ -33,6 +39,10 @@ pub enum LifecycleMode {
     AttachOrPersistent,
     /// Attach to any current owner, otherwise start an ephemeral owner.
     AttachOrEphemeral,
+    /// Require a persistent owner, replacing an idle ephemeral owner when
+    /// necessary. Assistant sessions use this instead of treating the global
+    /// background-agents preference as a dead-end block.
+    PromoteToPersistent,
 }
 
 impl LifecycleMode {
@@ -57,6 +67,7 @@ pub(crate) struct ConnectedDaemon {
     owns_daemon: bool,
     socket: PathBuf,
     startup_notice: Option<String>,
+    promoted_from_ephemeral: bool,
 }
 
 /// Foreground CLI connection scoped to one operation.
@@ -290,14 +301,24 @@ where
 /// so exposing the client cannot detach an ephemeral child.
 pub struct PersistentDaemonSession {
     pub client: DaemonClient,
+    promoted_from_ephemeral: bool,
 }
 
-/// Attach to the canonical persistent daemon, spawning one if needed.
+impl PersistentDaemonSession {
+    /// Whether acquiring this session promoted the shared ledger owner from
+    /// ephemeral to persistent mode.
+    pub fn promoted_from_ephemeral(&self) -> bool {
+        self.promoted_from_ephemeral
+    }
+}
+
+/// Require the canonical persistent daemon, promoting an idle ephemeral owner
+/// before spawning one when needed.
 ///
 /// Product CLI commands that need installation state must go through this
 /// helper. Spawn failure is fail-closed: callers must not open SQLite.
 pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
-    let connected = probe_or_spawn(LifecycleMode::AttachOrPersistent).await?;
+    let connected = probe_or_spawn(LifecycleMode::PromoteToPersistent).await?;
     if connected.owns_daemon {
         anyhow::bail!(
             "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"
@@ -305,6 +326,7 @@ pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
     }
     Ok(PersistentDaemonSession {
         client: connected.client,
+        promoted_from_ephemeral: connected.promoted_from_ephemeral,
     })
 }
 
@@ -327,7 +349,11 @@ pub async fn serve_lifecycle_requests(
                 endpoint: connected.endpoint,
                 owns_daemon: connected.owns_daemon,
                 socket: connected.socket,
-                startup_notice: connected.startup_notice,
+                startup_notice: connected.startup_notice.or_else(|| {
+                    connected
+                        .promoted_from_ephemeral
+                        .then(|| ASSISTANT_PERSISTENCE_NOTICE.to_string())
+                }),
             });
         match resolved {
             Ok(resolution) => {
@@ -396,6 +422,44 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     probe_or_spawn_with_spawn_authorization(mode, None).await
 }
 
+/// Replace the shared ephemeral owner once it has confirmed that no agent is
+/// running. The next lifecycle acquisition claims the released canonical
+/// endpoint as a persistent owner.
+async fn promote_ephemeral_owner(paths: &crate::daemon::DaemonPaths) -> Result<()> {
+    let old_pid = crate::daemon::daemon_pid(paths);
+    let client = connect_local_daemon(&paths.socket)
+        .await
+        .context("connecting to ephemeral daemon for persistent promotion")?;
+    let response = client
+        .request_ok(Request::RestartIfIdle)
+        .await
+        .context("requesting ephemeral daemon promotion")?;
+    let proto::Response::RestartDecision {
+        will_restart,
+        reason,
+    } = response
+    else {
+        anyhow::bail!("unexpected daemon promotion response: {response:?}");
+    };
+    if !will_restart {
+        anyhow::bail!(
+            "persistent daemon owner required; promotion deferred: {}",
+            reason.unwrap_or_else(|| "the current daemon cannot restart".to_string())
+        );
+    }
+    drop(client);
+    if !crate::daemon::wait_for_restart_release(
+        paths,
+        old_pid,
+        crate::daemon::restart_release_timeout(None),
+    )
+    .await
+    {
+        anyhow::bail!("timed out waiting for ephemeral daemon promotion to finish");
+    }
+    Ok(())
+}
+
 /// Resolve a daemon under optional request-scoped spawn authority. The permit
 /// runs through the only owner-creation path, after every discovery or restart
 /// wait, so cancellation and creation have a single linearization point.
@@ -406,10 +470,24 @@ async fn probe_or_spawn_with_spawn_authorization(
     use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
 
     match mode {
-        LifecycleMode::AttachOrPersistent | LifecycleMode::AttachOrEphemeral => {
+        LifecycleMode::AttachOrPersistent
+        | LifecycleMode::AttachOrEphemeral
+        | LifecycleMode::PromoteToPersistent => {
             let discovered = discover().await;
             match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
                 DiscoverAttachPlan::AttachRunning => {
+                    if matches!(mode, LifecycleMode::PromoteToPersistent)
+                        && discovered.paths.ephemeral
+                    {
+                        promote_ephemeral_owner(&discovered.paths).await?;
+                        let mut promoted = probe_or_spawn_with_spawn_authorization(
+                            LifecycleMode::AttachOrPersistent,
+                            lifecycle_request,
+                        )
+                        .await?;
+                        promoted.promoted_from_ephemeral = true;
+                        return Ok(promoted);
+                    }
                     let attached =
                         attach_running_with_skew_check(discovered.paths.clone(), None).await;
                     match attached {
@@ -432,6 +510,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
                                 startup_notice,
+                                promoted_from_ephemeral: false,
                             });
                         }
                         Err(error) => match after_restart_wait(error) {
@@ -449,6 +528,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                                             owns_daemon: false,
                                             socket: discovered.paths.socket,
                                             startup_notice,
+                                            promoted_from_ephemeral: false,
                                         });
                                     }
                                     Err(_) => {
@@ -553,6 +633,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                 owns_daemon: false,
                 socket: canonical.socket,
                 startup_notice: None,
+                promoted_from_ephemeral: false,
             });
         }
         let pid = spawn_detached(false)?;
@@ -578,6 +659,7 @@ async fn probe_or_spawn_with_spawn_authorization(
         owns_daemon: ephemeral,
         socket: paths.socket,
         startup_notice: None,
+        promoted_from_ephemeral: false,
     })
 }
 
@@ -592,6 +674,7 @@ async fn connect_shared_running(
         owns_daemon: false,
         socket: paths.socket,
         startup_notice,
+        promoted_from_ephemeral: false,
     })
 }
 
@@ -612,6 +695,7 @@ async fn attach_running_with_skew_check(
                     Some(reason) => format!("daemon version skew resolved: {reason}"),
                     None => "daemon version skew resolved by restarting the daemon".to_string(),
                 }),
+                promoted_from_ephemeral: false,
             });
         }
         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {

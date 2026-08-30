@@ -1854,29 +1854,26 @@ impl App {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let Some(endpoint) = self.attached_daemon_endpoint() else {
-            self.push_plain(
-                "/assistant: Unavailable — reconnect to the daemon, then Retry".to_string(),
-            );
-            return;
-        };
         let request = cockpit_proto::Request::ResolveAssistantSession {
             assistant_id: name.to_string(),
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
             mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         };
         let source_session_id = self.launch.session_id;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_at_blocking(&endpoint, request)? {
-                cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
-                    Ok(AsyncActionPayload::AssistantSessionResolved {
-                        session_id: session.session_id,
-                        source_session_id,
-                    })
-                }
-                other => Err(format!("unexpected assistant response: {other:?}")),
+            move || match agent_runner::resolve_assistant_session_blocking(lifecycle, request)? {
+                (
+                    cockpit_proto::Response::AssistantSessionResolved { session, .. },
+                    promotion_notice,
+                ) => Ok(AsyncActionPayload::AssistantSessionResolved {
+                    session_id: session.session_id,
+                    source_session_id,
+                    promotion_notice,
+                }),
+                (other, _) => Err(format!("unexpected assistant response: {other:?}")),
             },
         );
     }

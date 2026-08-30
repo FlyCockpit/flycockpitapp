@@ -1605,8 +1605,23 @@ impl App {
                 Ok(AsyncActionPayload::AssistantSessionResolved {
                     session_id,
                     source_session_id,
+                    promotion_notice,
                 }) => {
                     if self.launch.session_id == source_session_id {
+                        if let Some(notice) = promotion_notice {
+                            self.show_toast(notice, ToastKind::Info);
+                            // The prior runner was attached to the ephemeral
+                            // owner that just exited. Reattach directly to the
+                            // resolved persistent owner instead of asking that
+                            // dead transport to perform an in-process switch.
+                            self.agent_runner.take();
+                            self.launch.session_id = Some(session_id);
+                            self.start_runner_attach(
+                                true,
+                                RunnerAttachContinuation::RetryRetainedSubmissions,
+                            );
+                            return;
+                        }
                         self.resume_session(session_id);
                     }
                 }

@@ -395,6 +395,10 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
         mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
         LifecycleMode::AttachOrEphemeral
     );
+    assert_eq!(
+        mode_for_intent(cockpit_client::LifecycleIntent::PromoteToPersistent),
+        LifecycleMode::PromoteToPersistent
+    );
 }
 
 #[test]

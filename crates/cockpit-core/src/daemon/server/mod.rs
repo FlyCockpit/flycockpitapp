@@ -2523,6 +2523,22 @@ impl DaemonContext {
         Ok(true)
     }
 
+    /// Start last-client teardown only while this owner is still ephemeral.
+    ///
+    /// Promotion publishes the persistent endpoint and clears the lifetime
+    /// flag while holding this same decision lock.  Keeping the reaper's
+    /// check and shutdown transition in that critical section means a
+    /// promotion response cannot acknowledge a surviving owner and then lose
+    /// it to a stale zero-client observation.
+    pub(crate) fn reap_ephemeral_last_client(self: &Arc<Self>) -> bool {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        if !self.is_ephemeral_lifetime() {
+            return false;
+        }
+        request_shutdown(self);
+        true
+    }
+
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
         proto::Event::CaffeinateState {

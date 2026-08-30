@@ -1919,11 +1919,9 @@ async fn run_foreground_inner_with_boot_db(
         let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
         Some(tokio::spawn(async move {
-            ephemeral_last_client_reaper(
-                client_presence,
-                move || reaper_ctx.is_ephemeral_lifetime(),
-                move || server::request_shutdown(&ctx),
-            )
+            ephemeral_last_client_reaper(client_presence, move || {
+                reaper_ctx.reap_ephemeral_last_client()
+            })
             .await;
         }))
     } else {
@@ -2067,14 +2065,12 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
 #[cfg(any(unix, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
-    mut remains_ephemeral: impl FnMut() -> bool,
-    mut on_reap: impl FnMut(),
+    mut try_reap: impl FnMut() -> bool,
 ) {
     loop {
         let observed = *presence.borrow_and_update();
-        if observed.has_lifetime_client && observed.count == 0 && remains_ephemeral() {
+        if observed.has_lifetime_client && observed.count == 0 && try_reap() {
             tracing::info!("ephemeral daemon lost its final client; beginning teardown");
-            on_reap();
             return;
         }
         if presence.changed().await.is_err() {
@@ -2775,13 +2771,10 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let reaped_c = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(
-            presence_rx,
-            || true,
-            move || {
-                reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-            },
-        ));
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
             presence.has_lifetime_client = true;
@@ -2802,11 +2795,13 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ephemeral_for_reaper = ephemeral.clone();
         let reaped_for_reaper = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(
-            presence_rx,
-            move || ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst),
-            move || reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst),
-        ));
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -2818,6 +2813,66 @@ mod tests {
 
         assert!(!reaped.load(std::sync::atomic::Ordering::SeqCst));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn promotion_holds_the_last_client_reaper_decision_until_lifetime_changes() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let decision = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let ephemeral = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reaper_decision = decision.clone();
+        let reaper_ephemeral = ephemeral.clone();
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
+            let _decision = crate::sync::lock_or_recover(&reaper_decision);
+            if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
+            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+            true
+        }));
+
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+
+        let promotion_decision = decision.clone();
+        let promotion_ephemeral = ephemeral.clone();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let promotion = tokio::task::spawn_blocking(move || {
+            let _decision = crate::sync::lock_or_recover(&promotion_decision);
+            held_tx
+                .send(())
+                .expect("test waits for promotion decision lock");
+            release_rx.recv().expect("test releases promotion");
+            promotion_ephemeral.store(false, std::sync::atomic::Ordering::Release);
+        });
+        held_rx.await.expect("promotion holds decision lock");
+
+        // The reaper sees zero clients before promotion has changed the
+        // lifetime flag, but must wait for the shared decision lock.
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::Acquire),
+            "the reaper must not decide while promotion owns the lifecycle gate"
+        );
+
+        release_tx.send(()).expect("release promotion");
+        promotion.await.expect("promotion task joins");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("reaper observes the promoted lifetime")
+            .expect("reaper task joins");
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::Acquire),
+            "a zero-client observation before promotion must not reap its persistent owner"
+        );
     }
 
     #[tokio::test]

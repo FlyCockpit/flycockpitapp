@@ -119,9 +119,11 @@ impl App {
         match selected {
             Some("stop_all") => self.send_daemon_request(
                 "stop all",
-                cockpit_proto::Request::StopDaemon {
-                    grace_secs: Some(0),
-                },
+                // Cancel only this attached session.  If this detach leaves
+                // an ephemeral owner without clients, its reference-counted
+                // reaper performs the daemon-wide process cleanup; shared
+                // clients otherwise keep their daemon and work alive.
+                cockpit_proto::Request::CancelTurn,
                 ControlApplied::ExitAfterStoppingWork,
             ),
             Some("background") => self.send_daemon_request(

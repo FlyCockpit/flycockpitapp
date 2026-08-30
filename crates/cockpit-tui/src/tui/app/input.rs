@@ -500,14 +500,13 @@ impl App {
             return self.handle_ctrl_c();
         }
         // Ctrl+D preserves terminal EOF muscle memory only when the TUI is
-        // truly idle. If work or modal state is active, route through the
-        // same guarded exit policy as Ctrl+C so it cannot accidentally detach
-        // the user from active/background work.
+        // truly idle.  Unlike Ctrl+C, it is an exit gesture: live work must
+        // therefore enter the exit guard rather than interrupting that work.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('d'))
         {
-            return if self.ctrl_d_can_exit_immediately() {
+            return if self.ctrl_d_can_exit_immediately() || self.has_live_work_for_exit_guard() {
                 self.request_guarded_exit()
             } else {
                 self.handle_ctrl_c()

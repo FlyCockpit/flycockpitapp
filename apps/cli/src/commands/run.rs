@@ -1010,16 +1010,11 @@ pub(crate) async fn pump_events(
                         )?;
                         return Ok(130);
                     }
-                    // Stop all selected: force the ephemeral owner through its
-                    // normal daemon-wide shutdown path, which cancels every
-                    // session worker and its owned subprocesses.
+                    // Stop all selected: cancel this invocation, then detach.
+                    // The ephemeral owner's last-client reaper performs
+                    // daemon-wide cleanup only if this was the final client;
+                    // attached peers keep their work and shared owner alive.
                     let _ = reconcile_after_interrupt(client, id, format, &mut stderr).await?;
-                    client
-                        .request_ok(Request::StopDaemon {
-                            grace_secs: Some(0),
-                        })
-                        .await
-                        .context("stopping ephemeral daemon work")?;
                     return Ok(130);
                 }
                 return Ok(130);

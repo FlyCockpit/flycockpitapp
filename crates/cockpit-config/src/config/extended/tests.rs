@@ -92,7 +92,7 @@ fn knowledge_base_registry_round_trips_through_extended_config_doc() {
 }
 
 #[test]
-fn configured_knowledge_attachment_identity_follows_its_source() {
+fn configured_knowledge_attachment_provisional_identity_follows_its_source() {
     let entry = KnowledgeBaseRegistryEntry::new(
         "project".to_string(),
         "Project memory".to_string(),

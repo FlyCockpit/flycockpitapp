@@ -137,23 +137,30 @@ impl KnowledgeBaseRegistryEntry {
         }
     }
 
-    /// Return the immutable identity used to scope durable dream state.
+    /// Return the identity used to scope durable dream state.
     ///
-    /// Workspace entries derive it from their concrete configured source,
-    /// rather than accepting a user-supplied UUID. Consequently a source
-    /// replacement is always a new attachment for watermark purposes.
+    /// A host-owned installer, or the local attachment resolver, may bind a
+    /// concrete identity. Unbound workspace entries use a deterministic
+    /// provisional source identity so configuration validation can identify
+    /// duplicates before a local source is resolved. Durable consumers must
+    /// resolve local sources before using that provisional identity.
     pub fn attachment_id(&self) -> uuid::Uuid {
         self.attachment_identity
             .unwrap_or_else(|| source_attachment_identity(&self.source))
     }
 
-    /// Bind an attachment identity assigned by a host-owned installer.
+    /// Bind a concrete attachment identity assigned by its owning resolver.
     ///
     /// This is deliberately not serializable: a workspace configuration cannot
     /// retain or assert this identity.
-    pub fn with_host_attachment_identity(mut self, attachment_id: uuid::Uuid) -> Self {
+    pub fn with_bound_attachment_identity(mut self, attachment_id: uuid::Uuid) -> Self {
         self.attachment_identity = Some(attachment_id);
         self
+    }
+
+    /// Whether an installer or source resolver has bound a concrete identity.
+    pub fn has_bound_attachment_identity(&self) -> bool {
+        self.attachment_identity.is_some()
     }
 }
 

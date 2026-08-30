@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 #[cfg(test)]
 use crate::config::extended::RedactConfig;
@@ -1386,7 +1387,7 @@ pub(crate) async fn attached_bundles(
                 entry.id
             );
         }
-        let local = local.map(|local| {
+        let mut local = local.map(|local| {
             let root = if local.root.is_absolute() {
                 local.root
             } else {
@@ -1402,10 +1403,30 @@ pub(crate) async fn attached_bundles(
             }
         });
         // Relative local paths are interpreted against this invocation's
-        // workspace root. Bind the ledger key to that resolved source, not the
-        // spelling in config, so the identity always matches the provider's
-        // concrete root.
-        if let Some(local) = &local {
+        // workspace root. Workspace-local sources are then bound to the
+        // concrete directory object, not merely that path spelling. This
+        // prevents a replacement directory (or a changed symlink target) from
+        // inheriting the predecessor's dream boundary. Installer-owned entries
+        // already carry their installation identity and intentionally retain it.
+        if let Some(local) = &mut local {
+            if !entry.has_bound_attachment_identity() {
+                match local_source_attachment_identity(&local.root)? {
+                    Some((root, attachment_id)) => {
+                        if local.sidecar_path.as_deref()
+                            == Some(local.root.join(SIDE_CAR_FILE).as_path())
+                        {
+                            local.sidecar_path = Some(root.join(SIDE_CAR_FILE));
+                        }
+                        local.root = root;
+                        entry = entry.with_bound_attachment_identity(attachment_id);
+                    }
+                    // An unavailable local provider cannot serve KB results.
+                    // Give it an invocation-local identity so fresh-session
+                    // retrieval never mistakes a predecessor's boundary for
+                    // proof that this absent source has been dreamed.
+                    None => entry = entry.with_bound_attachment_identity(uuid::Uuid::new_v4()),
+                }
+            }
             entry.source = KnowledgeBaseSource::Local {
                 path: local.root.clone(),
             };
@@ -1433,6 +1454,105 @@ pub(crate) async fn attached_bundles(
         knowledge_bases.push(AttachedKnowledgeBase { entry, provider });
     }
     Ok(knowledge_bases)
+}
+
+/// Resolve a workspace-local KB to the filesystem object that owns it.
+///
+/// The identity includes the canonical target so symlink spelling is never the
+/// identity, a stable identity of the target directory, and a digest of the
+/// bounded Markdown snapshot the KB actually serves. A dream writer records
+/// its boundary after committing its KB output, so it binds that boundary to
+/// the resulting source snapshot. An unrelated replacement, whether it swaps
+/// the directory, changes a symlink target, or rewrites the source in place,
+/// therefore cannot inherit the predecessor's boundary. A missing root is
+/// unavailable rather than a ledger lookup candidate.
+fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid::Uuid)>> {
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("resolving local knowledge base source {}", root.display())
+            });
+        }
+    };
+    let metadata = std::fs::metadata(&root)
+        .with_context(|| format!("reading local knowledge base source {}", root.display()))?;
+    if !metadata.is_dir() {
+        bail!(
+            "local knowledge base source {} is not a directory",
+            root.display()
+        );
+    }
+
+    let mut name = b"flycockpit/knowledge-local-attachment/v2\0".to_vec();
+    append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        name.extend_from_slice(&metadata.dev().to_le_bytes());
+        name.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        name.extend_from_slice(&metadata.creation_time().to_le_bytes());
+        name.extend_from_slice(&metadata.file_attributes().to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let created = metadata
+            .created()
+            .context("reading local knowledge base source creation time")?
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("local knowledge base source creation time predates the Unix epoch")?;
+        name.extend_from_slice(&created.as_secs().to_le_bytes());
+        name.extend_from_slice(&created.subsec_nanos().to_le_bytes());
+    }
+    let mut documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+        &root,
+        MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_ENTRIES,
+        MAX_KNOWLEDGE_DEPTH,
+        MAX_KNOWLEDGE_FILE_BYTES,
+        MAX_KNOWLEDGE_TOTAL_BYTES,
+    )
+    .with_context(|| {
+        format!(
+            "snapshotting local knowledge base source {}",
+            root.display()
+        )
+    })?;
+    documents.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut source_fingerprint = Sha256::new();
+    source_fingerprint.update(b"flycockpit/knowledge-local-source/v1\0");
+    for (path, body) in documents {
+        update_attachment_identity_component(
+            &mut source_fingerprint,
+            path.to_string_lossy().as_bytes(),
+        );
+        update_attachment_identity_component(&mut source_fingerprint, body.as_bytes());
+    }
+    let source_fingerprint: [u8; 32] = source_fingerprint.finalize().into();
+    name.extend_from_slice(&source_fingerprint);
+
+    Ok(Some((
+        root,
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &name),
+    )))
+}
+
+fn append_attachment_identity_component(name: &mut Vec<u8>, component: &[u8]) {
+    name.extend_from_slice(&(component.len() as u64).to_le_bytes());
+    name.extend_from_slice(component);
+}
+
+fn update_attachment_identity_component(hasher: &mut Sha256, component: &[u8]) {
+    hasher.update((component.len() as u64).to_le_bytes());
+    hasher.update(component);
 }
 
 #[derive(Debug, Clone)]
@@ -1492,7 +1612,7 @@ async fn assistant_knowledge_registry_entry(
         false,
         KnowledgeBaseMergePolicy::Auto,
     )
-    .with_host_attachment_identity(config.installation_id);
+    .with_bound_attachment_identity(config.installation_id);
     Ok(Some(RegistryKnowledgeBase {
         entry,
         local: Some(RegistryLocalKb {
@@ -2189,14 +2309,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_kb_source_does_not_reuse_the_previous_dream_boundary() {
+    async fn replacement_kb_directory_at_the_same_path_does_not_reuse_the_previous_dream_boundary()
+    {
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
-        let original = project_knowledge_registry_entry();
-        let mut replacement = original.clone();
-        replacement.source = KnowledgeBaseSource::Local {
-            path: PathBuf::from(".cockpit/replacement-knowledge"),
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![entry],
+            ..Default::default()
         };
+        let original = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
         let project_uuid = session
             .db
             .authoritative_project_uuid(&session.project_id)
@@ -2207,6 +2348,20 @@ mod tests {
             project_uuid,
             knowledge_base_attachment_id: original.attachment_id(),
         };
+        session
+            .db
+            .record_knowledge_dream_boundary(original_key, 100, 110)
+            .await
+            .unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        write_bundle(&root);
+        let replacement = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
         let replacement_key = crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
             project_uuid,
             knowledge_base_attachment_id: replacement.attachment_id(),
@@ -2216,11 +2371,6 @@ mod tests {
             original_key.knowledge_base_attachment_id,
             replacement_key.knowledge_base_attachment_id
         );
-        session
-            .db
-            .record_knowledge_dream_boundary(original_key, 100, 110)
-            .await
-            .unwrap();
         assert!(
             session
                 .db
@@ -2229,6 +2379,75 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changed_local_kb_symlink_target_has_a_new_attachment_identity() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let first_target = tmp.path().join("first-knowledge");
+        let second_target = tmp.path().join("second-knowledge");
+        let link = tmp.path().join("knowledge");
+        write_bundle(&first_target);
+        write_bundle(&second_target);
+        symlink(&first_target, &link).unwrap();
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![entry],
+            ..Default::default()
+        };
+        let first = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
+
+        fs::remove_file(&link).unwrap();
+        symlink(&second_target, &link).unwrap();
+        let second = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
+
+        assert_ne!(first.attachment_id(), second.attachment_id());
+    }
+
+    #[test]
+    fn rewritten_local_kb_source_has_a_new_attachment_identity() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let (_, first) = local_source_attachment_identity(tmp.path())
+            .unwrap()
+            .unwrap();
+
+        fs::write(
+            tmp.path().join("deploy.md"),
+            "---\ntype: decision\n---\n\nA replacement knowledge source.",
+        )
+        .unwrap();
+        let (_, second) = local_source_attachment_identity(tmp.path())
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first, second);
     }
 
     #[test]

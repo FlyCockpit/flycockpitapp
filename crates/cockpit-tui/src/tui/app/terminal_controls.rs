@@ -31,8 +31,105 @@ impl App {
                 ToastKind::Info,
             );
             false
+        } else if self.has_live_work_for_exit_guard() {
+            if self.exit_owner_is_ephemeral() {
+                self.open_exit_guard_prompt();
+                false
+            } else {
+                let notice = format!(
+                    "This session is still running in the background; reattach with {}",
+                    self.exit_reattach_command()
+                );
+                self.exit_notice = Some(notice.clone());
+                self.show_toast(notice, ToastKind::Info);
+                true
+            }
         } else {
             true
+        }
+    }
+
+    fn has_live_work_for_exit_guard(&self) -> bool {
+        self.busy || !self.active_schedules.is_empty()
+    }
+
+    fn exit_owner_is_ephemeral(&self) -> bool {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .is_some_and(|runner| runner.ephemeral_owner)
+    }
+
+    pub(super) fn exit_reattach_command(&self) -> String {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(crate::tui::agent_runner::AgentRunner::session_id)
+            .or(self.launch.session_id)
+            .map(|session_id| format!("cockpit run --session {session_id}"))
+            .unwrap_or_else(|| "cockpit".to_string())
+    }
+
+    fn open_exit_guard_prompt(&mut self) {
+        use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+
+        let interrupt_id = uuid::Uuid::new_v4();
+        self.pending_local_choice = Some(LocalChoice::ExitGuard(interrupt_id));
+        self.question_dialog = Some(
+            crate::tui::dialog::question::QuestionDialog::new(
+                interrupt_id,
+                String::new(),
+                InterruptQuestionSet {
+                    questions: vec![InterruptQuestion::Single {
+                        prompt: "This session is still working. What would you like to do?"
+                            .to_string(),
+                        options: vec![
+                            InterruptOption {
+                                id: "stop_all".to_string(),
+                                label: "Stop all".to_string(),
+                                description: Some(
+                                    "Cancel work and stop the ephemeral daemon.".to_string(),
+                                ),
+                                secondary: false,
+                            },
+                            InterruptOption {
+                                id: "background".to_string(),
+                                label: "Run in background".to_string(),
+                                description: Some(
+                                    "Keep work running and make this daemon persistent."
+                                        .to_string(),
+                                ),
+                                secondary: false,
+                            },
+                        ],
+                        allow_freetext: false,
+                        command_detail: None,
+                        permission: false,
+                        approval_class: None,
+                        sandbox_escalation: None,
+                    }],
+                },
+                self.dialog_lockout(),
+            )
+            .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
+        );
+    }
+
+    pub(super) fn resolve_exit_guard_choice(&mut self, selected: Option<&str>) {
+        match selected {
+            Some("stop_all") => self.send_daemon_request(
+                "stop all",
+                cockpit_proto::Request::StopDaemon {
+                    grace_secs: Some(0),
+                },
+                ControlApplied::ExitAfterStoppingWork,
+            ),
+            Some("background") => self.send_daemon_request(
+                "run in background",
+                cockpit_proto::Request::PromoteToPersistent,
+                ControlApplied::ExitAfterBackgroundPromotion,
+            ),
+            _ => self.show_toast("Exit cancelled", ToastKind::Info),
         }
     }
 

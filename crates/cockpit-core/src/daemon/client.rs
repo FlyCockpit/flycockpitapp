@@ -71,6 +71,7 @@ pub(crate) struct ConnectedDaemon {
     client: DaemonClient,
     endpoint: cockpit_client::ClientEndpoint,
     owns_daemon: bool,
+    ephemeral_owner: bool,
     socket: PathBuf,
     startup_notice: Option<String>,
     promoted_from_ephemeral: bool,
@@ -437,6 +438,7 @@ fn lifecycle_resolution(connected: ConnectedDaemon) -> cockpit_client::Lifecycle
     cockpit_client::LifecycleResolution {
         endpoint: connected.endpoint,
         owns_daemon: connected.owns_daemon,
+        ephemeral_owner: connected.ephemeral_owner,
         socket: connected.socket,
         startup_notice: connected.startup_notice,
         promoted_from_ephemeral: connected.promoted_from_ephemeral,
@@ -508,12 +510,46 @@ async fn promote_ephemeral_owner(
     paths: &crate::daemon::DaemonPaths,
     lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
 ) -> Result<ConnectedDaemon> {
+    // The detach guard promotes a live owner in place. This keeps the daemon's
+    // session workers, subagents, and host processes intact; the owner merely
+    // stops participating in last-client ephemeral teardown.
+    match promote_live_ephemeral_owner(paths).await {
+        Ok(connected) => return Ok(connected),
+        Err(error) => {
+            tracing::warn!(%error, "in-place daemon promotion failed; trying legacy idle replacement")
+        }
+    }
     promote_ephemeral_owner_with_recovery_policy(
         paths,
         lifecycle_request,
         PromotionRecoveryPolicy::production(),
     )
     .await
+}
+
+async fn promote_live_ephemeral_owner(
+    paths: &crate::daemon::DaemonPaths,
+) -> Result<ConnectedDaemon> {
+    let expected = ephemeral_owner_identity(paths)
+        .ok_or_else(|| anyhow!("ephemeral daemon owner identity is unavailable for promotion"))?;
+    let client = connect_local_daemon(&paths.socket)
+        .await
+        .context("connecting to ephemeral daemon for live promotion")?;
+    if ephemeral_owner_identity(paths) != Some(expected) {
+        anyhow::bail!("ephemeral daemon owner changed before live promotion");
+    }
+    match client.request_ok(Request::PromoteToPersistent).await? {
+        proto::Response::Ack => {}
+        other => anyhow::bail!("unexpected live promotion response: {other:?}"),
+    }
+    drop(client);
+    let discovered = crate::daemon::discover().await;
+    if discovered.status != crate::daemon::DaemonStatus::Running || discovered.paths.ephemeral {
+        anyhow::bail!("daemon did not publish persistent ownership after promotion");
+    }
+    let mut connected = attach_running_with_skew_check(discovered.paths, None).await?;
+    connected.promoted_from_ephemeral = true;
+    Ok(connected)
 }
 
 #[derive(Clone, Copy)]
@@ -854,6 +890,7 @@ async fn spawn_verified_persistent_replacement(
             endpoint: local_daemon_endpoint(&canonical.socket),
             client,
             owns_daemon: false,
+            ephemeral_owner: false,
             socket: canonical.socket,
             startup_notice: None,
             promoted_from_ephemeral: true,
@@ -958,6 +995,7 @@ async fn try_attach_verified_persistent_replacement(
         endpoint: local_daemon_endpoint(&verified.paths.socket),
         client,
         owns_daemon: false,
+        ephemeral_owner: false,
         socket: verified.paths.socket,
         startup_notice: None,
         promoted_from_ephemeral: true,
@@ -1070,6 +1108,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                                 endpoint: local_daemon_endpoint(&discovered.paths.socket),
                                 client,
                                 owns_daemon: false,
+                                ephemeral_owner: discovered.paths.ephemeral,
                                 socket: discovered.paths.socket,
                                 startup_notice,
                                 promoted_from_ephemeral: false,
@@ -1103,6 +1142,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                                             ),
                                             client,
                                             owns_daemon: false,
+                                            ephemeral_owner: discovered.paths.ephemeral,
                                             socket: discovered.paths.socket,
                                             startup_notice,
                                             promoted_from_ephemeral: false,
@@ -1208,6 +1248,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                 endpoint: local_daemon_endpoint(&canonical.socket),
                 client,
                 owns_daemon: false,
+                ephemeral_owner: false,
                 socket: canonical.socket,
                 startup_notice: None,
                 promoted_from_ephemeral: false,
@@ -1234,6 +1275,7 @@ async fn probe_or_spawn_with_spawn_authorization(
         endpoint: local_daemon_endpoint(&paths.socket),
         client,
         owns_daemon: ephemeral,
+        ephemeral_owner: ephemeral,
         socket: paths.socket,
         startup_notice: None,
         promoted_from_ephemeral: false,
@@ -1249,6 +1291,7 @@ async fn connect_shared_running(
         endpoint: local_daemon_endpoint(&paths.socket),
         client,
         owns_daemon: false,
+        ephemeral_owner: paths.ephemeral,
         socket: paths.socket,
         startup_notice,
         promoted_from_ephemeral: false,
@@ -1267,6 +1310,7 @@ async fn attach_running_with_skew_check(
                 endpoint: local_daemon_endpoint(&paths.socket),
                 client,
                 owns_daemon: false,
+                ephemeral_owner: paths.ephemeral,
                 socket: paths.socket,
                 startup_notice: Some(match reason {
                     Some(reason) => format!("daemon version skew resolved: {reason}"),

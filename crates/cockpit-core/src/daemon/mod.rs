@@ -275,7 +275,6 @@ fn read_published_endpoint_record_from(
     (record.receipt == receipt).then_some(record)
 }
 
-#[cfg(any(unix, test))]
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
     let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&paths.pid_file) else {
         anyhow::bail!("daemon PID receipt is missing before endpoint publication");
@@ -285,7 +284,6 @@ fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
     write_endpoint_record_with_receipt_and_canonical(paths, &canonical, &receipt)
 }
 
-#[cfg(any(unix, test))]
 fn write_endpoint_record_with_receipt_and_canonical(
     paths: &DaemonPaths,
     canonical: &DaemonPaths,
@@ -1918,11 +1916,14 @@ async fn run_foreground_inner_with_boot_db(
     // deliberately has no idle timeout.
     let lifecycle_task = if paths.ephemeral {
         let ctx = ctx.clone();
+        let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
         Some(tokio::spawn(async move {
-            ephemeral_last_client_reaper(client_presence, move || {
-                server::request_shutdown(&ctx);
-            })
+            ephemeral_last_client_reaper(
+                client_presence,
+                move || reaper_ctx.is_ephemeral_lifetime(),
+                move || server::request_shutdown(&ctx),
+            )
             .await;
         }))
     } else {
@@ -2066,11 +2067,12 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
 #[cfg(any(unix, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
+    mut remains_ephemeral: impl FnMut() -> bool,
     mut on_reap: impl FnMut(),
 ) {
     loop {
         let observed = *presence.borrow_and_update();
-        if observed.has_lifetime_client && observed.count == 0 {
+        if observed.has_lifetime_client && observed.count == 0 && remains_ephemeral() {
             tracing::info!("ephemeral daemon lost its final client; beginning teardown");
             on_reap();
             return;
@@ -2773,9 +2775,13 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let reaped_c = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            || true,
+            move || {
+                reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
             presence.has_lifetime_client = true;
@@ -2786,6 +2792,32 @@ mod tests {
             .expect("the durable first-connection marker must survive a coalesced disconnect")
             .expect("reaper task joins");
         assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn promoted_owner_does_not_reap_after_its_last_client_detaches() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let ephemeral = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ephemeral_for_reaper = ephemeral.clone();
+        let reaped_for_reaper = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            move || ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst),
+            move || reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst),
+        ));
+
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_lifetime_client = true;
+        });
+        ephemeral.store(false, std::sync::atomic::Ordering::SeqCst);
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(!reaped.load(std::sync::atomic::Ordering::SeqCst));
+        task.abort();
     }
 
     #[tokio::test]

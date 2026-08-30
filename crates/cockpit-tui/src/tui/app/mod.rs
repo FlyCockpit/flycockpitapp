@@ -452,6 +452,8 @@ pub(crate) enum ControlApplied {
         text: String,
     },
     RepairResume,
+    ExitAfterStoppingWork,
+    ExitAfterBackgroundPromotion,
     /// Settings Behavior tokenizer refresh confirmation (correlated
     /// ConfigRefreshed + ConfigSnapshot).
     ResponseMetricsTokenizer {
@@ -1309,6 +1311,7 @@ pub(super) enum LocalChoice {
     ResumeRepair(PendingResumeRepair),
     RedactionToggle(uuid::Uuid),
     ModelComparison(uuid::Uuid),
+    ExitGuard(uuid::Uuid),
 }
 
 impl LocalChoice {
@@ -1320,6 +1323,7 @@ impl LocalChoice {
             Self::RedactionToggle(interrupt_id) | Self::ModelComparison(interrupt_id) => {
                 *interrupt_id
             }
+            Self::ExitGuard(interrupt_id) => *interrupt_id,
         }
     }
 
@@ -1815,6 +1819,7 @@ pub struct App {
     /// a newer runner.
     sealed_capability_bindings: HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
     exit_requested: bool,
+    exit_notice: Option<String>,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
@@ -3618,6 +3623,7 @@ impl App {
             pending_sealed_operations: HashMap::new(),
             sealed_capability_bindings: HashMap::new(),
             exit_requested: false,
+            exit_notice: None,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.
@@ -4087,6 +4093,9 @@ impl App {
         // pre-alt-screen, so the user can scroll back through both.
         for line in tail {
             println!("{line}");
+        }
+        if let Some(notice) = self.exit_notice.take() {
+            println!("{notice}");
         }
         // Attach now flushes a durable sessions row, so print the id even
         // when the user never submitted a message. Prefer the 6-char short

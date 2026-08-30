@@ -362,6 +362,7 @@ mod notes_lifecycle_tests {
                         cockpit_client::InProcessEndpoint::new(connections, sensitive),
                     ),
                     owns_daemon: false,
+                    ephemeral_owner: false,
                     socket: std::path::PathBuf::from("in-process"),
                     startup_notice: None,
                     promoted_from_ephemeral: false,

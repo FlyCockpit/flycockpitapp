@@ -1140,6 +1140,16 @@ impl App {
                     runner.retry_retained_user_submissions();
                 }
             }
+            ControlApplied::ExitAfterStoppingWork => {
+                self.exit_requested = true;
+            }
+            ControlApplied::ExitAfterBackgroundPromotion => {
+                self.exit_notice = Some(format!(
+                    "This session is still running in the background; reattach with {}",
+                    self.exit_reattach_command()
+                ));
+                self.exit_requested = true;
+            }
             ControlApplied::ResponseMetricsTokenizer { .. } => {
                 // Confirmation is driven by ConfigRefreshed / snapshot arms.
             }

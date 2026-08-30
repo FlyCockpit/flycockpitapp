@@ -201,6 +201,9 @@ impl LifecycleIntent {
 pub struct LifecycleResolution {
     pub endpoint: ClientEndpoint,
     pub owns_daemon: bool,
+    /// Whether the resolved owner is reference-counted and therefore needs an
+    /// explicit live-work detach decision.
+    pub ephemeral_owner: bool,
     pub socket: PathBuf,
     pub startup_notice: Option<String>,
     /// The lifecycle host replaced an ephemeral owner while resolving this
@@ -1943,6 +1946,7 @@ mod tests {
                         sensitive,
                     )),
                     owns_daemon: true,
+                    ephemeral_owner: true,
                     socket: PathBuf::from("in-process"),
                     startup_notice: None,
                     promoted_from_ephemeral: false,

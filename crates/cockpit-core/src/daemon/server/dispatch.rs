@@ -9001,6 +9001,11 @@ async fn handle_serialized_request_impl(
             Ok(Response::Ack)
         }
 
+        Request::PromoteToPersistent => {
+            ctx.promote_to_persistent().map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::FsList {
             project_root,
             path,

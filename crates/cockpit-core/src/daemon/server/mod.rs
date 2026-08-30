@@ -2362,6 +2362,10 @@ pub struct DaemonContext {
     /// Serializes idle restart decisions so exactly one client can pair
     /// "daemon is idle" with the monotonic shutdown-gate transition.
     pub(crate) restart_decision: StdMutex<()>,
+    /// Mutable owner lifetime. An ephemeral owner may be promoted in place
+    /// while work is live; the last-client reaper consults this instead of the
+    /// boot-time path marker.
+    ephemeral_lifetime: AtomicBool,
     shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -2498,6 +2502,27 @@ impl DaemonContext {
     pub(crate) fn current_global_redaction(&self) -> Arc<RedactionTable> {
         current_redaction(&self.global_redaction)
     }
+
+    /// Whether this owner still follows last-client ephemeral teardown.
+    pub(crate) fn is_ephemeral_lifetime(&self) -> bool {
+        self.ephemeral_lifetime.load(Ordering::Acquire)
+    }
+
+    /// Promote this exact live owner without draining its workers. The endpoint
+    /// record and reaper gate transition together under the restart decision
+    /// lock, so last-client teardown cannot race the user choice.
+    pub(crate) fn promote_to_persistent(&self) -> Result<bool> {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        if !self.is_ephemeral_lifetime() {
+            return Ok(false);
+        }
+        let mut persistent_paths = self.paths.clone();
+        persistent_paths.ephemeral = false;
+        crate::daemon::write_endpoint_record(&persistent_paths)?;
+        self.ephemeral_lifetime.store(false, Ordering::Release);
+        Ok(true)
+    }
+
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
         proto::Event::CaffeinateState {
@@ -2525,6 +2550,7 @@ impl DaemonContext {
     ) -> Self {
         let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
+        let ephemeral_lifetime = paths.ephemeral;
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
         // authority. Built here and shared into the registry (which installs
@@ -2724,6 +2750,7 @@ impl DaemonContext {
             client_presence,
             shutdown,
             restart_decision: StdMutex::new(()),
+            ephemeral_lifetime: AtomicBool::new(ephemeral_lifetime),
             shutdown_grace_override: StdMutex::new(None),
             env_baseline: Arc::new(std::sync::RwLock::new(EnvSnapshot::from_process(
                 EnvSnapshotSource::DaemonStart,

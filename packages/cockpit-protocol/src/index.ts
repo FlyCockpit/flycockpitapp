@@ -827,6 +827,7 @@ const requestParamSchemas = {
   resolve_interrupt: z
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
+  promote_to_persistent: z.undefined(),
   restart_if_idle: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
@@ -1098,6 +1099,7 @@ const clientRequestVariants = [
   requestVariant("resolve_agent_decision", requestParamSchemas.resolve_agent_decision),
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
+  requestVariantNoParams("promote_to_persistent"),
   requestVariantNoParams("restart_if_idle"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),

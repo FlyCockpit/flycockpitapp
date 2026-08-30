@@ -379,6 +379,9 @@ pub struct AgentRunner {
     /// when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
     pub owns_daemon: bool,
+    /// Whether detaching the final client would reap this owner. Set from the
+    /// lifecycle host rather than inferred from the launch preference.
+    pub ephemeral_owner: bool,
     /// Capability used for every fresh connection to this exact daemon,
     /// including session switches and reconnects.
     pub(crate) endpoint: ClientEndpoint,
@@ -579,6 +582,7 @@ impl AgentRunner {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
+            ephemeral_owner: false,
             endpoint: ClientEndpoint::Wire(
                 socket
                     .clone()
@@ -2356,6 +2360,7 @@ async fn try_spawn_inner(
         let daemon = lifecycle.resolve(lifecycle_intent).await?;
         timer.phase("resolve_lifecycle");
         let owns_daemon = daemon.owns_daemon;
+        let ephemeral_owner = daemon.ephemeral_owner;
         let socket = daemon.socket.clone();
         let startup_notice = daemon.startup_notice.clone();
         let promoted_from_ephemeral = daemon.promoted_from_ephemeral;
@@ -2505,6 +2510,7 @@ async fn try_spawn_inner(
             usage,
             skill_inventory_names,
             owns_daemon,
+            ephemeral_owner,
             socket,
             startup_notice,
             assistant_promotion_notice,
@@ -2531,6 +2537,7 @@ async fn try_spawn_inner(
         usage,
         initial_skill_names,
         owns_daemon,
+        ephemeral_owner,
         socket,
         startup_notice,
         assistant_promotion_notice,
@@ -3111,6 +3118,7 @@ async fn try_spawn_inner(
         project_id,
         usage,
         owns_daemon,
+        ephemeral_owner,
         endpoint,
         lifecycle,
         socket,

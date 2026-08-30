@@ -94,6 +94,14 @@ async fn create_test_session(
     .unwrap()
 }
 
+async fn stage_text_artifact_blob(db: &crate::db::Db, session_id: Uuid, text: &str) -> String {
+    let path = crate::text_artifact_blob::new_path(session_id);
+    db.stage_text_artifact_blob_cleanup_intent(path.clone(), session_id, 1_000)
+        .await
+        .unwrap();
+    crate::text_artifact_blob::write_at(&path, text).unwrap()
+}
+
 async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
     db.write(move |conn| {
         crate::db::Db::create_fork_conn(
@@ -677,6 +685,7 @@ fn validations(request: &Value, response: &Value) -> Vec<Value> {
         request,
         Some(response),
         Path::new("/proj"),
+        None,
         None,
     )
     .as_array()
@@ -2730,6 +2739,7 @@ async fn export_text_artifacts_writes_index_and_payload() {
                 .to_string(),
             created_at: 123,
         }],
+        staged_blob_paths: Vec::new(),
         unavailable_projection: None,
     })
     .await
@@ -2754,6 +2764,94 @@ async fn export_text_artifacts_writes_index_and_payload() {
 }
 
 #[tokio::test]
+async fn blob_backed_tool_artifact_import_restages_body_and_projection() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let source_db = Db::open_in_memory().unwrap();
+    let source_session = create_test_session(&source_db, "p", "/proj", "Build").await;
+    let body = "blob-backed tool result\n".repeat(4_000);
+    let blob_path = stage_text_artifact_blob(&source_db, source_session.session_id, &body).await;
+    source_db
+        .record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+            session_id: source_session.session_id,
+            kind: SessionEventKind::ToolCall,
+            agent: Some("Build".into()),
+            call_id: Some("tc-blob-import".into()),
+            context: Default::default(),
+            ts_ms: 123,
+            data_json: json!({"output":"short"}).to_string(),
+            artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                projection_slot: Some(0),
+                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                content: body.clone(),
+                host_captured_bytes: body.len(),
+                host_original_bytes: body.len(),
+                host_dropped_bytes: 0,
+                stored_source_bytes: body.len(),
+                provenance_json: json!({
+                    "agent_id":"Build",
+                    "tool":"bash",
+                    "call_id":"tc-blob-import",
+                    "source":"tool_result",
+                    "preview_lines":7,
+                    "blob_path":blob_path.clone(),
+                })
+                .to_string(),
+                created_at: 123,
+            }],
+            staged_blob_paths: vec![blob_path],
+            unavailable_projection: None,
+        })
+        .await
+        .unwrap();
+
+    let bundle = collect_bundle(&source_db, source_session.session_id)
+        .await
+        .unwrap();
+    let archive = trusted_build_zip(&source_db, &source_session, &bundle)
+        .await
+        .unwrap();
+    let destination = Db::open_in_memory().unwrap();
+    let imported = crate::session::import::import_archive(
+        &destination,
+        crate::session::import::read_archive_bytes(&archive).unwrap(),
+    )
+    .await
+    .unwrap();
+    let imported_session_id = imported.imported[0];
+    let artifact = destination
+        .list_text_artifacts(imported_session_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(artifact.content.len() < body.len());
+    assert_eq!(artifact.content_bytes, body.len());
+    assert_eq!(
+        crate::text_artifact_blob::read_artifact_content(&artifact).unwrap(),
+        body
+    );
+    let path = crate::text_artifact_blob::path_from_provenance(&artifact.provenance_json)
+        .unwrap()
+        .expect("imported tool artifact retains a destination blob path");
+    let event = destination
+        .list_session_events(imported_session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "tool_call")
+        .unwrap();
+    assert_eq!(
+        event.data["artifact_projection"]["provenance"]["blob_path"].as_str(),
+        Some(path.as_str())
+    );
+    crate::engine::rehydrate::rehydrate_session(&destination, imported_session_id, "Build")
+        .await
+        .expect("restaged tool artifact projection rehydrates");
+}
+
+#[tokio::test]
 async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydrate() {
     struct AllowArtifactReceipt;
 
@@ -2767,6 +2865,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
         }
     }
 
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let db = Db::open_in_memory().unwrap();
     let source_session = create_test_session(&db, "p", "/proj", "Build").await;
     let source = "user artifact source\n".repeat(4_097);
@@ -2799,6 +2898,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
         crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => reservation,
         other => panic!("expected a typed source reservation, got {other:?}"),
     };
+    let source_blob_path = stage_text_artifact_blob(&db, source_session.session_id, &source).await;
     let materialized = db
         .materialize_reserved_user_text_artifacts(
             crate::db::text_artifacts::ReservedUserArtifactMaterialization {
@@ -2807,6 +2907,9 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source.clone(),
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: Some(7),
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: Default::default(),
@@ -2845,6 +2948,22 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
     .await
     .expect("typed oversized source remains importable");
     let imported_session_id = imported.imported[0];
+    let imported_source = destination
+        .list_text_artifacts(imported_session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|artifact| {
+            artifact.relation == crate::db::text_artifacts::TextArtifactRelation::SourceUserInput
+        })
+        .expect("import retains the oversized source artifact");
+    assert!(imported_source.content.len() < source.len());
+    assert_eq!(imported_source.content_bytes, source.len());
+    assert_eq!(
+        crate::text_artifact_blob::read_artifact_content(&imported_source).unwrap(),
+        source,
+        "archive import restores the full body to daemon-owned blob storage"
+    );
     let rebuilt =
         crate::engine::rehydrate::rehydrate_session(&destination, imported_session_id, "Build")
             .await
@@ -2933,6 +3052,7 @@ async fn export_text_artifact_preserves_capture_accounting() {
                 .to_string(),
             created_at: 124,
         }],
+        staged_blob_paths: Vec::new(),
         unavailable_projection: None,
     })
     .await
@@ -2986,6 +3106,7 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
                 .to_string(),
                 created_at: 125,
             }],
+            staged_blob_paths: Vec::new(),
             unavailable_projection: None,
         })
         .await
@@ -4012,6 +4133,7 @@ async fn tandem_validation_applies_bash_session_boundary_without_running() {
         Some(&response),
         root.path(),
         None,
+        None,
     )
     .as_array()
     .unwrap()
@@ -4021,6 +4143,37 @@ async fn tandem_validation_applies_bash_session_boundary_without_running() {
     assert_eq!(rows[1]["status"], "would_require_approval");
     assert_eq!(rows[1]["schema_valid"], true);
     assert_eq!(rows[2]["status"], "would_require_approval");
+}
+
+#[tokio::test]
+async fn tandem_validation_accepts_bash_targeting_durable_workspace_scratch() {
+    let request = request_with_tools(vec![tool_def(
+        "bash",
+        crate::tools::bash::BashTool::new().parameters(),
+    )]);
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let response = json!([
+        {
+            "type": "tool_use",
+            "name": "bash",
+            "input": {"cwd": scratch.path(), "command": "printf x > durable.txt"}
+        },
+    ]);
+
+    let rows = super::tandem_validation::validate_tandem_tool_calls(
+        &request,
+        Some(&response),
+        root.path(),
+        None,
+        Some(scratch.path()),
+    )
+    .as_array()
+    .unwrap()
+    .clone();
+
+    assert_eq!(rows[0]["status"], "valid");
+    assert_eq!(rows[0]["schema_valid"], true);
 }
 
 #[tokio::test]

@@ -1020,6 +1020,14 @@ pub struct VnextAgentDef {
     pub questions: Option<QuestionPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationPolicy>,
+    /// An absent allow-list inherits every workspace knowledge base; an empty
+    /// list intentionally attaches none.
+    #[serde(
+        rename = "allowedKnowledgeBases",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_knowledge_bases: Option<BTreeSet<String>>,
 }
 
 impl VnextAgentDef {
@@ -1042,6 +1050,11 @@ impl VnextAgentDef {
         }
         if let Some(verification) = &self.verification {
             verification.validate(&self.model_slots)?;
+        }
+        if let Some(knowledge_bases) = &self.allowed_knowledge_bases {
+            for id in knowledge_bases {
+                validate_knowledge_base_id(id)?;
+            }
         }
         Ok(())
     }
@@ -1219,6 +1232,17 @@ impl VnextAgentDef {
             estimate,
         )
     }
+}
+
+fn validate_knowledge_base_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("knowledge base IDs must be non-empty ASCII alphanumeric, `-`, or `_`");
+    }
+    Ok(())
 }
 
 fn resolve_compiled_verification(
@@ -2722,6 +2746,7 @@ mod tests {
             delegation: DelegationPolicy::default(),
             questions: None,
             verification: None,
+            allowed_knowledge_bases: None,
         }
     }
 

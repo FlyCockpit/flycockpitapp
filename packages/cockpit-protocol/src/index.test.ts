@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import acpForwardedMcpRoutesFixture from "../fixtures/acp-forwarded-mcp-v1.json" with {
+  type: "json",
+};
 import errorsFixture from "../fixtures/daemon-wire/errors.json" with { type: "json" };
 import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "json" };
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
-import acpForwardedMcpRoutesFixture from "../fixtures/acp-forwarded-mcp-v1.json" with {
-  type: "json",
-};
 import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with {
   type: "json",
 };
@@ -104,10 +104,12 @@ describe("ACP forwarded MCP ingress v1", () => {
         },
       ],
     });
-    expect(acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["X-Route", "x-route"])).success)
-      .toBe(false);
-    expect(acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["Ä-Route", "ä-route"])).success)
-      .toBe(true);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["X-Route", "x-route"])).success,
+    ).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["Ä-Route", "ä-route"])).success,
+    ).toBe(true);
   });
 
   it("locks every forwarded string's scalar and UTF-8 byte edges", () => {
@@ -137,14 +139,49 @@ describe("ACP forwarded MCP ingress v1", () => {
       },
     });
     const cases: FieldCase[] = [
-      { label: "declaration name", maxScalars: 64, maxBytes: 256, declaration: (name) => ({ ...stdio({}), name }) },
-      { label: "stdio command", maxScalars: 4096, maxBytes: 4096, declaration: (command) => stdio({ command }) },
-      { label: "stdio argument", maxScalars: 8192, maxBytes: 8192, declaration: (argument) => stdio({ args: [argument] }) },
-      { label: "environment name", maxScalars: 8192, maxBytes: 8192, declaration: (name) => stdio({ env: [{ name, value: "blue" }] }) },
-      { label: "environment value", maxScalars: 8192, maxBytes: 8192, declaration: (value) => stdio({ env: [{ name: "ROUTING_HINT", value }] }) },
+      {
+        label: "declaration name",
+        maxScalars: 64,
+        maxBytes: 256,
+        declaration: (name) => ({ ...stdio({}), name }),
+      },
+      {
+        label: "stdio command",
+        maxScalars: 4096,
+        maxBytes: 4096,
+        declaration: (command) => stdio({ command }),
+      },
+      {
+        label: "stdio argument",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (argument) => stdio({ args: [argument] }),
+      },
+      {
+        label: "environment name",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (name) => stdio({ env: [{ name, value: "blue" }] }),
+      },
+      {
+        label: "environment value",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (value) => stdio({ env: [{ name: "ROUTING_HINT", value }] }),
+      },
       { label: "URL", maxScalars: 4096, maxBytes: 4096, declaration: (url) => http({ url }) },
-      { label: "header name", maxScalars: 8192, maxBytes: 8192, declaration: (name) => http({ headers: [{ name, value: "blue" }] }) },
-      { label: "header value", maxScalars: 8192, maxBytes: 8192, declaration: (value) => http({ headers: [{ name: "x-route", value }] }) },
+      {
+        label: "header name",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (name) => http({ headers: [{ name, value: "blue" }] }),
+      },
+      {
+        label: "header value",
+        maxScalars: 8192,
+        maxBytes: 8192,
+        declaration: (value) => http({ headers: [{ name: "x-route", value }] }),
+      },
     ];
     for (const field of cases) {
       const parses = (value: string) =>
@@ -155,7 +192,11 @@ describe("ACP forwarded MCP ingress v1", () => {
       const edges: Array<[string, string, boolean]> = [
         ["ASCII scalar max", "a".repeat(field.maxScalars), true],
         ["ASCII scalar max+1", "a".repeat(field.maxScalars + 1), false],
-        ["multibyte scalar max", "é".repeat(field.maxScalars), field.maxScalars * 2 <= field.maxBytes],
+        [
+          "multibyte scalar max",
+          "é".repeat(field.maxScalars),
+          field.maxScalars * 2 <= field.maxBytes,
+        ],
         ["multibyte scalar max+1", "é".repeat(field.maxScalars + 1), false],
         ["UTF-8 byte max", "🦀".repeat(field.maxBytes / 4), true],
         ["UTF-8 byte max+1", `${"🦀".repeat(field.maxBytes / 4)}a`, false],
@@ -760,7 +801,7 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("config_refreshed_typescript_mirror_is_v21", () => {
-    expect(PROTOCOL_VERSION).toBe(22);
+    expect(PROTOCOL_VERSION).toBe(21);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );
@@ -773,22 +814,6 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("bounds mirrored Rust u64 and i64 JSON numbers to exact JavaScript integers", () => {
-    const markSeen = requestsFixture.mark_app_flag_seen;
-    expect(
-      clientEnvelopeSchema.safeParse({
-        ...markSeen,
-        params: { ...markSeen.params, expected_version: Number.MAX_SAFE_INTEGER },
-      }).success,
-    ).toBe(true);
-    for (const expected_version of [-1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
-      expect(
-        clientEnvelopeSchema.safeParse({
-          ...markSeen,
-          params: { ...markSeen.params, expected_version },
-        }).success,
-      ).toBe(false);
-    }
-
     for (const request of [
       requestsFixture.attach,
       requestsFixture.read_history_page,

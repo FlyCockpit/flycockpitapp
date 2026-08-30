@@ -55,9 +55,6 @@ pub(crate) enum ButtonId {
     QuestionAction {
         index: usize,
     },
-    DaemonPrompt {
-        index: usize,
-    },
 }
 
 impl ButtonId {
@@ -146,9 +143,6 @@ pub(crate) enum RowControlId {
     },
     DialogRow {
         surface: DialogSurface,
-        index: usize,
-    },
-    DaemonPrompt {
         index: usize,
     },
     FooterPicker {

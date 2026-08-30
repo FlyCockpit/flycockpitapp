@@ -116,6 +116,9 @@ CREATE TABLE sessions (
     -- parent session. NULL means the parent's durable tail at fork time.
     fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
+    description        TEXT CHECK (
+        description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
+    ),                                            -- generated old-session context (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -182,10 +185,12 @@ CREATE TABLE sessions (
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
-    -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
-    -- the same automatic title opportunity.
+    -- title/metadata slot (0, 1, 2, 4, 8, 16, 32, 64, or 128) so a resumed
+    -- session never repeats the same automatic metadata opportunity.
     user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
-    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
+    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16, 32, 64, 128)),
+    -- Monotonic ownership fence for an in-flight same-model metadata fork.
+    metadata_fork_generation INTEGER NOT NULL DEFAULT 0 CHECK (metadata_fork_generation >= 0),
 
     -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
     -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is

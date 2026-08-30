@@ -2502,6 +2502,7 @@ export const sessionSummarySchema = z
     turns: safeU64NumberSchema,
     active_agent: z.string(),
     title: z.string().nullable().optional(),
+    description: z.string().nullable().optional(),
     parent_session_id: uuidSchema.nullable().optional(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),

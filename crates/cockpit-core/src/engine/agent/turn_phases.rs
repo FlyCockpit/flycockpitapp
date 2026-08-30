@@ -2357,6 +2357,7 @@ pub(crate) async fn run_turn(
                     })
                 },
             });
+    let endpoint_recovery_enabled = endpoint_recovery.is_some();
 
     // Dispatch-time recording (`inference-timeout-and-failure-
     // observability.md` #4): persist the attempt's captured body BEFORE the
@@ -2421,13 +2422,19 @@ pub(crate) async fn run_turn(
     )
     .await;
 
+    // Remove root-bound metadata work from the session-wide slot before any
+    // fallible request preparation. The work remains local until the actual
+    // provider handoff seam below, so preparation or audit failures discard it
+    // with this turn instead of letting a later inference reuse a stale prefix.
+    let scheduled_metadata_work = take_scheduled_metadata_work(&session, is_root);
+
     let mut prepared_request = model.prepare_completion_request(
         &agent.system,
         history,
         &prompt,
         &tools,
         &agent.params,
-        endpoint_recovery.is_some(),
+        endpoint_recovery_enabled,
         sealed_egress.as_deref(),
     )?;
     // The immutable post-render request body for this dispatched-target attempt.
@@ -2541,6 +2548,18 @@ pub(crate) async fn run_turn(
     let display_slot =
         Some(shared_display_slot.unwrap_or_else(|| new_display_attempt_slot(&session, &config)));
 
+    // Claim the locally held metadata work at the exact foreground dispatch
+    // seam. Earlier preparation failures have already dropped it; it cannot
+    // remain queued for a later inference.
+    let metadata_work =
+        scheduled_metadata_work.and_then(|work| match session.activate_metadata_fork(work) {
+            Ok(work) => Some(work),
+            Err(error) => {
+                tracing::warn!(%error, "metadata fork: activation failed; dropping work");
+                None
+            }
+        });
+
     let completion = model
         .complete_prepared_with_pre_drain(
             prepared_request,
@@ -2615,6 +2634,45 @@ pub(crate) async fn run_turn(
             return Err(provider_error_remains_primary(e, audit_settled));
         }
     };
+
+    if let Some(work) = metadata_work {
+        // This runs only after the foreground request completed successfully.
+        // `history`, `prompt`, `tools`, system, model, and parameters are the
+        // same values that prepared that request, after all pruning and live
+        // injections. The foreground request therefore owns cache warming
+        // before the detached trailing metadata instruction can dispatch.
+        let session = session.clone();
+        let model = model.clone();
+        let system = agent.system.clone();
+        let agent_name = agent.name.clone();
+        let params = agent.params.clone();
+        let history = history.clone();
+        let prompt = prompt.clone();
+        let tools = tools.clone();
+        let cwd = cwd.to_path_buf();
+        let config = config.clone();
+        let cancel = cancel.clone();
+        let sealed_egress = sealed_egress.clone();
+        tokio::spawn(async move {
+            crate::auto_title::generate_session_metadata_fork(
+                session,
+                model,
+                system,
+                agent_name,
+                params,
+                history,
+                prompt,
+                tools,
+                endpoint_recovery_enabled,
+                work,
+                cwd,
+                config,
+                cancel,
+                sealed_egress,
+            )
+            .await;
+        });
+    }
 
     // Settle the dispatch-time record to `completed`, filling the phase-timestamp
     // columns now known (`first_token_ms` / `completed_ms`) WITHOUT touching the
@@ -3494,6 +3552,49 @@ pub(crate) async fn run_turn(
             cwd,
         }),
     })
+}
+
+/// Move work scheduled by the driver into the current root turn before request
+/// preparation begins. Once this returns, failure in any later preparation
+/// stage cannot leave the work in the session-global queue for another turn.
+fn take_scheduled_metadata_work(
+    session: &Session,
+    is_root: bool,
+) -> Option<crate::session::MetadataWork> {
+    is_root.then(|| session.take_metadata_fork()).flatten()
+}
+
+#[cfg(test)]
+mod metadata_fork_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn root_turn_removes_queued_metadata_before_request_preparation() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-preparation-failure"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let work = session
+            .note_user_content_for_metadata("schedule metadata before a failed request")
+            .expect("first user boundary schedules metadata");
+        session.queue_metadata_fork(work);
+
+        let held_for_this_turn = take_scheduled_metadata_work(&session, true);
+        assert!(held_for_this_turn.is_some());
+        assert!(
+            session.take_metadata_fork().is_none(),
+            "request preparation cannot leave this turn's metadata in the session queue"
+        );
+
+        // A request-preparation error drops this local work. A later root turn
+        // must not be able to claim it.
+        drop(held_for_this_turn);
+        assert!(session.take_metadata_fork().is_none());
+    }
 }
 
 #[cfg(test)]

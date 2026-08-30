@@ -1014,6 +1014,69 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.scheduler).clone()
     }
 
+    /// Run a daemon-owned keep-warm callback against its original session.
+    /// The callback payload is locally minted by the driver; malformed or
+    /// stale jobs fail closed and cannot be mistaken for a user submission.
+    pub async fn run_keep_warm_job(
+        &self,
+        job: crate::daemon::scheduler::ScheduledJob,
+    ) -> anyhow::Result<String> {
+        let mut parts = job.id.split('.');
+        anyhow::ensure!(
+            parts.next() == Some("keep-warm"),
+            "keep-warm callback has an invalid job id"
+        );
+        let session_id = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a session id"))?
+            .parse::<uuid::Uuid>()?;
+        let armed_at_unix_secs = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing an arm time"))?
+            .parse::<i64>()?;
+        let after_secs = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a delay"))?
+            .parse::<u64>()?;
+        let idle_window_secs = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing an idle window"))?
+            .parse::<u64>()?;
+        let _nonce = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a nonce"))?
+            .parse::<i64>()?;
+        anyhow::ensure!(
+            parts.next().is_none(),
+            "keep-warm callback job id has extra fields"
+        );
+
+        let handle = self
+            .attach_existing(
+                session_id,
+                None,
+                false,
+                None,
+                crate::env_snapshot::EnvSnapshot::from_process(
+                    crate::daemon::proto::EnvSnapshotSource::DaemonStart,
+                ),
+            )
+            .await?;
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
+                armed_at_unix_secs,
+                after_secs,
+                idle_window_secs,
+                respond_to,
+            })
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("keep-warm worker stopped before replying"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     fn scheduler_source(
         &self,
     ) -> Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>> {

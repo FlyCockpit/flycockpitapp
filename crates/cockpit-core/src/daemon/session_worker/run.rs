@@ -9866,6 +9866,31 @@ pub(super) async fn run_worker(
                         break WorkerStop::DriverFailed;
                     }
                 }
+                SessionWork::KeepWarm {
+                    armed_at_unix_secs,
+                    after_secs,
+                    idle_window_secs,
+                    respond_to,
+                } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::KeepWarm {
+                            armed_at_unix_secs,
+                            after_secs,
+                            idle_window_secs,
+                            respond_to,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
                 SessionWork::ProbeUserMessage {
                     client_submission_id,
                     wire_fingerprint,

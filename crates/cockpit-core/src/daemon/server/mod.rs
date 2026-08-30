@@ -2631,6 +2631,11 @@ impl DaemonContext {
         let scheduler: Option<crate::daemon::scheduler::DaemonSchedulerHandle> = None;
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
+            let keep_warm_registry = registry.clone();
+            handle.register_callback("keep_warm", move |job| {
+                let registry = keep_warm_registry.clone();
+                async move { registry.run_keep_warm_job(job).await }
+            })?;
         }
         let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
         let host_capability_probes =

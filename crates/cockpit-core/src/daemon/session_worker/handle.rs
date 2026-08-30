@@ -2171,6 +2171,14 @@ pub struct OversizedRunInvocationAdmission {
 #[derive(Debug)]
 pub enum SessionWork {
     WakeGoal,
+    /// A daemon-scheduled, observed-hit-gated cache refresh. It is never a
+    /// user message and never advances away/resume activity.
+    KeepWarm {
+        armed_at_unix_secs: i64,
+        after_secs: u64,
+        idle_window_secs: u64,
+        respond_to: oneshot::Sender<std::result::Result<String, String>>,
+    },
     ProbeUserMessage {
         client_submission_id: Uuid,
         wire_fingerprint: String,

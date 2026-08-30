@@ -90,6 +90,14 @@ use crate::session::Session;
 #[derive(Debug)]
 pub enum DriverControl {
     WakeGoal,
+    /// Send one non-mutating prompt-cache refresh while the session remains in
+    /// the idle window. This is cost-only and carries no resume semantics.
+    KeepWarm {
+        armed_at_unix_secs: i64,
+        after_secs: u64,
+        idle_window_secs: u64,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
     /// Deliver an already-durable late user steer to the exact live executor
     /// that originally owned the automatic decision. The worker acknowledges
     /// the DB claim only after that continuation completes, so a crash before
@@ -1206,6 +1214,8 @@ pub struct Driver {
     /// no stale completion can publish after session teardown.
     shadow_brief: Option<ShadowBriefState>,
     shadow_brief_generation: u64,
+    /// One one-shot keep-warm may be armed for each accepted user idle window.
+    keep_warm_armed_for_idle_window: bool,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
     goal_progress_last_seq: i64,
@@ -2230,6 +2240,7 @@ impl Driver {
             prune_effectiveness: self.prune_effectiveness.clone(),
             shadow_brief: None,
             shadow_brief_generation: 0,
+            keep_warm_armed_for_idle_window: false,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
@@ -2598,6 +2609,7 @@ impl Driver {
             prune_effectiveness: std::collections::VecDeque::new(),
             shadow_brief: None,
             shadow_brief_generation: 0,
+            keep_warm_armed_for_idle_window: false,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
@@ -5387,6 +5399,7 @@ impl Driver {
             if !waiting_for_keep_parked_siblings {
                 self.maybe_shadow_brief(tx).await;
                 self.maybe_auto_compact(tx).await;
+                self.maybe_schedule_keep_warm().await;
             }
             // Refresh the "% prunable" projection from the now-settled
             // foreground history. AgentIdle is turn-boundary chrome, not a
@@ -5728,6 +5741,17 @@ impl Driver {
                 if let Err(error) = self.maybe_continue_active_goal(input_queue, tx).await {
                     tracing::warn!(%error, "waking supervised goal failed");
                 }
+            }
+            DriverControl::KeepWarm {
+                armed_at_unix_secs,
+                after_secs,
+                idle_window_secs,
+                respond_to,
+            } => {
+                let _ = respond_to.send(
+                    self.run_keep_warm(armed_at_unix_secs, after_secs, idle_window_secs)
+                        .await,
+                );
             }
             DriverControl::FlushSendNow => {
                 // The live bash path observes the queue's send-now revision
@@ -7850,6 +7874,9 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
@@ -9359,6 +9386,225 @@ impl Driver {
     /// can't be loaded (implementation note).
     fn resolve_context_config(&self) -> crate::config::providers::ContextConfig {
         Self::context_config_from(self.active_providers_config().as_ref())
+    }
+
+    /// Evaluate one observed-hit-gated keep-warm opportunity at an idle root
+    /// boundary. The scheduler owns the later one-shot execution; this method
+    /// only records the decision and never changes user activity.
+    async fn maybe_schedule_keep_warm(&mut self) {
+        if self.keep_warm_armed_for_idle_window || !self.at_safe_boundary() || self.stack.len() != 1
+        {
+            return;
+        }
+        let Some((providers, provider, model)) = self.active_providers_config() else {
+            return;
+        };
+        let context = providers.resolve_context(&provider, &model);
+        let profile = providers.resolve_cache_retention_profile(&provider, &model);
+        let observed_cache_hit = self
+            .session
+            .last_usage()
+            .and_then(|usage| usage.hit_rate())
+            .is_some_and(|rate| rate > 0.0);
+        let decision = crate::keep_warm::decide(
+            context.keep_warm,
+            context.idle_window_secs,
+            profile,
+            observed_cache_hit,
+        );
+        self.keep_warm_armed_for_idle_window = true;
+
+        let agent = self.active_agent().to_string();
+        match decision {
+            crate::keep_warm::KeepWarmDecision::Skip(reason) => {
+                if let Err(error) = self
+                    .session
+                    .record_event(
+                        crate::db::session_log::SessionEventKind::InferenceRequest,
+                        Some(&agent),
+                        None,
+                        &serde_json::json!({
+                            "purpose": "keep_warm",
+                            "outcome": "skipped",
+                            "reason": reason.as_str(),
+                            "provider": provider,
+                            "model": model,
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "recording keep-warm skip failed");
+                }
+            }
+            crate::keep_warm::KeepWarmDecision::Schedule(schedule) => {
+                let Some(scheduler) = self.daemon_scheduler_handle() else {
+                    tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
+                    return;
+                };
+                let armed_at_unix_secs = chrono::Utc::now().timestamp();
+                let unique_millis = chrono::Utc::now().timestamp_millis();
+                let job = crate::daemon::proto::ScheduledJobCreate {
+                    id: format!(
+                        "keep-warm.{}.{}.{}.{}.{}",
+                        self.session.id.simple(),
+                        armed_at_unix_secs,
+                        schedule.after_secs,
+                        schedule.idle_window_secs,
+                        unique_millis,
+                    ),
+                    owner: "system:keep_warm".to_string(),
+                    schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
+                        at: armed_at_unix_secs.saturating_add(schedule.after_secs as i64),
+                    },
+                    payload: crate::daemon::proto::ScheduledJobPayload::Callback {
+                        subsystem: "keep_warm".to_string(),
+                    },
+                    enabled: true,
+                    missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
+                };
+                match scheduler.create_job(job).await {
+                    Ok(_) => {
+                        if let Err(error) = self
+                            .session
+                            .record_event(
+                                crate::db::session_log::SessionEventKind::InferenceRequest,
+                                Some(&agent),
+                                None,
+                                &serde_json::json!({
+                                    "purpose": "keep_warm",
+                                    "outcome": "scheduled",
+                                    "after_secs": schedule.after_secs,
+                                    "idle_window_secs": schedule.idle_window_secs,
+                                    "provider": provider,
+                                    "model": model,
+                                    "aggregator_guidance": schedule.aggregator_route.then_some(
+                                        "pin upstream provider routing/ordering to preserve cache locality"
+                                    ),
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, "recording keep-warm schedule failed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, session_id = %self.session.id, "scheduling keep-warm failed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute the one-shot cache refresh without appending a user or
+    /// assistant message. A stale job fails closed: it cannot run before its
+    /// arm time, after the original idle window, or after a later inference
+    /// has reset the cache activity clock.
+    async fn run_keep_warm(
+        &mut self,
+        armed_at_unix_secs: i64,
+        after_secs: u64,
+        idle_window_secs: u64,
+    ) -> std::result::Result<String, String> {
+        let elapsed = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(armed_at_unix_secs)
+            .max(0) as u64;
+        if elapsed < after_secs {
+            return Ok("skipped: before keep-warm deadline".to_string());
+        }
+        if elapsed >= idle_window_secs {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
+        if self
+            .session
+            .seconds_since_last_send()
+            .is_none_or(|age| age < after_secs)
+        {
+            return Ok("skipped: newer session activity".to_string());
+        }
+        let Some((providers, provider, model_id)) = self.active_providers_config() else {
+            return Ok("skipped: active endpoint unavailable".to_string());
+        };
+        let context = providers.resolve_context(&provider, &model_id);
+        let decision = crate::keep_warm::decide(
+            context.keep_warm,
+            context.idle_window_secs,
+            providers.resolve_cache_retention_profile(&provider, &model_id),
+            self.session
+                .last_usage()
+                .and_then(|usage| usage.hit_rate())
+                .is_some_and(|rate| rate > 0.0),
+        );
+        if let crate::keep_warm::KeepWarmDecision::Skip(reason) = decision {
+            return Ok(format!("skipped: {}", reason.as_str()));
+        }
+
+        let Some(root) = self.stack.first() else {
+            return Ok("skipped: root context unavailable".to_string());
+        };
+        let model = root.agent.model.clone();
+        let params = root.agent.params.clone();
+        let system = root.agent.system.clone();
+        let history = root.history.clone();
+        let agent = root.agent.name.clone();
+        let cancel = self
+            .cancel_current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_default();
+        let call_id = uuid::Uuid::new_v4();
+        let refresh = tokio::time::timeout(
+            crate::engine::model::UtilityCallSite::KeepWarm.timeout(),
+            model.complete_captured(
+                &system,
+                &history,
+                Message::user("Respond only with OK."),
+                &[],
+                params,
+                &agent,
+                None,
+                &cancel,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| "keep-warm request timed out".to_string())?
+        .map_err(|error| format!("keep-warm request failed: {error:#}"))?;
+        let ((_, _, usage), captured, _) = refresh;
+        let session_table = model.session_redact_table();
+        if let Err(error) = self
+            .session
+            .record_inference_request(
+                call_id,
+                &captured,
+                crate::db::session_log::InferenceRequestStatus::Completed,
+                session_table.as_ref(),
+                model.is_trusted(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "recording keep-warm request failed");
+        }
+        if let Some(usage) = usage
+            && let Err(error) = self.session.record_usage_utility(call_id, usage).await
+        {
+            tracing::warn!(%error, "recording keep-warm usage failed");
+        }
+        let call_id_text = call_id.to_string();
+        if let Err(error) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some(&agent),
+                Some(&call_id_text),
+                &serde_json::json!({ "purpose": "keep_warm", "outcome": "completed" }),
+            )
+            .await
+        {
+            tracing::warn!(%error, "recording keep-warm completion failed");
+        }
+        Ok("keep-warm completed".to_string())
     }
 
     fn root_can_self_compact(&self) -> bool {

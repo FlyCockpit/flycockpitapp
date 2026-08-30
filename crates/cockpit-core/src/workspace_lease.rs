@@ -890,10 +890,22 @@ pub async fn explicitly_clean_managed_worktree(
     owner_agent_instance_id: Uuid,
     lease_id: Uuid,
 ) -> Result<()> {
-    let row = db
+    let Some(row) = db
         .workspace_lease(session_id, owner_agent_instance_id, lease_id)
         .await?
-        .context("managed workspace lease is not owned by this host lifecycle request")?;
+    else {
+        if db
+            .workspace_lease_for_session(session_id, lease_id)
+            .await?
+            .is_some()
+        {
+            bail!("managed workspace lease is not owned by this host lifecycle request");
+        }
+        // Cleanup is a retryable host lifecycle operation.  A prior retry may
+        // already have retired the exact lease, so an absent owner-scoped row
+        // is a safe idempotent no-op rather than an internal failure.
+        return Ok(());
+    };
     let mut lease = WorkspaceLease::from_row(&row)?;
     if !lease.is_durable_host_issued_managed_worktree() {
         bail!("explicit cleanup requires a durable host-issued managed workspace lease");
@@ -903,10 +915,19 @@ pub async fn explicitly_clean_managed_worktree(
     // remaining Active-but-inadmissible forever.
     if lease.state == WorkspaceLeaseState::Active {
         expire_active_workspace_lease_if_due(db, &lease).await?;
-        let row = db
+        let Some(row) = db
             .workspace_lease(session_id, owner_agent_instance_id, lease_id)
             .await?
-            .context("managed workspace lease is not owned by this host lifecycle request")?;
+        else {
+            if db
+                .workspace_lease_for_session(session_id, lease_id)
+                .await?
+                .is_some()
+            {
+                bail!("managed workspace lease is not owned by this host lifecycle request");
+            }
+            return Ok(());
+        };
         lease = WorkspaceLease::from_row(&row)?;
     }
     if !matches!(

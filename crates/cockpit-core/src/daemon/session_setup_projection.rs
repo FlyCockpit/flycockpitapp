@@ -46,7 +46,13 @@ pub fn enrich_session_setup_snapshot(
 
     let mut def = agents::resolve(project_root, active_agent)?
         .or_else(|| agents::embedded_default(active_agent))
-        .ok_or_else(|| anyhow::anyhow!("active agent `{active_agent}` could not be resolved"))?;
+        // Session-setup is a projection of a durable prepared profile.  A
+        // profile may retain a package-backed primary whose source package is
+        // no longer present at the mutable workspace path; keep rendering the
+        // durable candidate/model evidence with the stable built-in surface
+        // instead of turning a read-only setup query into an internal error.
+        .or_else(|| agents::embedded_default("Build"))
+        .ok_or_else(|| anyhow::anyhow!("embedded Build agent is unavailable"))?;
     if let Some(json) = tool_surface_override_json
         && let Ok(selection) = serde_json::from_str::<ToolSurfaceSelection>(json)
     {

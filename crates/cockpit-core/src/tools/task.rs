@@ -70,7 +70,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`. Independent calls keep separate task IDs; `batch` is for grouped/depends_on work. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
+            "Delegate {list}: `intent` plus optional `payload`; separate calls get task IDs, `batch` groups/depends_on work. Use @file/@dir or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
         // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job

@@ -60,7 +60,10 @@ impl Tool for SymbolFindTool {
 
         let mut hits = index.symbol_find(name, exact, kind).await?;
         if hits.is_empty() {
-            return Ok(ToolOutput::text(format!("No symbol matches `{name}`.")));
+            // Keep a no-match response independent of the query. Besides
+            // avoiding needless prompt echo, this makes an empty scoped index
+            // distinguishable from evidence discovered outside the lease.
+            return Ok(ToolOutput::text("No matching symbol definitions."));
         }
         // Centrality ranking (additive, default-on, config-disablable):
         // when a name resolves to multiple definitions, surface the most

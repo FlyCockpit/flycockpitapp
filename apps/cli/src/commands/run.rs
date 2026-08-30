@@ -1001,7 +1001,14 @@ pub(crate) async fn pump_events(
                                 )?;
                                 return Ok(130);
                             }
-                            RunExitChoice::StopAll => {}
+                            RunExitChoice::StopAll => {
+                                // This is the only interactive path that broadens
+                                // cancellation beyond the current invocation.
+                                client
+                                    .request_ok(Request::CancelAllSessionWork)
+                                    .await
+                                    .context("cancelling all attached session work")?;
+                            }
                         }
                     } else {
                         writeln!(
@@ -1010,12 +1017,10 @@ pub(crate) async fn pump_events(
                         )?;
                         return Ok(130);
                     }
-                    // Stop all selected: cancel this invocation, then detach.
-                    // The ephemeral owner's last-client reaper performs
-                    // daemon-wide cleanup only if this was the final client;
-                    // attached peers keep their work and shared owner alive.
-                    let _ = reconcile_after_interrupt(client, id, format, &mut stderr).await?;
-                    return Ok(130);
+                    // Reconcile the interrupted invocation after the explicit
+                    // StopAll request. Normal Ctrl-C cancellation remains
+                    // invocation-scoped inside this helper.
+                    return reconcile_after_interrupt(client, id, format, &mut stderr).await;
                 }
                 return Ok(130);
             }

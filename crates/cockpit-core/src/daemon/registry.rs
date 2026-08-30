@@ -190,7 +190,7 @@ struct Inner {
         Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
-    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    resource_scheduler: Mutex<Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>>,
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
@@ -679,7 +679,7 @@ impl SessionRegistry {
                 command_secret_cache: Mutex::new(
                     crate::secret_command::CommandSecretCache::with_subprocess_executor(),
                 ),
-                resource_scheduler,
+                resource_scheduler: Mutex::new(resource_scheduler),
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
@@ -792,7 +792,14 @@ impl SessionRegistry {
     pub fn resource_scheduler(
         &self,
     ) -> Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>> {
-        self.inner.resource_scheduler.clone()
+        crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone()
+    }
+
+    pub fn set_resource_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.resource_scheduler) = scheduler;
     }
 
     pub fn set_global_bus(&self, tx: EventSender) {
@@ -801,6 +808,10 @@ impl SessionRegistry {
 
     pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
+    }
+
+    pub fn clear_scheduler(&self) {
+        *crate::sync::lock_or_recover(&self.inner.scheduler) = None;
     }
 
     pub fn set_write_scope(
@@ -831,6 +842,10 @@ impl SessionRegistry {
             Some((storage, ledger));
     }
 
+    pub(crate) fn clear_message_media_authority(&self) {
+        *crate::sync::lock_or_recover(&self.inner.message_media_authority) = None;
+    }
+
     fn message_media_authority(
         &self,
     ) -> Option<(
@@ -845,6 +860,10 @@ impl SessionRegistry {
         runtime: Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>,
     ) {
         *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
+    }
+
+    pub(crate) fn clear_tool_media_runtime(&self) {
+        *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = None;
     }
 
     pub(crate) fn tool_media_runtime(

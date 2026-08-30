@@ -501,7 +501,7 @@ pub(super) async fn prepare_session_deletion(
     // that cannot run inside the SQLite ledger transaction, and it is idempotent
     // / reconcilable: a later ledger failure leaves the retry safe because the
     // reconcile pass re-runs it. Run it before either delete path.
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         storage
             .begin_session_deletion_cleanup(session_id, now_wall_ms)
             .await

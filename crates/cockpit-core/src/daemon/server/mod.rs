@@ -2341,6 +2341,22 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
     }
 }
 
+struct PromotedPersistentServices {
+    media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    #[cfg(feature = "extended")]
+    image_generation_worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PromotedPersistentServices {
+    fn empty() -> Self {
+        Self {
+            media_storage_recovery: None,
+            #[cfg(feature = "extended")]
+            image_generation_worker: None,
+        }
+    }
+}
+
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
 pub struct DaemonContext {
@@ -2411,6 +2427,10 @@ pub struct DaemonContext {
     /// The durable scheduler is absent for an ephemeral owner and installed
     /// atomically before an in-place promotion publishes a persistent owner.
     scheduler: Arc<StdMutex<Option<DaemonSchedulerHandle>>>,
+    /// Services provisioned by an in-place ephemeral-to-persistent promotion.
+    /// They are installed and removed under `restart_decision` with endpoint
+    /// publication so request gates cannot outlive a failed promotion.
+    promoted_persistent_services: StdMutex<PromotedPersistentServices>,
     /// Stable, nonzero daemon boot UUID for all image-generation scheduler
     /// passes and deadline observation. The lifecycle worker uses it as its
     /// `worker_boot_id`; a job-creation caller uses it as the plan's
@@ -2509,6 +2529,8 @@ pub struct DaemonContext {
     /// make a parallel test daemon fail spuriously.
     #[cfg(test)]
     redaction_refresh_failure: Arc<AtomicBool>,
+    #[cfg(test)]
+    persistent_endpoint_publication_failure: AtomicBool,
 }
 
 #[cfg(test)]
@@ -2549,13 +2571,14 @@ impl DaemonContext {
         if !self.is_ephemeral_lifetime() {
             return Ok(false);
         }
-        self.install_persistent_scheduler();
+        self.install_persistent_services()?;
         let mut persistent_paths = self.paths.clone();
         persistent_paths.ephemeral = false;
         self.ephemeral_lifetime.store(false, Ordering::Release);
-        if let Err(error) = crate::daemon::write_endpoint_record(&persistent_paths) {
+        if let Err(error) = self.write_persistent_endpoint_record(&persistent_paths) {
             // No client has been told about the transition and the persistent
             // endpoint was not published, so preserve the old reap contract.
+            self.remove_persistent_services();
             self.ephemeral_lifetime.store(true, Ordering::Release);
             return Err(error);
         }
@@ -2584,6 +2607,103 @@ impl DaemonContext {
             self.registry.set_scheduler(handle.clone());
             *scheduler = Some(handle);
         }
+    }
+
+    fn install_persistent_services(&self) -> Result<()> {
+        let resource_scheduler =
+            Arc::new(crate::engine::resource_scheduler::ResourceScheduler::new(
+                ExtendedConfig::default().resource_scheduler,
+            ));
+        let media_root = crate::config::resolve::cockpit_data_dir()
+            .context("resolving persistent media root")?
+            .join("media");
+        let media_storage = Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(
+                self.db.clone(),
+                &media_root,
+            )
+            .context("opening persistent media storage")?,
+        );
+        #[cfg(feature = "extended")]
+        let image_generation_worker = {
+            let root = crate::config::resolve::cockpit_data_dir()
+                .context("resolving image generation artifact root")?
+                .join("image-artifacts");
+            cockpit_host::private_fs::ensure_private_dir(&root)
+                .context("creating private image generation artifact root")?;
+            let artifact_root = Arc::new(
+                crate::image_generation_job::open_image_generation_artifact_root(&root)
+                    .context("opening image generation artifact root")?,
+            );
+            let dispatch = self.registry.image_generation_dispatch_registry();
+            crate::daemon::image_generation_worker::spawn_image_generation_worker(
+                self.db.clone(),
+                self.image_generation_boot_id,
+                self.started_at,
+                dispatch.adapter_map(),
+                Arc::new(dispatch.clone()),
+                Arc::new(dispatch),
+                artifact_root,
+                self.shutdown.clone(),
+            )
+        };
+        self.registry
+            .set_resource_scheduler(Some(resource_scheduler));
+        self.install_persistent_scheduler();
+        self.registry
+            .set_media_storage_recovery(Some(media_storage.clone()));
+        self.registry
+            .set_message_media_authority(media_storage.clone(), self.media_ledger.clone());
+        if let Some(secure_key) = self.secure_key.clone() {
+            self.registry.set_tool_media_runtime(Arc::new(
+                crate::tool_media_authority::runtime::ToolMediaRuntime::new(
+                    secure_key,
+                    media_storage.clone(),
+                ),
+            ));
+        }
+        let mut services = crate::sync::lock_or_recover(&self.promoted_persistent_services);
+        services.media_storage_recovery = Some(media_storage);
+        #[cfg(feature = "extended")]
+        {
+            services.image_generation_worker = Some(image_generation_worker);
+        }
+        Ok(())
+    }
+
+    fn remove_persistent_services(&self) {
+        self.registry.set_resource_scheduler(None);
+        self.registry.clear_scheduler();
+        self.registry.set_media_storage_recovery(None);
+        self.registry.clear_message_media_authority();
+        self.registry.clear_tool_media_runtime();
+        *crate::sync::lock_or_recover(&self.scheduler) = None;
+        let mut services = crate::sync::lock_or_recover(&self.promoted_persistent_services);
+        services.media_storage_recovery = None;
+        #[cfg(feature = "extended")]
+        if let Some(worker) = services.image_generation_worker.take() {
+            worker.abort();
+        }
+    }
+
+    pub(crate) fn active_media_storage_recovery(
+        &self,
+    ) -> Option<Arc<crate::media_storage::MediaStorageRecovery>> {
+        crate::sync::lock_or_recover(&self.promoted_persistent_services)
+            .media_storage_recovery
+            .clone()
+            .or_else(|| self.media_storage_recovery.clone())
+    }
+
+    fn write_persistent_endpoint_record(&self, paths: &DaemonPaths) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .persistent_endpoint_publication_failure
+            .load(Ordering::Acquire)
+        {
+            anyhow::bail!("persistent endpoint publication forced to fail");
+        }
+        crate::daemon::write_endpoint_record(paths)
     }
 
     /// Start last-client teardown only while this owner is still ephemeral.
@@ -2836,6 +2956,7 @@ impl DaemonContext {
             #[cfg(feature = "remote")]
             remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
             scheduler: Arc::new(StdMutex::new(scheduler)),
+            promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
             image_generation_boot_id,
             _image_generation_worker: image_generation_worker,
             credential_store_path: None,
@@ -2869,6 +2990,8 @@ impl DaemonContext {
             redaction_publication_poisoned: AtomicBool::new(false),
             #[cfg(test)]
             redaction_refresh_failure: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            persistent_endpoint_publication_failure: AtomicBool::new(false),
         };
         #[cfg(test)]
         {
@@ -2933,7 +3056,7 @@ impl DaemonContext {
                 handle.clone(),
             ));
         self.registry.set_redaction_key_resolver(resolver.clone());
-        if let Some(storage) = self.media_storage_recovery.clone() {
+        if let Some(storage) = self.active_media_storage_recovery() {
             self.registry.set_tool_media_runtime(Arc::new(
                 crate::tool_media_authority::runtime::ToolMediaRuntime::new(
                     handle.clone(),
@@ -3987,7 +4110,7 @@ pub(crate) async fn boot_with_db(
     db.reconcile_delegation_sidecar_cleanup_intents()
         .await
         .context("reconciling delegation sidecar cleanup intents")?;
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         storage
             .reconcile_abandoned_component_leases(now_unix_ms)
@@ -4654,7 +4777,7 @@ async fn run_media_retention_sweep(
 }
 
 async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
-    let Some(storage) = ctx.media_storage_recovery.as_ref() else {
+    let Some(storage) = ctx.active_media_storage_recovery() else {
         return;
     };
     if let Err(error) = run_media_retention_sweep(storage, now_unix_ms).await {

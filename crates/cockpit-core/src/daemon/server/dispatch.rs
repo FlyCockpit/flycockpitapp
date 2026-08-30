@@ -3531,8 +3531,7 @@ async fn handle_send_user_message_v2(
         Vec::new()
     } else {
         let storage = ctx
-            .media_storage_recovery
-            .as_ref()
+            .active_media_storage_recovery()
             .ok_or_else(|| internal("durable media storage unavailable"))?;
         match storage
             .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
@@ -16068,8 +16067,7 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
@@ -16132,8 +16130,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
@@ -16190,8 +16187,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(unavailable)?;
             let trust_policy = attached.handle.current_trust_policy();
             let (_, extended) = ctx
@@ -16332,8 +16328,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(unavailable)?;
             let now = chrono::Utc::now().timestamp_millis();
             let lease = storage
@@ -16404,8 +16399,7 @@ async fn handle_serialized_request_impl(
                 .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
                 .map_err(internal)?;
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .begin_media_upload(
@@ -16473,8 +16467,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .append_media_upload_chunk(request, chrono::Utc::now().timestamp_millis())
@@ -16537,8 +16530,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .cancel_media_upload(request, chrono::Utc::now().timestamp_millis())
@@ -16601,8 +16593,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = storage
                 .discard_media_attachment(request, chrono::Utc::now().timestamp_millis())
@@ -16712,8 +16703,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .finalize_media_upload(request, chrono::Utc::now().timestamp_millis())

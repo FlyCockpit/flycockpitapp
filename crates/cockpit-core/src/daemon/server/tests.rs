@@ -7963,6 +7963,31 @@ fn ephemeral_promotion_provisions_scheduler_before_persistent_publication() {
     assert!(ctx.registry.scheduler().is_some());
 }
 
+#[test]
+fn failed_persistent_endpoint_publication_removes_promoted_services() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+
+    let ctx = test_ctx();
+    ctx.persistent_endpoint_publication_failure
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    assert!(ctx.promote_to_persistent().is_err());
+    assert!(ctx.is_ephemeral_lifetime());
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+    assert!(ctx.registry.resource_scheduler().is_none());
+    assert!(ctx.active_media_storage_recovery().is_none());
+    assert!(ctx.registry.tool_media_runtime().is_none());
+    #[cfg(feature = "extended")]
+    assert!(
+        crate::sync::lock_or_recover(&ctx.promoted_persistent_services)
+            .image_generation_worker
+            .is_none()
+    );
+}
+
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
@@ -33214,6 +33239,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         global_redaction: base.global_redaction.clone(),
         redaction_generation: std::sync::atomic::AtomicU64::new(0),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
         client_presence: base.client_presence.clone(),
@@ -33228,6 +33254,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
+        promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
         credential_store_path: None,
@@ -33431,6 +33458,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         global_redaction: base.global_redaction.clone(),
         redaction_generation: std::sync::atomic::AtomicU64::new(0),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
         client_presence: base.client_presence.clone(),
@@ -33445,6 +33473,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
+        promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
         credential_store_path: None,

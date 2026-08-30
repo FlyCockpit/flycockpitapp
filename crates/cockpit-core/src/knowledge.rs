@@ -194,83 +194,12 @@ impl LocalKb {
             embedder,
         }
     }
-
-    /// Build an assistant provider while its installation identity has been
-    /// resolved. The local provider owns this filesystem read so registry
-    /// assembly never needs to know how local KB contents are represented.
-    fn assistant(
-        entry: KnowledgeBaseRegistryEntry,
-        root: PathBuf,
-        snapshot_root: PathBuf,
-        sidecar_path: PathBuf,
-    ) -> Result<Option<Self>> {
-        let Some(snapshot) = Self::snapshot_assistant(&root, snapshot_root)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self::new(
-            entry,
-            root,
-            Some(snapshot),
-            sidecar_path,
-            None,
-        )))
-    }
-
-    fn snapshot_assistant(root: &Path, snapshot_root: PathBuf) -> Result<Option<KnowledgeBundle>> {
-        let handle = match cockpit_config::config::open_config_directory_nofollow(root) {
-            Ok(handle) => handle,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("opening assistant knowledge root {}", root.display())
-                });
-            }
-        };
-        drop(handle);
-        let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-            root,
-            MAX_KNOWLEDGE_FILES,
-            MAX_KNOWLEDGE_ENTRIES,
-            MAX_KNOWLEDGE_DEPTH,
-            MAX_KNOWLEDGE_FILE_BYTES,
-            MAX_KNOWLEDGE_TOTAL_BYTES,
-        )?;
-        parse_bundle_snapshot(snapshot_root, documents).map(Some)
-    }
 }
 
 #[async_trait]
 impl KbProvider for LocalKb {
     async fn is_available(&self) -> Result<bool> {
-        if self.snapshot.is_some() {
-            return Ok(true);
-        }
-        match cockpit_config::config::open_config_directory_nofollow(&self.root) {
-            Ok(handle) => {
-                drop(handle);
-                Ok(true)
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "opening local knowledge base `{}` at {}",
-                    self.entry.id,
-                    self.root.display()
-                )
-            }),
-        }
+        Ok(self.snapshot.is_some())
     }
 
     async fn retrieve(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
@@ -291,13 +220,13 @@ impl KbProvider for LocalKb {
             .into_iter()
             .next()
             .context("embedding query returned no vector")?;
-        let (index, _) = match &self.snapshot {
-            Some(snapshot) => {
-                KnowledgeIndex::open_snapshot(snapshot.clone(), self.sidecar_path.clone(), embedder)
-                    .await?
-            }
-            None => KnowledgeIndex::open(&self.root, embedder).await?,
-        };
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .context("available local knowledge provider has no retained source snapshot")?;
+        let (index, _) =
+            KnowledgeIndex::open_snapshot(snapshot.clone(), self.sidecar_path.clone(), embedder)
+                .await?;
         let mut results = index.search_with_vector(&query_vector, query, limit)?;
         for result in &mut results {
             result.knowledge_base_id = self.entry.id.clone();
@@ -1489,6 +1418,7 @@ pub(crate) async fn attached_bundles(
                 root,
                 assistant_snapshot_root: local.assistant_snapshot_root,
                 sidecar_path: Some(sidecar_path),
+                snapshot: local.snapshot,
             }
         });
         // Relative local paths are interpreted against this invocation's
@@ -1535,7 +1465,27 @@ pub(crate) async fn attached_bundles(
             denied_knowledge_base_ids.push(entry.id.clone());
             continue;
         }
-        let sealed_id = sealed_knowledge_base_identity(&entry, session.secret_vault().as_ref())?;
+        let sealed_id = if let Some(local) = &mut local {
+            let Some((snapshot, sealed_id)) =
+                capture_local_sealed_knowledge_base(&local.root, session.secret_vault().as_ref())?
+            else {
+                continue;
+            };
+            if local.assistant_snapshot_root.is_none() {
+                // The workspace directory is the replaceable source, never a
+                // cache authority. Keep its derived index in the daemon's
+                // private data directory so a pathname successor cannot
+                // inject cached snippets after we captured the source.
+                let cache_root =
+                    crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
+                cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
+                local.sidecar_path = Some(cache_root.join(format!("{sealed_id}.sqlite")));
+            }
+            local.snapshot = Some(snapshot);
+            sealed_id
+        } else {
+            sealed_knowledge_base_identity(&entry, session.secret_vault().as_ref())?
+        };
         let Some(provider) = provider_for(entry.clone(), local)? else {
             continue;
         };
@@ -1627,6 +1577,41 @@ pub(crate) fn sealed_knowledge_base_id_for_owner(
 /// vault entries to a replacement directory. A read-only attachment lacking a
 /// marker receives an invocation-local ID; any committed token then fails
 /// closed. The marker is created only by the sealed authoring path below.
+fn capture_local_sealed_knowledge_base(
+    root: &Path,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<Option<(KnowledgeBundle, crate::sealed::SealedKnowledgeBaseId)>> {
+    let source = match cockpit_config::config::open_config_directory_nofollow(root) {
+        Ok(source) => source,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening knowledge base source {}", root.display()));
+        }
+    };
+    let sealed_id = sealed_knowledge_base_identity_from_retained_source(root, &source, vault)?;
+    let documents =
+        cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+            &source,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )
+        .with_context(|| format!("snapshotting knowledge base source {}", root.display()))?;
+    Ok(Some((
+        parse_bundle_snapshot(root.to_path_buf(), documents)?,
+        sealed_id,
+    )))
+}
+
 fn sealed_knowledge_base_identity(
     entry: &KnowledgeBaseRegistryEntry,
     vault: &crate::secure_key::SecretVault,
@@ -1653,7 +1638,23 @@ fn sealed_knowledge_base_identity(
             root.display()
         );
     }
-    read_sealed_knowledge_base_marker(&root, vault)?.map_or_else(
+    let source = cockpit_config::config::open_config_directory_nofollow(&root)
+        .with_context(|| format!("opening knowledge base source {}", root.display()))?;
+    sealed_knowledge_base_identity_from_retained_source(&root, &source, vault)
+}
+
+fn sealed_knowledge_base_identity_from_retained_source(
+    root: &Path,
+    source: &std::fs::File,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<crate::sealed::SealedKnowledgeBaseId> {
+    if !cockpit_config::config::directory_handle_matches_path(source, root)? {
+        bail!(
+            "knowledge base source {} was replaced while resolving its sealed identity",
+            root.display()
+        );
+    }
+    read_sealed_knowledge_base_marker_from_retained_source(root, source, vault)?.map_or_else(
         || crate::sealed::SealedKnowledgeBaseId::from_attachment_id(uuid::Uuid::new_v4()),
         crate::sealed::SealedKnowledgeBaseId::from_attachment_id,
     )
@@ -1680,7 +1681,16 @@ fn ensure_sealed_knowledge_base_identity(
             root.display()
         );
     }
-    if let Some(id) = read_sealed_knowledge_base_marker(&root, vault)? {
+    let source = cockpit_config::config::open_config_directory_nofollow(&root)
+        .with_context(|| format!("opening knowledge base source {}", root.display()))?;
+    if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
+        bail!(
+            "knowledge base source {} was replaced while assigning its sealed identity",
+            root.display()
+        );
+    }
+    if let Some(id) = read_sealed_knowledge_base_marker_from_retained_source(&root, &source, vault)?
+    {
         return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(id);
     }
 
@@ -1692,21 +1702,38 @@ fn ensure_sealed_knowledge_base_identity(
         .open(&marker)
     {
         Ok(mut file) => {
+            if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
+                bail!(
+                    "knowledge base source {} was replaced while assigning its sealed identity",
+                    root.display()
+                );
+            }
             file.write_all(SEALED_KNOWLEDGE_BASE_MARKER_VERSION.as_bytes())?;
             file.write_all(b"\n")?;
             file.write_all(generated.to_string().as_bytes())?;
             file.write_all(b"\n")?;
             file.sync_all()?;
-            let binding = sealed_knowledge_base_marker_binding(&root, generated)?;
+            let marker_identity = sealed_marker_object_identity(&file)?;
+            let binding =
+                sealed_knowledge_base_marker_binding(&root, &source, marker_identity, generated)?;
             let tag = vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding);
             file.write_all(crate::intel::hex_lower(&tag).as_bytes())?;
             file.write_all(b"\n")?;
             file.sync_all()?;
-            sync_sealed_knowledge_base_marker_directory(&root)?;
+            sync_sealed_knowledge_base_marker_directory(&source, &root)?;
+            if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
+                bail!(
+                    "knowledge base source {} was replaced while assigning its sealed identity",
+                    root.display()
+                );
+            }
             crate::sealed::SealedKnowledgeBaseId::from_attachment_id(generated)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = read_sealed_knowledge_base_marker(&root, vault)?.context(
+            let existing = read_sealed_knowledge_base_marker_from_retained_source(
+                &root, &source, vault,
+            )?
+            .context(
                 "knowledge-base sealed identity marker appeared but is not a regular marker file",
             )?;
             crate::sealed::SealedKnowledgeBaseId::from_attachment_id(existing)
@@ -1724,24 +1751,31 @@ fn sealed_knowledge_base_marker_path(root: &Path) -> PathBuf {
     root.join(SEALED_KNOWLEDGE_BASE_ID_FILE)
 }
 
-fn read_sealed_knowledge_base_marker(
+fn read_sealed_knowledge_base_marker_from_retained_source(
     root: &Path,
+    source: &std::fs::File,
     vault: &crate::secure_key::SecretVault,
 ) -> Result<Option<uuid::Uuid>> {
-    let marker = sealed_knowledge_base_marker_path(root);
-    let metadata = match std::fs::symlink_metadata(&marker) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", marker.display())),
-    };
-    if !metadata.file_type().is_file() {
-        bail!(
-            "knowledge-base sealed identity marker {} must be a regular file",
-            marker.display()
-        );
-    }
-    let raw = std::fs::read_to_string(&marker)
-        .with_context(|| format!("reading {}", marker.display()))?;
+    let (raw, marker_identity) =
+        match cockpit_config::config::read_config_leaf_from_retained_directory_with_identity(
+            source,
+            std::ffi::OsStr::new(SEALED_KNOWLEDGE_BASE_ID_FILE),
+            1024,
+        ) {
+            Ok(value) => value,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).context("reading knowledge-base sealed identity marker");
+            }
+        };
+    let raw =
+        String::from_utf8(raw).context("knowledge-base sealed identity marker is not UTF-8")?;
     let mut lines = raw.split_terminator('\n');
     let version = lines
         .next()
@@ -1761,7 +1795,7 @@ fn read_sealed_knowledge_base_marker(
     }
     let id = uuid::Uuid::parse_str(id)
         .context("knowledge-base sealed identity marker must contain a UUID")?;
-    let binding = sealed_knowledge_base_marker_binding(root, id)?;
+    let binding = sealed_knowledge_base_marker_binding(root, source, marker_identity, id)?;
     let expected = crate::intel::hex_lower(
         &vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding),
     );
@@ -1778,70 +1812,74 @@ fn read_sealed_knowledge_base_marker(
 /// identifiers; they only make a copied marker fail validation. Binding both
 /// directory and marker objects also turns an inode-reuse event into a paired
 /// ABA condition rather than a namespace derivation.
-fn sealed_knowledge_base_marker_binding(root: &Path, id: uuid::Uuid) -> Result<Vec<u8>> {
-    let marker = sealed_knowledge_base_marker_path(root);
-    let root_metadata = std::fs::metadata(root)
-        .with_context(|| format!("reading knowledge base source {}", root.display()))?;
-    let marker_metadata =
-        std::fs::metadata(&marker).with_context(|| format!("reading {}", marker.display()))?;
-    if !root_metadata.is_dir() || !marker_metadata.is_file() {
-        bail!("knowledge-base sealed identity marker source objects are invalid");
-    }
+fn sealed_knowledge_base_marker_binding(
+    root: &Path,
+    source: &std::fs::File,
+    marker_identity: cockpit_config::config::TerminalIngressFileIdentity,
+    id: uuid::Uuid,
+) -> Result<Vec<u8>> {
     let mut binding = b"flycockpit/knowledge-base-sealed-marker-binding/v1\0".to_vec();
     append_attachment_identity_component(&mut binding, root.to_string_lossy().as_bytes());
     append_attachment_identity_component(&mut binding, id.as_bytes());
-    append_sealed_marker_object_identity(&mut binding, &root_metadata)?;
-    append_sealed_marker_object_identity(&mut binding, &marker_metadata)?;
+    append_sealed_marker_object_identity(&mut binding, sealed_marker_object_identity(source)?);
+    append_sealed_marker_object_identity(&mut binding, marker_identity);
     Ok(binding)
 }
 
-#[cfg(unix)]
 fn append_sealed_marker_object_identity(
     binding: &mut Vec<u8>,
-    metadata: &std::fs::Metadata,
-) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    binding.extend_from_slice(b"unix\0");
-    binding.extend_from_slice(&metadata.dev().to_le_bytes());
-    binding.extend_from_slice(&metadata.ino().to_le_bytes());
-    Ok(())
+    identity: cockpit_config::config::TerminalIngressFileIdentity,
+) {
+    binding.extend_from_slice(&identity.volume.to_le_bytes());
+    binding.extend_from_slice(&identity.file.to_le_bytes());
 }
 
-#[cfg(windows)]
-fn append_sealed_marker_object_identity(
-    binding: &mut Vec<u8>,
-    metadata: &std::fs::Metadata,
-) -> Result<()> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    binding.extend_from_slice(b"windows\0");
-    binding.extend_from_slice(&metadata.creation_time().to_le_bytes());
-    binding.extend_from_slice(&metadata.file_attributes().to_le_bytes());
-    Ok(())
+fn sealed_marker_object_identity(
+    file: &std::fs::File,
+) -> Result<cockpit_config::config::TerminalIngressFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        return Ok(cockpit_config::config::TerminalIngressFileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+            links: metadata.nlink().try_into().unwrap_or(u32::MAX),
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+            .context("querying held Windows knowledge-base marker identity")?;
+        return Ok(cockpit_config::config::TerminalIngressFileIdentity {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            file: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+            links: information.nNumberOfLinks,
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        bail!(
+            "knowledge-base sealed markers require filesystem object identities on this platform"
+        );
+    }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn append_sealed_marker_object_identity(
-    binding: &mut Vec<u8>,
-    metadata: &std::fs::Metadata,
-) -> Result<()> {
-    let created = metadata
-        .created()
-        .context("reading knowledge-base sealed marker object creation time")?
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("knowledge-base sealed marker object creation time predates the Unix epoch")?;
-    binding.extend_from_slice(b"portable\0");
-    binding.extend_from_slice(&created.as_secs().to_le_bytes());
-    binding.extend_from_slice(&created.subsec_nanos().to_le_bytes());
-    Ok(())
-}
-
-fn sync_sealed_knowledge_base_marker_directory(root: &Path) -> Result<()> {
-    std::fs::File::open(root)
-        .with_context(|| format!("opening knowledge base source directory {}", root.display()))?
-        .sync_all()
-        .with_context(|| format!("fsync knowledge base source directory {}", root.display()))
+fn sync_sealed_knowledge_base_marker_directory(root: &std::fs::File, display: &Path) -> Result<()> {
+    root.sync_all().with_context(|| {
+        format!(
+            "fsync knowledge base source directory {}",
+            display.display()
+        )
+    })
 }
 
 fn validate_dream_models(
@@ -2011,7 +2049,16 @@ fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid
             });
         }
     };
-    let metadata = std::fs::metadata(&root)
+    let source = cockpit_config::config::open_config_directory_nofollow(&root)
+        .with_context(|| format!("opening local knowledge base source {}", root.display()))?;
+    if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
+        bail!(
+            "local knowledge base source {} was replaced while attaching it",
+            root.display()
+        );
+    }
+    let metadata = source
+        .metadata()
         .with_context(|| format!("reading local knowledge base source {}", root.display()))?;
     if !metadata.is_dir() {
         bail!(
@@ -2023,44 +2070,24 @@ fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid
     let mut name = b"flycockpit/knowledge-local-attachment/v2\0".to_vec();
     append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-
-        name.extend_from_slice(&metadata.dev().to_le_bytes());
-        name.extend_from_slice(&metadata.ino().to_le_bytes());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-
-        name.extend_from_slice(&metadata.creation_time().to_le_bytes());
-        name.extend_from_slice(&metadata.file_attributes().to_le_bytes());
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let created = metadata
-            .created()
-            .context("reading local knowledge base source creation time")?
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("local knowledge base source creation time predates the Unix epoch")?;
-        name.extend_from_slice(&created.as_secs().to_le_bytes());
-        name.extend_from_slice(&created.subsec_nanos().to_le_bytes());
-    }
-    let mut documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-        &root,
-        MAX_KNOWLEDGE_FILES,
-        MAX_KNOWLEDGE_ENTRIES,
-        MAX_KNOWLEDGE_DEPTH,
-        MAX_KNOWLEDGE_FILE_BYTES,
-        MAX_KNOWLEDGE_TOTAL_BYTES,
-    )
-    .with_context(|| {
-        format!(
-            "snapshotting local knowledge base source {}",
-            root.display()
+    let source_identity = sealed_marker_object_identity(&source)?;
+    name.extend_from_slice(&source_identity.volume.to_le_bytes());
+    name.extend_from_slice(&source_identity.file.to_le_bytes());
+    let mut documents =
+        cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+            &source,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "snapshotting local knowledge base source {}",
+                root.display()
+            )
+        })?;
     documents.sort_by(|(left, _), (right, _)| left.cmp(right));
     let mut source_fingerprint = Sha256::new();
     source_fingerprint.update(b"flycockpit/knowledge-local-source/v1\0");
@@ -2101,6 +2128,7 @@ struct RegistryLocalKb {
     root: PathBuf,
     assistant_snapshot_root: Option<PathBuf>,
     sidecar_path: Option<PathBuf>,
+    snapshot: Option<KnowledgeBundle>,
 }
 
 fn workspace_knowledge_base(entry: KnowledgeBaseRegistryEntry) -> RegistryKnowledgeBase {
@@ -2109,6 +2137,7 @@ fn workspace_knowledge_base(entry: KnowledgeBaseRegistryEntry) -> RegistryKnowle
             root: path.clone(),
             assistant_snapshot_root: None,
             sidecar_path: None,
+            snapshot: None,
         }),
         KnowledgeBaseSource::Remote { .. } => None,
     };
@@ -2157,6 +2186,7 @@ async fn assistant_knowledge_registry_entry(
                 snapshot.row.name
             ))),
             sidecar_path: Some(cache_root.join(format!("{}.sqlite", config.installation_id))),
+            snapshot: None,
         }),
     }))
 }
@@ -2227,15 +2257,21 @@ fn provider_for(
             let sidecar_path = local
                 .sidecar_path
                 .context("local knowledge provider has no sidecar path")?;
-            if let Some(snapshot_root) = local.assistant_snapshot_root {
-                return LocalKb::assistant(entry, local.root, snapshot_root, sidecar_path).map(
-                    |provider| provider.map(|provider| Arc::new(provider) as Arc<dyn KbProvider>),
-                );
-            }
+            let snapshot = local
+                .snapshot
+                .context("local knowledge provider has no retained source snapshot")?;
+            let snapshot = if let Some(snapshot_root) = local.assistant_snapshot_root {
+                KnowledgeBundle {
+                    root: snapshot_root,
+                    ..snapshot
+                }
+            } else {
+                snapshot
+            };
             Ok(Some(Arc::new(LocalKb::new(
                 entry,
                 local.root,
-                None,
+                Some(snapshot),
                 sidecar_path,
                 None,
             ))))
@@ -3012,6 +3048,51 @@ mod tests {
         assert_eq!(
             sealed_knowledge_base_identity(&entry, &vault).unwrap(),
             replacement
+        );
+    }
+
+    #[test]
+    fn retained_sealed_kb_capture_cannot_be_redirected_by_a_path_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local { path: root.clone() },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let original = ensure_sealed_knowledge_base_identity(&entry, &vault).unwrap();
+        let (captured, captured_id) = capture_local_sealed_knowledge_base(&root, &vault)
+            .unwrap()
+            .unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        write_bundle(&root);
+        fs::write(
+            root.join("deploy.md"),
+            "---\ntype: decision\n---\n\nreplacement directory content\n",
+        )
+        .unwrap();
+
+        assert_eq!(captured_id, original);
+        assert!(
+            captured
+                .concepts
+                .iter()
+                .any(|concept| serialize_concept(concept).contains("green deploy pipeline"))
+        );
+        assert!(
+            captured.concepts.iter().all(
+                |concept| !serialize_concept(concept).contains("replacement directory content")
+            )
         );
     }
 

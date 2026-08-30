@@ -339,6 +339,18 @@ pub fn read_config_leaf_from_retained_directory(
     files::read_leaf_from_directory_handle(directory, leaf, max_bytes)
 }
 
+/// Read one bounded regular-file leaf relative to a retained directory and
+/// return the stable identity of the exact object whose bytes were captured.
+/// This prevents callers from authenticating a path lookup and then consuming
+/// a replacement leaf.
+pub fn read_config_leaf_from_retained_directory_with_identity(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> anyhow::Result<(Vec<u8>, TerminalIngressFileIdentity)> {
+    files::read_leaf_from_directory_handle_with_identity(directory, leaf, max_bytes)
+}
+
 /// Snapshot every visible Markdown document below an existing directory using
 /// component-relative, no-follow handles. Symlinks/reparse points and identity
 /// ambiguity fail the entire snapshot; callers never mix trusted and untrusted
@@ -353,6 +365,27 @@ pub fn snapshot_markdown_tree_nofollow(
 ) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
     files::snapshot_markdown_tree_nofollow(
         root,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )
+}
+
+/// Snapshot Markdown below an already-retained directory. Descendants are
+/// opened component-relative without following links, so a later replacement
+/// of the directory's path cannot redirect the captured source.
+pub fn snapshot_markdown_tree_from_retained_directory_nofollow(
+    directory: &std::fs::File,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
+    files::snapshot_markdown_tree_from_directory_nofollow(
+        directory,
         max_files,
         max_entries,
         max_depth,

@@ -1109,6 +1109,15 @@ pub(crate) fn read_leaf_from_directory_handle(
     leaf: &std::ffi::OsStr,
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
+    read_leaf_from_directory_handle_with_identity(directory, leaf, max_bytes)
+        .map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn read_leaf_from_directory_handle_with_identity(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, super::TerminalIngressFileIdentity)> {
     if Path::new(leaf).components().count() != 1
         || matches!(
             Path::new(leaf).components().next(),
@@ -1121,14 +1130,14 @@ pub(crate) fn read_leaf_from_directory_handle(
         anyhow::bail!("retained-directory read requires one normal leaf component");
     }
     #[cfg(unix)]
-    let file = open_file_at_nofollow(
+    let mut file = open_file_at_nofollow(
         directory,
         leaf,
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
     )?;
     #[cfg(windows)]
-    let file = {
+    let mut file = {
         use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
@@ -1156,11 +1165,38 @@ pub(crate) fn read_leaf_from_directory_handle(
             anyhow::bail!("retained-directory leaf is not a bounded regular file");
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        (&mut file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() > max_bytes {
             anyhow::bail!("retained-directory leaf exceeds the byte limit");
         }
-        Ok(bytes)
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            super::TerminalIngressFileIdentity {
+                volume: metadata.dev(),
+                file: metadata.ino(),
+                links: metadata.nlink().try_into().unwrap_or(u32::MAX),
+            }
+        };
+        #[cfg(windows)]
+        let identity = {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            super::TerminalIngressFileIdentity {
+                volume: u64::from(info.dwVolumeSerialNumber),
+                file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+                links: info.nNumberOfLinks,
+            }
+        };
+        Ok((bytes, identity))
     }
 }
 
@@ -1637,6 +1673,24 @@ pub(crate) fn snapshot_markdown_tree_nofollow(
     max_total_bytes: usize,
 ) -> Result<Vec<(PathBuf, String)>> {
     let root_handle = open_directory_handle_nofollow(root)?;
+    snapshot_markdown_tree_from_directory_nofollow(
+        &root_handle,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )
+}
+
+pub(crate) fn snapshot_markdown_tree_from_directory_nofollow(
+    root_handle: &std::fs::File,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<(PathBuf, String)>> {
     let mut output = Vec::new();
     let mut total = 0usize;
     let mut entries = 0usize;
@@ -1648,7 +1702,7 @@ pub(crate) fn snapshot_markdown_tree_nofollow(
         max_total_bytes,
     };
     snapshot_markdown_directory(
-        &root_handle,
+        root_handle,
         Path::new(""),
         &mut output,
         &mut total,

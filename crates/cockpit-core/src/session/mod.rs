@@ -360,10 +360,6 @@ pub struct Session {
     /// Immutable session-start KB identity/freshness facts rendered into the
     /// cached system prefix. Never rewritten after a dream completes.
     knowledge_base_prompt_snapshot: Arc<KnowledgeBasePromptSnapshot>,
-    /// In-memory delivery watermarks for volatile dream-completion notices.
-    /// They intentionally reset on attach: the persisted snapshot remains the
-    /// authority for whether a resumed session needs one notice.
-    knowledge_base_freshness_notices: Mutex<std::collections::BTreeMap<String, i64>>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -1199,6 +1195,12 @@ impl Session {
 
     /// Return one-line, per-turn freshness facts for dreams that completed
     /// after this session began. This does not update the cached system prompt.
+    ///
+    /// This deliberately does not acknowledge a notice. The caller appends a
+    /// returned message to the live turn history immediately before dispatch;
+    /// that history is the delivery record. If a turn is cancelled, times out,
+    /// or is retried before dispatch, asking again returns the same notice, so
+    /// an acknowledgement can never outlive the history that delivers it.
     pub async fn knowledge_base_freshness_notices(&self) -> Vec<String> {
         let snapshot = self.knowledge_base_prompt_snapshot.clone();
         if snapshot.entries().is_empty() {
@@ -1212,11 +1214,6 @@ impl Session {
             }
         };
         let project_root = self.project_root.to_string_lossy().into_owned();
-        let already_announced = self
-            .knowledge_base_freshness_notices
-            .lock()
-            .unwrap()
-            .clone();
         let mut fresh = Vec::new();
         for entry in snapshot.entries() {
             let current = match self
@@ -1236,29 +1233,17 @@ impl Session {
             if entry
                 .last_dreamed_at_unix_ms
                 .map_or(true, |snapshot| current > snapshot)
-                && already_announced
-                    .get(&entry.id)
-                    .map_or(true, |announced| current > *announced)
             {
                 fresh.push((entry.id.clone(), entry.name.clone(), current));
             }
         }
-
-        let mut announced = self.knowledge_base_freshness_notices.lock().unwrap();
         fresh
             .into_iter()
-            .filter_map(|(id, name, timestamp)| {
-                if announced
-                    .get(&id)
-                    .is_some_and(|previous| *previous >= timestamp)
-                {
-                    return None;
-                }
-                announced.insert(id, timestamp);
-                Some(format!(
+            .map(|(_id, name, timestamp)| {
+                format!(
                     "KB {name} finished a new dream at {}; newer knowledge is now available.",
                     crate::knowledge::format_dream_timestamp(timestamp)
-                ))
+                )
             })
             .collect()
     }
@@ -1780,7 +1765,11 @@ mod tests {
         assert!(notices[0].contains("KB Team Notes finished a new dream at"));
         assert!(notices[0].contains("newer knowledge is now available"));
         assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
-        assert!(session.knowledge_base_freshness_notices().await.is_empty());
+        assert_eq!(
+            session.knowledge_base_freshness_notices().await,
+            notices,
+            "detecting freshness must not acknowledge it before the caller records it in history"
+        );
     }
 
     fn providers_config(

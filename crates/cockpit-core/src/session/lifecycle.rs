@@ -150,12 +150,22 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
 fn capture_knowledge_base_prompt_snapshot_json(
     db: &Db,
     project_root: &std::path::Path,
+    assistant_name: Option<&str>,
+    allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<String> {
     let config = crate::config::extended::load_for_cwd(project_root);
     let project_root = project_root.to_string_lossy().into_owned();
+    let assistant_name = assistant_name.map(str::to_owned);
+    let allowed_knowledge_bases = allowed_knowledge_bases.cloned();
     db.blocking_write_for_sync_maintenance(move |conn| {
-        crate::knowledge::KnowledgeBasePromptSnapshot::capture(&config, conn, &project_root)
-            .map(|snapshot| snapshot.to_json_string())
+        crate::knowledge::KnowledgeBasePromptSnapshot::capture(
+            &config,
+            conn,
+            &project_root,
+            assistant_name.as_deref(),
+            allowed_knowledge_bases.as_ref(),
+        )
+        .map(|snapshot| snapshot.to_json_string())
     })
     .context("capturing knowledge-base prompt snapshot")
 }
@@ -185,8 +195,14 @@ impl Session {
         })?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        row.knowledge_base_prompt_snapshot_json =
-            capture_knowledge_base_prompt_snapshot_json(&db, &project_root)?;
+        let allowed_knowledge_bases = crate::agents::resolve(&project_root, active_agent)?
+            .and_then(|definition| definition.allowed_knowledge_bases().cloned());
+        row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
+            &db,
+            &project_root,
+            None,
+            allowed_knowledge_bases.as_ref(),
+        )?;
         let row_for_db = row.clone();
         let row = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -206,6 +222,7 @@ impl Session {
         db: Db,
         project_root: PathBuf,
         active_agent: &str,
+        allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
@@ -226,8 +243,12 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        row.knowledge_base_prompt_snapshot_json =
-            capture_knowledge_base_prompt_snapshot_json(&db, &project_root)?;
+        row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
+            &db,
+            &project_root,
+            None,
+            allowed_knowledge_bases,
+        )?;
         let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -283,6 +304,7 @@ impl Session {
         project_root: PathBuf,
         active_agent: &str,
         assistant_name: &str,
+        allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
@@ -305,8 +327,12 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        row.knowledge_base_prompt_snapshot_json =
-            capture_knowledge_base_prompt_snapshot_json(&db, &project_root)?;
+        row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
+            &db,
+            &project_root,
+            Some(assistant_name),
+            allowed_knowledge_bases,
+        )?;
         let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -561,7 +587,6 @@ impl Session {
             secret_path_matcher: std::sync::OnceLock::new(),
             model_system_prompt_snapshot,
             knowledge_base_prompt_snapshot,
-            knowledge_base_freshness_notices: Mutex::new(std::collections::BTreeMap::new()),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),

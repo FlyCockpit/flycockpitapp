@@ -30,7 +30,7 @@ impl Session {
     ) -> Result<Self> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::create_deferred(db, project_root, active_agent, resolver, vault)
+        Self::create_deferred(db, project_root, active_agent, None, resolver, vault)
     }
 
     pub fn create_assistant_deferred_for_test(
@@ -47,6 +47,7 @@ impl Session {
             project_root,
             active_agent,
             assistant_name,
+            None,
             resolver,
             vault,
         )

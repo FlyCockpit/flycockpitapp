@@ -61,20 +61,28 @@ impl KnowledgeBasePromptSnapshot {
         config: &ExtendedConfig,
         conn: &rusqlite::Connection,
         project_root: &str,
+        assistant_name: Option<&str>,
+        allowed_knowledge_bases: Option<&BTreeSet<String>>,
     ) -> Result<Self> {
         let consumer = crate::db::installation_identity::ensure_installation_identity_conn(conn)?;
-        let entries = config
-            .knowledge_bases
-            .iter()
+        let attached = attached_bundles_from_registry(
+            assistant_knowledge_registry_entry_for_session_start(conn, assistant_name)?,
+            config,
+            Path::new(project_root),
+            allowed_knowledge_bases,
+        )?;
+        let entries = attached
+            .into_iter()
             .map(|knowledge_base| {
+                let entry = knowledge_base.entry;
                 Ok(KnowledgeBasePromptSnapshotEntry {
-                    id: knowledge_base.id.clone(),
-                    name: knowledge_base.name.clone(),
-                    description: knowledge_base.description.clone(),
+                    id: entry.id.clone(),
+                    name: entry.name,
+                    description: entry.description,
                     last_dreamed_at_unix_ms:
                         crate::db::knowledge_dreams::knowledge_base_last_dreamed_at_conn(
                             conn,
-                            &knowledge_base.id,
+                            &entry.id,
                             project_root,
                             consumer.as_hex(),
                         )?,
@@ -3564,10 +3572,28 @@ pub(crate) async fn attached_bundles(
     allowed_knowledge_bases: Option<&BTreeSet<String>>,
     extended: &ExtendedConfig,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
+    attached_bundles_from_registry(
+        assistant_knowledge_registry_entry(session).await?,
+        extended,
+        cwd,
+        allowed_knowledge_bases,
+    )
+}
+
+/// The shared registry-to-attachment resolver for retrieval, dream writes,
+/// and the frozen KB prompt snapshot. Keeping the snapshot on this exact
+/// path prevents its advertised KBs from drifting from the active agent's
+/// usable attachments.
+fn attached_bundles_from_registry(
+    assistant: Option<RegistryKnowledgeBase>,
+    extended: &ExtendedConfig,
+    cwd: &Path,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+) -> Result<Vec<AttachedKnowledgeBase>> {
     let mut seen = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
-    if let Some(assistant) = assistant_knowledge_registry_entry(session).await? {
+    if let Some(assistant) = assistant {
         registry.push(assistant);
     }
     registry.extend(
@@ -3691,10 +3717,33 @@ async fn assistant_knowledge_registry_entry(
     else {
         return Ok(None);
     };
-    let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
-    let config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&snapshot.row.config_json)
-            .context("parsing assistant identity for knowledge cache")?;
+    assistant_knowledge_registry_entry_from_row(&snapshot.row).map(Some)
+}
+
+/// Session creation already owns the database connection that will store the
+/// frozen snapshot, so it cannot re-enter the async assistant snapshot
+/// coordinator. It still resolves the assistant registry entry through the
+/// same validated row-to-entry conversion used by live retrieval.
+fn assistant_knowledge_registry_entry_for_session_start(
+    conn: &rusqlite::Connection,
+    name: Option<&str>,
+) -> Result<Option<RegistryKnowledgeBase>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    crate::assistants::validate_assistant_name(name)?;
+    let row = crate::db::Db::get_assistant_conn(conn, name)?.with_context(|| {
+        format!("assistant `{name}` disappeared while capturing knowledge snapshot")
+    })?;
+    assistant_knowledge_registry_entry_from_row(&row).map(Some)
+}
+
+fn assistant_knowledge_registry_entry_from_row(
+    row: &cockpit_db::AssistantRow,
+) -> Result<RegistryKnowledgeBase> {
+    let root = crate::assistants::validate_row_home(row)?.join("knowledge");
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .context("parsing assistant identity for knowledge cache")?;
     if config.installation_id.is_nil() {
         bail!("assistant knowledge has no installation identity");
     }
@@ -3711,19 +3760,19 @@ async fn assistant_knowledge_registry_entry(
         trust_required: false,
         merge_policy: KnowledgeBaseMergePolicy::Auto,
     };
-    Ok(Some(RegistryKnowledgeBase {
+    Ok(RegistryKnowledgeBase {
         entry,
         local: Some(RegistryLocalKb {
             root,
             assistant_snapshot_root: Some(PathBuf::from(format!(
                 "assistant://{}/knowledge",
-                snapshot.row.name
+                row.name
             ))),
             sidecars: Some(KbSidecars::in_root(
                 &cache_root.join(config.installation_id.to_string()),
             )),
         }),
-    }))
+    })
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
@@ -5272,6 +5321,38 @@ timestamp: 2026-08-29T12:00:00Z
         .unwrap();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].entry.id, "project");
+    }
+
+    #[test]
+    fn prompt_snapshot_uses_the_same_attachment_filter_as_retrieval() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(&tmp.path().join("available"));
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let mut available = project_knowledge_registry_entry();
+        available.id = "available".to_string();
+        available.name = "Available".to_string();
+        available.trust_required = false;
+        available.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("available"),
+        };
+        let mut restricted = available.clone();
+        restricted.id = "restricted".to_string();
+        restricted.name = "Restricted".to_string();
+        let config = ExtendedConfig {
+            knowledge_bases: vec![available, restricted],
+            ..Default::default()
+        };
+        let allowed = BTreeSet::from(["available".to_string()]);
+        let root = tmp.path().to_string_lossy().into_owned();
+
+        let snapshot = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                KnowledgeBasePromptSnapshot::capture(&config, conn, &root, None, Some(&allowed))
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.entries().len(), 1);
+        assert_eq!(snapshot.entries()[0].id, "available");
     }
 
     #[tokio::test]

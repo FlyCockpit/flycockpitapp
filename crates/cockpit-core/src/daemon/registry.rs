@@ -1457,6 +1457,10 @@ impl SessionRegistry {
             &available,
             session_worker::initial_active_agent(&extended_cfg),
         );
+        let initial_agent_definition =
+            crate::agents::resolve_with_assistant_db(&project_root, &initial_agent, &self.inner.db)
+                .await
+                .context("resolving active agent before capturing knowledge attachments")?;
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
@@ -1466,6 +1470,9 @@ impl SessionRegistry {
             self.inner.db.clone(),
             project_root,
             &initial_agent,
+            initial_agent_definition
+                .as_ref()
+                .and_then(crate::agents::AgentDef::allowed_knowledge_bases),
             self.redaction_key_resolver()?,
             self.secret_vault()?,
         )
@@ -1565,7 +1572,7 @@ impl SessionRegistry {
         };
         let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
         crate::assistants::validate_assistant_name(assistant_name)?;
-        crate::assistants::load_verified(&self.inner.db, assistant_name)
+        let assistant_definition = crate::assistants::load_verified(&self.inner.db, assistant_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
 
@@ -1604,6 +1611,7 @@ impl SessionRegistry {
             project_root,
             assistant_name,
             assistant_name,
+            assistant_definition.agent.allowed_knowledge_bases(),
             self.redaction_key_resolver()?,
             self.secret_vault()?,
         )

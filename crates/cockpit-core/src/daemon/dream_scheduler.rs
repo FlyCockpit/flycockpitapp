@@ -31,7 +31,17 @@ use crate::knowledge::dream::{
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const DREAM_TURN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Cancellation is cooperative, but the dedicated Dream worker must not own
+/// the per-KB execution fence indefinitely when it fails to publish a terminal
+/// outcome. After this grace expires we stop that exact worker generation.
+#[cfg(not(test))]
+const DREAM_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DREAM_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(10);
 const DEFAULT_JITTER_SECONDS: i64 = 60 * 60;
+
+pub(crate) const REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE: &str =
+    "remote knowledge-base dream submission is hosted and not implemented";
 
 #[derive(Clone)]
 pub(crate) struct DreamScheduler {
@@ -129,9 +139,17 @@ impl DreamScheduler {
                 }
             };
             for knowledge_base in &extended.knowledge_bases {
-                if !matches!(&knowledge_base.source, KnowledgeBaseSource::Local { .. }) {
-                    // TODO(hosted dream service): dispatch configured remote KB
-                    // schedules through the hosted sink once it owns remote writes.
+                if let KnowledgeBaseSource::Remote { url } = &knowledge_base.source {
+                    // Remote Dream execution is intentionally hosted-only for
+                    // now. A configured schedule must still be visible as
+                    // unavailable instead of looking like an active local
+                    // schedule that silently never fires.
+                    tracing::warn!(
+                        knowledge_base_id = %knowledge_base.id,
+                        remote_url = %url,
+                        reason = REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE,
+                        "skipping scheduled remote knowledge dream because hosted execution is unavailable"
+                    );
                     continue;
                 }
                 let last_scheduled = self
@@ -349,7 +367,7 @@ pub(crate) async fn run_knowledge_dream(
         .context("Dream session dropped queue acknowledgement")?
         .map_err(|error| anyhow::anyhow!(error.message))?;
     let turn_id = queued_item.id.to_string();
-    await_dream_turn_terminal(&handle, &turn_id, DREAM_TURN_TIMEOUT).await?;
+    await_dream_turn_terminal(registry, &handle, &turn_id, DREAM_TURN_TIMEOUT).await?;
 
     let remaining = db
         .undreamed_sessions_for_knowledge_base(
@@ -475,6 +493,7 @@ fn default_jitter_seconds(kb_id: &str, consumer_id: &str) -> i64 {
 }
 
 async fn await_dream_turn_terminal(
+    registry: &SessionRegistry,
     handle: &crate::daemon::session_worker::SessionWorkerHandle,
     turn_id: &str,
     timeout: Duration,
@@ -487,9 +506,31 @@ async fn await_dream_turn_terminal(
                 .send_work(SessionWork::Cancel)
                 .await
                 .context("cancelling timed-out Dream turn")?;
-            classify_dream_turn_terminal(turn_id, handle.watch_turn(turn_id).await)
-                .context("Dream turn timed out and was cancelled")?;
-            Ok(())
+            match tokio::time::timeout(DREAM_CANCEL_SETTLE_TIMEOUT, handle.watch_turn(turn_id))
+                .await
+            {
+                Ok(outcome) => classify_dream_turn_terminal(turn_id, outcome)
+                    .context("Dream turn timed out and was cancelled"),
+                Err(_) => {
+                    // The registry checks the worker-channel identity before
+                    // stopping it, so this cannot cancel a successor that
+                    // reused the session id. Whether graceful stop succeeds
+                    // or the registry force-aborts at its own deadline, this
+                    // task can now release the per-KB run fence and let a
+                    // future manual/scheduled run start cleanly.
+                    let stop_result = registry.interrupt_and_stop_exact(handle).await;
+                    match stop_result {
+                        Ok(_) => anyhow::bail!(
+                            "Dream turn `{turn_id}` did not publish a terminal outcome within {}ms after cancellation; its worker was stopped",
+                            DREAM_CANCEL_SETTLE_TIMEOUT.as_millis()
+                        ),
+                        Err(error) => anyhow::bail!(
+                            "Dream turn `{turn_id}` did not publish a terminal outcome within {}ms after cancellation; attempted to stop its exact worker: {error}",
+                            DREAM_CANCEL_SETTLE_TIMEOUT.as_millis()
+                        ),
+                    }
+                }
+            }
         }
     }
 }
@@ -525,6 +566,34 @@ mod tests {
     use crate::db::workspace_trust::WorkspaceTrustMode;
     use crate::locks::LockManager;
     use crate::session::Session;
+
+    fn test_registry(db: &Db) -> SessionRegistry {
+        let registry = SessionRegistry::new(
+            db.clone(),
+            Arc::new(LockManager::in_memory(db.clone())),
+            ShutdownSignal::new(),
+            None,
+            ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
+        );
+        registry.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
+        registry.set_secret_vault(crate::secure_key::vault_for_db(db).unwrap());
+        registry
+    }
+
+    fn test_scheduler(db: &Db, knowledge_bases: Vec<KnowledgeBaseRegistryEntry>) -> DreamScheduler {
+        DreamScheduler {
+            db: db.clone(),
+            registry: test_registry(db),
+            config_source: ConfigSource::fixed(
+                test_dream_providers(),
+                ExtendedConfig {
+                    knowledge_bases,
+                    ..Default::default()
+                },
+            ),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
 
     #[test]
     fn per_machine_default_jitter_is_stable_and_kb_specific() {
@@ -567,9 +636,13 @@ mod tests {
     }
 
     fn test_dream_entry(schedule: Option<&str>) -> KnowledgeBaseRegistryEntry {
+        test_dream_entry_with_id("kb", schedule)
+    }
+
+    fn test_dream_entry_with_id(id: &str, schedule: Option<&str>) -> KnowledgeBaseRegistryEntry {
         KnowledgeBaseRegistryEntry {
-            id: "kb".into(),
-            name: "KB".into(),
+            id: id.into(),
+            name: format!("KB {id}"),
             description: "test".into(),
             source: KnowledgeBaseSource::Local {
                 path: PathBuf::from("kb"),
@@ -605,6 +678,16 @@ mod tests {
         providers
     }
 
+    fn test_dream_model() -> ActiveModelRef {
+        ActiveModelRef {
+            provider: "p".into(),
+            model: "dream".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }
+    }
+
     #[tokio::test]
     async fn run_due_once_records_empty_fire_for_trusted_configured_workspace_without_attachments()
     {
@@ -614,28 +697,7 @@ mod tests {
             .await
             .unwrap();
 
-        let registry = SessionRegistry::new(
-            db.clone(),
-            Arc::new(LockManager::in_memory(db.clone())),
-            ShutdownSignal::new(),
-            None,
-            ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
-        );
-        registry.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
-        registry.set_secret_vault(crate::secure_key::vault_for_db(&db).unwrap());
-
-        let scheduler = DreamScheduler {
-            db: db.clone(),
-            registry,
-            config_source: ConfigSource::fixed(
-                test_dream_providers(),
-                ExtendedConfig {
-                    knowledge_bases: vec![test_dream_entry(Some("@hourly"))],
-                    ..Default::default()
-                },
-            ),
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
-        };
+        let scheduler = test_scheduler(&db, vec![test_dream_entry(Some("@hourly"))]);
 
         let consumer_id = db
             .ensure_installation_identity()
@@ -665,9 +727,172 @@ mod tests {
         .expect("detached empty-fire task should persist its cursor");
     }
 
+    #[tokio::test]
+    async fn independently_scheduled_knowledge_bases_each_persist_their_fire() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        db.set_workspace_trust(root.path(), WorkspaceTrustMode::Trust)
+            .await
+            .unwrap();
+        let scheduler = test_scheduler(
+            &db,
+            vec![
+                test_dream_entry_with_id("hourly", Some("@hourly")),
+                test_dream_entry_with_id("daily", Some("@daily")),
+            ],
+        );
+        let consumer_id = db
+            .ensure_installation_identity()
+            .await
+            .unwrap()
+            .as_hex()
+            .to_owned();
+        let project_root = root.path().canonicalize().unwrap().display().to_string();
+
+        scheduler.run_due_once().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let hourly = db
+                    .knowledge_base_last_scheduled_at("hourly", &project_root, &consumer_id)
+                    .await
+                    .unwrap();
+                let daily = db
+                    .knowledge_base_last_scheduled_at("daily", &project_root, &consumer_id)
+                    .await
+                    .unwrap();
+                if hourly.is_some() && daily.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("each due knowledge base should fire independently");
+    }
+
+    #[tokio::test]
+    async fn durable_schedule_cursor_catches_up_after_daemon_restart() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let database_path = state_dir.path().join("cockpit.sqlite3");
+        let workspace = tempfile::tempdir().unwrap();
+        let project_root = workspace
+            .path()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let first_daemon_db = Db::open(&database_path).unwrap();
+        first_daemon_db
+            .set_workspace_trust(workspace.path(), WorkspaceTrustMode::Trust)
+            .await
+            .unwrap();
+        let consumer_id = first_daemon_db
+            .ensure_installation_identity()
+            .await
+            .unwrap()
+            .as_hex()
+            .to_owned();
+        let before_shutdown = Utc::now().timestamp_millis() - 2 * 60 * 60 * 1_000;
+        first_daemon_db
+            .record_knowledge_dream_schedule_fire(
+                "kb",
+                &project_root,
+                &consumer_id,
+                before_shutdown,
+                Some(before_shutdown),
+            )
+            .await
+            .unwrap();
+        drop(first_daemon_db);
+
+        let restarted_daemon_db = Db::open(&database_path).unwrap();
+        let scheduler = test_scheduler(
+            &restarted_daemon_db,
+            vec![test_dream_entry(Some("@hourly"))],
+        );
+        scheduler.run_due_once().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let last_scheduled = restarted_daemon_db
+                    .knowledge_base_last_scheduled_at("kb", &project_root, &consumer_id)
+                    .await
+                    .unwrap();
+                if last_scheduled.is_some_and(|value| value > before_shutdown) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a persisted missed schedule should fire after daemon restart");
+    }
+
+    #[tokio::test]
+    async fn manual_and_scheduled_runs_cannot_select_sources_before_the_shared_full_run_fence() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(&db);
+        let entry = test_dream_entry(None);
+        let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let held_fence = knowledge_dream_run_lock_for_root(&project_root, &entry.id)
+            .lock_owned()
+            .await;
+
+        let manual_db = db.clone();
+        let manual_registry = registry.clone();
+        let manual_root = root.path().to_path_buf();
+        let manual_entry = entry.clone();
+        let manual = tokio::spawn(async move {
+            run_knowledge_dream(
+                &manual_db,
+                &manual_registry,
+                &manual_root,
+                &manual_entry,
+                test_dream_model(),
+                HistoryCallerTrust::Trusted,
+                false,
+                false,
+            )
+            .await
+        });
+
+        let scheduled_db = db.clone();
+        let scheduled_registry = registry.clone();
+        let scheduled_root = root.path().to_path_buf();
+        let scheduled_entry = entry.clone();
+        let scheduled = tokio::spawn(async move {
+            run_knowledge_dream(
+                &scheduled_db,
+                &scheduled_registry,
+                &scheduled_root,
+                &scheduled_entry,
+                test_dream_model(),
+                HistoryCallerTrust::Trusted,
+                false,
+                true,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !manual.is_finished() && !scheduled.is_finished(),
+            "both entry paths must wait before their source-selection fast path"
+        );
+        drop(held_fence);
+        assert_eq!(manual.await.unwrap().unwrap(), DreamRunDisposition::Empty);
+        assert_eq!(
+            scheduled.await.unwrap().unwrap(),
+            DreamRunDisposition::Empty
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timeout_cancel_keeps_exact_completed_turn_as_success() {
         let db = Db::open_in_memory().unwrap();
+        let registry = test_registry(&db);
         let locks = Arc::new(LockManager::in_memory(db.clone()));
         let session = Arc::new(
             Session::create_deferred_for_test(
@@ -681,7 +906,10 @@ mod tests {
         let (handle, mut work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let observed = tokio::spawn({
             let handle = handle.clone();
-            async move { await_dream_turn_terminal(&handle, "turn-1", Duration::from_secs(60)).await }
+            async move {
+                await_dream_turn_terminal(&registry, &handle, "turn-1", Duration::from_secs(60))
+                    .await
+            }
         });
 
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -693,6 +921,65 @@ mod tests {
         });
 
         observed.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_worker_without_terminal_outcome_is_stopped_and_releases_the_run_fence() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(&db);
+        let session = Arc::new(
+            Session::create_deferred_for_test(
+                db.clone(),
+                root.path().to_path_buf(),
+                "Dream",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let (handle, mut work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(session, registry.locks());
+        registry.insert_test_worker(handle.clone(), tokio::spawn(std::future::pending::<()>()));
+        let entry = test_dream_entry(None);
+        let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let observed = tokio::spawn({
+            let registry = registry.clone();
+            let handle = handle.clone();
+            let project_root = project_root.clone();
+            let knowledge_base_id = entry.id.clone();
+            async move {
+                let _fence = knowledge_dream_run_lock_for_root(&project_root, &knowledge_base_id)
+                    .lock_owned()
+                    .await;
+                await_dream_turn_terminal(&registry, &handle, "turn-1", Duration::from_secs(60))
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(matches!(work_rx.recv().await, Some(SessionWork::Cancel)));
+        tokio::time::advance(DREAM_CANCEL_SETTLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::daemon::registry::DESTRUCTIVE_STOP_TIMEOUT).await;
+        assert!(observed.await.unwrap().is_err());
+
+        assert_eq!(
+            run_knowledge_dream(
+                &db,
+                &registry,
+                root.path(),
+                &entry,
+                test_dream_model(),
+                HistoryCallerTrust::Trusted,
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
+            DreamRunDisposition::Empty,
+            "the next manual or scheduled fire must be able to re-enter after forced recovery"
+        );
     }
 
     #[test]

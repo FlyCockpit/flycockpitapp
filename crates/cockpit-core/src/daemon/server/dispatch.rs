@@ -5836,8 +5836,9 @@ async fn handle_serialized_request_impl(
             ) {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
-                    message: "remote knowledge-base dream submission is hosted and not implemented"
-                        .to_string(),
+                    message:
+                        crate::daemon::dream_scheduler::REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE
+                            .to_string(),
                 });
             }
             let model =
@@ -5899,8 +5900,9 @@ async fn handle_serialized_request_impl(
             ) {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
-                    message: "remote knowledge-base dream submission is hosted and not implemented"
-                        .to_string(),
+                    message:
+                        crate::daemon::dream_scheduler::REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE
+                            .to_string(),
                 });
             }
             let model =

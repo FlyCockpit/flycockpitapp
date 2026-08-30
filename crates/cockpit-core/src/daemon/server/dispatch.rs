@@ -14143,7 +14143,7 @@ async fn handle_serialized_request_impl(
                         &cwd, &def,
                     )
                     .catalog();
-                    let entry = catalog.servers.get(&server).ok_or_else(|| {
+                    let entry = catalog.get(&server).ok_or_else(|| {
                         bad_request(format!("MCP server `{server}` is not available to agent `{agent}`"))
                     })?;
                     if !entry.agent_bound {
@@ -20172,12 +20172,11 @@ fn redacted_mcp_config_snapshot(
         crate::mcp::resolver::discover_effective_catalog(cwd)
     });
     let mut shadowed = catalog
-        .shadowed
-        .iter()
+        .shadowed_entries()
         .filter_map(|entry| {
             entry.shadowed_by.map(|shadowed_by| {
                 serde_json::json!({
-                    "server": entry.name,
+                    "server": entry.name(),
                     "source": entry.source().as_str(),
                     "shadowed_by": shadowed_by.as_str(),
                 })
@@ -20190,7 +20189,7 @@ fn redacted_mcp_config_snapshot(
         };
         let agent_catalog =
             crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, &def).catalog();
-        shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
+        shadowed.extend(agent_catalog.shadowed_entries().filter_map(|entry| {
             let shadowed_by = entry.shadowed_by?;
             if entry.source() != crate::mcp::resolver::McpScope::Agent
                 && shadowed_by != crate::mcp::resolver::McpScope::Agent
@@ -20199,7 +20198,7 @@ fn redacted_mcp_config_snapshot(
             }
             Some(serde_json::json!({
                 "agent": listing.name,
-                "server": entry.name,
+                "server": entry.name(),
                 "source": entry.source().as_str(),
                 "shadowed_by": shadowed_by.as_str(),
             }))

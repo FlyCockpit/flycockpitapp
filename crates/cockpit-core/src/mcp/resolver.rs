@@ -80,7 +80,7 @@ pub use super::config::DEFAULT_PROFILE;
 /// One server in the effective catalog, including the layer that defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
-    pub name: String,
+    name: String,
     origin: CatalogOrigin,
     /// More-specific scope that hid this same-named server, if any.
     pub shadowed_by: Option<McpScope>,
@@ -108,7 +108,7 @@ impl CatalogEntry {
         self.shadowed_by.is_none()
     }
 
-    pub fn builtin() -> Self {
+    fn builtin() -> Self {
         Self {
             name: BUILTIN_SERVER_ID.to_string(),
             origin: CatalogOrigin::Builtin,
@@ -118,7 +118,7 @@ impl CatalogEntry {
         }
     }
 
-    pub fn persistent(name: String, server: ServerConfig, scope: PersistentMcpScope) -> Self {
+    fn persistent(name: String, server: ServerConfig, scope: PersistentMcpScope) -> Self {
         Self {
             name,
             origin: CatalogOrigin::Persistent { scope, server },
@@ -133,6 +133,11 @@ impl CatalogEntry {
             CatalogOrigin::Builtin => None,
             CatalogOrigin::Persistent { server, .. } => Some(server),
         }
+    }
+
+    /// The server identity admitted with this provenance.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     fn persistent_server_mut(&mut self) -> Option<&mut ServerConfig> {
@@ -158,10 +163,10 @@ impl CatalogEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveCatalog {
     /// Winning (unshadowed) entries keyed by server name.
-    pub servers: BTreeMap<String, CatalogEntry>,
+    servers: BTreeMap<String, CatalogEntry>,
     /// Same-named entries hidden by a more-specific scope. Never silent:
     /// a projection can surface `shadowed_by`.
-    pub shadowed: Vec<CatalogEntry>,
+    shadowed: Vec<CatalogEntry>,
     /// A layer tried to define the reserved `cockpit` server.
     pub reserved_builtin_rejected: bool,
 }
@@ -226,6 +231,22 @@ impl EffectiveCatalog {
         }
     }
 
+    /// Add caller-provided persistent definitions without replacing a
+    /// root-admitted entry. This keeps every such overlay within the same
+    /// identity/provenance admission boundary as discovered configuration.
+    pub(crate) fn supplement_persistent_config(&mut self, cfg: &McpConfig) {
+        for (name, server) in &cfg.servers {
+            if self.servers.contains_key(name) {
+                continue;
+            }
+            self.merge_entry(CatalogEntry::persistent(
+                name.clone(),
+                server.clone(),
+                PersistentMcpScope::Workspace,
+            ));
+        }
+    }
+
     pub fn to_mcp_config(&self) -> McpConfig {
         McpConfig {
             servers: self
@@ -256,6 +277,25 @@ impl EffectiveCatalog {
                     .map(|server| (name.as_str(), server, entry))
             })
             .collect()
+    }
+
+    /// Active entries in their catalog key order. The key is the authoritative
+    /// server identity; `CatalogEntry` cannot be inserted or renamed by
+    /// catalog consumers.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &CatalogEntry)> {
+        self.servers
+            .iter()
+            .filter(|(_, entry)| entry.is_live())
+            .map(|(name, entry)| (name.as_str(), entry))
+    }
+
+    /// Entries that lost a scope-precedence merge.
+    pub fn shadowed_entries(&self) -> impl Iterator<Item = &CatalogEntry> {
+        self.shadowed.iter()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
     }
 
     pub fn has_reserved_builtin_server_config(&self) -> bool {

@@ -4601,15 +4601,11 @@ pub(crate) mod tests {
 
         let agent = agent_from_def(&def, &args).expect("child constructs");
         assert!(
-            agent
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("reachable"),
+            agent.mcp_resolver.catalog().contains("reachable"),
             "parent-reachable bound server stays visible at admission"
         );
         assert!(
-            !agent.mcp_resolver.catalog().servers.contains_key("secret"),
+            !agent.mcp_resolver.catalog().contains("secret"),
             "agent-bound servers the parent cannot reach must drop at admission"
         );
         let admitted_catalog = agent.mcp_resolver.catalog();
@@ -4624,19 +4620,9 @@ pub(crate) mod tests {
         rebuild_args.mcp_parent_reachable = None;
         let rebuilt = rebuild_from_pinned_definition(&agent, &rebuild_args)
             .expect("pinned rebuild constructs");
+        assert!(rebuilt.mcp_resolver.catalog().contains("reachable"));
         assert!(
-            rebuilt
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("reachable")
-        );
-        assert!(
-            !rebuilt
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("secret"),
+            !rebuilt.mcp_resolver.catalog().contains("secret"),
             "rebuild must not restore agent-bound servers the parent could not reach"
         );
         assert_eq!(
@@ -4648,11 +4634,7 @@ pub(crate) mod tests {
             "a turn rebuild must retain the agent's admitted catalog projection"
         );
         assert!(
-            !rebuilt
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("new-persistent"),
+            !rebuilt.mcp_resolver.catalog().contains("new-persistent"),
             "edited persistent configuration is visible only to a new root worker"
         );
         let descendant_args = SpawnArgs {
@@ -4662,11 +4644,7 @@ pub(crate) mod tests {
         };
         let descendant = agent_from_def(&def, &descendant_args).expect("descendant constructs");
         assert!(
-            !descendant
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("new-persistent"),
+            !descendant.mcp_resolver.catalog().contains("new-persistent"),
             "a descendant projects its parent root snapshot, not the current disk catalog"
         );
     }

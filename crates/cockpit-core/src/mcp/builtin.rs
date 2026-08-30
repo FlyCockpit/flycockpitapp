@@ -112,15 +112,7 @@ impl HostContext {
     ) -> crate::mcp::resolver::EffectiveCatalog {
         if let Some(ctx) = &self.native_tool_ctx {
             let mut catalog = (*ctx.mcp_resolver.catalog()).clone();
-            for (name, server) in &fallback.servers {
-                catalog.servers.entry(name.clone()).or_insert_with(|| {
-                    crate::mcp::resolver::CatalogEntry::persistent(
-                        name.clone(),
-                        server.clone(),
-                        crate::mcp::resolver::PersistentMcpScope::Workspace,
-                    )
-                });
-            }
+            catalog.supplement_persistent_config(fallback);
             catalog
         } else {
             crate::mcp::resolver::EffectiveCatalog::from_mcp_config(fallback)

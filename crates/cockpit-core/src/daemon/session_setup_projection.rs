@@ -120,18 +120,18 @@ fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSe
         project_root,
         agent_layer.as_ref(),
     );
-    let mut entries: Vec<CatalogEntry> = catalog.servers.into_values().collect();
-    entries.extend(catalog.shadowed);
+    let mut entries: Vec<&CatalogEntry> = catalog.entries().map(|(_, entry)| entry).collect();
+    entries.extend(catalog.shadowed_entries());
     entries.sort_by(|left, right| {
         scope_rank(left.source())
             .cmp(&scope_rank(right.source()))
-            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.name().cmp(right.name()))
     });
     entries
         .into_iter()
-        .filter(CatalogEntry::is_enabled)
+        .filter(|entry| entry.is_enabled())
         .map(|entry| SessionSetupMcpV1 {
-            name: entry.name,
+            name: entry.name().to_string(),
             scope: entry.source().as_str().to_string(),
             enabled: entry.is_enabled(),
             shadowed_by: entry.shadowed_by.map(|scope| scope.as_str().to_string()),
@@ -326,7 +326,13 @@ mod tests {
             "enabled": true
         }))
         .expect("server");
-        let mut entry = CatalogEntry::persistent(name.to_string(), server, source);
+        let mut cfg = crate::mcp::config::McpConfig::default();
+        cfg.servers.insert(name.to_string(), server);
+        let mut entry =
+            crate::mcp::resolver::EffectiveCatalog::from_mcp_config_with_scope(&cfg, source)
+                .get(name)
+                .expect("fixture server is admitted")
+                .clone();
         entry.shadowed_by = shadowed_by;
         entry
     }
@@ -350,7 +356,7 @@ mod tests {
         entries.sort_by(|left, right| {
             scope_rank(left.source())
                 .cmp(&scope_rank(right.source()))
-                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.name().cmp(right.name()))
         });
         let scopes: Vec<_> = entries.iter().map(|e| e.source().as_str()).collect();
         assert_eq!(scopes, vec!["global", "global", "agent", "workspace"]);

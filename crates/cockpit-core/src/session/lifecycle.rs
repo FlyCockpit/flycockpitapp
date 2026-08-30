@@ -148,6 +148,202 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
 }
 
 impl Session {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_workspace_root(project_root: PathBuf) -> (PathBuf, bool) {
+        // Test fixtures commonly use stable synthetic paths (for example
+        // `/proj`) to exercise path policy without creating host files.
+        // Prefer production identity when the fixture root exists.
+        match std::fs::canonicalize(&project_root) {
+            Ok(canonical_root) => (canonical_root, true),
+            Err(_) => (project_root, false),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_with_test_workspace_root(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
+        let project_id = project_id_for(&project_root);
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let mut row = db.blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::build_new_session_row_conn(
+                conn,
+                &project_id_for_db,
+                &project_root_for_db,
+                &active_agent_for_db,
+            )
+        })?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let row_for_db = row.clone();
+        let row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::insert_session_row_conn(conn, &row_for_db)
+            })
+            .context("creating test session row")?;
+        Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+            true,
+            initialize_workspace_scratch,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_deferred_with_test_workspace_root(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
+        let project_id = project_id_for(&project_root);
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let mut row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::build_new_session_row_conn(
+                    conn,
+                    &project_id_for_db,
+                    &project_root_for_db,
+                    &active_agent_for_db,
+                )
+            })
+            .context("building deferred test session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            initialize_workspace_scratch,
+        )?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_assistant_deferred_with_test_workspace_root(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        assistant_name: &str,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let (project_root, initialize_workspace_scratch) = Self::test_workspace_root(project_root);
+        let project_id = project_id_for(&project_root);
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let assistant_name_for_db = assistant_name.to_string();
+        let mut row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::build_new_assistant_session_row_conn(
+                    conn,
+                    &project_id_for_db,
+                    &project_root_for_db,
+                    &active_agent_for_db,
+                    &assistant_name_for_db,
+                )
+            })
+            .context("building deferred assistant test session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            initialize_workspace_scratch,
+        )?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_fork_with_test_workspace_root(
+        db: Db,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Self> {
+        let row = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::create_fork_conn(
+                    conn,
+                    parent_session_id,
+                    fork_point_turn_id,
+                    false,
+                    Uuid::new_v4(),
+                    Utc::now().timestamp_millis(),
+                )
+            })
+            .context("creating test fork session row")?;
+        copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
+            .context("copying vault sealed values and redaction table into test fork")?;
+        let (project_root, initialize_workspace_scratch) =
+            Self::test_workspace_root(PathBuf::from(&row.project_root));
+        Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+            false,
+            initialize_workspace_scratch,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resume_with_test_workspace_root(
+        db: Db,
+        session_id: Uuid,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Option<Self>> {
+        let Some(row) = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::get_session_conn(conn, session_id)
+            })
+            .context("fetching test session")?
+        else {
+            return Ok(None);
+        };
+        let (project_root, initialize_workspace_scratch) =
+            Self::test_workspace_root(PathBuf::from(&row.project_root));
+        Ok(Some(Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+            false,
+            initialize_workspace_scratch,
+        )?))
+    }
+
     /// Create a brand-new session, inserting its row in the DB.
     #[allow(dead_code)]
     pub fn create(
@@ -179,7 +375,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault, true)
+        Self::from_row(db, project_root, row, resolver, vault, true, true)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -213,7 +409,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -275,7 +471,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -397,7 +593,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault, false)
+        Self::from_row(db, project_root, row, resolver, vault, false, true)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -424,6 +620,7 @@ impl Session {
             resolver,
             vault,
             false,
+            true,
         )?))
     }
 
@@ -434,9 +631,17 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
         freshly_created: bool,
+        initialize_workspace_scratch: bool,
     ) -> Result<Self> {
-        let project_root = canonical_workspace_root(&project_root)
-            .context("canonicalizing persisted session workspace root")?;
+        let project_root = if initialize_workspace_scratch {
+            canonical_workspace_root(&project_root)
+                .context("canonicalizing persisted session workspace root")?
+        } else {
+            // Test-support constructors deliberately permit synthetic roots
+            // such as `/proj`. Preserve canonicalization when possible so
+            // fixtures using real roots keep production-equivalent identity.
+            std::fs::canonicalize(&project_root).unwrap_or(project_root)
+        };
         anyhow::ensure!(
             project_id_for(&project_root) == row.project_id,
             "persisted session project id does not match canonical workspace root"
@@ -490,12 +695,19 @@ impl Session {
             None => load_redaction_table_from_vault(&vault, row.session_id)
                 .context("loading vault redaction table while resuming session")?,
         };
-        // Durable workspace scratch is a required session capability. Create
-        // and publish its reverse-map marker before returning a usable session
-        // so every later prompt and sandbox consumer has the same path.
-        let workspace_scratch_dir =
+        // Durable workspace scratch is a required production session
+        // capability. Test-support sessions with synthetic roots receive the
+        // same per-session path but must not publish a reverse-map marker for
+        // a root that cannot be canonicalized.
+        let workspace_scratch_dir = if initialize_workspace_scratch {
             workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
-                .context("initializing required durable workspace scratch")?;
+                .context("initializing required durable workspace scratch")?
+        } else {
+            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)?;
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
+            path
+        };
         Ok(Self {
             id: row.session_id,
             project_id: row.project_id,

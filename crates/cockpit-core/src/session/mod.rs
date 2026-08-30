@@ -2412,6 +2412,58 @@ mod tests {
     }
 
     #[test]
+    fn test_constructor_supports_a_synthetic_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let synthetic_root = home.path().join("fixture-workspace-that-does-not-exist");
+        let db = Db::open_in_memory().unwrap();
+
+        let session = Session::create_for_test(
+            db,
+            synthetic_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        assert_eq!(session.project_root, synthetic_root);
+        assert!(session.workspace_scratch_dir().is_dir());
+        assert_eq!(
+            workspace_root_for_project_id(&session.project_id).unwrap(),
+            None,
+            "a synthetic fixture must not publish a canonical workspace marker"
+        );
+    }
+
+    #[test]
+    fn test_constructor_resumes_a_persisted_synthetic_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let synthetic_root = home.path().join("fixture-workspace-that-does-not-exist");
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            synthetic_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+
+        assert!(session.persist_if_needed().unwrap());
+        drop(session);
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.project_root, synthetic_root);
+    }
+
+    #[test]
     fn workspace_scratch_is_durable_and_reverse_mapped_by_project_id() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());

@@ -492,6 +492,7 @@ impl Session {
             DreamRunFenceState::Pending(fence) => DreamRunFenceState::Held(fence),
             _ => DreamRunFenceState::Vacant,
         };
+        drop(current);
         DreamReadScopeTurn(scope, run_fence)
     }
 

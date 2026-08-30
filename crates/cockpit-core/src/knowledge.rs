@@ -45,13 +45,15 @@ const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
 const MAX_KNOWLEDGE_DEPTH: usize = 32;
 const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-/// A host-owned, non-secret generation marker for local KB sealed values.
-///
-/// This intentionally lives beside the KB markdown rather than in daemon
-/// state: a filesystem object can be deleted and later reuse every observable
-/// platform identity (including an inode). A fresh directory has no marker,
-/// so it is assigned a fresh namespace before it can receive a sealed value.
+/// A non-secret, host-authenticated generation marker for local KB sealed
+/// values. The marker is ignored by git and carries a host-keyed binding to
+/// the concrete source directory and marker file objects. A copied marker is
+/// therefore not a capability: only the daemon that owns the vault key can
+/// validate it for its original source object.
 const SEALED_KNOWLEDGE_BASE_ID_FILE: &str = ".flycockpit-sealed-kb-id";
+const SEALED_KNOWLEDGE_BASE_MARKER_VERSION: &str = "v1";
+const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN: &[u8] =
+    b"flycockpit/knowledge-base-sealed-marker/v1";
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
@@ -1533,7 +1535,7 @@ pub(crate) async fn attached_bundles(
             denied_knowledge_base_ids.push(entry.id.clone());
             continue;
         }
-        let sealed_id = sealed_knowledge_base_identity(&entry)?;
+        let sealed_id = sealed_knowledge_base_identity(&entry, session.secret_vault().as_ref())?;
         let Some(provider) = provider_for(entry.clone(), local)? else {
             continue;
         };
@@ -1580,7 +1582,7 @@ pub(crate) async fn sealed_knowledge_base_id_for_tool(
         .find(|bundle| bundle.entry.id == registry_id)
         .map(|bundle| &bundle.entry)
         .context("knowledge base is unavailable or not attached")?;
-    ensure_sealed_knowledge_base_identity(entry)
+    ensure_sealed_knowledge_base_identity(entry, ctx.session.secret_vault().as_ref())
 }
 
 /// Resolve the Owner's registry label to the exact immutable namespace bound
@@ -1592,6 +1594,7 @@ pub(crate) fn sealed_knowledge_base_id_for_owner(
     cwd: &Path,
     extended: &ExtendedConfig,
     registry_id: &str,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<crate::sealed::SealedKnowledgeBaseId> {
     let mut matches = extended
         .knowledge_bases
@@ -1613,7 +1616,7 @@ pub(crate) fn sealed_knowledge_base_id_for_owner(
             },
         };
     }
-    ensure_sealed_knowledge_base_identity(&entry)
+    ensure_sealed_knowledge_base_identity(&entry, vault)
 }
 
 /// Stable sealed-value identity for one KB source object.
@@ -1626,6 +1629,7 @@ pub(crate) fn sealed_knowledge_base_id_for_owner(
 /// closed. The marker is created only by the sealed authoring path below.
 fn sealed_knowledge_base_identity(
     entry: &KnowledgeBaseRegistryEntry,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<crate::sealed::SealedKnowledgeBaseId> {
     let KnowledgeBaseSource::Local { path } = &entry.source else {
         return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(entry.attachment_id());
@@ -1649,7 +1653,7 @@ fn sealed_knowledge_base_identity(
             root.display()
         );
     }
-    read_sealed_knowledge_base_marker(&root)?.map_or_else(
+    read_sealed_knowledge_base_marker(&root, vault)?.map_or_else(
         || crate::sealed::SealedKnowledgeBaseId::from_attachment_id(uuid::Uuid::new_v4()),
         crate::sealed::SealedKnowledgeBaseId::from_attachment_id,
     )
@@ -1660,6 +1664,7 @@ fn sealed_knowledge_base_identity(
 /// reads never create state and therefore cannot bless a replacement object.
 fn ensure_sealed_knowledge_base_identity(
     entry: &KnowledgeBaseRegistryEntry,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<crate::sealed::SealedKnowledgeBaseId> {
     let KnowledgeBaseSource::Local { path } = &entry.source else {
         return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(entry.attachment_id());
@@ -1675,7 +1680,7 @@ fn ensure_sealed_knowledge_base_identity(
             root.display()
         );
     }
-    if let Some(id) = read_sealed_knowledge_base_marker(&root)? {
+    if let Some(id) = read_sealed_knowledge_base_marker(&root, vault)? {
         return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(id);
     }
 
@@ -1687,13 +1692,21 @@ fn ensure_sealed_knowledge_base_identity(
         .open(&marker)
     {
         Ok(mut file) => {
+            file.write_all(SEALED_KNOWLEDGE_BASE_MARKER_VERSION.as_bytes())?;
+            file.write_all(b"\n")?;
             file.write_all(generated.to_string().as_bytes())?;
             file.write_all(b"\n")?;
             file.sync_all()?;
+            let binding = sealed_knowledge_base_marker_binding(&root, generated)?;
+            let tag = vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding);
+            file.write_all(crate::intel::hex_lower(&tag).as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            sync_sealed_knowledge_base_marker_directory(&root)?;
             crate::sealed::SealedKnowledgeBaseId::from_attachment_id(generated)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = read_sealed_knowledge_base_marker(&root)?.context(
+            let existing = read_sealed_knowledge_base_marker(&root, vault)?.context(
                 "knowledge-base sealed identity marker appeared but is not a regular marker file",
             )?;
             crate::sealed::SealedKnowledgeBaseId::from_attachment_id(existing)
@@ -1711,7 +1724,10 @@ fn sealed_knowledge_base_marker_path(root: &Path) -> PathBuf {
     root.join(SEALED_KNOWLEDGE_BASE_ID_FILE)
 }
 
-fn read_sealed_knowledge_base_marker(root: &Path) -> Result<Option<uuid::Uuid>> {
+fn read_sealed_knowledge_base_marker(
+    root: &Path,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<Option<uuid::Uuid>> {
     let marker = sealed_knowledge_base_marker_path(root);
     let metadata = match std::fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
@@ -1726,15 +1742,106 @@ fn read_sealed_knowledge_base_marker(root: &Path) -> Result<Option<uuid::Uuid>> 
     }
     let raw = std::fs::read_to_string(&marker)
         .with_context(|| format!("reading {}", marker.display()))?;
-    let value = raw
-        .strip_suffix('\n')
-        .context("knowledge-base sealed identity marker must end with a newline")?;
-    if value.contains('\n') || value.contains('\r') {
+    let mut lines = raw.split_terminator('\n');
+    let version = lines
+        .next()
+        .context("knowledge-base sealed identity marker version is missing")?;
+    let id = lines
+        .next()
+        .context("knowledge-base sealed identity marker UUID is missing")?;
+    let tag = lines
+        .next()
+        .context("knowledge-base sealed identity marker binding is missing")?;
+    if version != SEALED_KNOWLEDGE_BASE_MARKER_VERSION
+        || lines.next().is_some()
+        || !raw.ends_with('\n')
+        || raw.contains('\r')
+    {
         bail!("knowledge-base sealed identity marker has invalid content");
     }
-    uuid::Uuid::parse_str(value)
-        .context("knowledge-base sealed identity marker must contain a UUID")
-        .map(Some)
+    let id = uuid::Uuid::parse_str(id)
+        .context("knowledge-base sealed identity marker must contain a UUID")?;
+    let binding = sealed_knowledge_base_marker_binding(root, id)?;
+    let expected = crate::intel::hex_lower(
+        &vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding),
+    );
+    if tag != expected {
+        bail!(
+            "knowledge-base sealed identity marker does not belong to this source object; remove it before authoring a new sealed value"
+        );
+    }
+    Ok(Some(id))
+}
+
+/// Build the authenticated evidence for the exact source object that owns a
+/// marker. The random namespace is never derived from these mutable platform
+/// identifiers; they only make a copied marker fail validation. Binding both
+/// directory and marker objects also turns an inode-reuse event into a paired
+/// ABA condition rather than a namespace derivation.
+fn sealed_knowledge_base_marker_binding(root: &Path, id: uuid::Uuid) -> Result<Vec<u8>> {
+    let marker = sealed_knowledge_base_marker_path(root);
+    let root_metadata = std::fs::metadata(root)
+        .with_context(|| format!("reading knowledge base source {}", root.display()))?;
+    let marker_metadata =
+        std::fs::metadata(&marker).with_context(|| format!("reading {}", marker.display()))?;
+    if !root_metadata.is_dir() || !marker_metadata.is_file() {
+        bail!("knowledge-base sealed identity marker source objects are invalid");
+    }
+    let mut binding = b"flycockpit/knowledge-base-sealed-marker-binding/v1\0".to_vec();
+    append_attachment_identity_component(&mut binding, root.to_string_lossy().as_bytes());
+    append_attachment_identity_component(&mut binding, id.as_bytes());
+    append_sealed_marker_object_identity(&mut binding, &root_metadata)?;
+    append_sealed_marker_object_identity(&mut binding, &marker_metadata)?;
+    Ok(binding)
+}
+
+#[cfg(unix)]
+fn append_sealed_marker_object_identity(
+    binding: &mut Vec<u8>,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    binding.extend_from_slice(b"unix\0");
+    binding.extend_from_slice(&metadata.dev().to_le_bytes());
+    binding.extend_from_slice(&metadata.ino().to_le_bytes());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn append_sealed_marker_object_identity(
+    binding: &mut Vec<u8>,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    binding.extend_from_slice(b"windows\0");
+    binding.extend_from_slice(&metadata.creation_time().to_le_bytes());
+    binding.extend_from_slice(&metadata.file_attributes().to_le_bytes());
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn append_sealed_marker_object_identity(
+    binding: &mut Vec<u8>,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let created = metadata
+        .created()
+        .context("reading knowledge-base sealed marker object creation time")?
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("knowledge-base sealed marker object creation time predates the Unix epoch")?;
+    binding.extend_from_slice(b"portable\0");
+    binding.extend_from_slice(&created.as_secs().to_le_bytes());
+    binding.extend_from_slice(&created.subsec_nanos().to_le_bytes());
+    Ok(())
+}
+
+fn sync_sealed_knowledge_base_marker_directory(root: &Path) -> Result<()> {
+    std::fs::File::open(root)
+        .with_context(|| format!("opening knowledge base source directory {}", root.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync knowledge base source directory {}", root.display()))
 }
 
 fn validate_dream_models(
@@ -2875,6 +2982,8 @@ mod tests {
     #[test]
     fn replacement_kb_directory_at_the_same_path_gets_a_fresh_sealed_namespace() {
         let tmp = TempDir::new().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
         let root = tmp.path().join("knowledge");
         write_bundle(&root);
         let entry = KnowledgeBaseRegistryEntry::new(
@@ -2889,20 +2998,68 @@ mod tests {
             KnowledgeBaseMergePolicy::Auto,
         );
 
-        let original = ensure_sealed_knowledge_base_identity(&entry).unwrap();
-        assert_eq!(sealed_knowledge_base_identity(&entry).unwrap(), original);
+        let original = ensure_sealed_knowledge_base_identity(&entry, &vault).unwrap();
+        assert_eq!(
+            sealed_knowledge_base_identity(&entry, &vault).unwrap(),
+            original
+        );
 
         fs::remove_dir_all(&root).unwrap();
         write_bundle(&root);
-        let replacement = ensure_sealed_knowledge_base_identity(&entry).unwrap();
+        let replacement = ensure_sealed_knowledge_base_identity(&entry, &vault).unwrap();
 
         assert_ne!(original, replacement);
-        assert_eq!(sealed_knowledge_base_identity(&entry).unwrap(), replacement);
+        assert_eq!(
+            sealed_knowledge_base_identity(&entry, &vault).unwrap(),
+            replacement
+        );
+    }
+
+    #[test]
+    fn copied_sealed_namespace_marker_cannot_authorize_a_replacement_kb() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local { path: root.clone() },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+
+        ensure_sealed_knowledge_base_identity(&entry, &vault).unwrap();
+        let copied_marker = fs::read(sealed_knowledge_base_marker_path(&root)).unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        write_bundle(&root);
+        fs::write(sealed_knowledge_base_marker_path(&root), copied_marker).unwrap();
+
+        let error = sealed_knowledge_base_identity(&entry, &vault).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to this source object")
+        );
+        let error = ensure_sealed_knowledge_base_identity(&entry, &vault).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to this source object")
+        );
     }
 
     #[test]
     fn owner_can_pin_a_configured_kb_label_before_the_first_sealed_copy() {
         let tmp = TempDir::new().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
         let root = tmp.path().join("knowledge");
         write_bundle(&root);
         let extended = ExtendedConfig {
@@ -2922,10 +3079,11 @@ mod tests {
             ..Default::default()
         };
 
-        let pinned = sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project").unwrap();
+        let pinned =
+            sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project", &vault).unwrap();
 
         assert_eq!(
-            sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project").unwrap(),
+            sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project", &vault).unwrap(),
             pinned
         );
         assert!(sealed_knowledge_base_marker_path(&root).is_file());

@@ -7195,6 +7195,7 @@ async fn handle_serialized_request_impl(
                     &ctx.canonical_cwd,
                     &extended,
                     &origin_id,
+                    ctx.secret_vault.as_ref(),
                 )
                 .map_err(|error| bad_request(error.to_string()))?
                 .to_string()

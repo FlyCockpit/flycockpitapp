@@ -35,6 +35,9 @@ apps/web/dev-dist
 *~
 .DS_Store
 
+# Host-authenticated local KB sealed-value namespaces
+**/.flycockpit-sealed-kb-id
+
 # Logs
 logs
 *.log

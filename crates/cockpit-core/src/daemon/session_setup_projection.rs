@@ -123,8 +123,8 @@ fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSe
     let mut entries: Vec<CatalogEntry> = catalog.servers.into_values().collect();
     entries.extend(catalog.shadowed);
     entries.sort_by(|left, right| {
-        scope_rank(left.source)
-            .cmp(&scope_rank(right.source))
+        scope_rank(left.source())
+            .cmp(&scope_rank(right.source()))
             .then_with(|| left.name.cmp(&right.name))
     });
     entries
@@ -132,7 +132,7 @@ fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSe
         .filter(CatalogEntry::is_enabled)
         .map(|entry| SessionSetupMcpV1 {
             name: entry.name,
-            scope: entry.source.as_str().to_string(),
+            scope: entry.source().as_str().to_string(),
             enabled: entry.is_enabled(),
             shadowed_by: entry.shadowed_by.map(|scope| scope.as_str().to_string()),
             profile: Some(entry.profile).filter(|profile| !profile.is_empty()),
@@ -316,36 +316,43 @@ mod tests {
         );
     }
 
-    fn entry(name: &str, source: McpScope, shadowed_by: Option<McpScope>) -> CatalogEntry {
+    fn entry(
+        name: &str,
+        source: crate::mcp::resolver::PersistentMcpScope,
+        shadowed_by: Option<McpScope>,
+    ) -> CatalogEntry {
         let server: crate::mcp::config::ServerConfig = serde_json::from_value(serde_json::json!({
             "transport": "streamable",
             "enabled": true
         }))
         .expect("server");
-        CatalogEntry {
-            name: name.to_string(),
-            server: Some(server),
-            source,
-            shadowed_by,
-            profile: crate::mcp::resolver::DEFAULT_PROFILE.to_string(),
-            agent_bound: source == McpScope::Agent,
-        }
+        let mut entry = CatalogEntry::persistent(name.to_string(), server, source);
+        entry.shadowed_by = shadowed_by;
+        entry
     }
 
     #[test]
     fn setup_mcp_groups_global_then_agent_then_workspace() {
         let mut entries = vec![
-            entry("w", McpScope::Workspace, None),
-            entry("a", McpScope::Agent, None),
-            entry("g", McpScope::Global, None),
-            entry("g-shadow", McpScope::Global, Some(McpScope::Workspace)),
+            entry(
+                "w",
+                crate::mcp::resolver::PersistentMcpScope::Workspace,
+                None,
+            ),
+            entry("a", crate::mcp::resolver::PersistentMcpScope::Agent, None),
+            entry("g", crate::mcp::resolver::PersistentMcpScope::Global, None),
+            entry(
+                "g-shadow",
+                crate::mcp::resolver::PersistentMcpScope::Global,
+                Some(McpScope::Workspace),
+            ),
         ];
         entries.sort_by(|left, right| {
-            scope_rank(left.source)
-                .cmp(&scope_rank(right.source))
+            scope_rank(left.source())
+                .cmp(&scope_rank(right.source()))
                 .then_with(|| left.name.cmp(&right.name))
         });
-        let scopes: Vec<_> = entries.iter().map(|e| e.source.as_str()).collect();
+        let scopes: Vec<_> = entries.iter().map(|e| e.source().as_str()).collect();
         assert_eq!(scopes, vec!["global", "global", "agent", "workspace"]);
         assert_eq!(entries[1].shadowed_by, Some(McpScope::Workspace));
     }

@@ -377,7 +377,7 @@ async fn dispatch(
                         super::catalog::connect_context(host)
                             .with_profile(entry.profile.clone())
                             .with_agent_bound(entry.agent_bound),
-                        entry.source,
+                        entry.source(),
                         &entry.profile,
                         entry.agent_bound,
                     )

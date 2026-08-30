@@ -22,6 +22,38 @@ pub enum McpScope {
     Agent,
 }
 
+/// The only scopes allowed to enter persistent MCP routing.
+///
+/// This deliberately excludes [`McpScope::Builtin`]. A persistent server's
+/// configuration and its provenance are stored together in [`CatalogEntry`],
+/// so callers cannot manufacture a built-in entry that reaches cache,
+/// credential, approval, or transport code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersistentMcpScope {
+    Global,
+    Workspace,
+    Agent,
+}
+
+impl PersistentMcpScope {
+    fn from_config_dir_kind(kind: ConfigDirKind) -> Self {
+        match kind {
+            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
+                Self::Global
+            }
+            ConfigDirKind::Project => Self::Workspace,
+        }
+    }
+
+    fn as_scope(self) -> McpScope {
+        match self {
+            Self::Global => McpScope::Global,
+            Self::Workspace => McpScope::Workspace,
+            Self::Agent => McpScope::Agent,
+        }
+    }
+}
+
 impl McpScope {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -29,15 +61,6 @@ impl McpScope {
             Self::Global => "global",
             Self::Workspace => "workspace",
             Self::Agent => "agent",
-        }
-    }
-
-    pub fn from_config_dir_kind(kind: ConfigDirKind) -> Self {
-        match kind {
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
-                Self::Global
-            }
-            ConfigDirKind::Project => Self::Workspace,
         }
     }
 
@@ -58,10 +81,7 @@ pub use super::config::DEFAULT_PROFILE;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
     pub name: String,
-    /// `None` only for the host-owned `cockpit` pseudo-server. Persistent
-    /// entries carry their exact authored configuration.
-    pub server: Option<ServerConfig>,
-    pub source: McpScope,
+    origin: CatalogOrigin,
     /// More-specific scope that hid this same-named server, if any.
     pub shadowed_by: Option<McpScope>,
     /// Credential profile selected for this agent. Stage 1 always uses
@@ -73,6 +93,16 @@ pub struct CatalogEntry {
     pub agent_bound: bool,
 }
 
+/// Closed provenance/configuration pair for a catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogOrigin {
+    Builtin,
+    Persistent {
+        scope: PersistentMcpScope,
+        server: ServerConfig,
+    },
+}
+
 impl CatalogEntry {
     pub fn is_live(&self) -> bool {
         self.shadowed_by.is_none()
@@ -81,28 +111,42 @@ impl CatalogEntry {
     pub fn builtin() -> Self {
         Self {
             name: BUILTIN_SERVER_ID.to_string(),
-            server: None,
-            source: McpScope::Builtin,
+            origin: CatalogOrigin::Builtin,
             shadowed_by: None,
             profile: DEFAULT_PROFILE.to_string(),
             agent_bound: false,
         }
     }
 
-    fn persistent(name: String, server: ServerConfig, source: McpScope) -> Self {
-        debug_assert_ne!(source, McpScope::Builtin);
+    pub fn persistent(name: String, server: ServerConfig, scope: PersistentMcpScope) -> Self {
         Self {
             name,
-            server: Some(server),
-            source,
+            origin: CatalogOrigin::Persistent { scope, server },
             shadowed_by: None,
             profile: DEFAULT_PROFILE.to_string(),
-            agent_bound: source == McpScope::Agent,
+            agent_bound: scope == PersistentMcpScope::Agent,
         }
     }
 
     pub fn persistent_server(&self) -> Option<&ServerConfig> {
-        self.server.as_ref()
+        match &self.origin {
+            CatalogOrigin::Builtin => None,
+            CatalogOrigin::Persistent { server, .. } => Some(server),
+        }
+    }
+
+    fn persistent_server_mut(&mut self) -> Option<&mut ServerConfig> {
+        match &mut self.origin {
+            CatalogOrigin::Builtin => None,
+            CatalogOrigin::Persistent { server, .. } => Some(server),
+        }
+    }
+
+    pub fn source(&self) -> McpScope {
+        match &self.origin {
+            CatalogOrigin::Builtin => McpScope::Builtin,
+            CatalogOrigin::Persistent { scope, .. } => (*scope).as_scope(),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -136,10 +180,10 @@ impl EffectiveCatalog {
     /// Wrap a pre-merged [`McpConfig`] as workspace-scoped entries. Used by
     /// tests and non-tool callers that already have a merged document.
     pub fn from_mcp_config(cfg: &McpConfig) -> Self {
-        Self::from_mcp_config_with_scope(cfg, McpScope::Workspace)
+        Self::from_mcp_config_with_scope(cfg, PersistentMcpScope::Workspace)
     }
 
-    pub fn from_mcp_config_with_scope(cfg: &McpConfig, source: McpScope) -> Self {
+    pub fn from_mcp_config_with_scope(cfg: &McpConfig, source: PersistentMcpScope) -> Self {
         let mut catalog = Self::default();
         for (name, server) in &cfg.servers {
             catalog.merge_entry(CatalogEntry::persistent(
@@ -151,7 +195,7 @@ impl EffectiveCatalog {
         catalog
     }
 
-    fn merge_layer(&mut self, layer: McpConfig, source: McpScope) {
+    fn merge_layer(&mut self, layer: McpConfig, source: PersistentMcpScope) {
         for (name, server) in layer.servers {
             self.merge_entry(CatalogEntry::persistent(name, server, source));
         }
@@ -166,17 +210,17 @@ impl EffectiveCatalog {
             None => {
                 self.servers.insert(incoming.name.clone(), incoming);
             }
-            Some(existing) if existing.source.rank() <= incoming.source.rank() => {
+            Some(existing) if existing.source().rank() <= incoming.source().rank() => {
                 let mut old = existing.clone();
-                if old.source != incoming.source {
-                    old.shadowed_by = Some(incoming.source);
+                if old.source() != incoming.source() {
+                    old.shadowed_by = Some(incoming.source());
                     self.shadowed.push(old);
                 }
                 self.servers.insert(incoming.name.clone(), incoming);
             }
             Some(existing) => {
                 let mut shadowed = incoming;
-                shadowed.shadowed_by = Some(existing.source);
+                shadowed.shadowed_by = Some(existing.source());
                 self.shadowed.push(shadowed);
             }
         }
@@ -232,7 +276,7 @@ impl EffectiveCatalog {
             .collect();
         let mut next = BTreeMap::new();
         for (name, mut entry) in std::mem::take(&mut self.servers) {
-            if entry.source == McpScope::Builtin {
+            if entry.source() == McpScope::Builtin {
                 next.insert(name, entry);
                 continue;
             }
@@ -349,7 +393,7 @@ impl EffectiveCatalogResolver {
     ) -> Arc<Self> {
         let mut catalog = (*root_catalog).clone();
         if let Some(agent_layer) = agent_layer {
-            catalog.merge_layer(agent_layer, McpScope::Agent);
+            catalog.merge_layer(agent_layer, PersistentMcpScope::Agent);
         }
         catalog.reserved_builtin_rejected |= agent_reserved_rejected;
         catalog.apply_bindings(&bindings);
@@ -446,15 +490,15 @@ pub fn discover_effective_catalog_from_layers(
     let mut globals = Vec::new();
     let mut workspaces = Vec::new();
     for (kind, path) in layers {
-        match McpScope::from_config_dir_kind(*kind) {
-            McpScope::Global => globals.push((*kind, path.clone())),
-            McpScope::Workspace => workspaces.push((*kind, path.clone())),
-            McpScope::Agent | McpScope::Builtin => {}
+        match PersistentMcpScope::from_config_dir_kind(*kind) {
+            PersistentMcpScope::Global => globals.push((*kind, path.clone())),
+            PersistentMcpScope::Workspace => workspaces.push((*kind, path.clone())),
+            PersistentMcpScope::Agent => {}
         }
     }
     load_and_merge_paths(&mut catalog, &globals);
     if let Some(agent) = agent_layer {
-        catalog.merge_layer(agent.clone(), McpScope::Agent);
+        catalog.merge_layer(agent.clone(), PersistentMcpScope::Agent);
     }
     load_and_merge_paths(&mut catalog, &workspaces);
     catalog
@@ -467,7 +511,7 @@ fn load_and_merge_paths(catalog: &mut EffectiveCatalog, layers: &[(ConfigDirKind
         };
         match McpConfig::parse(&raw) {
             Ok(layer) => {
-                catalog.merge_layer(layer, McpScope::from_config_dir_kind(*kind));
+                catalog.merge_layer(layer, PersistentMcpScope::from_config_dir_kind(*kind));
             }
             Err(error) if crate::mcp::config::parse_error_is_reserved_builtin(&error) => {
                 catalog.reserved_builtin_rejected = true;
@@ -544,8 +588,8 @@ mod tests {
                     .as_deref(),
                 discovered.servers["shared"].endpoint.as_deref(),
             );
-            assert_eq!(catalog.servers["shared"].source, McpScope::Workspace);
-            assert_eq!(catalog.servers["home_only"].source, McpScope::Global);
+            assert_eq!(catalog.servers["shared"].source(), McpScope::Workspace);
+            assert_eq!(catalog.servers["home_only"].source(), McpScope::Global);
             assert_eq!(
                 catalog.servers["shared"]
                     .persistent_server()
@@ -624,10 +668,17 @@ mod tests {
             catalog.to_mcp_config().servers["svc"].endpoint,
             cfg.servers["svc"].endpoint
         );
-        assert_eq!(catalog.servers["svc"].source, McpScope::Workspace);
+        assert_eq!(catalog.servers["svc"].source(), McpScope::Workspace);
         assert_eq!(catalog.servers["svc"].profile, DEFAULT_PROFILE);
-        assert_eq!(catalog.servers[BUILTIN_SERVER_ID].source, McpScope::Builtin);
-        assert!(catalog.servers[BUILTIN_SERVER_ID].server.is_none());
+        assert_eq!(
+            catalog.servers[BUILTIN_SERVER_ID].source(),
+            McpScope::Builtin
+        );
+        assert!(
+            catalog.servers[BUILTIN_SERVER_ID]
+                .persistent_server()
+                .is_none()
+        );
         assert!(
             !catalog
                 .to_mcp_config()
@@ -664,13 +715,34 @@ mod tests {
     }
 
     #[test]
+    fn catalog_entry_origin_couples_scope_and_configuration() {
+        let builtin = CatalogEntry::builtin();
+        assert_eq!(builtin.source(), McpScope::Builtin);
+        assert!(builtin.persistent_server().is_none());
+
+        let persistent = CatalogEntry::persistent(
+            "svc".to_string(),
+            streamable("https://svc/mcp"),
+            PersistentMcpScope::Workspace,
+        );
+        assert_eq!(persistent.source(), McpScope::Workspace);
+        assert!(persistent.persistent_server().is_some());
+    }
+
+    #[test]
     fn precedence_workspace_beats_agent_beats_global() {
         let mut catalog = EffectiveCatalog::default();
-        catalog.merge_layer(named_cfg("shared", "https://global/mcp"), McpScope::Global);
-        catalog.merge_layer(named_cfg("shared", "https://agent/mcp"), McpScope::Agent);
+        catalog.merge_layer(
+            named_cfg("shared", "https://global/mcp"),
+            PersistentMcpScope::Global,
+        );
+        catalog.merge_layer(
+            named_cfg("shared", "https://agent/mcp"),
+            PersistentMcpScope::Agent,
+        );
         catalog.merge_layer(
             named_cfg("shared", "https://workspace/mcp"),
-            McpScope::Workspace,
+            PersistentMcpScope::Workspace,
         );
         assert_eq!(
             catalog.servers["shared"]
@@ -680,13 +752,13 @@ mod tests {
                 .as_deref(),
             Some("https://workspace/mcp")
         );
-        assert_eq!(catalog.servers["shared"].source, McpScope::Workspace);
+        assert_eq!(catalog.servers["shared"].source(), McpScope::Workspace);
         let shadowed: Vec<_> = catalog
             .shadowed
             .iter()
             .map(|e| {
                 (
-                    e.source,
+                    e.source(),
                     e.shadowed_by,
                     e.persistent_server()
                         .and_then(|server| server.endpoint.clone()),
@@ -714,15 +786,15 @@ mod tests {
     #[test]
     fn precedence_pairs_record_shadow_markers() {
         let pairs = [
-            (McpScope::Global, McpScope::Agent),
-            (McpScope::Global, McpScope::Workspace),
-            (McpScope::Agent, McpScope::Workspace),
+            (PersistentMcpScope::Global, PersistentMcpScope::Agent),
+            (PersistentMcpScope::Global, PersistentMcpScope::Workspace),
+            (PersistentMcpScope::Agent, PersistentMcpScope::Workspace),
         ];
         for (lower, higher) in pairs {
             let mut catalog = EffectiveCatalog::default();
             catalog.merge_layer(named_cfg("svc", "https://lower/mcp"), lower);
             catalog.merge_layer(named_cfg("svc", "https://higher/mcp"), higher);
-            assert_eq!(catalog.servers["svc"].source, higher);
+            assert_eq!(catalog.servers["svc"].source(), higher.as_scope());
             assert_eq!(
                 catalog.servers["svc"]
                     .persistent_server()
@@ -732,8 +804,8 @@ mod tests {
                 Some("https://higher/mcp")
             );
             assert_eq!(catalog.shadowed.len(), 1);
-            assert_eq!(catalog.shadowed[0].source, lower);
-            assert_eq!(catalog.shadowed[0].shadowed_by, Some(higher));
+            assert_eq!(catalog.shadowed[0].source(), lower.as_scope());
+            assert_eq!(catalog.shadowed[0].shadowed_by, Some(higher.as_scope()));
         }
     }
 
@@ -770,23 +842,28 @@ mod tests {
                     .as_deref(),
                 Some("https://workspace/mcp")
             );
-            assert_eq!(catalog.servers["shared"].source, McpScope::Workspace);
-            assert_eq!(catalog.servers["agent_only"].source, McpScope::Agent);
-            assert_eq!(catalog.servers["global_only"].source, McpScope::Global);
+            assert_eq!(catalog.servers["shared"].source(), McpScope::Workspace);
+            assert_eq!(catalog.servers["agent_only"].source(), McpScope::Agent);
+            assert_eq!(catalog.servers["global_only"].source(), McpScope::Global);
         });
     }
 
     #[test]
     fn bindings_select_profile_and_hide_unbound_servers() {
         let mut catalog = EffectiveCatalog::default();
-        catalog.merge_layer(named_cfg("alpha", "https://a/mcp"), McpScope::Global);
-        catalog.merge_layer(named_cfg("beta", "https://b/mcp"), McpScope::Global);
+        catalog.merge_layer(
+            named_cfg("alpha", "https://a/mcp"),
+            PersistentMcpScope::Global,
+        );
+        catalog.merge_layer(
+            named_cfg("beta", "https://b/mcp"),
+            PersistentMcpScope::Global,
+        );
         catalog
             .servers
             .get_mut("alpha")
             .unwrap()
-            .server
-            .as_mut()
+            .persistent_server_mut()
             .unwrap()
             .profiles
             .insert(
@@ -811,8 +888,14 @@ mod tests {
     #[test]
     fn child_intersection_keeps_scope_level_and_intersects_agent_bound() {
         let mut catalog = EffectiveCatalog::default();
-        catalog.merge_layer(named_cfg("global", "https://g/mcp"), McpScope::Global);
-        catalog.merge_layer(named_cfg("bound", "https://a/mcp"), McpScope::Agent);
+        catalog.merge_layer(
+            named_cfg("global", "https://g/mcp"),
+            PersistentMcpScope::Global,
+        );
+        catalog.merge_layer(
+            named_cfg("bound", "https://a/mcp"),
+            PersistentMcpScope::Agent,
+        );
         catalog.servers.get_mut("bound").unwrap().agent_bound = true;
         let parent = BTreeSet::from([("global".to_string(), DEFAULT_PROFILE.to_string())]);
         catalog.intersect_parent_reachable(&parent);
@@ -828,12 +911,22 @@ mod tests {
         let mut catalog = EffectiveCatalog::default();
         catalog.merge_layer(
             named_cfg(BUILTIN_SERVER_ID, "https://evil/mcp"),
-            McpScope::Workspace,
+            PersistentMcpScope::Workspace,
         );
-        catalog.merge_layer(named_cfg("ok", "https://ok/mcp"), McpScope::Global);
+        catalog.merge_layer(
+            named_cfg("ok", "https://ok/mcp"),
+            PersistentMcpScope::Global,
+        );
         assert!(catalog.has_reserved_builtin_server_config());
-        assert_eq!(catalog.servers[BUILTIN_SERVER_ID].source, McpScope::Builtin);
-        assert!(catalog.servers[BUILTIN_SERVER_ID].server.is_none());
+        assert_eq!(
+            catalog.servers[BUILTIN_SERVER_ID].source(),
+            McpScope::Builtin
+        );
+        assert!(
+            catalog.servers[BUILTIN_SERVER_ID]
+                .persistent_server()
+                .is_none()
+        );
         assert!(catalog.servers.contains_key("ok"));
         assert!(catalog.shadowed.is_empty());
     }

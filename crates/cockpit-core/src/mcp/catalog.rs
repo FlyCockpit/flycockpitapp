@@ -92,7 +92,7 @@ async fn list_tools_for_entry(
     list_tools_cached_identified(
         &entry.name,
         &cfg,
-        entry.source,
+        entry.source(),
         &entry.profile,
         entry.agent_bound,
         context

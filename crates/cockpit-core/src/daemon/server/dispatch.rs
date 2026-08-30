@@ -5694,7 +5694,14 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             if !state.principal.is_owner() {
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
-                    handle.redaction_table()
+                    let session = handle.session();
+                    let base = handle.redaction_table();
+                    std::sync::Arc::new(
+                        session
+                            .with_machine_scoped_sealed_redactions(&base)
+                            .await
+                            .map_err(internal)?,
+                    )
                 } else {
                     let session = crate::session::Session::resume(
                         ctx.db.clone(),
@@ -5707,15 +5714,18 @@ async fn handle_serialized_request_impl(
                         code: ErrorCode::UnknownSession,
                         message: format!("unknown session {session_id}"),
                     })?;
+                    let table = session
+                        .persisted_redaction_table()
+                        .map_err(internal)?
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "session transcript redaction data is unavailable".to_string(),
+                        })?;
                     std::sync::Arc::new(
                         session
-                            .persisted_redaction_table()
-                            .map_err(internal)?
-                            .ok_or_else(|| ErrorPayload {
-                                code: ErrorCode::Authorization,
-                                message: "session transcript redaction data is unavailable"
-                                    .to_string(),
-                            })?,
+                            .with_machine_scoped_sealed_redactions(&table)
+                            .await
+                            .map_err(internal)?,
                     )
                 };
                 history = scrub_history_for_principal(&state.principal, history, &redact);
@@ -17227,7 +17237,14 @@ async fn handle_concurrent_request_impl(
                 .map_err(internal)?;
             if !shared.principal.is_owner() {
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
-                    handle.redaction_table()
+                    let session = handle.session();
+                    let base = handle.redaction_table();
+                    std::sync::Arc::new(
+                        session
+                            .with_machine_scoped_sealed_redactions(&base)
+                            .await
+                            .map_err(internal)?,
+                    )
                 } else {
                     let session = crate::session::Session::resume(
                         ctx.db.clone(),
@@ -17240,15 +17257,18 @@ async fn handle_concurrent_request_impl(
                         code: ErrorCode::UnknownSession,
                         message: format!("unknown session {session_id}"),
                     })?;
+                    let table = session
+                        .persisted_redaction_table()
+                        .map_err(internal)?
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "session transcript redaction data is unavailable".to_string(),
+                        })?;
                     std::sync::Arc::new(
                         session
-                            .persisted_redaction_table()
-                            .map_err(internal)?
-                            .ok_or_else(|| ErrorPayload {
-                                code: ErrorCode::Authorization,
-                                message: "session transcript redaction data is unavailable"
-                                    .to_string(),
-                            })?,
+                            .with_machine_scoped_sealed_redactions(&table)
+                            .await
+                            .map_err(internal)?,
                     )
                 };
                 history = scrub_history_for_principal(&shared.principal, history, &redact);
@@ -26527,7 +26547,18 @@ pub(super) async fn attach(
     effects.session_event_rx = Some(event_rx);
 
     history = if let Some(att) = state.attached.as_ref() {
-        let redact = att.handle.redaction_table();
+        let redact = if state.principal.is_owner() {
+            att.handle.redaction_table()
+        } else {
+            let base = att.handle.redaction_table();
+            std::sync::Arc::new(
+                att.handle
+                    .session()
+                    .with_machine_scoped_sealed_redactions(&base)
+                    .await
+                    .map_err(internal)?,
+            )
+        };
         scrub_history_for_principal(&state.principal, history, &redact)
     } else {
         history
@@ -27170,15 +27201,18 @@ async fn run_docs_ask_pipeline(
     let store = session
         .provider_credential_store(&providers)
         .map_err(|error| format!("opening owner-scoped credential store: {error:#}"))?;
-    let redact = Arc::new(
-        crate::redact::RedactionTable::build_with_env_and_credential_store(
-            &extended.redact,
-            &cwd,
-            env_snapshot.vars(),
-            &store,
-        )
-        .map_err(|error| format!("building redaction table: {error:#}"))?,
-    );
+    let redact = crate::redact::RedactionTable::build_with_env_and_credential_store(
+        &extended.redact,
+        &cwd,
+        env_snapshot.vars(),
+        &store,
+    )
+    .map_err(|error| format!("building redaction table: {error:#}"))?;
+    let redact = session
+        .with_machine_scoped_sealed_redactions(&redact)
+        .await
+        .map_err(|error| format!("adding machine-scoped sealed values: {error:#}"))?;
+    let redact = Arc::new(redact);
     let model = Arc::new(
         crate::engine::model::Model::from_config_with_store(
             &providers,
@@ -28038,6 +28072,12 @@ pub(super) async fn auto_title_request(
         };
         std::sync::Arc::new(table)
     };
+    let redact = std::sync::Arc::new(
+        session
+            .with_machine_scoped_sealed_redactions(&redact)
+            .await
+            .map_err(internal)?,
+    );
 
     let title = crate::auto_title::generate_session_title_slug_once(
         &session,

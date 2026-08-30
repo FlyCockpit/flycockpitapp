@@ -304,6 +304,9 @@ impl Driver {
         let args = serde_json::json!({ "name": skill_name });
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
             agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,

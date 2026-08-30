@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use super::{helpers::*, lifecycle::*, run::run_worker, *};
 
 /// Handle one or more client tasks hold to drive a session. Cheap to
@@ -2415,7 +2417,8 @@ pub enum SessionWork {
     },
 }
 
-/// One-shot constructor: spawn the worker and return its handle.
+/// One-shot constructor: persist its initial redaction boundary, then spawn the
+/// worker and return its handle.
 ///
 /// `client_no_sandbox` is the attaching client's `--no-sandbox` flag
 /// (sandboxing part 2): `Some(true)` means the client asked for new
@@ -2459,11 +2462,11 @@ pub fn spawn(
     media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     config_snapshot: SessionConfigSnapshot,
-) -> (
+) -> Result<(
     SessionWorkerHandle,
     tokio::task::JoinHandle<()>,
     WorkerStartPermit,
-) {
+)> {
     let session_id = session.id;
     // The primary the chrome's active-agent slot opens on. Spawn is sync, so
     // it uses the session's in-memory active agent, which is hydrated from the
@@ -2537,9 +2540,9 @@ pub fn spawn(
     // approved-secret-file registration, or per-turn refresh can be in flight.
     // It happens-before every locked writer, so it can neither read a stale table
     // nor be clobbered by one.
-    if let Err(error) = session.persist_redaction_table(&redact) {
-        tracing::warn!(error = %error, %session_id, "persisting initial redaction table failed");
-    }
+    session
+        .persist_redaction_table(&redact)
+        .context("persisting initial redaction table")?;
     for origin in legacy_disk_origins
         .iter()
         .filter(|origin| !redact.has_origin(origin))
@@ -2664,7 +2667,7 @@ pub fn spawn(
         crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });
 
-    (handle, join, WorkerStartPermit(Some(start_tx)))
+    Ok((handle, join, WorkerStartPermit(Some(start_tx))))
 }
 
 /// One-shot authority that makes a newly spawned worker runnable only after

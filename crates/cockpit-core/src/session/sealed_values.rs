@@ -71,6 +71,73 @@ pub fn validate_sealed_value(value_id: &str, value: &str) -> Result<(), SealedVa
 }
 
 impl Session {
+    /// Union every live machine-scoped sealed literal into a session redaction
+    /// table. Project values are intentionally not narrowed to this session's
+    /// project: redaction is a containment boundary, not an authorization
+    /// decision, and recall may cross project boundaries.
+    pub(crate) async fn with_machine_scoped_sealed_redactions(
+        &self,
+        table: &crate::redact::RedactionTable,
+    ) -> Result<crate::redact::RedactionTable> {
+        let records = self.db.machine_scoped_sealed_redaction_records().await?;
+        let compartment =
+            crate::sealed::compartment::SealedCompartment::from_vault(self.secret_vault.clone());
+        let mut unioned = table.union(&crate::redact::RedactionTable::empty())?;
+
+        for record in records {
+            let locator = record
+                .compartment_key
+                .as_deref()
+                .context("live machine-scoped sealed value has no compartment locator")?;
+            let key = crate::sealed::compartment::SealedCompartmentKey::parse(locator)?;
+            let literal = compartment
+                .get_exact(&key)?
+                .context("live machine-scoped sealed value is missing its compartment literal")?;
+            let identity = crate::sealed::identity::SealedRedactionIdentity {
+                scope: record.scope,
+                record_id: Some(crate::sealed::identity::SealedRecordId::parse(
+                    &record.record_id,
+                )?),
+                name: crate::sealed::identity::SealedName::canonical(&record.name)?,
+                version: u32::try_from(record.active_version)
+                    .context("sealed value version does not fit the redaction identity")?,
+            };
+            unioned = unioned
+                .with_forced_sealed_literal(literal.expose_for_redaction().to_string(), identity)?;
+        }
+
+        Ok(unioned)
+    }
+
+    /// Build the enforced redaction union for text recalled from `target`.
+    /// The target table is read directly from the encrypted vault because a
+    /// recalled session need not have a live [`Session`] object.
+    pub(crate) async fn recall_redaction_table(
+        &self,
+        reader: &crate::redact::RedactionTable,
+        target: uuid::Uuid,
+    ) -> Result<crate::redact::RedactionTable> {
+        let base = self.with_machine_scoped_sealed_redactions(reader).await?;
+        self.recall_redaction_table_from_base(&base, target)
+    }
+
+    /// Add one target session's persisted table to a reader/machine base.
+    /// Search callers reuse the base across hits so machine compartments are
+    /// opened only once per recall operation.
+    pub(crate) fn recall_redaction_table_from_base(
+        &self,
+        base: &crate::redact::RedactionTable,
+        target: uuid::Uuid,
+    ) -> Result<crate::redact::RedactionTable> {
+        let mut unioned = base.union(&crate::redact::RedactionTable::empty())?;
+        let json = super::lifecycle::load_redaction_table_from_vault(&self.secret_vault, target)?
+            .context("target session redaction table is unavailable for recall")?;
+        let target = crate::redact::RedactionTable::from_persisted_json(&json)
+            .context("loading target session redaction table for recall")?;
+        unioned = unioned.union(&target)?;
+        Ok(unioned.enforced())
+    }
+
     /// Store a sealed literal only after its unioned redaction table has been
     /// persisted.  The caller installs the returned table into the live worker
     /// before exposing any operation that could emit text.
@@ -370,6 +437,71 @@ mod tests {
             validate_sealed_value("UPPER", "high-entropy-value-123"),
             Err(SealedValueError::InvalidId)
         );
+    }
+
+    #[tokio::test]
+    async fn every_session_table_includes_unreferenced_machine_scoped_sealed_literals() {
+        const GLOBAL_LITERAL: &str = "global-unreferenced-secret-value-130";
+        const PROJECT_LITERAL: &str = "other-project-unreferenced-secret-130";
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/unrelated-project"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let global_record_id = uuid::Uuid::new_v4().to_string();
+        let project_record_id = uuid::Uuid::new_v4().to_string();
+        let global_locator =
+            "a".repeat(crate::sealed::compartment::SEALED_COMPARTMENT_KEY_BYTES * 2);
+        let project_locator =
+            "b".repeat(crate::sealed::compartment::SEALED_COMPARTMENT_KEY_BYTES * 2);
+        let global_locator_for_row = global_locator.clone();
+        let project_locator_for_row = project_locator.clone();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO sealed_value_records
+                    (record_id, scope, scope_key, name, description, owner_principal,
+                     active_version, compartment_key, created_at_ms, updated_at_ms, deleted_at_ms)
+                 VALUES (?1, 'global', '', 'machine_token', '', 'owner', 1, ?2, 1, 1, NULL)",
+                rusqlite::params![global_record_id, global_locator_for_row],
+            )?;
+            conn.execute(
+                "INSERT INTO sealed_value_records
+                    (record_id, scope, scope_key, name, description, owner_principal,
+                     active_version, compartment_key, created_at_ms, updated_at_ms, deleted_at_ms)
+                 VALUES (?1, 'project', 'different-project', 'project_token', '', 'owner', 1, ?2, 2, 2, NULL)",
+                rusqlite::params![project_record_id, project_locator_for_row],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::SealedCompartment,
+                &global_locator,
+                GLOBAL_LITERAL.as_bytes(),
+            )
+            .unwrap();
+        session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::SealedCompartment,
+                &project_locator,
+                PROJECT_LITERAL.as_bytes(),
+            )
+            .unwrap();
+
+        let table = session
+            .with_machine_scoped_sealed_redactions(&crate::redact::RedactionTable::empty())
+            .await
+            .unwrap();
+
+        assert!(!table.scrub(GLOBAL_LITERAL).contains(GLOBAL_LITERAL));
+        assert!(!table.scrub(PROJECT_LITERAL).contains(PROJECT_LITERAL));
     }
 
     #[tokio::test]

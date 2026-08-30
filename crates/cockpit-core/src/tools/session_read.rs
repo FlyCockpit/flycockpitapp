@@ -7,9 +7,9 @@
 //! a `seq`-addressable `offset`, mirroring the `read` tool's truncation
 //! marker (prompt `search-old-sessions.md`).
 //!
-//! Output is plain tool text and passes back through the redaction chokepoint
-//! normally — no bypass. Stored history is raw, so reads are trust-filtered in
-//! the DB and must only reach models as ordinary tool output.
+//! Stored history is raw. Reads retain the DB trust filter and, for untrusted
+//! callers, are scrubbed before return with the reader/target/machine redaction
+//! union; the ordinary outbound chokepoint remains defense in depth.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -130,7 +130,18 @@ impl Tool for SessionReadTool {
             turns[0].seq
         };
 
-        Ok(render_window(&turns, start_seq, id_arg))
+        let mut output = render_window(&turns, start_seq, id_arg);
+        if caller_history_trust(ctx) == crate::db::session_search::HistoryCallerTrust::Untrusted {
+            let redaction = ctx
+                .session
+                .recall_redaction_table(&ctx.redact, session_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("session_read redaction: {e:#}"))?;
+            output.content = crate::engine::tool::CanonicalToolResultContents::text(
+                redaction.scrub(output.content.model_text()),
+            );
+        }
+        Ok(output)
     }
 }
 
@@ -258,6 +269,48 @@ mod tests {
     use crate::tools::common::test_ctx;
     use serde_json::json;
 
+    fn write_untrusted_provider(root: &std::path::Path) {
+        let providers = root.join(".cockpit/providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(root.join(".cockpit/config.json"), r#"{}"#).unwrap();
+        std::fs::write(
+            providers.join("local.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [
+                    { "id": "trusted-model", "trust": "trusted" },
+                    { "id": "local-model", "trust": "untrusted" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn persist_target_table(ctx: &ToolCtx, target: Uuid, secret: &str) {
+        let target_root = ctx.cwd.join("workspace-b");
+        std::fs::create_dir_all(&target_root).unwrap();
+        std::fs::write(
+            target_root.join(".env"),
+            format!("TARGET_ONLY_TOKEN={secret}\n"),
+        )
+        .unwrap();
+        let table = crate::redact::RedactionTable::build_with_env(
+            &ctx.config.extended().redact,
+            &target_root,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        ctx.session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&target.to_string()),
+                table.to_persisted_json().unwrap().as_bytes(),
+            )
+            .unwrap();
+    }
+
     /// Seed a sibling session with `n` turns; return its (short_id, uuid).
     async fn seed_thread(ctx: &ToolCtx, texts: &[(&str, bool)]) -> (String, Uuid) {
         let s = ctx
@@ -278,6 +331,17 @@ mod tests {
                 }
             })
             .await
+            .unwrap();
+        ctx.session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&s.session_id.to_string()),
+                crate::redact::RedactionTable::empty()
+                    .to_persisted_json()
+                    .unwrap()
+                    .as_bytes(),
+            )
             .unwrap();
         for (text, is_assistant) in texts {
             let kind = if *is_assistant {
@@ -388,6 +452,83 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("hello via uuid"));
+    }
+
+    #[tokio::test]
+    async fn untrusted_calling_model_scrubs_read_despite_trusted_session_active_model() {
+        const TARGET_ONLY_SECRET: &str = "workspace-b-only-dotenv-secret-130";
+        let tmp = tempfile::tempdir().unwrap();
+        write_untrusted_provider(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
+        ctx.session
+            .set_active_model("local", "trusted-model")
+            .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
+        let (short, target) = seed_thread(
+            &ctx,
+            &[("workspace B used workspace-b-only-dotenv-secret-130", false)],
+        )
+        .await;
+        persist_target_table(&ctx, target, TARGET_ONLY_SECRET);
+
+        let out = SessionReadTool
+            .call(json!({ "short_id": short }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!out.content.contains(TARGET_ONLY_SECRET), "{}", out.content);
+        assert!(
+            out.content.contains(ctx.redact.placeholder()),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_calling_model_read_fails_closed_despite_trusted_session_active_model() {
+        const TARGET_ONLY_SECRET: &str = "workspace-b-unpersisted-dotenv-secret-130";
+        let tmp = tempfile::tempdir().unwrap();
+        write_untrusted_provider(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
+        ctx.session
+            .set_active_model("local", "trusted-model")
+            .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
+        let (short, target) = seed_thread(
+            &ctx,
+            &[(
+                "workspace B used workspace-b-unpersisted-dotenv-secret-130",
+                false,
+            )],
+        )
+        .await;
+        ctx.session
+            .secret_vault()
+            .delete_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&target.to_string()),
+            )
+            .unwrap();
+
+        let err = SessionReadTool
+            .call(json!({ "short_id": short }), &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("target session redaction table is unavailable"),
+            "{err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains(TARGET_ONLY_SECRET),
+            "the target transcript must not be returned in the failure: {err:#}"
+        );
     }
 
     #[tokio::test]

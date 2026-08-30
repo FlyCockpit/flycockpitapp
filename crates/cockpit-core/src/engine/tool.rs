@@ -1053,6 +1053,13 @@ impl ToolOutput {
 /// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
     pub(crate) agent_id: String,
+    /// Exact provider/model identity of the agent that issued this tool call.
+    ///
+    /// This is intentionally dispatch-scoped rather than derived from the
+    /// session's active-model preference: delegated and custom agents may run
+    /// a different model. `None` is reserved for isolated/headless contexts
+    /// and must be handled as untrusted by custody-sensitive tools.
+    pub(crate) caller_model: Option<CallerModel>,
     /// Stable daemon-owned lifecycle identity for this concrete executor.
     /// `None` is reserved for isolated tests and legacy headless helpers;
     /// production driver frames always carry a durable instance id.
@@ -1247,6 +1254,7 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            caller_model: self.caller_model.clone(),
             agent_instance_id: self.agent_instance_id,
             lock_identity: self.lock_identity.clone(),
             write_scope: self.write_scope.clone(),
@@ -1345,6 +1353,37 @@ impl ToolCtx {
         let mut cloned = self.clone_for_dispatch();
         cloned.locks = Arc::new(self.locks.without_read_recording());
         cloned
+    }
+}
+
+/// Non-secret identity of the model that issued a tool call.
+///
+/// `ToolCtx` carries this small value instead of a model handle so tools can
+/// apply their own turn-pinned policy without retaining inference capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallerModel {
+    provider_id: String,
+    model_id: String,
+}
+
+impl CallerModel {
+    pub(crate) fn new(provider_id: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        }
+    }
+
+    pub(crate) fn from_model(model: &crate::engine::model::Model) -> Self {
+        Self::new(model.provider_id(), model.model_id_ref())
+    }
+
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
     }
 }
 

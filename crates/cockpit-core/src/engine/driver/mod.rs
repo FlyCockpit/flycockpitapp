@@ -3001,6 +3001,22 @@ impl Driver {
         .await
         {
             Ok(Ok(new_table)) => {
+                let new_table = match self
+                    .session
+                    .with_machine_scoped_sealed_redactions(&new_table)
+                    .await
+                {
+                    Ok(table) => table,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "adding machine-scoped sealed redactions failed");
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: format!("Redaction refresh failed: {error:#}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
                 // J2: route the per-turn refresh through the hub so it unions the
                 // disk scan onto the LATEST shared table under the same
                 // `redaction_table_write_lock` as sealed adoption. `self.redact`
@@ -4426,6 +4442,9 @@ impl Driver {
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
             agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
             lock_identity: agent.name.clone().clone(),
             write_scope: agent.write_scope.clone(),

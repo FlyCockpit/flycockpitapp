@@ -3873,7 +3873,8 @@ impl Tool for KnowledgeDreamSourcesTool {
         for source in &mut sources {
             let target_union = ctx
                 .session
-                .recall_redaction_table_from_base(&redaction_base, source.session_id)?;
+                .recall_redaction_table_from_base(&redaction_base, source.session_id)
+                .await?;
             source.title = source.title.take().map(|title| target_union.scrub(&title));
             source.description = target_union.scrub(&source.description);
         }

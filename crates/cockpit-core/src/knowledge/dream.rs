@@ -360,7 +360,8 @@ impl DreamEngine {
         for source in &sources {
             redaction = self
                 .session
-                .recall_redaction_table_from_base(&redaction, source.session_id)?;
+                .recall_redaction_table_from_base(&redaction, source.session_id)
+                .await?;
         }
         let redacted = redact_and_validate_change_set(change_set, &redaction)?;
         let sink_outcome = sink.apply(&model, &redacted, cancel).await?;

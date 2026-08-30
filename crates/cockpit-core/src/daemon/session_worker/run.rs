@@ -6377,6 +6377,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by

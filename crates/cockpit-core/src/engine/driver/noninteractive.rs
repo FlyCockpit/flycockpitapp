@@ -9586,6 +9586,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             granted_tools,
             lock_identity: None,
             write_scope,
+            dream_read_scope: session.dream_read_scope(),
             workspace_lease: recovered_workspace_lease.clone().map(Arc::new),
             credential_store: session.provider_credential_store(&config.providers()).ok(),
             media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),

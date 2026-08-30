@@ -3615,7 +3615,6 @@ mod tests {
             context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
-            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),

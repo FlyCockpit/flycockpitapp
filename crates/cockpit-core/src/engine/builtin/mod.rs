@@ -4242,6 +4242,7 @@ pub(crate) mod tests {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            dream_read_scope: Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             credential_store: None,
             media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),

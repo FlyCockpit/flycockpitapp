@@ -5739,9 +5739,8 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             session_id,
         } => {
-            let _guard = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id)
-                .lock()
-                .await;
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let _guard = dream_lock.lock().await;
             ctx.db
                 .attach_session_to_knowledge_base(&knowledge_base_id, session_id)
                 .await
@@ -5753,9 +5752,8 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             session_id,
         } => {
-            let _guard = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id)
-                .lock()
-                .await;
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let _guard = dream_lock.lock().await;
             ctx.db
                 .detach_session_from_knowledge_base(&knowledge_base_id, session_id)
                 .await
@@ -27210,6 +27208,7 @@ async fn run_docs_ask_pipeline(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: None,
         credential_store: Some(store),
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),

@@ -2492,6 +2492,7 @@ impl Driver {
         let (job_cmd_tx, job_cmd_rx) = mpsc::channel::<ScheduleCommand>(JOB_CHANNEL_CAPACITY);
         let (noninteractive_complete_tx, noninteractive_complete_rx) =
             mpsc::channel::<BackgroundNoninteractiveCompletion>(JOB_CHANNEL_CAPACITY);
+        let dream_read_scope = session.dream_read_scope();
         let ctx = crate::engine::schedule::authority::ScheduleContext {
             session: session.clone(),
             locks: locks.clone(),
@@ -2504,7 +2505,7 @@ impl Driver {
             // Installed later by `set_write_scope_source`; the authority's copy
             // is updated through the same setter.
             write_scope: None,
-            dream_read_scope: session.dream_read_scope(),
+            dream_read_scope: dream_read_scope.clone(),
         };
         // The authority needs the engine UI-event channel (`tx`) to emit
         // started/progress/note signals, but `tx` isn't known until
@@ -2619,7 +2620,7 @@ impl Driver {
             resource_scheduler: None,
             daemon_scheduler: None,
             write_scope: None,
-            dream_read_scope: session.dream_read_scope(),
+            dream_read_scope,
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,

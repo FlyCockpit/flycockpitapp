@@ -190,7 +190,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::EndedSessionsPurged { .. }
         | proto::Response::AssistantDeleted { .. }
         | proto::Response::MediaReservationDiagnosis { .. }
-        | proto::Response::MediaReservationRepaired { .. } => {}
+        | proto::Response::MediaReservationRepaired { .. }
+        | proto::Response::KnowledgeDreamStatus { .. } => {}
         #[cfg(feature = "remote")]
         proto::Response::ConnectorState { .. } | proto::Response::OrgSyncStatus { .. } => {}
         // Free-text-bearing owner-remoted reads: the vaulted-secret redaction

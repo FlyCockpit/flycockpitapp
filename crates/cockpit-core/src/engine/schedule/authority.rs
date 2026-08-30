@@ -1107,6 +1107,7 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(64);
         let (turn_tx, turn_rx) = mpsc::channel(64);
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact,

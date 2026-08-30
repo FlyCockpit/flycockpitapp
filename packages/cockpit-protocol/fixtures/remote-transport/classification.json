@@ -51,9 +51,9 @@
     }
   ],
   "counts": {
-    "event": 83,
+    "event": 84,
     "request": 232,
-    "response": 157
+    "response": 156
   },
   "messages": {
     "event": [
@@ -532,6 +532,12 @@
         "tag": "daemon_draining"
       },
       {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "daemon_lifetime_changed"
+      },
+      {
         "class": "resume_window",
         "inlinePayloadBound": "bounded",
         "lane": "control",
@@ -548,6 +554,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "host_capabilities_changed"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "workspace_trust_reconciliation"
       }
     ],
     "request": [
@@ -916,6 +928,30 @@
         "inlinePayloadBound": "bounded",
         "lane": "control",
         "tag": "cancel_turn"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_all_session_work"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "promote_to_persistent"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "exit_guard_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "release_exit_guard"
       },
       {
         "class": "bounded_request_response",
@@ -1938,6 +1974,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "control",
         "tag": "restart_decision"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "exit_guard_status"
       },
       {
         "class": "bounded_request_response",

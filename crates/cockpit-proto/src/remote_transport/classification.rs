@@ -529,6 +529,26 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "cancel_all_session_work",
+        RemoteMessageClass::Cancel,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "promote_to_persistent",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "exit_guard_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "release_exit_guard",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "fs_list",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1401,6 +1421,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "restart_decision",
+        RemoteMessageClass::Liveness,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "exit_guard_status",
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2577,6 +2602,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "daemon_lifetime_changed",
+        RemoteMessageClass::Liveness,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "paused_work_available",
         RemoteMessageClass::ResumeWindow,
         RemoteInlinePayloadBound::Bounded,
@@ -2845,8 +2875,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 223);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 147);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 232);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 156);
         assert_eq!(EVENT_CLASSIFICATION.len(), 84);
     }
 

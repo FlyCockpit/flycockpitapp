@@ -500,18 +500,13 @@ impl App {
             return self.handle_ctrl_c();
         }
         // Ctrl+D preserves terminal EOF muscle memory only when the TUI is
-        // truly idle. If work or modal state is active, route through the
-        // same guarded exit policy as Ctrl+C so it cannot accidentally detach
-        // the user from active/background work.
+        // truly idle.  Unlike Ctrl+C, it is an exit gesture: live work must
+        // therefore enter the exit guard rather than interrupting that work.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('d'))
         {
-            return if self.ctrl_d_can_exit_immediately() {
-                self.request_guarded_exit()
-            } else {
-                self.handle_ctrl_c()
-            };
+            return self.request_guarded_exit();
         }
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -1416,28 +1411,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    fn ctrl_d_can_exit_immediately(&self) -> bool {
-        self.composer.is_empty()
-            && !self.busy
-            && self.queue.is_empty()
-            && self.pending.is_none()
-            && self.active_schedules.is_empty()
-            && matches!(self.dialog, Dialog::None)
-            && !self.overlay.is_open()
-            && self.question_dialog.is_none()
-            && self.pending_local_choice.is_none()
-            && !self.pending_prune_confirm
-            && self.pending_stop_confirm.is_none()
-            && self.pending_compact.is_none()
-            && self.pending_mcp_local.is_none()
-            && !self.pending_external_edit
-            && self.context_menu.is_none()
-            && self.pane.is_none()
-            && self.pin_pick.is_none()
-            && self.pins_review.is_none()
-            && self.keys_overlay.is_none()
     }
 
     pub(super) fn handle_key_insert(&mut self, key: KeyEvent) -> bool {

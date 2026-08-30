@@ -1,8 +1,8 @@
 //! `cockpit run` — one-shot non-interactive prompt through the daemon.
 //!
 //! Lifecycle: attach to a shareable daemon when one is already up; otherwise
-//! this one-shot command owns a private in-process ephemeral daemon for the
-//! duration of the run.
+//! this command starts a shared ephemeral daemon for the duration of the run.
+//! That owner can be promoted in place when the user selects background work.
 //!
 //! Behavior:
 //!
@@ -12,8 +12,8 @@
 //! 4. Send the prompt and pump events until `TurnComplete`.
 //! 5. In `default` format we stream assistant text to stdout; in
 //!    `json` format we emit one envelope per line.
-//! 6. If the operation booted an in-process owner, its guard shuts it down on
-//!    every exit; a run attached to an existing daemon leaves that owner up.
+//! 6. On ordinary exit an ephemeral owner reaps after the final client; a run
+//!    attached to an existing daemon leaves that owner up.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{OwnedDaemonRunError, ScopedDaemonClient};
+use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
 use crate::daemon::proto::{self, Request, Response, send_user_message_v2::MessageIngressV2};
 
 #[derive(Debug, thiserror::Error)]
@@ -278,20 +278,23 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         })
         .await
     } else {
-        crate::daemon::client::run_one_shot_daemon(move |client| {
-            Box::pin(async move {
-                run_with_daemon(
-                    client,
-                    &args,
-                    prompt,
-                    no_sandbox,
-                    &cwd,
-                    seed_unset_trust,
-                    false,
-                )
-                .await
-            })
-        })
+        crate::daemon::client::run_owned_daemon(
+            OwnedSessionMode::AttachOrEphemeral,
+            move |client| {
+                Box::pin(async move {
+                    run_with_daemon(
+                        client,
+                        &args,
+                        prompt,
+                        no_sandbox,
+                        &cwd,
+                        seed_unset_trust,
+                        false,
+                    )
+                    .await
+                })
+            },
+        )
         .await
     };
 
@@ -985,9 +988,49 @@ pub(crate) async fn pump_events(
                         writeln!(stderr, "{}", second_interrupt_unknown_guidance(id))?;
                         return Ok(130);
                     }
-                    // First SIGINT: stop ordinary waiting; cancel + reconcile.
-                    let code = reconcile_after_interrupt(client, id, format, &mut stderr).await?;
-                    return Ok(code);
+                    let proto::Response::ExitGuardStatus {
+                        ephemeral_owner,
+                        has_live_work,
+                    } = client
+                        .request_ok(Request::ExitGuardStatus)
+                        .await
+                        .context("reading authoritative daemon exit state")?
+                    else {
+                        anyhow::bail!("unexpected daemon exit-state response");
+                    };
+                    if has_live_work && ephemeral_owner {
+                        match prompt_run_exit_choice(&mut stderr)? {
+                            RunExitChoice::Background => {
+                                client
+                                    .request_ok(Request::PromoteToPersistent)
+                                    .await
+                                    .context("promoting daemon to persistent background owner")?;
+                                writeln!(
+                                    stderr,
+                                    "This session is still running in the background; reattach with cockpit run --session {session_id}"
+                                )?;
+                                return Ok(130);
+                            }
+                            RunExitChoice::StopAll => {
+                                // This is the only interactive path that broadens
+                                // cancellation beyond the current invocation.
+                                client
+                                    .request_ok(Request::CancelAllSessionWork)
+                                    .await
+                                    .context("cancelling all attached session work")?;
+                            }
+                        }
+                    } else if has_live_work {
+                        writeln!(
+                            stderr,
+                            "This session is still running in the background; reattach with cockpit run --session {session_id}"
+                        )?;
+                        return Ok(130);
+                    }
+                    // Either StopAll was explicitly selected, or the daemon
+                    // confirmed no live work at detach time. Normal Ctrl-C
+                    // cancellation remains invocation-scoped in this helper.
+                    return reconcile_after_interrupt(client, id, format, &mut stderr).await;
                 }
                 return Ok(130);
             }
@@ -1119,6 +1162,31 @@ pub(crate) async fn pump_events(
         stdout.flush()?;
     }
     Ok(code)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunExitChoice {
+    StopAll,
+    Background,
+}
+
+fn prompt_run_exit_choice(stderr: &mut impl Write) -> Result<RunExitChoice> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(RunExitChoice::StopAll);
+    }
+    writeln!(
+        stderr,
+        "This session is still working. What would you like to do? [s]top all / [b]ackground"
+    )?;
+    stderr.flush()?;
+    let mut choice = String::new();
+    std::io::stdin()
+        .read_line(&mut choice)
+        .context("reading exit choice")?;
+    Ok(match choice.trim().to_ascii_lowercase().as_str() {
+        "b" | "background" | "run in background" => RunExitChoice::Background,
+        _ => RunExitChoice::StopAll,
+    })
 }
 
 /// Map an authoritative terminal lifecycle state after interrupt reconciliation.
@@ -1965,7 +2033,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events (no session_id) — irrelevant to a headless
         // one-shot run, so they're filtered out by the session check.
-        CaffeinateState { .. } | DaemonDraining { .. }
+        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }

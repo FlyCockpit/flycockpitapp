@@ -62,6 +62,35 @@ const IN_PROCESS_EVENT_QUEUE: usize = 1024;
 const CLIENT_IO_CHANNEL_CAPACITY: usize = 64;
 const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 
+fn start_persistent_scheduler(
+    db: &Db,
+    registry: &SessionRegistry,
+    shutdown: &crate::daemon::shutdown::ShutdownSignal,
+    start_gate: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Option<DaemonSchedulerHandle> {
+    #[cfg(feature = "extended")]
+    {
+        let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+            db.clone(),
+            registry.clone(),
+        ));
+        let callbacks = executor.callback_registry();
+        Some(
+            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
+                db.clone(),
+                Arc::new(crate::daemon::scheduler::SystemClock),
+                executor,
+            ))
+            .start_with_callbacks_gated(shutdown.clone(), callbacks, start_gate),
+        )
+    }
+    #[cfg(not(feature = "extended"))]
+    {
+        let _ = (db, registry, shutdown, start_gate);
+        None
+    }
+}
+
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProcessContext>>> =
     OnceLock::new();
 
@@ -672,6 +701,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             will_restart: _,
             reason: _,
         } => {}
+        proto::Response::ExitGuardStatus {
+            ephemeral_owner: _,
+            has_live_work: _,
+        } => {}
         proto::Response::CaffeinateState {
             active: _,
             lid_close_guaranteed: _,
@@ -1004,7 +1037,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             dropped: _,
         }
-        | proto::Event::DaemonDraining { forced: _ } => {}
+        | proto::Event::DaemonDraining { forced: _ }
+        | proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: _,
+        } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
             agent: _,
@@ -2310,6 +2346,47 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
     }
 }
 
+struct PromotedPersistentServices {
+    media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    service_start_gate: Option<tokio::sync::watch::Sender<bool>>,
+    #[cfg(feature = "extended")]
+    image_generation_worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Fallible persistent-only resources prepared before an ephemeral owner is
+/// published as persistent. Nothing in this bundle is registered with the
+/// daemon or starts a task, so a failed endpoint publication cannot expose a
+/// durable admission path or dispatch external work.
+struct PreparedPersistentServices {
+    resource_scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
+    media_storage_recovery: Arc<crate::media_storage::MediaStorageRecovery>,
+    service_start_gate: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "extended")]
+    image_generation_artifact_root:
+        Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
+}
+
+/// The last-client reaper must distinguish a completed shutdown decision from
+/// a persistent promotion and from live work that has to drain before the
+/// ephemeral owner may terminate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EphemeralReapDecision {
+    Shutdown,
+    Persistent,
+    WaitingForLiveWork,
+}
+
+impl PromotedPersistentServices {
+    fn empty() -> Self {
+        Self {
+            media_storage_recovery: None,
+            service_start_gate: None,
+            #[cfg(feature = "extended")]
+            image_generation_worker: None,
+        }
+    }
+}
+
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
 pub struct DaemonContext {
@@ -2362,6 +2439,16 @@ pub struct DaemonContext {
     /// Serializes idle restart decisions so exactly one client can pair
     /// "daemon is idle" with the monotonic shutdown-gate transition.
     pub(crate) restart_decision: StdMutex<()>,
+    /// A live-work exit prompt reserves the ephemeral lifetime decision for
+    /// its attached client. The daemon retains only a `Weak`: transport
+    /// teardown releases the reservation automatically, while another client
+    /// cannot promote between the authoritative status response and that
+    /// client's prompt/choice.
+    exit_guard_reservation: StdMutex<std::sync::Weak<()>>,
+    /// Mutable owner lifetime. An ephemeral owner may be promoted in place
+    /// while work is live; the last-client reaper consults this instead of the
+    /// boot-time path marker.
+    ephemeral_lifetime: AtomicBool,
     shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -2373,7 +2460,13 @@ pub struct DaemonContext {
     /// must learn that it lost before it can stop workers or touch media.
     #[cfg(feature = "remote")]
     remote_operation_locks: tokio::sync::Mutex<HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>>,
-    pub scheduler: Option<DaemonSchedulerHandle>,
+    /// The durable scheduler is absent for an ephemeral owner and installed
+    /// atomically before an in-place promotion publishes a persistent owner.
+    scheduler: Arc<StdMutex<Option<DaemonSchedulerHandle>>>,
+    /// Services provisioned by an in-place ephemeral-to-persistent promotion.
+    /// They are installed and removed under `restart_decision` with endpoint
+    /// publication so request gates cannot outlive a failed promotion.
+    promoted_persistent_services: StdMutex<PromotedPersistentServices>,
     /// Stable, nonzero daemon boot UUID for all image-generation scheduler
     /// passes and deadline observation. The lifecycle worker uses it as its
     /// `worker_boot_id`; a job-creation caller uses it as the plan's
@@ -2472,6 +2565,8 @@ pub struct DaemonContext {
     /// make a parallel test daemon fail spuriously.
     #[cfg(test)]
     redaction_refresh_failure: Arc<AtomicBool>,
+    #[cfg(test)]
+    persistent_endpoint_publication_failure: AtomicBool,
 }
 
 #[cfg(test)]
@@ -2498,12 +2593,296 @@ impl DaemonContext {
     pub(crate) fn current_global_redaction(&self) -> Arc<RedactionTable> {
         current_redaction(&self.global_redaction)
     }
+
+    /// Whether this owner still follows last-client ephemeral teardown.
+    pub(crate) fn is_ephemeral_lifetime(&self) -> bool {
+        self.ephemeral_lifetime.load(Ordering::Acquire)
+    }
+
+    /// Promote this exact live owner without draining its workers. The endpoint
+    /// record and reaper gate transition together under the restart decision
+    /// lock, so last-client teardown cannot race the user choice.
+    pub(crate) fn promote_to_persistent(
+        &self,
+        exit_guard_reservation: Option<&Arc<()>>,
+    ) -> Result<bool> {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        self.require_exit_guard_promotion_owner(exit_guard_reservation)?;
+        if !self.is_ephemeral_lifetime() {
+            return Ok(false);
+        }
+        let services = self.prepare_persistent_services()?;
+        let mut persistent_paths = self.paths.clone();
+        persistent_paths.ephemeral = false;
+        let _service_transition = self.registry.lock_persistent_service_transition();
+        // Install every persistent service authority before publishing the
+        // lifetime or persistent endpoint. `restart_decision` keeps the
+        // reaper and lifetime snapshots outside this transition, and the
+        // synchronous registry setters make the authorities available to
+        // production consumers before either final publication store below.
+        self.activate_persistent_services(services);
+        self.ephemeral_lifetime.store(false, Ordering::Release);
+        if let Err(error) = self.write_persistent_endpoint_record(&persistent_paths) {
+            self.ephemeral_lifetime.store(true, Ordering::Release);
+            self.deactivate_persistent_services();
+            return Err(error);
+        }
+        self.start_persistent_service_tasks();
+        self.clear_exit_guard_reservation(exit_guard_reservation);
+        self.broadcast_global(proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: false,
+        });
+        Ok(true)
+    }
+
+    fn reserve_exit_guard(&self, client_state: &mut MutableClientState) -> Result<()> {
+        let mut reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
+        if let Some(active) = reservation.upgrade() {
+            if client_state
+                .exit_guard_reservation
+                .as_ref()
+                .is_some_and(|owned| Arc::ptr_eq(owned, &active))
+            {
+                return Ok(());
+            }
+            anyhow::bail!("another client is deciding how to detach live ephemeral work");
+        }
+        let owned = Arc::new(());
+        *reservation = Arc::downgrade(&owned);
+        client_state.exit_guard_reservation = Some(owned);
+        Ok(())
+    }
+
+    fn require_exit_guard_promotion_owner(
+        &self,
+        client_reservation: Option<&Arc<()>>,
+    ) -> Result<()> {
+        let reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
+        let Some(active) = reservation.upgrade() else {
+            return Ok(());
+        };
+        if client_reservation.is_some_and(|owned| Arc::ptr_eq(owned, &active)) {
+            Ok(())
+        } else {
+            anyhow::bail!("another client is deciding how to detach live ephemeral work");
+        }
+    }
+
+    fn clear_exit_guard_reservation(&self, client_reservation: Option<&Arc<()>>) {
+        let mut reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
+        let Some(active) = reservation.upgrade() else {
+            return;
+        };
+        if client_reservation.is_some_and(|owned| Arc::ptr_eq(owned, &active)) {
+            *reservation = std::sync::Weak::new();
+        }
+    }
+
+    pub(crate) fn release_exit_guard_reservation(&self, client_state: &mut MutableClientState) {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        self.clear_exit_guard_reservation(client_state.exit_guard_reservation.as_ref());
+        client_state.exit_guard_reservation = None;
+    }
+
+    /// Return the currently installed durable scheduler without retaining the
+    /// installation lock across an async scheduler operation.
+    pub(crate) fn scheduler(&self) -> Option<DaemonSchedulerHandle> {
+        // Prepared promotion services are deliberately not observable while
+        // this owner still has ephemeral lifetime. This makes the lifetime
+        // store below the single publication edge for scheduler admission.
+        if self.is_ephemeral_lifetime() {
+            return None;
+        }
+        crate::sync::lock_or_recover(&self.scheduler).clone()
+    }
+
+    /// Install the durable scheduler with a closed start gate. Its loop opens
+    /// only after endpoint and lifetime publication commit, so a failed
+    /// promotion cannot dispatch durable work.
+    fn install_persistent_scheduler(&self, start_gate: tokio::sync::watch::Receiver<bool>) {
+        let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
+        if scheduler.is_some() {
+            return;
+        }
+        if let Some(handle) =
+            start_persistent_scheduler(&self.db, &self.registry, &self.shutdown, Some(start_gate))
+        {
+            self.registry.set_scheduler(handle.clone());
+            *scheduler = Some(handle);
+        }
+    }
+
+    fn prepare_persistent_services(&self) -> Result<PreparedPersistentServices> {
+        let (service_start_gate, _) = tokio::sync::watch::channel(false);
+        let resource_scheduler =
+            Arc::new(crate::engine::resource_scheduler::ResourceScheduler::new(
+                ExtendedConfig::default().resource_scheduler,
+            ));
+        let media_root = crate::config::resolve::cockpit_data_dir()
+            .context("resolving persistent media root")?
+            .join("media");
+        let media_storage = Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(
+                self.db.clone(),
+                &media_root,
+            )
+            .context("opening persistent media storage")?,
+        );
+        #[cfg(feature = "extended")]
+        let image_generation_artifact_root = {
+            let root = crate::config::resolve::cockpit_data_dir()
+                .context("resolving image generation artifact root")?
+                .join("image-artifacts");
+            cockpit_host::private_fs::ensure_private_dir(&root)
+                .context("creating private image generation artifact root")?;
+            Arc::new(
+                crate::image_generation_job::open_image_generation_artifact_root(&root)
+                    .context("opening image generation artifact root")?,
+            )
+        };
+        Ok(PreparedPersistentServices {
+            resource_scheduler,
+            media_storage_recovery: media_storage,
+            service_start_gate,
+            #[cfg(feature = "extended")]
+            image_generation_artifact_root,
+        })
+    }
+
+    /// Install prepared persistent services while `promote_to_persistent`
+    /// holds `restart_decision`, before endpoint and lifetime publication.
+    fn activate_persistent_services(&self, services: PreparedPersistentServices) {
+        self.registry
+            .set_resource_scheduler(Some(services.resource_scheduler));
+        self.install_persistent_scheduler(services.service_start_gate.subscribe());
+        self.registry
+            .set_media_storage_recovery(Some(services.media_storage_recovery.clone()));
+        self.registry.set_message_media_authority(
+            services.media_storage_recovery.clone(),
+            self.media_ledger.clone(),
+        );
+        if let Some(secure_key) = self.secure_key.clone() {
+            self.registry.set_tool_media_runtime(Arc::new(
+                crate::tool_media_authority::runtime::ToolMediaRuntime::new(
+                    secure_key,
+                    services.media_storage_recovery.clone(),
+                ),
+            ));
+        }
+        let mut promoted_services =
+            crate::sync::lock_or_recover(&self.promoted_persistent_services);
+        promoted_services.media_storage_recovery = Some(services.media_storage_recovery);
+        promoted_services.service_start_gate = Some(services.service_start_gate.clone());
+        #[cfg(feature = "extended")]
+        {
+            let dispatch = self.registry.image_generation_dispatch_registry();
+            promoted_services.image_generation_worker = Some(
+                crate::daemon::image_generation_worker::spawn_image_generation_worker_gated(
+                    self.db.clone(),
+                    self.image_generation_boot_id,
+                    self.started_at,
+                    dispatch.adapter_map(),
+                    Arc::new(dispatch.clone()),
+                    Arc::new(dispatch),
+                    services.image_generation_artifact_root,
+                    self.shutdown.clone(),
+                    Some(services.service_start_gate.subscribe()),
+                ),
+            );
+        }
+    }
+
+    /// Undo a not-yet-published promotion. Endpoint publication is the only
+    /// fallible step after service preparation; no persistent service may
+    /// remain reachable if it fails.
+    fn deactivate_persistent_services(&self) {
+        self.registry.set_resource_scheduler(None);
+        self.registry.clear_scheduler();
+        if let Some(scheduler) = crate::sync::lock_or_recover(&self.scheduler).take() {
+            scheduler.abort();
+        }
+        self.registry.set_media_storage_recovery(None);
+        self.registry.clear_message_media_authority();
+        self.registry.clear_tool_media_runtime();
+        let mut promoted_services =
+            crate::sync::lock_or_recover(&self.promoted_persistent_services);
+        promoted_services.media_storage_recovery = None;
+        promoted_services.service_start_gate = None;
+        #[cfg(feature = "extended")]
+        if let Some(worker) = promoted_services.image_generation_worker.take() {
+            worker.abort();
+        }
+    }
+
+    /// Release task loops only after endpoint and lifetime publication. The
+    /// handles are already available to persistent consumers, but no durable
+    /// scheduler or worker can dispatch before that publication succeeds.
+    fn start_persistent_service_tasks(&self) {
+        if let Some(start_gate) = crate::sync::lock_or_recover(&self.promoted_persistent_services)
+            .service_start_gate
+            .as_ref()
+        {
+            let _ = start_gate.send(true);
+        }
+    }
+
+    pub(crate) fn active_media_storage_recovery(
+        &self,
+    ) -> Option<Arc<crate::media_storage::MediaStorageRecovery>> {
+        if self.is_ephemeral_lifetime() {
+            return None;
+        }
+        crate::sync::lock_or_recover(&self.promoted_persistent_services)
+            .media_storage_recovery
+            .clone()
+            .or_else(|| self.media_storage_recovery.clone())
+    }
+
+    fn write_persistent_endpoint_record(&self, paths: &DaemonPaths) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .persistent_endpoint_publication_failure
+            .load(Ordering::Acquire)
+        {
+            anyhow::bail!("persistent endpoint publication forced to fail");
+        }
+        crate::daemon::write_endpoint_record(paths)
+    }
+
+    /// Start last-client teardown only while this owner is still ephemeral.
+    ///
+    /// Promotion publishes the persistent endpoint and clears the lifetime
+    /// flag while holding this same decision lock.  Keeping the reaper's
+    /// check and shutdown transition in that critical section means a
+    /// promotion response cannot acknowledge a surviving owner and then lose
+    /// it to a stale zero-client observation.
+    pub(crate) fn reap_ephemeral_last_client(self: &Arc<Self>) -> EphemeralReapDecision {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        if !self.is_ephemeral_lifetime() {
+            return EphemeralReapDecision::Persistent;
+        }
+        if self.registry.any_agent_running() {
+            return EphemeralReapDecision::WaitingForLiveWork;
+        }
+        request_shutdown(self);
+        EphemeralReapDecision::Shutdown
+    }
+
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
         proto::Event::CaffeinateState {
             active: snap.active,
             lid_close_guaranteed: false,
             message: None,
+        }
+    }
+
+    /// Replayable daemon-global lifetime snapshot. This accompanies attach and
+    /// global-stream lag recovery so a client that missed the promotion edge
+    /// cannot retain a stale ephemeral exit policy.
+    fn lifetime_state_event(&self) -> proto::Event {
+        proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: self.is_ephemeral_lifetime(),
         }
     }
 
@@ -2525,6 +2904,7 @@ impl DaemonContext {
     ) -> Self {
         let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
+        let ephemeral_lifetime = paths.ephemeral;
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
         // authority. Built here and shared into the registry (which installs
@@ -2611,22 +2991,9 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
-        #[cfg(feature = "extended")]
-        let scheduler = (!paths.ephemeral).then(|| {
-            let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
-                db.clone(),
-                registry.clone(),
-            ));
-            let callbacks = executor.callback_registry();
-            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
-                db.clone(),
-                Arc::new(crate::daemon::scheduler::SystemClock),
-                executor,
-            ))
-            .start_with_callbacks(shutdown.clone(), callbacks)
-        });
-        #[cfg(not(feature = "extended"))]
-        let scheduler: Option<crate::daemon::scheduler::DaemonSchedulerHandle> = None;
+        let scheduler = (!paths.ephemeral)
+            .then(|| start_persistent_scheduler(&db, &registry, &shutdown, None))
+            .flatten();
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -2724,6 +3091,8 @@ impl DaemonContext {
             client_presence,
             shutdown,
             restart_decision: StdMutex::new(()),
+            exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
+            ephemeral_lifetime: AtomicBool::new(ephemeral_lifetime),
             shutdown_grace_override: StdMutex::new(None),
             env_baseline: Arc::new(std::sync::RwLock::new(EnvSnapshot::from_process(
                 EnvSnapshotSource::DaemonStart,
@@ -2733,7 +3102,8 @@ impl DaemonContext {
             connector_wake,
             #[cfg(feature = "remote")]
             remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
-            scheduler,
+            scheduler: Arc::new(StdMutex::new(scheduler)),
+            promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
             image_generation_boot_id,
             _image_generation_worker: image_generation_worker,
             credential_store_path: None,
@@ -2767,6 +3137,8 @@ impl DaemonContext {
             redaction_publication_poisoned: AtomicBool::new(false),
             #[cfg(test)]
             redaction_refresh_failure: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            persistent_endpoint_publication_failure: AtomicBool::new(false),
         };
         #[cfg(test)]
         {
@@ -2831,7 +3203,7 @@ impl DaemonContext {
                 handle.clone(),
             ));
         self.registry.set_redaction_key_resolver(resolver.clone());
-        if let Some(storage) = self.media_storage_recovery.clone() {
+        if let Some(storage) = self.active_media_storage_recovery() {
             self.registry.set_tool_media_runtime(Arc::new(
                 crate::tool_media_authority::runtime::ToolMediaRuntime::new(
                     handle.clone(),
@@ -3885,7 +4257,7 @@ pub(crate) async fn boot_with_db(
     db.reconcile_delegation_sidecar_cleanup_intents()
         .await
         .context("reconciling delegation sidecar cleanup intents")?;
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         storage
             .reconcile_abandoned_component_leases(now_unix_ms)
@@ -3893,7 +4265,7 @@ pub(crate) async fn boot_with_db(
             .context("reconciling abandoned media component leases")?;
         // Boot is recovery-only: crash-resume the same three calls the periodic
         // tick owns for long-lived daemons. Abandoned leases stay boot-only.
-        run_media_retention_sweep(storage, now_unix_ms)
+        run_media_retention_sweep(&storage, now_unix_ms)
             .await
             .context("media retention recovery")?;
     }
@@ -4187,8 +4559,9 @@ pub(crate) async fn boot_with_db(
         tracing::warn!("media admission is closed until durable reservations are recovered");
         timer.phase("media_reservation_admission_blocked");
     }
-    if let Some(handle) = &ctx.scheduler
-        && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
+    if let Some(handle) = ctx.scheduler()
+        && let Err(error) =
+            crate::skills::curator::register_scheduler(&handle, ctx.db.clone()).await
     {
         tracing::warn!(error = %error, "skill curator scheduler registration failed");
     }
@@ -4551,10 +4924,10 @@ async fn run_media_retention_sweep(
 }
 
 async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
-    let Some(storage) = ctx.media_storage_recovery.as_ref() else {
+    let Some(storage) = ctx.active_media_storage_recovery() else {
         return;
     };
-    if let Err(error) = run_media_retention_sweep(storage, now_unix_ms).await {
+    if let Err(error) = run_media_retention_sweep(&storage, now_unix_ms).await {
         tracing::warn!(error = %error, "media retention tick failed");
     }
 }
@@ -4662,6 +5035,7 @@ struct MutableClientState {
     upload_limits: AttachmentUploadLimits,
     terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
+    exit_guard_reservation: Option<Arc<()>>,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -4766,6 +5140,7 @@ impl MutableClientState {
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host,
+            exit_guard_reservation: None,
         }
     }
 
@@ -5121,6 +5496,9 @@ async fn run_in_process_client(
                             if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
                                 break 'client;
                             }
+                        }
+                        if !try_send_in_process_event(&event_tx, ctx.lifetime_state_event(), None, &mut pending_lag) {
+                            break 'client;
                         }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
@@ -5640,6 +6018,14 @@ async fn run_client_event_forwarder(
                         {
                             return;
                         }
+                        if !send_writer_envelope(
+                            &writer_tx,
+                            Envelope::event(ctx.lifetime_state_event()),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         if let Some(event) = ctx.drain_state_event()
                             && !send_writer_envelope(&writer_tx, Envelope::event(event)).await
                         {
@@ -5946,6 +6332,11 @@ async fn handle_envelope(
                 }
                 if let Some(event) = ctx.drain_state_event() {
                     let _ = send_writer_envelope(writer_tx, Envelope::event(event)).await;
+                }
+                if !send_writer_envelope(writer_tx, Envelope::event(ctx.lifetime_state_event()))
+                    .await
+                {
+                    return Ok(());
                 }
                 if let Some(rx) = effects.session_event_rx.take() {
                     let session_id = state

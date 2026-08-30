@@ -223,6 +223,16 @@ fn control_response_outcome_table() {
         control_response_outcome(Err("daemon error".to_string())),
         ControlRequestOutcome::Rejected(message) if message == "daemon error"
     ));
+    assert!(matches!(
+        control_response_outcome(Ok(Response::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        })),
+        ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        }
+    ));
 }
 
 #[tokio::test]

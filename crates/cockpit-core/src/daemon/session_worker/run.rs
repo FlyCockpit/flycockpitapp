@@ -12965,14 +12965,19 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    match session.credential_store().and_then(|store| {
+                    let new_table = session.credential_store().and_then(|store| {
                         crate::redact::RedactionTable::build_with_env_and_credential_store(
                             &effective_redact,
                             &project_root,
                             &session_env,
                             &store,
                         )
-                    }) {
+                    });
+                    let new_table = match new_table {
+                        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
+                        Err(error) => Err(error),
+                    };
+                    match new_table {
                         Ok(new_table) => {
                             // H1: read the LATEST table, union, persist, and swap
                             // under the per-session redaction-table write lock so

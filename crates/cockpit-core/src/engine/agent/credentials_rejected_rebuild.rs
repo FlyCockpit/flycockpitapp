@@ -134,6 +134,9 @@ pub(crate) async fn rebuild_model_for_credentials(
         &env,
         &store,
     )?;
+    let refreshed_secrets = session
+        .with_machine_scoped_sealed_redactions(&refreshed_secrets)
+        .await?;
     let refreshed = Arc::new(redact.union(&refreshed_secrets)?);
     // (c) Rebuild a fresh client from the owner-scoped store under the refreshed
     // table. Same construction funnel as the model-swap path.

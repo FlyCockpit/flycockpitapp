@@ -1926,6 +1926,10 @@ impl SessionRegistry {
             &session.credential_store()?,
         )
         .context("building redaction table")?;
+        let redact = session
+            .with_machine_scoped_sealed_redactions(&redact)
+            .await
+            .context("adding machine-scoped sealed values to redaction table")?;
         let redact = Arc::new(redact);
 
         // Build the model from providers config. Errors out loud if

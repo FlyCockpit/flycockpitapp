@@ -55,6 +55,15 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    CodeRootCreated(crate::CreateCodeRootV1Result),
+    CodeRootAttached(crate::AttachExistingCodeRootV1Result),
+    CodeRootAttachmentClosed(crate::CloseCodeRootAttachmentV1Result),
+    CodeRootsDiscovered(crate::DiscoverCodeRootsV1Result),
+    CodeRootRead(crate::ReadCodeRootV1Result),
+    CodeRootDeliveries(crate::ReadCodeRootDeliveriesV1Result),
+    CodeRootDeliveriesAcked(crate::AckCodeRootDeliveriesV1Result),
+    CodeRootInterruptResolved(crate::ResolveCodeRootInterruptResultV1),
+
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
 
     LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
@@ -1268,6 +1277,48 @@ pub enum Response {
     Unknown,
 }
 
+impl crate::CodeRootReadV1 {
+    /// Preserve the pre-existing first-party attached-session view while all
+    /// Code construction/attachment itself goes through the closed routes.
+    pub fn into_attached_response(self) -> Response {
+        Response::Attached {
+            session_id: self.root_id.0,
+            session_entry_mode: crate::SessionEntryMode::Code,
+            short_id: self.short_id,
+            project_root: self.workspace_path,
+            project_id: self.project_id,
+            active_agent: self.active_agent,
+            active_agent_path: self.active_agent_path,
+            foreground_target: self.foreground_target,
+            active_subagent: self.active_subagent,
+            active_model_state: self.active_model_state,
+            history: self.history,
+            paused_work: self.paused_work,
+            repair_required: self.repair_required,
+            // A Code-root read is an immutable projection, while this offer
+            // is ephemeral authority issued only for an interactive attach.
+            resume_compaction_offer: None,
+            daemon_version: self.daemon_version,
+            compatible: self.compatible,
+            env_baseline: self.env_baseline,
+            env_session: self.env_session,
+            env_drift: self.env_drift,
+            env_policy_applied: self.env_policy_applied,
+            btw_fork: self.btw_fork,
+        }
+    }
+}
+
+impl Response {
+    pub fn into_first_party_attached(self) -> Self {
+        match self {
+            Self::CodeRootCreated(result) => result.root.into_attached_response(),
+            Self::CodeRootAttached(result) => result.root.into_attached_response(),
+            response => response,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ClientSubmissionReceiptStatus {
@@ -1483,6 +1534,14 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::CodeRootCreated(..), "code_root_created");
+            (Response::CodeRootAttached(..), "code_root_attached");
+            (Response::CodeRootAttachmentClosed(..), "code_root_attachment_closed");
+            (Response::CodeRootsDiscovered(..), "code_roots_discovered");
+            (Response::CodeRootRead(..), "code_root_read");
+            (Response::CodeRootDeliveries(..), "code_root_deliveries");
+            (Response::CodeRootDeliveriesAcked(..), "code_root_deliveries_acked");
+            (Response::CodeRootInterruptResolved(..), "code_root_interrupt_resolved");
             (Response::MediaOwnerRecovery(..), "media_owner_recovery");
             (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
             (Response::ImageIngressAdmitted(..), "image_ingress_admitted");

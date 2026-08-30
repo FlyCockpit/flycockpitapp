@@ -499,30 +499,31 @@ pub(crate) async fn attach_send_pump(
     // plan executor passes the plan's pinned model) is both the authoritative
     // initial session selection and the pin that overrides every spawned
     // agent's frontmatter model for this session's run.
-    let attached = match client
-        .request(Request::Attach {
-            session_id: requested_session,
-            since_seq: None,
-            project_root: Some(project_root),
-            initial_model: model_override.clone(),
+    let request = match requested_session {
+        Some(session_id) => proto::attach_existing_code_root_v1_request(
+            session_id,
+            None,
+            model_override.clone(),
             no_sandbox,
-            // A streamed run has no UI to answer an interrupt — a
-            // non-interactive attach. The loop guard treats the session as
-            // headless and auto-rejects a back-to-back repeat (with the
-            // guidance error) rather than blocking.
-            interactive: false,
-            // Headless runs have no selected interactive setup surface.
-            session_entry_mode: requested_session
-                .is_none()
-                .then_some(proto::SessionEntryMode::Code),
+            false,
             model_override,
-            client_protocol_version: client.negotiated().version,
-            env_snapshot: Some(env_snapshot.to_wire()),
-            env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-        })
-        .await?
-    {
-        Ok(response) => response,
+            client.negotiated().version,
+            Some(env_snapshot.to_wire()),
+            crate::env_snapshot::EnvDriftPolicy::Daemon,
+        ),
+        None => proto::create_code_root_v1_request(
+            project_root,
+            model_override.clone(),
+            no_sandbox,
+            false,
+            model_override,
+            client.negotiated().version,
+            Some(env_snapshot.to_wire()),
+            crate::env_snapshot::EnvDriftPolicy::Daemon,
+        ),
+    };
+    let attached = match client.request(request).await? {
+        Ok(response) => response.into_first_party_attached(),
         Err(error) if error.code == proto::ErrorCode::WorkspaceTrust => {
             return Err(RunWorkspaceTrustError(error.message).into());
         }

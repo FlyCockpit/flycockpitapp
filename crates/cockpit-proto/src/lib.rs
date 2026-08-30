@@ -32,9 +32,18 @@ pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use acp::{
-    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1,
-    AcpForwardedMcpTransportV1, AcpNameValuePairV1, AcpSessionAdmissionMethodV1,
-    ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+    AckCodeRootDeliveriesV1Request, AckCodeRootDeliveriesV1Result, AcpForwardedMcpDeclarationV1,
+    AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1, AcpForwardedMcpTransportV1,
+    AcpNameValuePairV1, AcpSessionAdmissionMethodV1, AttachExistingCodeRootV1Request,
+    AttachExistingCodeRootV1Result, CloseCodeRootAttachmentV1Request,
+    CloseCodeRootAttachmentV1Result, CodeRootAttachOptionsV1, CodeRootAttachmentCapabilityV1,
+    CodeRootAttachmentV1, CodeRootDeliveryPayloadV1, CodeRootDeliveryV1, CodeRootDiscoveryCursorV1,
+    CodeRootIdV1, CodeRootLifecycleV1, CodeRootReadV1, CodeRootReplayCursorV1, CodeRootSummaryV1,
+    CodeRootWorkspaceSelectorV1, CreateCodeRootV1Request, CreateCodeRootV1Result,
+    DiscoverCodeRootsV1Request, DiscoverCodeRootsV1Result, OpaqueAsciiId128V1,
+    ReadCodeRootDeliveriesV1Request, ReadCodeRootDeliveriesV1Result, ReadCodeRootV1Request,
+    ReadCodeRootV1Result, ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+    attach_existing_code_root_v1_request, create_code_root_v1_request,
 };
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -578,6 +587,36 @@ pub enum SessionEntryMode {
     Code,
     Assistant,
     Computer,
+}
+
+/// Closed discriminator for the legacy generic attachment surface. Code is
+/// intentionally unrepresentable; Code roots use the named v1 routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonCodeSessionEntryMode {
+    Assistant,
+    Computer,
+}
+
+impl From<NonCodeSessionEntryMode> for SessionEntryMode {
+    fn from(value: NonCodeSessionEntryMode) -> Self {
+        match value {
+            NonCodeSessionEntryMode::Assistant => Self::Assistant,
+            NonCodeSessionEntryMode::Computer => Self::Computer,
+        }
+    }
+}
+
+impl TryFrom<SessionEntryMode> for NonCodeSessionEntryMode {
+    type Error = &'static str;
+
+    fn try_from(value: SessionEntryMode) -> Result<Self, Self::Error> {
+        match value {
+            SessionEntryMode::Assistant => Ok(Self::Assistant),
+            SessionEntryMode::Computer => Ok(Self::Computer),
+            SessionEntryMode::Code => Err("Code roots require the closed Code-root routes"),
+        }
+    }
 }
 
 impl SessionEntryMode {
@@ -1259,8 +1298,10 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version. v21 includes the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
-/// profiles, agent-dimensioned MCP scopes, bounded base64 media previews, and
-/// the rolling-precompaction resume choice.
+/// profiles, agent-dimensioned MCP scopes on the attached-session and
+/// daemon-owned setup inventory, bounded base64 media previews, and the
+/// rolling-precompaction resume choice. Older fixtures remain frozen migration
+/// evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a

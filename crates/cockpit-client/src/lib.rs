@@ -1010,8 +1010,17 @@ async fn run_io(
                             Body::Response { id, response } => {
                                 let response = *response;
                                 if let Some(tx) = pending.remove(&id) {
-                                    if let Response::Attached { session_id, .. } = &response {
-                                        attached_session = Some(*session_id);
+                                    match &response {
+                                        Response::Attached { session_id, .. } => {
+                                            attached_session = Some(*session_id);
+                                        }
+                                        Response::CodeRootCreated(result) => {
+                                            attached_session = Some(result.root.root_id.0);
+                                        }
+                                        Response::CodeRootAttached(result) => {
+                                            attached_session = Some(result.root.root_id.0);
+                                        }
+                                        _ => {}
                                     }
                                     let _ = tx.send(Ok(response));
                                 } else if is_nil_daemon_status_hello(id, &response) {
@@ -1264,7 +1273,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version,
             env_snapshot: None,
@@ -1275,7 +1284,7 @@ mod tests {
     fn attached_response(session_id: Uuid) -> Response {
         Response::Attached {
             session_id,
-            session_entry_mode: proto::SessionEntryMode::Code,
+            session_entry_mode: proto::SessionEntryMode::Assistant,
             short_id: "abc123".to_string(),
             project_root: "/tmp".to_string(),
             project_id: "project".to_string(),
@@ -1710,7 +1719,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,

@@ -1094,6 +1094,9 @@ CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_
 -- item can replace the plaintext without a rebuild dance.
 CREATE TABLE sealed_values (
     session_id TEXT NOT NULL,
+    source_key TEXT CHECK (
+        source_key IS NULL OR length(CAST(source_key AS BLOB)) BETWEEN 1 AND 128
+    ),
     value_id   TEXT NOT NULL,
     value      TEXT,
     reason     TEXT NOT NULL,
@@ -2710,6 +2713,84 @@ CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
 -- History trust filters scan one session in seq order while excluding trusted-authored rows.
 CREATE INDEX idx_sevents_session_trust_seq ON session_events (session_id, model_trust, seq)
   WHERE model_trust IS NOT NULL;
+
+-- ---- ACP Code-root projection ---------------------------------------------
+-- The projection is a redacted delivery ledger, not an ACP session store.
+-- Cockpit's session/agent/decision tables remain authoritative. Attachment
+-- capabilities and discovery snapshots are deliberately absent: they are
+-- boot-local daemon authorities and become invalid on restart.
+CREATE TABLE code_root_projection_deliveries (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id TEXT NOT NULL UNIQUE CHECK (
+        length(delivery_id) = 36 AND delivery_id = lower(delivery_id)
+    ),
+    replay_cursor TEXT NOT NULL UNIQUE CHECK (
+        length(replay_cursor) = 32
+        AND replay_cursor = lower(replay_cursor)
+        AND replay_cursor NOT GLOB '*[^0-9a-f]*'
+    ),
+    session_id TEXT NOT NULL,
+    source_key TEXT CHECK (
+        source_key IS NULL OR length(CAST(source_key AS BLOB)) BETWEEN 1 AND 128
+    ),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'history', 'attention', 'root_state_changed', 'client_incompatible'
+    )),
+    payload_json TEXT NOT NULL CHECK (
+        json_valid(payload_json)
+        AND json_type(payload_json) = 'object'
+        AND length(CAST(payload_json AS BLOB)) <= 524288
+    ),
+    created_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+CREATE INDEX idx_code_root_projection_session_sequence
+    ON code_root_projection_deliveries(session_id, sequence);
+CREATE UNIQUE INDEX uq_code_root_projection_source
+    ON code_root_projection_deliveries(session_id, kind, source_key)
+    WHERE source_key IS NOT NULL;
+
+-- Durable logical-client ACK state. The capability authenticates each live
+-- request in memory; only the bounded caller id and acknowledged projection
+-- position survive so session/load can resume after a daemon restart.
+CREATE TABLE code_root_replay_cursors (
+    session_id TEXT NOT NULL,
+    logical_client_id TEXT NOT NULL CHECK (
+        length(CAST(logical_client_id AS BLOB)) BETWEEN 1 AND 128
+        AND logical_client_id NOT GLOB '*[^ -~]*'
+    ),
+    acknowledged_sequence INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged_sequence >= 0),
+    updated_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, logical_client_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+-- First-wins, durable receipts for ACP decision resolution. The boot-local
+-- attachment capability authorizes a live call; this row lets the same
+-- logical client recover its accepted terminal result after reconnect/restart.
+CREATE TABLE code_root_interrupt_receipts (
+    session_id TEXT NOT NULL,
+    logical_client_id TEXT NOT NULL CHECK (
+        length(CAST(logical_client_id AS BLOB)) BETWEEN 1 AND 128
+        AND logical_client_id NOT GLOB '*[^ -~]*'
+    ),
+    client_request_id TEXT NOT NULL CHECK (
+        length(CAST(client_request_id AS BLOB)) BETWEEN 1 AND 128
+        AND client_request_id NOT GLOB '*[^ -~]*'
+    ),
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'accepted', 'already_resolved_same', 'already_resolved_other',
+        'cancelled', 'expired'
+    )),
+    resolved_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, logical_client_id, client_request_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
+);
 
 -- ---- verification ledger ----------------------------------------------------
 -- Verification work is daemon-owned audit state.  Rows deliberately contain

@@ -412,6 +412,105 @@ const optionalUuidSchema = uuidSchema.nullable().optional();
 const passthroughObjectSchema = z.object({}).passthrough();
 const statsRangeSchema = z.enum(["last7_days", "all_time"]);
 const envDriftPolicySchema = z.enum(["daemon", "client", "update-daemon", "error-on-drift"]);
+export const opaqueAsciiId128V1Schema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[\x21-\x7e]+$/);
+export const codeRootIdV1Schema = uuidSchema;
+export const codeRootAttachmentCapabilityV1Schema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[\x21-\x7e]+$/);
+export const codeRootReplayCursorV1Schema = z
+  .string()
+  .length(32)
+  .regex(/^[0-9a-f]+$/);
+export const codeRootDiscoveryCursorV1Schema = z
+  .string()
+  .length(32)
+  .regex(/^[0-9a-f]+$/);
+export const codeRootAttachOptionsV1Schema = z
+  .object({
+    initial_model: activeModelRefSchema.optional(),
+    model_override: activeModelRefSchema.optional(),
+    no_sandbox: z.boolean().optional(),
+    interactive: z.boolean().optional(),
+    client_protocol_version: u32Schema.optional(),
+    env_snapshot: z.unknown().optional(),
+    env_policy: envDriftPolicySchema.optional(),
+  })
+  .strict();
+export const createCodeRootV1RequestSchema = z
+  .object({
+    workspace_selector: z.object({ path: z.string().min(1).max(32768) }).strict(),
+    logical_client_id: opaqueAsciiId128V1Schema,
+    client_request_id: opaqueAsciiId128V1Schema,
+    options: codeRootAttachOptionsV1Schema,
+  })
+  .strict();
+export const attachExistingCodeRootV1RequestSchema = z
+  .object({
+    root_id: codeRootIdV1Schema,
+    capture_generation: safeU64NumberSchema,
+    logical_client_id: opaqueAsciiId128V1Schema,
+    client_request_id: opaqueAsciiId128V1Schema,
+    replay_cursor: codeRootReplayCursorV1Schema.optional(),
+    since_seq: safeI64NumberSchema.optional(),
+    options: codeRootAttachOptionsV1Schema,
+  })
+  .strict();
+export const closeCodeRootAttachmentV1RequestSchema = z
+  .object({
+    attachment_capability: codeRootAttachmentCapabilityV1Schema,
+    client_request_id: opaqueAsciiId128V1Schema,
+  })
+  .strict();
+export const discoverCodeRootsV1RequestSchema = z
+  .object({
+    workspace_selector: z.object({ path: z.string().min(1).max(32768) }).strict(),
+    logical_client_id: opaqueAsciiId128V1Schema,
+    cursor: codeRootDiscoveryCursorV1Schema.optional(),
+    limit: z.number().int().min(1).max(100),
+  })
+  .strict();
+export const readCodeRootV1RequestSchema = z
+  .object({ attachment_capability: codeRootAttachmentCapabilityV1Schema })
+  .strict();
+export const readCodeRootDeliveriesV1RequestSchema = z
+  .object({
+    attachment_capability: codeRootAttachmentCapabilityV1Schema,
+    after: codeRootReplayCursorV1Schema.optional(),
+    limit: z.number().int().min(1).max(256),
+  })
+  .strict();
+export const ackCodeRootDeliveriesV1RequestSchema = z
+  .object({
+    attachment_capability: codeRootAttachmentCapabilityV1Schema,
+    through: codeRootReplayCursorV1Schema,
+    client_request_id: opaqueAsciiId128V1Schema,
+  })
+  .strict();
+export const resolveCodeRootInterruptV1Schema = z
+  .object({
+    attachment_capability: codeRootAttachmentCapabilityV1Schema,
+    attention_id: opaqueAsciiId128V1Schema,
+    client_request_id: opaqueAsciiId128V1Schema,
+    selected_choice: opaqueAsciiId128V1Schema,
+  })
+  .strict();
+export type CodeRootAttachOptionsV1 = z.infer<typeof codeRootAttachOptionsV1Schema>;
+export type CreateCodeRootV1Request = z.infer<typeof createCodeRootV1RequestSchema>;
+export type AttachExistingCodeRootV1Request = z.infer<typeof attachExistingCodeRootV1RequestSchema>;
+export type CloseCodeRootAttachmentV1Request = z.infer<
+  typeof closeCodeRootAttachmentV1RequestSchema
+>;
+export type DiscoverCodeRootsV1Request = z.infer<typeof discoverCodeRootsV1RequestSchema>;
+export type ReadCodeRootV1Request = z.infer<typeof readCodeRootV1RequestSchema>;
+export type ReadCodeRootDeliveriesV1Request = z.infer<typeof readCodeRootDeliveriesV1RequestSchema>;
+export type AckCodeRootDeliveriesV1Request = z.infer<typeof ackCodeRootDeliveriesV1RequestSchema>;
+export type ResolveCodeRootInterruptV1 = z.infer<typeof resolveCodeRootInterruptV1Schema>;
 const activeModelSwitchTriggerSchema = z.enum(["picker", "quick", "cycle", "daemon"]);
 
 export const grantKindSchema = z.enum(["command", "path", "mcp_tool"]);
@@ -670,6 +769,9 @@ export const pendingGuidanceProposalSchema = z
   .strict();
 export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
 
+export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
+export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
+
 const requestParamSchemas = {
   get_storage_report: z.undefined(),
   get_app_flag: z
@@ -740,6 +842,14 @@ const requestParamSchemas = {
     .strict(),
   get_workspace_history_scope: z.object({ project_root: projectRootSchema }).strict(),
   archive_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
+  create_code_root_v1: createCodeRootV1RequestSchema,
+  attach_existing_code_root_v1: attachExistingCodeRootV1RequestSchema,
+  close_code_root_attachment_v1: closeCodeRootAttachmentV1RequestSchema,
+  discover_code_roots_v1: discoverCodeRootsV1RequestSchema,
+  read_code_root_v1: readCodeRootV1RequestSchema,
+  read_code_root_deliveries_v1: readCodeRootDeliveriesV1RequestSchema,
+  ack_code_root_deliveries_v1: ackCodeRootDeliveriesV1RequestSchema,
+  resolve_code_root_interrupt_v1: resolveCodeRootInterruptV1Schema,
   attach: z.union([
     // A fresh session has no durable session identity yet, so it must name
     // its non-authoritative entry presentation explicitly.
@@ -1121,6 +1231,20 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // array directly so it stays in sync with `clientRequestSchema` by
 // construction.
 const clientRequestVariants = [
+  requestVariant("create_code_root_v1", requestParamSchemas.create_code_root_v1),
+  requestVariant("attach_existing_code_root_v1", requestParamSchemas.attach_existing_code_root_v1),
+  requestVariant(
+    "close_code_root_attachment_v1",
+    requestParamSchemas.close_code_root_attachment_v1,
+  ),
+  requestVariant("discover_code_roots_v1", requestParamSchemas.discover_code_roots_v1),
+  requestVariant("read_code_root_v1", requestParamSchemas.read_code_root_v1),
+  requestVariant("read_code_root_deliveries_v1", requestParamSchemas.read_code_root_deliveries_v1),
+  requestVariant("ack_code_root_deliveries_v1", requestParamSchemas.ack_code_root_deliveries_v1),
+  requestVariant(
+    "resolve_code_root_interrupt_v1",
+    requestParamSchemas.resolve_code_root_interrupt_v1,
+  ),
   requestVariant("get_app_flag", requestParamSchemas.get_app_flag),
   requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
   requestVariant("mark_app_flag_seen", requestParamSchemas.mark_app_flag_seen),
@@ -1129,14 +1253,8 @@ const clientRequestVariants = [
   requestVariant("preview_storage_cleanup", requestParamSchemas.preview_storage_cleanup),
   requestVariant("execute_storage_cleanup", requestParamSchemas.execute_storage_cleanup),
   requestVariant("set_workspace_trust", requestParamSchemas.set_workspace_trust),
-  requestVariant(
-    "set_workspace_history_scope",
-    requestParamSchemas.set_workspace_history_scope,
-  ),
-  requestVariant(
-    "get_workspace_history_scope",
-    requestParamSchemas.get_workspace_history_scope,
-  ),
+  requestVariant("set_workspace_history_scope", requestParamSchemas.set_workspace_history_scope),
+  requestVariant("get_workspace_history_scope", requestParamSchemas.get_workspace_history_scope),
   requestVariant("archive_session", requestParamSchemas.archive_session),
   requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
   requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
@@ -1289,9 +1407,19 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
+  "app_flag",
+  "app_flag_seen",
   "assistant_session_resolved",
   "config_refreshed",
   "attached",
+  "code_root_created",
+  "code_root_attached",
+  "code_root_attachment_closed",
+  "code_roots_discovered",
+  "code_root_read",
+  "code_root_deliveries",
+  "code_root_deliveries_acked",
+  "code_root_interrupt_resolved",
   "forked",
   "fs_list",
   "fs_read",
@@ -1500,8 +1628,6 @@ export const queueTargetSchema = z
   })
   .passthrough();
 export type QueueTarget = z.infer<typeof queueTargetSchema>;
-export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
-export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const queueItemSchema = z
   .object({
     id: uuidSchema,
@@ -1628,6 +1754,64 @@ export const attachedDataSchema = z
   })
   .passthrough();
 export type AttachedData = z.infer<typeof attachedDataSchema>;
+export const codeRootAttachmentV1Schema = z
+  .object({
+    root_id: codeRootIdV1Schema,
+    attachment_capability: codeRootAttachmentCapabilityV1Schema,
+    capture_generation: safeU64NumberSchema,
+    replay_cursor: codeRootReplayCursorV1Schema,
+  })
+  .strict();
+export const codeRootReadV1Schema = attachedDataSchema
+  .omit({ session_id: true, session_entry_mode: true, project_root: true })
+  .extend({
+    root_id: codeRootIdV1Schema,
+    workspace_path: projectRootSchema,
+    title: z.string().nullable().optional(),
+    attention: z.array(agentDecisionAttentionSchema),
+  })
+  .strict();
+export const createCodeRootV1ResultSchema = z
+  .object({ attachment: codeRootAttachmentV1Schema, root: codeRootReadV1Schema })
+  .strict();
+export const attachExistingCodeRootV1ResultSchema = createCodeRootV1ResultSchema;
+export const codeRootSummaryV1Schema = z
+  .object({
+    root_id: codeRootIdV1Schema,
+    title: z.string().nullable().optional(),
+    short_id: z.string(),
+    workspace_path: projectRootSchema,
+    last_active_at_unix_ms: safeI64NumberSchema,
+    lifecycle: z.enum(["active", "ended", "archived"]),
+    capture_generation: safeU64NumberSchema,
+  })
+  .strict();
+export const discoverCodeRootsV1ResultSchema = z
+  .object({
+    roots: z.array(codeRootSummaryV1Schema),
+    next_cursor: codeRootDiscoveryCursorV1Schema.optional(),
+  })
+  .strict();
+export const codeRootDeliveryV1Schema = z
+  .object({
+    delivery_id: uuidSchema,
+    cursor: codeRootReplayCursorV1Schema,
+    payload: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("history"), entry: historyEntryWireSchema }).strict(),
+      z.object({ kind: z.literal("attention"), entry: agentDecisionAttentionSchema }).strict(),
+      z.object({ kind: z.literal("root_state_changed") }).strict(),
+      z.object({ kind: z.literal("client_incompatible") }).strict(),
+    ]),
+    created_at_unix_ms: safeI64NumberSchema,
+  })
+  .strict();
+export type CodeRootAttachmentV1 = z.infer<typeof codeRootAttachmentV1Schema>;
+export type CodeRootReadV1 = z.infer<typeof codeRootReadV1Schema>;
+export type CreateCodeRootV1Result = z.infer<typeof createCodeRootV1ResultSchema>;
+export type AttachExistingCodeRootV1Result = z.infer<typeof attachExistingCodeRootV1ResultSchema>;
+export type CodeRootSummaryV1 = z.infer<typeof codeRootSummaryV1Schema>;
+export type DiscoverCodeRootsV1Result = z.infer<typeof discoverCodeRootsV1ResultSchema>;
+export type CodeRootDeliveryV1 = z.infer<typeof codeRootDeliveryV1Schema>;
 export const userMessageQueuedResultSchema = z
   .object({ item: queueItemSchema, queue: z.array(queueItemSchema) })
   .passthrough();
@@ -1775,6 +1959,28 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ applied_generation: safeU64NumberSchema, changed: z.boolean() }).strict(),
   ),
   responseVariant("attached", attachedDataSchema),
+  responseVariant("code_root_created", createCodeRootV1ResultSchema),
+  responseVariant("code_root_attached", attachExistingCodeRootV1ResultSchema),
+  responseVariant("code_root_attachment_closed", z.enum(["closed", "already_closed"])),
+  responseVariant("code_roots_discovered", discoverCodeRootsV1ResultSchema),
+  responseVariant("code_root_read", z.object({ root: codeRootReadV1Schema }).strict()),
+  responseVariant(
+    "code_root_deliveries",
+    z
+      .object({
+        deliveries: z.array(codeRootDeliveryV1Schema).max(256),
+        high_water_cursor: codeRootReplayCursorV1Schema,
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "code_root_deliveries_acked",
+    z.object({ acked_through: codeRootReplayCursorV1Schema }).strict(),
+  ),
+  responseVariant(
+    "code_root_interrupt_resolved",
+    z.enum(["accepted", "already_resolved_same", "already_resolved_other", "cancelled", "expired"]),
+  ),
   responseVariant(
     "guidance_proposals",
     z.object({ proposals: z.array(pendingGuidanceProposalSchema) }).strict(),
@@ -2573,9 +2779,7 @@ const workspaceTrustReconciliationDataSchema = z
   })
   .strict();
 
-const daemonLifetimeChangedDataSchema = z
-  .object({ ephemeral_owner: z.boolean() })
-  .strict();
+const daemonLifetimeChangedDataSchema = z.object({ ephemeral_owner: z.boolean() }).strict();
 
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),

@@ -55,7 +55,7 @@ fn attach_request_with_client_protocol_version(
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version,
         env_snapshot: None,

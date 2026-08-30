@@ -31,6 +31,7 @@ pub mod bulk_staging;
 pub mod bulk_upload;
 pub mod caffeinate;
 pub mod client;
+pub mod code_roots;
 pub(crate) mod config_publication_recovery;
 pub(crate) mod config_refresh;
 pub mod config_source;
@@ -3009,7 +3010,7 @@ mod tests {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -3036,7 +3037,7 @@ mod tests {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: None,
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,

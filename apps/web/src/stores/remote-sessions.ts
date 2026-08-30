@@ -10,9 +10,9 @@ import type {
   HistoryPageResult,
   InterruptQuestion,
   ResumeRepairState,
-  type StorageCleanupCompletedResult,
-  type StorageCleanupPreviewResult,
-  type StorageReportResult,
+  StorageCleanupCompletedResult,
+  StorageCleanupPreviewResult,
+  StorageReportResult,
   HistoryEntry as WireHistoryEntry,
   SessionSummary as WireSessionSummary,
 } from "@flycockpit/cockpit-protocol";

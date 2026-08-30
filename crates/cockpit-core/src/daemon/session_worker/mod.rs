@@ -302,7 +302,70 @@ fn send_session_event_with_agent(
     source: NoticeSource,
 ) {
     record_notice_event_with_agent(Some(session), agent, redact, &event, source);
+    // A Code-root transition is observable to ordinary session clients only
+    // after its ACP replay invalidation is durable.  The event itself is
+    // already a committed worker transition, so there is no safe later read
+    // that can reconstruct a missed delivery for a reconnecting ACP client.
+    // Fail closed instead of publishing an unreplayable transition.
+    if !record_code_root_state_transition(session, &event) {
+        return;
+    }
     send_event(tx, redact, event);
+}
+
+/// Capture the durable ACP invalidation at the same worker seam that publishes
+/// a committed session/agent-tree transition.  This is intentionally before
+/// broadcast and is never invoked by the delivery-read route: a short-lived
+/// attention row therefore leaves two durable transition deliveries even when
+/// no ACP client polls while it is open.
+fn record_code_root_state_transition(session: &Session, event: &proto::Event) -> bool {
+    if session.session_entry_mode() != proto::SessionEntryMode::Code {
+        return true;
+    }
+    let payload = match serde_json::to_string(&proto::CodeRootDeliveryPayloadV1::RootStateChanged) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(%error, session_id = %session.id, "serializing Code-root state delivery failed; suppressing session broadcast");
+            return false;
+        }
+    };
+    let source_key = code_root_transition_source_key(event);
+    let now = crate::db::session_log::now_ms();
+    let session_id = session.id;
+    if let Err(error) = session.db.blocking_write_for_sync_event(move |conn| {
+        crate::db::Db::append_code_root_projection_delivery_conn(
+            conn,
+            session_id,
+            "root_state_changed",
+            source_key.as_deref(),
+            &payload,
+            now,
+        )
+        .map(|_| ())
+    }) {
+        tracing::error!(%error, session_id = %session.id, "recording Code-root state delivery failed; suppressing session broadcast");
+        false
+    } else {
+        true
+    }
+}
+
+fn code_root_transition_source_key(event: &proto::Event) -> Option<String> {
+    let (kind, sequence) = match event {
+        proto::Event::AgentTreeChanged {
+            session_event_seq, ..
+        } => Some(("agent_tree", Some(*session_event_seq))),
+        proto::Event::AssistantText { seq, .. } => Some(("assistant", *seq)),
+        proto::Event::AssistantDisplayComplete { seq, .. } => Some(("assistant_display", *seq)),
+        proto::Event::QueuedUserMessagesFolded { seq, .. } => Some(("user", *seq)),
+        proto::Event::ToolEnd { seq, .. } => Some(("tool_end", *seq)),
+        proto::Event::ToolError { seq, .. } => Some(("tool_error", *seq)),
+        proto::Event::InterruptResolved { seq, .. } => Some(("interrupt", *seq)),
+        proto::Event::UserMessageRecorded { seq, .. } => Some(("user", Some(*seq))),
+        _ => None,
+    }?;
+    let sequence = sequence?;
+    Some(format!("state:{kind}:{sequence}"))
 }
 
 /// Inbound work-queue capacity. Generous — user messages, cancels,

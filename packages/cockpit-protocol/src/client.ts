@@ -4,6 +4,7 @@ import {
   RELAY_ENVELOPE_VERSION,
 } from "@flycockpit/relay-protocol/envelopes";
 import {
+  type ActiveModelRef,
   type ClientRequest,
   createClientSubmissionId,
   createEnvelope,
@@ -74,10 +75,10 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
 export type SendUserMessageParams = {
   client_submission_id: string;
   expected_model_state_generation?: number;
-  expected_model?: { provider: string; model: string; reasoning_effort?: string | null };
+  expected_model?: ActiveModelRef;
   text: string;
   display_text?: string;
-  tag_expansions?: unknown[];
+  tag_expansions?: Record<string, unknown>[];
   forced_skill?: string;
   delivery_class_override?: "steering" | "held";
   run_invocation_options?: {

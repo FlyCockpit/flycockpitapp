@@ -278,20 +278,19 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                 crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
             );
             let attached = client
-                .request_ok(Request::Attach {
-                    session_id: Some(session_id),
-                    since_seq: None,
-                    project_root: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-                    initial_model: None,
-                    no_sandbox: false,
-                    interactive: false,
-                    session_entry_mode: None,
-                    model_override: None,
-                    client_protocol_version: client.negotiated().version,
-                    env_snapshot: Some(env_snapshot.to_wire()),
-                    env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-                })
-                .await?;
+                .request_ok(crate::daemon::proto::attach_existing_code_root_v1_request(
+                    session_id,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    client.negotiated().version,
+                    Some(env_snapshot.to_wire()),
+                    crate::env_snapshot::EnvDriftPolicy::Daemon,
+                ))
+                .await?
+                .into_first_party_attached();
             match attached {
                 Response::Attached {
                     session_id: id,

@@ -11496,6 +11496,7 @@ pub(super) async fn run_worker(
                 SessionWork::ResolveAgentDecision {
                     decision_request_id,
                     answer,
+                    code_root_receipt,
                     respond_to,
                 } => {
                     let outcome = async {
@@ -11523,9 +11524,49 @@ pub(super) async fn run_worker(
                             decision_before.decision_class != "host_approval",
                             "host approval decisions can only be resolved through their real host-owned interrupt"
                         );
-                        let settlement = tree_runtime
-                            .resolve_user_answer(session_id, decision_request_id, answer)
-                            .await?;
+                        let settlement = match code_root_receipt {
+                            Some(receipt) => {
+                                let settlement = tree_runtime
+                                    .resolve_user_answer_with_code_root_receipt(
+                                        session_id,
+                                        decision_request_id,
+                                        answer,
+                                        receipt.clone(),
+                                    )
+                                    .await?;
+                                // A newly answered decision writes this row in
+                                // its settlement transaction above. Steers and
+                                // pre-existing terminal decisions have no new
+                                // decision CAS, but the worker still owns the
+                                // receipt write before it replies to dispatch.
+                                if !matches!(
+                                    &settlement,
+                                    crate::agent_tree::DecisionSettlement::Resolved(_)
+                                ) {
+                                    let outcome = match &settlement {
+                                        crate::agent_tree::DecisionSettlement::Steered { .. } => "accepted",
+                                        crate::agent_tree::DecisionSettlement::AlreadyTerminal(_) => "already_resolved_other",
+                                        crate::agent_tree::DecisionSettlement::Retry => "cancelled",
+                                        crate::agent_tree::DecisionSettlement::Resolved(_) => unreachable!(),
+                                    };
+                                    session
+                                        .db
+                                        .record_code_root_interrupt_receipt(
+                                            session_id,
+                                            &receipt.logical_client_id,
+                                            &receipt.client_request_id,
+                                            receipt.fingerprint,
+                                            outcome,
+                                            receipt.resolved_at_unix_ms,
+                                        )
+                                        .await?;
+                                }
+                                settlement
+                            }
+                            None => tree_runtime
+                                .resolve_user_answer(session_id, decision_request_id, answer)
+                                .await?,
+                        };
                         if matches!(
                             settlement,
                             crate::agent_tree::DecisionSettlement::Resolved(_)

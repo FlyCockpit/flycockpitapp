@@ -419,7 +419,17 @@ pub struct RunInvocationOptions {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", content = "params")]
 pub enum Request {
-    /// Attach to an existing session by id, or create a new one.
+    CreateCodeRootV1(crate::CreateCodeRootV1Request),
+    AttachExistingCodeRootV1(crate::AttachExistingCodeRootV1Request),
+    CloseCodeRootAttachmentV1(crate::CloseCodeRootAttachmentV1Request),
+    DiscoverCodeRootsV1(crate::DiscoverCodeRootsV1Request),
+    ReadCodeRootV1(crate::ReadCodeRootV1Request),
+    ReadCodeRootDeliveriesV1(crate::ReadCodeRootDeliveriesV1Request),
+    AckCodeRootDeliveriesV1(crate::AckCodeRootDeliveriesV1Request),
+    ResolveCodeRootInterruptV1(crate::ResolveCodeRootInterruptV1),
+
+    /// Attach to an existing Assistant/Computer session, or create a new
+    /// non-Code session. Code is structurally absent from this route.
     /// Returns the session's identity + a snapshot of its existing
     /// history so the TUI can re-render the transcript after a
     /// reconnect.
@@ -459,13 +469,9 @@ pub enum Request {
         /// treated as headless — the safe, non-blocking default.
         #[serde(default)]
         interactive: bool,
-        /// Immutable daemon-owned entry setup for a newly-created session.
-        /// It is required for new sessions. Existing-session attaches omit it
-        /// in all first-party clients; if another client supplies it, the
-        /// daemon requires exact equality with the durable value and never
-        /// permits it to overwrite that value.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_entry_mode: Option<crate::SessionEntryMode>,
+        /// Required non-Code mode assertion for both create and resume. The
+        /// daemon verifies an existing row has the same immutable mode.
+        session_entry_mode: crate::NonCodeSessionEntryMode,
         /// Plan-level model pin (prompt
         /// `plan-duplication-and-model-override.md`). The complete selection
         /// is also the new session's authoritative active model, while this
@@ -2767,6 +2773,45 @@ impl Request {
         }
 
         match self {
+            Self::CreateCodeRootV1(request) => {
+                if request.workspace_selector.path.is_empty()
+                    || request.workspace_selector.path.len() > 32_768
+                {
+                    return Err("workspace selector path must contain 1..=32768 bytes".to_string());
+                }
+                if let Some(selection) = &request.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+            }
+            Self::AttachExistingCodeRootV1(request) => {
+                if request.root_id.0.is_nil() {
+                    return Err("Code root id must not be nil".to_string());
+                }
+                if let Some(selection) = &request.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+            }
+            Self::DiscoverCodeRootsV1(request) => {
+                if request.workspace_selector.path.is_empty()
+                    || request.workspace_selector.path.len() > 32_768
+                {
+                    return Err("workspace selector path must contain 1..=32768 bytes".to_string());
+                }
+                if !(1..=crate::acp::CODE_ROOT_DISCOVERY_PAGE_MAX).contains(&request.limit) {
+                    return Err("Code root discovery limit must be 1..=100".to_string());
+                }
+            }
+            Self::ReadCodeRootDeliveriesV1(request) => {
+                if !(1..=crate::acp::CODE_ROOT_DELIVERY_PAGE_MAX).contains(&request.limit) {
+                    return Err("Code root delivery limit must be 1..=256".to_string());
+                }
+            }
             #[cfg(feature = "remote")]
             Self::StoreFlycockpitCredential { credential, .. } => {
                 credential
@@ -4081,6 +4126,14 @@ fn validate_agent_interrupt_response(response: &AgentInterruptResponse) -> Resul
 macro_rules! request_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
+            (Request::CreateCodeRootV1(..), "create_code_root_v1");
+            (Request::AttachExistingCodeRootV1(..), "attach_existing_code_root_v1");
+            (Request::CloseCodeRootAttachmentV1(..), "close_code_root_attachment_v1");
+            (Request::DiscoverCodeRootsV1(..), "discover_code_roots_v1");
+            (Request::ReadCodeRootV1(..), "read_code_root_v1");
+            (Request::ReadCodeRootDeliveriesV1(..), "read_code_root_deliveries_v1");
+            (Request::AckCodeRootDeliveriesV1(..), "ack_code_root_deliveries_v1");
+            (Request::ResolveCodeRootInterruptV1(..), "resolve_code_root_interrupt_v1");
             (Request::Attach { .. }, "attach");
             (Request::SubagentTranscript { .. }, "subagent_transcript");
             (Request::SendUserMessageV2 { .. }, "send_user_message");
@@ -4401,7 +4454,15 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
-            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
+            (Request::CreateCodeRootV1(request), "create_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootV1Request", [request: $crate::CreateCodeRootV1Request => param]);
+            (Request::AttachExistingCodeRootV1(request), "attach_existing_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AttachExistingCodeRootV1Request", [request: $crate::AttachExistingCodeRootV1Request => param]);
+            (Request::CloseCodeRootAttachmentV1(request), "close_code_root_attachment_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CloseCodeRootAttachmentV1Request", [request: $crate::CloseCodeRootAttachmentV1Request => param]);
+            (Request::DiscoverCodeRootsV1(request), "discover_code_roots_v1", owner_only, none, false, read_only, none, serialized, none, "request:DiscoverCodeRootsV1Request", [request: $crate::DiscoverCodeRootsV1Request => param]);
+            (Request::ReadCodeRootV1(request), "read_code_root_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootV1Request", [request: $crate::ReadCodeRootV1Request => param]);
+            (Request::ReadCodeRootDeliveriesV1(request), "read_code_root_deliveries_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootDeliveriesV1Request", [request: $crate::ReadCodeRootDeliveriesV1Request => param]);
+            (Request::AckCodeRootDeliveriesV1(request), "ack_code_root_deliveries_v1", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:AckCodeRootDeliveriesV1Request", [request: $crate::AckCodeRootDeliveriesV1Request => param]);
+            (Request::ResolveCodeRootInterruptV1(request), "resolve_code_root_interrupt_v1", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ResolveCodeRootInterruptV1", [request: $crate::ResolveCodeRootInterruptV1 => param]);
+            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:NonCodeSessionEntryMode|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: $crate::NonCodeSessionEntryMode => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::SendUserMessageV2 { ingress }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "ingress:MessageIngressV2", [ingress: MessageIngressV2 => opaque_fcm2]);
             (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
@@ -5319,32 +5380,26 @@ mod tests {
     fn semantic_validation_covers_every_active_model_request_shape() {
         let invalid = active_model("", "model", None);
         let requests = [
-            Request::Attach {
-                session_id: None,
-                since_seq: None,
-                project_root: None,
-                initial_model: Some(invalid.clone()),
-                no_sandbox: false,
-                interactive: false,
-                session_entry_mode: Some(SessionEntryMode::Code),
-                model_override: None,
-                client_protocol_version: PROTOCOL_VERSION,
-                env_snapshot: None,
-                env_policy: EnvDriftPolicy::Daemon,
-            },
-            Request::Attach {
-                session_id: None,
-                since_seq: None,
-                project_root: None,
-                initial_model: None,
-                no_sandbox: false,
-                interactive: false,
-                session_entry_mode: Some(SessionEntryMode::Code),
-                model_override: Some(invalid.clone()),
-                client_protocol_version: PROTOCOL_VERSION,
-                env_snapshot: None,
-                env_policy: EnvDriftPolicy::Daemon,
-            },
+            crate::create_code_root_v1_request(
+                "/repo".into(),
+                Some(invalid.clone()),
+                false,
+                false,
+                None,
+                PROTOCOL_VERSION,
+                None,
+                EnvDriftPolicy::Daemon,
+            ),
+            crate::create_code_root_v1_request(
+                "/repo".into(),
+                None,
+                false,
+                false,
+                Some(invalid.clone()),
+                PROTOCOL_VERSION,
+                None,
+                EnvDriftPolicy::Daemon,
+            ),
             Request::CreateAssistantSession {
                 name: "assistant".to_string(),
                 project_root: "/repo".to_string(),

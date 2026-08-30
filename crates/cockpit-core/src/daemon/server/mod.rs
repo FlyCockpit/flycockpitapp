@@ -215,6 +215,34 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
+        proto::Response::CodeRootCreated(result) => scrub_code_root_read(&mut result.root, redact),
+        proto::Response::CodeRootAttached(result) => scrub_code_root_read(&mut result.root, redact),
+        proto::Response::CodeRootRead(result) => scrub_code_root_read(&mut result.root, redact),
+        proto::Response::CodeRootsDiscovered(result) => {
+            for root in &mut result.roots {
+                scrub_string(&mut root.workspace_path, redact);
+                scrub_option_string(&mut root.title, redact);
+            }
+        }
+        proto::Response::CodeRootDeliveries(result) => {
+            for delivery in &mut result.deliveries {
+                match &mut delivery.payload {
+                    proto::CodeRootDeliveryPayloadV1::History { entry } => {
+                        scrub_history_entries(std::slice::from_mut(entry), redact)
+                    }
+                    proto::CodeRootDeliveryPayloadV1::Attention { entry } => {
+                        scrub_string(&mut entry.options_contract_json, redact);
+                        scrub_option_string(&mut entry.free_text_contract_json, redact);
+                        scrub_option_string(&mut entry.recommendation_json, redact);
+                    }
+                    proto::CodeRootDeliveryPayloadV1::RootStateChanged
+                    | proto::CodeRootDeliveryPayloadV1::ClientIncompatible => {}
+                }
+            }
+        }
+        proto::Response::CodeRootAttachmentClosed(_)
+        | proto::Response::CodeRootDeliveriesAcked(_)
+        | proto::Response::CodeRootInterruptResolved(_) => {}
         // Metadata-only owner-remoted CLI-surface responses: package registry
         // metadata, connector/org-sync state, counts, deletion flags, and
         // structured media-accounting facts carry no free text where a vaulted
@@ -933,6 +961,24 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::ImageSidecarAuthoritySnapshot(..)
         | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::Unknown => {}
+    }
+}
+
+pub(super) fn scrub_code_root_read(root: &mut proto::CodeRootReadV1, redact: &RedactionTable) {
+    scrub_string(&mut root.workspace_path, redact);
+    scrub_option_string(&mut root.title, redact);
+    if let Some(active) = &mut root.active_subagent {
+        scrub_active_subagent(active, redact);
+    }
+    scrub_history_entries(&mut root.history, redact);
+    scrub_paused_work(&mut root.paused_work, redact);
+    if let Some(repair) = &mut root.repair_required {
+        scrub_resume_repair_state(repair, redact);
+    }
+    for attention in &mut root.attention {
+        scrub_string(&mut attention.options_contract_json, redact);
+        scrub_option_string(&mut attention.free_text_contract_json, redact);
+        scrub_option_string(&mut attention.recommendation_json, redact);
     }
 }
 
@@ -2417,6 +2463,9 @@ pub struct DaemonContext {
     pub media_ledger: crate::media_reservation::MediaReservationLedger,
     pub media_admission_open: Arc<std::sync::atomic::AtomicBool>,
     pub registry: SessionRegistry,
+    /// Boot-local Code-root capabilities, frozen discovery snapshots, and
+    /// bounded idempotency receipts. Durable replay/ACK state lives in Db.
+    pub(crate) code_root_authority: Arc<StdMutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
     pub paths: DaemonPaths,
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.
@@ -3095,6 +3144,9 @@ impl DaemonContext {
             media_ledger,
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
+            code_root_authority: Arc::new(StdMutex::new(
+                crate::daemon::code_roots::CodeRootAuthorityV1::default(),
+            )),
             paths,
             canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
@@ -5343,6 +5395,7 @@ struct ReadyAttachment {
 
 struct AttachedSession {
     handle: SessionWorkerHandle,
+    code_root_capability: Option<proto::CodeRootAttachmentCapabilityV1>,
     /// Captured at attach before this connection can issue setup reads. The
     /// setup projection verifies this stable directory identity rather than
     /// authorizing a later object that happens to reuse the same pathname.
@@ -5516,7 +5569,12 @@ async fn run_in_process_client(
                         &mut effects,
                     )
                     .await;
-                    let attached = matches!(&result, Ok(Response::Attached { .. }));
+                    let attached = matches!(
+                        &result,
+                        Ok(Response::Attached { .. })
+                            | Ok(Response::CodeRootCreated(..))
+                            | Ok(Response::CodeRootAttached(..))
+                    );
                     if attached || state.attached.is_none() {
                         shared = state.shared_snapshot();
                     }
@@ -6304,7 +6362,12 @@ async fn handle_envelope(
                 });
                 return Ok(());
             }
-            let is_attach = matches!(&request, Request::Attach { .. });
+            let is_attach = matches!(
+                &request,
+                Request::Attach { .. }
+                    | Request::CreateCodeRootV1(..)
+                    | Request::AttachExistingCodeRootV1(..)
+            );
             let mut effects = ClientRequestEffects::default();
             #[cfg(feature = "remote")]
             let result = Box::pin(
@@ -6329,7 +6392,12 @@ async fn handle_envelope(
                 &mut effects,
             ))
             .await;
-            let attached = matches!(&result, Ok(Response::Attached { .. }));
+            let attached = matches!(
+                &result,
+                Ok(Response::Attached { .. })
+                    | Ok(Response::CodeRootCreated(..))
+                    | Ok(Response::CodeRootAttached(..))
+            );
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
             }

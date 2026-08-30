@@ -46,7 +46,7 @@
       "project_root": "project_root-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111",
       "since_seq": 7,
-      "session_entry_mode": "code"
+      "session_entry_mode": "assistant"
     },
     "request": "attach",
     "v": 21
@@ -675,5 +675,107 @@
     },
     "request": "review_guidance_proposal",
     "v": 21
+  },
+  "create_code_root_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "create_code_root_v1",
+    "params": {
+      "workspace_selector": {
+        "path": "/tmp/project"
+      },
+      "logical_client_id": "editor-1",
+      "client_request_id": "create-1",
+      "options": {
+        "no_sandbox": false,
+        "interactive": true,
+        "client_protocol_version": 21,
+        "env_policy": "daemon"
+      }
+    }
+  },
+  "attach_existing_code_root_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "attach_existing_code_root_v1",
+    "params": {
+      "root_id": "11111111-1111-4111-8111-111111111111",
+      "capture_generation": 4803839602540817,
+      "logical_client_id": "editor-1",
+      "client_request_id": "attach-1",
+      "options": {
+        "no_sandbox": false,
+        "interactive": true,
+        "client_protocol_version": 21,
+        "env_policy": "daemon"
+      }
+    }
+  },
+  "close_code_root_attachment_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "close_code_root_attachment_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_request_id": "close-1"
+    }
+  },
+  "discover_code_roots_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "discover_code_roots_v1",
+    "params": {
+      "workspace_selector": {
+        "path": "/tmp/project"
+      },
+      "logical_client_id": "editor-1",
+      "limit": 25
+    }
+  },
+  "read_code_root_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "read_code_root_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "read_code_root_deliveries_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "read_code_root_deliveries_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "limit": 25
+    }
+  },
+  "ack_code_root_deliveries_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "ack_code_root_deliveries_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "through": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "client_request_id": "ack-1"
+    }
+  },
+  "resolve_code_root_interrupt_v1": {
+    "v": 21,
+    "kind": "req",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "request": "resolve_code_root_interrupt_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_request_id": "11111111-1111-4111-8111-111111111111",
+      "selected_choice": "allow_once",
+      "attention_id": "22222222-2222-4222-8222-222222222222"
+    }
   }
 }

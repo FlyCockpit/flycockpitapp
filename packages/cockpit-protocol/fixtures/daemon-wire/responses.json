@@ -747,8 +747,18 @@
         "override_revision": 0,
         "root_foreground": true,
         "model": {
-          "effective": { "provider_id": "vendor", "model_id": "model-a", "is_default": true },
-          "allowed": [{ "provider_id": "vendor", "model_id": "model-a", "is_default": true }]
+          "effective": {
+            "provider_id": "vendor",
+            "model_id": "model-a",
+            "is_default": true
+          },
+          "allowed": [
+            {
+              "provider_id": "vendor",
+              "model_id": "model-a",
+              "is_default": true
+            }
+          ]
         },
         "tools": [
           {
@@ -898,10 +908,393 @@
     "v": 21
   },
   "guidance_proposal_reviewed": {
-    "data": { "installed_rules": [[1, 1, 1]] },
+    "data": {
+      "installed_rules": [[1, 1, 1]]
+    },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposal_reviewed",
     "v": 21
+  },
+  "code_root_created": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_created",
+    "data": {
+      "attachment": {
+        "root_id": "11111111-1111-4111-8111-111111111111",
+        "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "capture_generation": 4803839602540817,
+        "replay_cursor": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "root": {
+        "active_agent": "active_agent-fixture",
+        "active_agent_path": ["active_agent_path-fixture"],
+        "active_model_state": {
+          "default_selection": {
+            "model": "model-fixture",
+            "provider": "provider-fixture"
+          },
+          "diverged": false,
+          "generation": 0,
+          "selection": {
+            "model": "model-fixture",
+            "provider": "provider-fixture"
+          }
+        },
+        "active_subagent": {
+          "child": "builder",
+          "label": "Implement",
+          "parent": "Build",
+          "task_call_id": "task-1"
+        },
+        "compatible": true,
+        "daemon_version": "daemon_version-fixture",
+        "env_baseline": {
+          "digest": "digest-fixture",
+          "key_count": 2,
+          "path_entry_count": 1,
+          "source": "explicit_cli"
+        },
+        "env_drift": {
+          "added_keys": 1,
+          "baseline_digest": "base",
+          "candidate_digest": "cand",
+          "changed_keys": 3,
+          "changed_secret_keys": ["TOKEN"],
+          "path_added": ["/opt/bin"],
+          "path_removed": ["/bin"],
+          "removed_keys": 2
+        },
+        "env_policy_applied": "update-daemon",
+        "env_session": {
+          "digest": "digest-fixture",
+          "key_count": 2,
+          "path_entry_count": 1,
+          "source": "explicit_cli"
+        },
+        "foreground_target": {
+          "agent": "Build",
+          "depth": 1,
+          "id": "root",
+          "task_call_id": "task-parent"
+        },
+        "history": [
+          {
+            "display_text": "hello @history",
+            "origin_principal": "flycockpit:user",
+            "role": "user",
+            "seq": 7,
+            "tag_expansions": [
+              {
+                "detail": "142 lines",
+                "ok": true,
+                "path": "src/lib.rs",
+                "tool": "read"
+              }
+            ],
+            "text": "hello history",
+            "ts_ms": 1700000000000
+          }
+        ],
+        "paused_work": [
+          {
+            "active_agent": "Build",
+            "client_version": "0.1.0",
+            "daemon_version": "0.1.0",
+            "pending_tool_count": 1,
+            "project_root": "/tmp/project",
+            "reason": "daemon_shutdown",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "updated_at": 1700000000
+          }
+        ],
+        "project_id": "project_id-fixture",
+        "repair_required": {
+          "detail": "detail",
+          "failing_tool_call_ids": ["call-1"],
+          "failure_kind": "missing_tool_result",
+          "model": "model",
+          "provider": "fixture",
+          "safe_last_turn_seq": 4,
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "short_id": "abc123",
+          "suggested_actions": ["repair_synthetic_tool_results"],
+          "wire_api": "responses"
+        },
+        "short_id": "short_id-fixture",
+        "root_id": "11111111-1111-4111-8111-111111111111",
+        "workspace_path": "project_root-fixture",
+        "title": null,
+        "attention": []
+      }
+    }
+  },
+  "code_root_attached": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_attached",
+    "data": {
+      "attachment": {
+        "root_id": "11111111-1111-4111-8111-111111111111",
+        "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "capture_generation": 4803839602540817,
+        "replay_cursor": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "root": {
+        "active_agent": "active_agent-fixture",
+        "active_agent_path": ["active_agent_path-fixture"],
+        "active_model_state": {
+          "default_selection": {
+            "model": "model-fixture",
+            "provider": "provider-fixture"
+          },
+          "diverged": false,
+          "generation": 0,
+          "selection": {
+            "model": "model-fixture",
+            "provider": "provider-fixture"
+          }
+        },
+        "active_subagent": {
+          "child": "builder",
+          "label": "Implement",
+          "parent": "Build",
+          "task_call_id": "task-1"
+        },
+        "compatible": true,
+        "daemon_version": "daemon_version-fixture",
+        "env_baseline": {
+          "digest": "digest-fixture",
+          "key_count": 2,
+          "path_entry_count": 1,
+          "source": "explicit_cli"
+        },
+        "env_drift": {
+          "added_keys": 1,
+          "baseline_digest": "base",
+          "candidate_digest": "cand",
+          "changed_keys": 3,
+          "changed_secret_keys": ["TOKEN"],
+          "path_added": ["/opt/bin"],
+          "path_removed": ["/bin"],
+          "removed_keys": 2
+        },
+        "env_policy_applied": "update-daemon",
+        "env_session": {
+          "digest": "digest-fixture",
+          "key_count": 2,
+          "path_entry_count": 1,
+          "source": "explicit_cli"
+        },
+        "foreground_target": {
+          "agent": "Build",
+          "depth": 1,
+          "id": "root",
+          "task_call_id": "task-parent"
+        },
+        "history": [
+          {
+            "display_text": "hello @history",
+            "origin_principal": "flycockpit:user",
+            "role": "user",
+            "seq": 7,
+            "tag_expansions": [
+              {
+                "detail": "142 lines",
+                "ok": true,
+                "path": "src/lib.rs",
+                "tool": "read"
+              }
+            ],
+            "text": "hello history",
+            "ts_ms": 1700000000000
+          }
+        ],
+        "paused_work": [
+          {
+            "active_agent": "Build",
+            "client_version": "0.1.0",
+            "daemon_version": "0.1.0",
+            "pending_tool_count": 1,
+            "project_root": "/tmp/project",
+            "reason": "daemon_shutdown",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "updated_at": 1700000000
+          }
+        ],
+        "project_id": "project_id-fixture",
+        "repair_required": {
+          "detail": "detail",
+          "failing_tool_call_ids": ["call-1"],
+          "failure_kind": "missing_tool_result",
+          "model": "model",
+          "provider": "fixture",
+          "safe_last_turn_seq": 4,
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "short_id": "abc123",
+          "suggested_actions": ["repair_synthetic_tool_results"],
+          "wire_api": "responses"
+        },
+        "short_id": "short_id-fixture",
+        "root_id": "11111111-1111-4111-8111-111111111111",
+        "workspace_path": "project_root-fixture",
+        "title": null,
+        "attention": []
+      }
+    }
+  },
+  "code_root_attachment_closed": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_attachment_closed",
+    "data": "closed"
+  },
+  "code_roots_discovered": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_roots_discovered",
+    "data": {
+      "roots": []
+    }
+  },
+  "code_root_read": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_read",
+    "data": {
+      "root": {
+        "active_agent": "active_agent-fixture",
+        "active_agent_path": ["active_agent_path-fixture"],
+        "active_model_state": {
+          "default_selection": {
+            "model": "model-fixture",
+            "provider": "provider-fixture"
+          },
+          "diverged": false,
+          "generation": 0,
+          "selection": {
+            "model": "model-fixture",
+            "provider": "provider-fixture"
+          }
+        },
+        "active_subagent": {
+          "child": "builder",
+          "label": "Implement",
+          "parent": "Build",
+          "task_call_id": "task-1"
+        },
+        "compatible": true,
+        "daemon_version": "daemon_version-fixture",
+        "env_baseline": {
+          "digest": "digest-fixture",
+          "key_count": 2,
+          "path_entry_count": 1,
+          "source": "explicit_cli"
+        },
+        "env_drift": {
+          "added_keys": 1,
+          "baseline_digest": "base",
+          "candidate_digest": "cand",
+          "changed_keys": 3,
+          "changed_secret_keys": ["TOKEN"],
+          "path_added": ["/opt/bin"],
+          "path_removed": ["/bin"],
+          "removed_keys": 2
+        },
+        "env_policy_applied": "update-daemon",
+        "env_session": {
+          "digest": "digest-fixture",
+          "key_count": 2,
+          "path_entry_count": 1,
+          "source": "explicit_cli"
+        },
+        "foreground_target": {
+          "agent": "Build",
+          "depth": 1,
+          "id": "root",
+          "task_call_id": "task-parent"
+        },
+        "history": [
+          {
+            "display_text": "hello @history",
+            "origin_principal": "flycockpit:user",
+            "role": "user",
+            "seq": 7,
+            "tag_expansions": [
+              {
+                "detail": "142 lines",
+                "ok": true,
+                "path": "src/lib.rs",
+                "tool": "read"
+              }
+            ],
+            "text": "hello history",
+            "ts_ms": 1700000000000
+          }
+        ],
+        "paused_work": [
+          {
+            "active_agent": "Build",
+            "client_version": "0.1.0",
+            "daemon_version": "0.1.0",
+            "pending_tool_count": 1,
+            "project_root": "/tmp/project",
+            "reason": "daemon_shutdown",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "updated_at": 1700000000
+          }
+        ],
+        "project_id": "project_id-fixture",
+        "repair_required": {
+          "detail": "detail",
+          "failing_tool_call_ids": ["call-1"],
+          "failure_kind": "missing_tool_result",
+          "model": "model",
+          "provider": "fixture",
+          "safe_last_turn_seq": 4,
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "short_id": "abc123",
+          "suggested_actions": ["repair_synthetic_tool_results"],
+          "wire_api": "responses"
+        },
+        "short_id": "short_id-fixture",
+        "root_id": "11111111-1111-4111-8111-111111111111",
+        "workspace_path": "project_root-fixture",
+        "title": null,
+        "attention": []
+      }
+    }
+  },
+  "code_root_deliveries": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_deliveries",
+    "data": {
+      "deliveries": [],
+      "high_water_cursor": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "code_root_deliveries_acked": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_deliveries_acked",
+    "data": {
+      "acked_through": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "code_root_interrupt_resolved": {
+    "v": 21,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "code_root_interrupt_resolved",
+    "data": "accepted"
   }
 }

@@ -90,6 +90,32 @@ pub enum OwnedSessionMode {
     AttachOrEphemeral,
 }
 
+/// Acquire the shareable ledger owner for an ACP process. ACP is multi-window,
+/// so this path always resolves a discoverable socket owner and never selects
+/// the one-shot in-process optimization. The background-agents setting chooses
+/// only the lifetime when this call must start a new owner; an existing owner
+/// is always reused.
+pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<DaemonClient> {
+    let mode = if background_agents {
+        LifecycleMode::AttachOrPersistent
+    } else {
+        LifecycleMode::AttachOrEphemeral
+    };
+    let connected = probe_or_spawn(mode).await?;
+    #[cfg(unix)]
+    {
+        if !matches!(&connected.endpoint, cockpit_client::ClientEndpoint::Wire(_)) {
+            anyhow::bail!("ACP requires a discoverable socket ledger owner");
+        }
+        return Ok(connected.client);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = connected;
+        anyhow::bail!("ACP socket ledger ownership is unavailable on this platform")
+    }
+}
+
 impl OwnedSessionMode {
     fn lifecycle(self) -> LifecycleMode {
         match self {

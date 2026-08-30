@@ -749,7 +749,9 @@ function SessionSection({
               {session.attention ? <ShieldAlert className="size-4 shrink-0 text-primary" /> : null}
             </div>
             {session.description ? (
-              <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{session.description}</p>
+              <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                {session.description}
+              </p>
             ) : null}
             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span>{session.shortId ?? session.sessionId.slice(0, 8)}</span>

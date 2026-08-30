@@ -147,11 +147,9 @@ impl App {
         let intent = self.lifecycle_intent();
         let lifecycle = self.lifecycle.clone();
         let worker_cwd = cwd.clone();
-        // New-session attach requires a mode; resume must not send one.
-        // App already has the launch mode for new attaches (`session_mode`).
-        let requested_session_entry_mode = requested_session_id
-            .is_none()
-            .then(|| self.session_mode.unwrap_or(SessionMode::Code));
+        // Route selection is structural: Code uses the closed Code-root API,
+        // while generic attach can represent only Assistant/Computer.
+        let requested_session_entry_mode = Some(self.session_mode.unwrap_or(SessionMode::Code));
         let action_id = self
             .async_actions
             .start(

@@ -635,6 +635,15 @@ pub(super) async fn drain_client_attachment_ownership(
     ctx: &DaemonContext,
     _reason: &str,
 ) -> std::result::Result<(), ErrorPayload> {
+    if let Some(capability) = state
+        .attached
+        .as_mut()
+        .and_then(|attached| attached.code_root_capability.take())
+    {
+        crate::sync::lock_or_recover(&ctx.code_root_authority)
+            .close(&capability)
+            .map_err(super::dispatch::code_root_contract_error)?;
+    }
     let pending: Vec<_> = state
         .pending_uploads
         .iter()

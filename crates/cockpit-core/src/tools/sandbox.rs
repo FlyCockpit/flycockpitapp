@@ -159,12 +159,20 @@ pub async fn check_native_access(
         // every native filesystem consumer of this choke point is fenced.
         crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
             .map_err(|error| invalid_input(error.to_string()))?;
+        if required == SandboxPathAccess::ReadWrite {
+            crate::knowledge::ensure_no_generic_local_knowledge_write(ctx, &effective)
+                .map_err(|error| invalid_input(error.to_string()))?;
+        }
         return Ok(effective);
     }
 
     let effective = match effective_native_path(path) {
         Ok(path) => path,
         Err(err) => {
+            if required == SandboxPathAccess::ReadWrite {
+                crate::knowledge::ensure_no_generic_local_knowledge_write(ctx, path)
+                    .map_err(|error| invalid_input(error.to_string()))?;
+            }
             let Some(approver) = ctx.approver.as_ref() else {
                 return Err(invalid_input(format!(
                     "`{}` cannot be proven inside the session boundary: {err}",
@@ -190,6 +198,10 @@ pub async fn check_native_access(
     // future native tool that obtains host-path authority through this helper.
     crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
         .map_err(|error| invalid_input(error.to_string()))?;
+    if required == SandboxPathAccess::ReadWrite {
+        crate::knowledge::ensure_no_generic_local_knowledge_write(ctx, &effective)
+            .map_err(|error| invalid_input(error.to_string()))?;
+    }
 
     if within_boundary(ctx, &effective) {
         return Ok(effective);
@@ -224,6 +236,51 @@ pub async fn check_native_access(
             effective.display()
         )))
     }
+}
+
+/// Admit the one explicit human KB write path. Generic native writes must not
+/// use this: they continue through [`check_native_access`] and #177's KB
+/// read-only fence. The knowledge module has already confirmed that `path` is
+/// a trusted, foreground-primary concept target under `knowledge_root`.
+pub(crate) async fn check_native_human_knowledge_write_access(
+    ctx: &ToolCtx,
+    path: &Path,
+    knowledge_root: &Path,
+) -> Result<PathBuf> {
+    let effective = effective_native_path(path).unwrap_or_else(|_| path.to_path_buf());
+    if !cockpit_host::path_containment::contained_under(knowledge_root, &effective) {
+        return Err(invalid_input(format!(
+            "`{}` is outside the admitted local knowledge-base root `{}`",
+            effective.display(),
+            knowledge_root.display()
+        )));
+    }
+    if let Some(cage) = &ctx.review_cage
+        && cage.auto_deny_approvals()
+        && !cage.preauthorizes_package_path(&effective)
+    {
+        return Err(invalid_input(format!(
+            "`{}` is outside the session boundary and background review cannot approve it",
+            effective.display()
+        )));
+    }
+    if let Some(lease) = ctx.workspace_lease.as_deref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            return Err(invalid_input(format!(
+                "`{}` is denied because workspace lease `{}` is expired or revoked",
+                effective.display(),
+                lease.id
+            )));
+        }
+        if !lease.allows_write() || !lease.covers_path(&effective) {
+            return Err(invalid_input(format!(
+                "`{}` is denied by workspace lease `{}` write authority",
+                effective.display(),
+                lease.id
+            )));
+        }
+    }
+    Ok(effective)
 }
 
 /// The exact path-access candidate used by `approve_path` and the concrete

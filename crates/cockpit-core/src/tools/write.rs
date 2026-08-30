@@ -101,15 +101,29 @@ impl Tool for WriteTool {
             .ok_or_else(|| crate::engine::tool::invalid_input("`content` is required"))?;
         let requested_path = resolve(path_arg, &ctx.cwd);
         enforce_requested_write_scope(ctx, &requested_path, self.name())?;
+        let human_knowledge_target =
+            crate::knowledge::human_knowledge_concept_target(ctx, &requested_path)?;
 
         // Native-tool boundary check (sandboxing part 2): an out-of-cwd
         // write target escalates (naming the path) before we touch disk.
-        let path = crate::tools::sandbox::check_native_access(
-            ctx,
-            &requested_path,
-            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-        )
-        .await?;
+        let path = match human_knowledge_target.as_ref() {
+            Some(target) => {
+                crate::tools::sandbox::check_native_human_knowledge_write_access(
+                    ctx,
+                    &requested_path,
+                    target.root(),
+                )
+                .await?
+            }
+            None => {
+                crate::tools::sandbox::check_native_access(
+                    ctx,
+                    &requested_path,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await?
+            }
+        };
         enforce_write_scope(ctx, &path, self.name())?;
         let (identity_note, identity_write_preauthorized) =
             match crate::assistants::identity::check_identity_write(ctx, &path).await? {
@@ -139,7 +153,12 @@ impl Tool for WriteTool {
             None
         };
         let want_crlf = existing_before.as_deref().is_some_and(detect_crlf);
-        let normalized = normalize_line_endings(content, want_crlf);
+        let normalized = if let Some(target) = human_knowledge_target.as_ref() {
+            crate::knowledge::normalize_human_knowledge_concept(target, content)?
+        } else {
+            content.to_string()
+        };
+        let normalized = normalize_line_endings(&normalized, want_crlf);
         if !identity_write_preauthorized
             && (existing_before
                 .as_deref()
@@ -216,13 +235,30 @@ impl Tool for WriteTool {
             &concrete_effects,
         )
         .await?;
-        let (outcome, created_directories) = if exists {
+        let (outcome, created_directories, human_knowledge_outcome) = if let Some(target) =
+            human_knowledge_target
+        {
+            let knowledge_outcome = crate::knowledge::apply_human_knowledge_concept_edit(
+                target,
+                normalized.clone(),
+                ctx.cancel.clone(),
+            )
+            .await?;
+            (
+                crate::tools::common::release_after_external_write(ctx, &path, write_guard).await,
+                None,
+                Some(knowledge_outcome),
+            )
+        } else if exists {
             (
                 write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?,
                 None,
+                None,
             )
         } else {
-            create_new_and_release(&path, normalized.as_bytes(), write_guard).await?
+            let (outcome, created_directories) =
+                create_new_and_release(&path, normalized.as_bytes(), write_guard).await?;
+            (outcome, created_directories, None)
         };
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
@@ -239,7 +275,19 @@ impl Tool for WriteTool {
             message.push('\n');
             message.push_str(&created);
         }
-        if let Some(lsp) = &ctx.lsp {
+        if let Some(outcome) = human_knowledge_outcome {
+            message.push('\n');
+            message.push_str(&crate::knowledge::human_knowledge_edit_outcome_note(
+                &outcome,
+            ));
+        }
+        // Diagnostics can spawn or reuse an opaque LSP host. A completed
+        // native knowledge write does not grant that host KB write access.
+        if let Some(lsp) = &ctx.lsp
+            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
+                .await
+                .is_empty()
+        {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
         if let Some(note) =

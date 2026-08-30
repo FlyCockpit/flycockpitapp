@@ -919,10 +919,31 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeDreamCommit {
     pub knowledge_base_id: String,
+    /// The only two durable KB authoring origins at launch. Native human
+    /// edits deliberately share the dream transaction/fence, but must never
+    /// be represented as dream output in Git history.
+    pub origin: KnowledgeCommitOrigin,
     pub model: String,
     pub sessions_dreamed: usize,
     pub concepts_written: usize,
     pub data_files_written: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeCommitOrigin {
+    Dream,
+    Human,
+}
+
+/// A resolved local KB concept target admitted for the explicit human-edit
+/// path. This is intentionally not a general filesystem capability: callers
+/// may use it only with [`apply_human_knowledge_concept_edit`].
+#[derive(Debug, Clone)]
+pub(crate) struct HumanKnowledgeConceptTarget {
+    knowledge_base_id: String,
+    root: PathBuf,
+    relative_path: PathBuf,
+    merge_policy: KnowledgeBaseMergePolicy,
 }
 
 /// Git is an optional durability enhancement for a local KB.  A deferred
@@ -1588,14 +1609,21 @@ fn initialize_knowledge_git_history(root: &Path, knowledge_base_id: &str) -> Res
 }
 
 fn structured_dream_commit_message(dream: &KnowledgeDreamCommit) -> String {
-    format!(
-        "dream(kb={}): sessions={} model={} concepts={} data_files={}",
-        git_message_field(&dream.knowledge_base_id),
-        dream.sessions_dreamed,
-        git_message_field(&dream.model),
-        dream.concepts_written,
-        dream.data_files_written,
-    )
+    match dream.origin {
+        KnowledgeCommitOrigin::Dream => format!(
+            "dream(kb={}): sessions={} model={} concepts={} data_files={}",
+            git_message_field(&dream.knowledge_base_id),
+            dream.sessions_dreamed,
+            git_message_field(&dream.model),
+            dream.concepts_written,
+            dream.data_files_written,
+        ),
+        KnowledgeCommitOrigin::Human => format!(
+            "human(kb={}): concepts={}",
+            git_message_field(&dream.knowledge_base_id),
+            dream.concepts_written,
+        ),
+    }
 }
 
 fn git_message_field(value: &str) -> String {
@@ -4457,6 +4485,62 @@ pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> 
     Ok(())
 }
 
+/// Ordinary native filesystem surfaces never write a configured KB. The
+/// explicit human concept route enters through its own narrow sandbox gate;
+/// dreams enter through their provider transaction. Keeping this synchronous
+/// guard here also makes a missing target's lexical path fail closed before a
+/// generic approval can turn it into KB authoring authority.
+pub(crate) fn ensure_no_generic_local_knowledge_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
+    for entry in &ctx.config.extended().knowledge_bases {
+        let KnowledgeBaseSource::Local {
+            path: configured_path,
+        } = &entry.source
+        else {
+            continue;
+        };
+        let root = if configured_path.is_absolute() {
+            configured_path.clone()
+        } else {
+            ctx.cwd.join(configured_path)
+        };
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
+        if cockpit_host::path_containment::contained_under(&root, path) {
+            bail!(
+                "access denied: `{}` is in local knowledge base `{}`; generic native writes are denied",
+                path.display(),
+                entry.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Return every configured local KB root. Opaque host integrations use this
+/// separate fence: a native human concept edit does not make the KB writable
+/// to a reused LSP or another ambient process.
+pub(crate) async fn configured_local_knowledge_roots(
+    _session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for entry in &extended.knowledge_bases {
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let root = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 /// Reject a local media path that resolves inside a protected KB before the
 /// media authority opens its held descriptor. Media path sources are always
 /// relative to the session project root; unlike ordinary native tools, they do
@@ -4667,6 +4751,211 @@ where
     })
     .await
     .context("knowledge dream write task terminated before completing")?
+}
+
+/// Resolve an explicit human/manual native write target. The root primary is
+/// the only non-dream authoring surface: delegated agents cannot turn an
+/// ordinary write/edit capability into autonomous KB authorship.
+pub(crate) fn human_knowledge_concept_target(
+    ctx: &ToolCtx,
+    requested_path: &Path,
+) -> Result<Option<HumanKnowledgeConceptTarget>> {
+    let candidate = crate::tools::sandbox::effective_native_path(requested_path)
+        .unwrap_or_else(|_| requested_path.to_path_buf());
+    for entry in &ctx.config.extended().knowledge_bases {
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let configured_root = if path.is_absolute() {
+            path.clone()
+        } else {
+            ctx.cwd.join(path)
+        };
+        let root =
+            crate::tools::sandbox::effective_native_path(&configured_root).with_context(|| {
+                format!(
+                    "resolving local knowledge base `{}` for a human edit",
+                    entry.id
+                )
+            })?;
+        if !cockpit_host::path_containment::contained_under(&root, &candidate) {
+            continue;
+        }
+        if !ctx.root_agent_frame || ctx.agent_id == "Dream" {
+            bail!(
+                "access denied: only the foreground assistant primary may apply an explicit human knowledge-base edit"
+            );
+        }
+        if entry.trust_required && !ctx.executing_model_trusted {
+            bail!(
+                "access denied: local knowledge base `{}` requires a trusted model for human edits",
+                entry.id
+            );
+        }
+        let relative_path = candidate.strip_prefix(&root).with_context(|| {
+            format!(
+                "deriving human knowledge concept path under {}",
+                root.display()
+            )
+        })?;
+        if relative_path.as_os_str().is_empty()
+            || relative_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("md")
+            || matches!(
+                relative_path.to_string_lossy().as_ref(),
+                "index.md" | "log.md"
+            )
+        {
+            bail!(
+                "access denied: native knowledge-base edits may target only Markdown concept documents, not `{}`",
+                candidate.display()
+            );
+        }
+        return Ok(Some(HumanKnowledgeConceptTarget {
+            knowledge_base_id: entry.id.clone(),
+            root,
+            relative_path: relative_path.to_path_buf(),
+            merge_policy: entry.merge_policy,
+        }));
+    }
+    Ok(None)
+}
+
+impl HumanKnowledgeConceptTarget {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Validate and normalize one explicit human concept document. The native
+/// tools own the authoring request; this layer owns the durable OKF marker so
+/// a partial edit cannot accidentally remain dream-authored.
+pub(crate) fn normalize_human_knowledge_concept(
+    target: &HumanKnowledgeConceptTarget,
+    content: &str,
+) -> Result<String> {
+    // OKF parsing is newline-normalized; the native writer reapplies the
+    // target file's line-ending convention after provenance is stamped.
+    let content = content.replace("\r\n", "\n");
+    let mut concept = parse_concept(&target.root, target.relative_path.clone(), &content)?
+        .with_context(|| {
+            format!(
+                "human knowledge edit `{}` must be an OKF concept with frontmatter and a `type`",
+                target.relative_path.display()
+            )
+        })?;
+    concept
+        .frontmatter
+        .insert("provenance".to_string(), "human".to_string());
+    Ok(serialize_concept(&concept))
+}
+
+/// Commit one explicit human concept write through the same process lock,
+/// validation, rollback, and Git fence used by dreams. It intentionally does
+/// not route through a provider snapshot: a native edit is a foreground
+/// primary operation against the configured local source itself.
+pub(crate) async fn apply_human_knowledge_concept_edit(
+    target: HumanKnowledgeConceptTarget,
+    content: String,
+    cancel: CancellationToken,
+) -> Result<KnowledgeDreamGitOutcome> {
+    if cancel.is_cancelled() {
+        bail!("human knowledge edit cancelled before entering the knowledge-base fence");
+    }
+    tokio::task::spawn_blocking(move || {
+        let commit = KnowledgeDreamCommit {
+            knowledge_base_id: target.knowledge_base_id.clone(),
+            origin: KnowledgeCommitOrigin::Human,
+            model: "human".to_string(),
+            sessions_dreamed: 0,
+            concepts_written: 1,
+            data_files_written: 0,
+        };
+        apply_knowledge_dream_cancellable(
+            &target.root,
+            target.merge_policy,
+            &commit,
+            &cancel,
+            |root| {
+                let path = root.join(&target.relative_path);
+                let previous = match fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("capturing human knowledge concept {}", path.display())
+                        });
+                    }
+                };
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("creating human knowledge concept parent {}", parent.display())
+                    })?;
+                }
+                let applied = (|| {
+                    fs::write(&path, &content).with_context(|| {
+                        format!("writing human knowledge concept {}", path.display())
+                    })?;
+                    let bundle = parse_bundle(root)?;
+                    if !bundle.concepts.iter().any(|concept| {
+                        concept.path == target.relative_path
+                            && concept.provenance() == Some("human")
+                    }) {
+                        bail!(
+                            "human knowledge edit {} did not produce a human-provenance concept",
+                            target.relative_path.display()
+                        );
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = applied {
+                    match previous {
+                        Some(bytes) => fs::write(&path, bytes).with_context(|| {
+                            format!("restoring human knowledge concept {}", path.display())
+                        })?,
+                        None => match fs::remove_file(&path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(restore_error) => {
+                                return Err(error.context(format!(
+                                    "human knowledge edit failed and restoring {} failed: {restore_error}",
+                                    path.display()
+                                )));
+                            }
+                        },
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            },
+        )
+    })
+    .await
+    .context("human knowledge edit task terminated before completing")?
+}
+
+pub(crate) fn human_knowledge_edit_outcome_note(outcome: &KnowledgeDreamGitOutcome) -> String {
+    match outcome {
+        KnowledgeDreamGitOutcome::Committed {
+            commit,
+            branch,
+            pushed,
+        } => format!(
+            "human knowledge concept committed to `{branch}` as `{commit}`{}",
+            if *pushed { " and pushed" } else { "" }
+        ),
+        KnowledgeDreamGitOutcome::NoChanges { branch } => {
+            format!("human knowledge concept is unchanged on `{branch}`")
+        }
+        KnowledgeDreamGitOutcome::Skipped { reason } => {
+            format!("human knowledge concept applied; Git history was skipped: {reason}")
+        }
+        KnowledgeDreamGitOutcome::Deferred { reason, .. } => {
+            format!("human knowledge concept applied, but Git synchronization deferred: {reason}")
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5214,6 +5503,7 @@ impl Tool for KnowledgeDreamApplyTool {
         let data_files_written = writes.len().saturating_sub(concepts_written);
         let dream = KnowledgeDreamCommit {
             knowledge_base_id: args.knowledge_base_id.clone(),
+            origin: KnowledgeCommitOrigin::Dream,
             model: self.executing_model.clone(),
             sessions_dreamed: args.source_session_ids.len(),
             concepts_written,
@@ -7911,6 +8201,7 @@ Inventory facts for warehouse operations.
     fn test_dream(knowledge_base_id: &str) -> KnowledgeDreamCommit {
         KnowledgeDreamCommit {
             knowledge_base_id: knowledge_base_id.to_string(),
+            origin: KnowledgeCommitOrigin::Dream,
             model: "openai:gpt-5".to_string(),
             sessions_dreamed: 2,
             concepts_written: 1,
@@ -8507,6 +8798,42 @@ Inventory facts for warehouse operations.
             .unwrap();
             assert!(ignored.success, "{name} must be ignored in a KB repository");
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_human_concept_edit_is_stamped_and_committed_through_the_kb_fence() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let target = HumanKnowledgeConceptTarget {
+            knowledge_base_id: "personal".to_string(),
+            root: tmp.path().to_path_buf(),
+            relative_path: PathBuf::from("manual.md"),
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let content = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\nprovenance: dream\n---\n\nHuman correction.\n",
+        )
+        .unwrap();
+
+        let outcome = apply_human_knowledge_concept_edit(target, content, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        let concept = parse_bundle(tmp.path())
+            .unwrap()
+            .concepts
+            .into_iter()
+            .find(|concept| concept.id == "manual")
+            .expect("human concept is present");
+        assert_eq!(concept.provenance(), Some("human"));
+        let subject =
+            crate::git::run_git_checked(tmp.path(), &["log", "-1", "--format=%s"]).unwrap();
+        assert!(subject.starts_with("human(kb=personal):"), "{subject}");
     }
 
     fn ids(results: &[SearchResult]) -> Vec<String> {

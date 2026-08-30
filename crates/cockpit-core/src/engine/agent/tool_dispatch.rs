@@ -324,16 +324,25 @@ fn verification_host_settlement(
     }
 }
 
-async fn cancel_replayed_selected_dispatch(
+/// A replayed verification memo owns a live dispatch reservation only for a
+/// selected revision or a durably selected original.  Both must be settled if
+/// replay is refused before entering the host-effect boundary.
+fn replay_memo_has_reserved_dispatch(
+    memo: &crate::db::needs_attention::InterruptVerificationMemo,
+) -> bool {
+    memo.dispatch_attempt_revision >= 0
+        && matches!(
+            memo.outcome,
+            crate::db::needs_attention::InterruptVerificationOutcome::Revise { .. }
+                | crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal
+        )
+}
+
+async fn cancel_replayed_reserved_dispatch(
     session: &Session,
     memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
 ) {
-    let Some(memo) = memo.filter(|memo| {
-        matches!(
-            memo.outcome,
-            crate::db::needs_attention::InterruptVerificationOutcome::Revise { .. }
-        ) && memo.dispatch_attempt_revision >= 0
-    }) else {
+    let Some(memo) = memo.filter(replay_memo_has_reserved_dispatch) else {
         return;
     };
     let _ = session
@@ -1252,7 +1261,7 @@ async fn execute_ordinary_call_unscoped(
         || cage_block.is_some()
         || !repair_outcome.valid;
     if selected_replay_denied_before_intercept {
-        cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+        cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await;
     }
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
@@ -1298,7 +1307,7 @@ async fn execute_ordinary_call_unscoped(
             permission_kind,
         } = authorize_btw_native_call(env, resolved_name, &args).await?
         {
-            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await;
             // A /btw approval denial early-returns before the common deny-audit
             // site below, so `permissionDenied` must fire here (observe-only /
             // fail-open) with the matching deny kind — otherwise a real
@@ -1349,7 +1358,7 @@ async fn execute_ordinary_call_unscoped(
         )
         .await;
         if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
-            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await;
             // The deny is already recorded by `run_pre_tool_hooks` via
             // `record_hook_run`. Return the deterministic model-visible
             // rejected-tool diagnostic; the tool is never executed and no
@@ -2853,6 +2862,35 @@ mod tests {
             verification_host_settlement(false, true, false),
             DispatchSettlement::Unknown
         );
+    }
+
+    #[test]
+    fn replay_refusal_terminalizes_every_reserved_verification_dispatch() {
+        use crate::db::needs_attention::{InterruptVerificationMemo, InterruptVerificationOutcome};
+
+        let memo = |outcome, dispatch_attempt_revision| InterruptVerificationMemo {
+            operation_id: uuid::Uuid::nil(),
+            dispatch_attempt_revision,
+            outcome,
+        };
+
+        assert!(replay_memo_has_reserved_dispatch(&memo(
+            InterruptVerificationOutcome::DispatchOriginal,
+            4,
+        )));
+        assert!(replay_memo_has_reserved_dispatch(&memo(
+            InterruptVerificationOutcome::Revise {
+                args: serde_json::json!({ "path": "output.txt" }),
+                disclosure: "selected revision".to_string(),
+            },
+            4,
+        )));
+        assert!(!replay_memo_has_reserved_dispatch(&memo(
+            InterruptVerificationOutcome::Block {
+                message: "blocked before dispatch".to_string(),
+            },
+            -1,
+        )));
     }
 
     struct EchoTool;

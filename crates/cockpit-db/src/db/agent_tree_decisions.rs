@@ -653,6 +653,18 @@ pub enum DecisionTransitionOutcome {
     RevisionConflict,
 }
 
+/// Receipt bound to the same SQLite transaction as an ACP Code-root decision
+/// settlement. This is deliberately an internal storage DTO: callers cannot
+/// write a terminal ACP receipt without also taking the decision CAS path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeRootInterruptReceiptWrite {
+    pub logical_client_id: String,
+    pub client_request_id: String,
+    pub fingerprint: [u8; 32],
+    pub outcome: String,
+    pub resolved_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewAgentInstance {
     pub session_id: Uuid,
@@ -6713,6 +6725,7 @@ impl Db {
             None,
             false,
             None,
+            None,
             now_unix_ms,
         )
         .await
@@ -6740,6 +6753,7 @@ impl Db {
             None,
             None,
             false,
+            None,
             None,
             now_unix_ms,
         )
@@ -6814,6 +6828,7 @@ impl Db {
             None,
             false,
             None,
+            None,
             now_unix_ms,
         )
         .await
@@ -6848,6 +6863,43 @@ impl Db {
             None,
             false,
             None,
+            None,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Same CAS as the normal user-answer settlement, plus the ACP request
+    /// identity in that exact transaction. A committed decision can therefore
+    /// never outlive the durable replay identity of the request that won it.
+    pub async fn resolve_decision_request_with_resume_payload_and_code_root_receipt(
+        &self,
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        expected_revision: i64,
+        terminal_state: DecisionState,
+        receipt_json: &str,
+        resume_payload_json: &str,
+        code_root_receipt: CodeRootInterruptReceiptWrite,
+        now_unix_ms: i64,
+    ) -> Result<DecisionTransitionOutcome> {
+        ensure!(
+            terminal_state.is_terminal(),
+            "decision resolution must be terminal"
+        );
+        let resume_payload_json = validate_resume_payload_json(resume_payload_json)?;
+        self.transition_decision_request(
+            session_id,
+            decision_request_id,
+            expected_revision,
+            terminal_state,
+            None,
+            receipt_json,
+            Some(resume_payload_json),
+            None,
+            false,
+            None,
+            Some(code_root_receipt),
             now_unix_ms,
         )
         .await
@@ -6888,6 +6940,7 @@ impl Db {
             Some(selected_response_json),
             true,
             Some(interrupt_id),
+            None,
             now_unix_ms,
         )
         .await
@@ -6905,6 +6958,7 @@ impl Db {
         host_selected_response_json: Option<String>,
         trusted_host_approval: bool,
         host_interrupt_id: Option<Uuid>,
+        code_root_receipt: Option<CodeRootInterruptReceiptWrite>,
         now_unix_ms: i64,
     ) -> Result<DecisionTransitionOutcome> {
         let receipt_json = redact_receipt_json(receipt_json)?;
@@ -7162,6 +7216,9 @@ impl Db {
                         now_unix_ms,
                     ],
                 )?;
+                if let Some(receipt) = code_root_receipt {
+                    record_code_root_interrupt_receipt_conn(conn, session_id, &receipt)?;
+                }
                 fail_after_control_event(5, decision_request_id)?;
                 resolve_owned_decision_attention(
                     conn,
@@ -7215,6 +7272,75 @@ impl Db {
     }
 }
 
+fn record_code_root_interrupt_receipt_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    receipt: &CodeRootInterruptReceiptWrite,
+) -> Result<()> {
+    ensure!(
+        !receipt.logical_client_id.is_empty()
+            && receipt.logical_client_id.len() <= 128
+            && receipt
+                .logical_client_id
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic()),
+        "invalid Code-root logical client id"
+    );
+    ensure!(
+        !receipt.client_request_id.is_empty()
+            && receipt.client_request_id.len() <= 128
+            && receipt
+                .client_request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic()),
+        "invalid Code-root client request id"
+    );
+    ensure!(
+        matches!(
+            receipt.outcome.as_str(),
+            "accepted"
+                | "already_resolved_same"
+                | "already_resolved_other"
+                | "cancelled"
+                | "expired"
+        ),
+        "invalid Code-root interrupt receipt outcome"
+    );
+    conn.execute(
+        "INSERT INTO code_root_interrupt_receipts
+         (session_id, logical_client_id, client_request_id, fingerprint, outcome, resolved_at_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, logical_client_id, client_request_id) DO NOTHING",
+        params![
+            session_id.to_string(),
+            receipt.logical_client_id,
+            receipt.client_request_id,
+            receipt.fingerprint.as_slice(),
+            receipt.outcome,
+            receipt.resolved_at_unix_ms,
+        ],
+    )?;
+    let (fingerprint, outcome): (Vec<u8>, String) = conn.query_row(
+        "SELECT fingerprint, outcome FROM code_root_interrupt_receipts
+         WHERE session_id = ?1 AND logical_client_id = ?2 AND client_request_id = ?3",
+        params![
+            session_id.to_string(),
+            receipt.logical_client_id,
+            receipt.client_request_id,
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        fingerprint.as_slice() == receipt.fingerprint,
+        "Code-root idempotency conflict"
+    );
+    ensure!(
+        outcome == receipt.outcome,
+        "Code-root interrupt receipt outcome conflict"
+    );
+    Ok(())
+}
+
 fn validate_agent_lineage(
     conn: &Connection,
     input: &NewAgentInstance,
@@ -7244,7 +7370,7 @@ fn validate_agent_lineage(
                     Some(parent_workspace_ref)
                 }
                 None => {
-                    // Legacy/test-only daemonless roots deliberately have no
+                    // Legacy/test-only isolated roots deliberately have no
                     // workspace identity. They may only produce another
                     // absent identity; a child still cannot inject text.
                     ensure!(
@@ -7259,7 +7385,7 @@ fn validate_agent_lineage(
             // `ensure_session_root_agent` is the only root creation API that
             // accepts a workspace identity; it receives the daemon-derived
             // path digest and persists the stable `session-root` binding.
-            // Generic agent creation remains useful for daemonless fixtures
+            // Generic agent creation remains useful for isolated fixtures
             // and non-root recovery scaffolding, but cannot inject a root
             // workspace selector into packets.
             ensure!(

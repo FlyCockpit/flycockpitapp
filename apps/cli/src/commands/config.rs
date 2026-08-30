@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 
 #[cfg(feature = "extended")]
 use crate::cli::ImageSpendArgs;
-use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs};
+use crate::cli::{
+    ConfigCommand, ConfigExportPolicyArgs, ConfigHistoryScopeArgs, ConfigImportPolicyArgs,
+};
 #[cfg(feature = "extended")]
 use anyhow::bail;
 
@@ -12,7 +14,55 @@ pub async fn run(cmd: ConfigCommand) -> Result<()> {
         ConfigCommand::ImageSpend(args) => image_spend(args).await,
         ConfigCommand::ExportPolicy(args) => export_policy(args).await,
         ConfigCommand::ImportPolicy(args) => import_policy(args).await,
+        ConfigCommand::HistoryScope(args) => history_scope(args).await,
     }
+}
+
+async fn history_scope(args: ConfigHistoryScopeArgs) -> Result<()> {
+    let root = args.path.unwrap_or(std::env::current_dir()?);
+    let project_root = root.display().to_string();
+    let daemon = crate::daemon::client::ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for history scope")?;
+    let client = daemon.client;
+    let current = client
+        .request(crate::daemon::proto::Request::GetWorkspaceHistoryScope {
+            project_root: project_root.clone(),
+        })
+        .await?
+        .map_err(|error| anyhow::anyhow!("daemon rejected history scope read: {error}"))?;
+    let crate::daemon::proto::Response::WorkspaceHistoryScope {
+        mut outbound,
+        mut inbound,
+    } = current
+    else {
+        anyhow::bail!("daemon returned unexpected history scope response: {current:?}");
+    };
+    let changed = args.outbound.is_some() || args.inbound.is_some();
+    if let Some(value) = args.outbound {
+        outbound = value;
+    }
+    if let Some(value) = args.inbound {
+        inbound = value;
+    }
+    if changed {
+        let saved = client
+            .request(crate::daemon::proto::Request::SetWorkspaceHistoryScope {
+                project_root,
+                outbound,
+                inbound,
+            })
+            .await?
+            .map_err(|error| anyhow::anyhow!("daemon rejected history scope save: {error}"))?;
+        if !matches!(
+            saved,
+            crate::daemon::proto::Response::WorkspaceHistoryScope { .. }
+        ) {
+            anyhow::bail!("daemon returned unexpected history scope save response: {saved:?}");
+        }
+    }
+    println!("outbound: {outbound}\ninbound: {inbound}");
+    Ok(())
 }
 
 #[cfg(feature = "extended")]

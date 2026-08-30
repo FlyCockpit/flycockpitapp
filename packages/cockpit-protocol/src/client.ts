@@ -4,6 +4,7 @@ import {
   RELAY_ENVELOPE_VERSION,
 } from "@flycockpit/relay-protocol/envelopes";
 import {
+  type ActiveModelRef,
   type ClientRequest,
   createClientSubmissionId,
   createEnvelope,
@@ -19,6 +20,9 @@ import {
   parseListSessionsResult,
   parseSessionLiveStatusResult,
   parseSessionMessagesResult,
+  parseStorageCleanupCompletedResult,
+  parseStorageCleanupPreviewResult,
+  parseStorageReportResult,
   parseUserMessageQueuedResult,
   type ResolveResponse,
   serverMessageSchema,
@@ -71,10 +75,10 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
 export type SendUserMessageParams = {
   client_submission_id: string;
   expected_model_state_generation?: number;
-  expected_model?: { provider: string; model: string; reasoning_effort?: string | null };
+  expected_model?: ActiveModelRef;
   text: string;
   display_text?: string;
-  tag_expansions?: unknown[];
+  tag_expansions?: Record<string, unknown>[];
   forced_skill?: string;
   delivery_class_override?: "steering" | "held";
   run_invocation_options?: {
@@ -385,6 +389,29 @@ export class RemoteSessionClient {
     );
   }
 
+  async getStorageReport() {
+    return parseStorageReportResult(await this.send({ request: "get_storage_report" }));
+  }
+
+  async dismissStorageManagementHint(expected_version: number) {
+    await this.send({
+      request: "mark_app_flag_seen",
+      params: { key: "storage_management_hint", expected_version },
+    });
+  }
+
+  async previewStorageCleanup(params: ParamsOf<"preview_storage_cleanup">) {
+    return parseStorageCleanupPreviewResult(
+      await this.send({ request: "preview_storage_cleanup", params }),
+    );
+  }
+
+  async executeStorageCleanup(preview_id: string) {
+    return parseStorageCleanupCompletedResult(
+      await this.send({ request: "execute_storage_cleanup", params: { preview_id } }),
+    );
+  }
+
   async archiveSession(session_id: string, cascade = false) {
     return parseAckResult(
       await this.send({ request: "archive_session", params: { session_id, cascade } }),
@@ -411,10 +438,6 @@ export class RemoteSessionClient {
     return parseAckResult(
       await this.send({ request: "share_session", params: { session_id, shared } }),
     );
-  }
-
-  async deleteSession(session_id: string) {
-    return parseAckResult(await this.send({ request: "delete_session", params: { session_id } }));
   }
 
   async setActiveModel(params: ParamsOf<"set_active_model">) {

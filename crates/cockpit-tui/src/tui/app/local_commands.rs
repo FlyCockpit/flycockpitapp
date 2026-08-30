@@ -510,6 +510,12 @@ impl App {
                 };
                 self.resolve_model_comparison_select(selected.as_deref());
             }
+            Some(LocalChoice::ExitGuard(_)) => {
+                let LocalChoiceSelection::Single(selected) = selection else {
+                    return;
+                };
+                self.resolve_exit_guard_choice(selected.as_deref());
+            }
             None => {}
         }
     }

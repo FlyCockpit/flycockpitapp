@@ -121,7 +121,7 @@ fn render_capped_payload_range(
 ) -> ToolOutput {
     // Reserve space for the continuation marker so the final output
     // (marker included) never exceeds the cap.  This mirrors the approach
-    // in `artifact_read::render_capped_artifact_lines`.
+    // in the recall provider's capped-page renderer.
     const CONTINUATION_RESERVE_BYTES: usize = 192;
     let mut output = String::new();
     let mut next = None;

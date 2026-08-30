@@ -848,6 +848,43 @@ async fn background_gate_refuse_starts_no_job() {
     assert!(rx.try_recv().is_err());
 }
 
+#[tokio::test]
+async fn untrusted_background_start_requires_a_sandbox_for_a_trust_required_kb() {
+    let (mut driver, tmp) = schedule_journaling_driver(
+        "test-token",
+        false,
+        crate::session::test_redaction_key_resolver(),
+    );
+    let knowledge = tmp.path().join(".cockpit/knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    std::fs::write(knowledge.join("private.md"), "private knowledge").unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        r#"{"knowledgeBases":[{"id":"private","name":"Private","description":"Private local knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+    )
+    .unwrap();
+    driver.refresh_config_from_disk_for_tests();
+    driver.session.set_sandbox_enabled(false);
+
+    let out = super::super::schedule_dispatch::with_background_sandbox_availability_for_test(
+        crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+            reason: "bwrap absent".to_string(),
+            fix_command: None,
+        },
+        driver.dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "cat .cockpit/knowledge/private.md" }
+        })),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.contains("Access denied"), "got {out}");
+    assert!(out.contains("requires a trusted model"), "got {out}");
+    assert!(!out.contains("/sandbox off"), "got {out}");
+    assert!(driver.schedule.snapshot().is_empty());
+}
+
 fn capture_schedule_events(driver: &mut Driver) -> mpsc::Receiver<TurnEvent> {
     let (tx, rx) = mpsc::channel(8);
     driver.schedule.set_turn_tx(tx);

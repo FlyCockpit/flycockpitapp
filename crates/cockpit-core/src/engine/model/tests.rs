@@ -20,8 +20,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
 
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &history,
+            AgentPromptParts::new("system", &history),
             &prompt,
             &[],
             &ModelParams::default(),
@@ -62,8 +61,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
         captured,
         model
             .prepare_completion_request(
-                "system",
-                &history,
+                AgentPromptParts::new("system", &history),
                 &prompt,
                 &[],
                 &ModelParams::default(),
@@ -73,6 +71,287 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
             .unwrap()
             .captured,
         "prepared payload remains byte-identical to the canonical assembly"
+    );
+}
+
+#[test]
+fn cache_boundary_keeps_system_and_tools_byte_identical_across_volatile_turns() {
+    let (_tmp, redact) = secret_table();
+    let model = model_at("http://127.0.0.1:1/v1", redact);
+    let tools = [crate::engine::message::ToolDefinition {
+        name: "memory_search".to_string(),
+        description: "search attached OKF memory bundles with citations".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }];
+    let stable_prefix = "session-stable system prefix";
+    let first_history = [Message::user("[time: first turn]\n\nhello")];
+    let second_history = [Message::user(
+        "[knowledge]\nnew retrieval\n\n[project guidance notice] changed",
+    )];
+
+    let first = model
+        .prepare_completion_request(
+            AgentPromptParts::new(stable_prefix, &first_history),
+            &Message::user("first prompt"),
+            &tools,
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    let second = model
+        .prepare_completion_request(
+            AgentPromptParts::new(stable_prefix, &second_history),
+            &Message::user("second prompt"),
+            &tools,
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(first.system, second.system);
+    assert_eq!(
+        serde_json::to_vec(&first.captured["tools"]).unwrap(),
+        serde_json::to_vec(&second.captured["tools"]).unwrap(),
+        "the serialized provider tools array must stay cache-identical"
+    );
+    assert_ne!(
+        serde_json::to_value(&first.history).unwrap(),
+        serde_json::to_value(&second.history).unwrap()
+    );
+    assert!(!first.system.contains("[time:") && !first.system.contains("[knowledge]"));
+}
+
+#[tokio::test]
+async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_ephemerally() {
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("foreground response".into()))
+        .turn(Turn::ToolCall {
+            id: "metadata-call".into(),
+            name: "mcp".into(),
+            arguments: serde_json::json!({
+                "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'repair-cache-fence', 'description': 'Repairs the durable metadata write fence.'})"
+            }),
+        })
+        .start()
+        .await;
+    // An auto-selected Chat Completions endpoint enables identity
+    // normalization when the interactive foreground may recover to Responses.
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, false);
+    let session = std::sync::Arc::new(
+        crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/metadata-fork-test"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let work = session
+        .note_user_content_for_metadata("repair the metadata cache fence")
+        .expect("first user boundary schedules metadata");
+    let work = session.activate_metadata_fork(work).unwrap();
+    let history = vec![
+        Message::user("prior user context"),
+        assistant(vec![responses_tool_call("provider-item", None)]),
+        tool_result_message("provider-item", None),
+    ];
+    let foreground_prompt = Message::user("foreground user turn");
+    let tools = vec![ToolDefinition {
+        name: "mcp".into(),
+        description: "Execute a Monty script.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "script": { "type": "string" } },
+            "required": ["script"]
+        }),
+    }];
+    let params = ModelParams::default();
+    let cancel = CancellationToken::new();
+
+    let (_, foreground_captured, _) = model
+        .complete_captured(
+            "shared system prompt",
+            &history,
+            foreground_prompt.clone(),
+            &tools,
+            params.clone(),
+            "Build",
+            None,
+            &cancel,
+            Some(EndpointRecoveryContext {
+                approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+            }),
+        )
+        .await
+        .expect("foreground request");
+    let without_recovery = model
+        .prepare_completion_request(
+            AgentPromptParts::new("shared system prompt", &history),
+            &foreground_prompt,
+            &tools,
+            &params,
+            false,
+            None,
+        )
+        .expect("non-recovery preparation");
+    assert_ne!(
+        foreground_captured, without_recovery.captured,
+        "the tool-bearing fixture must exercise recovery-specific identity normalization"
+    );
+    crate::auto_title::generate_session_metadata_fork(
+        session.clone(),
+        model,
+        "shared system prompt".into(),
+        "Build".into(),
+        params,
+        history.clone(),
+        foreground_prompt,
+        tools,
+        true,
+        work,
+        std::path::PathBuf::from("/metadata-fork-test"),
+        crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        cancel,
+        None,
+    )
+    .await;
+
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 2, "one foreground and one fork request");
+    let foreground = &captured[0].body;
+    let fork = &captured[1].body;
+    assert_eq!(
+        fork["tools"], foreground["tools"],
+        "native tool block is identical"
+    );
+    let foreground_messages = foreground["messages"].as_array().unwrap();
+    let fork_messages = fork["messages"].as_array().unwrap();
+    assert_eq!(
+        &fork_messages[..foreground_messages.len()],
+        foreground_messages.as_slice(),
+        "fork retains the foreground request through its cached prefix"
+    );
+    assert_eq!(
+        serde_json::to_vec(foreground_messages).unwrap(),
+        serde_json::to_vec(&fork_messages[..foreground_messages.len()]).unwrap(),
+        "the serialized cached message prefix is byte-identical"
+    );
+    assert_eq!(fork_messages.len(), foreground_messages.len() + 1);
+    assert_eq!(
+        history,
+        vec![
+            Message::user("prior user context"),
+            assistant(vec![responses_tool_call("provider-item", None)]),
+            tool_result_message("provider-item", None),
+        ]
+    );
+
+    let row = session.db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("repair-cache-fence"));
+    assert_eq!(
+        row.description.as_deref(),
+        Some("Repairs the durable metadata write fence.")
+    );
+}
+
+#[tokio::test]
+async fn metadata_fork_retry_retains_the_initial_call_skeleton() {
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("I will provide metadata shortly.".into()))
+        .turn(Turn::ToolCall {
+            id: "metadata-call".into(),
+            name: "mcp".into(),
+            arguments: serde_json::json!({
+                "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'retain-call-skeleton', 'description': 'Retains the initial metadata call skeleton during recovery.'})"
+            }),
+        })
+        .start()
+        .await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, true);
+    let session = std::sync::Arc::new(
+        crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/metadata-fork-retry-test"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let work = session
+        .note_user_content_for_metadata("retain the metadata call skeleton")
+        .expect("first user boundary schedules metadata");
+    let work = session.activate_metadata_fork(work).unwrap();
+    let history = vec![Message::user("prior user context")];
+    let foreground_prompt = Message::user("foreground user turn");
+    let tools = vec![ToolDefinition {
+        name: "mcp".into(),
+        description: "Execute a Monty script.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "script": { "type": "string" } },
+            "required": ["script"]
+        }),
+    }];
+    let params = ModelParams::default();
+    let cancel = CancellationToken::new();
+
+    model
+        .complete_captured(
+            "shared system prompt",
+            &history,
+            foreground_prompt.clone(),
+            &tools,
+            params.clone(),
+            "Build",
+            None,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("foreground request");
+    crate::auto_title::generate_session_metadata_fork(
+        session.clone(),
+        model,
+        "shared system prompt".into(),
+        "Build".into(),
+        params,
+        history,
+        foreground_prompt,
+        tools,
+        false,
+        work,
+        std::path::PathBuf::from("/metadata-fork-retry-test"),
+        crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        cancel,
+        None,
+    )
+    .await;
+
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 3, "foreground plus two capped fork turns");
+    let retry_messages = captured[2].body["messages"].as_array().unwrap();
+    let retry_wire = serde_json::to_string(retry_messages).unwrap();
+    assert!(
+        retry_wire.contains("short-kebab-title"),
+        "the retry retains the concrete call skeleton from the first fork turn: {retry_wire}"
+    );
+    assert!(
+        retry_wire.contains("I will provide metadata shortly."),
+        "the retry retains the first fork response: {retry_wire}"
+    );
+
+    let row = session.db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("retain-call-skeleton"));
+    assert_eq!(
+        row.description.as_deref(),
+        Some("Retains the initial metadata call skeleton during recovery.")
     );
 }
 
@@ -3988,8 +4267,7 @@ async fn capture_anthropic_body(
     );
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &[],
+            AgentPromptParts::new("system", &[]),
             &Message::user("hi"),
             &[],
             &params,
@@ -7066,8 +7344,7 @@ fn untrusted_json_tool_result_values_and_keys_are_scrubbed() {
 
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &history,
+            AgentPromptParts::new("system", &history),
             &prompt,
             &[],
             &ModelParams::default(),
@@ -7153,8 +7430,7 @@ fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
     // Drive the PRODUCTION entry point and assert on the scrubbed message.
     let prepared = model
         .prepare_completion_request(
-            "system",
-            std::slice::from_ref(&msg),
+            AgentPromptParts::new("system", std::slice::from_ref(&msg)),
             &Message::user("continue"),
             &[],
             &ModelParams::default(),
@@ -7186,8 +7462,7 @@ fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
     // byte-stable no-op (the terminal collision object never re-renders).
     let reprepared = model
         .prepare_completion_request(
-            "system",
-            std::slice::from_ref(&prepared.history[0]),
+            AgentPromptParts::new("system", std::slice::from_ref(&prepared.history[0])),
             &Message::user("continue"),
             &[],
             &ModelParams::default(),
@@ -7271,8 +7546,7 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
     assert!(raw.contains(SECRET) && raw.contains(base64_secret.as_str()));
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &[message],
+            AgentPromptParts::new("system", &[message]),
             &Message::user("go"),
             &[],
             &ModelParams::default(),
@@ -7327,8 +7601,7 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         // failure BEFORE any network I/O.
         let err = untrusted
             .prepare_completion_request(
-                "system",
-                &[media()],
+                AgentPromptParts::new("system", &[media()]),
                 &Message::user("go"),
                 &[],
                 &ModelParams::default(),
@@ -7397,8 +7670,7 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         .unwrap();
         assert!(trusted.is_trusted());
         let trusted_prep = trusted.prepare_completion_request(
-            "system",
-            &[media()],
+            AgentPromptParts::new("system", &[media()]),
             &Message::user("go"),
             &[],
             &ModelParams::default(),
@@ -7731,8 +8003,7 @@ async fn untrusted_provider_wire_inventory_is_closed() {
     );
     let prepared = chat
         .prepare_completion_request(
-            "system",
-            &full_history,
+            AgentPromptParts::new("system", &full_history),
             &Message::user(format!("final {SECRET}")),
             &[],
             &ModelParams::default(),

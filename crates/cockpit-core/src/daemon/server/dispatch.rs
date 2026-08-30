@@ -5847,50 +5847,71 @@ async fn handle_serialized_request_impl(
                         outcome: crate::daemon::proto::KnowledgeDreamRunOutcome::Unavailable,
                         session_ids: Vec::new(),
                         commit: None,
+                        failure: None,
                     });
                     continue;
                 }
-                let model = crate::knowledge::dream::resolve_dream_model(
-                    &knowledge_base,
-                    &extended,
-                    &providers,
-                )
-                .map_err(daemon_config_error)?;
-                let caller_trust =
-                    crate::knowledge::dream::history_caller_trust(&model, &providers);
-                let model = crate::config::providers::ActiveModelRef {
-                    provider: model.provider,
-                    model: model.model,
-                    reasoning_effort: None,
-                    thinking_mode: None,
-                    prompt_cache_retention: None,
-                };
-                let run = crate::daemon::dream_scheduler::run_knowledge_dream(
-                    &ctx.db,
-                    &ctx.registry,
-                    cwd,
-                    &knowledge_base,
-                    model,
-                    caller_trust,
-                    no_sandbox,
-                    false,
-                )
-                .await
-                .map_err(internal)?;
-                let outcome = match run.disposition {
-                    crate::daemon::dream_scheduler::DreamRunDisposition::Empty => {
-                        crate::daemon::proto::KnowledgeDreamRunOutcome::NothingToDream
+                let run = async {
+                    let model = crate::knowledge::dream::resolve_dream_model(
+                        &knowledge_base,
+                        &extended,
+                        &providers,
+                    )?;
+                    let caller_trust =
+                        crate::knowledge::dream::history_caller_trust(&model, &providers);
+                    let model = crate::config::providers::ActiveModelRef {
+                        provider: model.provider,
+                        model: model.model,
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                        prompt_cache_retention: None,
+                    };
+                    crate::daemon::dream_scheduler::run_knowledge_dream(
+                        &ctx.db,
+                        &ctx.registry,
+                        cwd,
+                        &knowledge_base,
+                        model,
+                        caller_trust,
+                        no_sandbox,
+                        false,
+                    )
+                    .await
+                }
+                .await;
+                match run {
+                    Ok(run) => {
+                        let outcome = match run.disposition {
+                            crate::daemon::dream_scheduler::DreamRunDisposition::Empty => {
+                                crate::daemon::proto::KnowledgeDreamRunOutcome::NothingToDream
+                            }
+                            crate::daemon::dream_scheduler::DreamRunDisposition::Completed => {
+                                crate::daemon::proto::KnowledgeDreamRunOutcome::Dreamed
+                            }
+                        };
+                        results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
+                            knowledge_base_id: knowledge_base.id,
+                            outcome,
+                            session_ids: run.session_ids,
+                            commit: run.commit,
+                            failure: None,
+                        });
                     }
-                    crate::daemon::dream_scheduler::DreamRunDisposition::Completed => {
-                        crate::daemon::proto::KnowledgeDreamRunOutcome::Dreamed
+                    Err(error) => {
+                        tracing::warn!(
+                            knowledge_base_id = %knowledge_base.id,
+                            error = %error,
+                            "manual knowledge dream failed; continuing ordered all-KB run"
+                        );
+                        results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
+                            knowledge_base_id: knowledge_base.id,
+                            outcome: crate::daemon::proto::KnowledgeDreamRunOutcome::Failed,
+                            session_ids: Vec::new(),
+                            commit: None,
+                            failure: Some(error.to_string()),
+                        });
                     }
-                };
-                results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
-                    knowledge_base_id: knowledge_base.id,
-                    outcome,
-                    session_ids: run.session_ids,
-                    commit: run.commit,
-                });
+                }
             }
             Ok(Response::KnowledgeDreamRuns { results })
         }

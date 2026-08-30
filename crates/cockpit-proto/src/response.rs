@@ -26,6 +26,9 @@ pub struct KnowledgeDreamRunReceipt {
     pub session_ids: Vec<Uuid>,
     /// A new local knowledge Git commit created by this run, when one exists.
     pub commit: Option<String>,
+    /// A per-KB execution error. Present exactly when `outcome` is `Failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -35,6 +38,8 @@ pub enum KnowledgeDreamRunOutcome {
     NothingToDream,
     /// TODO(hosted dream service): remote KB execution remains hosted-only.
     Unavailable,
+    /// The local KB was attempted but its model resolution or dream run failed.
+    Failed,
 }
 
 // ---- Responses -------------------------------------------------------------

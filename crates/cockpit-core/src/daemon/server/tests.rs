@@ -68,6 +68,90 @@ async fn run_knowledge_dream_all_returns_an_empty_daemon_receipt_list_when_none_
     assert!(matches!(response, Response::KnowledgeDreamRuns { results } if results.is_empty()));
 }
 
+#[tokio::test]
+async fn run_knowledge_dream_all_reports_a_failed_kb_and_continues_in_config_order() {
+    use crate::config::extended::{
+        KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy, KnowledgeBaseRegistryEntry,
+        KnowledgeBaseSource,
+    };
+
+    let unusable_local = KnowledgeBaseRegistryEntry {
+        id: "unusable-local".to_string(),
+        name: "Unusable local".to_string(),
+        description: "Has no configured dream model".to_string(),
+        source: KnowledgeBaseSource::Local {
+            path: "knowledge".into(),
+        },
+        embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
+        dream_model: None,
+        dream_schedule: None,
+        trust_required: false,
+        merge_policy: KnowledgeBaseMergePolicy::Auto,
+    };
+    let hosted = KnowledgeBaseRegistryEntry {
+        id: "hosted".to_string(),
+        name: "Hosted".to_string(),
+        description: "Deferred hosted execution".to_string(),
+        source: KnowledgeBaseSource::Remote {
+            url: "https://knowledge.example.test".to_string(),
+        },
+        embedding_ownership: KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+        dream_model: None,
+        dream_schedule: None,
+        trust_required: false,
+        merge_policy: KnowledgeBaseMergePolicy::Auto,
+    };
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        stub_providers_config(),
+        crate::config::extended::ExtendedConfig {
+            knowledge_bases: vec![unusable_local, hosted],
+            ..Default::default()
+        },
+    ));
+    let workspace = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            workspace.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    let response = handle_request(
+        Request::RunKnowledgeDream {
+            project_root: workspace.path().to_string_lossy().into_owned(),
+            knowledge_base_id: None,
+            no_sandbox: false,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    let Response::KnowledgeDreamRuns { results } = response else {
+        panic!("dream-all must return ordered per-KB receipts");
+    };
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].knowledge_base_id, "unusable-local");
+    assert!(matches!(
+        results[0].outcome,
+        crate::daemon::proto::KnowledgeDreamRunOutcome::Failed
+    ));
+    assert!(
+        results[0]
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("has no dream model"))
+    );
+    assert_eq!(results[1].knowledge_base_id, "hosted");
+    assert!(matches!(
+        results[1].outcome,
+        crate::daemon::proto::KnowledgeDreamRunOutcome::Unavailable
+    ));
+}
+
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
     let value = serde_json::to_value(config).unwrap();
     let operations = value

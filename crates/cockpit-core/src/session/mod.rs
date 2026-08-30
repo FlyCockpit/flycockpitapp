@@ -214,6 +214,11 @@ pub struct Session {
     /// the orchestrator and its delegated readers reconstruct their `ToolCtx`
     /// independently between model turns.
     dream_read_scope: Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
+    /// The per-KB dream execution fence acquired by `knowledge_dream_sources`.
+    /// It remains session-owned while the orchestrator reads and reasons, then
+    /// moves into the detached apply owner so a dispatcher timeout cannot
+    /// release it before the completion ledger is settled.
+    dream_run_fence: Arc<Mutex<DreamRunFenceState>>,
     /// Daemon-injected wrap-key vault. Session fork, sealed persist, and
     /// redaction-table load use this handle instead of opening a second vault.
     secret_vault: Arc<crate::secure_key::SecretVault>,
@@ -509,14 +514,109 @@ impl Session {
         self.dream_read_scope.clone()
     }
 
-    /// Starts a root turn with no inherited dream attachment consent. The
-    /// returned guard owns cleanup for every exit path, including a source
-    /// lookup that returns empty, errors while redacting, times out, or never
-    /// reaches `knowledge_dream_apply`.
+    /// Starts a root turn with no inherited dream attachment consent or
+    /// execution fence. The returned guard owns cleanup for every exit path,
+    /// including a source lookup that returns empty, errors while redacting,
+    /// times out, or never reaches `knowledge_dream_apply`.
     pub(crate) fn begin_dream_read_scope_turn(&self) -> DreamReadScopeTurn {
         let scope = self.dream_read_scope();
         *scope.write().expect("dream read scope lock poisoned") = None;
-        DreamReadScopeTurn(scope)
+        let run_fence = self.dream_run_fence.clone();
+        *run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned") = DreamRunFenceState::Vacant;
+        DreamReadScopeTurn(scope, run_fence)
+    }
+
+    /// Acquire the one per-root/per-KB boundary before selecting dream
+    /// sources. The fence stays held through orchestrator model work and is
+    /// transferred by [`Self::take_dream_run_fence`] to the apply owner.
+    pub(crate) async fn acquire_dream_run_fence(
+        &self,
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let key = DreamRunFenceKey::new(project_root, knowledge_base_id);
+        let state = self.dream_run_fence.clone();
+        {
+            let mut current = state
+                .lock()
+                .expect("knowledge dream run fence state poisoned");
+            match &*current {
+                DreamRunFenceState::Vacant => {
+                    *current = DreamRunFenceState::Acquiring(key.clone());
+                }
+                DreamRunFenceState::Acquiring(existing) => {
+                    anyhow::bail!(
+                        "knowledge dream source selection is already acquiring the per-KB execution fence for `{}`",
+                        existing.knowledge_base_id
+                    );
+                }
+                DreamRunFenceState::Held(existing) if existing.key == key => return Ok(()),
+                DreamRunFenceState::Held(existing) => {
+                    anyhow::bail!(
+                        "knowledge dream turn already owns the per-KB execution fence for `{}`",
+                        existing.key.knowledge_base_id
+                    );
+                }
+            }
+        }
+        let mut acquisition = DreamRunFenceAcquisition::new(state.clone(), key.clone());
+        let lock = crate::knowledge::dream::knowledge_dream_run_lock_for_root(
+            project_root,
+            knowledge_base_id,
+        );
+        let guard = tokio::select! {
+            guard = lock.lock_owned() => guard,
+            () = cancel.cancelled() => anyhow::bail!("knowledge dream cancelled while waiting for the KB execution fence"),
+        };
+        let mut current = state
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if !matches!(&*current, DreamRunFenceState::Acquiring(existing) if *existing == key) {
+            anyhow::bail!(
+                "knowledge dream execution fence lifecycle ended before source selection"
+            );
+        }
+        *current = DreamRunFenceState::Held(DreamRunFence { key, _guard: guard });
+        acquisition.commit();
+        Ok(())
+    }
+
+    /// Transfer the exact source-selection fence to the task that owns the
+    /// sink transaction and completion ledger. Applying without that prior
+    /// selection boundary fails closed.
+    pub(crate) fn take_dream_run_fence(
+        &self,
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+    ) -> Result<DreamRunFence> {
+        let key = DreamRunFenceKey::new(project_root, knowledge_base_id);
+        let mut current = self
+            .dream_run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        match std::mem::replace(&mut *current, DreamRunFenceState::Vacant) {
+            DreamRunFenceState::Held(fence) if fence.key == key => Ok(fence),
+            DreamRunFenceState::Held(fence) => {
+                let selected_knowledge_base_id = fence.key.knowledge_base_id.clone();
+                *current = DreamRunFenceState::Held(fence);
+                anyhow::bail!(
+                    "knowledge dream apply targets `{knowledge_base_id}`, but source selection owns `{}`",
+                    selected_knowledge_base_id
+                );
+            }
+            DreamRunFenceState::Acquiring(fence) => {
+                *current = DreamRunFenceState::Acquiring(fence);
+                anyhow::bail!("knowledge dream apply requires completed source selection");
+            }
+            DreamRunFenceState::Vacant => {
+                anyhow::bail!(
+                    "knowledge dream apply requires a prior source-selection execution fence"
+                );
+            }
+        }
     }
 
     pub(crate) fn is_freshly_created(&self) -> bool {
@@ -528,11 +628,80 @@ impl Session {
 /// deliberately never carried into the next reusable session turn.
 pub(crate) struct DreamReadScopeTurn(
     Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
+    Arc<Mutex<DreamRunFenceState>>,
 );
 
 impl Drop for DreamReadScopeTurn {
     fn drop(&mut self) {
         *self.0.write().expect("dream read scope lock poisoned") = None;
+        *self
+            .1
+            .lock()
+            .expect("knowledge dream run fence state poisoned") = DreamRunFenceState::Vacant;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DreamRunFenceKey {
+    project_root: String,
+    knowledge_base_id: String,
+}
+
+impl DreamRunFenceKey {
+    fn new(
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+    ) -> Self {
+        Self {
+            project_root: project_root.as_str().to_owned(),
+            knowledge_base_id: knowledge_base_id.to_owned(),
+        }
+    }
+}
+
+pub(crate) struct DreamRunFence {
+    key: DreamRunFenceKey,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+enum DreamRunFenceState {
+    Vacant,
+    Acquiring(DreamRunFenceKey),
+    Held(DreamRunFence),
+}
+
+struct DreamRunFenceAcquisition {
+    state: Arc<Mutex<DreamRunFenceState>>,
+    key: DreamRunFenceKey,
+    committed: bool,
+}
+
+impl DreamRunFenceAcquisition {
+    fn new(state: Arc<Mutex<DreamRunFenceState>>, key: DreamRunFenceKey) -> Self {
+        Self {
+            state,
+            key,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DreamRunFenceAcquisition {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut current = self
+            .state
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if matches!(&*current, DreamRunFenceState::Acquiring(existing) if *existing == self.key) {
+            *current = DreamRunFenceState::Vacant;
+        }
     }
 }
 
@@ -1732,8 +1901,9 @@ mod tests {
         let scope = Arc::new(std::sync::RwLock::new(Some(
             [Uuid::nil()].into_iter().collect(),
         )));
+        let run_fence = Arc::new(Mutex::new(DreamRunFenceState::Vacant));
         {
-            let _turn = DreamReadScopeTurn(scope.clone());
+            let _turn = DreamReadScopeTurn(scope.clone(), run_fence.clone());
             assert!(scope.read().unwrap().is_some());
         }
         assert!(scope.read().unwrap().is_none());

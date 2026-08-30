@@ -1095,24 +1095,41 @@ CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_
 -- foreign key to a duplicated SQLite registry.
 CREATE TABLE knowledge_base_session_attachments (
     kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    project_root TEXT NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
     session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attached_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY (kb_id, session_id)
+    PRIMARY KEY (kb_id, project_root, session_id)
 );
 CREATE INDEX idx_kb_session_attachments_session
-    ON knowledge_base_session_attachments(session_id, kb_id);
+    ON knowledge_base_session_attachments(session_id, project_root, kb_id);
 
 -- Immutable completion facts. consumer_id is the local installation identity
 -- today and is reserved for hosted MCP-token consumers without a schema change.
 CREATE TABLE knowledge_dreamed_sessions (
     kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    project_root TEXT NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
     consumer_id TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
     session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     dreamed_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY (kb_id, consumer_id, session_id)
+    PRIMARY KEY (kb_id, project_root, consumer_id, session_id)
 );
 CREATE INDEX idx_knowledge_dreamed_sessions_last
-    ON knowledge_dreamed_sessions(kb_id, consumer_id, dreamed_at_unix_ms DESC);
+    ON knowledge_dreamed_sessions(kb_id, project_root, consumer_id, dreamed_at_unix_ms DESC);
+
+-- Per-machine daemon dream scheduler state.  The completion ledger above is
+-- immutable evidence about individual source sessions; this row records the
+-- daemon's schedule cursor and also makes an empty scheduled fire visible to
+-- users as a successful check.
+CREATE TABLE knowledge_dream_schedule_state (
+    kb_id                       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    project_root                TEXT NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
+    consumer_id                 TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
+    last_scheduled_at_unix_ms   INTEGER NOT NULL,
+    last_dreamed_at_unix_ms     INTEGER,
+    PRIMARY KEY (kb_id, project_root, consumer_id)
+);
+CREATE INDEX idx_knowledge_dream_schedule_state_last
+    ON knowledge_dream_schedule_state(kb_id, project_root, consumer_id, last_scheduled_at_unix_ms DESC);
 
 -- One monotonic freshness boundary per concrete KB attachment. The attachment
 -- UUID, rather than the mutable registry id, prevents a replacement source

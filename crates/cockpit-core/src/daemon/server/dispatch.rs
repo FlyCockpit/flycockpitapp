@@ -6635,10 +6635,30 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             session_id,
         } => {
-            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &session.project_root,
+                )?;
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock_for_root(
+                &project_root,
+                &knowledge_base_id,
+            );
             let _guard = dream_lock.lock().await;
             ctx.db
-                .attach_session_to_knowledge_base(&knowledge_base_id, session_id)
+                .attach_session_to_knowledge_base(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    session_id,
+                )
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
@@ -6648,30 +6668,53 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             session_id,
         } => {
-            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_persisted_canonical_root(
+                    &session.project_root,
+                )
+                .map_err(internal)?;
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock_for_root(
+                &project_root,
+                &knowledge_base_id,
+            );
             let _guard = dream_lock.lock().await;
             ctx.db
-                .detach_session_from_knowledge_base(&knowledge_base_id, session_id)
+                .detach_session_from_knowledge_base(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    session_id,
+                )
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
         }
 
-        Request::KnowledgeDreamStatus {
+        Request::RunKnowledgeDream {
             project_root,
             knowledge_base_id,
+            no_sandbox,
         } => {
-            let cwd = std::fs::canonicalize(&project_root).map_err(|_| ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: "project_root must identify an existing canonical workspace".to_string(),
-            })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &project_root,
+                )?;
+            let cwd = project_root.as_path();
             let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd)
                     .await
                     .map_err(internal)?;
             let (providers, extended) = ctx
                 .config_source()
-                .load_effective_for_daemon(&cwd, &trust_policy)
+                .load_effective_for_daemon(cwd, &trust_policy)
                 .map_err(daemon_config_error)?;
             let knowledge_base = extended
                 .knowledge_bases
@@ -6689,8 +6732,73 @@ async fn handle_serialized_request_impl(
             ) {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
-                    message: "remote knowledge-base dream submission is hosted and not implemented"
-                        .to_string(),
+                    message:
+                        crate::daemon::dream_scheduler::REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE
+                            .to_string(),
+                });
+            }
+            let model =
+                crate::knowledge::dream::resolve_dream_model(knowledge_base, &extended, &providers)
+                    .map_err(daemon_config_error)?;
+            let caller_trust = crate::knowledge::dream::history_caller_trust(&model, &providers);
+            let model = crate::config::providers::ActiveModelRef {
+                provider: model.provider,
+                model: model.model,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            };
+            crate::daemon::dream_scheduler::run_knowledge_dream(
+                &ctx.db,
+                &ctx.registry,
+                cwd,
+                knowledge_base,
+                model,
+                caller_trust,
+                no_sandbox,
+                false,
+            )
+            .await
+            .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::KnowledgeDreamStatus {
+            project_root,
+            knowledge_base_id,
+        } => {
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &project_root,
+                )?;
+            let cwd = project_root.as_path();
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd)
+                    .await
+                    .map_err(internal)?;
+            let (providers, extended) = ctx
+                .config_source()
+                .load_effective_for_daemon(cwd, &trust_policy)
+                .map_err(daemon_config_error)?;
+            let knowledge_base = extended
+                .knowledge_bases
+                .iter()
+                .find(|entry| entry.id == knowledge_base_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "knowledge base `{knowledge_base_id}` is not configured for this workspace"
+                    ),
+                })?;
+            if !matches!(
+                &knowledge_base.source,
+                crate::config::extended::KnowledgeBaseSource::Local { .. }
+            ) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message:
+                        crate::daemon::dream_scheduler::REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE
+                            .to_string(),
                 });
             }
             let model =
@@ -6705,6 +6813,7 @@ async fn handle_serialized_request_impl(
                 .db
                 .undreamed_sessions_for_knowledge_base(
                     &knowledge_base_id,
+                    project_root.as_str(),
                     consumer.as_hex(),
                     crate::knowledge::dream::history_caller_trust(&model, &providers),
                 )
@@ -6713,12 +6822,22 @@ async fn handle_serialized_request_impl(
                 .into_iter()
                 .map(|source| source.session_id)
                 .collect();
+            let last_dreamed_at_unix_ms = ctx
+                .db
+                .knowledge_base_last_dreamed_at(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    consumer.as_hex(),
+                )
+                .await
+                .map_err(internal)?;
             Ok(Response::KnowledgeDreamStatus {
                 // CLI model selectors use the canonical `provider/model`
                 // spelling, while the dream engine's internal comparison is
                 // colon-delimited after attach.
                 model: format!("{}/{}", model.provider, model.model),
                 undreamed_session_ids,
+                last_dreamed_at_unix_ms,
             })
         }
 

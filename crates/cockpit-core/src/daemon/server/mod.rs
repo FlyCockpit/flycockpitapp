@@ -2556,6 +2556,9 @@ pub struct DaemonContext {
     /// start only). Held for the daemon's lifetime; the worker exits
     /// cooperatively when the shutdown gate drains.
     _image_generation_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Per-KB daemon dream scheduler. It is deliberately distinct from the
+    /// session-scoped agent scheduler stored above.
+    _dream_scheduler: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     credential_store_path: Option<PathBuf>,
     /// Daemon-held wrap-key vault. Flycockpit credential persist uses this
@@ -3151,6 +3154,15 @@ impl DaemonContext {
         });
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
+        let dream_scheduler = (!paths.ephemeral).then(|| {
+            crate::daemon::dream_scheduler::DreamScheduler::spawn(
+                db.clone(),
+                registry.clone(),
+                config_source.clone(),
+                canonical_cwd.clone(),
+                shutdown.clone(),
+            )
+        });
         let mut ctx = Self {
             guidance_proposals: registry.guidance_proposals(),
             db,
@@ -3191,6 +3203,7 @@ impl DaemonContext {
             promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
             image_generation_boot_id,
             _image_generation_worker: image_generation_worker,
+            _dream_scheduler: dream_scheduler,
             credential_store_path: None,
             secret_vault,
             sealed_owner_capabilities: Arc::new(StdMutex::new(

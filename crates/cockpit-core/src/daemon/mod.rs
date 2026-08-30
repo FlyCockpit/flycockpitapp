@@ -42,6 +42,7 @@ pub mod connector;
 #[cfg(feature = "remote")]
 pub mod control_replay;
 pub(crate) mod diagnostics_probe;
+pub(crate) mod dream_scheduler;
 pub mod effective_default_recovery;
 #[cfg(feature = "remote")]
 pub mod egress;

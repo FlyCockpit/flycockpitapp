@@ -4556,11 +4556,16 @@ impl Tool for KnowledgeDreamSourcesTool {
             model.reference()
         );
         let consumer = ctx.session.db.ensure_installation_identity().await?;
+        let project_root = dream::CanonicalDreamProjectRoot::from_session_path(&ctx.cwd)?;
+        ctx.session
+            .acquire_dream_run_fence(&project_root, &knowledge_base.entry.id, &ctx.cancel)
+            .await?;
         let mut sources = ctx
             .session
             .db
             .undreamed_sessions_for_knowledge_base(
                 &knowledge_base.entry.id,
+                project_root.as_str(),
                 consumer.as_hex(),
                 dream::history_caller_trust(&model, &providers),
             )
@@ -4952,31 +4957,50 @@ impl Tool for KnowledgeDreamApplyTool {
             concepts_written,
             data_files_written,
         };
+        let project_root = dream::CanonicalDreamProjectRoot::from_session_path(&ctx.cwd)?;
+        let run_fence = ctx
+            .session
+            .take_dream_run_fence(&project_root, &args.knowledge_base_id)?;
         let cancel = dream_write_cancellation(ctx);
         let session = ctx.session.clone();
         let cwd = ctx.cwd.clone();
-        let outcome = apply_registered_knowledge_dream(
-            &session,
-            &cwd,
-            self.allowed_knowledge_bases.as_ref(),
-            &extended,
-            ctx.knowledge_access_trusted,
-            &dream,
-            cancel.cancel.clone(),
-            move |root| apply_knowledge_dream_writes(root, &writes),
-        )
-        .await?;
-        if !matches!(outcome, KnowledgeDreamGitOutcome::Deferred { .. }) {
-            let consumer = ctx.session.db.ensure_installation_identity().await?;
-            ctx.session
-                .db
-                .record_knowledge_dream_completion(
-                    &args.knowledge_base_id,
-                    consumer.as_hex(),
-                    &args.source_session_ids,
-                )
-                .await?;
-        }
+        let allowed_knowledge_bases = self.allowed_knowledge_bases.clone();
+        let knowledge_access_trusted = ctx.knowledge_access_trusted;
+        let knowledge_base_id = args.knowledge_base_id;
+        let source_session_ids = args.source_session_ids;
+        // The provider write is blocking and can outlive a dispatcher timeout.
+        // Keep the exact fence through the completion ledger in a detached task
+        // so a second dream cannot select the same sources while it finishes.
+        let apply = tokio::spawn(async move {
+            let _run_fence = run_fence;
+            let outcome = apply_registered_knowledge_dream(
+                &session,
+                &cwd,
+                allowed_knowledge_bases.as_ref(),
+                &extended,
+                knowledge_access_trusted,
+                &dream,
+                cancel.cancel.clone(),
+                move |root| apply_knowledge_dream_writes(root, &writes),
+            )
+            .await?;
+            if !matches!(outcome, KnowledgeDreamGitOutcome::Deferred { .. }) {
+                let consumer = session.db.ensure_installation_identity().await?;
+                session
+                    .db
+                    .record_knowledge_dream_completion(
+                        &knowledge_base_id,
+                        project_root.as_str(),
+                        consumer.as_hex(),
+                        &source_session_ids,
+                    )
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(outcome)
+        });
+        let outcome = apply
+            .await
+            .context("knowledge dream owner task terminated before completion")??;
         Ok(render_knowledge_dream_outcome(outcome))
     }
 }

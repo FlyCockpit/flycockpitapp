@@ -2186,7 +2186,11 @@ pub(crate) async fn run_turn(
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
     let media_available = active_tools.has_direct_native_media();
-    let mut tools = active_tools.definitions(agent.tool_steering);
+    // The provider sees the stable schema projection, while dispatch below
+    // keeps using `active_tools` and enforces transient availability at call
+    // time. This is the cache boundary for dynamic media, memory, and host
+    // capability probes.
+    let mut tools = active_tools.advertised_definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
@@ -2194,17 +2198,14 @@ pub(crate) async fn run_turn(
     // pre-classification stream deltas through the buffered delivery sink. The
     // SAME predicate drives both so schema advertisement and stream withholding
     // cannot drift. Computed on the pre-append tool set: a trusted or
-    // tool-disabled (empty `tools`) route is never eligible.
+    // tool-disabled (empty `tools`) route is never eligible. Its only inputs
+    // are the agent/model posture, so a change accompanies the intentional
+    // model failover or agent rebuild cache boundary, never live availability.
     let report_leak_eligible =
         crate::leak_report::route_advertises_report_leak(model.is_trusted(), &tools);
     if report_leak_eligible {
         tools.push(crate::leak_report::report_leak_tool_definition());
     }
-
-    inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history)
-        .await;
-    let active_tool_names = active_tools.names();
-    super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.
@@ -2221,28 +2222,20 @@ pub(crate) async fn run_turn(
     // prefix.
     session.note_send();
 
-    inject_initial_project_guidance(&agent.name, history, &cwd, &config, redact.clone(), tx).await;
-    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, &prompt);
-    crate::knowledge::inject_knowledge_for_turn(
-        history,
+    inject_volatile_context(
+        agent,
         &session,
+        &active_tools,
+        is_root,
+        context_usage,
+        history,
+        &prompt,
         &cwd,
         &config,
-        &knowledge_query,
         redact.clone(),
+        tx,
     )
     .await;
-
-    // Live instructions-file diff injection (prompt
-    // `instructions-file-live-diff.md`). Guidance now rides as user-role
-    // project notes rather than raw system text, so live in-place edits do the
-    // same. Gated to the session root: subagents inject their own current
-    // guidance once when their first model turn starts. The baseline advances
-    // on inject, so each distinct change is injected exactly once.
-    if is_root && let Some(message) = session.guidance_change_injection(&cwd).await {
-        inject_live_project_guidance_change(history, &cwd, &config, redact.clone(), tx, &message)
-            .await;
-    }
 
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
@@ -2422,8 +2415,7 @@ pub(crate) async fn run_turn(
     .await;
 
     let mut prepared_request = model.prepare_completion_request(
-        &agent.system,
-        history,
+        crate::engine::model::AgentPromptParts::new(&agent.system, history),
         &prompt,
         &tools,
         &agent.params,
@@ -3569,6 +3561,48 @@ async fn inject_turn_start_system_messages(
             .any(|message| matches!(message, Message::System { content } if content == &nudge))
     {
         history.push(Message::System { content: nudge });
+    }
+}
+
+/// Inject every host-owned, per-turn prompt addition immediately before the
+/// provider request is assembled. The time prelude is already part of the
+/// inbound user message by this point; like every message appended here, it is
+/// deliberately volatile history rather than system-preamble text.
+async fn inject_volatile_context(
+    agent: &Agent,
+    session: &Session,
+    active_tools: &ToolBox,
+    is_root: bool,
+    context_usage: crate::engine::tool::ContextUsageSnapshot,
+    history: &mut Vec<Message>,
+    prompt: &Message,
+    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    redact: Arc<RedactionTable>,
+    tx: &mpsc::Sender<TurnEvent>,
+) {
+    inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history).await;
+    let active_tool_names = active_tools.names();
+    super::inject_available_skills_catalog(history, cwd, config, &active_tool_names);
+
+    inject_initial_project_guidance(&agent.name, history, cwd, config, redact.clone(), tx).await;
+    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, prompt);
+    crate::knowledge::inject_knowledge_for_turn(
+        history,
+        session,
+        cwd,
+        config,
+        &knowledge_query,
+        redact.clone(),
+    )
+    .await;
+
+    // Live instructions-file diffs and knowledge retrieval are fresh turn
+    // observations, so they stay in history. The same seam is reserved for
+    // knowledge-base freshness notices; their names/descriptions and frozen
+    // `last_dreamed_at` snapshot belong to the spawn-time stable prefix.
+    if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
+        inject_live_project_guidance_change(history, cwd, config, redact, tx, &message).await;
     }
 }
 

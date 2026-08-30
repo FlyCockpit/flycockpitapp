@@ -1584,6 +1584,11 @@ impl ToolBox {
         for (name, tool) in dormant {
             if availability.exposes_direct_tool(&name) {
                 self.tools.insert(name, tool);
+            } else {
+                // Retain the schema-only dormant entry so a partial live
+                // authority changes callability, never the cacheable tools
+                // prefix advertised to the provider.
+                self.dormant_direct_native_media.insert(name, tool);
             }
         }
         self.definition_cache.lock().unwrap().clear();
@@ -1598,6 +1603,27 @@ impl ToolBox {
         self.tools.keys().any(|name| {
             crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name.as_str())
         })
+    }
+
+    /// Move a direct-native media tool out of the callable surface while
+    /// retaining its schema in the stable provider projection.
+    pub(crate) fn deactivate_direct_native_media(mut self, name: &str) -> Self {
+        debug_assert!(crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name));
+        if let Some(tool) = self.tools.remove(name) {
+            self.dormant_direct_native_media
+                .insert(name.to_string(), tool);
+            self.definition_cache.lock().unwrap().clear();
+        }
+        self
+    }
+
+    /// Deactivate every direct-native media tool for a turn without deleting
+    /// the stable provider schema selected for this agent.
+    pub(crate) fn deactivate_direct_native_media_tools(mut self) -> Self {
+        for &name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+            self = self.deactivate_direct_native_media(name);
+        }
+        self
     }
 
     /// Permanently strip direct-native media from a background clone.
@@ -1816,6 +1842,35 @@ impl ToolBox {
             .unwrap()
             .insert(steering, definitions.clone());
         definitions
+    }
+
+    /// Project the session-stable provider tool schema.
+    ///
+    /// A live capability probe or root-scoped media authority may make a tool
+    /// temporarily non-callable, but it must not add or remove that tool from
+    /// the provider's cacheable `tools[]` prefix.  The ordinary
+    /// [`Self::definitions`] projection remains the operational view for UI,
+    /// MCP, and dispatch; this projection includes dormant media tools and
+    /// deliberately omits volatile capability-description suffixes. Calls to a
+    /// currently unavailable tool are rejected by the normal call-time lookup.
+    pub fn advertised_definitions(
+        &self,
+        steering: crate::agents::ToolSteering,
+    ) -> Vec<ToolDefinition> {
+        let tools: BTreeMap<&str, &Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .map(|(name, tool)| (name.as_str(), tool))
+            .chain(
+                self.dormant_direct_native_media
+                    .iter()
+                    .map(|(name, tool)| (name.as_str(), tool)),
+            )
+            .collect();
+        tools
+            .into_values()
+            .map(|tool| definition_of(&**tool, steering, self.overrides.get(tool.name())))
+            .collect()
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -2210,6 +2265,55 @@ mod definition_cache_tests {
         // A different steering is a different cache key → rebuild.
         let _ = toolbox.definitions(crate::agents::ToolSteering::Verbose);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct DormantMediaTool;
+
+    #[async_trait]
+    impl Tool for DormantMediaTool {
+        fn name(&self) -> &str {
+            "read_image"
+        }
+
+        fn description(&self) -> &str {
+            "read a current-session image"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("unavailable without live media authority"))
+        }
+    }
+
+    #[test]
+    fn advertised_definitions_include_dormant_media_without_making_it_callable() {
+        let toolbox = ToolBox::new().with_dormant_direct_native_media(Arc::new(DormantMediaTool));
+
+        assert!(toolbox.get("read_image").is_none());
+        assert!(
+            toolbox
+                .definitions(crate::agents::ToolSteering::Terse)
+                .is_empty()
+        );
+        let advertised = toolbox.advertised_definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0].name, "read_image");
+
+        let activated = toolbox.clone().activate_dormant_direct_native_media(
+            crate::tool_media_authority::MediaToolAvailability::available(),
+        );
+        assert!(activated.get("read_image").is_some());
+        assert_eq!(
+            serde_json::to_vec(&advertised).unwrap(),
+            serde_json::to_vec(
+                &activated.advertised_definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            "a media authority may change callability but never tools[]"
+        );
     }
 }
 

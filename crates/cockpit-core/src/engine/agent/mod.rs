@@ -460,14 +460,10 @@ pub(crate) async fn turn_toolbox(
             .await
             .is_none()
         {
-            toolbox = toolbox.without("transcribe_audio");
+            toolbox = toolbox.deactivate_direct_native_media("transcribe_audio");
         }
     } else {
-        for &name in
-            crate::tool_media_authority::MediaToolAvailability::unavailable().omitted_tool_names()
-        {
-            toolbox = toolbox.without(name);
-        }
+        toolbox = toolbox.deactivate_direct_native_media_tools();
     }
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
@@ -729,12 +725,15 @@ async fn toolbox_with_retrieval_if_needed(
     session: &Session,
     posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
-    // These two tools are registered with the built-in inventory so their
-    // schemas are available once a capture exists, but they must never be
-    // offered speculatively.  Start by removing any static registration so a
-    // rebuilt/restarted session gets the same artifact-dependent surface as a
-    // newly-created one.
+    // These retrieval tools are intentionally availability-gated: advertising
+    // a durable artifact or delegation payload before it exists would create a
+    // capability oracle. Their appearance therefore reflects a genuine new
+    // session resource and is an explicitly accepted cache-boundary change.
+    // Start by removing any static registration so a rebuilt/restarted session
+    // gets the same artifact-dependent surface as a newly-created one.
     tools = tools.without("artifact_read").without("artifact_search");
+    // Escalation is likewise a real session policy change, not a probe result;
+    // its schema changes only when that user-controlled policy changes.
     if session.sandbox_escalation_enabled()
         && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {

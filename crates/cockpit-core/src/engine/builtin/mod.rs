@@ -1662,17 +1662,17 @@ fn with_audio_video_tools(
             crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
         };
     }
-    if args.media_availability.is_available() {
-        tb = match effective_tool_tier(def, "transcribe_audio", false) {
-            crate::agents::ToolTier::Enabled => {
-                add_tool_by_name(tb, "transcribe_audio", def, args)?
-            }
-            crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
-            }
-            crate::agents::ToolTier::Disabled => tb,
-        };
-    }
+    // Materialize the transcriber even when the spawn snapshot cannot expose
+    // it. `materialize_tool_by_name` retains it as dormant in that case, and
+    // the stable advertised projection keeps its schema in `tools[]`; the
+    // root-scoped authority remains enforced at call time.
+    tb = match effective_tool_tier(def, "transcribe_audio", false) {
+        crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "transcribe_audio", def, args)?,
+        crate::agents::ToolTier::Discoverable => {
+            add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
+        }
+        crate::agents::ToolTier::Disabled => tb,
+    };
     Ok(tb)
 }
 
@@ -7787,6 +7787,12 @@ pub(crate) mod tests {
         let out = compose_system_prompt("ROLE", "abc", tmp.path());
         assert!(!out.contains("Project guidance"));
         assert!(!out.contains("RULES"));
+        // Every changing turn addition stays in the history half of
+        // `AgentPromptParts`, never in the cache-stable system prefix.
+        assert!(!out.contains("[time:"));
+        assert!(!out.contains("[knowledge]"));
+        assert!(!out.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(!out.contains("[project guidance notice]"));
     }
 
     /// Contract test: when multiple configured filenames exist in the

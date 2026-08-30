@@ -704,6 +704,9 @@ pub(super) fn validate_set_agent_name(
     name: &str,
     ownable: &[String],
 ) -> std::result::Result<(), ErrorPayload> {
+    if crate::agents::is_feature_primary(name) {
+        return Ok(());
+    }
     if !ownable.iter().any(|agent| agent == name) {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,

@@ -6631,6 +6631,97 @@ async fn handle_serialized_request_impl(
             })
         }
 
+        Request::AttachKnowledgeBaseSession {
+            knowledge_base_id,
+            session_id,
+        } => {
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let _guard = dream_lock.lock().await;
+            ctx.db
+                .attach_session_to_knowledge_base(&knowledge_base_id, session_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::DetachKnowledgeBaseSession {
+            knowledge_base_id,
+            session_id,
+        } => {
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let _guard = dream_lock.lock().await;
+            ctx.db
+                .detach_session_from_knowledge_base(&knowledge_base_id, session_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::KnowledgeDreamStatus {
+            project_root,
+            knowledge_base_id,
+        } => {
+            let cwd = std::fs::canonicalize(&project_root).map_err(|_| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "project_root must identify an existing canonical workspace".to_string(),
+            })?;
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                    .await
+                    .map_err(internal)?;
+            let (providers, extended) = ctx
+                .config_source()
+                .load_effective_for_daemon(&cwd, &trust_policy)
+                .map_err(daemon_config_error)?;
+            let knowledge_base = extended
+                .knowledge_bases
+                .iter()
+                .find(|entry| entry.id == knowledge_base_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "knowledge base `{knowledge_base_id}` is not configured for this workspace"
+                    ),
+                })?;
+            if !matches!(
+                &knowledge_base.source,
+                crate::config::extended::KnowledgeBaseSource::Local { .. }
+            ) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "remote knowledge-base dream submission is hosted and not implemented"
+                        .to_string(),
+                });
+            }
+            let model =
+                crate::knowledge::dream::resolve_dream_model(knowledge_base, &extended, &providers)
+                    .map_err(daemon_config_error)?;
+            let consumer = ctx
+                .db
+                .ensure_installation_identity()
+                .await
+                .map_err(internal)?;
+            let undreamed_session_ids = ctx
+                .db
+                .undreamed_sessions_for_knowledge_base(
+                    &knowledge_base_id,
+                    consumer.as_hex(),
+                    crate::knowledge::dream::history_caller_trust(&model, &providers),
+                )
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(|source| source.session_id)
+                .collect();
+            Ok(Response::KnowledgeDreamStatus {
+                // CLI model selectors use the canonical `provider/model`
+                // spelling, while the dream engine's internal comparison is
+                // colon-delimited after attach.
+                model: format!("{}/{}", model.provider, model.model),
+                undreamed_session_ids,
+            })
+        }
+
         Request::SendUserMessageV2 { ingress } => {
             Box::pin(handle_send_user_message_v2(
                 request_id,
@@ -28634,6 +28725,7 @@ async fn run_docs_ask_pipeline(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: None,
         credential_store: Some(store),
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),

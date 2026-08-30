@@ -209,6 +209,11 @@ pub struct Session {
     /// false even when their durable row is still idle.
     freshly_created: bool,
     pub db: Db,
+    /// Ephemeral attachment consent for an in-progress knowledge dream.  This
+    /// belongs to the session rather than an individual tool dispatch because
+    /// the orchestrator and its delegated readers reconstruct their `ToolCtx`
+    /// independently between model turns.
+    dream_read_scope: Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
     /// Daemon-injected wrap-key vault. Session fork, sealed persist, and
     /// redaction-table load use this handle instead of opening a second vault.
     secret_vault: Arc<crate::secure_key::SecretVault>,
@@ -497,8 +502,37 @@ pub struct Session {
 }
 
 impl Session {
+    /// The session-owned knowledge-dream attachment-consent cell.
+    pub(crate) fn dream_read_scope(
+        &self,
+    ) -> Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>> {
+        self.dream_read_scope.clone()
+    }
+
+    /// Starts a root turn with no inherited dream attachment consent. The
+    /// returned guard owns cleanup for every exit path, including a source
+    /// lookup that returns empty, errors while redacting, times out, or never
+    /// reaches `knowledge_dream_apply`.
+    pub(crate) fn begin_dream_read_scope_turn(&self) -> DreamReadScopeTurn {
+        let scope = self.dream_read_scope();
+        *scope.write().expect("dream read scope lock poisoned") = None;
+        DreamReadScopeTurn(scope)
+    }
+
     pub(crate) fn is_freshly_created(&self) -> bool {
         self.freshly_created
+    }
+}
+
+/// Root-turn ownership of ephemeral dream attachment consent. A scope is
+/// deliberately never carried into the next reusable session turn.
+pub(crate) struct DreamReadScopeTurn(
+    Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
+);
+
+impl Drop for DreamReadScopeTurn {
+    fn drop(&mut self) {
+        *self.0.write().expect("dream read scope lock poisoned") = None;
     }
 }
 
@@ -1692,6 +1726,18 @@ mod tests {
     use super::*;
     use crate::config::providers::{ProviderEntry, ProvidersConfig, WireApi};
     use serde_json::json;
+
+    #[test]
+    fn dream_read_scope_turn_clears_on_drop() {
+        let scope = Arc::new(std::sync::RwLock::new(Some(
+            [Uuid::nil()].into_iter().collect(),
+        )));
+        {
+            let _turn = DreamReadScopeTurn(scope.clone());
+            assert!(scope.read().unwrap().is_some());
+        }
+        assert!(scope.read().unwrap().is_none());
+    }
 
     fn providers_config(
         entries: impl IntoIterator<Item = (&'static str, ProviderEntry)>,

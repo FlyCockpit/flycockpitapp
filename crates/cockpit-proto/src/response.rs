@@ -55,6 +55,12 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    /// Authoritative pre/post-run receipt for CLI dream orchestration. The
+    /// source IDs are consent-bound ledger candidates, never transcript data.
+    KnowledgeDreamStatus {
+        model: String,
+        undreamed_session_ids: Vec<Uuid>,
+    },
     CodeRootCreated(crate::CreateCodeRootV1Result),
     CodeRootAttached(crate::AttachExistingCodeRootV1Result),
     CodeRootAttachmentClosed(crate::CloseCodeRootAttachmentV1Result),
@@ -1543,6 +1549,7 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
             (Response::CodeRootCreated(..), "code_root_created");
             (Response::CodeRootAttached(..), "code_root_attached");
             (Response::CodeRootAttachmentClosed(..), "code_root_attachment_closed");

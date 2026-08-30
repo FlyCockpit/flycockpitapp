@@ -831,6 +831,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
             ),
             None => ctx.agent.write_scope.clone(),
         },
+        dream_read_scope: ctx.dream_read_scope.clone(),
         workspace_lease: crate::workspace_lease::inherit_or_select_lease(
             ctx.agent.workspace_lease.as_deref(),
             None,
@@ -1241,6 +1242,7 @@ mod tests {
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact: table.clone(),
@@ -1424,6 +1426,7 @@ mod tests {
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact: table.clone(),
@@ -1565,6 +1568,7 @@ mod tests {
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         });
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact,

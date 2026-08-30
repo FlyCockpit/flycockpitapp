@@ -13,7 +13,7 @@
 //! and trusted-model rows may contain secrets because trusted outbound redaction
 //! is a no-op; history text must only reach models as ordinary tool output.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -27,6 +27,19 @@ const DEFAULT_LIMIT: u32 = 10;
 const MAX_LIMIT: u32 = 50;
 const TOOL_SCAN_MAX_SESSIONS: u32 = 16;
 const TOOL_SCAN_MAX_ROWS_PER_SESSION: u32 = 20;
+
+/// Return the source-session attachment set established by
+/// `knowledge_dream_sources`.  The lock is session-owned so a reconstructed
+/// tool context observes the same turn-scoped consent, while poisoning fails
+/// closed rather than widening history recall.
+pub(crate) fn established_dream_read_scope(
+    ctx: &crate::engine::tool::ToolCtx,
+) -> Result<Option<std::collections::BTreeSet<uuid::Uuid>>> {
+    ctx.dream_read_scope
+        .read()
+        .map(|scope| scope.clone())
+        .map_err(|_| anyhow::anyhow!("knowledge dream read scope lock poisoned"))
+}
 
 pub struct HistorySearchTool;
 
@@ -127,6 +140,12 @@ impl Tool for HistorySearchTool {
             .filter(|q| !q.is_empty())
             .ok_or_else(|| invalid_input("`query` is required"))?;
 
+        let dream_scope = established_dream_read_scope(ctx)?;
+        ensure!(
+            dream_scope.is_none() || scope == HistorySearchScope::Past,
+            "history_search denied: knowledge dreams may only search attached source sessions"
+        );
+
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -213,6 +232,26 @@ impl Tool for HistorySearchTool {
                 render_lineage(query, hits, scan, limit, ctx).await
             }
             HistorySearchScope::Past | HistorySearchScope::AllProjects => {
+                if let Some(scope) = dream_scope {
+                    // Attachment membership participates in the FTS query, so
+                    // ranking and the bounded result set can never include an
+                    // unattached session.
+                    let session_ids = scope.into_iter().collect::<Vec<_>>();
+                    let hits = ctx
+                        .session
+                        .db
+                        .search_candidates_in_sessions_for_trust(
+                            query,
+                            &session_ids,
+                            Some(ctx.session.id),
+                            since,
+                            limit,
+                            trust,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                    return render_session_hits(query, &hits, limit, false, ctx).await;
+                }
                 let all_projects = scope == HistorySearchScope::AllProjects;
                 let project_id = (!all_projects).then_some(ctx.session.project_id.as_str());
                 let hits = if all_projects {

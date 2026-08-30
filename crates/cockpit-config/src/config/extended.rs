@@ -385,6 +385,11 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utility_model: Option<String>,
 
+    /// Default model for knowledge-base dream orchestration. A KB-specific
+    /// `dreamModel` wins; this value then falls back to `utility_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream_model: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation_model: Option<String>,
 
@@ -1670,6 +1675,21 @@ impl ExtendedConfig {
             .or(self.utility_model.as_deref())
     }
 
+    /// Resolve the workspace-level half of the dream-model cascade. The
+    /// per-KB override is applied by the knowledge engine.
+    pub fn dream_model_ref(&self) -> Option<&str> {
+        self.dream_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                self.utility_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+            })
+    }
+
     /// The model ref for drafting the `/compact` handoff brief: the
     /// dedicated `compact_model` when set and non-empty (after trimming),
     /// else the shared `utility_model`. An unset/empty result means "use
@@ -1726,6 +1746,7 @@ impl Default for ExtendedConfig {
             allow_computer_guidance_proposals: None,
             allow_remote_config: false,
             utility_model: None,
+            dream_model: None,
             translation_model: None,
             cheap_code: None,
             smart_code: None,

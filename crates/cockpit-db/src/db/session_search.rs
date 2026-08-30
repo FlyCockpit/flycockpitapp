@@ -156,6 +156,38 @@ impl Db {
                 pool,
                 caller_trust,
                 None,
+                None,
+            )
+        })
+        .await
+    }
+
+    /// Search only an explicit set of sessions. The membership filter is part
+    /// of the FTS query, before BM25 ordering and the bounded candidate pool,
+    /// so consent-scoped callers cannot be starved by unrelated sessions.
+    pub async fn search_candidates_in_sessions_for_trust(
+        &self,
+        query: &str,
+        session_ids: &[Uuid],
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let session_ids = session_ids.to_vec();
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                None,
+                exclude_session,
+                since,
+                None,
+                pool,
+                caller_trust,
+                Some(&session_ids),
+                None,
             )
         })
         .await
@@ -185,6 +217,7 @@ impl Db {
                 Some(after_session_event_seq),
                 pool,
                 caller_trust,
+                None,
                 None,
             )
         })
@@ -216,6 +249,7 @@ impl Db {
                 None,
                 pool,
                 caller_trust,
+                None,
                 Some(&reader_project),
             )
         })
@@ -476,6 +510,7 @@ fn search_candidates_inner(
     after_session_event_seq: Option<i64>,
     pool: u32,
     caller_trust: HistoryCallerTrust,
+    allowed_session_ids: Option<&[Uuid]>,
     reader_project: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
@@ -545,11 +580,16 @@ fn search_candidates_inner(
                          AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
                                      WHERE target.project_id = s.project_id
                                        AND target.inbound_enabled = 1)))
+                AND (?8 IS NULL OR f.session_id IN (SELECT value FROM json_each(?8)))
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
 
     let exclude = exclude_session.map(|u| u.to_string());
+    let allowed_session_ids = allowed_session_ids.map(|ids| {
+        serde_json::to_string(&ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+            .expect("UUID session ids serialize")
+    });
     let rows = stmt
         .query_map(
             params![
@@ -560,6 +600,7 @@ fn search_candidates_inner(
                 after_session_event_seq,
                 caller_trust.can_read_trusted(),
                 reader_project,
+                allowed_session_ids,
             ],
             |row| {
                 let sid: String = row.get("session_id")?;
@@ -1571,6 +1612,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(global.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_session_scope_filters_before_candidate_pool_truncation() {
+        let db = Db::open_in_memory().unwrap();
+        let attached = db
+            .create_session("attached", "/attached", "Build")
+            .await
+            .unwrap();
+        msg(
+            &db,
+            attached.session_id,
+            SessionEventKind::UserMessage,
+            "shared dream-search marker",
+        )
+        .await;
+        for project in ["unattached-a", "unattached-b", "unattached-c"] {
+            let session = db.create_session(project, "/other", "Build").await.unwrap();
+            msg(
+                &db,
+                session.session_id,
+                SessionEventKind::UserMessage,
+                "shared dream-search marker",
+            )
+            .await;
+        }
+
+        // A global pool of one can be consumed by a later, unattached match.
+        // The explicit attachment filter must run in SQL before that pool is
+        // ranked and truncated.
+        let hits = db
+            .search_candidates_in_sessions_for_trust(
+                "shared dream-search marker",
+                &[attached.session_id],
+                None,
+                None,
+                1,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.session_id).collect::<Vec<_>>(),
+            vec![attached.session_id]
+        );
     }
 
     #[tokio::test]

@@ -57,10 +57,16 @@ pub fn is_removed_primary(name: &str) -> bool {
 /// Built-in primaries that are real primary agents but never appear in the
 /// normal `/agent` list or Shift+Tab cycle. They are reached only through a
 /// dedicated feature flow.
-pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Multireview"];
+pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Dream", "Multireview"];
 
 pub fn is_hidden_primary(name: &str) -> bool {
     HIDDEN_PRIMARY_NAMES.contains(&name)
+}
+
+/// Feature-only root agents are excluded from the selectable roster but may
+/// be selected by their owning command flow.
+pub fn is_feature_primary(name: &str) -> bool {
+    matches!(name, "Dream")
 }
 
 /// Public built-in primaries in the `/agent` listing and Shift+Tab cycle.
@@ -68,7 +74,7 @@ pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful"];
 
 /// Every built-in primary that may own a root session, including hidden
 /// feature-flow primaries.
-pub const BUILTIN_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful", "Multireview"];
+pub const BUILTIN_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful", "Dream", "Multireview"];
 
 pub fn is_builtin_primary(name: &str) -> bool {
     BUILTIN_PRIMARY_NAMES.contains(&name)
@@ -117,6 +123,8 @@ pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
         "computer" => Some(computer_def()),
         "docs-resolver" => Some(docs_resolver_def()),
         "docs-answerer" => Some(docs_answerer_def()),
+        "Dream" => Some(dream_def()),
+        "dream-worker" => Some(dream_worker_def()),
         "standard" => Some(standard_def()),
         _ => None,
     }
@@ -267,6 +275,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
             "deepthink",
             "scout",
         ],
+        "Dream" => &["dream-worker"],
         "Plan" => &["explore", "history", "knowledge"],
         "Multireview" => &["scout"],
         "builder" | "bee" => &["explore"],
@@ -683,6 +692,32 @@ fn multireview_def() -> AgentDef {
     )
 }
 
+/// `Dream` is the only root that may invoke the governed dream source/apply
+/// tools. Its complete surface is intentionally read-only apart from the
+/// structural `task` delegation to its single read-only worker.
+fn dream_def() -> AgentDef {
+    def(
+        "Dream",
+        "Governed knowledge-dream orchestrator; it may delegate only to the read-only dream worker.",
+        AgentMode::Primary,
+        &["read", "history_search"],
+        crate::engine::builtin::DREAM_PROMPT,
+    )
+}
+
+/// One-layer leaf used exclusively by [`dream_def`]. It has no shell,
+/// mutation, MCP, or delegation capability, so a proposal cannot bypass the
+/// orchestrator's change-set sink.
+fn dream_worker_def() -> AgentDef {
+    def(
+        "dream-worker",
+        "Read-only knowledge-dream evidence worker; returns proposed concept upserts to Dream.",
+        AgentMode::Subagent,
+        &["read", "history_search", "return"],
+        crate::engine::builtin::DREAM_WORKER_PROMPT,
+    )
+}
+
 fn computer_def() -> AgentDef {
     def(
         "computer",
@@ -891,6 +926,40 @@ mod tests {
             listed.iter().any(|name| name == "Careful"),
             "Careful should be public in the primary list: {listed:?}"
         );
+    }
+
+    #[test]
+    fn dream_agent_chain_has_no_direct_mutation_or_shell_capability() {
+        let dream = embedded_internal_default("Dream").expect("Dream definition");
+        let worker = embedded_internal_default("dream-worker").expect("worker definition");
+        for (name, definition) in [("Dream", &dream), ("dream-worker", &worker)] {
+            let tools = definition.tools.as_ref().expect("explicit tools");
+            for forbidden in [
+                "bash", "write", "edit", "unlock", "mcp", "spawn", "schedule",
+            ] {
+                assert!(
+                    !tools.iter().any(|tool| tool == forbidden),
+                    "{name} must not hold {forbidden}"
+                );
+            }
+        }
+        assert!(
+            !worker
+                .tools
+                .as_ref()
+                .expect("worker tools")
+                .iter()
+                .any(|tool| tool == "task"),
+            "dream workers are a one-layer leaf"
+        );
+        assert!(matches!(
+            dream
+                .vnext
+                .as_ref()
+                .and_then(|definition| definition.delegation.allowed_children.first()),
+            Some(AllowedChild::PortableRef { portable_agent_ref })
+                if portable_agent_ref == "cockpit/dream-worker"
+        ));
     }
 
     #[test]

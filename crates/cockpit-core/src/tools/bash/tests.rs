@@ -817,6 +817,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         agent_instance_id: None,
         lock_identity: "builder".to_string().clone(),
         write_scope: None,
+        dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
         workspace_lease: None,
         current_tool_call_id: None,
         tool_steering: crate::agents::ToolSteering::Terse,

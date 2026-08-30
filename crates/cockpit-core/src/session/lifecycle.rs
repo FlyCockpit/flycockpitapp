@@ -736,6 +736,7 @@ impl Session {
             started_at,
             freshly_created,
             db,
+            dream_read_scope: Arc::new(std::sync::RwLock::new(None)),
             secret_vault: vault,
             external_journal: Mutex::new(None),
             transcription_dispatch: Mutex::new(std::collections::HashMap::new()),

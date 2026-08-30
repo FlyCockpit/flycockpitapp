@@ -41,7 +41,7 @@ CREATE TABLE assistants (
 -- network-order bytes and never derive an identity by hashing the legacy key.
 CREATE TABLE project_identities (
     project_id   TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
-    project_uuid BLOB NOT NULL UNIQUE CHECK (
+    project_uuid BLOB NOT NULL CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
         AND project_uuid <> zeroblob(16)
     ),
@@ -1088,6 +1088,49 @@ CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_
   WHERE shared_with_collaborators = 1;
 CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_unix_ms DESC)
   WHERE assistant_name IS NOT NULL;
+
+-- ---- knowledge dream scope + completion ledger ----------------------------
+-- Attachment is the explicit consent boundary for cross-session dream reads.
+-- KB definitions remain configuration-owned, so kb_id intentionally has no
+-- foreign key to a duplicated SQLite registry.
+CREATE TABLE knowledge_base_session_attachments (
+    kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    attached_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (kb_id, session_id)
+);
+CREATE INDEX idx_kb_session_attachments_session
+    ON knowledge_base_session_attachments(session_id, kb_id);
+
+-- Immutable completion facts. consumer_id is the local installation identity
+-- today and is reserved for hosted MCP-token consumers without a schema change.
+CREATE TABLE knowledge_dreamed_sessions (
+    kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    consumer_id TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    dreamed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (kb_id, consumer_id, session_id)
+);
+CREATE INDEX idx_knowledge_dreamed_sessions_last
+    ON knowledge_dreamed_sessions(kb_id, consumer_id, dreamed_at_unix_ms DESC);
+
+-- One monotonic freshness boundary per concrete KB attachment. The attachment
+-- UUID, rather than the mutable registry id, prevents a replacement source
+-- from inheriting the predecessor's dream state.
+CREATE TABLE knowledge_dream_ledger (
+    project_uuid BLOB NOT NULL UNIQUE CHECK (
+        typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
+        AND project_uuid <> zeroblob(16)
+    ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,
+    knowledge_base_attachment_id BLOB NOT NULL CHECK (
+        typeof(knowledge_base_attachment_id) = 'blob'
+        AND length(knowledge_base_attachment_id) = 16
+        AND knowledge_base_attachment_id <> zeroblob(16)
+    ),
+    last_dreamed_session_event_seq INTEGER NOT NULL CHECK (last_dreamed_session_event_seq >= 0),
+    updated_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_uuid, knowledge_base_attachment_id)
+);
 
 -- ---- sealed_values ---------------------------------------------------------
 -- Session-owned write-only values. The literal column is nullable so a vault

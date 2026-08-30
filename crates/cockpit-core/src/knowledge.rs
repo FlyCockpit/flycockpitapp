@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,9 @@ use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
+
+pub(crate) mod dream;
+pub use dream::build_dream_prompt;
 
 /// Durable, paid projection of local KB chunks.  This database deliberately
 /// contains no OKF metadata or FTS state, so rebuilding the other sidecar can
@@ -64,6 +67,7 @@ const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 const KNOWLEDGE_RETRIEVE_TOOL_NAME: &str = "knowledge_retrieve";
+const KNOWLEDGE_DREAM_SOURCES_TOOL_NAME: &str = "knowledge_dream_sources";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
 const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
@@ -85,6 +89,7 @@ pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
     &[
         MEMORY_SEARCH_TOOL_NAME,
         KNOWLEDGE_RETRIEVE_TOOL_NAME,
+        KNOWLEDGE_DREAM_SOURCES_TOOL_NAME,
         KNOWLEDGE_DREAM_APPLY_TOOL_NAME,
     ]
 }
@@ -129,6 +134,41 @@ pub(crate) struct KnowledgeConcept {
 }
 
 impl KnowledgeConcept {
+    /// Build a concept produced by the governed dream pipeline.  Provenance is
+    /// represented in the stable OKF frontmatter rather than as a parallel
+    /// in-memory field, so parsed and newly-created concepts have one source
+    /// of truth.
+    pub(crate) fn dream(
+        id: String,
+        concept_type: String,
+        title: Option<String>,
+        body: String,
+        citations: Vec<Citation>,
+    ) -> Self {
+        let mut frontmatter = BTreeMap::new();
+        frontmatter.insert("id".to_owned(), id.clone());
+        frontmatter.insert("provenance".to_owned(), "dream".to_owned());
+        if let Some(title) = title {
+            frontmatter.insert("title".to_owned(), title);
+        }
+        Self {
+            path: PathBuf::from(format!("{id}.md")),
+            id,
+            concept_type,
+            frontmatter,
+            body,
+            citations,
+            valid_from: None,
+            supersedes: Vec::new(),
+            invalidated_by: None,
+        }
+    }
+
+    /// Return the source-of-truth OKF provenance marker, when supplied.
+    pub(crate) fn provenance(&self) -> Option<&str> {
+        self.frontmatter.get("provenance").map(String::as_str)
+    }
+
     /// Resolve this concept's KB-scoped symbolic references at read time.
     /// Markdown serialization never calls this method, so the source tree and
     /// git only ever receive the symbolic token.
@@ -4402,13 +4442,20 @@ pub(crate) async fn with_memory_search_if_attached(
                 )
         })
     });
-    if dream_writes_enabled {
-        toolbox.with(Arc::new(KnowledgeDreamApplyTool {
-            allowed_knowledge_bases,
-            executing_model: executing_model.to_string(),
-        }))
+    if dream_writes_enabled && definition.is_some_and(|definition| definition.name == "Dream") {
+        toolbox
+            .with(Arc::new(KnowledgeDreamApplyTool {
+                allowed_knowledge_bases: allowed_knowledge_bases.clone(),
+                executing_model: executing_model.to_string(),
+            }))
+            .with(Arc::new(KnowledgeDreamSourcesTool {
+                allowed_knowledge_bases,
+                executing_model: executing_model.to_string(),
+            }))
     } else {
-        toolbox.without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
+        toolbox
+            .without(KNOWLEDGE_DREAM_SOURCES_TOOL_NAME)
+            .without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
     }
 }
 
@@ -4436,11 +4483,22 @@ pub(crate) struct KnowledgeDreamApplyTool {
     executing_model: String,
 }
 
+pub(crate) struct KnowledgeDreamSourcesTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+    executing_model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeDreamSourcesArgs {
+    knowledge_base_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeDreamApplyArgs {
     knowledge_base_id: String,
-    sessions_dreamed: usize,
+    source_session_ids: Vec<uuid::Uuid>,
     writes: Vec<KnowledgeDreamWrite>,
 }
 
@@ -4448,6 +4506,98 @@ struct KnowledgeDreamApplyArgs {
 struct KnowledgeDreamWrite {
     path: String,
     content: String,
+}
+
+#[async_trait]
+impl Tool for KnowledgeDreamSourcesTool {
+    fn name(&self) -> &str {
+        KNOWLEDGE_DREAM_SOURCES_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "List the consent-attached sessions that still need to be dreamed"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": { "knowledgeBaseId": { "type": "string" } },
+            "required": ["knowledgeBaseId"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: KnowledgeDreamSourcesArgs = typed_args(args)?;
+        let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
+        let knowledge_base = bundles
+            .bundles
+            .iter()
+            .find(|bundle| bundle.entry.id == args.knowledge_base_id)
+            .context("dream target knowledge base is not attached")?;
+        let model = dream::resolve_dream_model(&knowledge_base.entry, &extended, &providers)?;
+        ensure!(
+            model.reference() == self.executing_model,
+            "knowledge base `{}` must dream with `{}`",
+            knowledge_base.entry.id,
+            model.reference()
+        );
+        let consumer = ctx.session.db.ensure_installation_identity().await?;
+        let mut sources = ctx
+            .session
+            .db
+            .undreamed_sessions_for_knowledge_base(
+                &knowledge_base.entry.id,
+                consumer.as_hex(),
+                dream::history_caller_trust(&model, &providers),
+            )
+            .await?;
+        let redaction_base = ctx
+            .session
+            .with_machine_scoped_sealed_redactions(&ctx.redact)
+            .await?;
+        for source in &mut sources {
+            let redactor = ctx
+                .session
+                .recall_redaction_table_from_base(&redaction_base, source.session_id)?;
+            source.title = source.title.take().map(|title| redactor.scrub(&title));
+            source.description = redactor.scrub(&source.description);
+        }
+        let ids = sources
+            .iter()
+            .map(|source| source.session_id)
+            .collect::<BTreeSet<_>>();
+        let output = serde_json::to_string_pretty(
+            &sources
+                .into_iter()
+                .map(|source| {
+                    json!({
+                        "sessionId": source.session_id,
+                        "title": source.title,
+                        "description": source.description,
+                        "lastActiveAtUnixMs": source.last_active_at_unix_ms,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        *ctx.dream_read_scope
+            .write()
+            .expect("dream read scope lock poisoned") = Some(ids);
+        Ok(ToolOutput::text(output))
+    }
 }
 
 #[async_trait]
@@ -4463,8 +4613,9 @@ impl Tool for KnowledgeDreamApplyTool {
     fn verbose_description(&self) -> Option<String> {
         Some(
             "Write the complete changed OKF concept/resource files from a completed knowledge dream. \
-             The named KB must be attached and configured with a dream model. Paths are single files \
-             at the KB root; submit the full contents for every file changed by this dream. The daemon \
+             The named KB must be attached and configured with a dream model. Submit exactly the \
+             sourceSessionIds returned by knowledge_dream_sources, plus full contents for every \
+             changed root-level file. The daemon \
              validates the resulting OKF bundle, records a structured Git commit when available, and \
              safely defers remote publication rather than force-pushing."
                 .to_string(),
@@ -4483,10 +4634,11 @@ impl Tool for KnowledgeDreamApplyTool {
                     "type": "string",
                     "description": "Attached local knowledge base ID"
                 },
-                "sessionsDreamed": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Number of source sessions included in this dream"
+                "sourceSessionIds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "format": "uuid" },
+                    "description": "Exact source IDs returned by knowledge_dream_sources"
                 },
                 "writes": {
                     "type": "array",
@@ -4508,7 +4660,7 @@ impl Tool for KnowledgeDreamApplyTool {
                     }
                 }
             },
-            "required": ["knowledgeBaseId", "sessionsDreamed", "writes"],
+            "required": ["knowledgeBaseId", "sourceSessionIds", "writes"],
             "additionalProperties": false
         })
     }
@@ -4520,11 +4672,26 @@ impl Tool for KnowledgeDreamApplyTool {
                 "knowledgeDreamApply knowledgeBaseId must not be empty",
             ));
         }
-        if args.sessions_dreamed == 0 {
+        if args.source_session_ids.is_empty() {
             return Err(invalid_input(
-                "knowledgeDreamApply sessionsDreamed must be at least 1",
+                "knowledgeDreamApply sourceSessionIds must not be empty",
             ));
         }
+        let submitted_sources = args
+            .source_session_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            submitted_sources.len() == args.source_session_ids.len(),
+            "knowledgeDreamApply sourceSessionIds must not contain duplicates"
+        );
+        let scoped_sources = crate::tools::session_search::established_dream_read_scope(ctx)?
+            .context("knowledge_dream_apply requires a prior knowledge_dream_sources call")?;
+        ensure!(
+            scoped_sources == submitted_sources,
+            "knowledge_dream_apply sourceSessionIds must exactly match the current consent scope"
+        );
         let writes = validate_knowledge_dream_writes(args.writes)?;
         let extended = ctx.config.extended();
         let bundles = attached_bundles(
@@ -4779,9 +4946,9 @@ impl Tool for KnowledgeDreamApplyTool {
             .count();
         let data_files_written = writes.len().saturating_sub(concepts_written);
         let dream = KnowledgeDreamCommit {
-            knowledge_base_id: args.knowledge_base_id,
+            knowledge_base_id: args.knowledge_base_id.clone(),
             model: self.executing_model.clone(),
-            sessions_dreamed: args.sessions_dreamed,
+            sessions_dreamed: args.source_session_ids.len(),
             concepts_written,
             data_files_written,
         };
@@ -4798,8 +4965,19 @@ impl Tool for KnowledgeDreamApplyTool {
             cancel.cancel.clone(),
             move |root| apply_knowledge_dream_writes(root, &writes),
         )
-        .await;
-        Ok(render_knowledge_dream_outcome(outcome?))
+        .await?;
+        if !matches!(outcome, KnowledgeDreamGitOutcome::Deferred { .. }) {
+            let consumer = ctx.session.db.ensure_installation_identity().await?;
+            ctx.session
+                .db
+                .record_knowledge_dream_completion(
+                    &args.knowledge_base_id,
+                    consumer.as_hex(),
+                    &args.source_session_ids,
+                )
+                .await?;
+        }
+        Ok(render_knowledge_dream_outcome(outcome))
     }
 }
 

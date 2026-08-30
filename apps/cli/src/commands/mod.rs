@@ -83,6 +83,7 @@ pub mod init;
 pub mod invocation;
 pub mod jq;
 pub mod kcl;
+pub mod knowledge;
 pub mod learn;
 pub mod mcp;
 pub mod models;

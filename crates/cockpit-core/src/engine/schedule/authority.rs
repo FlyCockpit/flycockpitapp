@@ -229,6 +229,8 @@ pub struct ScheduleContext {
     /// rather than a resolved value: the coordinator is installed after the
     /// driver is built, so a snapshot taken here would always be `None`.
     pub write_scope: Option<crate::write_scope::WriteScopeSource>,
+    pub dream_read_scope:
+        std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
 }
 
 impl ScheduleContext {
@@ -1121,6 +1123,7 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(64);
         let (turn_tx, turn_rx) = mpsc::channel(64);
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact,

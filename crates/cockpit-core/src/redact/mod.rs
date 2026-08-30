@@ -929,6 +929,7 @@ impl PersistedEntry {
 /// A built lookup of `value → origin-name` pairs the next outbound
 /// request must be scrubbed against. Hold one per session (cheap to
 /// rebuild; small in-memory footprint).
+#[derive(Clone)]
 pub struct RedactionTable {
     /// Aho-Corasick search structure; `None` when there's nothing to
     /// scrub or redaction is disabled. Keeping it `Option` lets

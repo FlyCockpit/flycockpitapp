@@ -7,6 +7,30 @@ use crate::daemon::client::OwnedSessionMode;
 
 pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
     match command {
+        KnowledgeCommand::Attach {
+            knowledge_base_id,
+            session_id,
+        } => {
+            mutate_attachment(
+                cockpit_proto::request::Request::AttachKnowledgeBaseSession {
+                    knowledge_base_id,
+                    session_id,
+                },
+            )
+            .await
+        }
+        KnowledgeCommand::Detach {
+            knowledge_base_id,
+            session_id,
+        } => {
+            mutate_attachment(
+                cockpit_proto::request::Request::DetachKnowledgeBaseSession {
+                    knowledge_base_id,
+                    session_id,
+                },
+            )
+            .await
+        }
         KnowledgeCommand::Dream { knowledge_base_id } => {
             let prompt = cockpit_core::knowledge::build_dream_prompt(&knowledge_base_id);
             eprintln!("Dreaming knowledge base `{knowledge_base_id}`…");
@@ -33,4 +57,17 @@ pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn mutate_attachment(request: cockpit_proto::request::Request) -> Result<()> {
+    crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
+        Box::pin(async move {
+            client
+                .request_ok(request)
+                .await
+                .context("updating knowledge-base session consent")?;
+            Ok(())
+        })
+    })
+    .await
 }

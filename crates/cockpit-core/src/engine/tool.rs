@@ -1064,6 +1064,11 @@ pub struct ToolCtx {
     /// Optional subtree that write-capable native tools and shell sandboxes must
     /// confine writes to. Reads remain governed by the session boundary.
     pub(crate) write_scope: Option<std::path::PathBuf>,
+    /// Knowledge-dream consent scope established by `knowledge_dream_sources`.
+    /// When present, cross-session readers must only read these attached source
+    /// sessions, and sibling/global short-id lookup is disabled.
+    pub(crate) dream_read_scope:
+        Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
     /// Host-issued workspace lease for this child. Path checks, the shell
     /// sandbox, and computer-use gating honor its visibility root and ops.
     pub(crate) workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
@@ -1250,6 +1255,7 @@ impl ToolCtx {
             agent_instance_id: self.agent_instance_id,
             lock_identity: self.lock_identity.clone(),
             write_scope: self.write_scope.clone(),
+            dream_read_scope: self.dream_read_scope.clone(),
             workspace_lease: self.workspace_lease.clone(),
             current_tool_call_id: self.current_tool_call_id.clone(),
             tool_steering: self.tool_steering,

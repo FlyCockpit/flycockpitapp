@@ -5735,6 +5735,34 @@ async fn handle_serialized_request_impl(
             })
         }
 
+        Request::AttachKnowledgeBaseSession {
+            knowledge_base_id,
+            session_id,
+        } => {
+            let _guard = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id)
+                .lock()
+                .await;
+            ctx.db
+                .attach_session_to_knowledge_base(&knowledge_base_id, session_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::DetachKnowledgeBaseSession {
+            knowledge_base_id,
+            session_id,
+        } => {
+            let _guard = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id)
+                .lock()
+                .await;
+            ctx.db
+                .detach_session_from_knowledge_base(&knowledge_base_id, session_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::SendUserMessageV2 { ingress } => {
             Box::pin(handle_send_user_message_v2(
                 request_id,

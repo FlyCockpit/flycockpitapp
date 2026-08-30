@@ -205,6 +205,8 @@ pub struct SpawnArgs {
     /// Optional write-confined subtree for delegated children. Native writes
     /// and shell sandboxes enforce this; reads remain cwd-wide.
     pub write_scope: Option<std::path::PathBuf>,
+    pub dream_read_scope:
+        std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
     /// Host-issued workspace lease for this spawn. Sandboxed children see
     /// only this lease's visibility root.
     pub workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,

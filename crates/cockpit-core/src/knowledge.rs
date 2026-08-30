@@ -3859,6 +3859,15 @@ impl Tool for KnowledgeDreamSourcesTool {
             .db
             .undreamed_sessions_for_knowledge_base(&knowledge_base.entry.id, consumer.as_hex())
             .await?;
+        {
+            let scoped_ids = sources
+                .iter()
+                .map(|source| source.session_id)
+                .collect::<BTreeSet<_>>();
+            *ctx.dream_read_scope
+                .write()
+                .expect("dream read scope lock poisoned") = Some(scoped_ids);
+        }
         let redaction_base = ctx
             .session
             .with_machine_scoped_sealed_redactions(&ctx.redact)
@@ -3989,6 +3998,20 @@ impl Tool for KnowledgeDreamApplyTool {
             source_session_ids: args.source_session_ids,
             upserts: args.upserts,
         };
+        ensure!(
+            ctx.dream_read_scope
+                .read()
+                .expect("dream read scope lock poisoned")
+                .as_ref()
+                .is_some_and(|scope| {
+                    scope.len() == change_set.source_session_ids.len()
+                        && change_set
+                            .source_session_ids
+                            .iter()
+                            .all(|session_id| scope.contains(session_id))
+                }),
+            "knowledge_dream_apply requires a prior knowledge_dream_sources call for the same source sessions"
+        );
         let cancel = dream_write_cancellation(ctx);
         let sink = dream::LocalGitSink::new(
             ctx.session.clone(),

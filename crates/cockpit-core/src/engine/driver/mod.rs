@@ -1302,6 +1302,8 @@ pub struct Driver {
     /// Durable write-scope authority cell, installed by the worker. Held as the
     /// registry's cell so a late `set_write_scope` is visible.
     write_scope: Option<crate::write_scope::WriteScopeSource>,
+    dream_read_scope:
+        std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
     /// Compact-after-delegation trackers for **interactive** subagent
     /// delegations (`SpawnSubagent`), keyed by the paused parent frame's
     /// stack depth (its index in `self.stack`). The lazy shrink for the
@@ -1626,6 +1628,8 @@ struct ChildCwd {
 struct DelegationConfinement {
     lock_identity: Option<String>,
     write_scope: Option<std::path::PathBuf>,
+    dream_read_scope:
+        std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
     workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
 }
 
@@ -2129,6 +2133,7 @@ impl Driver {
             local_installations: self.vnext_local_installation_resolver.clone(),
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
         };
         let schedule = ScheduleAuthority::new(
             job_event_tx,
@@ -2249,6 +2254,7 @@ impl Driver {
             resource_scheduler: self.resource_scheduler.clone(),
             daemon_scheduler: self.daemon_scheduler.clone(),
             write_scope: self.write_scope.clone(),
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: self.model_override.clone(),
             swarm_max_depth: self.swarm_max_depth,
@@ -2498,6 +2504,7 @@ impl Driver {
             // Installed later by `set_write_scope_source`; the authority's copy
             // is updated through the same setter.
             write_scope: None,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
         };
         // The authority needs the engine UI-event channel (`tx`) to emit
         // started/progress/note signals, but `tx` isn't known until
@@ -2612,6 +2619,7 @@ impl Driver {
             resource_scheduler: None,
             daemon_scheduler: None,
             write_scope: None,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
@@ -4386,6 +4394,7 @@ impl Driver {
             agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
             lock_identity: agent.name.clone().clone(),
             write_scope: agent.write_scope.clone(),
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: agent.workspace_lease.clone(),
             current_tool_call_id: None,
             tool_steering: agent.tool_steering,
@@ -14066,6 +14075,7 @@ impl Driver {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             // Owner-scoped store for delegated/computer-use model construction,
             // derived from the driver's pinned providers config: a child can only
@@ -14200,6 +14210,7 @@ impl Driver {
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,
             write_scope: confinement.write_scope,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             mcp_parent_reachable: self
                 .stack
                 .last()

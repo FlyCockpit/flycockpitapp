@@ -415,6 +415,20 @@ pub struct LearnArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum KnowledgeCommand {
+    /// Attach a session to a knowledge base as dream input consent.
+    Attach {
+        #[arg(value_name = "KB_ID")]
+        knowledge_base_id: String,
+        #[arg(value_name = "SESSION_ID")]
+        session_id: uuid::Uuid,
+    },
+    /// Revoke a session's knowledge-base dream input consent.
+    Detach {
+        #[arg(value_name = "KB_ID")]
+        knowledge_base_id: String,
+        #[arg(value_name = "SESSION_ID")]
+        session_id: uuid::Uuid,
+    },
     /// Dream all currently attached, undreamed sessions into a KB.
     Dream {
         #[arg(value_name = "KB_ID")]

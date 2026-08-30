@@ -401,6 +401,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,

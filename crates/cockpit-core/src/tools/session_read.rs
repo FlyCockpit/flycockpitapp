@@ -11,7 +11,7 @@
 //! normally — no bypass. Stored history is raw, so reads are trust-filtered in
 //! the DB and must only reach models as ordinary tool output.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
@@ -94,6 +94,7 @@ impl Tool for SessionReadTool {
             .ok_or_else(|| invalid_input("`short_id` is required"))?;
 
         let session_id = resolve_session(ctx, id_arg).await?;
+        enforce_dream_read_scope(ctx, session_id)?;
 
         let turns = ctx
             .session
@@ -132,6 +133,20 @@ impl Tool for SessionReadTool {
 
         Ok(render_window(&turns, start_seq, id_arg))
     }
+}
+
+fn enforce_dream_read_scope(ctx: &ToolCtx, session_id: Uuid) -> Result<()> {
+    let guard = ctx
+        .dream_read_scope
+        .read()
+        .expect("dream read scope lock poisoned");
+    if let Some(scope) = guard.as_ref() {
+        ensure!(
+            scope.contains(&session_id),
+            "session_read denied: knowledge dreams may read only attached source sessions"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve `id_arg` to a session id. Accepts a full UUID or a 6-char

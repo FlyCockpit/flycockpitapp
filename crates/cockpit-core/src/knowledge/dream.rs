@@ -365,7 +365,7 @@ impl DreamEngine {
     }
 }
 
-fn knowledge_dream_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn knowledge_dream_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let mut locks = LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))

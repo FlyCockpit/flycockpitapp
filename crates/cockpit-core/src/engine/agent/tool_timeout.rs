@@ -67,7 +67,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     // write fence. Once the blocking transaction starts it must reach its
     // commit/defer boundary, so it must not claim the dispatcher's stronger
     // cleanup-before-return cancellation contract.
-    ToolTimeoutSafety::abandon_safe("knowledge_dream_apply"),
+    ToolTimeoutSafety::nested_dispatch_or_owned_transport("knowledge_dream_apply"),
     ToolTimeoutSafety::abandon_safe("knowledge_dream_sources"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),

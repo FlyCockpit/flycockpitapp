@@ -687,6 +687,7 @@ async fn observe_capture(
         subagent_type,
         subagent_id,
         fields,
+        false,
     )
     .await;
     let inv = runner
@@ -733,6 +734,7 @@ async fn retained_relative_hook_dispatch_never_reopens_command_or_workspace_cwd(
             start_source: Some("fresh"),
             ..Default::default()
         },
+        false,
     )
     .await;
 
@@ -961,6 +963,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
         Some("reviewer"),
         Some("sub-1"),
         ObserveFields::default(),
+        false,
     )
     .await;
     assert_eq!(env["subagentType"], "reviewer");
@@ -989,6 +992,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -1020,6 +1024,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
             Some("reviewer"),
             Some("sub-9"),
             Some("completed"),
+            false,
             &mut state,
         )
         .await;
@@ -1052,6 +1057,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
             sid,
             workspace(),
             &db,
+            false,
         )
         .await;
         let stdin: Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
@@ -1088,6 +1094,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
             sid,
             workspace(),
             &db,
+            false,
         )
         .await;
         let stdin: Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
@@ -1122,6 +1129,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
             sid,
             workspace(),
             &db,
+            false,
         )
         .await;
         let stdin: Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
@@ -1179,6 +1187,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
                 start_source: Some("fresh"),
                 ..Default::default()
             },
+            false,
         )
         .await;
         assert!(
@@ -1645,6 +1654,7 @@ async fn observe_once(
         None,
         None,
         fields,
+        false,
     )
     .await;
     let rows = hook_run_events(&db, sid).await;
@@ -1684,6 +1694,7 @@ async fn observe_subagent_once(
         Some(subagent_type),
         subagent_id,
         fields,
+        false,
     )
     .await;
     let rows = hook_run_events(&db, sid).await;
@@ -2286,6 +2297,7 @@ async fn pre_tool_hook_explicit_deny_blocks_dispatch() {
         sid,
         workspace(),
         &db,
+        false,
     )
     .await;
 
@@ -2305,11 +2317,149 @@ async fn pre_tool_hook_explicit_deny_blocks_dispatch() {
     // The hook was actually invoked (real dispatch, not a lookalike).
     assert_eq!(runner.invocations().len(), 1);
     // The recorded audit is the closed projection — never any process output.
-    let rows = db.list_session_events(sid).await.unwrap();
+    let rows: Vec<_> = db
+        .list_session_events(sid)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "hook_run")
+        .collect();
     let data = rows[0].data.as_object().unwrap();
     for forbidden in ["payload", "stdout", "stderr", "output", "argv", "cwd"] {
         assert!(!data.contains_key(forbidden), "audit leaked `{forbidden}`");
     }
+}
+
+#[tokio::test]
+async fn local_knowledge_write_fence_skips_model_triggered_hook_commands() {
+    let (db, sid) = db_session().await;
+    let reg = registry(vec![test_hook(
+        HookEvent::PreToolUse,
+        vec!["fenced-hook".to_string()],
+        Some(vec!["bash".to_string()]),
+        BTreeMap::new(),
+        5,
+    )]);
+    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"deny"}"#));
+    let env = FakeProcessEnv::with_default_resolution();
+
+    let outcome = run_pre_tool_hooks(
+        &runner,
+        &env,
+        &reg,
+        "bash",
+        &json!({}),
+        "call-fenced",
+        sid,
+        workspace(),
+        &db,
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        PreHookOutcome::Allow,
+        "the hook gate remains fail-open"
+    );
+    assert!(
+        runner.invocations().is_empty(),
+        "the fenced hook must not spawn"
+    );
+    assert_eq!(
+        hook_run_statuses(&db, sid).await,
+        vec!["failed".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn local_knowledge_write_fence_skips_stop_hook_commands() {
+    let (db, sid) = db_session().await;
+    let runner = FakeCommandRunner::new(successful_output(
+        r#"{"decision":"block","reason":"must not run"}"#,
+    ));
+    let env = FakeProcessEnv::with_default_resolution();
+    let mut state = StopGateState::default();
+
+    let outcome = run_stop_hooks(
+        &runner,
+        &env,
+        &registry(vec![stop_hook()]),
+        HookEvent::Stop,
+        "end_turn",
+        sid,
+        workspace(),
+        &db,
+        None,
+        None,
+        None,
+        true,
+        &mut state,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        StopHookOutcome::End,
+        "the stop gate remains fail-open"
+    );
+    assert!(
+        runner.invocations().is_empty(),
+        "the fenced hook must not spawn"
+    );
+    let rows: Vec<_> = db
+        .list_session_events(sid)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "hook_run")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data["status"], "failed");
+    assert_eq!(
+        rows[0].data["reason"], REASON_LOCAL_KNOWLEDGE_WRITE_FENCE,
+        "the fenced stop audit reason is a stable exact value"
+    );
+}
+
+#[tokio::test]
+async fn local_knowledge_write_fence_skips_observe_hook_commands() {
+    let (db, sid) = db_session().await;
+    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+    let env = FakeProcessEnv::with_default_resolution();
+
+    run_observe_hooks(
+        &runner,
+        &env,
+        &registry(vec![observe_hook(HookEvent::SessionStart, "fresh")]),
+        HookEvent::SessionStart,
+        "fresh",
+        sid,
+        workspace(),
+        &db,
+        None,
+        None,
+        None,
+        None,
+        ObserveFields {
+            start_source: Some("fresh"),
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+
+    assert!(
+        runner.invocations().is_empty(),
+        "the fenced hook must not spawn"
+    );
+    let rows = db.list_session_events(sid).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data["status"], "failed");
+    assert_eq!(
+        rows[0].data["reason"], REASON_LOCAL_KNOWLEDGE_WRITE_FENCE,
+        "the fenced observe audit reason is a stable exact value"
+    );
 }
 
 #[tokio::test]
@@ -2338,6 +2488,7 @@ async fn pre_tool_hook_failures_are_fail_open() {
             sid,
             workspace(),
             &db,
+            false,
         )
         .await;
         (outcome, hook_run_statuses(&db, sid).await)
@@ -2402,6 +2553,7 @@ async fn pre_tool_hook_failures_are_fail_open() {
             sid,
             workspace(),
             &db,
+            false,
         )
         .await;
         assert_eq!(outcome, PreHookOutcome::Allow);
@@ -2458,6 +2610,7 @@ async fn tool_hooks_run_in_canonical_lifecycle_order() {
         sid,
         workspace(),
         &db,
+        false,
     )
     .await;
     assert_eq!(pre, PreHookOutcome::Allow);
@@ -2493,6 +2646,7 @@ async fn tool_hooks_run_in_canonical_lifecycle_order() {
         sid,
         workspace(),
         &db,
+        false,
     )
     .await;
 
@@ -2521,6 +2675,7 @@ async fn tool_hooks_run_in_canonical_lifecycle_order() {
         sid2,
         workspace(),
         &db2,
+        false,
     )
     .await;
     assert_eq!(
@@ -2587,6 +2742,7 @@ async fn tool_hook_matcher_and_ordering() {
             sid,
             workspace(),
             &db,
+            false,
         )
         .await;
         assert_eq!(
@@ -2643,6 +2799,7 @@ async fn tool_hook_matcher_and_ordering() {
                 start_source: Some("fresh"),
                 ..Default::default()
             },
+            false,
         )
         .await;
         assert_eq!(
@@ -2687,6 +2844,7 @@ async fn stop_hook_continuation_state_machine() {
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -2715,6 +2873,7 @@ async fn stop_hook_continuation_state_machine() {
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -2752,6 +2911,7 @@ async fn stop_hook_continuation_state_machine() {
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -2783,6 +2943,7 @@ async fn stop_hook_continuation_state_machine() {
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -2815,6 +2976,7 @@ async fn stop_hook_continuation_state_machine() {
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -2872,6 +3034,7 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
             None,
             None,
             None,
+            false,
             &mut state,
         )
         .await;
@@ -2920,6 +3083,7 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
         None,
         None,
         None,
+        false,
         &mut state,
     )
     .await;
@@ -2974,6 +3138,7 @@ async fn subagent_stop_dispatch_carries_child_envelope_and_honors_continuation()
         Some("builder"),
         Some("task-42"),
         Some("completed"),
+        false,
         &mut state,
     )
     .await;
@@ -3029,6 +3194,7 @@ async fn subagent_stop_dispatch_carries_child_envelope_and_honors_continuation()
         Some("builder"),
         Some("task-99"),
         Some("aborted"),
+        false,
         &mut discarded,
     )
     .await;
@@ -3985,7 +4151,7 @@ async fn tool_hook_runner_actor_terminate_error_is_failed() {
 }
 
 #[test]
-fn descendant_containment_reason_constants_are_stable() {
+fn externally_documented_hook_failure_reason_constants_are_stable() {
     // Independent literals (NOT the constants) — the exact `hook_run.reason`
     // strings are a durable-ledger + docs contract; a changed VALUE must fail.
     assert_eq!(
@@ -3999,6 +4165,10 @@ fn descendant_containment_reason_constants_are_stable() {
     assert_eq!(
         REASON_DESCENDANT_CONTAINMENT_FAILED,
         "descendant_containment_failed"
+    );
+    assert_eq!(
+        REASON_LOCAL_KNOWLEDGE_WRITE_FENCE,
+        "local_knowledge_write_fence"
     );
 }
 

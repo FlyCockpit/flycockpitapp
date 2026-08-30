@@ -521,6 +521,8 @@ the ledger is one of these exact runner strings:
   gone.
 - `descendant_containment_failed` — the containment actor itself errored while
   terminating or awaiting empty.
+- `local_knowledge_write_fence` — an attached local knowledge base is read-only,
+  so the matching hook is audited as failed without launching its command.
 
 On Windows, a hook whose parent process has no `SystemRoot` also fails open with
 a `missing SystemRoot` clean-environment construction error rather than being

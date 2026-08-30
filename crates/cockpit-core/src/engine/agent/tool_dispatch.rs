@@ -618,6 +618,12 @@ async fn authorize_revised_call(
         env.session.id,
         env.cwd,
         &env.session.db,
+        crate::knowledge::local_knowledge_write_fence_active(
+            env.session,
+            env.cwd,
+            &env.ctx.config.extended(),
+        )
+        .await,
     )
     .await;
     if let super::hooks::PreHookOutcome::Deny { reason } = pre_hook {
@@ -757,6 +763,10 @@ async fn fire_monty_permission_denied_hook(
     permission_kind: &'static str,
 ) {
     let snapshot = ctx.config.snapshot();
+    let extended = snapshot.extended.clone();
+    let local_knowledge_write_fence_active =
+        crate::knowledge::local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &extended)
+            .await;
     super::hooks::run_observe_hooks(
         &super::hooks::TokioCommandRunner::with_optional_containment(
             ctx.session.process_containment(),
@@ -776,6 +786,7 @@ async fn fire_monty_permission_denied_hook(
             permission_kind: Some(permission_kind),
             ..Default::default()
         },
+        local_knowledge_write_fence_active,
     )
     .await;
 }
@@ -792,6 +803,9 @@ async fn fire_permission_denied_hook(
     tool_call_id: &str,
     permission_kind: &'static str,
 ) {
+    let extended = env.ctx.config.extended();
+    let local_knowledge_write_fence_active =
+        crate::knowledge::local_knowledge_write_fence_active(env.session, env.cwd, &extended).await;
     super::hooks::run_observe_hooks(
         &super::hooks::TokioCommandRunner::with_optional_containment(
             env.session.process_containment(),
@@ -811,6 +825,7 @@ async fn fire_permission_denied_hook(
             permission_kind: Some(permission_kind),
             ..Default::default()
         },
+        local_knowledge_write_fence_active,
     )
     .await;
 }
@@ -1429,6 +1444,12 @@ async fn execute_ordinary_call_unscoped(
             env.session.id,
             env.cwd,
             &env.session.db,
+            crate::knowledge::local_knowledge_write_fence_active(
+                env.session,
+                env.cwd,
+                &env.ctx.config.extended(),
+            )
+            .await,
         )
         .await;
         if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
@@ -1852,6 +1873,12 @@ async fn execute_ordinary_call_unscoped(
             env.session.id,
             env.cwd,
             &env.session.db,
+            crate::knowledge::local_knowledge_write_fence_active(
+                env.session,
+                env.cwd,
+                &env.ctx.config.extended(),
+            )
+            .await,
         )
         .await;
     }

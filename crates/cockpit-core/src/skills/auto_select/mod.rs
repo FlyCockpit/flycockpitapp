@@ -135,6 +135,7 @@ async fn select(
         extended,
         providers,
         redact,
+        false,
         None,
         &[],
         turns,
@@ -150,6 +151,7 @@ pub async fn select_with_diagnostics(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
+    local_knowledge_write_fence_active: bool,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     active_tools: &[String],
     turns: &[PredictionTurn],
@@ -160,6 +162,7 @@ pub async fn select_with_diagnostics(
         extended,
         providers,
         redact,
+        local_knowledge_write_fence_active,
         shutdown_gate,
         active_tools,
         turns,
@@ -181,6 +184,7 @@ async fn select_inner(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
+    local_knowledge_write_fence_active: bool,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     active_tools: &[String],
     turns: &[PredictionTurn],
@@ -249,7 +253,13 @@ async fn select_inner(
         return Ok((Selection::None, diagnostics));
     }
 
-    let injected = render_capped_and_budgeted(&chosen, cwd, extended, &redact);
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        cwd,
+        extended,
+        local_knowledge_write_fence_active,
+        &redact,
+    );
     if injected.is_empty() {
         Ok((Selection::None, diagnostics))
     } else {
@@ -269,6 +279,7 @@ fn render_capped_and_budgeted(
     chosen: &[Survivor<'_>],
     cwd: &Path,
     extended: &ExtendedConfig,
+    local_knowledge_write_fence_active: bool,
     redact: &crate::redact::RedactionTable,
 ) -> Vec<InjectedSkill> {
     // Hard count cap (token economy). Log what the cap dropped so it never
@@ -307,8 +318,13 @@ fn render_capped_and_budgeted(
                 continue;
             }
         };
-        let rendered =
-            crate::skills::render_body(&body, cwd, extended.skills.auto_bang_commands, redact);
+        let rendered = crate::skills::render_body(
+            &body,
+            cwd,
+            extended.skills.auto_bang_commands,
+            local_knowledge_write_fence_active,
+            redact,
+        );
         let cost = crate::tokens::count(&rendered);
         if used_tokens + cost > SELECTED_BODY_TOKEN_BUDGET {
             // Over budget → drop this whole body (never truncate). Keep

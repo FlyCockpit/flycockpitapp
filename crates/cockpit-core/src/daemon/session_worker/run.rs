@@ -7254,6 +7254,18 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let extended = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &session,
+                &project_root,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 session.process_containment(),
@@ -7273,6 +7285,7 @@ pub(super) async fn run_worker(
                 start_source: Some(start_source),
                 ..Default::default()
             },
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -13722,6 +13735,18 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let extended = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &session,
+                &project_root,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 session.process_containment(),
@@ -13741,6 +13766,7 @@ pub(super) async fn run_worker(
                 end_reason: Some(end_matcher),
                 ..Default::default()
             },
+            local_knowledge_write_fence_active,
         )
         .await;
     }

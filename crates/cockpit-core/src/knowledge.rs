@@ -4472,6 +4472,19 @@ pub(crate) async fn configured_local_knowledge_roots(
     roots
 }
 
+/// Whether an opaque host process must be denied because a configured local
+/// knowledge base is present. An attached KB grants bounded read access; it
+/// never grants an ambient process authority to write that source.
+pub(crate) async fn local_knowledge_write_fence_active(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> bool {
+    !configured_local_knowledge_roots(session, cwd, extended)
+        .await
+        .is_empty()
+}
+
 /// Return canonical local KB roots withheld from a model without requiring a
 /// full tool context. Driver-owned execution paths (for example scheduled
 /// shell jobs) use this before a [`ToolCtx`] exists.
@@ -4576,9 +4589,7 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         &["harness_invoke", "lsp", "worktree_orchestrate"];
 
     if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
-        && !configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
-            .await
-            .is_empty()
+        && local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
     {
         bail!(
             "access denied: `{tool_name}` is unavailable because attached local knowledge bases are read-only"

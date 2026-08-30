@@ -4020,18 +4020,32 @@ impl Tool for KnowledgeDreamApplyTool {
             extended.clone(),
         );
         let engine = dream::DreamEngine::new(ctx.session.clone());
-        let outcome = engine
-            .apply_orchestrated_change_set(
-                &entry,
-                &extended,
-                &providers,
-                &self.executing_model,
-                &ctx.redact,
-                change_set,
-                &sink,
-                cancel.cancel.clone(),
-            )
-            .await?;
+        let executing_model = self.executing_model.clone();
+        let reader_redaction = ctx.redact.clone();
+        // A dispatcher timeout drops this tool future.  The provider write
+        // itself is blocking and cannot be cancelled by that drop, so the
+        // operation which owns the per-KB guard must outlive the caller too:
+        // otherwise a second dream could select the same sources before the
+        // first mutation reaches its ledger boundary.  Dropping the join
+        // handle deliberately detaches this task; it keeps the guard, sink
+        // transaction, and completion-ledger continuation together.
+        let apply = tokio::spawn(async move {
+            engine
+                .apply_orchestrated_change_set(
+                    &entry,
+                    &extended,
+                    &providers,
+                    &executing_model,
+                    &reader_redaction,
+                    change_set,
+                    &sink,
+                    cancel.cancel,
+                )
+                .await
+        });
+        let outcome = apply
+            .await
+            .context("knowledge dream owner task terminated before completion")??;
         Ok(render_dream_run_outcome(outcome))
     }
 }

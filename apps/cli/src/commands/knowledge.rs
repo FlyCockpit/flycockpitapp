@@ -1,6 +1,8 @@
 //! Governed knowledge dream orchestration.
 
-use anyhow::{Context, Result};
+use std::collections::BTreeSet;
+
+use anyhow::{Context, Result, ensure};
 
 use crate::cli::KnowledgeCommand;
 use crate::daemon::client::OwnedSessionMode;
@@ -38,15 +40,44 @@ pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
                 OwnedSessionMode::AttachOrEphemeral,
                 |client| {
                     Box::pin(async move {
-                        crate::commands::run::attach_send_pump(
+                        let cwd = std::env::current_dir().context("resolving dream workspace")?;
+                        let before = dream_status(&client, &cwd, &knowledge_base_id).await?;
+                        if before.undreamed_session_ids.is_empty() {
+                            eprintln!(
+                                "Knowledge base `{knowledge_base_id}` has no attached, undreamed sessions."
+                            );
+                            return Ok(0);
+                        }
+                        let source_ids = before
+                            .undreamed_session_ids
+                            .into_iter()
+                            .collect::<BTreeSet<_>>();
+                        let turn_exit_code = crate::commands::run::attach_send_pump(
                             &client,
                             prompt,
                             no_sandbox,
                             crate::cli::OutputFormat::Default,
-                            crate::commands::run::RunPumpOptions::default(),
+                            crate::commands::run::RunPumpOptions {
+                                model_override: Some(&before.model),
+                                project_root: Some(&cwd),
+                                ..Default::default()
+                            },
                         )
                         .await
-                        .context("running knowledge dream turn")
+                        .context("running knowledge dream turn")?;
+                        if turn_exit_code != 0 {
+                            anyhow::bail!("knowledge dream agent reported an error");
+                        }
+                        let after = dream_status(&client, &cwd, &knowledge_base_id).await?;
+                        let remaining = after
+                            .undreamed_session_ids
+                            .into_iter()
+                            .collect::<BTreeSet<_>>();
+                        ensure!(
+                            source_ids.is_disjoint(&remaining),
+                            "knowledge dream did not apply its selected source sessions; the agent must call knowledge_dream_apply"
+                        );
+                        Ok(0)
                     })
                 },
             )
@@ -56,6 +87,35 @@ pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+struct DreamStatus {
+    model: String,
+    undreamed_session_ids: Vec<uuid::Uuid>,
+}
+
+async fn dream_status(
+    client: &crate::daemon::client::ScopedDaemonClient<'_>,
+    cwd: &std::path::Path,
+    knowledge_base_id: &str,
+) -> Result<DreamStatus> {
+    let response = client
+        .request_ok(cockpit_proto::request::Request::KnowledgeDreamStatus {
+            project_root: cwd.to_string_lossy().into_owned(),
+            knowledge_base_id: knowledge_base_id.to_string(),
+        })
+        .await
+        .context("resolving knowledge dream configuration")?;
+    match response {
+        cockpit_proto::Response::KnowledgeDreamStatus {
+            model,
+            undreamed_session_ids,
+        } => Ok(DreamStatus {
+            model,
+            undreamed_session_ids,
+        }),
+        other => anyhow::bail!("daemon returned unexpected response to knowledge dream status: {other:?}"),
     }
 }
 

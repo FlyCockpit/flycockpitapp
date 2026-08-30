@@ -29,6 +29,13 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    /// Authoritative pre/post-run receipt for CLI dream orchestration. The
+    /// source IDs are consent-bound ledger candidates, never transcript data.
+    KnowledgeDreamStatus {
+        model: String,
+        undreamed_session_ids: Vec<Uuid>,
+    },
+
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
 
     LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
@@ -1425,6 +1432,7 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
             (Response::MediaOwnerRecovery(..), "media_owner_recovery");
             (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
             (Response::ImageIngressAdmitted(..), "image_ingress_admitted");

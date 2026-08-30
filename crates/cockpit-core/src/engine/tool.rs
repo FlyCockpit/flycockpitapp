@@ -24,6 +24,35 @@ use crate::engine::message::ToolDefinition;
 
 pub use crate::daemon::proto::ToolFailKind;
 
+/// Session-scoped knowledge-dream source consent.  A dream's orchestrator and
+/// every delegated child run in the same session, while each gets a fresh
+/// `ToolCtx`; keying the shared cell by session identity makes the boundary
+/// survive that reconstruction without widening it to other sessions.
+pub(crate) fn dream_read_scope_for_session(
+    session_id: uuid::Uuid,
+) -> Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>> {
+    static SCOPES: std::sync::OnceLock<
+        Mutex<
+            HashMap<
+                uuid::Uuid,
+                std::sync::Weak<
+                    std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>,
+                >,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    let mut scopes = SCOPES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("dream read scope registry poisoned");
+    if let Some(scope) = scopes.get(&session_id).and_then(std::sync::Weak::upgrade) {
+        return scope;
+    }
+    let scope = Arc::new(std::sync::RwLock::new(None));
+    scopes.insert(session_id, Arc::downgrade(&scope));
+    scope
+}
+
 /// Marker error a tool returns when the *arguments* were the problem
 /// (see [`ToolFailKind::Invocation`]). The dispatcher downcasts to this
 /// to classify the failure; build it with [`invalid_input`].

@@ -506,6 +506,13 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// Resolve the authoritative dream model and the exact source sessions
+    /// still absent from the completion ledger for one workspace KB.
+    KnowledgeDreamStatus {
+        project_root: String,
+        knowledge_base_id: String,
+    },
+
     /// Send a user message into the currently attached session. The daemon
     /// enqueues it on the driver and acks immediately — per-turn progress
     /// flows over the event stream. Carries a strict tagged V2 ingress
@@ -4050,6 +4057,9 @@ macro_rules! request_variants {
         $with_variants! { ($($context),*) [
             (Request::Attach { .. }, "attach");
             (Request::SubagentTranscript { .. }, "subagent_transcript");
+            (Request::AttachKnowledgeBaseSession { .. }, "attach_knowledge_base_session");
+            (Request::DetachKnowledgeBaseSession { .. }, "detach_knowledge_base_session");
+            (Request::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
             (Request::SendUserMessageV2 { .. }, "send_user_message");
             (Request::SendUserMessageBulk { .. }, "send_user_message_bulk");
             (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status");
@@ -4362,6 +4372,7 @@ macro_rules! command {
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::AttachKnowledgeBaseSession { knowledge_base_id, session_id }, "attach_knowledge_base_session", session_row_writer(session_id), field(session_id), true, local_only, none, serialized, none, "knowledge_base_id:String|session_id:Uuid", [knowledge_base_id: String => param, session_id: Uuid => session]);
             (Request::DetachKnowledgeBaseSession { knowledge_base_id, session_id }, "detach_knowledge_base_session", session_row_writer(session_id), field(session_id), true, local_only, none, serialized, none, "knowledge_base_id:String|session_id:Uuid", [knowledge_base_id: String => param, session_id: Uuid => session]);
+            (Request::KnowledgeDreamStatus { project_root, knowledge_base_id }, "knowledge_dream_status", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String|knowledge_base_id:String", [project_root: String => project_root, knowledge_base_id: String => param]);
             (Request::SendUserMessageV2 { ingress }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "ingress:MessageIngressV2", [ingress: MessageIngressV2 => opaque_fcm2]);
             (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);

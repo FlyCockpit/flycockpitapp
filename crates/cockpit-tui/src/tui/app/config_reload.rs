@@ -97,7 +97,7 @@ impl App {
     /// Re-run the pre-attach bootstrap projection (extended read + redacted,
     /// credential-free provider view) and re-derive launch + TUI chrome from
     /// it. This is the one sanctioned client-side resolution, reused for the
-    /// detached case (pre-attach first-run, daemonless `/settings` save).
+    /// detached case (pre-attach first-run, unavailable-daemon `/settings` save).
     pub(super) fn refresh_bootstrap_config_snapshot(&mut self) {
         let LaunchBundle {
             launch: fresh,

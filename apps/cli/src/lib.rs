@@ -35,7 +35,7 @@ pub(crate) mod daemon {
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
             OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, ensure_persistent_daemon,
-            run_owned_daemon,
+            run_one_shot_daemon, run_owned_daemon,
         };
     }
     #[cfg(test)]
@@ -746,10 +746,9 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
     // exists.
     if matches!(
         command,
-        Some(Command::Run(args)) if args.ephemeral
-    ) || matches!(
-        command,
-        Some(Command::Init(_)) | Some(Command::Assistants(crate::cli::AssistantCommand::Learn(_)))
+        Some(Command::Run(_))
+            | Some(Command::Init(_))
+            | Some(Command::Assistants(crate::cli::AssistantCommand::Learn(_)))
     ) {
         return false;
     }
@@ -1285,13 +1284,11 @@ mod tests {
             crate::cli::InitArgs {
                 path: None,
                 force: false,
-                ephemeral: false,
             }
         ))));
         assert!(!command_requires_workspace_trust(Some(
             &Command::Assistants(crate::cli::AssistantCommand::Learn(crate::cli::LearnArgs {
                 sources: vec!["https://example.test".into()],
-                ephemeral: false,
             }))
         )));
         assert!(!command_requires_workspace_trust(Some(&Command::Run(
@@ -1312,7 +1309,6 @@ mod tests {
                 follow: false,
                 file: Vec::new(),
                 thinking: false,
-                ephemeral: true,
                 max_turns: None,
                 timeout: None,
                 permission_mode: None,

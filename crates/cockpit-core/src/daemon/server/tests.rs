@@ -8061,7 +8061,6 @@ fn remote_state_with_grants(
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     }
 }
 
@@ -8103,7 +8102,6 @@ fn owner_state() -> MutableClientState {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     }
 }
 
@@ -15128,7 +15126,6 @@ async fn attached_state_with_worker_receiver(
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
-            negotiated_protocol_version: proto::PROTOCOL_VERSION,
         },
         session_row.session_id,
         work_rx,
@@ -32828,6 +32825,33 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
 }
 
 #[tokio::test]
+async fn hello_only_probe_does_not_claim_client_lifetime() {
+    let ctx = test_ctx();
+    let presence = ctx.client_presence();
+    let (server, client) = tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES);
+    let task = tokio::spawn(handle_client_transport_as(
+        server,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+    ));
+    let mut client = ProtoStream::new(client);
+
+    assert!(matches!(
+        client.recv().await.unwrap(),
+        Some(RecvFrame::Envelope(_))
+    ));
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("hello-only probe transport exits")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(*presence.borrow(), ClientPresence::default());
+}
+
+#[tokio::test]
 async fn attach_replay_precedes_live_events_under_task_split() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -33206,7 +33230,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
-        client_count: base.client_count.clone(),
+        client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
         shutdown_grace_override: StdMutex::new(None),
@@ -33422,7 +33446,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
-        client_count: base.client_count.clone(),
+        client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
         shutdown_grace_override: StdMutex::new(None),
@@ -33522,8 +33546,8 @@ async fn delete_session_rejects_active_session() {
     .await
     .expect_err("active session must be rejected");
 
-    // v10: DeleteSession rejects an active session with a typed Conflict
-    // error. The session row remains intact.
+    // Active sessions reject deletion with a typed Conflict error. The session
+    // row remains intact.
     assert_eq!(err.code, ErrorCode::Conflict);
     assert!(err.message.contains("is active; end it before deleting"));
     assert!(
@@ -33532,45 +33556,6 @@ async fn delete_session_rejects_active_session() {
             .await
             .unwrap()
             .is_some()
-    );
-}
-
-#[tokio::test]
-async fn delete_session_at_min_supported_rejects_active_session() {
-    let ctx = test_ctx();
-    // The v11 cutover retired v9/v10 (MIN_SUPPORTED == 11), so the
-    // active-session rejection now applies to every supported client. A
-    // client negotiated at the minimum supported version must therefore get
-    // the Conflict — the old frozen v9 stop-and-delete leniency is gone.
-    // This also guards the gate against drift: if PROTOCOL_VERSION were ever
-    // bumped above MIN_SUPPORTED, the oldest supported client must not
-    // silently fall back to the lenient path.
-    let mut state = MutableClientState::detached_for_test_with_protocol_version(
-        proto::MIN_SUPPORTED_PROTOCOL_VERSION,
-    );
-    // A freshly created session is active (ended_at is None).
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
-
-    let err = handle_request(
-        Request::DeleteSession {
-            session_id: session.session_id,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect_err("min-supported DeleteSession must reject an active session");
-
-    assert_eq!(err.code, ErrorCode::Conflict);
-    assert!(err.message.contains("is active; end it before deleting"));
-    // The session row survives — a rejected delete must not remove it.
-    assert!(
-        ctx.db
-            .get_session(session.session_id)
-            .await
-            .unwrap()
-            .is_some(),
-        "a rejected active-session delete must leave the session intact"
     );
 }
 
@@ -33811,7 +33796,6 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     };
     let parent_session_id = parent_row.session_id;
     let ctx_for_parent = ctx.clone();
@@ -33888,7 +33872,6 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
-        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     };
     let btw_session_id = created.info.session_id;
     let ctx_for_btw = ctx.clone();

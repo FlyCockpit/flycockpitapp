@@ -750,20 +750,13 @@ impl App {
                     self.reset_display_attach_backoff();
                     self.maybe_open_add_provider_wizard();
                 }
-                Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
-                    // Daemonless mode: this TUI owns its own pid+nonce
-                    // ephemeral daemon (isolated from the canonical daemon
-                    // and from any other TUI's), spawned on the first attach
-                    // and reaped when this TUI exits. Flip the lifecycle flag
-                    // and mark "connected" — the latter so daemon-aware UI
-                    // (e.g. the `/sessions` pane's live-RPC path) treats this
-                    // window as connected. The eager display attach
-                    // deliberately skips daemonless mode, so this does *not*
-                    // spawn the owned ephemeral daemon just to show an id; the
-                    // short id appears once the first message brings it up.
-                    self.daemonless = true;
+                Some(crate::tui::daemon_prompt::DaemonChoice::StartEphemeral) => {
+                    // The next lifecycle resolution prefers an ephemeral,
+                    // reference-counted owner. It remains attachable through
+                    // the canonical socket, so normal RPC UI stays enabled.
+                    self.ephemeral_preference = true;
                     self.daemon_connected = true;
-                    self.push_plain("daemon: running a private daemon for this window only — it shuts down when you exit"
+                    self.push_plain("daemon: starting an ephemeral daemon — it shuts down after the last client exits"
                                 .to_string());
                     self.daemon_prompt = None;
                     self.maybe_open_add_provider_wizard();

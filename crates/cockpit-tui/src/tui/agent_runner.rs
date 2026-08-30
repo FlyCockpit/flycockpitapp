@@ -374,7 +374,7 @@ pub struct AgentRunner {
     /// maps from these once.
     pub usage: UsageCounts,
     /// `true` when this TUI *spawned* the daemon it's attached to (the
-    /// daemonless `AlwaysEphemeral` path) and therefore owns its teardown
+    /// ephemeral path) and therefore owns its teardown
     /// — the CLI lifecycle composition retains its teardown guard. `false`
     /// when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
@@ -3230,7 +3230,7 @@ async fn daemon_guidance_estimate_at_endpoint(
     }
 }
 
-/// Daemonless fallback: size the guidance file body and the full composed
+/// Local fallback: size the guidance file body and the full composed
 /// system prompt in-process with the shared raw cl100k tokenizer.
 /// Cheap and synchronous — `load_agent_guidance` only stats/reads one
 /// small file along the cwd→git-root walk — so it never blocks launch.
@@ -3321,9 +3321,8 @@ fn daemon_request_blocking(
 /// Run one blocking request against the daemon at a *known* `socket` —
 /// the socket the attached [`AgentRunner`] is already bound to. Unlike
 /// [`daemon_request_blocking`], this never re-resolves the canonical path,
-/// so it reaches an owned pid+nonce ephemeral daemon (the daemonless and
-/// auto-spawn paths) whose socket env is set only in the daemon child, not
-/// in this client process. Connects only — never spawns. `Err(String)` on
+/// so it reuses the established daemon endpoint. Connects only — never
+/// spawns. `Err(String)` on
 /// any transport/typed failure.
 pub(crate) fn daemon_request_at_blocking(
     endpoint: &ClientEndpoint,
@@ -3374,8 +3373,7 @@ pub(crate) fn daemon_reveal_leak_blocking(
 /// Run one request-response RPC against the daemon at `socket`. Unlike
 /// [`daemon_request_blocking`] (which probes the *canonical* daemon paths),
 /// this targets a specific socket — the one the live runner is attached to.
-/// That matters in daemonless mode, where the runner owns a pid+nonce
-/// ephemeral daemon the canonical paths don't point at.
+/// That matters when the runner is bound to a recently resolved endpoint.
 fn request_on_endpoint(endpoint: &ClientEndpoint, req: Request) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
@@ -4872,7 +4870,7 @@ mod tests {
         );
     }
 
-    /// Daemonless / pre-spawn resolution: the local fallback (the only
+    /// Pre-spawn resolution: the local fallback (the only
     /// source feeding the fresh-chat indicator before any daemon exists)
     /// must detect a guidance file sitting in `cwd` and report its basename
     /// plus a non-zero body size. `AGENTS.md` is in the shipped default

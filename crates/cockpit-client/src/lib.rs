@@ -167,10 +167,11 @@ impl ClientEndpoint {
 /// composition layer; the TUI never probes or spawns a daemon itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleIntent {
-    AttachOrAutoPromote,
+    /// Attach to the current owner, or start a persistent owner.
+    AttachOrPersistent,
+    /// Attach to the current owner, or start a reference-counted ephemeral
+    /// owner at the shared ledger socket.
     AttachOrEphemeral,
-    AlwaysEphemeral,
-    AttachOwnEphemeral,
     EnsurePersistent,
 }
 
@@ -184,9 +185,6 @@ pub struct LifecycleResolution {
 pub struct LifecycleRequest {
     pub intent: LifecycleIntent,
     pub reply: oneshot::Sender<Result<LifecycleResolution, String>>,
-    /// The resolver retains any owned-daemon guard only after the requester
-    /// acknowledges that it received the endpoint capability.
-    pub accepted: oneshot::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -210,26 +208,17 @@ impl LifecycleClient {
 
     pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
         let (reply, receive) = oneshot::channel();
-        let (accepted, acceptance) = oneshot::channel();
         tokio::time::timeout(
             REQUEST_TIMEOUT,
-            self.requests.send(LifecycleRequest {
-                intent,
-                reply,
-                accepted: acceptance,
-            }),
+            self.requests.send(LifecycleRequest { intent, reply }),
         )
         .await
         .map_err(|_| "daemon lifecycle request enqueue timed out".to_string())?
         .map_err(|_| "daemon lifecycle resolver has stopped".to_string())?;
-        let resolution = tokio::time::timeout(REQUEST_TIMEOUT, receive)
+        tokio::time::timeout(REQUEST_TIMEOUT, receive)
             .await
             .map_err(|_| "daemon lifecycle resolution timed out".to_string())?
-            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())??;
-        accepted
-            .send(())
-            .map_err(|_| "daemon lifecycle resolver retired before acceptance".to_string())?;
-        Ok(resolution)
+            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())?
     }
 }
 
@@ -341,8 +330,13 @@ enum IoCommand {
 }
 
 impl DaemonClient {
-    /// Connect to the daemon at `socket`. Spawns the background task
-    /// before returning.
+    /// Connect to the daemon at `socket`.
+    ///
+    /// A socket client confirms the negotiated daemon hello before this
+    /// returns. That distinguishes an authenticated client from a raw
+    /// hello-only discovery probe and gives an ephemeral daemon its lifetime
+    /// reference before the caller can be cancelled, dropped, or hand a live
+    /// owner off to another client.
     pub async fn connect(socket: &Path) -> Result<Self> {
         #[cfg(feature = "test-support")]
         CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -354,7 +348,12 @@ impl DaemonClient {
             let mut proto = ProtoStream::new(stream);
             let negotiated = negotiate_hello(&mut proto).await?;
             proto.set_negotiated_version(negotiated.version);
-            Ok(Self::from_proto_negotiated(proto, negotiated))
+            let initial_events = confirm_client_lifetime(&mut proto, negotiated.version).await?;
+            Ok(Self::from_proto_negotiated(
+                proto,
+                negotiated,
+                initial_events,
+            ))
         }
         #[cfg(not(unix))]
         {
@@ -384,16 +383,25 @@ impl DaemonClient {
     #[cfg(unix)]
     #[cfg(test)]
     fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
-        Self::from_proto_negotiated(proto, proto::NegotiatedProtocol::current())
+        Self::from_proto_negotiated(proto, proto::NegotiatedProtocol::current(), Vec::new())
     }
 
     #[cfg(unix)]
     fn from_proto_negotiated(
         proto: ProtoStream<UnixStream>,
         negotiated: proto::NegotiatedProtocol,
+        initial_events: Vec<proto::Event>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
+        for event in initial_events {
+            // The confirmation exchange occurs before the client exposes its
+            // event receiver. Preserve daemon events that arrive ahead of the
+            // confirmation response so connection setup remains lossless.
+            event_tx
+                .try_send(event)
+                .expect("bounded confirmation events fit the client queue");
+        }
         tokio::spawn(run_io(proto, request_rx, event_tx));
         Self {
             backend: ClientBackend::Wire(request_tx),
@@ -581,6 +589,68 @@ async fn negotiate_hello(
     };
 
     proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
+}
+
+/// Confirm that a peer which parsed the daemon's hello is an actual client,
+/// not a reachability probe that merely reads and drops that hello. The server
+/// takes its ephemeral lifetime reference while it processes this request.
+///
+/// This happens before `run_io` owns the transport, so a returned
+/// [`DaemonClient`] is already a live reference even if its caller is
+/// immediately cancelled or dropped without making an application request.
+#[cfg(unix)]
+async fn confirm_client_lifetime(
+    proto_stream: &mut ProtoStream<UnixStream>,
+    version: u32,
+) -> Result<Vec<proto::Event>> {
+    let id = Uuid::now_v7();
+    proto_stream
+        .send(&Envelope::request_at(version, id, Request::DaemonStatus))
+        .await
+        .context("sending daemon lifetime confirmation")?;
+
+    let confirmation = async {
+        let mut initial_events = Vec::new();
+        loop {
+            let frame = proto_stream.recv().await?;
+            let Some(frame) = frame else {
+                return Err(protocol_handshake_error(
+                    "daemon closed before lifetime confirmation",
+                ));
+            };
+            match frame {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Event { event } => initial_events.push(event),
+                    Body::Response {
+                        id: response_id,
+                        response,
+                    } if response_id == id
+                        && matches!(*response, Response::DaemonStatus { .. }) =>
+                    {
+                        return Ok(initial_events);
+                    }
+                    Body::Error {
+                        id: Some(response_id),
+                        error,
+                    } if response_id == id => return Err(anyhow::Error::new(error)),
+                    _ => {
+                        return Err(protocol_handshake_error(
+                            "daemon sent an invalid lifetime confirmation",
+                        ));
+                    }
+                },
+                RecvFrame::Unknown { .. } | RecvFrame::VersionMismatch { .. } => {
+                    return Err(protocol_handshake_error(
+                        "daemon rejected the lifetime confirmation version",
+                    ));
+                }
+            }
+        }
+    };
+
+    tokio::time::timeout(REQUEST_TIMEOUT, confirmation)
+        .await
+        .map_err(|_| protocol_handshake_error("daemon lifetime confirmation timed out"))?
 }
 
 #[cfg(unix)]
@@ -970,6 +1040,24 @@ mod tests {
             .unwrap();
     }
 
+    async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
+        let id = match daemon.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: Request::DaemonStatus,
+                    ..
+                } => id,
+                other => panic!("expected lifetime confirmation, got {other:?}"),
+            },
+            other => panic!("expected lifetime confirmation envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(id, daemon_status_response()))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn nil_daemon_status_is_known_hello() {
         assert!(is_nil_daemon_status_hello(
@@ -1014,6 +1102,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut daemon).await;
         });
 
         let client = DaemonClient::connect(&socket).await.unwrap();
@@ -1093,6 +1182,7 @@ mod tests {
             )
             .await;
             daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+            confirm_client_lifetime(&mut daemon).await;
             let request_id = match daemon.recv().await.unwrap().unwrap() {
                 proto::RecvFrame::Envelope(env) => match env.body {
                     Body::Request { id, request, .. } => {
@@ -1548,11 +1638,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_resolution_requires_requester_acceptance() {
+    async fn lifecycle_resolution_returns_endpoint() {
         let (client, mut requests) = LifecycleClient::channel(1);
         let resolve = tokio::spawn(async move {
             client
-                .resolve(LifecycleIntent::AlwaysEphemeral)
+                .resolve(LifecycleIntent::AttachOrEphemeral)
                 .await
                 .expect("resolution")
         });
@@ -1574,20 +1664,18 @@ mod tests {
                 .is_ok()
         );
         let _resolution = resolve.await.expect("resolve task");
-        request.accepted.await.expect("endpoint acceptance");
     }
 
     #[tokio::test]
-    async fn cancelled_lifecycle_resolution_closes_reply_and_acceptance() {
+    async fn cancelled_lifecycle_resolution_closes_reply() {
         let (client, mut requests) = LifecycleClient::channel(1);
         let resolve = tokio::spawn(async move {
-            let _ = client.resolve(LifecycleIntent::AlwaysEphemeral).await;
+            let _ = client.resolve(LifecycleIntent::AttachOrEphemeral).await;
         });
         let request = requests.recv().await.expect("lifecycle request");
         resolve.abort();
         let _ = resolve.await;
         assert!(request.reply.is_closed());
-        assert!(request.accepted.await.is_err());
     }
 
     #[tokio::test]

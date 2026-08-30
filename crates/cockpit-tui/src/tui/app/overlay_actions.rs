@@ -371,7 +371,6 @@ mod notes_lifecycle_tests {
             endpoint,
             cockpit_client::ClientEndpoint::InProcess(_)
         ));
-        request.accepted.await.expect("endpoint acceptance");
         assert!(
             requests.try_recv().is_err(),
             "later attachment must not duplicate a settled intent"

@@ -10514,15 +10514,9 @@ async fn handle_serialized_request_impl(
                     &Request::DeleteSession { session_id },
                     operation,
                 )?;
-                return sessions_remote::delete_session(
-                    ctx,
-                    session_id,
-                    state.negotiated_protocol_version(),
-                    &ledger,
-                )
-                .await;
+                return sessions_remote::delete_session(ctx, session_id, &ledger).await;
             }
-            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
+            delete_session(ctx, session_id).await
         }
 
         Request::GetInventoryBundle {
@@ -25773,7 +25767,7 @@ pub(super) fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str
 // ---- shutdown -------------------------------------------------------------
 
 /// The single entry point every stop trigger (SIGINT/SIGTERM, explicit
-/// `StopDaemon`, the ephemeral last-client/owner-exit teardown) routes
+/// `StopDaemon`, and ephemeral last-client teardown) routes
 /// through (`daemon-graceful-drain-shutdown.md`).
 ///
 /// First call begins the drain: it broadcasts the `DaemonDraining { forced:

@@ -1515,6 +1515,20 @@ pub struct ToolBox {
     capability_description_suffixes: BTreeMap<String, Vec<String>>,
 }
 
+/// Whether a provider-advertised tool can be called in the current turn.
+///
+/// Provider schemas deliberately remain stable while capability probes and
+/// direct-native media authority change.  Callers must therefore distinguish a
+/// provider-visible but unavailable tool from a name the provider was never
+/// told about; the latter is a hallucinated tool call, while the former gets a
+/// normal call-time availability result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCallAvailability {
+    Callable,
+    AdvertisedUnavailable,
+    NotAdvertised,
+}
+
 #[derive(Clone)]
 struct McpBuiltinToolEntry {
     tool: Arc<dyn Tool>,
@@ -1726,6 +1740,48 @@ impl ToolBox {
         self.get(name).cloned()
     }
 
+    /// Return a tool from the provider-visible schema, including a dormant
+    /// direct-native media tool. Unlike [`Self::get`], this does not imply the
+    /// tool is callable in this turn.
+    pub(crate) fn advertised_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools
+            .get(name)
+            .or_else(|| self.dormant_direct_native_media.get(name))
+    }
+
+    /// Resolve the call-time status of a name against the stable provider
+    /// schema. This is the sole boundary that distinguishes an unavailable
+    /// advertised tool from a hallucinated name.
+    pub(crate) fn call_availability(&self, name: &str) -> ToolCallAvailability {
+        if self.get(name).is_some() {
+            ToolCallAvailability::Callable
+        } else if self.advertised_tool(name).is_some() {
+            ToolCallAvailability::AdvertisedUnavailable
+        } else {
+            ToolCallAvailability::NotAdvertised
+        }
+    }
+
+    /// Model-visible explanation for an advertised tool that cannot be called
+    /// in this turn. Capability detail is retained when it is safe and useful;
+    /// dormant media tools intentionally expose only their authority state.
+    pub(crate) fn unavailable_call_message(&self, name: &str) -> Option<String> {
+        if self.call_availability(name) != ToolCallAvailability::AdvertisedUnavailable {
+            return None;
+        }
+        if let Some(issues) = self.capability_unavailable.get(name) {
+            let notice = crate::capabilities::missing_required_notice(
+                issues.iter().cloned(),
+                crate::capabilities::RemedyPlatform::current(),
+            )
+            .unwrap_or_else(|| "required host capability is unavailable".to_string());
+            return Some(format!("Tool `{name}` is currently unavailable: {notice}"));
+        }
+        Some(format!(
+            "Tool `{name}` is currently unavailable because this session has no live media authority."
+        ))
+    }
+
     pub fn apply_capabilities(
         mut self,
         env: &std::collections::HashMap<String, String>,
@@ -1849,10 +1905,11 @@ impl ToolBox {
     /// A live capability probe or root-scoped media authority may make a tool
     /// temporarily non-callable, but it must not add or remove that tool from
     /// the provider's cacheable `tools[]` prefix.  The ordinary
-    /// [`Self::definitions`] projection remains the operational view for UI,
-    /// MCP, and dispatch; this projection includes dormant media tools and
-    /// deliberately omits volatile capability-description suffixes. Calls to a
-    /// currently unavailable tool are rejected by the normal call-time lookup.
+    /// [`Self::definitions`] projection remains the operational view for UI and
+    /// MCP; this projection includes dormant media tools and deliberately omits
+    /// volatile capability-description suffixes. Dispatch uses this stable
+    /// schema to distinguish an unavailable advertised call from a
+    /// hallucinated name at call time.
     pub fn advertised_definitions(
         &self,
         steering: crate::agents::ToolSteering,
@@ -2293,6 +2350,15 @@ mod definition_cache_tests {
         let toolbox = ToolBox::new().with_dormant_direct_native_media(Arc::new(DormantMediaTool));
 
         assert!(toolbox.get("read_image").is_none());
+        assert_eq!(
+            toolbox.call_availability("read_image"),
+            ToolCallAvailability::AdvertisedUnavailable
+        );
+        assert!(
+            toolbox
+                .unavailable_call_message("read_image")
+                .is_some_and(|message| message.contains("live media authority"))
+        );
         assert!(
             toolbox
                 .definitions(crate::agents::ToolSteering::Terse)

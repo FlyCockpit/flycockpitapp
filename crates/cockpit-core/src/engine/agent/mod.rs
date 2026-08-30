@@ -474,14 +474,9 @@ pub(crate) async fn turn_toolbox(
     );
     toolbox = crate::knowledge::with_knowledge_search_tools(
         toolbox,
-        session,
-        cwd,
         agent.definition.as_deref(),
-        config,
         &executing_model,
-        agent.model.is_trusted(),
-    )
-    .await;
+    );
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
     toolbox.apply_capabilities(&env, cwd, target)
 }

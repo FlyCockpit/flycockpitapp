@@ -175,7 +175,7 @@ const KB_MACHINE_STATE_GITIGNORE: &[&str] = &[
     "schedule-state/",
     "sealed-material/",
 ];
-pub(crate) const INDEX_LOGIC_VERSION: i64 = 2;
+pub(crate) const INDEX_LOGIC_VERSION: i64 = 3;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
@@ -188,6 +188,9 @@ const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
 const MAX_KNOWLEDGE_DEPTH: usize = 32;
 const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STRUCTURED_SEARCH_QUERY_CHARS: usize = 1_024;
+const MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS: usize = 256;
+const MAX_STRUCTURED_SEARCH_FILTERS: usize = 16;
 /// A non-secret, host-authenticated generation marker for local KB sealed
 /// values. The marker is ignored by git and carries a host-keyed binding to
 /// the concrete source directory and marker file objects. A copied marker is
@@ -2256,6 +2259,14 @@ fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<Knowledg
             root.join(&rel).display()
         );
     };
+    if let Some(timestamp) = frontmatter.get("timestamp") {
+        normalized_rfc3339_timestamp(timestamp).with_context(|| {
+            format!(
+                "knowledge concept {} has an invalid RFC 3339 `timestamp` frontmatter value",
+                root.join(&rel).display()
+            )
+        })?;
+    }
     let (body, citations) = split_citations(markdown);
     let id = frontmatter
         .get("id")
@@ -2272,6 +2283,19 @@ fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<Knowledg
         body: body.trim().to_string(),
         citations,
     }))
+}
+
+/// Normalize RFC 3339 values before persisting or comparing them. The fixed
+/// nanosecond precision and UTC `Z` offset make SQLite TEXT ordering match
+/// chronological ordering across source offset spellings.
+fn normalized_rfc3339_timestamp(value: &str) -> Result<String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("`{value}` is not an RFC 3339 timestamp"))
+        .map(|timestamp| {
+            timestamp
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        })
 }
 
 fn split_frontmatter(raw: &str) -> Option<(BTreeMap<String, String>, &str)> {
@@ -2728,7 +2752,11 @@ fn rebuild_index(conn: &Connection, bundle: &KnowledgeBundle) -> Result<()> {
                 concept.frontmatter.get("description"),
                 concept.frontmatter.get("resource"),
                 serde_json::to_string(&parse_string_list(concept.frontmatter.get("tags")))?,
-                concept.frontmatter.get("timestamp"),
+                concept
+                    .frontmatter
+                    .get("timestamp")
+                    .map(|timestamp| normalized_rfc3339_timestamp(timestamp))
+                    .transpose()?,
                 serde_json::to_string(&concept.frontmatter)?,
                 concept.body,
                 serde_json::to_string(&concept.citations)?,
@@ -3367,16 +3395,12 @@ fn structured_search_index(
     }
     if let Some(timestamp) = &query.timestamp {
         if let Some(after) = timestamp.after.as_deref() {
-            sql.push_str(
-                "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'timestamp' AND cf.value >= ?\n )",
-            );
-            values.push(SqlValue::Text(after.to_string()));
+            sql.push_str("\n AND c.timestamp >= ?");
+            values.push(SqlValue::Text(normalized_rfc3339_timestamp(after)?));
         }
         if let Some(before) = timestamp.before.as_deref() {
-            sql.push_str(
-                "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'timestamp' AND cf.value <= ?\n )",
-            );
-            values.push(SqlValue::Text(before.to_string()));
+            sql.push_str("\n AND c.timestamp <= ?");
+            values.push(SqlValue::Text(normalized_rfc3339_timestamp(before)?));
         }
     }
     if !query.structured_filters.is_empty() {
@@ -4755,14 +4779,10 @@ fn provider_for(
     }
 }
 
-pub(crate) async fn with_knowledge_search_tools(
+pub(crate) fn with_knowledge_search_tools(
     toolbox: crate::engine::tool::ToolBox,
-    session: &Session,
-    cwd: &Path,
     definition: Option<&crate::agents::AgentDef>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
     executing_model: &str,
-    executing_model_trusted: bool,
 ) -> crate::engine::tool::ToolBox {
     let allowed_knowledge_bases = definition
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
@@ -4778,25 +4798,10 @@ pub(crate) async fn with_knowledge_search_tools(
         .with(Arc::new(StructuredSearchTool::new(
             allowed_knowledge_bases.clone(),
         )));
-    let extended = config.extended();
-    let dream_writes_enabled = attached_bundles(
-        session,
-        cwd,
-        allowed_knowledge_bases.as_ref(),
-        &extended,
-        executing_model_trusted,
-    )
-    .await
-    .is_ok_and(|bundles| {
-        bundles.bundles.iter().any(|knowledge_base| {
-            knowledge_base.entry.dream_model.as_deref() == Some(executing_model)
-                && matches!(
-                    &knowledge_base.entry.source,
-                    KnowledgeBaseSource::Local { .. }
-                )
-        })
-    });
-    if dream_writes_enabled && definition.is_some_and(|definition| definition.name == "Dream") {
+    // Dream's governed write tools are also cache-stable. Their attachment,
+    // trust, source-kind, and executing-model checks belong at call time, so
+    // changing an attached KB cannot change a provider-visible tool array.
+    if definition.is_some_and(|definition| definition.name == "Dream") {
         toolbox
             .with(Arc::new(KnowledgeDreamApplyTool {
                 allowed_knowledge_bases: allowed_knowledge_bases.clone(),
@@ -4808,8 +4813,6 @@ pub(crate) async fn with_knowledge_search_tools(
             }))
     } else {
         toolbox
-            .without(KNOWLEDGE_DREAM_SOURCES_TOOL_NAME)
-            .without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
     }
 }
 
@@ -4853,8 +4856,8 @@ impl StructuredSearchTool {
 /// The production model-facing dream executor.  It accepts a complete,
 /// validated OKF projection rather than a filesystem path, and invokes the
 /// registered-provider boundary so local writes always pass through the Git
-/// transaction/fence.  It is advertised only for attached local KBs that
-/// configure the model executing this turn.
+/// transaction/fence. Its availability is resolved at call time to keep the
+/// provider-visible Dream tool array cache-stable.
 pub(crate) struct KnowledgeDreamApplyTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
     executing_model: String,
@@ -5523,26 +5526,34 @@ impl Tool for StructuredSearchTool {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "full-text query over concept bodies" },
-                "type": { "type": "string", "description": "exact concept type frontmatter filter" },
-                "title": { "type": "string", "description": "case-sensitive title frontmatter substring filter" },
-                "tags": { "type": "array", "items": { "type": "string" }, "description": "tags every matching concept must have" },
+                "query": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_QUERY_CHARS, "description": "full-text query over concept bodies" },
+                "type": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "exact concept type frontmatter filter" },
+                "title": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "case-sensitive title frontmatter substring filter" },
+                "tags": { "type": "array", "maxItems": MAX_STRUCTURED_SEARCH_FILTERS, "items": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS }, "description": "tags every matching concept must have" },
                 "timestamp": {
                     "type": "object",
                     "properties": {
-                        "after": { "type": "string", "description": "inclusive timestamp frontmatter lower bound" },
-                        "before": { "type": "string", "description": "inclusive timestamp frontmatter upper bound" }
+                        "after": { "type": "string", "format": "date-time", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "inclusive RFC 3339 timestamp frontmatter lower bound" },
+                        "before": { "type": "string", "format": "date-time", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "inclusive RFC 3339 timestamp frontmatter upper bound" }
                     },
                     "additionalProperties": false,
                     "description": "inclusive timestamp frontmatter range"
                 },
                 "structured": {
                     "type": "array",
+                    "maxItems": MAX_STRUCTURED_SEARCH_FILTERS,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "column": { "type": "string", "description": "structured row column name" },
-                            "equals": { "type": ["string", "number", "boolean"], "description": "exact scalar value in the same structured row" }
+                            "column": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "structured row column name" },
+                            "equals": {
+                                "oneOf": [
+                                    { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS },
+                                    { "type": "number" },
+                                    { "type": "boolean" }
+                                ],
+                                "description": "exact scalar value in the same structured row"
+                            }
                         },
                         "required": ["column", "equals"],
                         "additionalProperties": false
@@ -5596,6 +5607,15 @@ impl Tool for StructuredSearchTool {
 }
 
 fn validate_structured_search_query(query: &StructuredSearchQuery) -> Result<()> {
+    if query
+        .query
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > MAX_STRUCTURED_SEARCH_QUERY_CHARS)
+    {
+        return Err(invalid_input(format!(
+            "structured_search query must be at most {MAX_STRUCTURED_SEARCH_QUERY_CHARS} characters"
+        )));
+    }
     let has_query = query
         .query
         .as_deref()
@@ -5619,11 +5639,33 @@ fn validate_structured_search_query(query: &StructuredSearchQuery) -> Result<()>
                 "structured_search {name} must not be empty"
             )));
         }
+        if value
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS)
+        {
+            return Err(invalid_input(format!(
+                "structured_search {name} must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+            )));
+        }
+    }
+    if query.tags.len() > MAX_STRUCTURED_SEARCH_FILTERS {
+        return Err(invalid_input(format!(
+            "structured_search tags must contain at most {MAX_STRUCTURED_SEARCH_FILTERS} values"
+        )));
     }
     if query.tags.iter().any(|tag| tag.trim().is_empty()) {
         return Err(invalid_input(
             "structured_search tags must not contain empty values",
         ));
+    }
+    if query
+        .tags
+        .iter()
+        .any(|tag| tag.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS)
+    {
+        return Err(invalid_input(format!(
+            "structured_search tags must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+        )));
     }
     if let Some(timestamp) = &query.timestamp {
         if timestamp
@@ -5644,6 +5686,25 @@ fn validate_structured_search_query(query: &StructuredSearchQuery) -> Result<()>
                 "structured_search timestamp requires after or before",
             ));
         }
+        for (name, value) in [("after", &timestamp.after), ("before", &timestamp.before)] {
+            if let Some(value) = value {
+                if value.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS {
+                    return Err(invalid_input(format!(
+                        "structured_search timestamp {name} must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+                    )));
+                }
+                normalized_rfc3339_timestamp(value).map_err(|_| {
+                    invalid_input(format!(
+                        "structured_search timestamp {name} must be an RFC 3339 timestamp"
+                    ))
+                })?;
+            }
+        }
+    }
+    if query.structured_filters.len() > MAX_STRUCTURED_SEARCH_FILTERS {
+        return Err(invalid_input(format!(
+            "structured_search structured must contain at most {MAX_STRUCTURED_SEARCH_FILTERS} predicates"
+        )));
     }
     for filter in &query.structured_filters {
         if filter.column.trim().is_empty() {
@@ -5651,10 +5712,24 @@ fn validate_structured_search_query(query: &StructuredSearchQuery) -> Result<()>
                 "structured_search structured column must not be empty",
             ));
         }
+        if filter.column.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS {
+            return Err(invalid_input(format!(
+                "structured_search structured column must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+            )));
+        }
         if !filter.equals.is_string() && !filter.equals.is_number() && !filter.equals.is_boolean() {
             return Err(invalid_input(
                 "structured_search structured equals must be a string, number, or boolean",
             ));
+        }
+        if filter
+            .equals
+            .as_str()
+            .is_some_and(|value| value.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS)
+        {
+            return Err(invalid_input(format!(
+                "structured_search structured equals strings must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+            )));
         }
     }
     if !has_query
@@ -6371,6 +6446,124 @@ Inventory facts for warehouse operations.
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].concept_id, "structured");
         assert_eq!(results[0].citations[0].target, "docs/inventory.md");
+    }
+
+    #[tokio::test]
+    async fn structured_search_normalizes_timestamp_offsets_before_filtering() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("offset.md"),
+            "---\ntype: event\ntimestamp: 2026-08-29T12:00:00+02:00\n---\n\nOffset event.\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("earlier.md"),
+            "---\ntype: event\ntimestamp: 2026-08-29T09:30:00Z\n---\n\nEarlier event.\n",
+        )
+        .unwrap();
+
+        let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let results = structured_search_index(
+            &index.index,
+            &StructuredSearchQuery {
+                query: None,
+                concept_type: None,
+                title: None,
+                tags: Vec::new(),
+                timestamp: Some(TimestampFilter {
+                    after: Some("2026-08-29T09:45:00Z".to_string()),
+                    before: Some("2026-08-29T10:15:00Z".to_string()),
+                }),
+                structured_filters: Vec::new(),
+                limit: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].concept_id, "offset");
+    }
+
+    #[test]
+    fn knowledge_concept_timestamp_must_be_rfc3339() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("invalid.md"),
+            "---\ntype: event\ntimestamp: definitely-not-a-timestamp\n---\n\nInvalid event.\n",
+        )
+        .unwrap();
+
+        let error = parse_bundle(tmp.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid RFC 3339 `timestamp`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn structured_search_validation_bounds_model_authored_input() {
+        let schema = StructuredSearchTool::new(None).parameters();
+        assert_eq!(
+            schema["properties"]["tags"]["maxItems"],
+            json!(MAX_STRUCTURED_SEARCH_FILTERS)
+        );
+        assert_eq!(
+            schema["properties"]["structured"]["maxItems"],
+            json!(MAX_STRUCTURED_SEARCH_FILTERS)
+        );
+        let too_many_tags = StructuredSearchQuery {
+            query: None,
+            concept_type: None,
+            title: None,
+            tags: vec!["tag".to_string(); MAX_STRUCTURED_SEARCH_FILTERS + 1],
+            timestamp: None,
+            structured_filters: Vec::new(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&too_many_tags).is_err());
+
+        let too_many_structured = StructuredSearchQuery {
+            query: None,
+            concept_type: None,
+            title: None,
+            tags: Vec::new(),
+            timestamp: None,
+            structured_filters: (0..=MAX_STRUCTURED_SEARCH_FILTERS)
+                .map(|index| StructuredValueFilter {
+                    column: format!("column-{index}"),
+                    equals: JsonValue::from(true),
+                })
+                .collect(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&too_many_structured).is_err());
+
+        let oversized_query = StructuredSearchQuery {
+            query: Some("word ".repeat(MAX_STRUCTURED_SEARCH_QUERY_CHARS)),
+            concept_type: None,
+            title: None,
+            tags: Vec::new(),
+            timestamp: None,
+            structured_filters: Vec::new(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&oversized_query).is_err());
+
+        let invalid_timestamp = StructuredSearchQuery {
+            query: None,
+            concept_type: None,
+            title: None,
+            tags: Vec::new(),
+            timestamp: Some(TimestampFilter {
+                after: Some("not-a-timestamp".to_string()),
+                before: None,
+            }),
+            structured_filters: Vec::new(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&invalid_timestamp).is_err());
     }
 
     #[tokio::test]
@@ -7170,20 +7363,17 @@ Inventory facts for warehouse operations.
     async fn knowledge_search_tool_schemas_are_stable_when_bundles_change() {
         let _env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
-        let session = test_session(tmp.path()).await;
         let base = crate::engine::tool::ToolBox::new();
-        let unavailable_toolbox = with_knowledge_search_tools(
-            base.clone(),
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-            "openai:gpt-5",
-            false,
-        )
-        .await;
+        let dream_definition = crate::agents::embedded_internal_default("Dream").unwrap();
+        let unavailable_toolbox =
+            with_knowledge_search_tools(base.clone(), Some(&dream_definition), "openai:gpt-5");
         assert!(unavailable_toolbox.names().contains(&"semantic_search"));
         assert!(unavailable_toolbox.names().contains(&"structured_search"));
+        assert!(
+            unavailable_toolbox
+                .names()
+                .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
+        );
         let unavailable_definitions = serde_json::to_vec(
             &unavailable_toolbox.definitions(crate::agents::ToolSteering::Terse),
         )
@@ -7196,16 +7386,8 @@ Inventory facts for warehouse operations.
             r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"openai:gpt-5","trustRequired":true,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
-        let untrusted_toolbox = with_knowledge_search_tools(
-            base.clone(),
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-            "openai:gpt-5",
-            false,
-        )
-        .await;
+        let untrusted_toolbox =
+            with_knowledge_search_tools(base.clone(), Some(&dream_definition), "openai:gpt-5");
         assert!(untrusted_toolbox.names().contains(&"semantic_search"));
         assert!(untrusted_toolbox.names().contains(&"structured_search"));
         assert_eq!(
@@ -7215,20 +7397,12 @@ Inventory facts for warehouse operations.
             "KB attachment changes must not change the serialized search tool array"
         );
         assert!(
-            !untrusted_toolbox
+            untrusted_toolbox
                 .names()
                 .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
         );
-        let attached_toolbox = with_knowledge_search_tools(
-            base,
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-            "openai:gpt-5",
-            true,
-        )
-        .await;
+        let attached_toolbox =
+            with_knowledge_search_tools(base, Some(&dream_definition), "openai:gpt-5");
         let attached = attached_toolbox.names();
         assert!(attached.contains(&"semantic_search"));
         assert!(attached.contains(&"structured_search"));
@@ -7241,14 +7415,9 @@ Inventory facts for warehouse operations.
         assert!(attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME));
         let mismatched_toolbox = with_knowledge_search_tools(
             crate::engine::tool::ToolBox::new(),
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            Some(&dream_definition),
             "anthropic:claude",
-            true,
-        )
-        .await;
+        );
         assert!(mismatched_toolbox.names().contains(&"semantic_search"));
         assert!(mismatched_toolbox.names().contains(&"structured_search"));
         assert_eq!(
@@ -7260,7 +7429,7 @@ Inventory facts for warehouse operations.
             "KB model attachment changes must not change the serialized search tool array"
         );
         assert!(
-            !mismatched_toolbox
+            mismatched_toolbox
                 .names()
                 .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
         );

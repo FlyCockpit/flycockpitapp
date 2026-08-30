@@ -860,24 +860,31 @@ fn apply_text_artifact_user_projections(
             .get("text")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("user artifact event lacks canonical text"))?;
-        // Oversized source artifacts are deliberately text-only. A
-        // media/file-bearing event cannot be materialized by the live ingress
-        // path, so fail closed before considering any artifact slots when an
-        // old or corrupt ledger claims otherwise.
-        if authored.len() > 64 * 1024 && user_event_has_media_or_file_parts(&event.data) {
+        let slots = by_event.remove(&event.seq).unwrap_or_default();
+        let has_user_artifact = !slots.is_empty();
+        // Artifact-backed sources are deliberately text-only. Their event text
+        // is a bounded preview, so artifact ownership — not its byte length —
+        // identifies this invariant.
+        if (has_user_artifact || authored.len() > 64 * 1024)
+            && user_event_has_media_or_file_parts(&event.data)
+        {
             return Err(anyhow!(
                 "oversized user event {} cannot carry media/file parts",
                 event.seq
             ));
         }
-        let slots = by_event.remove(&event.seq).unwrap_or_default();
-        let has_user_artifact = !slots.is_empty();
-        if !has_user_artifact && authored.len() <= 64 * 1024 {
+        if !has_user_artifact {
+            if authored.len() > 64 * 1024 {
+                return Err(anyhow!(
+                    "oversized user event {} must own exactly one source artifact",
+                    event.seq
+                ));
+            }
             continue;
         }
-        // A long canonical event must be backed by exactly one source. This
-        // makes missing/deleted/swapped associations a resume failure instead
-        // of a silent full-text provider handoff.
+        // An artifact-backed event must own exactly one source. This makes a
+        // missing/deleted/swapped association a resume failure instead of a
+        // silent full-text provider handoff.
         let sources = slots
             .iter()
             .filter(|artifact| artifact.relation == TextArtifactRelation::SourceUserInput)
@@ -891,17 +898,28 @@ fn apply_text_artifact_user_projections(
         let source = sources[0];
         let source_content = crate::text_artifact_blob::read_artifact_content(source)
             .context("reading blob-backed user source during rehydration")?;
+        let source_provenance: serde_json::Value = serde_json::from_str(&source.provenance_json)
+            .context("user source artifact provenance is invalid")?;
+        let preview_lines = source_provenance
+            .get("preview_lines")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+        let event_preview = if source_provenance.get("blob_path").is_some() {
+            source.content.clone()
+        } else {
+            crate::engine::text_artifact_frame::utf8_preview_lines(&source_content, preview_lines)
+        };
         if source.kind != TextArtifactKind::UserInputSource
             || source.capture_reason != CaptureReason::OversizedUserInput
             || source.projection_slot.is_some()
-            || source_content != authored
+            || event_preview != authored
+            || source_content.len() != source.content_bytes
         {
             return Err(anyhow!(
-                "user source artifact does not match its canonical event"
+                "user source artifact does not match its bounded event preview"
             ));
         }
-        let source_provenance: serde_json::Value = serde_json::from_str(&source.provenance_json)
-            .context("user source artifact provenance is invalid")?;
         if source_provenance
             .get("event_seq")
             .and_then(serde_json::Value::as_i64)
@@ -923,7 +941,6 @@ fn apply_text_artifact_user_projections(
             if projection.kind != TextArtifactKind::UserInputProjection
                 || projection.capture_reason != CaptureReason::OversizedUserInput
                 || projection.projection_slot != Some(0)
-                || projection.content == source.content
             {
                 return Err(anyhow!(
                     "user projection artifact has an invalid owner relation"
@@ -946,6 +963,14 @@ fn apply_text_artifact_user_projections(
                     "user projection artifact does not derive from its source"
                 ));
             }
+            let projection_content =
+                crate::text_artifact_blob::read_artifact_content(projection)
+                    .context("reading blob-backed user projection during rehydration")?;
+            if projection_content == source_content {
+                return Err(anyhow!(
+                    "user projection artifact must differ from its source"
+                ));
+            }
             projection
         } else {
             source
@@ -953,11 +978,6 @@ fn apply_text_artifact_user_projections(
         let effective_content = crate::text_artifact_blob::read_artifact_content(effective)
             .context("reading blob-backed user projection during rehydration")?;
         let outbound_content = redaction.scrub(&effective_content);
-        let preview_lines = source_provenance
-            .get("preview_lines")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
         let frame = crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content_and_preview_lines(
             effective,
             &outbound_content,
@@ -3261,6 +3281,14 @@ mod tests {
         s
     }
 
+    async fn stage_user_blob(s: &Session, text: &str) -> String {
+        let path = crate::text_artifact_blob::new_path(s.id);
+        s.db.stage_text_artifact_blob_cleanup_intent(path.clone(), s.id, 1)
+            .await
+            .unwrap();
+        crate::text_artifact_blob::write_at(&path, text).unwrap()
+    }
+
     async fn record_user(s: &Session, text: &str) {
         s.record_event(
             crate::db::session_log::SessionEventKind::UserMessage,
@@ -3644,6 +3672,7 @@ mod tests {
             }
         }
 
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let s = root_session();
         let source = "x".repeat(65_537);
         let operation_id = Uuid::new_v4();
@@ -3696,14 +3725,16 @@ mod tests {
                 {"type":"authored_text_slot"}
             ]
         });
+        let source_blob_path = stage_user_blob(&s, &source).await;
         s.db.materialize_reserved_user_text_artifacts(
             crate::db::text_artifacts::ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: json!({"text": source.clone()}).to_string(),
                 model_envelope_json: envelope.to_string(),
                 source_text: source,
-                source_blob_path: None,
+                source_blob_path: Some(source_blob_path),
                 source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
@@ -3760,6 +3791,7 @@ mod tests {
             }
         }
 
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let s = root_session();
         let source = "x".repeat(65_537);
         let operation_id = Uuid::new_v4();
@@ -3806,14 +3838,16 @@ mod tests {
             }],
             "parts": [{"type":"authored_text_slot"}]
         });
+        let source_blob_path = stage_user_blob(&s, &source).await;
         s.db.materialize_reserved_user_text_artifacts(
             crate::db::text_artifacts::ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: json!({"text": source.clone()}).to_string(),
                 model_envelope_json: envelope.to_string(),
                 source_text: source,
-                source_blob_path: None,
+                source_blob_path: Some(source_blob_path),
                 source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),

@@ -94,6 +94,14 @@ async fn create_test_session(
     .unwrap()
 }
 
+async fn stage_text_artifact_blob(db: &crate::db::Db, session_id: Uuid, text: &str) -> String {
+    let path = crate::text_artifact_blob::new_path(session_id);
+    db.stage_text_artifact_blob_cleanup_intent(path.clone(), session_id, 1_000)
+        .await
+        .unwrap();
+    crate::text_artifact_blob::write_at(&path, text).unwrap()
+}
+
 async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
     db.write(move |conn| {
         crate::db::Db::create_fork_conn(
@@ -2768,6 +2776,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
         }
     }
 
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let db = Db::open_in_memory().unwrap();
     let source_session = create_test_session(&db, "p", "/proj", "Build").await;
     let source = "user artifact source\n".repeat(4_097);
@@ -2800,6 +2809,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
         crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => reservation,
         other => panic!("expected a typed source reservation, got {other:?}"),
     };
+    let source_blob_path = stage_text_artifact_blob(&db, source_session.session_id, &source).await;
     let materialized = db
         .materialize_reserved_user_text_artifacts(
             crate::db::text_artifacts::ReservedUserArtifactMaterialization {
@@ -2808,8 +2818,9 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source.clone(),
-                source_blob_path: None,
+                source_blob_path: Some(source_blob_path),
                 source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: Default::default(),

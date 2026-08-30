@@ -25,6 +25,10 @@ pub const ARTIFACT_RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
 pub const ARTIFACT_RESERVATION_RENEW_AT_REMAINING_MS: i64 = 5 * 60 * 1000;
 pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize = 8 * 1024;
 pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize = 100;
+/// Agent definitions may spill above a 1 KiB threshold. Since admission is
+/// strictly `source_bytes > threshold`, the smallest artifact-backed source
+/// has 1,025 bytes.
+pub const MIN_USER_ARTIFACT_SOURCE_BYTES: usize = 1025;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -405,6 +409,10 @@ pub struct ReservedUserArtifactMaterialization {
     /// Ingress-selected model preview height.  Persisting it makes resume
     /// cache-stable if the agent definition later changes.
     pub source_preview_lines: Option<usize>,
+    /// Daemon-owned relative blob path for the distinct model projection. A
+    /// preprocessing result is an artifact body in its own right and must not
+    /// become an inline SQLite escape hatch.
+    pub model_projection_blob_path: Option<String>,
     pub model_projection: Option<String>,
     pub agent: Option<String>,
     pub context: TextArtifactEventContext,
@@ -1968,8 +1976,8 @@ fn validate_candidate(
             None,
         ) => {
             ensure!(
-                candidate.content.len() > 8 * 1024,
-                "user input source must cross the oversized threshold"
+                candidate.content.len() >= MIN_USER_ARTIFACT_SOURCE_BYTES,
+                "user input source is below the supported spill threshold"
             );
             validate_source_provenance(&provenance)?;
         }
@@ -2178,7 +2186,11 @@ fn artifact_inline_preview(content: &str, max_lines: usize) -> String {
 fn validate_projection_provenance(
     provenance: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
-    only_provenance_keys(provenance, &["source_artifact_id", "preprocessing_version"])?;
+    only_provenance_keys_with_optional(
+        provenance,
+        &["source_artifact_id", "preprocessing_version"],
+        "blob_path",
+    )?;
     let source = provenance
         .get("source_artifact_id")
         .and_then(serde_json::Value::as_str)
@@ -2208,7 +2220,7 @@ fn accept_message_with_reservation_conn(
     // first construct/validate FCM2, but no accepted receipt is ever left for a
     // source that cannot be represented by the artifact store.
     ensure!(
-        (65_537..=MAX_ARTIFACT_CONTENT_BYTES).contains(&source_bytes),
+        (MIN_USER_ARTIFACT_SOURCE_BYTES..=MAX_ARTIFACT_CONTENT_BYTES).contains(&source_bytes),
         "oversized source is outside the artifact reservation domain"
     );
 
@@ -2591,7 +2603,8 @@ fn acquire_reservation_conn(
     input: &TextArtifactReservationInput,
 ) -> Result<TextArtifactReservationAcquire> {
     validate_text_artifact_model_fence(input.model_fence.as_ref())?;
-    if !(65_537..=MAX_ARTIFACT_CONTENT_BYTES).contains(&input.source_bytes) {
+    if !(MIN_USER_ARTIFACT_SOURCE_BYTES..=MAX_ARTIFACT_CONTENT_BYTES).contains(&input.source_bytes)
+    {
         bail!("oversized source is outside the artifact reservation domain");
     }
     if let Some(existing) =
@@ -2985,6 +2998,66 @@ fn materialize_reserved_user_artifacts_conn(
         !canonical_user_event_has_media_or_file_parts(canonical_event),
         "oversized user event cannot carry media/file parts"
     );
+    ensure!(
+        input.source_blob_path.is_some(),
+        "oversized user source must be blob-backed"
+    );
+    ensure!(
+        input.model_projection.is_some() == input.model_projection_blob_path.is_some(),
+        "user projection body and blob path must be supplied together"
+    );
+    ensure!(
+        input.model_projection_blob_path.as_deref() != input.source_blob_path.as_deref(),
+        "user projection must not share its source blob"
+    );
+    let source_preview_lines = input
+        .source_preview_lines
+        .unwrap_or(DEFAULT_ARTIFACT_PREVIEW_LINES);
+    ensure!(
+        (1..=10_000).contains(&source_preview_lines),
+        "source preview line count is invalid"
+    );
+    // The canonical event validates the original FCM2 source, but SQLite must
+    // retain only the same bounded preview as the source artifact. Rebuild the
+    // value here, inside the owner transaction, so no caller can accidentally
+    // persist the full body by serializing the event before artifact admission.
+    let source_preview = artifact_inline_preview(&input.source_text, source_preview_lines);
+    let projection_preview = input
+        .model_projection
+        .as_deref()
+        .map(|projection| artifact_inline_preview(projection, source_preview_lines));
+    let mut persisted_event = canonical_event.clone();
+    persisted_event.insert(
+        "text".to_owned(),
+        serde_json::Value::String(source_preview.clone()),
+    );
+    // These UI-only fields can legitimately echo either durable body. Do not
+    // let an alias recreate the source/projection in `session_events` after
+    // the primary `text` member has been bounded.
+    for key in ["display_text", "preflight_cleaned"] {
+        let Some(value) = persisted_event.get_mut(key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        let replacement = if text == input.source_text {
+            Some(source_preview.clone())
+        } else if input
+            .model_projection
+            .as_deref()
+            .is_some_and(|projection| text == projection)
+        {
+            projection_preview.clone()
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            *value = serde_json::Value::String(replacement);
+        }
+    }
+    let persisted_event_json = serde_json::to_string(&serde_json::Value::Object(persisted_event))
+        .context("serializing bounded oversized user event")?;
     let bound_invocation_id = if reservation.run_invocation_bound {
         Some(
             bound_run_invocation_conn(
@@ -3032,7 +3105,7 @@ fn materialize_reserved_user_artifacts_conn(
         None,
         input.context.borrowed(),
         input.now_ms,
-        &input.canonical_event_json,
+        &persisted_event_json,
     )?;
     conn.execute(
         "INSERT INTO session_user_message_model_envelopes(session_id,event_seq,envelope_json) VALUES(?1,?2,?3)",
@@ -3048,12 +3121,13 @@ fn materialize_reserved_user_artifacts_conn(
         host_original_bytes: input.source_text.len(),
         host_dropped_bytes: 0,
         stored_source_bytes: input.source_text.len(),
-        provenance_json: match (&input.source_blob_path, input.source_preview_lines) {
-            (Some(path), Some(preview_lines)) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "blob_path": path, "preview_lines": preview_lines}).to_string(),
-            (Some(path), None) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "blob_path": path}).to_string(),
-            (None, Some(preview_lines)) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "preview_lines": preview_lines}).to_string(),
-            (None, None) => serde_json::json!({"event_seq": event_seq, "source": "user_paste"}).to_string(),
-        },
+        provenance_json: serde_json::json!({
+            "event_seq": event_seq,
+            "source": "user_paste",
+            "blob_path": input.source_blob_path.as_deref().expect("source blob path was required"),
+            "preview_lines": source_preview_lines,
+        })
+        .to_string(),
         created_at: input.now_ms,
     };
     let TextArtifactAdmission::Stored(source_artifact) = insert_artifact_conn(
@@ -3079,7 +3153,13 @@ fn materialize_reserved_user_artifacts_conn(
             host_original_bytes: projection.len(),
             host_dropped_bytes: 0,
             stored_source_bytes: projection.len(),
-            provenance_json: serde_json::json!({"source_artifact_id": source_artifact.artifact_id.to_string(), "preprocessing_version": 1}).to_string(),
+            provenance_json: serde_json::json!({
+                "source_artifact_id": source_artifact.artifact_id.to_string(),
+                "preprocessing_version": 1,
+                "blob_path": input.model_projection_blob_path.as_deref().expect("projection blob path was required"),
+                "preview_lines": source_preview_lines,
+            })
+            .to_string(),
             created_at: input.now_ms,
         };
         match insert_artifact_conn(
@@ -3107,7 +3187,15 @@ fn materialize_reserved_user_artifacts_conn(
     } else {
         None
     };
-    if let Some(path) = input.source_blob_path.as_deref() {
+    crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+        conn,
+        input
+            .source_blob_path
+            .as_deref()
+            .expect("source blob path was required"),
+        reservation.session_id,
+    )?;
+    if let Some(path) = input.model_projection_blob_path.as_deref() {
         crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
             conn,
             path,
@@ -3852,6 +3940,64 @@ mod tests {
         }
     }
 
+    async fn stage_blob(db: &Db, session_id: Uuid) -> String {
+        let path = format!("text-artifacts/{session_id}/{}.txt", Uuid::new_v4());
+        db.stage_text_artifact_blob_cleanup_intent(path.clone(), session_id, 1)
+            .await
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn minimum_supported_user_spill_materializes_as_a_bounded_event_preview() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let source = "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES);
+        let reservation = reserve(
+            &db,
+            acceptance_input(session.session_id, 250, 100),
+            source.len(),
+            source_digest(&source),
+        )
+        .await;
+        let source_blob_path = stage_blob(&db, session.session_id).await;
+        let materialized = db
+            .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: serde_json::json!({ "text": source }).to_string(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
+                source_text: "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES),
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: Some(1),
+                model_projection_blob_path: None,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: TextArtifactEventContext::default(),
+                now_ms: 101,
+            })
+            .await
+            .unwrap();
+        let ReservedUserArtifactMaterializationResult::Materialized(materialized) = materialized
+        else {
+            panic!("minimum supported spill must materialize");
+        };
+        assert_eq!(
+            materialized.source_artifact.content,
+            "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES)
+        );
+        let event = db
+            .list_session_events(session.session_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            event.data["text"].as_str(),
+            Some(materialized.source_artifact.content.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn oversized_model_fence_is_durable_replay_identity() {
         let db = Db::open_in_memory().unwrap();
@@ -4018,6 +4164,7 @@ mod tests {
         ));
 
         let materialized_at = 100_000;
+        let source_blob_path = stage_blob(&db, session.session_id).await;
         let materialized = db
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
@@ -4025,8 +4172,9 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
-                source_blob_path: None,
+                source_blob_path: Some(source_blob_path),
                 source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4508,6 +4656,7 @@ mod tests {
                 source_text: source,
                 source_blob_path: None,
                 source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4552,8 +4701,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "Build").await.unwrap();
         let source = "s".repeat(65_537);
+        let projection = format!("rewritten:{}", "p".repeat(65_537));
         let input = acceptance_input(session.session_id, 11, 100);
         let reservation = reserve(&db, input.clone(), source.len(), source_digest(&source)).await;
+        let source_blob_path = stage_blob(&db, session.session_id).await;
+        let projection_blob_path = stage_blob(&db, session.session_id).await;
         let materialized = db
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
@@ -4561,21 +4713,40 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
-                source_blob_path: None,
+                source_blob_path: Some(source_blob_path),
                 source_preview_lines: None,
-                model_projection: Some("different model projection".to_owned()),
+                model_projection_blob_path: Some(projection_blob_path),
+                model_projection: Some(projection.clone()),
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
                 now_ms: 101,
             })
             .await
             .unwrap();
-        let (source_event_seq, source_artifact) = match materialized {
-            ReservedUserArtifactMaterializationResult::Materialized(materialized) => {
-                (materialized.event_seq, materialized.source_artifact)
-            }
+        let (source_event_seq, source_artifact, projection_artifact) = match materialized {
+            ReservedUserArtifactMaterializationResult::Materialized(materialized) => (
+                materialized.event_seq,
+                materialized.source_artifact,
+                materialized
+                    .projection_artifact
+                    .expect("distinct projection is materialized"),
+            ),
             other => panic!("expected materialization, got {other:?}"),
         };
+        assert!(source_artifact.content.len() <= 16 * 1024);
+        assert!(projection_artifact.content.len() <= 16 * 1024);
+        assert_eq!(projection_artifact.content_bytes, projection.len());
+        let event = db
+            .list_session_events(session.session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.seq == source_event_seq)
+            .expect("source event is materialized");
+        assert_eq!(
+            event.data["text"].as_str(),
+            Some(source_artifact.content.as_str())
+        );
         let duplicate_source_id = Uuid::new_v4();
         db.transaction(move |conn| {
             insert_direct_artifact_copy(
@@ -5261,6 +5432,8 @@ mod tests {
         })
         .await
         .unwrap();
+        let source_blob_path = stage_blob(&db, session.session_id).await;
+        let projection_blob_path = stage_blob(&db, session.session_id).await;
         let materialization = ReservedUserArtifactMaterialization {
             reservation: reservation.clone(),
             canonical_event_json: serde_json::json!({ "text": source }).to_string(),
@@ -5269,8 +5442,9 @@ mod tests {
             // any owner/event row durable.
             model_envelope_json: r#"{"version":3,"prelude":[{"type":"forced_skill","call_id":"forced-fault","name":"review","args":{"name":"review"},"body":"FORCED","hard_fail":false}],"parts":[{"type":"text","text":"AUTO\nTAG\n"},{"type":"authored_text_slot"}]}"#.to_owned(),
             source_text: source,
-            source_blob_path: None,
+            source_blob_path: Some(source_blob_path),
             source_preview_lines: None,
+            model_projection_blob_path: Some(projection_blob_path),
             model_projection: Some("rewritten model body".to_owned()),
             agent: Some("Build".to_owned()),
             context: TextArtifactEventContext::default(),

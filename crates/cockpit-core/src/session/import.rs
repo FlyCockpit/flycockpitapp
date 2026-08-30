@@ -513,8 +513,10 @@ fn validate_text_artifact_graph(
                 TextArtifactRelation::SourceUserInput,
                 None,
             ) if event.kind == SessionEventKind::UserMessage => {
-                if artifact.content.len() <= INLINE_USER_TEXT_BYTES {
-                    bail!("user input source does not cross the oversized threshold");
+                if artifact.content.len()
+                    < crate::db::text_artifacts::MIN_USER_ARTIFACT_SOURCE_BYTES
+                {
+                    bail!("user input source is below the supported spill threshold");
                 }
                 let envelope = artifact
                     .model_envelope_json
@@ -550,10 +552,21 @@ fn validate_text_artifact_graph(
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("source user artifact event lacks canonical text"))?;
-        if text != source.content {
-            bail!("source user artifact differs from canonical event text");
-        }
         let provenance: Value = serde_json::from_str(&source.provenance_json)?;
+        let preview_lines = provenance
+            .get("preview_lines")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+        if text
+            != crate::engine::text_artifact_frame::utf8_preview_lines(
+                &source.content,
+                preview_lines,
+            )
+        {
+            bail!("source user artifact differs from its bounded event preview");
+        }
         if provenance.get("event_seq").and_then(Value::as_i64) != Some(*event_seq) {
             bail!("source user artifact provenance does not bind its event");
         }
@@ -592,12 +605,12 @@ fn validate_text_artifact_graph(
         let Some(text) = data.get("text").and_then(Value::as_str) else {
             continue;
         };
-        if text.len() > INLINE_USER_TEXT_BYTES && user_event_has_media_or_file_parts(&data) {
+        let has_source_artifact =
+            source_by_event.contains_key(&(event.source_session_id, event.seq));
+        if has_source_artifact && user_event_has_media_or_file_parts(&data) {
             bail!("oversized user event cannot carry media/file parts");
         }
-        if text.len() > INLINE_USER_TEXT_BYTES
-            && !source_by_event.contains_key(&(event.source_session_id, event.seq))
-        {
+        if text.len() > INLINE_USER_TEXT_BYTES && !has_source_artifact {
             bail!("oversized user event lacks its source text artifact");
         }
     }
@@ -668,10 +681,7 @@ fn validate_import_artifact_provenance(
             }
         }
         TextArtifactKind::UserInputProjection => {
-            require_exact_provenance_keys(
-                provenance,
-                &["source_artifact_id", "preprocessing_version"],
-            )?;
+            require_provenance_keys(provenance, &["source_artifact_id", "preprocessing_version"])?;
             let source = provenance
                 .get("source_artifact_id")
                 .and_then(Value::as_str)

@@ -57,7 +57,8 @@ impl Tool for ReadTool {
                 "offset":     { "type": "integer", "description": "1-indexed start line (default 1)" },
                 "limit":      { "type": "integer", "description": "Max lines (default 2000)" },
                 "start_line": { "type": "integer", "description": "1-indexed inclusive range start" },
-                "end_line":   { "type": "integer", "description": "1-indexed inclusive range end" }
+                "end_line":   { "type": "integer", "description": "1-indexed inclusive range end" },
+                "start_byte": { "type": "integer", "description": "0-indexed UTF-8 byte cursor within the selected start line; use the continuation returned for an oversized line" }
             },
             "required": ["path"]
         })
@@ -72,7 +73,8 @@ impl Tool for ReadTool {
                 "offset":     { "type": "integer", "description": "1-indexed line number to start reading from; defaults to 1 (the top of the file). Use with `limit` to page through a long file" },
                 "limit":      { "type": "integer", "description": "Maximum number of lines to return from `offset`; defaults to 2000. Lower it to keep the result small when you only need a slice" },
                 "start_line": { "type": "integer", "description": "1-indexed first line of an inclusive range to read; pair with `end_line` to read exactly that span instead of paging" },
-                "end_line":   { "type": "integer", "description": "1-indexed last line of the inclusive range to read; pair with `start_line`" }
+                "end_line":   { "type": "integer", "description": "1-indexed last line of the inclusive range to read; pair with `start_line`" },
+                "start_byte": { "type": "integer", "description": "0-indexed UTF-8 byte cursor within the selected start line. Use only with one selected line, as returned when an oversized line is paged." }
             },
             "required": ["path"]
         }))
@@ -256,7 +258,10 @@ pub(crate) async fn read_impl_outcome_with_path(
     // inclusive 1-indexed slice and prepends a content-hash header. This
     // is a separate path; when neither is present the behavior below is
     // byte-identical to before.
-    if args.get("start_line").is_some() || args.get("end_line").is_some() {
+    if args.get("start_line").is_some()
+        || args.get("end_line").is_some()
+        || args.get("start_byte").is_some()
+    {
         return read_range(&bytes, &text, &path, args, ctx, was_locked)
             .await
             .map(ReadOutcome::Content);
@@ -372,6 +377,12 @@ async fn read_range(
 ) -> Result<ToolOutput> {
     let start = args
         .get("start_line")
+        .or_else(|| {
+            args.get("start_byte")
+                .is_some()
+                .then(|| args.get("offset"))
+                .flatten()
+        })
         .and_then(Value::as_u64)
         .map(|s| s.max(1) as usize)
         .unwrap_or(1);
@@ -379,12 +390,33 @@ async fn read_range(
         .get("end_line")
         .and_then(Value::as_u64)
         .map(|e| e as usize);
+    let start_byte = args
+        .get("start_byte")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| {
+                    crate::engine::tool::invalid_input(
+                        "`start_byte` must be a non-negative integer",
+                    )
+                })
+                .and_then(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        crate::engine::tool::invalid_input(
+                            "`start_byte` exceeds this platform's byte range",
+                        )
+                    })
+                })
+        })
+        .transpose()?;
     let limit = requested_end
         .map(|end| end.max(start) - start + 1)
         .unwrap_or(usize::MAX);
     let slice = read_slice(text, start, limit);
     let total = slice.total_lines;
-    let end = requested_end.unwrap_or(total).max(start);
+    let end = requested_end
+        .unwrap_or_else(|| if start_byte.is_some() { start } else { total })
+        .max(start);
 
     // 12-hex prefix of the file's SHA-256.
     let mut hasher = Sha256::new();
@@ -401,6 +433,26 @@ async fn read_range(
         let header = format!("[hash={hash12} total_lines={total} returned=none]\n");
         let note = format!("Note: start_line {start} exceeds file length ({total} lines).\n");
         return Ok(ToolOutput::text(format!("{header}{note}")));
+    }
+    if let Some(start_byte) = start_byte {
+        let lines: Vec<_> = text.lines().collect();
+        let first = lines
+            .get(start - 1)
+            .expect("selected line exists when range slice is not exceeded");
+        if start_byte > first.len() || !first.is_char_boundary(start_byte) {
+            return Err(crate::engine::tool::invalid_input(
+                "`start_byte` must be a UTF-8 boundary within the selected line",
+            ));
+        }
+        let end = end.min(total);
+        let mut body = String::new();
+        for number in start..=end {
+            let line = lines[number - 1];
+            let byte = if number == start { start_byte } else { 0 };
+            body.push_str(&format!("{number}|{}\n", &line[byte..]));
+        }
+        let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");
+        return Ok(ToolOutput::text(format!("{header}{body}")));
     }
     let end = end.min(total);
     let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");

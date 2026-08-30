@@ -10,20 +10,35 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::engine::tool::{ToolCtx, ToolOutput, invalid_input};
+use crate::intel::budget::BudgetedWriter;
 use crate::tools::common::OUTPUT_BYTE_CAP;
 use crate::tools::session_search::caller_history_trust;
 
 const PREFIX: &str = "cockpit://";
 const DEFAULT_LINES: usize = 2_000;
 const MAX_SEARCH_MATCHES: usize = 100;
+const GLOB_TOKEN_CAP: usize = 4_000;
+const CONTINUATION_RESERVE_BYTES: usize = 256;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum RecallPath {
     History,
     Transcript(Uuid),
     Compaction(Uuid, usize),
     Plan(Uuid),
     Artifact(Uuid, Uuid),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PageMode {
+    Offset { start: usize, limit: usize },
+    Range { start: usize, end: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PageRequest {
+    mode: PageMode,
+    start_byte: usize,
 }
 
 pub fn is_recall_path(path: &str) -> bool {
@@ -35,73 +50,17 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_input("`path` is required"))?;
-    match parse(path, ctx).await? {
-        RecallPath::History => Ok(ToolOutput::text(history_directory(ctx).await?)),
-        RecallPath::Transcript(session_id) => {
-            let turns = ctx
-                .session
-                .db
-                .thread_turns_for_trust(session_id, caller_history_trust(ctx))
-                .await?;
-            let content = turns
-                .iter()
-                .map(|turn| {
-                    format!(
-                        "[{}] {}: {}",
-                        turn.seq,
-                        if turn.role == "assistant" {
-                            "Assistant"
-                        } else {
-                            "User"
-                        },
-                        turn.text.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(render_page(&content, path, args))
-        }
-        RecallPath::Compaction(session_id, n) => {
-            let Some(content) = ctx
-                .session
-                .db
-                .compaction_text_for_trust(session_id, n, caller_history_trust(ctx))
-                .await?
-            else {
-                return Ok(ToolOutput::text(format!(
-                    "No compaction {n} exists for `{path}`."
-                )));
-            };
-            Ok(render_page(&content, path, args))
-        }
-        RecallPath::Plan(session_id) => {
-            let content = ctx
-                .session
-                .db
-                .get_session_plan_doc(session_id)
-                .await?
-                .map(|doc| format!("[revision={}]\n{}", doc.revision, doc.content))
-                .unwrap_or_default();
-            Ok(render_page(&content, path, args))
-        }
-        RecallPath::Artifact(session_id, artifact_id) => {
-            let Some(artifact) = ctx
-                .session
-                .db
-                .text_artifact_for_trust(session_id, artifact_id, caller_history_trust(ctx))
-                .await?
-            else {
-                return Ok(ToolOutput::text(format!(
-                    "No readable artifact exists at `{path}`."
-                )));
-            };
-            Ok(render_page(
-                &ctx.redact.scrub(&artifact.content),
-                path,
-                args,
-            ))
-        }
-    }
+    let target = parse(path, ctx).await?;
+    let content = match target {
+        RecallPath::History => history_directory(ctx).await?,
+        target => match pseudofile_content(target, ctx).await? {
+            Some(content) => content,
+            None => return Ok(not_found(path, target)),
+        },
+    };
+    // Scrub before selecting a page so a secret split across a page boundary
+    // cannot leave a prefix or suffix in a later continuation.
+    render_page(&ctx.redact.scrub(&content), path, args)
 }
 
 pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
@@ -121,11 +80,31 @@ pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     if content.len() > 256 * 1024 {
         return Err(invalid_input("plan document exceeds 256 KiB"));
     }
-    let doc = ctx
+
+    let observed = ctx.session.db.get_session_plan_doc(session_id).await?;
+    let expected_revision = parse_expected_revision(args)?;
+    let current_revision = observed.as_ref().map(|doc| doc.revision).unwrap_or(0);
+    if observed.is_some() && expected_revision.is_none() {
+        return Err(invalid_input(
+            "`expected_revision` is required because a plan document already exists; read the plan and retry with the revision it reports",
+        ));
+    }
+    let expected_revision = expected_revision.unwrap_or(0);
+    if expected_revision != current_revision {
+        return Err(invalid_input(format!(
+            "stale `expected_revision`: expected {expected_revision}, but the current revision is {current_revision}; read the plan and retry"
+        )));
+    }
+    let Some(doc) = ctx
         .session
         .db
-        .write_session_plan_doc(session_id, content)
-        .await?;
+        .write_session_plan_doc_if_revision(session_id, expected_revision, content)
+        .await?
+    else {
+        return Err(invalid_input(
+            "stale `expected_revision`: the plan changed while this write was pending; read it and retry",
+        ));
+    };
     Ok(Some(ToolOutput::text(format!(
         "wrote `{path}` (revision {}, {} bytes)",
         doc.revision,
@@ -138,20 +117,28 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
     if !is_recall_path(requested) && !pattern.starts_with(PREFIX) {
         return Ok(None);
     }
-    let entries = history_entries(ctx).await?;
     let matcher = globset::Glob::new(pattern)
         .map_err(|err| invalid_input(format!("invalid glob `{pattern}`: {err}")))?
         .compile_matcher();
-    let body = entries
-        .into_iter()
-        .filter(|entry| matcher.is_match(entry))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(Some(if body.is_empty() {
-        ToolOutput::text("No matching cockpit pseudofiles.".to_string())
+    let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
+    for entry in history_entries(ctx).await? {
+        if matcher.is_match(&entry) && !writer.writeln(&entry) {
+            break;
+        }
+    }
+    if writer.is_empty() {
+        return Ok(Some(ToolOutput::text(
+            "No matching cockpit pseudofiles.".to_string(),
+        )));
+    }
+    let truncated = writer.is_truncated();
+    let mut body = writer.into_string();
+    if truncated {
+        body.push_str("... [truncated; narrow the pattern]\n");
+        Ok(Some(ToolOutput::truncated_text(body)))
     } else {
-        ToolOutput::text(format!("{body}\n"))
-    }))
+        Ok(Some(ToolOutput::text(body)))
+    }
 }
 
 pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
@@ -163,7 +150,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     }
     let target = parse(path, ctx).await?;
     if matches!(target, RecallPath::History) {
-        // #134 owns the final history-search tool.  Until then, discovery is
+        // #134 owns the final history-search tool. Until then, discovery is
         // FTS-only; never fall back to recursively regex-scanning transcripts.
         return Ok(Some(history_fts_search(args, ctx).await?));
     }
@@ -172,11 +159,9 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_input("`pattern` is required"))?;
-    let content = read(
-        &serde_json::json!({ "path": path, "limit": usize::MAX }),
-        ctx,
-    )
-    .await?;
+    let Some(content) = pseudofile_content(target, ctx).await? else {
+        return Ok(Some(not_found(path, target)));
+    };
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(
             args.get("case_insensitive")
@@ -185,17 +170,21 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
         )
         .build()
         .map_err(|err| invalid_input(format!("invalid regex: {err}")))?;
+
+    // Search the complete redacted pseudofile, rather than `read`'s first
+    // byte-capped result. The result itself has an independent byte cap.
+    let content = ctx.redact.scrub(&content);
     let mut out = String::new();
-    for (line, text) in content.content.model_text().lines().enumerate() {
-        if regex.is_match(text) {
-            let row = format!("{path}:{}: {text}\n", line + 1);
-            if out.len() + row.len() > OUTPUT_BYTE_CAP || out.lines().count() >= MAX_SEARCH_MATCHES
-            {
-                return Ok(Some(ToolOutput::truncated_text(format!(
-                    "{out}... [truncated]\n"
-                ))));
-            }
-            out.push_str(&row);
+    let mut matches = 0usize;
+    for (line, text) in content.lines().enumerate() {
+        if !regex.is_match(text) {
+            continue;
+        }
+        matches += 1;
+        if matches > MAX_SEARCH_MATCHES
+            || !append_capped_record(&mut out, &format!("{path}:{}: {text}\n", line + 1))
+        {
+            return Ok(Some(truncated_search_output(out)));
         }
     }
     Ok(Some(ToolOutput::text(if out.is_empty() {
@@ -219,11 +208,17 @@ async fn parse(path: &str, ctx: &ToolCtx) -> Result<RecallPath> {
     match parts.as_slice() {
         ["cockpit:", "", "session", _, "transcript"] => Ok(RecallPath::Transcript(session_id)),
         ["cockpit:", "", "session", _, "plan"] => Ok(RecallPath::Plan(session_id)),
-        ["cockpit:", "", "session", _, "compactions", n] => Ok(RecallPath::Compaction(
-            session_id,
-            n.parse()
-                .map_err(|_| invalid_input("compaction number must be a positive integer"))?,
-        )),
+        ["cockpit:", "", "session", _, "compactions", n] => {
+            let n = n
+                .parse::<usize>()
+                .map_err(|_| invalid_input("compaction number must be a positive integer"))?;
+            if n == 0 {
+                return Err(invalid_input(
+                    "compaction number must be a positive integer",
+                ));
+            }
+            Ok(RecallPath::Compaction(session_id, n))
+        }
         ["cockpit:", "", "session", _, "artifacts", id] => Ok(RecallPath::Artifact(
             session_id,
             Uuid::parse_str(id).map_err(|_| invalid_input("artifact id must be a UUID"))?,
@@ -237,64 +232,282 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
         return Ok(ctx.session.id);
     }
     if let Ok(id) = Uuid::parse_str(id) {
-        return ctx
+        let row = ctx
             .session
             .db
             .get_session(id)
             .await?
-            .map(|_| id)
-            .ok_or_else(|| invalid_input("session does not exist"));
+            .ok_or_else(|| invalid_input("session does not exist"))?;
+        if row.project_id != ctx.session.project_id {
+            return Err(invalid_input(
+                "session is outside the current workspace and cannot be recalled",
+            ));
+        }
+        return Ok(id);
     }
-    if let Some(row) = ctx
-        .session
+    ctx.session
         .db
         .get_session_by_short_id(&ctx.session.project_id, id)
         .await?
-    {
-        return Ok(row.session_id);
-    }
-    let found = ctx.session.db.find_sessions_by_short_id_global(id).await?;
-    match found.as_slice() {
-        [row] => Ok(row.session_id),
-        [] => Err(invalid_input(format!("no session with short id `{id}`"))),
-        _ => Err(invalid_input(format!(
-            "short id `{id}` is ambiguous; use the full UUID"
-        ))),
+        .map(|row| row.session_id)
+        .ok_or_else(|| invalid_input(format!("no session with short id `{id}`")))
+}
+
+async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<String>> {
+    match target {
+        RecallPath::History => Ok(Some(history_directory(ctx).await?)),
+        RecallPath::Transcript(session_id) => {
+            let turns = ctx
+                .session
+                .db
+                .thread_turns_for_trust(session_id, caller_history_trust(ctx))
+                .await?;
+            Ok(Some(
+                turns
+                    .iter()
+                    .map(|turn| {
+                        format!(
+                            "[{}] {}: {}",
+                            turn.seq,
+                            if turn.role == "assistant" {
+                                "Assistant"
+                            } else {
+                                "User"
+                            },
+                            turn.text.trim()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ))
+        }
+        RecallPath::Compaction(session_id, n) => {
+            ctx.session
+                .db
+                .compaction_text_for_trust(session_id, n, caller_history_trust(ctx))
+                .await
+        }
+        RecallPath::Plan(session_id) => Ok(Some(
+            ctx.session
+                .db
+                .get_session_plan_doc(session_id)
+                .await?
+                .map(|doc| format!("[revision={}]\n{}", doc.revision, doc.content))
+                .unwrap_or_default(),
+        )),
+        RecallPath::Artifact(session_id, artifact_id) => Ok(ctx
+            .session
+            .db
+            .text_artifact_for_trust(session_id, artifact_id, caller_history_trust(ctx))
+            .await?
+            .map(|artifact| artifact.content)),
     }
 }
 
-fn render_page(content: &str, path: &str, args: &Value) -> ToolOutput {
-    let offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1) as usize;
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_LINES as u64) as usize;
+fn not_found(path: &str, target: RecallPath) -> ToolOutput {
+    let message = match target {
+        RecallPath::Artifact(_, _) => format!("No readable artifact exists at `{path}`."),
+        RecallPath::Compaction(_, n) => format!("No compaction {n} exists for `{path}`."),
+        _ => format!("No readable pseudofile exists at `{path}`."),
+    };
+    ToolOutput::text(message)
+}
+
+fn render_page(content: &str, path: &str, args: &Value) -> Result<ToolOutput> {
+    let request = page_request(args, content.lines().count())?;
     let lines: Vec<_> = content.lines().collect();
+    let (start, end) = match request.mode {
+        PageMode::Offset { start, limit } => (start, start.saturating_add(limit.saturating_sub(1))),
+        PageMode::Range { start, end } => (start, end),
+    };
+    if lines.is_empty() {
+        return Ok(ToolOutput::text(String::new()));
+    }
+    if start > lines.len() {
+        return Ok(ToolOutput::text(format!(
+            "Note: start line {start} exceeds file length ({} lines).\n",
+            lines.len()
+        )));
+    }
+
     let mut out = String::new();
     let mut next = None;
-    for (index, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
-        let row = format!("{}|{}\n", index + 1, line);
-        if out.len() + row.len() + 96 > OUTPUT_BYTE_CAP {
-            next = Some(index + 1);
+    for number in start..=end.min(lines.len()) {
+        let line = lines[number - 1];
+        let byte = if number == start {
+            request.start_byte
+        } else {
+            0
+        };
+        if byte > line.len() || !line.is_char_boundary(byte) {
+            return Err(invalid_input(
+                "`start_byte` must be a UTF-8 boundary within the selected line",
+            ));
+        }
+        let prefix = format!("{number}|");
+        let remaining = OUTPUT_BYTE_CAP
+            .saturating_sub(out.len())
+            .saturating_sub(CONTINUATION_RESERVE_BYTES);
+        if remaining <= prefix.len() + 1 {
+            next = Some((number, byte));
             break;
         }
-        out.push_str(&row);
+        let text_budget = remaining - prefix.len() - 1;
+        let slice = &line[byte..];
+        let clipped = utf8_prefix(slice, text_budget);
+        out.push_str(&prefix);
+        out.push_str(clipped);
+        out.push('\n');
+        if clipped.len() != slice.len() {
+            next = Some((number, byte + clipped.len()));
+            break;
+        }
     }
-    if next.is_none() && offset.saturating_sub(1).saturating_add(limit) < lines.len() {
-        next = Some(offset.saturating_add(limit));
+
+    if next.is_none() && matches!(request.mode, PageMode::Offset { .. }) && end < lines.len() {
+        next = Some((end + 1, 0));
     }
-    if let Some(next) = next {
-        out.push_str(&format!(
-            "... [truncated; read `{path}` with offset={next}]\n"
-        ));
-        ToolOutput::truncated_text(out)
-    } else {
-        ToolOutput::text(out)
+    let Some((next_line, next_byte)) = next else {
+        return Ok(ToolOutput::text(out));
+    };
+    let continuation = continuation(path, request.mode, end, next_line, next_byte);
+    while out.len() + continuation.len() > OUTPUT_BYTE_CAP {
+        out.pop();
     }
+    out.push_str(&continuation);
+    Ok(ToolOutput::truncated_text(out))
+}
+
+fn page_request(args: &Value, line_count: usize) -> Result<PageRequest> {
+    let start_byte = nonnegative_usize(args, "start_byte")?.unwrap_or(0);
+    if args.get("start_line").is_some()
+        || args.get("end_line").is_some()
+        || (args.get("start_byte").is_some() && args.get("offset").is_none())
+    {
+        let start = positive_or_one(args, "start_line")?.unwrap_or(1);
+        let end = positive_or_one(args, "end_line")?.unwrap_or_else(|| {
+            if args.get("start_byte").is_some() {
+                start
+            } else {
+                line_count
+            }
+        });
+        if end < start {
+            return Err(invalid_input(
+                "`end_line` must be greater than or equal to `start_line`",
+            ));
+        }
+        return Ok(PageRequest {
+            mode: PageMode::Range { start, end },
+            start_byte,
+        });
+    }
+    let start = positive_or_one(args, "offset")?.unwrap_or(1);
+    let limit = line_limit(args)?;
+    Ok(PageRequest {
+        mode: PageMode::Offset { start, limit },
+        start_byte,
+    })
+}
+
+fn continuation(
+    path: &str,
+    mode: PageMode,
+    selected_end: usize,
+    next_line: usize,
+    next_byte: usize,
+) -> String {
+    match mode {
+        PageMode::Offset { limit, .. } => {
+            let remaining = if next_line > selected_end {
+                limit
+            } else {
+                selected_end
+                    .saturating_sub(next_line)
+                    .saturating_add(1)
+                    .max(1)
+            };
+            if next_byte == 0 {
+                format!(
+                    "... [truncated; read `{path}` with offset={next_line}, limit={remaining}]\n"
+                )
+            } else {
+                format!(
+                    "... [truncated; read `{path}` with offset={next_line}, limit={remaining}, start_byte={next_byte}]\n"
+                )
+            }
+        }
+        PageMode::Range { end, .. } => {
+            if next_byte == 0 {
+                format!(
+                    "... [truncated; read `{path}` with start_line={next_line}, end_line={end}]\n"
+                )
+            } else {
+                format!(
+                    "... [truncated; read `{path}` with start_line={next_line}, end_line={end}, start_byte={next_byte}]\n"
+                )
+            }
+        }
+    }
+}
+
+fn line_limit(args: &Value) -> Result<usize> {
+    let Some(value) = args.get("limit") else {
+        return Ok(DEFAULT_LINES);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| invalid_input("`limit` must be an integer"))?;
+    if value == 0 {
+        return Ok(DEFAULT_LINES);
+    }
+    usize::try_from(value).map_err(|_| invalid_input("`limit` exceeds this platform's line range"))
+}
+
+fn positive_or_one(args: &Value, name: &str) -> Result<Option<usize>> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| invalid_input(format!("`{name}` must be an integer")))?;
+    usize::try_from(value.max(1))
+        .map(Some)
+        .map_err(|_| invalid_input(format!("`{name}` exceeds this platform's line range")))
+}
+
+fn nonnegative_usize(args: &Value, name: &str) -> Result<Option<usize>> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| invalid_input(format!("`{name}` must be a non-negative integer")))?;
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| invalid_input(format!("`{name}` exceeds this platform's byte range")))
+}
+
+fn parse_expected_revision(args: &Value) -> Result<Option<i64>> {
+    args.get("expected_revision")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| invalid_input("`expected_revision` must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn utf8_prefix(value: &str, budget: usize) -> &str {
+    if value.len() <= budget {
+        return value;
+    }
+    let mut end = budget;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
@@ -334,7 +547,7 @@ async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
 }
 
 async fn history_directory(ctx: &ToolCtx) -> Result<String> {
-    Ok(format!("{}\n", history_entries(ctx).await?.join("\n")))
+    Ok(history_entries(ctx).await?.join("\n"))
 }
 
 async fn history_fts_search(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -355,20 +568,94 @@ async fn history_fts_search(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             caller_history_trust(ctx),
         )
         .await?;
-    let body = hits
-        .into_iter()
-        .map(|hit| {
-            format!(
-                "cockpit://session/{}/transcript: {}",
-                hit.short_id.unwrap_or_else(|| hit.session_id.to_string()),
-                hit.snippet.trim()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(ToolOutput::text(if body.is_empty() {
+    let mut out = String::new();
+    for hit in hits {
+        let row = format!(
+            "cockpit://session/{}/transcript: {}\n",
+            hit.short_id.unwrap_or_else(|| hit.session_id.to_string()),
+            ctx.redact.scrub(hit.snippet.trim())
+        );
+        if !append_capped_record(&mut out, &row) {
+            return Ok(truncated_search_output(out));
+        }
+    }
+    Ok(ToolOutput::text(if out.is_empty() {
         "No matches.".to_string()
     } else {
-        format!("{body}\n")
+        out
     }))
+}
+
+fn append_capped_record(out: &mut String, row: &str) -> bool {
+    const MARKER: &str = "... [truncated; narrow the search]\n";
+    if out.len() + row.len() + MARKER.len() <= OUTPUT_BYTE_CAP {
+        out.push_str(row);
+        return true;
+    }
+    if out.is_empty() {
+        out.push_str(utf8_prefix(
+            row,
+            OUTPUT_BYTE_CAP.saturating_sub(MARKER.len()),
+        ));
+    }
+    false
+}
+
+fn truncated_search_output(mut out: String) -> ToolOutput {
+    const MARKER: &str = "... [truncated; narrow the search]\n";
+    while out.len() + MARKER.len() > OUTPUT_BYTE_CAP {
+        out.pop();
+    }
+    out.push_str(MARKER);
+    ToolOutput::truncated_text(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn oversized_line_continuation_advances_within_the_line() {
+        let content = "x".repeat(OUTPUT_BYTE_CAP * 2);
+        let first = render_page(
+            &content,
+            "cockpit://session/abc123/transcript",
+            &json!({ "offset": 1, "limit": 1 }),
+        )
+        .unwrap();
+        let first_text = first.content.model_text();
+        assert!(first_text.len() <= OUTPUT_BYTE_CAP);
+        assert!(first_text.contains("offset=1, limit=1, start_byte="));
+
+        let cursor = first_text
+            .split("start_byte=")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(cursor > 0);
+        let second = render_page(
+            &content,
+            "cockpit://session/abc123/transcript",
+            &json!({ "offset": 1, "limit": 1, "start_byte": cursor }),
+        )
+        .unwrap();
+        assert!(second.content.model_text().starts_with("1|"));
+        assert_ne!(first.content.model_text(), second.content.model_text());
+    }
+
+    #[test]
+    fn range_mode_uses_the_read_tool_start_and_end_grammar() {
+        let output = render_page(
+            "one\ntwo\nthree",
+            "cockpit://session/abc123/transcript",
+            &json!({ "start_line": 2, "end_line": 2 }),
+        )
+        .unwrap();
+        assert_eq!(output.content.model_text(), "2|two\n");
+    }
 }

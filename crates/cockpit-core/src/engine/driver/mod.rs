@@ -4620,13 +4620,22 @@ impl Driver {
             approver: self.approver.clone(),
             image_generation_dispatch: self.session.image_generation_dispatch(),
             transcription_dispatch: None,
-            deferred_log: self.stack.last().context("driver stack is empty")?.deferred_log.clone(),
+            deferred_log: self
+                .stack
+                .last()
+                .context("driver stack is empty")?
+                .deferred_log
+                .clone(),
             root_agent_frame: false,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             review_cage: None,
             context_usage: Some(self.context_usage_snapshot()),
             available_tools: Arc::new(
-                active_tools.names().into_iter().map(str::to_string).collect(),
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
             ),
             mcp_builtin_registry: active_tools.mcp_builtin_registry(),
             has_tree: active_tools.get("code").is_some(),

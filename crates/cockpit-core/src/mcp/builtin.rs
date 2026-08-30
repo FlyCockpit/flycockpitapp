@@ -934,7 +934,9 @@ impl BuiltinRegistry {
                 Box::pin(async move {
                     let calls = crate::engine::seed_reads::parse_seed_reads(args.get("calls"))
                         .map_err(anyhow::Error::msg)?;
-                    *slot.lock().map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
+                    *slot
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
                         Some(calls.clone());
                     Ok(serde_json::json!({"accepted": true, "count": calls.len()}))
                 })
@@ -1779,6 +1781,25 @@ mod tests {
                 .is_some(),
             "the explore ephemeral fork catalog owns seed_reads"
         );
+    }
+
+    #[tokio::test]
+    async fn seed_reads_fork_rejects_mutating_calls() {
+        let slot = Arc::new(Mutex::new(None));
+        let host = HostContext::empty_for_tests()
+            .with_builtin_registry(Arc::new(BuiltinRegistry::seed_reads_fork(slot.clone())));
+        let error = invoke(
+            &host,
+            "seed_reads",
+            serde_json::json!({
+                "calls": [{"tool": "write", "args": {"path": "src/lib.rs"}}]
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("non-read-only tool `write`"), "{error}");
+        assert!(slot.lock().unwrap().is_none());
     }
 
     struct MontyAdapterTool {

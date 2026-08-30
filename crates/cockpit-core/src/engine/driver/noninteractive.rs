@@ -4085,13 +4085,12 @@ impl Driver {
             };
             let child_routing = ChildRoutingMetadata::from_model(&child.model);
             let recovered_next_prompt = recovery.next_prompt;
-            let recovered_seed_reads = if crate::engine::seed_reads::history_contains_seed_reads(
-                &recovery.history,
-            ) {
-                Vec::new()
-            } else {
-                seed_reads
-            };
+            let recovered_seed_reads =
+                if crate::engine::seed_reads::history_contains_seed_reads(&recovery.history) {
+                    Vec::new()
+                } else {
+                    seed_reads
+                };
             let target = NoninteractiveSteerTarget::new(task_call_id.clone(), recovery.label)
                 .with_agent_instance_id(recovery.agent_instance_id)
                 .with_recovered_late_user_steer_continuation(
@@ -10822,7 +10821,11 @@ pub(crate) async fn run_noninteractive_resumable(
             review_cage: None,
             context_usage: Some(crate::engine::tool::ContextUsageSnapshot::unavailable()),
             available_tools: Arc::new(
-                active_tools.names().into_iter().map(str::to_string).collect(),
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
             ),
             mcp_builtin_registry: active_tools.mcp_builtin_registry(),
             has_tree: active_tools.get("code").is_some(),
@@ -12025,7 +12028,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     agent.model.session_redact_table(),
                 )
                 .await;
-                let report = crate::engine::seed_reads::append_to_report(report, &seed_reads);
+                let report = if agent.name == "explore" {
+                    crate::engine::seed_reads::append_to_report(report, &seed_reads)
+                } else {
+                    report
+                };
                 return Ok(NoninteractiveOutcome {
                     report,
                     history,
@@ -12068,7 +12075,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     agent.model.session_redact_table(),
                 )
                 .await;
-                let report = crate::engine::seed_reads::append_to_report(report, &seed_reads);
+                let report = if agent.name == "explore" {
+                    crate::engine::seed_reads::append_to_report(report, &seed_reads)
+                } else {
+                    report
+                };
                 return Ok(NoninteractiveOutcome {
                     report,
                     history,

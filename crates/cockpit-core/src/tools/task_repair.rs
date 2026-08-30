@@ -705,6 +705,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_delegate_preserves_seed_reads() {
+        let parsed = parse_task_args(
+            &json!({
+                "intent": "delegate",
+                "payload": {
+                    "agent": "builder",
+                    "prompt": "implement",
+                    "seed_reads": [{"tool": "read", "args": {"path": "src/lib.rs"}}]
+                }
+            }),
+            &known(),
+        )
+        .unwrap();
+        let ParsedTaskArgs::Delegate { args, .. } = parsed else {
+            panic!("expected delegate");
+        };
+        assert_eq!(args["seed_reads"][0]["tool"], "read");
+    }
+
+    #[test]
     fn legacy_fresh_delegation_canonicalizes_to_delegate() {
         let args = json!({ "agent": "explore", "prompt": "look" });
 

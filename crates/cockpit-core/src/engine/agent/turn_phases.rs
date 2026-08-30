@@ -1898,23 +1898,22 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 // Collected loosely here (trimmed, de-blanked, de-duplicated);
                 // role-invariant rejection happens at the single driver chokepoint.
                 let granted_tools = task_string_array(&args, "grant_tools");
-                let seed_reads = match crate::engine::seed_reads::parse_seed_reads(
-                    args.get("seed_reads"),
-                ) {
-                    Ok(seed_reads) => seed_reads,
-                    Err(err) => {
-                        return_structural!(task_refusal(
-                            &tc.id,
-                            tc.provider
-                                .as_ref()
-                                .and_then(|provider| provider.item_id.clone()),
-                            tc.provider
-                                .as_ref()
-                                .map(|provider| provider.call_id.clone()),
-                            err
-                        ));
-                    }
-                };
+                let seed_reads =
+                    match crate::engine::seed_reads::parse_seed_reads(args.get("seed_reads")) {
+                        Ok(seed_reads) => seed_reads,
+                        Err(err) => {
+                            return_structural!(task_refusal(
+                                &tc.id,
+                                tc.provider
+                                    .as_ref()
+                                    .and_then(|provider| provider.item_id.clone()),
+                                tc.provider
+                                    .as_ref()
+                                    .map(|provider| provider.call_id.clone()),
+                                err
+                            ));
+                        }
+                    };
                 let todo_ids = task_todo_ids(&args);
                 if !noninteractive {
                     // Timeline event (Part B): an interactive `task`

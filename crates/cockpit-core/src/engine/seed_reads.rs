@@ -78,18 +78,14 @@ pub async fn select_from_explore_fork(
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
     cancel: tokio_util::sync::CancellationToken,
-    sealed_egress: Option<Arc<crate::redact::RedactionTable>>,
+    sealed_egress: Arc<crate::redact::RedactionTable>,
 ) -> Vec<SeedRead> {
     if agent_name != "explore" || cancel.is_cancelled() {
         return Vec::new();
     }
     let slot = Arc::new(Mutex::new(None));
-    let host = crate::mcp::builtin::HostContext::seed_reads_fork(
-        session,
-        cwd,
-        config,
-        slot.clone(),
-    );
+    let host =
+        crate::mcp::builtin::HostContext::seed_reads_fork(session, cwd, config, slot.clone());
     let prompt = Message::user(
         "Select only the read-only calls an implementation subagent should rerun before its first inference to avoid rediscovery while keeping results fresh. Call Monty exactly once with a script that invokes mcp.invoke('cockpit', 'seed_reads', {'calls': [...]}); each call is {'tool': one of read/grep/code/graph/search, 'args': {...}}. The script may compute the list programmatically. Do not execute the calls and do not explain.",
     );
@@ -103,7 +99,7 @@ pub async fn select_from_explore_fork(
             agent_name,
             false,
             &cancel,
-            sealed_egress.as_deref(),
+            Some(sealed_egress.as_ref()),
         )
         .await;
     let Ok(((_, content, _), _, _)) = completion else {
@@ -122,13 +118,9 @@ pub async fn select_from_explore_fork(
     else {
         return Vec::new();
     };
-    if crate::mcp::sandbox::run_with_host(
-        &script,
-        &crate::mcp::config::McpConfig::default(),
-        &host,
-    )
-    .await
-    .is_err()
+    if crate::mcp::sandbox::run_with_host(&script, &crate::mcp::config::McpConfig::default(), &host)
+        .await
+        .is_err()
     {
         return Vec::new();
     }
@@ -139,9 +131,6 @@ pub async fn select_from_explore_fork(
 }
 
 pub fn append_to_report(mut report: String, seed_reads: &[SeedRead]) -> String {
-    if seed_reads.is_empty() {
-        return report;
-    }
     let payload = serde_json::json!({"seed_reads": seed_reads});
     report.push_str("\n\n## Seed reads\n");
     report.push_str(&payload.to_string());

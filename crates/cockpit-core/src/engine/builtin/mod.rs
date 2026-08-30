@@ -6644,7 +6644,10 @@ pub(crate) mod tests {
         let args = test_spawn_args(tmp.path());
         let tools = explore(&args).tools.names();
         assert!(!tools.contains(&"seed"));
-        assert!(tools.contains(&"mcp"), "explore keeps Monty in its stable base toolbox");
+        assert!(
+            tools.contains(&"mcp"),
+            "explore keeps Monty in its stable base toolbox"
+        );
     }
 
     #[test]

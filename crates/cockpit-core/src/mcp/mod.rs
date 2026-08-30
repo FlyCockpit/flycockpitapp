@@ -18,6 +18,10 @@ pub mod child_failure;
 pub mod client;
 pub mod config;
 pub mod device;
+// The forwarded catalog is an internal daemon capability.  Keeping its module
+// crate-private prevents another workspace consumer from routing editor input
+// around the catalog/approval funnel.
+pub(crate) mod forwarded;
 pub mod invoke_prep;
 pub mod protocol;
 pub mod resolver;

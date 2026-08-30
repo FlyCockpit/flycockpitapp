@@ -1,6 +1,88 @@
 use super::*;
 
 impl Approver {
+    /// Prompt for an ACP-forwarded connect or tool effect without reading or
+    /// writing any persistent grant/reject record. `Session` is presented as
+    /// "always" by existing clients but is retained only by the live epoch.
+    pub(super) async fn approve_forwarded_mcp_inner(
+        &self,
+        display_name: &str,
+        tool: Option<&str>,
+        transport: &str,
+        identity: &str,
+    ) -> Result<Decision> {
+        let offered = [Scope::Once, Scope::Session];
+        let operation = tool.map_or("connect", |_| "tool");
+        // `display_name` is already host-owned/redacted.  Never make a
+        // durable target from an editor declaration name.
+        let target = format!("acp_forwarded:{operation}:{display_name}");
+        if self.yolo_mode()
+            || self
+                .auto_allows(crate::agent_tree::HostEffectClass::ExternalAction, &target)
+                .await
+        {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
+        let prompt = match tool {
+            Some(_) => format!(
+                "An editor-provided MCP tool on `{display_name}` wants to run. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
+            ),
+            None => format!(
+                "`{display_name}` wants to connect. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
+            ),
+        };
+        let question = approval_question(
+            &target,
+            false,
+            GrantKind::McpTool,
+            Some(&prompt),
+            None,
+            None,
+            &offered,
+            None,
+        );
+        let set = approval_option_set("acp_forwarded_mcp_approval", false, &offered, None);
+        let choice = self
+            .raise_and_decode(
+                &prompt,
+                question,
+                "acp_forwarded_mcp",
+                serde_json::json!({
+                    "source": crate::mcp::forwarded::SOURCE_ACP_FORWARDED,
+                    "server_display": display_name,
+                    "transport": transport,
+                    "identity": identity,
+                    "operation": operation,
+                    "offered_scopes": ["once", "epoch"],
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
+            .await?;
+        let decision = match choice {
+            ApprovalChoice::Approve(scope @ (Scope::Once | Scope::Session)) => {
+                Decision::Allow { scope }
+            }
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+            ApprovalChoice::Reject(Scope::Session) => Decision::StandingReject {
+                scope: Scope::Session,
+            },
+            ApprovalChoice::Deny
+            | ApprovalChoice::Reject(_)
+            | ApprovalChoice::Approve(_)
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+        };
+        self.record_permission_decision(
+            "acp_forwarded_mcp",
+            &target,
+            &offered,
+            decision,
+            DecisionSource::UserPrompt,
+        )
+        .await;
+        Ok(decision)
+    }
+
     pub fn new(
         store: GrantStore,
         db: crate::db::Db,

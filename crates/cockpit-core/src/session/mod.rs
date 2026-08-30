@@ -226,6 +226,11 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Memory-only ACP-forwarded MCP publication slot. It is reachable only
+    /// through the session carried by `ToolCtx`, so every descendant observes
+    /// the same root-scoped epoch and no declaration enters durable session
+    /// state.
+    forwarded_mcp_catalog: Arc<crate::mcp::forwarded::ForwardedCatalogSlot>,
     /// Turn-pinned transcription egress composed from the same resolved
     /// provider credential, endpoint, capability metadata, and journal.
     transcription_dispatch: Mutex<
@@ -861,6 +866,16 @@ impl Session {
 
     pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         self.external_journal.lock().unwrap().clone()
+    }
+
+    pub(crate) fn forwarded_mcp_slot(&self) -> Arc<crate::mcp::forwarded::ForwardedCatalogSlot> {
+        self.forwarded_mcp_catalog.clone()
+    }
+
+    pub(crate) fn forwarded_mcp_catalog(
+        &self,
+    ) -> Option<Arc<crate::mcp::forwarded::AcpForwardedMcpCatalogV1>> {
+        self.forwarded_mcp_catalog.active()
     }
 
     pub(crate) fn transcription_dispatch(

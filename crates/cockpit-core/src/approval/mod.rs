@@ -325,6 +325,16 @@ pub enum AuthorizationRequest<'a> {
         /// configuration immediately before connection.
         target: &'a serde_json::Value,
     },
+    /// Epoch-scoped editor-forwarded MCP invocation. The policy implementation
+    /// never consults or writes the durable grant store for this variant.
+    ForwardedMcpTool {
+        /// Host-owned bounded projection. Never pass the editor declaration
+        /// name into the interrupt/session-audit pipeline.
+        display_name: &'a str,
+        tool: &'a str,
+        transport: &'a str,
+        identity: &'a str,
+    },
     /// A configured shell tool, keyed by the calling agent and tool name.
     CustomTool {
         tool: &'a str,
@@ -341,6 +351,12 @@ pub enum AuthorizationRequest<'a> {
         server: &'a str,
         identity: &'a str,
         agent_bound: bool,
+    },
+    /// Epoch-scoped editor-forwarded connection authorization.
+    ForwardedMcpServerConnect {
+        display_name: &'a str,
+        transport: &'a str,
+        identity: &'a str,
     },
     /// Replace existing file contents after a visible approval.
     FileWrite {
@@ -601,6 +617,15 @@ impl Approver {
                 self.approve_mcp_tool_inner(agent, profile, server, tool, input, target)
                     .await
             }
+            AuthorizationRequest::ForwardedMcpTool {
+                display_name,
+                tool,
+                transport,
+                identity,
+            } => {
+                self.approve_forwarded_mcp_inner(display_name, Some(tool), transport, identity)
+                    .await
+            }
             AuthorizationRequest::CustomTool {
                 tool,
                 command,
@@ -618,6 +643,14 @@ impl Approver {
                 agent_bound,
             } => {
                 self.approve_mcp_server_connect_inner(agent, profile, server, identity, agent_bound)
+                    .await
+            }
+            AuthorizationRequest::ForwardedMcpServerConnect {
+                display_name,
+                transport,
+                identity,
+            } => {
+                self.approve_forwarded_mcp_inner(display_name, None, transport, identity)
                     .await
             }
             AuthorizationRequest::FileWrite {

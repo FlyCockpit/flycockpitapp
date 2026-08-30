@@ -37,6 +37,20 @@ impl HttpClient {
         })
     }
 
+    /// The sole constructor for editor-forwarded remote declarations. Taking
+    /// the closed forwarded type keeps its credential-bearing endpoint and
+    /// headers inside the audited transport consumer graph.
+    pub(crate) fn new_forwarded(
+        remote: &crate::mcp::forwarded::AcpForwardedRemoteV1,
+        timeouts: McpTimeouts,
+    ) -> Result<Self> {
+        Self::new(
+            remote.forwarded_url(),
+            remote.forwarded_headers().clone(),
+            timeouts,
+        )
+    }
+
     async fn request(&mut self, method: &str, params: Option<Value>) -> Result<JsonRpcResponse> {
         let id = self.next_id;
         self.next_id += 1;

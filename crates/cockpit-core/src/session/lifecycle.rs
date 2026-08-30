@@ -877,6 +877,7 @@ impl Session {
             dream_run_fence: Arc::new(Mutex::new(super::DreamRunFenceState::Vacant)),
             secret_vault: vault,
             external_journal: Mutex::new(None),
+            forwarded_mcp_catalog: Arc::new(crate::mcp::forwarded::ForwardedCatalogSlot::default()),
             transcription_dispatch: Mutex::new(std::collections::HashMap::new()),
             message_media_authority: Mutex::new(None),
             #[cfg(test)]

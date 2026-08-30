@@ -324,9 +324,6 @@ pub(super) async fn end_btw_fork(
         .end_btw_fork(parent_session_id)
         .await
         .map_err(internal)?;
-    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
-        tracing::warn!(%error, %parent_session_id, "btw text artifact cleanup remains pending");
-    }
     Ok(Response::Ack)
 }
 
@@ -358,9 +355,6 @@ pub(super) async fn discard_session(
         .discard_ephemeral_session(session_id)
         .await
         .map_err(internal)?;
-    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
-        tracing::warn!(%error, %session_id, "discarded-session text artifact cleanup remains pending");
-    }
     Ok(Response::Ack)
 }
 
@@ -440,9 +434,9 @@ pub(super) async fn delete_session(
             message: format!("session {session_id} is active; end it before deleting"),
         });
     }
-    // Capture every durable scratch path before the relational cascade removes
-    // descendants. The daemon owns this filesystem side effect; no UI process
-    // is permitted to infer or delete these paths.
+    // Capture filesystem targets before the relational cascade removes the
+    // descendants that authorize them. Both workspace scratch and result blobs
+    // are daemon-owned state and must be deleted with the session.
     let subtree = ctx
         .db
         .session_subtree_ids(session_id)
@@ -481,15 +475,13 @@ pub(super) async fn delete_session(
                     result_blob_dir.display()
                 )));
             }
-            Err(error) => {
-                return Err(internal(anyhow::Error::from(error).context(format!(
-                    "verifying result-blob removal at `{}`",
-                    result_blob_dir.display()
-                ))));
-            }
+            Err(error) => return Err(internal(error)),
         }
     }
     ctx.db.delete_session(session_id).await.map_err(internal)?;
+    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+        service.revoke_root(session_id);
+    }
     if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
         tracing::warn!(%error, %session_id, "text artifact blob cleanup remains pending");
     }
@@ -520,37 +512,23 @@ pub(super) async fn prepare_session_deletion(
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
-    // Commit a fence for the complete fork tree before stopping workers. This
-    // prevents a concurrent fork from appearing between discovery and the
-    // cascade, and gives every descendant the same deletion boundary.
-    let members = ctx
-        .db
-        .fence_session_subtree_for_deletion(session_id)
-        .await
-        .map_err(internal)?;
     // Don't delete out from under a running worker (GOALS §17h): stop any
-    // live workers in the now-fenced subtree first — that cancels their
+    // live workers in the affected subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
     stop_subtree(ctx, session_id, true).await?;
-    // SQLite deletion cascades through every member. Each one therefore needs
-    // its own containment and write-scope admission barrier; fencing only the
-    // requested root would let a descendant retain authority while its durable
-    // rows are removed by the cascade.
     // Deletion barrier: commit Deleting, wait for ProvenEmpty containments.
     if let Some(pc) = ctx.process_containment.as_ref() {
-        for member in &members {
-            pc.begin_session_deletion(*member)
-                .await
-                .map_err(|e| ErrorPayload {
-                    code: ErrorCode::Internal,
-                    message: format!("containment deletion barrier: {e}"),
-                })?;
-            if let Err(e) = pc.finish_session_deletion(*member).await {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Internal,
-                    message: format!("session deletion blocked on nonempty containments: {e}"),
-                });
-            }
+        pc.begin_session_deletion(session_id)
+            .await
+            .map_err(|e| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("containment deletion barrier: {e}"),
+            })?;
+        if let Err(e) = pc.finish_session_deletion(session_id).await {
+            return Err(ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("session deletion blocked on nonempty containments: {e}"),
+            });
         }
     }
     // Write-scope barrier: block new transfers, then refuse to delete while any
@@ -558,23 +536,21 @@ pub(super) async fn prepare_session_deletion(
     // session rows underneath a live lease would drop the durable record of an
     // authority that a still-running descendant believes it owns.
     if let Some(ws) = ctx.write_scope.as_ref() {
-        for member in &members {
-            let blockers = ws
-                .begin_session_deletion(*member)
-                .await
-                .map_err(|e| ErrorPayload {
-                    code: ErrorCode::Internal,
-                    message: format!("write scope deletion barrier: {e}"),
-                })?;
-            if !blockers.is_empty() {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Internal,
-                    message: format!(
-                        "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
-                        blockers.len()
-                    ),
-                });
-            }
+        let blockers = ws
+            .begin_session_deletion(session_id)
+            .await
+            .map_err(|e| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("write scope deletion barrier: {e}"),
+            })?;
+        if !blockers.is_empty() {
+            return Err(ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!(
+                    "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
+                    blockers.len()
+                ),
+            });
         }
     }
     let now_wall_ms = super::run_invocation::wall_ms_now();
@@ -584,7 +560,7 @@ pub(super) async fn prepare_session_deletion(
     // that cannot run inside the SQLite ledger transaction, and it is idempotent
     // / reconcilable: a later ledger failure leaves the retry safe because the
     // reconcile pass re-runs it. Run it before either delete path.
-    if let Some(storage) = ctx.active_media_storage_recovery() {
+    if let Some(storage) = &ctx.media_storage_recovery {
         storage
             .begin_session_deletion_cleanup(session_id, now_wall_ms)
             .await
@@ -619,6 +595,9 @@ pub(super) async fn archive_session(
         .archive_session(session_id, cascade)
         .await
         .map_err(internal)?;
+    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+        service.revoke_root(session_id);
+    }
     Ok(Response::Ack)
 }
 
@@ -704,9 +683,6 @@ pub(super) fn validate_set_agent_name(
     name: &str,
     ownable: &[String],
 ) -> std::result::Result<(), ErrorPayload> {
-    if crate::agents::is_feature_primary(name) {
-        return Ok(());
-    }
     if !ownable.iter().any(|agent| agent == name) {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
@@ -745,8 +721,8 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
 
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
-) -> std::result::Result<DaemonSchedulerHandle, ErrorPayload> {
-    ctx.scheduler().ok_or_else(|| ErrorPayload {
+) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
+    ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),
     })

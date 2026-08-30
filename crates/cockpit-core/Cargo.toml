@@ -65,6 +65,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 image = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+url.workspace = true
 # Workspace: `rig-core` aliased as `rig` — portable contracts + transport only.
 rig = { workspace = true }
 httpdate = "1"
@@ -287,6 +288,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # Source-scan guard for the daemon custody module (syn AST visitor). Already in
 # Cargo.lock at 2.x via the workspace; matches cockpit-proto's dev use.
 syn = { version = "2", features = ["full", "visit"] }
+# Source-range support for the forwarded-MCP production-only source ratchet.
+# The lockfile-compatible line is already used by sibling source-scan tests.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 rcgen = "=0.14.8"
 # `rustls` is now a normal dependency (process-global aws_lc_rs provider install);
 # see `[dependencies]`. `tokio-rustls` stays dev-only for media_https test servers.

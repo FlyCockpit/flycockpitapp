@@ -249,6 +249,25 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.read_regular_file(components)
     }
 
+    /// Atomically create a small, root-relative regular file if it is absent.
+    ///
+    /// The create is anchored in the retained workspace handle and refuses
+    /// symlinks/reparse points. `false` means another actor already created
+    /// the name; callers must reopen and validate its contents through this
+    /// authority rather than treating that outcome as success by itself.
+    pub fn create_regular_file_relative_if_absent(
+        &self,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<bool> {
+        validate_component(name)?;
+        ensure!(
+            contents.len() <= 4096,
+            "held workspace bootstrap file exceeds 4096 bytes"
+        );
+        self.imp.create_regular_file_if_absent(name, contents)
+    }
+
     /// Open a regular descendant through the retained workspace directory.
     /// The returned descriptor is anchored beneath the held root and never
     /// follows a symlink/reparse component. Callers retain this descriptor;
@@ -695,8 +714,8 @@ fn digest(parts: &[&[u8]]) -> String {
 #[cfg(unix)]
 mod imp {
     use std::ffi::{CString, OsStr};
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -820,6 +839,42 @@ mod imp {
 
         pub(super) fn directory_handle_clone(&self) -> Result<File> {
             Ok(self.dir.try_clone()?)
+        }
+
+        pub(super) fn create_regular_file_if_absent(
+            &self,
+            name: &str,
+            contents: &[u8],
+        ) -> Result<bool> {
+            let name = CString::new(name).context("workspace bootstrap file has NUL")?;
+            let raw = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    // This random lifetime discriminator is not a secret.
+                    // Keep it readable to every user who can attach the
+                    // shared workspace, so they derive the same project ID.
+                    0o644,
+                )
+            };
+            if raw < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Ok(false);
+                }
+                return Err(error).context("creating held workspace bootstrap file");
+            }
+            let mut file = unsafe { File::from_raw_fd(raw) };
+            file.write_all(contents)
+                .context("writing held workspace bootstrap file")?;
+            file.sync_all()
+                .context("syncing held workspace bootstrap file")?;
+            Ok(true)
         }
 
         pub(super) fn read_regular_file(&self, components: &[&str]) -> Result<Vec<u8>> {
@@ -1630,7 +1685,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::mem::size_of;
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -1936,6 +1991,62 @@ mod imp {
         }
         pub(super) fn directory_handle_clone(&self) -> Result<File> {
             Ok(self.dir.try_clone()?)
+        }
+        pub(super) fn create_regular_file_if_absent(
+            &self,
+            name: &str,
+            contents: &[u8],
+        ) -> Result<bool> {
+            let mut owned = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
+            let unicode = UnicodeString {
+                length: (owned.len() * 2) as u16,
+                maximum_length: (owned.len() * 2) as u16,
+                buffer: owned.as_mut_ptr(),
+            };
+            let attributes = ObjectAttributes {
+                length: size_of::<ObjectAttributes>() as u32,
+                root_directory: self.dir.as_raw_handle(),
+                object_name: &unicode,
+                attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+                security_descriptor: ptr::null_mut(),
+                security_quality_of_service: ptr::null_mut(),
+            };
+            let mut io = IoStatusBlock {
+                status: 0,
+                information: 0,
+            };
+            let mut raw = ptr::null_mut();
+            let status = unsafe {
+                NtCreateFile(
+                    &mut raw,
+                    GENERIC_WRITE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                    &attributes,
+                    &mut io,
+                    ptr::null(),
+                    FILE_ATTRIBUTE_NORMAL,
+                    FILE_SHARE_ALL,
+                    FILE_CREATE,
+                    FILE_NON_DIRECTORY_FILE
+                        | FILE_OPEN_REPARSE_POINT
+                        | FILE_SYNCHRONOUS_IO_NONALERT,
+                    ptr::null(),
+                    0,
+                )
+            };
+            if status == STATUS_OBJECT_NAME_COLLISION {
+                return Ok(false);
+            }
+            ensure!(
+                status >= STATUS_SUCCESS_MIN && !raw.is_null(),
+                "creating held Windows workspace bootstrap file failed with NTSTATUS {status:#x}"
+            );
+            let mut file = unsafe { File::from_raw_handle(raw) };
+            verify_regular_handle(&file)?;
+            file.write_all(contents)
+                .context("writing held Windows workspace bootstrap file")?;
+            file.sync_all()
+                .context("syncing held Windows workspace bootstrap file")?;
+            Ok(true)
         }
         pub(super) fn read_regular_file(&self, components: &[&str]) -> Result<Vec<u8>> {
             let (leaf, parents) = components
@@ -3182,6 +3293,9 @@ mod imp {
             anyhow::bail!("held workspace directory authority is unavailable")
         }
         pub(super) fn directory_handle_clone(&self) -> Result<File> {
+            anyhow::bail!("held workspace directory authority is unavailable")
+        }
+        pub(super) fn create_regular_file_if_absent(&self, _: &str, _: &[u8]) -> Result<bool> {
             anyhow::bail!("held workspace directory authority is unavailable")
         }
         pub(super) fn read_regular_file(&self, _: &[&str]) -> Result<Vec<u8>> {

@@ -1328,13 +1328,17 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-/// Derive a workspace key from the live root directory object, rather than
-/// from its pathname. A replacement repository at the same canonical path
-/// therefore gets a new key and cannot inherit the predecessor's sessions or
-/// history-scope consent. The held authority rejects symlink substitution
-/// while taking the platform object proof (device/inode or volume/file ID).
+const WORKSPACE_BIRTH_TOKEN_FILE: &str = ".cockpit-workspace-birth-token";
+const WORKSPACE_BIRTH_TOKEN_MAX_BYTES: usize = 64;
+
+/// Derive a workspace key from both the live root directory object and a
+/// random birth token held inside that object. Object IDs alone are not a
+/// lifetime identity: Unix inodes and Windows file IDs can be recycled after
+/// deletion. A replacement repository consequently creates a fresh token and
+/// cannot inherit the predecessor's sessions or history-scope consent even if
+/// its platform object ID is recycled. The held authority anchors both the
+/// token read and its exclusive creation beneath the verified root.
 pub fn project_id_for(root: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
     let canonical = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
     let authority =
@@ -1342,15 +1346,65 @@ pub fn project_id_for(root: &Path) -> Result<String> {
             &canonical,
         )
         .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
+    let birth_token = workspace_birth_token(&authority)?;
+    Ok(project_id_from_workspace_evidence(
+        authority.identity(),
+        &birth_token,
+    ))
+}
+
+fn workspace_birth_token(
+    authority: &cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority,
+) -> Result<Vec<u8>> {
+    match authority.read_regular_file_relative_bounded(
+        &[WORKSPACE_BIRTH_TOKEN_FILE],
+        WORKSPACE_BIRTH_TOKEN_MAX_BYTES,
+    ) {
+        Ok(token) => validate_workspace_birth_token(token),
+        Err(read_error)
+            if read_error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let generated = Uuid::new_v4().to_string().into_bytes();
+            authority
+                .create_regular_file_relative_if_absent(WORKSPACE_BIRTH_TOKEN_FILE, &generated)
+                .context("creating workspace birth token")?;
+            authority
+                .read_regular_file_relative_bounded(
+                    &[WORKSPACE_BIRTH_TOKEN_FILE],
+                    WORKSPACE_BIRTH_TOKEN_MAX_BYTES,
+                )
+                .context("reopening workspace birth token after creation")
+                .and_then(validate_workspace_birth_token)
+        }
+        Err(error) => Err(error).context("reading workspace birth token"),
+    }
+}
+
+fn validate_workspace_birth_token(token: Vec<u8>) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(&token).context("workspace birth token is not UTF-8")?;
+    let parsed = Uuid::parse_str(text).context("workspace birth token is not a UUID")?;
+    anyhow::ensure!(
+        parsed.to_string() == text,
+        "workspace birth token is not canonical"
+    );
+    Ok(token)
+}
+
+fn project_id_from_workspace_evidence(object_identity: &str, birth_token: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"cockpit-workspace-object-identity-v1\0");
-    h.update(authority.identity().as_bytes());
+    h.update(b"cockpit-workspace-identity-v2\0");
+    h.update(object_identity.as_bytes());
+    h.update(b"\0");
+    h.update(birth_token);
     let out = h.finalize();
     let mut hex = String::with_capacity(64);
     for byte in out {
         hex.push_str(&format!("{byte:02x}"));
     }
-    Ok(hex)
+    hex
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
@@ -3166,10 +3220,34 @@ mod tests {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let original = project_id_for(&workspace).unwrap();
+        let original_birth_token =
+            std::fs::read(workspace.join(WORKSPACE_BIRTH_TOKEN_FILE)).unwrap();
 
         std::fs::rename(&workspace, temp.path().join("retired-workspace")).unwrap();
         std::fs::create_dir(&workspace).unwrap();
         let replacement = project_id_for(&workspace).unwrap();
+        let replacement_birth_token =
+            std::fs::read(workspace.join(WORKSPACE_BIRTH_TOKEN_FILE)).unwrap();
+
+        assert_ne!(original, replacement);
+        assert_ne!(original_birth_token, replacement_birth_token);
+    }
+
+    #[test]
+    fn recycled_filesystem_object_identity_cannot_reuse_a_project_id() {
+        // This models the platform case the filesystem cannot conveniently
+        // force in a deterministic test: a replacement directory receives
+        // the exact same device/inode or volume/file ID as its predecessor.
+        // The independent birth token still partitions their history.
+        let recycled_object_identity = "recycled-platform-object";
+        let original = project_id_from_workspace_evidence(
+            recycled_object_identity,
+            b"00112233-4455-4677-8899-aabbccddeeff",
+        );
+        let replacement = project_id_from_workspace_evidence(
+            recycled_object_identity,
+            b"ffeeddcc-bbaa-4766-8899-001122334455",
+        );
 
         assert_ne!(original, replacement);
     }

@@ -750,7 +750,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderMutationCommitted { .. }
         | proto::Response::SubscriptionAckCommitted { .. }
         | proto::Response::AppFlag { .. }
-        | proto::Response::AppFlagSeen { .. } => {}
+        | proto::Response::AppFlagSeen { .. }
+        | proto::Response::StorageReport { .. }
+        | proto::Response::StorageCleanupPreview { .. }
+        | proto::Response::StorageCleanupCompleted { .. } => {}
         proto::Response::LocalOperationSettlement {
             response,
             terminal_error,
@@ -6637,6 +6640,7 @@ mod secret_store_local_tests;
 mod sessions;
 #[cfg(feature = "remote")]
 mod sessions_remote;
+mod storage;
 #[cfg(test)]
 mod tests;
 

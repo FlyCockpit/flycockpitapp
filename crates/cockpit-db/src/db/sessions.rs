@@ -250,6 +250,16 @@ pub struct BtwForkCreateResult {
     pub created: bool,
 }
 
+/// Minimal, secret-free session projection used solely to build a storage
+/// cleanup preview. The daemon still owns the actual archive/delete mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageSessionCandidate {
+    pub session_id: Uuid,
+    pub project_id: String,
+    pub title: Option<String>,
+    pub last_active_at_unix_ms: i64,
+}
+
 impl SessionRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id: String = row.get("session_id")?;
@@ -985,16 +995,115 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
             );
         }
     }
+    // `secret_vault_items` deliberately has no foreign key to `sessions`: it
+    // stores several installation-wide namespaces, while session-owned values
+    // are addressed by opaque item ids.  Delete the two session namespaces
+    // explicitly before the session cascade removes the metadata needed to
+    // identify them.  A redaction table is keyed directly by session UUID;
+    // session sealed values are all namespaced below `<session-id>/` (including
+    // superseded versions), so this removes every encrypted generation rather
+    // than merely the currently active one.
+    for member in &subtree {
+        let member_id = member.to_string();
+        conn.execute(
+            "DELETE FROM secret_vault_items
+              WHERE kind = 'redaction_table' AND item_id = ?1",
+            [&member_id],
+        )
+        .context("deleting session redaction-table vault item")?;
+        let session_sealed_prefix = format!("{member_id}/%");
+        conn.execute(
+            "DELETE FROM secret_vault_items
+              WHERE kind = 'session_sealed_value' AND item_id LIKE ?1 ESCAPE '\\'",
+            [&session_sealed_prefix],
+        )
+        .context("deleting session sealed-value vault items")?;
+    }
     let changes_before = conn.total_changes();
     conn.execute(
         "DELETE FROM sessions WHERE session_id = ?1",
         [session_id.to_string()],
     )
     .context("deleting session")?;
+    verify_session_delete_cleanup_conn(conn, &subtree)?;
     Ok(conn.total_changes().saturating_sub(changes_before))
 }
 
+/// Verify the deletion boundary after the session cascade has committed its
+/// relational work but before its transaction is returned to the caller.
+///
+/// This is intentionally a real scan of the narrowly scoped ownership keys,
+/// not a best-effort diagnostic: a successful permanent delete must never
+/// leave vault ciphertext, compaction state, text artifacts, or FTS documents
+/// behind for any member of the deleted fork subtree.
+fn verify_session_delete_cleanup_conn(conn: &Connection, subtree: &[Uuid]) -> Result<()> {
+    for member in subtree {
+        let member_id = member.to_string();
+        let sealed_prefix = format!("{member_id}/%");
+        let leftovers: i64 = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM secret_vault_items
+                  WHERE (kind = 'redaction_table' AND item_id = ?1)
+                     OR (kind = 'session_sealed_value' AND item_id LIKE ?2 ESCAPE '\\'))
+              + (SELECT COUNT(*) FROM protected_redaction_history WHERE session_id = ?1)
+              + (SELECT COUNT(*) FROM compaction_handoffs WHERE session_id = ?1)
+              + (SELECT COUNT(*) FROM session_text_artifacts WHERE session_id = ?1)
+              + (SELECT COUNT(*) FROM session_fts_docs WHERE session_id = ?1)",
+            params![member_id, sealed_prefix],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            leftovers == 0,
+            "session deletion left {leftovers} owned storage record(s) for {member}"
+        );
+    }
+    Ok(())
+}
+
 impl Db {
+    /// Return the exact fork subtree targeted by a permanent session delete.
+    /// The daemon captures this before the cascade so filesystem cleanup can
+    /// remove each corresponding durable scratch directory after commit.
+    pub async fn session_subtree_ids(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
+        self.read(move |conn| collect_subtree(conn, session_id))
+            .await
+    }
+
+    /// List inactive, non-archived sessions eligible for the conservative
+    /// "older than N days" storage action. User-renamed sessions are excluded
+    /// by default; callers may explicitly opt into including them.
+    pub async fn storage_sessions_older_than(
+        &self,
+        cutoff_unix_ms: i64,
+        include_renamed_or_pinned: bool,
+    ) -> Result<Vec<StorageSessionCandidate>> {
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT session_id, project_id, title, last_active_at_unix_ms
+                   FROM sessions
+                  WHERE archived_at_unix_ms IS NULL
+                    AND last_active_at_unix_ms < ?1
+                    AND (?2 != 0 OR user_renamed = 0)
+                  ORDER BY last_active_at_unix_ms ASC",
+            )?;
+            statement
+                .query_map(
+                    params![cutoff_unix_ms, include_renamed_or_pinned as i64],
+                    |row| {
+                        let session_id: String = row.get(0)?;
+                        Ok(StorageSessionCandidate {
+                            session_id: parse_uuid(&session_id)?,
+                            project_id: row.get(1)?,
+                            title: row.get(2)?,
+                            last_active_at_unix_ms: row.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
     /// Load the daemon-private authoritative project UUID. Absence is a
     /// fail-closed state for security receipts; callers must never synthesize
     /// one from the legacy project string.
@@ -4618,6 +4727,55 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_purges_session_keyed_vault_items_for_every_descendant() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_vault_keys
+                    (key_version, kek_version, wrap_version, algorithm, wrap_nonce, wrapped_dek, active, created_at)
+                 VALUES (1, 1, 1, 'chacha20poly1305', ?1, ?2, 1, 1)",
+                params![vec![1_u8; 12], vec![2_u8; 48]],
+            )?;
+            for (index, session_id) in [parent.session_id, child.session_id].into_iter().enumerate() {
+                for (kind_index, (kind, item_id)) in [
+                    ("redaction_table", session_id.to_string()),
+                    ("session_sealed_value", format!("{session_id}/deploy/v1")),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    conn.execute(
+                        "INSERT INTO secret_vault_items
+                            (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision)
+                         VALUES (?1, ?2, 1, ?3, ?4, 1, 1, 1)",
+                        params![kind, item_id, vec![(3 + index * 2 + kind_index) as u8; 12], vec![4_u8; 16]],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        db.delete_session(parent.session_id).await.unwrap();
+        let remaining: i64 = db
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM secret_vault_items", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "session deletion must leave no vault ciphertext behind"
         );
     }
 

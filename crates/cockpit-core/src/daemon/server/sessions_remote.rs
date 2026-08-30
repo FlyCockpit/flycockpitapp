@@ -413,19 +413,32 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
-    negotiated_protocol_version: u32,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
     let session = require_session(ctx, session_id).await?;
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
-    {
+    if session.ended_at_unix_ms.is_none() {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),
         });
+    }
+    let subtree = ctx
+        .db
+        .session_subtree_ids(session_id)
+        .await
+        .map_err(internal)?;
+    let mut scratch_dirs = Vec::with_capacity(subtree.len());
+    for member in subtree {
+        let Some(member_session) = ctx.db.get_session(member).await.map_err(internal)? else {
+            continue;
+        };
+        scratch_dirs.push(
+            crate::session::workspace_scratch_path_for_session(&member_session.project_id, member)
+                .map_err(internal)?,
+        );
     }
     super::sessions::prepare_session_deletion(ctx, session_id).await?;
     let now_wall_ms = super::run_invocation::wall_ms_now();
@@ -438,6 +451,9 @@ pub(super) async fn delete_session(
     .await?;
     if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
         tracing::warn!(%error, %session_id, "post-commit delegation sidecar cleanup failed; ledgered delete stands");
+    }
+    for scratch_dir in scratch_dirs {
+        super::sessions::remove_session_scratch(&scratch_dir).map_err(internal)?;
     }
     Ok(response)
 }

@@ -1542,6 +1542,10 @@ mod tests {
             crate::AppFlagKey::DaemonAutostartNotice
         );
         check!(
+            "app_flag_key.storage_management_hint",
+            crate::AppFlagKey::StorageManagementHint
+        );
+        check!(
             "assistant_session_resolution_mode.most_recent_or_create",
             crate::AssistantSessionResolutionMode::MostRecentOrCreate
         );

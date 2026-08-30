@@ -642,6 +642,18 @@ pub enum Response {
         version: u64,
         changed: bool,
     },
+    StorageReport {
+        total_bytes: u64,
+        categories: Vec<StorageCategoryUsage>,
+        orphaned_workspace_storage: Vec<StorageCleanupItem>,
+        show_management_hint: bool,
+    },
+    StorageCleanupPreview {
+        preview: StorageCleanupPreview,
+    },
+    StorageCleanupCompleted {
+        bytes_freed: u64,
+    },
     AssistantSessionResolved {
         session: SessionSummary,
         created: bool,
@@ -1518,6 +1530,9 @@ macro_rules! response_variants {
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");
             (Response::AppFlagSeen { .. }, "app_flag_seen");
+            (Response::StorageReport { .. }, "storage_report");
+            (Response::StorageCleanupPreview { .. }, "storage_cleanup_preview");
+            (Response::StorageCleanupCompleted { .. }, "storage_cleanup_completed");
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");

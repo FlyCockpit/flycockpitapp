@@ -884,6 +884,19 @@ pub enum Request {
         key: AppFlagKey,
         expected_version: u64,
     },
+    /// Read the daemon-owned, whole-installation storage footprint for the
+    /// Settings → Storage page. This has no deletion side effect.
+    GetStorageReport,
+    /// Create a single-use dry-run cleanup plan. Destructive work is impossible
+    /// without the separately returned preview id.
+    PreviewStorageCleanup {
+        target: StorageCleanupTarget,
+    },
+    /// Execute exactly one unexpired dry-run plan returned by
+    /// `PreviewStorageCleanup`.
+    ExecuteStorageCleanup {
+        preview_id: Uuid,
+    },
     ResolveAssistantSession {
         assistant_id: String,
         project_root: String,
@@ -4096,6 +4109,9 @@ macro_rules! request_variants {
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
+            (Request::GetStorageReport, "get_storage_report");
+            (Request::PreviewStorageCleanup { .. }, "preview_storage_cleanup");
+            (Request::ExecuteStorageCleanup { .. }, "execute_storage_cleanup");
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
@@ -4406,6 +4422,9 @@ macro_rules! command {
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
+            (Request::GetStorageReport, "get_storage_report", owner_only, none, false, local_only, none, concurrent, none, "-", []);
+            (Request::PreviewStorageCleanup { target }, "preview_storage_cleanup", owner_only, none, false, local_only, none, serialized, none, "target:StorageCleanupTarget", [target: StorageCleanupTarget => param]);
+            (Request::ExecuteStorageCleanup { preview_id }, "execute_storage_cleanup", owner_only, none, true, local_only, none, serialized, none, "preview_id:Uuid", [preview_id: Uuid => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
@@ -5025,6 +5044,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         }
         "ActiveModelSwitchTrigger"
         | "AppFlagKey"
+        | "StorageCleanupTarget"
         | "ApprovalMode"
         | "AssistantSessionResolutionMode"
         | "AttachmentPurpose"

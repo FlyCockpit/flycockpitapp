@@ -2746,6 +2746,7 @@ impl std::error::Error for GoalMutationRejected {}
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
         proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
+        proto::AppFlagKey::StorageManagementHint => "storage-management-hint",
     }
 }
 
@@ -7894,6 +7895,11 @@ async fn handle_serialized_request_impl(
                 changed,
             })
         }
+        Request::GetStorageReport => super::storage::report(ctx).await,
+        Request::PreviewStorageCleanup { target } => super::storage::preview(ctx, target).await,
+        Request::ExecuteStorageCleanup { preview_id } => {
+            super::storage::execute(ctx, preview_id).await
+        }
         Request::ResolveAssistantSession {
             assistant_id,
             project_root,
@@ -10514,15 +10520,9 @@ async fn handle_serialized_request_impl(
                     &Request::DeleteSession { session_id },
                     operation,
                 )?;
-                return sessions_remote::delete_session(
-                    ctx,
-                    session_id,
-                    state.negotiated_protocol_version(),
-                    &ledger,
-                )
-                .await;
+                return sessions_remote::delete_session(ctx, session_id, &ledger).await;
             }
-            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
+            delete_session(ctx, session_id).await
         }
 
         Request::GetInventoryBundle {

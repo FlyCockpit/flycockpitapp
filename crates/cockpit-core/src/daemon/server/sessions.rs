@@ -417,7 +417,6 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
-    negotiated_protocol_version: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let session = match ctx.db.get_session(session_id).await {
         Ok(Some(session)) => session,
@@ -429,21 +428,32 @@ pub(super) async fn delete_session(
         }
         Err(e) => return Err(internal(e)),
     };
-    // v10-only: reject deleting an active session. The CLI's existing
-    // behavior bails with "session is active; end it before deleting";
-    // the daemon must match — it must NOT stop-and-delete the active
-    // session. The session row remains intact.
-    //
-    // v9 clients retain the frozen behavior: stop-and-delete proceeds
-    // regardless of the active state. The negotiated protocol version
-    // gates this so a v9 envelope carrying the unchanged DeleteSession
-    // tag does not get the new rejection behavior.
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
-    {
+    // A permanent delete never stops and deletes a live session implicitly.
+    // There is one launch protocol contract, so this invariant is not
+    // negotiated or downgraded for historical clients.
+    if session.ended_at_unix_ms.is_none() {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),
         });
+    }
+    // Capture every durable scratch path before the relational cascade removes
+    // descendants. The daemon owns this filesystem side effect; no UI process
+    // is permitted to infer or delete these paths.
+    let subtree = ctx
+        .db
+        .session_subtree_ids(session_id)
+        .await
+        .map_err(internal)?;
+    let mut scratch_dirs = Vec::with_capacity(subtree.len());
+    for member in subtree {
+        let Some(member_session) = ctx.db.get_session(member).await.map_err(internal)? else {
+            continue;
+        };
+        scratch_dirs.push(
+            crate::session::workspace_scratch_path_for_session(&member_session.project_id, member)
+                .map_err(internal)?,
+        );
     }
     prepare_session_deletion(ctx, session_id).await?;
     let now_wall_ms = super::run_invocation::wall_ms_now();
@@ -453,7 +463,26 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal)?;
     ctx.db.delete_session(session_id).await.map_err(internal)?;
+    for scratch_dir in scratch_dirs {
+        remove_session_scratch(&scratch_dir).map_err(internal)?;
+    }
     Ok(Response::Ack)
+}
+
+pub(super) fn remove_session_scratch(path: &std::path::Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting `{}`", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "refusing to remove non-directory session scratch `{}`",
+        path.display()
+    );
+    std::fs::remove_dir_all(path).with_context(|| format!("removing `{}`", path.display()))
 }
 
 /// Complete every asynchronous, idempotent side-effect phase that must precede

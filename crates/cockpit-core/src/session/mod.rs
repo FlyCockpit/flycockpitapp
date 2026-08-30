@@ -125,6 +125,29 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Work due for the cache-reusing, same-model metadata fork. The title slots
+/// refine both fields; later slots refresh the richer description while still
+/// requiring the atomic combined metadata call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAction {
+    None,
+    TitleAndDescribe,
+    Describe,
+}
+
+/// A scheduled self-metadata pass, fenced to the exact user-content
+/// generation that made it eligible. The durable token total fences newer user
+/// content, while the durable metadata-fork generation fences cancellation,
+/// drain, and superseding fork ownership before a generated write can publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataWork {
+    pub action: MetadataAction,
+    pub expected_user_content_tokens: usize,
+    /// Assigned at the foreground dispatch seam. It is included in the
+    /// generated write's durable CAS predicate.
+    pub expected_metadata_fork_generation: i64,
+}
+
 /// Process-wide audit counter: how many times any session waived the
 /// durable-before-handoff inference journal barrier. Read by doctor / audit
 /// surfaces; never reset in production. `nextest` runs each test in its own
@@ -333,6 +356,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub btw_tangent: bool,
     title: Mutex<Option<String>>,
+    description: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
     active_agent: Mutex<String>,
     /// Complete session selection, including invocation preferences that are
@@ -373,6 +397,10 @@ pub struct Session {
     /// resumed session has already passed any previous slot and must not
     /// re-nudge it.
     title_nudge_slot_pending: AtomicU8,
+    /// One metadata pass waiting for the foreground request that owns its
+    /// cached prefix to complete.  It is consumed by that request's turn
+    /// phase, never by a later user turn.
+    pending_metadata_fork: Mutex<Option<MetadataWork>>,
     /// In-memory two-shot latch for compact self-nudges (`0`, `1`, `2`).
     /// Reset only by successful compaction; prunes deliberately do not re-arm
     /// it because ctx% can oscillate around the threshold.
@@ -392,11 +420,17 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// Wall-clock instant of the most recent inference send. Stamped by
-    /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
-    /// it to decide whether the provider's prompt-cache TTL has elapsed.
-    /// In-memory only — a resumed session re-warms naturally.
-    last_send_at: Mutex<Option<std::time::Instant>>,
+    /// The configured endpoint that reported the last real prompt-cache hit.
+    /// This is deliberately separate from `last_usage`: context chrome may use
+    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// the endpoint it is about to refresh.
+    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
+    /// Monotonic instant and durable identity of the most recent inference
+    /// send. The cache-cold predicate uses the monotonic instant, while the
+    /// daemon-scheduled keep-warm callback carries the unique identity across
+    /// its durable job boundary. In-memory only — a resumed session re-warms
+    /// naturally.
+    last_send_at: Mutex<Option<InferenceSendTime>>,
     /// User messages pinned via `/pin` (GOALS §10 / `plan.md` T6.e):
     /// must-survive content injected verbatim into the `/compact`
     /// handoff, never summarized. In pin order.
@@ -479,6 +513,21 @@ struct LastToolCall {
 struct LastRecoverableToolCall {
     signature: String,
     message: String,
+}
+
+/// The durable identity for exactly one inference send. Wall-clock time
+/// supplies the scheduler deadline; `send_id` prevents two sends in one
+/// millisecond from being treated as the same cache-producing request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InferenceSendIdentity {
+    pub unix_millis: i64,
+    pub send_id: Uuid,
+}
+
+#[derive(Clone, Copy)]
+struct InferenceSendTime {
+    monotonic: std::time::Instant,
+    identity: InferenceSendIdentity,
 }
 
 /// Shared test-only redaction key resolver for constructing `Session`s in unit
@@ -971,10 +1020,14 @@ impl Session {
     }
 
     /// Stamp "an inference send just happened now." Drives the cache-TTL
-    /// arm of the cache-cold predicate (GOALS §10). Called once per
+    /// arm of the cache-cold predicate (GOALS §10) and establishes the
+    /// absolute origin of a keep-warm idle window. Called once per
     /// `model.complete` round-trip.
     pub fn note_send(&self) {
-        *self.last_send_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.note_send_at(
+            std::time::Instant::now(),
+            chrono::Utc::now().timestamp_millis(),
+        );
     }
 
     /// Seconds since the last inference send, or `None` if no send has
@@ -984,7 +1037,58 @@ impl Session {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| t.monotonic.elapsed().as_secs())
+    }
+
+    /// Snapshot the latest inference send's durable identity. The timestamp
+    /// is only for the daemon job deadline; elapsed-time policy continues to
+    /// use [`Self::seconds_since_last_send`] while the session is live.
+    pub(crate) fn last_send_identity(&self) -> Option<InferenceSendIdentity> {
+        self.last_send_at.lock().unwrap().map(|t| t.identity)
+    }
+
+    /// Atomically snapshot the latest send's durable identity and monotonic
+    /// origin. Keep-warm derives its absolute execution deadline directly
+    /// from this origin, so synchronous preparation cannot extend the idle
+    /// window between sampling elapsed time and arming a timer.
+    pub(crate) fn last_send_identity_and_origin(
+        &self,
+    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
+        self.last_send_at
+            .lock()
+            .unwrap()
+            .map(|t| (t.identity, t.monotonic))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_send_at_for_test(&self, elapsed: std::time::Duration) {
+        let elapsed_millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        self.note_send_at(
+            std::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(std::time::Instant::now),
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(elapsed_millis),
+        );
+    }
+
+    /// Force a timestamp collision between two otherwise distinct sends.
+    /// This test seam proves that keep-warm fences on the send identity, not
+    /// the millisecond used to calculate its deadline.
+    #[cfg(test)]
+    pub(crate) fn note_send_with_unix_millis_for_test(&self, unix_millis: i64) {
+        self.note_send_at(std::time::Instant::now(), unix_millis);
+    }
+
+    fn note_send_at(&self, monotonic: std::time::Instant, unix_millis: i64) {
+        *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
+            monotonic,
+            identity: InferenceSendIdentity {
+                unix_millis,
+                send_id: Uuid::new_v4(),
+            },
+        });
     }
 
     /// Record a dispatched tool call's loop-guard `signature` and return
@@ -1357,6 +1461,7 @@ fn project_id_from_workspace_object(object_identity: &str) -> String {
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
+const METADATA_SCHEDULE_SLOTS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 fn normalize_title_slot(value: i64) -> u8 {
     match value {
@@ -1365,13 +1470,25 @@ fn normalize_title_slot(value: i64) -> u8 {
         2 | 3 => 2,
         4..=7 => 4,
         8..=15 => 8,
-        _ => 16,
+        16..=31 => 16,
+        32..=63 => 32,
+        64..=127 => 64,
+        _ => 128,
     }
 }
 
 fn scheduled_title_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
     let slot = u8::try_from(user_turns).ok()?;
     if TITLE_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+fn scheduled_metadata_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
+    let slot = u8::try_from(user_turns).ok()?;
+    if METADATA_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
         Some(slot)
     } else {
         None

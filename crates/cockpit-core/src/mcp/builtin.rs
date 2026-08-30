@@ -59,6 +59,15 @@ pub struct HostContext {
     pub builtin_registry: Arc<BuiltinRegistry>,
     pub native_tool_ctx: Option<Arc<ToolCtx>>,
     pub scan_tool_results: bool,
+    /// Present only for the isolated metadata fork. It fences the generated
+    /// write to the user-content boundary that scheduled the fork.
+    metadata_expected_user_content_tokens: Option<i64>,
+    /// Durable ownership generation for this exact metadata fork.
+    metadata_expected_generation: Option<i64>,
+    /// The foreground run's lifecycle owners. The fork must not write after a
+    /// user cancel or daemon drain.
+    metadata_cancel: Option<tokio_util::sync::CancellationToken>,
+    metadata_shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     #[cfg(test)]
     test_builtin_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
@@ -93,6 +102,49 @@ impl HostContext {
             builtin_registry: ctx.mcp_builtin_registry.clone(),
             native_tool_ctx: Some(Arc::new(ctx.clone_stripped())),
             scan_tool_results: true,
+            metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
+            #[cfg(test)]
+            test_builtin_gate: None,
+            #[cfg(test)]
+            test_external_invoke: None,
+            #[cfg(test)]
+            test_external_approval_entered: None,
+        }
+    }
+
+    /// Build the isolated host catalog used by the cache-reusing session
+    /// metadata fork. It intentionally has no native-tool context: the fork
+    /// can reach exactly one host function, through Monty's normal discovery
+    /// path, and cannot make a foreground tool call by accident.
+    pub fn metadata_fork(
+        session: Arc<Session>,
+        cwd: PathBuf,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+        expected_user_content_tokens: usize,
+        expected_generation: i64,
+        cancel: tokio_util::sync::CancellationToken,
+        shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+    ) -> Self {
+        Self {
+            db: Some(session.db.clone()),
+            session_id: Some(session.id),
+            cwd,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            config,
+            session: Some(session),
+            root_agent_frame: false,
+            context_usage: None,
+            child_events: None,
+            builtin_registry: Arc::new(BuiltinRegistry::metadata_fork()),
+            native_tool_ctx: None,
+            scan_tool_results: false,
+            metadata_expected_user_content_tokens: Some(expected_user_content_tokens as i64),
+            metadata_expected_generation: Some(expected_generation),
+            metadata_cancel: Some(cancel),
+            metadata_shutdown_gate: Some(shutdown_gate),
             #[cfg(test)]
             test_builtin_gate: None,
             #[cfg(test)]
@@ -110,20 +162,16 @@ impl HostContext {
         &self,
         fallback: &crate::mcp::config::McpConfig,
     ) -> crate::mcp::resolver::EffectiveCatalog {
-        if let Some(ctx) = &self.native_tool_ctx {
+        if self.metadata_expected_user_content_tokens.is_some() {
+            // The fork catalog is a distinct source with exactly one builtin.
+            // Do not reconstruct persistent config here: even `mcp.search`
+            // must not open or enumerate an external catalog.
+            crate::mcp::resolver::EffectiveCatalog::from_mcp_config(
+                &crate::mcp::config::McpConfig::default(),
+            )
+        } else if let Some(ctx) = &self.native_tool_ctx {
             let mut catalog = (*ctx.mcp_resolver.catalog()).clone();
-            for (name, server) in &fallback.servers {
-                catalog.servers.entry(name.clone()).or_insert_with(|| {
-                    crate::mcp::resolver::CatalogEntry {
-                        name: name.clone(),
-                        server: server.clone(),
-                        source: crate::mcp::resolver::McpScope::Workspace,
-                        shadowed_by: None,
-                        profile: crate::mcp::resolver::DEFAULT_PROFILE.to_string(),
-                        agent_bound: false,
-                    }
-                });
-            }
+            catalog.supplement_persistent_config(fallback);
             catalog
         } else {
             crate::mcp::resolver::EffectiveCatalog::from_mcp_config(fallback)
@@ -145,6 +193,10 @@ impl HostContext {
             builtin_registry: default_registry(),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             #[cfg(test)]
             test_builtin_gate: None,
             #[cfg(test)]
@@ -806,6 +858,25 @@ impl BuiltinRegistry {
         Self::new(funcs)
     }
 
+    /// The source-tagged effective catalog for an ephemeral metadata fork.
+    /// This is deliberately separate from both the global default registry and
+    /// every agent registry, so `mcp.search` in the foreground can never
+    /// discover `set_session_metadata`.
+    pub fn metadata_fork() -> Self {
+        Self::new(vec![BuiltinFunction::new(
+            "set_session_metadata",
+            "Set this session's generated title and one-sentence description",
+            BuiltinPresentation {
+                glyph: "🏷️",
+                label: "set_session_metadata".to_string(),
+            },
+            Arc::new(set_session_metadata_schema),
+            Arc::new(set_session_metadata_availability),
+            true,
+            Arc::new(set_session_metadata),
+        )])
+    }
+
     fn iter(&self) -> impl Iterator<Item = &BuiltinFunction> {
         self.funcs.values()
     }
@@ -1247,6 +1318,101 @@ fn rename_session_schema() -> Value {
     })
 }
 
+fn set_session_metadata_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Short kebab-case session title, 1 to 60 characters"
+            },
+            "description": {
+                "type": "string",
+                "description": "One concise sentence of session context, 1 to 1000 characters"
+            }
+        },
+        "required": ["title", "description"],
+        "additionalProperties": false
+    })
+}
+
+fn set_session_metadata_availability(ctx: &HostContext) -> Availability {
+    let Some(session) = ctx.session.as_ref() else {
+        return Availability::unavailable("set_session_metadata requires a live session");
+    };
+    let Ok(Some(row)) = session.db.blocking_write_for_sync_maintenance({
+        let session_id = session.id;
+        move |conn| crate::db::Db::get_session_conn(conn, session_id)
+    }) else {
+        return Availability::unavailable("session metadata is unavailable");
+    };
+    if row.user_renamed || row.ephemeral {
+        return Availability::unavailable("session metadata is no longer eligible");
+    }
+    Availability::available()
+}
+
+fn set_session_metadata<'a>(
+    ctx: &'a HostContext,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .context("`cockpit.set_session_metadata` requires title as a string")?;
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .context("`cockpit.set_session_metadata` requires description as a string")?;
+        if title.is_empty() || title.chars().count() > crate::auto_title::TITLE_MAX_CHARS {
+            bail!("`cockpit.set_session_metadata` title must be 1 to 60 characters");
+        }
+        if crate::auto_title::slugify_title(title).as_deref() != Some(title) {
+            bail!("`cockpit.set_session_metadata` title must be lowercase kebab-case");
+        }
+        if description.is_empty() || description.chars().count() > 1000 {
+            bail!("`cockpit.set_session_metadata` description must be 1 to 1000 characters");
+        }
+        let expected_user_content_tokens = ctx
+            .metadata_expected_user_content_tokens
+            .context("`cockpit.set_session_metadata` is only available to the metadata fork")?;
+        let expected_generation = ctx
+            .metadata_expected_generation
+            .context("`cockpit.set_session_metadata` is only available to the metadata fork")?;
+        if ctx
+            .metadata_cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || ctx
+                .metadata_shutdown_gate
+                .as_ref()
+                .is_some_and(crate::daemon::shutdown::ShutdownSignal::is_draining)
+        {
+            bail!("`cockpit.set_session_metadata` metadata fork is no longer live");
+        }
+        let session = ctx
+            .session
+            .as_ref()
+            .context("`cockpit.set_session_metadata` requires a live session")?;
+        if !session.set_auto_metadata(
+            title,
+            description,
+            expected_user_content_tokens as usize,
+            expected_generation,
+        )? {
+            bail!("`cockpit.set_session_metadata` did not update session metadata");
+        }
+        Ok(serde_json::json!({
+            "updated": true,
+            "title": title,
+            "description": description,
+        }))
+    })
+}
+
 fn rename_session_availability(ctx: &HostContext) -> Availability {
     let Some(session) = ctx.session.as_ref() else {
         return Availability::unavailable("rename_session requires a live session");
@@ -1260,7 +1426,8 @@ fn rename_session_availability(ctx: &HostContext) -> Availability {
 }
 
 fn auto_title_model_configured(ctx: &HostContext) -> bool {
-    ctx.config.extended().auto_title_model_ref().is_some()
+    let extended = ctx.config.extended();
+    extended.auto_title_model_ref().is_some() && !extended.auto_title_with_session_model
 }
 
 fn rename_session<'a>(
@@ -1493,6 +1660,22 @@ mod tests {
         RwLock,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn metadata_function_is_absent_from_the_main_builtin_catalog() {
+        assert!(
+            BuiltinRegistry::default_with(Vec::new())
+                .get("set_session_metadata")
+                .is_none(),
+            "the foreground Monty catalog must not discover fork metadata"
+        );
+        assert!(
+            BuiltinRegistry::metadata_fork()
+                .get("set_session_metadata")
+                .is_some(),
+            "the ephemeral fork catalog owns the metadata function"
+        );
+    }
 
     struct MontyAdapterTool {
         name: String,
@@ -2899,6 +3082,10 @@ mod tests {
             builtin_registry: default_registry(),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             test_builtin_gate: None,
             test_external_invoke: None,
             test_external_approval_entered: None,
@@ -2997,6 +3184,10 @@ mod tests {
             builtin_registry: default_registry(),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             test_builtin_gate: None,
             test_external_invoke: None,
             test_external_approval_entered: None,

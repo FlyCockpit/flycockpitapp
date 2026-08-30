@@ -1110,41 +1110,6 @@
       "tag": "get_startup_disclosures"
     },
     {
-      "class": "local_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "key:enum16:AppFlagKey",
-      "fcorRoles": [
-        {
-          "field": "key",
-          "role": "param",
-          "type": "AppFlagKey"
-        }
-      ],
-      "fcorSchema": "key:AppFlagKey",
-      "strategy": "none",
-      "tag": "get_app_flag"
-    },
-    {
-      "class": "local_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "key:enum16:AppFlagKey|expected_version:u64",
-      "fcorRoles": [
-        {
-          "field": "key",
-          "role": "param",
-          "type": "AppFlagKey"
-        },
-        {
-          "field": "expected_version",
-          "role": "param",
-          "type": "u64"
-        }
-      ],
-      "fcorSchema": "key:AppFlagKey|expected_version:u64",
-      "strategy": "none",
-      "tag": "mark_app_flag_seen"
-    },
-    {
       "class": "transactional_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "assistant_id:string|project_root:string|mode:enum16:AssistantSessionResolutionMode",

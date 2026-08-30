@@ -1141,21 +1141,6 @@ async fn search_bundles(
     Ok(all)
 }
 
-pub(crate) async fn attached_bundles_available(
-    session: &Session,
-    cwd: &Path,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-) -> bool {
-    let extended = config.extended();
-    match attached_bundles(session, cwd, &extended).await {
-        Ok(bundles) => !bundles.is_empty(),
-        Err(error) => {
-            tracing::warn!(%error, "assistant knowledge availability check failed closed");
-            false
-        }
-    }
-}
-
 pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
@@ -1251,11 +1236,12 @@ pub(crate) async fn with_memory_search_if_attached(
     cwd: &Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> crate::engine::tool::ToolBox {
-    if attached_bundles_available(session, cwd, config).await {
-        toolbox.with(Arc::new(MemorySearchTool))
-    } else {
-        toolbox.without(MEMORY_SEARCH_TOOL_NAME)
-    }
+    // Keep the schema present for the whole agent lifetime. Attachment state
+    // is deliberately resolved in `MemorySearchTool::call`, where an absent
+    // bundle produces the normal content-free availability result instead of
+    // churning the provider's cacheable tools array.
+    let _ = (session, cwd, config);
+    toolbox.with(Arc::new(MemorySearchTool))
 }
 
 pub(crate) struct MemorySearchTool;
@@ -1710,14 +1696,14 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[tokio::test]
-    async fn memory_search_tool_gated() {
+    async fn memory_search_tool_schema_is_stable_when_bundles_change() {
         let _env = crate::test_env::lock_async().await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
         let base = crate::engine::tool::ToolBox::new();
         assert!(
-            !with_memory_search_if_attached(
+            with_memory_search_if_attached(
                 base.clone(),
                 &session,
                 tmp.path(),

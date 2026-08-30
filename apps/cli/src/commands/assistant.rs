@@ -17,7 +17,7 @@ use crate::cli::{
     MediaAccountingCommand,
 };
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
-use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::client::{ensure_assistant_persistent_daemon, ensure_persistent_daemon};
 use crate::daemon::proto::{AssistantSessionResolutionMode, Request, Response};
 #[cfg(test)]
 use crate::session::project_id_for;
@@ -467,9 +467,15 @@ async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Re
     crate::assistants::validate_assistant_name(name)?;
     let project_root = std::env::current_dir().context("resolving cwd")?;
     let project_root_str = project_root.to_string_lossy().into_owned();
-    let daemon = ensure_persistent_daemon()
+    let daemon = ensure_assistant_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant chat")?;
+    if daemon.promoted_from_ephemeral() {
+        eprintln!(
+            "{}",
+            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
+        );
+    }
     let response = daemon
         .client
         .request(Request::ResolveAssistantSession {

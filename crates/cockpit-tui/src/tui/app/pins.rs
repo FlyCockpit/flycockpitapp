@@ -952,7 +952,6 @@ mod tests {
 
     fn test_app(root: &std::path::Path) -> App {
         let mut app = App::new(Some(root), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app
     }

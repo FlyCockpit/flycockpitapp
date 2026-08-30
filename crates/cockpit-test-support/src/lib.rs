@@ -335,7 +335,7 @@ mod tests {
             },
             AllowedMutation {
                 file: "crates/cockpit-core/src/daemon/session_worker/handle.rs",
-                symbol: "from_disk_for_tests",
+                symbol: "from_disk_for_tests_at_generation",
                 reason: "test helper save/restores COCKPIT_CONFIG so the tempdir project layer loads even when another test left an explicit path set",
             },
         ];

@@ -13379,10 +13379,34 @@ pub(super) async fn run_worker(
     }
     if graceful_park {
         // Final sweep: the driver task has exited, so no further interrupt can
-        // be registered. Report the shutdown park-commit exactly once, now that
-        // it is sound: every registered-or-registerable interrupt is parked.
+        // be registered. Persist resumable work *before* publishing the
+        // shutdown park-commit: drain waits on that signal to release pid and
+        // socket, and a successor must already see the paused row.
         let sweep = interrupts.park_all_registered_collect().await;
         shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
+        if let WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active,
+            pending_tool_count,
+        } = &stop
+        {
+            let pending = session
+                .db
+                .list_open_interrupts(session_id)
+                .await
+                .map(|rows| rows.len() as i64)
+                .unwrap_or(*pending_tool_count);
+            if *active || pending > 0 {
+                persist_paused_session_work(
+                    &session,
+                    session_id,
+                    &root_agent_name,
+                    &project_root,
+                    pending,
+                )
+                .await;
+            }
+        }
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
     adopted_processes.join_all().await;
@@ -13449,27 +13473,6 @@ pub(super) async fn run_worker(
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
-            active: true,
-            pending_tool_count,
-        } => {
-            if let Err(e) = session
-                .db
-                .upsert_paused_session_work(
-                    session_id,
-                    &root_agent_name,
-                    &project_root.display().to_string(),
-                    "daemon shutdown paused active work",
-                    pending_tool_count,
-                    proto::DAEMON_VERSION,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "persisting paused session work failed");
-            }
-        }
-        WorkerStop::Shutdown {
-            pause_for_resume: true,
-            active: false,
             ..
         } => {}
         _ => {
@@ -13675,6 +13678,29 @@ async fn test_injected_park_delay(_var: &str) {
         {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
+    }
+}
+
+async fn persist_paused_session_work(
+    session: &Session,
+    session_id: Uuid,
+    root_agent_name: &str,
+    project_root: &std::path::Path,
+    pending_tool_count: i64,
+) {
+    if let Err(error) = session
+        .db
+        .upsert_paused_session_work(
+            session_id,
+            root_agent_name,
+            &project_root.display().to_string(),
+            "daemon shutdown paused active work",
+            pending_tool_count,
+            proto::DAEMON_VERSION,
+        )
+        .await
+    {
+        tracing::warn!(%error, "persisting paused session work failed");
     }
 }
 

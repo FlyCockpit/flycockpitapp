@@ -2743,6 +2743,13 @@ impl std::fmt::Display for GoalMutationRejected {
 #[cfg(feature = "remote")]
 impl std::error::Error for GoalMutationRejected {}
 
+fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
+    match key {
+        proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
+        proto::AppFlagKey::StorageManagementHint => "storage-management-hint",
+    }
+}
+
 /// How much workspace authority a mode grants, most restrictive first. This is
 /// the *only* ordering used to classify a trust transition; it is deliberately
 /// derived from what each mode lets a workspace do, not from enum declaration
@@ -7885,6 +7892,101 @@ async fn handle_serialized_request_impl(
                 config_generation: inventory::current_config_generation(),
             });
         }
+        Request::GetAppFlag { key } => {
+            let db_key = app_flag_db_key(key);
+            let version = ctx
+                .db
+                .read(move |conn| crate::db::Db::app_flag_version_conn(conn, db_key))
+                .await
+                .map_err(internal)?;
+            Ok(Response::AppFlag {
+                key,
+                seen: version > 0,
+                version,
+            })
+        }
+        Request::MarkAppFlagSeen {
+            key,
+            expected_version,
+        } => {
+            #[cfg(feature = "remote")]
+            let request = Request::MarkAppFlagSeen {
+                key,
+                expected_version,
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(remote_operation, ctx, "mark_app_flag_seen", async {
+                let db_key = app_flag_db_key(key);
+                let outcome = ctx
+                    .db
+                    .write(move |conn| {
+                        crate::db::Db::mark_app_flag_seen_versioned_conn(
+                            conn,
+                            db_key,
+                            expected_version,
+                        )
+                    })
+                    .await
+                    .map_err(internal)?;
+                let Some((version, changed)) = outcome else {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "app flag version changed; refresh before retrying".into(),
+                    });
+                };
+                Ok(Response::AppFlagSeen {
+                    key,
+                    version,
+                    changed,
+                })
+            })
+        }
+        Request::GetStorageReport => super::storage::report(ctx).await,
+        Request::PreviewStorageCleanup { target } => {
+            #[cfg(feature = "remote")]
+            let request = Request::PreviewStorageCleanup {
+                target: target.clone(),
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "preview_storage_cleanup",
+                super::storage::preview(ctx, target)
+            )
+        }
+        Request::ExecuteStorageCleanup { preview_id } => {
+            #[cfg(feature = "remote")]
+            let request = Request::ExecuteStorageCleanup { preview_id };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "execute_storage_cleanup",
+                super::storage::execute(ctx, preview_id)
+            )
+        }
         Request::ResolveAssistantSession {
             assistant_id,
             project_root,
@@ -8446,31 +8548,10 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let session_ids = ctx
-                .db
-                .read(move |conn| {
-                    let mut statement = conn.prepare(
-                        "SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL AND ended_at_unix_ms < ?1",
-                    )?;
-                    statement
-                        .query_map([before], |row| row.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(Into::into)
-                })
-                .await
-                .map_err(internal)?;
-            let mut purged = 0u32;
-            for id in &session_ids {
-                if let Ok(session_id) = Uuid::parse_str(id) {
-                    ctx.db.delete_session(session_id).await.map_err(internal)?;
-                    purged = purged.saturating_add(1);
-                }
-            }
-            let response = Response::EndedSessionsPurged {
-                purged,
-                session_ids_json: serde_json::to_string(&session_ids).map_err(internal)?,
-            };
-            finish_nonrepeatable_response!(remote_operation, ctx, "purge_ended_sessions", response)
+            let _ = before;
+            Err(bad_request(
+                "session purge requires a storage cleanup preview; select sessions and permanently delete them from Settings > Storage",
+            ))
         }
 
         Request::DeleteAssistant {
@@ -10553,17 +10634,10 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DeleteSession { session_id } => {
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
-                let ledger = build_remote_session_ledger(
-                    ctx,
-                    &authorized_request,
-                    &Request::DeleteSession { session_id },
-                    operation,
-                )?;
-                return sessions_remote::delete_session(ctx, session_id, &ledger).await;
-            }
-            delete_session(ctx, session_id).await
+            let _ = session_id;
+            Err(bad_request(
+                "direct session deletion is disabled; preview permanent deletion from Settings > Storage first",
+            ))
         }
 
         Request::GetInventoryBundle {

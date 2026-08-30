@@ -1544,6 +1544,34 @@ pub fn workspace_root_for_project_id(project_id: &str) -> Result<Option<PathBuf>
     Ok(Some(canonical_root))
 }
 
+/// Return the reverse-map details needed by daemon-owned storage maintenance.
+/// This reads only the project-id marker; it never scans candidate workspace
+/// roots or attempts to rediscover a missing mount.
+pub fn workspace_storage_details_for_project_id(
+    project_id: &str,
+) -> Result<Option<(PathBuf, i64)>> {
+    let marker_path = workspace_dir_for_project_id(project_id)?.join(".workspace.json");
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+    anyhow::ensure!(
+        marker.project_id == project_id,
+        "workspace marker project id does not match directory"
+    );
+    let canonical_root = PathBuf::from(marker.canonical_root);
+    anyhow::ensure!(
+        canonical_root.is_absolute(),
+        "workspace marker canonical root must be absolute"
+    );
+    Ok(Some((canonical_root, marker.last_used_at_unix_ms)))
+}
+
 fn workspace_scratch_dir_for_session(
     project_id: &str,
     project_root: &Path,

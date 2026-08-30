@@ -676,6 +676,30 @@ pub enum Response {
         connector: Option<ConnectorDisclosure>,
         config_generation: u64,
     },
+    AppFlag {
+        key: AppFlagKey,
+        seen: bool,
+        version: u64,
+    },
+    AppFlagSeen {
+        key: AppFlagKey,
+        version: u64,
+        changed: bool,
+    },
+    StorageReport {
+        total_bytes: u64,
+        categories: Vec<StorageCategoryUsage>,
+        orphaned_workspace_storage: Vec<StorageCleanupItem>,
+        archived_sessions: Vec<StorageCleanupItem>,
+        show_management_hint: bool,
+        storage_management_hint_version: u64,
+    },
+    StorageCleanupPreview {
+        preview: StorageCleanupPreview,
+    },
+    StorageCleanupCompleted {
+        bytes_freed: u64,
+    },
     AssistantSessionResolved {
         session: SessionSummary,
         created: bool,
@@ -1552,6 +1576,11 @@ macro_rules! response_variants {
             (Response::SubscriptionAckCommitted { .. }, "subscription_ack_committed");
             (Response::CopilotAuthCommitted { .. }, "copilot_auth_committed");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
+            (Response::AppFlag { .. }, "app_flag");
+            (Response::AppFlagSeen { .. }, "app_flag_seen");
+            (Response::StorageReport { .. }, "storage_report");
+            (Response::StorageCleanupPreview { .. }, "storage_cleanup_preview");
+            (Response::StorageCleanupCompleted { .. }, "storage_cleanup_completed");
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");

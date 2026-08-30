@@ -296,6 +296,10 @@ canonical_unit_enum16!(crate::WorkspaceTrustMode, {
     IgnoreConfig = 2,
     Untrusted = 3,
 });
+canonical_unit_enum16!(crate::AppFlagKey, {
+    DaemonAutostartNotice = 1,
+    StorageManagementHint = 2,
+});
 canonical_unit_enum16!(crate::AssistantSessionResolutionMode, {
     MostRecentOrCreate = 1
 });
@@ -1535,6 +1539,14 @@ mod tests {
         check!(
             "workspace_trust_mode.untrusted",
             crate::WorkspaceTrustMode::Untrusted
+        );
+        check!(
+            "app_flag_key.daemon_autostart_notice",
+            crate::AppFlagKey::DaemonAutostartNotice
+        );
+        check!(
+            "app_flag_key.storage_management_hint",
+            crate::AppFlagKey::StorageManagementHint
         );
         check!(
             "assistant_session_resolution_mode.most_recent_or_create",

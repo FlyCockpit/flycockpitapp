@@ -791,7 +791,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderUsageSnapshot { .. }
         | proto::Response::ProviderConfigUpserted { .. }
         | proto::Response::ProviderMutationCommitted { .. }
-        | proto::Response::SubscriptionAckCommitted { .. } => {}
+        | proto::Response::SubscriptionAckCommitted { .. }
+        | proto::Response::AppFlag { .. }
+        | proto::Response::AppFlagSeen { .. }
+        | proto::Response::StorageReport { .. }
+        | proto::Response::StorageCleanupPreview { .. }
+        | proto::Response::StorageCleanupCompleted { .. } => {}
         proto::Response::LocalOperationSettlement {
             response,
             terminal_error,
@@ -6991,6 +6996,20 @@ fn log_response_send_failed(id: Uuid, envelope_kind: &'static str, error: &anyho
     );
 }
 
+/// Convert an unexpected server-side failure into the protocol's internal
+/// error shape. This is shared by every request handler module, so it lives at
+/// the daemon-server boundary rather than under a particular request domain.
+fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Internal,
+        // `{:#}` walks the full anyhow context chain (e.g. `resolving
+        // model: provider ...: ...`) rather than printing only the
+        // outermost context, so daemon-surfaced errors are legible
+        // instead of an opaque `internal: resolving model`.
+        message: format!("{err:#}"),
+    }
+}
+
 fn bad_request(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::BadRequest,
@@ -7059,9 +7078,10 @@ mod leaks_tests;
 mod secret_store_boot_tests;
 #[cfg(test)]
 mod secret_store_local_tests;
-mod sessions;
+pub(crate) mod sessions;
 #[cfg(feature = "remote")]
 mod sessions_remote;
+pub(crate) mod storage;
 #[cfg(test)]
 mod tests;
 

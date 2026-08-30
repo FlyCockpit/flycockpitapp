@@ -44,6 +44,7 @@ pub mod agent_editor_leases;
 pub mod agent_installations;
 pub mod agent_mutation_journals;
 pub mod agent_tree_decisions;
+pub mod app_flags;
 pub mod archive_import;
 pub mod assistants;
 pub mod computer_outcomes;

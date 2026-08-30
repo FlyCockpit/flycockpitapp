@@ -2719,6 +2719,83 @@ pub enum FlycockpitOrgSyncOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AppFlagKey {
+    DaemonAutostartNotice,
+    StorageManagementHint,
+}
+
+/// A daemon-owned storage bucket. Bytes are measured on disk, never estimated
+/// from database row counts, so the settings surface can explain the actual
+/// local footprint before proposing a cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageCategory {
+    Ledger,
+    SessionsByAge,
+    WorkspaceScratch,
+    LocalConfigs,
+    Worktrees,
+    TaskArtifacts,
+    ComputerCapture,
+    ResultBlobs,
+    SessionShims,
+    SessionTmp,
+}
+
+/// One category in the daemon's local storage report. `reclaimable_bytes`
+/// measures data that an available user-confirmed cleanup can release; it is
+/// accounting only and never deletion authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCategoryUsage {
+    pub category: StorageCategory,
+    pub total_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+/// A filesystem item in a dry-run cleanup preview. Paths are daemon-generated
+/// display values; callers never send filesystem paths back as deletion
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCleanupItem {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "data")]
+pub enum StorageCleanupTarget {
+    ArchiveSessionsOlderThan {
+        age_days: u32,
+        include_renamed_or_pinned: bool,
+    },
+    PermanentlyDeleteSessions {
+        session_ids: Vec<Uuid>,
+    },
+    PermanentlyDeleteArchivedSessionsOlderThan {
+        age_days: u32,
+        include_renamed_or_pinned: bool,
+    },
+    RemoveOrphanedWorkspaceStorage {
+        project_ids: Vec<String>,
+    },
+}
+
+/// A daemon-generated, single-use cleanup plan. The caller must present its
+/// `preview_id` to execute; arbitrary paths and byte counts are never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCleanupPreview {
+    pub preview_id: Uuid,
+    pub target: StorageCleanupTarget,
+    pub items: Vec<StorageCleanupItem>,
+    pub bytes_to_free: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssistantSessionResolutionMode {
     MostRecentOrCreate,
 }

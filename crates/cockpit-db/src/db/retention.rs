@@ -17,7 +17,9 @@ pub struct RetentionConfig {
     /// Terminal operational evidence and usage metadata retention. Zero means unlimited.
     #[serde(default = "default_terminal_evidence_window_days")]
     pub terminal_evidence_window_days: u32,
-    /// Whole-session retention window in days.
+    /// Whole-session retention window in days. Zero disables automatic
+    /// deletion, which is the production default: durable sessions are only
+    /// permanently removed through a confirmed storage cleanup preview.
     #[serde(default = "default_session_window_days")]
     pub session_window_days: u32,
     /// Periodic retention sweep interval in hours.
@@ -58,7 +60,7 @@ fn default_terminal_evidence_window_days() -> u32 {
 }
 
 fn default_session_window_days() -> u32 {
-    365
+    0
 }
 
 fn default_retention_sweep_interval_hours() -> u32 {
@@ -1123,12 +1125,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_retention_defaults_bound_payloads_and_whole_sessions() {
+    fn launch_retention_defaults_keep_whole_sessions() {
         let cfg = RetentionConfig::default();
         assert_eq!(cfg.transcript_window_days, 90);
         assert_eq!(cfg.raw_wire_window_days, 30);
         assert_eq!(cfg.terminal_evidence_window_days, 90);
-        assert_eq!(cfg.session_window_days, 365);
+        assert_eq!(cfg.session_window_days, 0);
     }
 
     #[tokio::test]

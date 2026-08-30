@@ -1087,6 +1087,23 @@ CREATE TABLE sealed_values (
 CREATE INDEX idx_sealed_values_session_created
     ON sealed_values(session_id, created_at ASC, value_id ASC);
 
+-- ---- app_flags -------------------------------------------------------------
+-- Machine-local one-time UI flags. These are deliberately outside project
+-- config so onboarding notices do not depend on workspace trust state.
+
+CREATE TABLE app_flags (
+    key     TEXT    PRIMARY KEY,
+    seen_at INTEGER NOT NULL
+);
+
+-- Durable daemon-owned work left after a session's relational deletion has
+-- committed but its fenced directory could not yet be unlinked.  The path is
+-- an opaque staging pathname produced by the storage daemon, never UI input.
+CREATE TABLE storage_directory_cleanup_intents (
+    staged_path TEXT PRIMARY KEY,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------
 
 CREATE TABLE tool_call_events (

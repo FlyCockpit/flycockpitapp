@@ -10997,27 +10997,45 @@ async fn end_btw_fork_remote_path_commits_transactional_ledger() {
 
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn delete_session_remote_path_commits_transactional_ledger() {
+async fn remote_storage_delete_commits_and_replays_the_cleanup_operation() {
     let ctx = persistent_test_ctx();
     let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     ctx.db.end_session(session.session_id).await.unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
+    let preview_operation = remote_owner_operation().await;
+    let preview_request = Request::PreviewStorageCleanup {
+        target: proto::StorageCleanupTarget::PermanentlyDeleteSessions {
+            session_ids: vec![session.session_id],
+        },
+    };
+    let preview = dispatch_remote_session(
+        &ctx,
+        &mut state,
+        &shared,
+        preview_request,
+        &preview_operation,
+    )
+    .await
+    .expect("remote storage preview succeeds");
+    let Response::StorageCleanupPreview { preview } = preview else {
+        panic!("expected storage cleanup preview");
+    };
     let operation = remote_owner_operation().await;
-    let request = Request::DeleteSession {
-        session_id: session.session_id,
+    let request = Request::ExecuteStorageCleanup {
+        preview_id: preview.preview_id,
     };
     let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
         .await
-        .expect("remote delete succeeds");
-    assert!(matches!(first, Response::Ack));
+        .expect("remote storage cleanup succeeds");
+    assert!(matches!(first, Response::StorageCleanupCompleted { .. }));
     assert!(
         ctx.db
             .get_session(session.session_id)
             .await
             .unwrap()
             .is_none(),
-        "the session row must be deleted"
+        "the previewed session row must be deleted"
     );
     assert_eq!(
         remote_ledger_state(&ctx, &operation).await.as_deref(),
@@ -11025,8 +11043,41 @@ async fn delete_session_remote_path_commits_transactional_ledger() {
     );
     let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
         .await
-        .expect("replayed remote delete is idempotent");
-    assert!(matches!(replay, Response::Ack));
+        .expect("replayed remote cleanup is idempotent");
+    assert!(matches!(replay, Response::StorageCleanupCompleted { .. }));
+}
+
+#[tokio::test]
+#[cfg(feature = "remote")]
+async fn mark_app_flag_seen_is_owner_remoted_and_replay_safe() {
+    // The remote Settings shell owns storage-hint dismissal, so this durable
+    // acknowledgement is a nonrepeatable owner mutation rather than a
+    // local-only write. Its completed response is replayed from the remote
+    // operation ledger instead of applying the versioned write twice.
+    let ctx = persistent_test_ctx();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation().await;
+    let request = Request::MarkAppFlagSeen {
+        key: proto::AppFlagKey::DaemonAutostartNotice,
+        expected_version: 0,
+    };
+    let response = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("mark app flag seen succeeds");
+    let Response::AppFlagSeen {
+        version, changed, ..
+    } = response
+    else {
+        panic!("expected AppFlagSeen response");
+    };
+    assert!(changed);
+    assert_eq!(version, 1, "the local app flag write must have applied");
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await,
+        Some("committed".to_string()),
+        "the owner-remoted acknowledgement must commit a replay record"
+    );
 }
 
 #[tokio::test]

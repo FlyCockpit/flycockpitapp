@@ -2,7 +2,6 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -25,74 +24,59 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
 }
 
 async fn delete(session: &str, yes: bool) -> Result<()> {
-    confirm_destructive(yes, "Delete this session and all local data")?;
     let session_id = Uuid::parse_str(session).context("parsing session id")?;
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for session delete")?;
     let client = daemon.client.clone();
-    match client
-        .request(Request::DeleteSession { session_id })
+    let preview = match client
+        .request(Request::PreviewStorageCleanup {
+            target: crate::daemon::proto::StorageCleanupTarget::PermanentlyDeleteSessions {
+                session_ids: vec![session_id],
+            },
+        })
         .await
-        .context("requesting session delete from daemon")?
+        .context("previewing session delete with daemon")?
     {
-        Ok(Response::Ack) => {}
-        Ok(other) => bail!("daemon returned unexpected response to session delete: {other:?}"),
-        Err(error) => {
-            // The daemon rejects an active session with a typed Conflict
-            // error. Surface it the same way the CLI's old direct-DB path
-            // did ("session is active; end it before deleting").
-            bail!("{error}");
+        Ok(Response::StorageCleanupPreview { preview }) => preview,
+        Ok(other) => {
+            bail!("daemon returned unexpected response to session-delete preview: {other:?}")
         }
+        Err(error) => bail!("{error}"),
+    };
+    println!(
+        "preview: deleting {} item(s) will reclaim {} bytes",
+        preview.items.len(),
+        preview.bytes_to_free
+    );
+    for item in &preview.items {
+        println!("  {} ({} bytes)", item.label, item.bytes);
     }
-    println!("deleted session {session_id} and all associated local data");
+    confirm_destructive(
+        yes,
+        "Permanently delete the previewed session and all local data",
+    )?;
+    match client
+        .request(Request::ExecuteStorageCleanup {
+            preview_id: preview.preview_id,
+        })
+        .await
+        .context("executing session delete preview with daemon")?
+    {
+        Ok(Response::StorageCleanupCompleted { bytes_freed }) => {
+            println!("deleted session {session_id} and reclaimed {bytes_freed} bytes");
+        }
+        Ok(other) => bail!("daemon returned unexpected response to session delete: {other:?}"),
+        Err(error) => bail!("{error}"),
+    }
     Ok(())
 }
 
 async fn purge(before: &str, dry_run: bool, yes: bool) -> Result<()> {
-    let cutoff = parse_purge_before(before)?;
-    let daemon = ensure_persistent_daemon()
-        .await
-        .context("starting persistent daemon for session purge")?;
-    if dry_run {
-        // The daemon owns session storage; `PurgeEndedSessions` deletes and has
-        // no non-destructive count. Fail closed rather than open SQLite from the
-        // CLI or invent a preview count.
-        bail!(
-            "session purge --dry-run is not available through the daemon (no non-destructive ended-session count); rerun without --dry-run to purge"
-        );
-    }
-    confirm_destructive(yes, &format!("Delete all ended sessions before {before}"))?;
-    let response = daemon
-        .client
-        .request(Request::PurgeEndedSessions { before: cutoff })
-        .await
-        .context("requesting session purge from daemon")?
-        .map_err(|error| anyhow::anyhow!("daemon rejected session purge: {error}"))?;
-    let Response::EndedSessionsPurged { purged, .. } = response else {
-        bail!("daemon returned unexpected response to session purge: {response:?}");
-    };
-    println!("deleted {purged} ended session(s) before {before}");
-    Ok(())
-}
-
-fn parse_purge_before(input: &str) -> Result<i64> {
-    if let Some(days) = input
-        .strip_suffix("d")
-        .and_then(|value| value.parse::<i64>().ok())
-    {
-        if days <= 0 {
-            bail!("relative duration must be a positive number of days, such as 30d");
-        }
-        return Ok(Utc::now().timestamp() - days * 86_400);
-    }
-    let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
-        .context("--before must be YYYY-MM-DD or a relative duration such as 30d")?;
-    Ok(date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is valid")
-        .and_utc()
-        .timestamp())
+    let _ = (before, dry_run, yes);
+    bail!(
+        "bulk session purge is disabled because it cannot show the required per-session storage preview; delete selected sessions from Settings > Storage"
+    )
 }
 
 fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
@@ -742,14 +726,6 @@ mod tests {
             .to_string();
         assert!(err.contains("different response"));
     }
-    #[test]
-    fn purge_before_argument_parsing() {
-        assert!(parse_purge_before("2026-01-01").is_ok());
-        assert!(parse_purge_before("30d").is_ok());
-        assert!(parse_purge_before("0d").is_err());
-        assert!(parse_purge_before("tomorrow").is_err());
-    }
-
     #[test]
     fn delete_noninteractive_without_yes_refuses() {
         let mut input = std::io::Cursor::new(Vec::<u8>::new());

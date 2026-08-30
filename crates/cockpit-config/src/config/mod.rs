@@ -329,6 +329,17 @@ pub fn open_config_directory_nofollow(path: &std::path::Path) -> anyhow::Result<
     files::open_directory_handle_nofollow(path)
 }
 
+/// Check whether a retained directory handle still denotes the directory at
+/// `path`. This is intended for the narrow window while constructing a
+/// descriptor from a pathname; callers must continue using the retained
+/// handle after the check rather than reopening the path.
+pub fn directory_handle_matches_path(
+    directory: &std::fs::File,
+    path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    files::directory_handle_matches_path(directory, path)
+}
+
 /// Read one bounded regular-file leaf relative to a retained directory.
 /// Path replacement after the directory was opened cannot redirect this read.
 pub fn read_config_leaf_from_retained_directory(

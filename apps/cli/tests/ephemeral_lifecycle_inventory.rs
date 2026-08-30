@@ -1140,7 +1140,14 @@ fn raw_owner_connect_path_count(source: &str) -> usize {
 }
 
 fn compact_tokens(tokens: impl quote::ToTokens) -> String {
-    tokens.to_token_stream().to_string().replace(' ', "")
+    // rustfmt emits trailing commas on wrapped signatures; the contract is the
+    // typed surface and private-client delegation, not punctuation.
+    tokens
+        .to_token_stream()
+        .to_string()
+        .replace(' ', "")
+        .replace(",)", ")")
+        .replace(",>", ">")
 }
 
 fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
@@ -1187,6 +1194,16 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
             visit::visit_impl_item_fn(self, item);
             self.test_depth -= test;
             self.function = previous;
+        }
+
+        fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+            // Syn now surfaces the implicit receiver type (`&Self`, `Self`,
+            // `&mut Self`). Those are not Self-type leaks; only explicit
+            // `Self` in return types and turbofish constructors is inventoried.
+            match arg {
+                syn::FnArg::Receiver(_) => {}
+                syn::FnArg::Typed(typed) => visit::visit_pat_type(self, typed),
+            }
         }
 
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {

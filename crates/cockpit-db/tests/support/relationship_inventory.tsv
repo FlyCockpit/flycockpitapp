@@ -2104,7 +2104,7 @@ local	tool_call_events	mcp_server	denormalized
 local	tool_call_events	model	denormalized
 local	tool_call_events	original_input_json	non_relationship
 local	tool_call_events	output	non_relationship
-local	tool_call_events	parent_call_id	denormalized
+local	tool_call_events	parent_call_id	foreign
 local	tool_call_events	parent_child_index	non_relationship
 local	tool_call_events	path	non_relationship
 local	tool_call_events	project_id	denormalized

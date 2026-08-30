@@ -27,6 +27,27 @@ pub const SECURE_KEY_QUEUE_CAPACITY: usize = 32;
 
 type Reply<T> = oneshot::Sender<T>;
 
+/// Startup/sync callers wait on std `mpsc` from a Tokio worker without
+/// `oneshot::Receiver::blocking_recv`. Async callers keep a oneshot so they
+/// never touch Tokio's blocking pool.
+enum ReconcileReply {
+    Async(oneshot::Sender<Result<(), SecureKeyError>>),
+    Sync(mpsc::SyncSender<Result<(), SecureKeyError>>),
+}
+
+impl ReconcileReply {
+    fn send(self, result: Result<(), SecureKeyError>) {
+        match self {
+            Self::Async(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Sync(reply) => {
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
 enum Op {
     CreateOrLoad {
         namespace: Namespace,
@@ -71,9 +92,7 @@ enum Op {
         reply: Reply<Result<(), SecureKeyError>>,
     },
     Reconcile {
-        // std mpsc so constructors and sync tests can wait from a Tokio worker
-        // without `oneshot::Receiver::blocking_recv` panicking.
-        reply: mpsc::SyncSender<Result<(), SecureKeyError>>,
+        reply: ReconcileReply,
     },
     CheckConsistency {
         namespace: Namespace,
@@ -235,13 +254,11 @@ impl SecureKeyHandle {
     }
 
     pub async fn reconcile(&self) -> Result<(), SecureKeyError> {
-        let (reply, rx) = mpsc::sync_channel(1);
-        self.enqueue(Op::Reconcile { reply })?;
-        match tokio::task::spawn_blocking(move || rx.recv()).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(SecureKeyError::Internal("actor dropped reply".into())),
-            Err(error) => Err(SecureKeyError::Internal(error.to_string())),
-        }
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::Reconcile {
+            reply: ReconcileReply::Async(reply),
+        })?;
+        Self::await_reply(rx).await?
     }
 
     pub async fn check_consistency(&self, namespace: &str) -> Result<(), SecureKeyError> {
@@ -422,7 +439,9 @@ impl SecureKeyHandle {
 
     pub fn reconcile_blocking(&self) -> Result<(), SecureKeyError> {
         let (reply, rx) = mpsc::sync_channel(1);
-        self.enqueue(Op::Reconcile { reply })?;
+        self.enqueue(Op::Reconcile {
+            reply: ReconcileReply::Sync(reply),
+        })?;
         rx.recv()
             .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
     }
@@ -468,7 +487,9 @@ impl SecureKeyHandle {
 
     pub fn enqueue_raw_for_busy_test(&self) -> Result<(), SecureKeyError> {
         let (reply, _rx) = mpsc::sync_channel(1);
-        self.enqueue(Op::Reconcile { reply })
+        self.enqueue(Op::Reconcile {
+            reply: ReconcileReply::Sync(reply),
+        })
     }
 }
 
@@ -627,7 +648,12 @@ impl SecureKeyActor {
 
         let handle = SecureKeyHandle { tx: tx.clone() };
         let (reply, rx_ack) = mpsc::sync_channel(1);
-        if handle.enqueue(Op::Reconcile { reply }).is_err() {
+        if handle
+            .enqueue(Op::Reconcile {
+                reply: ReconcileReply::Sync(reply),
+            })
+            .is_err()
+        {
             return Self::fail_after_registration(
                 register_on_thread,
                 &tx,

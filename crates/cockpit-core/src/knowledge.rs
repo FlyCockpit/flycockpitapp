@@ -81,6 +81,20 @@ pub(crate) struct KnowledgeConcept {
     pub invalidated_by: Option<String>,
 }
 
+impl KnowledgeConcept {
+    /// Resolve this concept's KB-scoped symbolic references at read time.
+    /// Markdown serialization never calls this method, so the source tree and
+    /// git only ever receive the symbolic token.
+    pub(crate) async fn body_for_reader(
+        &self,
+        kb_id: &crate::sealed::SealedKnowledgeBaseId,
+        resolver: &dyn crate::sealed::SealedResolver,
+        trusted_reader: bool,
+    ) -> Result<String> {
+        crate::sealed::resolve_kb_markdown(&self.body, kb_id, resolver, trusted_reader).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Citation {
     pub label: String,

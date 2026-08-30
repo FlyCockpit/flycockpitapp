@@ -5936,7 +5936,9 @@ BEGIN
 END;
 
 -- ---- scoped sealed values --------------------------------------------------
--- Owner-managed sealed values across Session, Project, and Global scope.
+-- Owner-managed sealed values across Session, Project, Global, and Knowledge
+-- Base scope. KB references use the daemon vault directly; their markdown
+-- contains only resolver-agnostic symbolic tokens.
 --
 -- Only Session literals live in SQLite (the pre-existing `sealed_values`
 -- table above). Project and Global literals live in a dedicated sealed-value
@@ -5952,9 +5954,10 @@ END;
 -- half-live.
 CREATE TABLE sealed_value_records (
     record_id       TEXT    PRIMARY KEY,
-    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global', 'knowledge_base')),
     -- session_id for session scope, canonical project key for project scope,
-    -- and the empty string for global scope (global names are unique globally).
+    -- the KB id for knowledge-base scope, and the empty string for global
+    -- scope (global names are unique globally).
     scope_key       TEXT    NOT NULL,
     name            TEXT    NOT NULL,
     description     TEXT    NOT NULL,
@@ -5964,9 +5967,9 @@ CREATE TABLE sealed_value_records (
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL,
     deleted_at_ms   INTEGER,
-    -- Session literals never leave SQLite, so a session record never carries a
-    -- compartment locator.
-    CHECK (scope <> 'session' OR compartment_key IS NULL),
+    -- Session and knowledge-base literals use vault items directly, so neither
+    -- record kind carries a compartment locator.
+    CHECK (scope NOT IN ('session', 'knowledge_base') OR compartment_key IS NULL),
     -- Global records are unique globally; their scope key is always empty.
     CHECK ((scope = 'global') = (scope_key = '')),
     UNIQUE (scope, scope_key, name)
@@ -5985,7 +5988,7 @@ END;
 -- Deleted names are never reused. The tombstone outlives the record row so a
 -- later create of the same canonical name in the same scope is refused.
 CREATE TABLE sealed_value_name_tombstones (
-    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global', 'knowledge_base')),
     scope_key     TEXT    NOT NULL,
     name          TEXT    NOT NULL,
     retired_at_ms INTEGER NOT NULL,
@@ -6343,6 +6346,7 @@ CREATE TABLE secret_vault_items (
         'subscription_ack',
         'sealed_compartment',
         'session_sealed_value',
+        'knowledge_base_sealed_value',
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,

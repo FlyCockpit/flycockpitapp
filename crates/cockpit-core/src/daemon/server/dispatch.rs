@@ -27197,8 +27197,11 @@ fn parse_sealed_owner_scope_kind(
         "session" => Ok(crate::db::sealed_scope::SealedScopeKind::Session),
         "project" => Ok(crate::db::sealed_scope::SealedScopeKind::Project),
         "global" => Ok(crate::db::sealed_scope::SealedScopeKind::Global),
+        "knowledge_base" => Ok(crate::db::sealed_scope::SealedScopeKind::KnowledgeBase),
         other => {
-            anyhow::bail!("scope kind must be `session`, `project`, or `global`, got `{other}`")
+            anyhow::bail!(
+                "scope kind must be `session`, `project`, `global`, or `knowledge_base`, got `{other}`"
+            )
         }
     }
 }
@@ -27295,7 +27298,7 @@ fn build_sealed_scope_ref(
     scope_kind: Option<String>,
     scope_key: Option<String>,
 ) -> anyhow::Result<crate::sealed::identity::SealedScopeRef> {
-    use crate::sealed::identity::{SealedProjectKey, SealedScopeRef};
+    use crate::sealed::identity::{SealedKnowledgeBaseId, SealedProjectKey, SealedScopeRef};
     let kind =
         parse_sealed_owner_scope_kind(scope_kind.as_deref().context("a scope kind is required")?)?;
     let key = scope_key.unwrap_or_default();
@@ -27307,6 +27310,9 @@ fn build_sealed_scope_ref(
             SealedProjectKey::from_canonical(key),
         )),
         crate::db::sealed_scope::SealedScopeKind::Global => Ok(SealedScopeRef::Global),
+        crate::db::sealed_scope::SealedScopeKind::KnowledgeBase => Ok(
+            SealedScopeRef::KnowledgeBase(SealedKnowledgeBaseId::parse(&key)?),
+        ),
     }
 }
 
@@ -27359,6 +27365,9 @@ fn sealed_record_row_to_inventory_item(
         crate::db::sealed_scope::SealedScopeKind::Session => proto::SealedOwnerScopeKind::Session,
         crate::db::sealed_scope::SealedScopeKind::Project => proto::SealedOwnerScopeKind::Project,
         crate::db::sealed_scope::SealedScopeKind::Global => proto::SealedOwnerScopeKind::Global,
+        crate::db::sealed_scope::SealedScopeKind::KnowledgeBase => {
+            proto::SealedOwnerScopeKind::KnowledgeBase
+        }
     };
     proto::SealedOwnerInventoryItem {
         record_id: row.record_id,

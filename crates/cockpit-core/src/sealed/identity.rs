@@ -151,6 +151,35 @@ impl fmt::Display for SealedProjectKey {
     }
 }
 
+/// A validated knowledge-base identity used as the key for KB-scoped sealed
+/// values. This deliberately follows the KB registry grammar, so a symbolic
+/// reference cannot name a different spelling of the same configured KB.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SealedKnowledgeBaseId(String);
+
+impl SealedKnowledgeBaseId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        if raw.is_empty()
+            || !raw
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            bail!("knowledge base IDs must be non-empty ASCII alphanumeric, `-`, or `_`");
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SealedKnowledgeBaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Whether the canonical project is currently trusted.
 ///
 /// A sealed value never resolves in an untrusted project. This is an input to
@@ -176,6 +205,7 @@ pub enum SealedScopeRef {
     Session(Uuid),
     Project(SealedProjectKey),
     Global,
+    KnowledgeBase(SealedKnowledgeBaseId),
 }
 
 impl SealedScopeRef {
@@ -184,6 +214,7 @@ impl SealedScopeRef {
             Self::Session(_) => SealedScopeKind::Session,
             Self::Project(_) => SealedScopeKind::Project,
             Self::Global => SealedScopeKind::Global,
+            Self::KnowledgeBase(_) => SealedScopeKind::KnowledgeBase,
         }
     }
 
@@ -193,6 +224,7 @@ impl SealedScopeRef {
             Self::Session(id) => id.to_string(),
             Self::Project(key) => key.as_str().to_string(),
             Self::Global => String::new(),
+            Self::KnowledgeBase(id) => id.as_str().to_string(),
         }
     }
 }

@@ -491,6 +491,7 @@ impl SealedRuntime {
                     .map_err(|_| SealedUseDenied)?
                     .ok_or(SealedUseDenied)
             }
+            SealedScopeKind::KnowledgeBase => Err(SealedUseDenied),
         }
     }
 }

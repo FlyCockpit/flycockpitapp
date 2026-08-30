@@ -555,14 +555,26 @@ impl OutboundPermissionRegistry {
         sink: &mut dyn FrameSink,
         counters: &mut AcpTransportCounters,
     ) {
+        self.on_daemon_terminal_for_attachment(None, sink, counters);
+    }
+
+    /// Cancel issued permission requests for a daemon-terminal attachment.
+    /// An absent attachment denotes a terminal connection and closes every
+    /// outstanding request, preserving the original daemon-terminal path.
+    pub fn on_daemon_terminal_for_attachment(
+        &self,
+        attachment: Option<&str>,
+        sink: &mut dyn FrameSink,
+        counters: &mut AcpTransportCounters,
+    ) {
         let _gate = self.gate.lock().expect("registry gate");
         let mut inner = self.inner.lock().expect("registry");
         let ids: Vec<String> = inner.entries.keys().cloned().collect();
         for id in ids {
-            let issued = inner
-                .entries
-                .get(&id)
-                .is_some_and(|entry| entry.state == PermissionStateName::Issued);
+            let issued = inner.entries.get(&id).is_some_and(|entry| {
+                entry.state == PermissionStateName::Issued
+                    && attachment.is_none_or(|attachment| entry.attachment == attachment)
+            });
             if !issued {
                 continue;
             }

@@ -266,9 +266,9 @@ pub(crate) fn initialize_result() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": 1,
         "agentCapabilities": {
-            "loadSession": true
+            "loadSession": true,
+            "sessionCapabilities": { "list": {} }
         },
-        "sessionCapabilities": { "list": {} },
         "agentInfo": {
             "name": "cockpit",
             "title": "Cockpit",

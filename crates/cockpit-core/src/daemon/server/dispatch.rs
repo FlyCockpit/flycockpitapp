@@ -6351,15 +6351,19 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DiscoverCodeRootsV1(request) => {
-            let canonical =
-                crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?
-                    .to_string_lossy()
-                    .into_owned();
+            let canonical = request
+                .workspace_selector
+                .as_ref()
+                .map(|selector| {
+                    crate::daemon::fs_api::canonical_project_root(&selector.path)
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .transpose()?;
             let result = if let Some(cursor) = &request.cursor {
                 crate::sync::lock_or_recover(&ctx.code_root_authority)
                     .continue_discovery(
                         cursor,
-                        &canonical,
+                        canonical.as_deref(),
                         &request.logical_client_id,
                         request.limit,
                     )
@@ -6372,7 +6376,11 @@ async fn handle_serialized_request_impl(
                     .map_err(internal)?;
                 let mut roots = Vec::new();
                 for row in rows {
-                    if row.session_entry_mode != "code" || row.project_root != canonical {
+                    if row.session_entry_mode != "code"
+                        || canonical
+                            .as_ref()
+                            .is_some_and(|workspace| row.project_root != *workspace)
+                    {
                         continue;
                     }
                     let lifecycle = if row.archived_at_unix_ms.is_some() {

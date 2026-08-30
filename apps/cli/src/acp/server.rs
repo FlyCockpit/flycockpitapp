@@ -391,24 +391,69 @@ impl Peer {
         for (session_id, client) in attachments {
             loop {
                 let event = self.handle.block_on(async {
-                    tokio::time::timeout(Duration::from_millis(0), client.next_event())
-                        .await
-                        .ok()
-                        .flatten()
+                    tokio::time::timeout(Duration::from_millis(0), client.next_event()).await
                 });
-                let Some(event) = event else { break };
-                if let cockpit_proto::Event::AgentIdle {
-                    session_id: root_id,
-                    reason,
-                    ..
-                } = event
-                    && root_id.to_string() == session_id
-                {
-                    self.complete_prompt(&session_id, stop_reason(&reason))?;
+                let event = match event {
+                    Ok(Some(event)) => event,
+                    // A closed attachment stream is a daemon-terminal path,
+                    // not an idle poll. It must settle this root's deferred
+                    // prompt and issued permission request(s).
+                    Ok(None) => {
+                        self.terminate_session(&session_id)?;
+                        break;
+                    }
+                    Err(_) => break,
+                };
+                match event {
+                    cockpit_proto::Event::AgentIdle {
+                        session_id: root_id,
+                        reason,
+                        ..
+                    } if root_id.to_string() == session_id => {
+                        self.complete_prompt(&session_id, stop_reason(&reason))?;
+                    }
+                    cockpit_proto::Event::SessionEnded {
+                        session_id: root_id,
+                        ..
+                    } if root_id.to_string() == session_id => {
+                        self.terminate_session(&session_id)?;
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// A root can terminate without an `AgentIdle` event (for example, from
+    /// another attachment or daemon shutdown). Finish its deferred prompt and
+    /// cancel only this root's outstanding ACP permissions; other loaded
+    /// roots continue to own their requests.
+    fn terminate_session(&mut self, session_id: &str) -> Result<()> {
+        let capability = {
+            let mut state = self.state.lock().expect("ACP state");
+            let capability = state
+                .attachments
+                .get(session_id)
+                .map(|attachment| attachment.capability.clone());
+            if let Some(capability) = &capability {
+                state
+                    .permission_deliveries
+                    .retain(|_, (_, delivery_capability, _)| delivery_capability != capability);
+            }
+            capability
+        };
+        if let Some(capability) = capability {
+            self.adapter.registry.on_daemon_terminal_for_attachment(
+                Some(capability.expose_opaque()),
+                &mut self.adapter.sink,
+                &mut self.adapter.counters,
+            );
+        }
+        // ACP v1 has no session-ended stop reason. This is a terminal daemon
+        // failure for an outstanding prompt, rather than a completed turn.
+        self.complete_prompt(session_id, "refusal")
     }
 
     fn complete_prompt(&mut self, session_id: &str, stop_reason: &str) -> Result<()> {
@@ -532,7 +577,9 @@ impl DaemonIngress {
         }
     }
 
-    fn discover(&self, workspace: &str) -> Result<Vec<cockpit_proto::CodeRootSummaryV1>> {
+    /// `workspace` is the optional ACP `cwd` filter. Its absence must remain
+    /// absent through the daemon request so an editor can discover all roots.
+    fn discover(&self, workspace: Option<&str>) -> Result<Vec<cockpit_proto::CodeRootSummaryV1>> {
         let logical_client_id = self
             .state
             .lock()
@@ -543,9 +590,9 @@ impl DaemonIngress {
         let mut cursor = None;
         loop {
             let response = self.call(Request::DiscoverCodeRootsV1(DiscoverCodeRootsV1Request {
-                workspace_selector: CodeRootWorkspaceSelectorV1 {
-                    path: workspace.to_string(),
-                },
+                workspace_selector: workspace.map(|path| CodeRootWorkspaceSelectorV1 {
+                    path: path.to_string(),
+                }),
                 logical_client_id: logical_client_id.clone(),
                 cursor,
                 limit: DISCOVERY_PAGE_SIZE,
@@ -641,7 +688,7 @@ impl SessionIngress for DaemonIngress {
                 let root_id = Uuid::parse_str(&session_id)
                     .map_err(|_| SessionIngressError::InvalidAdmission)?;
                 let root = self
-                    .discover(&cwd)
+                    .discover(Some(&cwd))
                     .map_err(|_| SessionIngressError::Unavailable)?
                     .into_iter()
                     .find(|summary| summary.root_id == CodeRootIdV1(root_id))
@@ -690,15 +737,16 @@ impl SessionIngress for DaemonIngress {
     ) -> Result<Value, SessionIngressError> {
         let params: Value =
             serde_json::from_str(raw).map_err(|_| SessionIngressError::InvalidAdmission)?;
-        let cwd = match params.get("cwd").and_then(Value::as_str) {
-            Some(cwd) => cwd.to_string(),
-            None => std::env::current_dir()
-                .map_err(|_| SessionIngressError::Unavailable)?
-                .display()
-                .to_string(),
+        let params = params
+            .as_object()
+            .ok_or(SessionIngressError::InvalidAdmission)?;
+        let cwd = match params.get("cwd") {
+            Some(Value::String(cwd)) => Some(cwd.as_str()),
+            Some(_) => return Err(SessionIngressError::InvalidAdmission),
+            None => None,
         };
         let sessions = self
-            .discover(&cwd)
+            .discover(cwd)
             .map_err(|_| SessionIngressError::Unavailable)?;
         Ok(json!({ "sessions": sessions.into_iter().map(|root| json!({
             "sessionId": root.root_id.0.to_string(),

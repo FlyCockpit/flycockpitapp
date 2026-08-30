@@ -2784,8 +2784,9 @@ impl Request {
                 request.ingress.validate()?;
             }
             Self::DiscoverCodeRootsV1(request) => {
-                if request.workspace_selector.path.is_empty()
-                    || request.workspace_selector.path.len() > 32_768
+                if let Some(workspace_selector) = &request.workspace_selector
+                    && (workspace_selector.path.is_empty()
+                        || workspace_selector.path.len() > 32_768)
                 {
                     return Err("workspace selector path must contain 1..=32768 bytes".to_string());
                 }

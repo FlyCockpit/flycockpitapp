@@ -36,6 +36,7 @@ fn peer() -> AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck> {
 struct RecordingSessionIngress {
     admissions: Vec<SessionAdmissionReceipt>,
     cancel_calls: usize,
+    list_params: Vec<String>,
 }
 
 impl SessionIngress for RecordingSessionIngress {
@@ -58,9 +59,10 @@ impl SessionIngress for RecordingSessionIngress {
 
     fn list(
         &mut self,
-        _raw_params: &str,
+        raw_params: &str,
         _counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError> {
+        self.list_params.push(raw_params.to_string());
         Ok(json!({ "sessions": [] }))
     }
 
@@ -162,6 +164,19 @@ fn acp_transport_initialize_capability_serialization() {
     assert!(response.contains("\"protocolVersion\":1"));
     assert!(response.contains("\"loadSession\":true"));
     assert!(response.contains("\"sessionCapabilities\""));
+    let result = serde_json::from_str::<serde_json::Value>(&response)
+        .unwrap()
+        .get("result")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        result
+            .get("agentCapabilities")
+            .and_then(|capabilities| capabilities.get("sessionCapabilities"))
+            .and_then(|capabilities| capabilities.get("list")),
+        Some(&json!({}))
+    );
+    assert!(result.get("sessionCapabilities").is_none());
     assert!(!response.contains("promptCapabilities"));
     assert!(!response.contains("mcpCapabilities"));
     assert!(!response.contains("elicitation"));
@@ -372,6 +387,31 @@ fn acp_transport_session_methods_fail_closed_without_an_ingress_owner() {
         assert!(response.contains("ACP session adaptation is unavailable"));
         assert_no_transport_mutation(&adapter.counters);
     }
+}
+
+#[test]
+fn acp_transport_session_list_preserves_an_absent_cwd_filter() {
+    let mut adapter = AcpAdapter::new_with_session_ingress(
+        MemoryFrameSink::default(),
+        RecordingResolve::default(),
+        RecordingAck::default(),
+        RecordingSessionIngress::default(),
+    );
+    let response = send(
+        &mut adapter,
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/list","params":{}}"#,
+    )
+    .unwrap();
+    assert!(response.contains("\"sessions\":[]"));
+    assert_eq!(
+        adapter
+            .session_ingress
+            .lock()
+            .unwrap()
+            .list_params
+            .as_slice(),
+        ["{}".to_string()]
+    );
 }
 
 #[test]
@@ -1178,6 +1218,42 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             .frames
             .iter()
             .any(|frame| frame.contains("$/cancel_request"))
+    );
+
+    let mut adapter = peer();
+    let ended = adapter
+        .registry
+        .issue_and_write(
+            "att-ended".into(),
+            "d-ended".into(),
+            "a-ended".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut adapter.sink,
+            &mut adapter.counters,
+        )
+        .unwrap();
+    let live = adapter
+        .registry
+        .issue_and_write(
+            "att-live".into(),
+            "d-live".into(),
+            "a-live".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut adapter.sink,
+            &mut adapter.counters,
+        )
+        .unwrap();
+    adapter.registry.on_daemon_terminal_for_attachment(
+        Some("att-ended"),
+        &mut adapter.sink,
+        &mut adapter.counters,
+    );
+    assert_eq!(adapter.registry.state_of(&ended), Some(Released));
+    assert_eq!(
+        adapter.registry.state_of(&live),
+        Some(PermissionStateName::Issued)
     );
 }
 

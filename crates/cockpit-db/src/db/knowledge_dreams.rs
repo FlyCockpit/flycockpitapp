@@ -104,6 +104,7 @@ impl Db {
                  JOIN sessions s ON s.session_id = a.session_id
                  WHERE a.kb_id = ?1
                    AND a.project_root = ?2
+                   AND s.is_dream_session = 0
                    AND NOT EXISTS (
                      SELECT 1 FROM knowledge_dreamed_sessions d
                      WHERE d.kb_id = a.kb_id
@@ -533,6 +534,45 @@ mod tests {
         assert_eq!(
             next.iter().map(|row| row.session_id).collect::<Vec<_>>(),
             vec![second.session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_session_attachments_are_never_undreamed_sources() {
+        let db = Db::open_in_memory().unwrap();
+        let ordinary = db.create_session("p", ROOT_A, "Build").await.unwrap();
+        let dream = db.create_session("p", ROOT_A, "Dream").await.unwrap();
+        let dream_id = dream.session_id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET is_dream_session = 1 WHERE session_id = ?1",
+                [dream_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        for session_id in [ordinary.session_id, dream_id] {
+            db.attach_session_to_knowledge_base("kb", ROOT_A, session_id)
+                .await
+                .unwrap();
+        }
+
+        let sources = db
+            .undreamed_sessions_for_knowledge_base(
+                "kb",
+                ROOT_A,
+                "consumer",
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.session_id)
+                .collect::<Vec<_>>(),
+            vec![ordinary.session_id]
         );
     }
 

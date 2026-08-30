@@ -1053,6 +1053,11 @@ impl ToolOutput {
 /// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
     pub(crate) agent_id: String,
+    /// History-read trust of the concrete tool frame. This is carried from the
+    /// agent frame rather than inferred from the session's active model;
+    /// delegated frames remain untrusted even when a host-selected fallback
+    /// model is trusted, because their custody is redacted-untrusted.
+    pub(crate) executing_model_trusted: bool,
     /// Stable daemon-owned lifecycle identity for this concrete executor.
     /// `None` is reserved for isolated tests and legacy headless helpers;
     /// production driver frames always carry a durable instance id.

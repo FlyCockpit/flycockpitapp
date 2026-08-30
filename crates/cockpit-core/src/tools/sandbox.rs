@@ -697,6 +697,7 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,

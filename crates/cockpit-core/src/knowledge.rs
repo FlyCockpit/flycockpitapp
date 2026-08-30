@@ -1601,9 +1601,12 @@ pub(crate) struct MemorySearchTool {
 /// Read-only retrieval surface used by the built-in `knowledge` specialist.
 ///
 /// KB results always flow through [`KbProvider`]. When dream has recorded a
-/// watermark for an attached KB, the same call also searches the bounded set
-/// of sessions active after that point. The DB search applies the caller's
-/// history-trust filter before results reach the normal redaction chokepoint.
+/// watermark for every attached KB, the same call searches the bounded set of
+/// sessions active after the oldest boundary. Before dream has recorded its
+/// first boundary, it conservatively searches matching project sessions and
+/// reports that no history can yet be proven dreamed. The DB search applies the
+/// caller's history-trust filter before results reach the normal redaction
+/// chokepoint.
 pub(crate) struct KnowledgeRetrieveTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
 }
@@ -1628,7 +1631,7 @@ impl Tool for KnowledgeRetrieveTool {
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search attached knowledge bases through their configured providers, then search only sessions newer than the recorded dream watermark when one exists. Returns concept-path and session references plus explicit freshness notes."
+            "Search attached knowledge bases through their configured providers, then search sessions newer than the recorded dream watermark when every attached KB has one. Before the first watermark, conservatively search a bounded set of matching project sessions and say that no history can yet be proven dreamed. Returns concept-path and session references plus explicit freshness notes."
                 .to_string(),
         )
     }
@@ -1722,29 +1725,40 @@ async fn retrieve_undreamed_session_hits(
         }
     }
 
-    let hits = match oldest_watermark_unix_ms {
-        Some(watermark) => {
-            // `search_candidates_for_trust` is inclusive, while the dream
-            // contract is strictly after the watermark. Saturate safely at
-            // the representable upper boundary (which naturally yields none).
-            let since = watermark.saturating_add(1);
-            let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
-            ctx.session
-                .db
-                .search_candidates_for_trust(
-                    query,
-                    Some(ctx.session.project_id.as_str()),
-                    Some(ctx.session.id),
-                    Some(since),
-                    pool,
-                    crate::tools::session_search::caller_history_trust(ctx),
-                )
-                .await?
-                .into_iter()
-                .take(limit)
-                .collect()
+    // A missing watermark is not evidence that history has been dreamed. On
+    // first use (and whenever any attached KB lacks a ledger row), search the
+    // project's matching session history conservatively instead of silently
+    // returning no fresh results. Once every attached KB has a boundary, the
+    // oldest one safely bounds the shared candidate set.
+    let (since, search_enabled) = if missing_watermark_knowledge_bases.is_empty() {
+        match oldest_watermark_unix_ms {
+            // `search_candidates_for_trust` is inclusive but dream's contract
+            // is strictly after the watermark. `checked_add` makes the
+            // representable upper boundary correctly yield no sessions.
+            Some(watermark) => (watermark.checked_add(1), watermark != i64::MAX),
+            None => (None, false),
         }
-        None => Vec::new(),
+    } else {
+        (None, true)
+    };
+    let hits = if search_enabled {
+        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
+        ctx.session
+            .db
+            .search_candidates_for_trust(
+                query,
+                Some(ctx.session.project_id.as_str()),
+                None,
+                since,
+                pool,
+                crate::tools::session_search::caller_history_trust(ctx),
+            )
+            .await?
+            .into_iter()
+            .take(limit)
+            .collect()
+    } else {
+        Vec::new()
     };
     Ok(FreshSessionRetrieval {
         hits,
@@ -1777,35 +1791,27 @@ fn render_knowledge_retrieval(
         }
     }
 
-    match freshness.oldest_watermark_unix_ms {
-        Some(watermark) => {
-            out.push_str("Fresh-session staleness check: searched this project's sessions active after ");
-            out.push_str(&watermark.to_string());
-            out.push_str(" for KB(s) ");
-            out.push_str(&freshness.watermark_knowledge_bases.join(", "));
-            out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
-            if freshness.hits.is_empty() {
-                out.push_str("- No matching undreamed-session updates.\n");
-            } else {
-                out.push_str("Undreamed-session citations:\n");
-                for hit in &freshness.hits {
-                    let fallback_reference = hit.session_id.to_string();
-                    let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
-                    out.push_str("- session ");
-                    out.push_str(reference);
-                    out.push_str(" — ");
-                    out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
-                    out.push_str(" — ");
-                    out.push_str(&short_summary(&hit.snippet));
-                    out.push_str(" [session ref: ");
-                    out.push_str(&hit.session_id.to_string());
-                    out.push_str("]\n");
-                }
+    if !freshness.missing_watermark_knowledge_bases.is_empty() {
+        out.push_str(
+            "Fresh-session staleness check: no dream watermark is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
+        );
+        render_fresh_session_hits(&mut out, &freshness.hits);
+    } else {
+        match freshness.oldest_watermark_unix_ms {
+            Some(watermark) => {
+                out.push_str(
+                    "Fresh-session staleness check: searched this project's sessions active after ",
+                );
+                out.push_str(&watermark.to_string());
+                out.push_str(" for KB(s) ");
+                out.push_str(&freshness.watermark_knowledge_bases.join(", "));
+                out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
+                render_fresh_session_hits(&mut out, &freshness.hits);
             }
+            None => out.push_str(
+                "Fresh-session staleness check: no eligible fresh-session boundary is available.\n",
+            ),
         }
-        None => out.push_str(
-            "Fresh-session staleness check: no dream watermark is recorded for an attached KB, so no bounded undreamed-session subset was searched.\n",
-        ),
     }
     if !freshness.missing_watermark_knowledge_bases.is_empty() {
         out.push_str("KB(s) without a dream watermark: ");
@@ -1813,6 +1819,27 @@ fn render_knowledge_retrieval(
         out.push_str(".\n");
     }
     redact.scrub(&out)
+}
+
+fn render_fresh_session_hits(out: &mut String, hits: &[crate::db::session_search::SearchHit]) {
+    if hits.is_empty() {
+        out.push_str("- No matching undreamed-session updates.\n");
+    } else {
+        out.push_str("Undreamed-session citations:\n");
+        for hit in hits {
+            let fallback_reference = hit.session_id.to_string();
+            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
+            out.push_str("- session ");
+            out.push_str(reference);
+            out.push_str(" — ");
+            out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
+            out.push_str(" — ");
+            out.push_str(&short_summary(&hit.snippet));
+            out.push_str(" [session ref: ");
+            out.push_str(&hit.session_id.to_string());
+            out.push_str("]\n");
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1994,6 +2021,59 @@ mod tests {
         assert!(rendered.contains("session ab12cd"));
         assert!(rendered.contains(&session_id.to_string()));
         assert!(rendered.contains("may not yet be dreamed"));
+    }
+
+    #[tokio::test]
+    async fn fresh_retrieval_includes_the_current_session_before_the_first_watermark() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "current session has the windfall launch decision" }),
+            )
+            .await
+            .unwrap();
+        let entry = project_knowledge_registry_entry();
+        let bundles = vec![AttachedKnowledgeBase {
+            provider: Arc::new(RemoteKb {
+                entry: entry.clone(),
+            }),
+            entry,
+        }];
+
+        let freshness = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            freshness.missing_watermark_knowledge_bases,
+            vec!["project".to_string()]
+        );
+        assert!(
+            freshness
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == ctx.session.id)
+        );
+    }
+
+    #[test]
+    fn fresh_retrieval_reports_its_conservative_first_use_search() {
+        let freshness = FreshSessionRetrieval {
+            hits: Vec::new(),
+            watermark_knowledge_bases: Vec::new(),
+            oldest_watermark_unix_ms: None,
+            missing_watermark_knowledge_bases: vec!["project".to_string()],
+        };
+
+        let rendered = render_knowledge_retrieval(&[], &freshness, &RedactionTable::empty());
+        assert!(rendered.contains("searched conservatively"));
+        assert!(rendered.contains("no session history can yet be proven dreamed"));
     }
 
     fn write_bundle(root: &Path) {

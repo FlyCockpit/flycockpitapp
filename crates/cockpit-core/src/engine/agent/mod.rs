@@ -1557,6 +1557,7 @@ mod redaction_placeholder_guard_tests {
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,

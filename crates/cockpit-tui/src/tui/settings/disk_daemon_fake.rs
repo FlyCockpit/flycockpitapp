@@ -987,16 +987,22 @@ fn provider_catalog_snapshot(
     snapshot_session_id: &str,
 ) -> Result<Response, String> {
     let mut paths = cockpit_config::dirs::config_file_paths_for_load(root);
-    // A fixture target under this root is its most specific layer, so it merges
-    // last and wins — the same precedence the settings snapshot gives it.
+    // A registered target is an explicit isolated fixture. Do not merge the
+    // developer machine's global provider layers into it: fixtures open a
+    // single authoritative config document and must not inherit a developer's
+    // default model, providers, or credentials.
     let registered = extra_layer_targets()
         .lock()
-        .map(|targets| targets.iter().cloned().collect::<Vec<_>>())
+        .map(|targets| {
+            targets
+                .iter()
+                .filter(|target| target.starts_with(root))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
-    for target in registered {
-        if target.starts_with(root) && !paths.contains(&target) {
-            paths.push(target);
-        }
+    if !registered.is_empty() {
+        paths = registered;
     }
     let mut config = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
     if let Some(provider_id) = provider_id {

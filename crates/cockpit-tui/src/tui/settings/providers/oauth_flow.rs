@@ -1068,7 +1068,7 @@ pub(super) fn handle_oauth_flow_key_with(
     // completion (including cancellation) is applied.  In particular, do not
     // let navigation, another login, acknowledgement, paste editing, or a
     // wizard save race a live begin/poll/exchange.
-    if s.pending || s.polling {
+    if s.action_operation.is_pending() {
         return if matches!(key.code, KeyCode::Esc) {
             OAuthKeyOutcome::stay(Some(s.begin_cancel()))
         } else {

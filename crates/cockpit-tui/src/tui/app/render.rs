@@ -2377,12 +2377,30 @@ impl App {
         // A non-zero request means "leave the tail", even when geometry has
         // not been measured yet. Clamping that request to 0 would pin to
         // the newest rows and hide the beginning-of-conversation marker.
-        if offset == 0 {
+        if offset == 0
+            && !(self.chat_total_lines == 0
+                && self.chat_visible_lines == 0
+                && !self.history.is_empty())
+        {
             self.pin_chat_to_tail();
             return;
         }
         self.chat_pinned_to_tail = false;
-        self.chat_scroll_offset = if max_offset == 0 {
+        if self.chat_total_lines > 0 && offset >= self.chat_total_lines {
+            // A caller uses the current total as an explicit "oldest row"
+            // request. The history page may just have been prepended, so the
+            // cached total cannot safely be clamped until the next layout.
+            self.chat_scroll_offset = usize::MAX;
+            self.chat_scroll_anchor = None;
+            return;
+        }
+        self.chat_scroll_offset = if max_offset == 0 && offset == 0 {
+            // Before the first layout pass, a caller can request the oldest
+            // history row while both cached dimensions are still zero. Keep
+            // that intent until the renderer can clamp it against measured
+            // geometry rather than silently converting it to tail-following.
+            usize::MAX
+        } else if max_offset == 0 {
             offset
         } else {
             offset.min(max_offset)

@@ -934,7 +934,16 @@ impl NotesPane {
         let block = Block::default()
             .borders(Borders::RIGHT)
             .title(Line::from(" notes "));
-        let body = block.inner(area);
+        // A title on a side-only block makes ratatui's `inner` reserve the
+        // top row even though there is no horizontal border. The list owns
+        // that row; otherwise the first visible note is shifted down and a
+        // long selected name is clipped before its reserved scrollbar cell.
+        let body = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width.saturating_sub(1),
+            height: area.height,
+        };
         frame.render_widget(block, area);
 
         let status_height = u16::from(self.status.is_some());
@@ -1416,21 +1425,15 @@ mod tests {
                 (!symbol.is_empty()).then_some(symbol)
             })
             .collect::<String>();
-        let chars: Vec<char> = rendered.chars().collect();
         let mut compact = String::new();
-        for (index, &ch) in chars.iter().enumerate() {
-            if ch == ' ' {
-                let prev_wide = compact
+        for ch in rendered.chars() {
+            if ch == ' '
+                && compact
                     .chars()
                     .last()
-                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2));
-                let next_wide = chars
-                    .get(index + 1)
-                    .copied()
-                    .is_some_and(|next| unicode_width::UnicodeWidthChar::width(next) == Some(2));
-                if prev_wide && next_wide {
-                    continue;
-                }
+                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2))
+            {
+                continue;
             }
             compact.push(ch);
         }
@@ -2429,7 +2432,6 @@ mod tests {
             .draw(|frame| pane.render(frame, Rect::new(0, 0, 60, 8)))
             .expect("draw notes");
         let buffer = terminal.backend().buffer();
-
         assert_eq!(pane.last_view_width, 29);
         assert_eq!(buffer[(26, 1)].symbol(), "Z");
         assert_ne!(buffer[(27, 1)].symbol(), "Z");

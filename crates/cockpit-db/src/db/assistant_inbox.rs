@@ -58,6 +58,7 @@ pub struct AssistantInboxItem {
     pub assistant_name: String,
     pub main_session_id: Uuid,
     pub raising_session_id: Uuid,
+    pub operation_scope: String,
     pub operation_id: String,
     pub summary: String,
     pub delivery: AssistantInboxDelivery,
@@ -94,6 +95,7 @@ impl AssistantInboxItem {
                     error.into(),
                 )
             })?,
+            operation_scope: row.get("operation_scope")?,
             operation_id: row.get("operation_id")?,
             summary: row.get("summary")?,
             delivery: AssistantInboxDelivery::parse(&delivery)?,
@@ -106,17 +108,29 @@ impl AssistantInboxItem {
 impl Db {
     /// Insert a structured item into the owning assistant's inbox.
     ///
-    /// Only a durable assistant thread may raise.  The target is resolved by
-    /// walking the thread's parent chain to its non-thread root; callers never
-    /// supply a destination, which prevents point-to-point thread messaging.
+    /// Only a durable assistant thread may raise. `operation_scope` is the
+    /// daemon-owned inference/replay attempt identity; `operation_id` is the
+    /// provider's retry correlation within that scope. The target is resolved
+    /// by walking the thread's parent chain to its non-thread root; callers
+    /// never supply a destination, which prevents point-to-point thread
+    /// messaging.
     pub async fn raise_assistant_inbox_item(
         &self,
         raising_session_id: Uuid,
+        operation_scope: String,
         operation_id: String,
         summary: String,
         delivery: AssistantInboxDelivery,
     ) -> Result<AssistantInboxItem> {
         let summary = summary.trim().to_string();
+        ensure!(
+            !operation_scope.is_empty(),
+            "assistant inbox operation scope must not be empty"
+        );
+        ensure!(
+            operation_scope.len() <= 128,
+            "assistant inbox operation scope exceeds 128 bytes"
+        );
         ensure!(
             !operation_id.is_empty(),
             "assistant inbox operation id must not be empty"
@@ -150,8 +164,10 @@ impl Db {
             if let Some(existing) = conn
                 .query_row(
                     "SELECT * FROM assistant_inbox_items
-                       WHERE raising_session_id = ?1 AND operation_id = ?2",
-                    params![raising_session_id.to_string(), operation_id],
+                       WHERE raising_session_id = ?1
+                         AND operation_scope = ?2
+                         AND operation_id = ?3",
+                    params![raising_session_id.to_string(), operation_scope, operation_id],
                     AssistantInboxItem::from_row,
                 )
                 .optional()
@@ -159,7 +175,7 @@ impl Db {
             {
                 ensure!(
                     existing.summary == summary && existing.delivery == delivery,
-                    "assistant inbox operation id was reused with different arguments"
+                    "assistant inbox operation identity was reused with different arguments"
                 );
                 return Ok(existing);
             }
@@ -189,13 +205,14 @@ impl Db {
             conn.execute(
                 "INSERT INTO assistant_inbox_items(
                     inbox_item_id, assistant_name, main_session_id,
-                    raising_session_id, operation_id, summary, delivery, created_at_unix_ms
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    raising_session_id, operation_scope, operation_id, summary, delivery, created_at_unix_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     inbox_item_id.to_string(),
                     assistant_name,
                     main.session_id.to_string(),
                     raising_session_id.to_string(),
+                    operation_scope,
                     operation_id,
                     summary,
                     delivery.as_str(),
@@ -391,6 +408,7 @@ mod tests {
         let first = db
             .raise_assistant_inbox_item(
                 thread.session_id,
+                "turn-1".into(),
                 "call-1".into(),
                 "result".into(),
                 AssistantInboxDelivery::Immediate,
@@ -400,6 +418,7 @@ mod tests {
         let retry = db
             .raise_assistant_inbox_item(
                 thread.session_id,
+                "turn-1".into(),
                 "call-1".into(),
                 "result".into(),
                 AssistantInboxDelivery::Immediate,
@@ -410,6 +429,7 @@ mod tests {
         assert!(
             db.raise_assistant_inbox_item(
                 thread.session_id,
+                "turn-1".into(),
                 "call-1".into(),
                 "different".into(),
                 AssistantInboxDelivery::Immediate,
@@ -419,6 +439,35 @@ mod tests {
             .to_string()
             .contains("reused with different arguments")
         );
+    }
+
+    #[tokio::test]
+    async fn recycled_provider_operation_id_is_distinct_in_a_new_daemon_scope() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, thread) = assistant_with_thread(&db).await;
+        let first = db
+            .raise_assistant_inbox_item(
+                thread.session_id,
+                "turn-1".into(),
+                "provider-call-1".into(),
+                "first result".into(),
+                AssistantInboxDelivery::Immediate,
+            )
+            .await
+            .unwrap();
+        let later = db
+            .raise_assistant_inbox_item(
+                thread.session_id,
+                "turn-2".into(),
+                "provider-call-1".into(),
+                "later result".into(),
+                AssistantInboxDelivery::Defer,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(first.inbox_item_id, later.inbox_item_id);
+        assert_eq!(later.operation_scope, "turn-2");
     }
 
     #[tokio::test]
@@ -432,6 +481,7 @@ mod tests {
         ] {
             db.raise_assistant_inbox_item(
                 thread.session_id,
+                "turn-1".into(),
                 operation.into(),
                 operation.into(),
                 delivery,
@@ -487,6 +537,7 @@ mod tests {
         for index in 0..MAX_PENDING_INBOX_ITEMS_PER_ASSISTANT + 1 {
             db.raise_assistant_inbox_item(
                 thread.session_id,
+                "turn-notify".into(),
                 format!("notify-{index}"),
                 format!("notify {index}"),
                 AssistantInboxDelivery::Notify,
@@ -496,6 +547,7 @@ mod tests {
         }
         db.raise_assistant_inbox_item(
             thread.session_id,
+            "turn-after-notify".into(),
             "immediate-after-notify".into(),
             "still accepted".into(),
             AssistantInboxDelivery::Immediate,
@@ -511,6 +563,7 @@ mod tests {
         for index in 0..MAX_RAISES_PER_ASSISTANT_PER_HOUR {
             db.raise_assistant_inbox_item(
                 thread.session_id,
+                format!("turn-{index}"),
                 format!("call-{index}"),
                 format!("raise {index}"),
                 AssistantInboxDelivery::Notify,
@@ -535,6 +588,7 @@ mod tests {
         assert!(
             db.raise_assistant_inbox_item(
                 thread.session_id,
+                "turn-over-bound".into(),
                 "over-bound".into(),
                 "must fail".into(),
                 AssistantInboxDelivery::Notify,

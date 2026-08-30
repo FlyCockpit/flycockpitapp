@@ -10285,6 +10285,10 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         dream_read_scope: session.dream_read_scope(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
+        current_tool_call_scope: payload
+            .resume
+            .assistant_seq
+            .map(|seq| format!("parked-tool-start-{seq}")),
         tool_steering: agent.tool_steering,
         locks: locks.clone(),
         session: session.clone(),

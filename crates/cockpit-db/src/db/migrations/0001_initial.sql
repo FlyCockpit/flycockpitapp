@@ -51,6 +51,9 @@ CREATE TABLE assistant_inbox_items (
     assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE,
     main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    -- Daemon-owned inference/replay scope. Provider tool-call IDs are only
+    -- idempotency correlations, not globally unique operation identities.
+    operation_scope    TEXT NOT NULL CHECK (length(CAST(operation_scope AS BLOB)) BETWEEN 1 AND 128),
     operation_id       TEXT NOT NULL CHECK (length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 1024),
     summary            TEXT NOT NULL CHECK (length(CAST(summary AS BLOB)) BETWEEN 1 AND 4000),
     delivery           TEXT NOT NULL CHECK (delivery IN ('immediate', 'defer', 'notify')),
@@ -59,7 +62,7 @@ CREATE TABLE assistant_inbox_items (
     CHECK (main_session_id <> raising_session_id)
 );
 CREATE UNIQUE INDEX assistant_inbox_items_raise_operation_idx
-    ON assistant_inbox_items(raising_session_id, operation_id);
+    ON assistant_inbox_items(raising_session_id, operation_scope, operation_id);
 CREATE INDEX assistant_inbox_items_main_pending_idx
     ON assistant_inbox_items(main_session_id, delivered_at_unix_ms, created_at_unix_ms);
 CREATE INDEX assistant_inbox_items_assistant_rate_idx

@@ -641,6 +641,7 @@ local	assistant_inbox_items	delivery	non_relationship
 local	assistant_inbox_items	inbox_item_id	primary
 local	assistant_inbox_items	main_session_id	foreign
 local	assistant_inbox_items	operation_id	local_identity
+local	assistant_inbox_items	operation_scope	local_identity
 local	assistant_inbox_items	raising_session_id	foreign
 local	assistant_inbox_items	summary	non_relationship
 local	assistant_mutation_journals	action	non_relationship

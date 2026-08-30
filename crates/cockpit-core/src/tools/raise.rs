@@ -77,12 +77,17 @@ impl Tool for RaiseTool {
                 ));
             }
         };
+        let operation_scope = ctx
+            .current_tool_call_scope
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("`raise` requires a daemon-owned tool-call scope"))?;
         let operation_id = ctx
             .current_tool_call_id
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("`raise` requires a durable tool-call identity"))?;
+            .ok_or_else(|| anyhow::anyhow!("`raise` requires a tool-call correlation identity"))?;
         let durable_write = ctx.session.db.raise_assistant_inbox_item(
             ctx.session.id,
+            operation_scope,
             operation_id,
             summary,
             delivery,

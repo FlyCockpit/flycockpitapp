@@ -4333,6 +4333,7 @@ fn provider_for(
 ) -> Result<Option<Arc<dyn KbProvider>>> {
     match (entry.source.clone(), local) {
         (KnowledgeBaseSource::Local { .. }, Some(local)) => {
+            let has_assistant_snapshot_root = local.assistant_snapshot_root.is_some();
             let snapshot = local
                 .snapshot
                 .context("local knowledge provider has no retained source snapshot")?;
@@ -4353,7 +4354,7 @@ fn provider_for(
                 Some(snapshot),
                 sidecars,
                 None,
-                local.assistant_snapshot_root.is_some(),
+                has_assistant_snapshot_root,
             ))))
         }
         (KnowledgeBaseSource::Remote { .. }, None) => Ok(Some(Arc::new(RemoteKb { entry }))),

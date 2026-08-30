@@ -140,6 +140,37 @@ impl Db {
                 project_id.as_deref(),
                 exclude_session,
                 since,
+                None,
+                pool,
+                caller_trust,
+            )
+        })
+        .await
+    }
+
+    /// Search matching threads restricted to sessions that have at least one
+    /// event strictly after `after_session_event_seq`. Unlike wall-clock
+    /// activity timestamps, `session_events.seq` is a durable global ordering
+    /// fence, so this is suitable for a snapshot/commit freshness boundary.
+    pub async fn search_candidates_after_session_event_seq_for_trust(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        after_session_event_seq: i64,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                exclude_session,
+                None,
+                Some(after_session_event_seq),
                 pool,
                 caller_trust,
             )
@@ -311,6 +342,7 @@ fn search_candidates_inner(
     project_id: Option<&str>,
     exclude_session: Option<Uuid>,
     since: Option<i64>,
+    after_session_event_seq: Option<i64>,
     pool: u32,
     caller_trust: HistoryCallerTrust,
 ) -> Result<Vec<SearchHit>> {
@@ -355,7 +387,13 @@ fn search_candidates_inner(
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
-                AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                AND (?5 IS NULL OR EXISTS (
+                    SELECT 1
+                      FROM session_events AS later_event
+                     WHERE later_event.session_id = s.session_id
+                       AND later_event.seq > ?5
+                ))
+                AND (?6 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
@@ -368,6 +406,7 @@ fn search_candidates_inner(
                 project_id,
                 exclude,
                 since,
+                after_session_event_seq,
                 caller_trust.can_read_trusted()
             ],
             |row| {
@@ -964,6 +1003,65 @@ mod tests {
             turns
                 .iter()
                 .all(|turn| !turn.text.contains("trusted hidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_bounded_search_includes_only_sessions_with_later_events() {
+        let db = Db::open_in_memory().unwrap();
+        let before = db.create_session("p", "/before", "Build").await.unwrap();
+        let after = db.create_session("p", "/after", "Build").await.unwrap();
+        msg(
+            &db,
+            before.session_id,
+            SessionEventKind::UserMessage,
+            "quartz decision before dream",
+        )
+        .await;
+        let boundary = msg(
+            &db,
+            after.session_id,
+            SessionEventKind::UserMessage,
+            "quartz decision before dream",
+        )
+        .await;
+
+        let no_later_events = db
+            .search_candidates_after_session_event_seq_for_trust(
+                "quartz",
+                Some("p"),
+                None,
+                boundary,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert!(no_later_events.is_empty());
+
+        let later = msg(
+            &db,
+            after.session_id,
+            SessionEventKind::UserMessage,
+            "post-dream activity",
+        )
+        .await;
+        assert!(later > boundary);
+
+        let hits = db
+            .search_candidates_after_session_event_seq_for_trust(
+                "quartz",
+                Some("p"),
+                None,
+                boundary,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.session_id).collect::<Vec<_>>(),
+            vec![after.session_id]
         );
     }
 

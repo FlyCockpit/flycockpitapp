@@ -1621,13 +1621,13 @@ pub(crate) struct MemorySearchTool {
 
 /// Read-only retrieval surface used by the built-in `knowledge` specialist.
 ///
-/// KB results always flow through [`KbProvider`]. When dream has recorded a
-/// watermark for every attached KB, the same call searches the bounded set of
-/// sessions active after the oldest boundary. Before dream has recorded its
-/// first boundary, it conservatively searches matching project sessions and
-/// reports that no history can yet be proven dreamed. The DB search applies the
-/// caller's history-trust filter before results reach the normal redaction
-/// chokepoint.
+/// KB results always flow through [`KbProvider`]. When dream has recorded an
+/// ordering boundary for every attached KB, the same call searches the bounded
+/// set of sessions with an event after the oldest boundary. Before dream has
+/// recorded its first boundary, it conservatively searches matching project
+/// sessions and reports that no history can yet be proven dreamed. The DB
+/// search applies the caller's history-trust filter before results reach the
+/// normal redaction chokepoint.
 pub(crate) struct KnowledgeRetrieveTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
 }
@@ -1652,7 +1652,7 @@ impl Tool for KnowledgeRetrieveTool {
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search attached knowledge bases through their configured providers, then search sessions newer than the recorded dream watermark when every attached KB has one. Before the first watermark, conservatively search a bounded set of matching project sessions and say that no history can yet be proven dreamed. Returns concept-path and session references plus explicit freshness notes."
+            "Search attached knowledge bases through their configured providers, then search sessions with events after the recorded dream boundary when every attached KB has one. Before the first boundary, conservatively search a bounded set of matching project sessions and say that no history can yet be proven dreamed. Returns concept-path and session references plus explicit freshness notes."
                 .to_string(),
         )
     }
@@ -1713,9 +1713,9 @@ impl Tool for KnowledgeRetrieveTool {
 
 struct FreshSessionRetrieval {
     hits: Vec<crate::db::session_search::SearchHit>,
-    watermark_knowledge_bases: Vec<String>,
-    oldest_watermark_unix_ms: Option<i64>,
-    missing_watermark_knowledge_bases: Vec<String>,
+    boundary_knowledge_bases: Vec<String>,
+    oldest_boundary_session_event_seq: Option<i64>,
+    missing_boundary_knowledge_bases: Vec<String>,
 }
 
 async fn retrieve_undreamed_session_hits(
@@ -1730,42 +1730,42 @@ async fn retrieve_undreamed_session_hits(
         .authoritative_project_uuid(&ctx.session.project_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
-    let mut watermark_knowledge_bases = Vec::new();
-    let mut missing_watermark_knowledge_bases = Vec::new();
-    let mut oldest_watermark_unix_ms = None;
+    let mut boundary_knowledge_bases = Vec::new();
+    let mut missing_boundary_knowledge_bases = Vec::new();
+    let mut oldest_boundary_session_event_seq = None;
     for bundle in bundles {
         match ctx
             .session
             .db
-            .knowledge_dream_watermark(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
                 project_uuid,
                 knowledge_base_attachment_id: bundle.entry.attachment_id(),
             })
             .await?
         {
-            Some(watermark) => {
-                watermark_knowledge_bases.push(bundle.entry.id.clone());
-                oldest_watermark_unix_ms = Some(
-                    oldest_watermark_unix_ms
-                        .map(|oldest: i64| oldest.min(watermark.last_dreamed_at_unix_ms))
-                        .unwrap_or(watermark.last_dreamed_at_unix_ms),
+            Some(boundary) => {
+                boundary_knowledge_bases.push(bundle.entry.id.clone());
+                oldest_boundary_session_event_seq = Some(
+                    oldest_boundary_session_event_seq
+                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
+                        .unwrap_or(boundary.last_dreamed_session_event_seq),
                 );
             }
-            None => missing_watermark_knowledge_bases.push(bundle.entry.id.clone()),
+            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
         }
     }
 
-    // A missing watermark is not evidence that history has been dreamed. On
+    // A missing ordering boundary is not evidence that history has been dreamed. On
     // first use (and whenever any attached KB lacks a ledger row), search the
     // project's matching session history conservatively instead of silently
     // returning no fresh results. Once every attached KB has a boundary, the
-    // oldest one safely bounds the shared candidate set.
-    let (since, search_enabled) = if missing_watermark_knowledge_bases.is_empty() {
-        match oldest_watermark_unix_ms {
-            // `search_candidates_for_trust` is inclusive but dream's contract
-            // is strictly after the watermark. `checked_add` makes the
-            // representable upper boundary correctly yield no sessions.
-            Some(watermark) => (watermark.checked_add(1), watermark != i64::MAX),
+    // oldest exact event boundary safely bounds the shared candidate set.
+    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
+        match oldest_boundary_session_event_seq {
+            // The DB predicate is strictly greater than this durable global
+            // event sequence. A later commit receives a greater sequence even
+            // when it shares the dream snapshot's millisecond timestamp.
+            Some(boundary) => (Some(boundary), true),
             None => (None, false),
         }
     } else {
@@ -1773,28 +1773,44 @@ async fn retrieve_undreamed_session_hits(
     };
     let hits = if search_enabled {
         let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
-        ctx.session
-            .db
-            .search_candidates_for_trust(
-                query,
-                Some(ctx.session.project_id.as_str()),
-                None,
-                since,
-                pool,
-                crate::tools::session_search::caller_history_trust(ctx),
-            )
-            .await?
-            .into_iter()
-            .take(limit)
-            .collect()
+        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
+        let hits = match after_session_event_seq {
+            Some(boundary) => {
+                ctx.session
+                    .db
+                    .search_candidates_after_session_event_seq_for_trust(
+                        query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        boundary,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+            None => {
+                ctx.session
+                    .db
+                    .search_candidates_for_trust(
+                        query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        None,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+        };
+        hits.into_iter().take(limit).collect()
     } else {
         Vec::new()
     };
     Ok(FreshSessionRetrieval {
         hits,
-        watermark_knowledge_bases,
-        oldest_watermark_unix_ms,
-        missing_watermark_knowledge_bases,
+        boundary_knowledge_bases,
+        oldest_boundary_session_event_seq,
+        missing_boundary_knowledge_bases,
     })
 }
 
@@ -1821,20 +1837,20 @@ fn render_knowledge_retrieval(
         }
     }
 
-    if !freshness.missing_watermark_knowledge_bases.is_empty() {
+    if !freshness.missing_boundary_knowledge_bases.is_empty() {
         out.push_str(
-            "Fresh-session staleness check: no dream watermark is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
+            "Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
         );
         render_fresh_session_hits(&mut out, &freshness.hits);
     } else {
-        match freshness.oldest_watermark_unix_ms {
-            Some(watermark) => {
+        match freshness.oldest_boundary_session_event_seq {
+            Some(boundary) => {
                 out.push_str(
-                    "Fresh-session staleness check: searched this project's sessions active after ",
+                    "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence ",
                 );
-                out.push_str(&watermark.to_string());
+                out.push_str(&boundary.to_string());
                 out.push_str(" for KB(s) ");
-                out.push_str(&freshness.watermark_knowledge_bases.join(", "));
+                out.push_str(&freshness.boundary_knowledge_bases.join(", "));
                 out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
                 render_fresh_session_hits(&mut out, &freshness.hits);
             }
@@ -1843,9 +1859,9 @@ fn render_knowledge_retrieval(
             ),
         }
     }
-    if !freshness.missing_watermark_knowledge_bases.is_empty() {
-        out.push_str("KB(s) without a dream watermark: ");
-        out.push_str(&freshness.missing_watermark_knowledge_bases.join(", "));
+    if !freshness.missing_boundary_knowledge_bases.is_empty() {
+        out.push_str("KB(s) without a dream ordering boundary: ");
+        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
         out.push_str(".\n");
     }
     redact.scrub(&out)
@@ -2041,9 +2057,9 @@ mod tests {
                 snippet: "The rollout is waiting for approval.".to_string(),
                 bm25: -1.0,
             }],
-            watermark_knowledge_bases: vec!["project".to_string()],
-            oldest_watermark_unix_ms: Some(100),
-            missing_watermark_knowledge_bases: Vec::new(),
+            boundary_knowledge_bases: vec!["project".to_string()],
+            oldest_boundary_session_event_seq: Some(100),
+            missing_boundary_knowledge_bases: Vec::new(),
         };
 
         let rendered = render_knowledge_retrieval(&results, &freshness, &RedactionTable::empty());
@@ -2054,7 +2070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_retrieval_includes_the_current_session_before_the_first_watermark() {
+    async fn fresh_retrieval_includes_the_current_session_before_the_first_boundary() {
         let tmp = TempDir::new().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.session
@@ -2081,7 +2097,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            freshness.missing_watermark_knowledge_bases,
+            freshness.missing_boundary_knowledge_bases,
             vec!["project".to_string()]
         );
         assert!(
@@ -2093,7 +2109,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_kb_source_does_not_reuse_the_previous_dream_watermark() {
+    async fn fresh_retrieval_uses_the_event_sequence_boundary_not_a_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let entry = project_knowledge_registry_entry();
+        let bundles = vec![AttachedKnowledgeBase {
+            provider: Arc::new(RemoteKb {
+                entry: entry.clone(),
+            }),
+            entry,
+        }];
+        let first = ctx
+            .session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "windfall decision before dream" }),
+            )
+            .await
+            .unwrap();
+        let project_uuid = ctx
+            .session
+            .db
+            .authoritative_project_uuid(&ctx.session.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let boundary = ctx
+            .session
+            .db
+            .snapshot_knowledge_dream_boundary(project_uuid)
+            .await
+            .unwrap();
+        assert_eq!(boundary, first);
+        ctx.session
+            .db
+            .record_knowledge_dream_boundary(
+                crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                    project_uuid,
+                    knowledge_base_attachment_id: bundles[0].entry.attachment_id(),
+                },
+                boundary,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let before_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+        assert!(before_later_event.hits.is_empty());
+
+        let later = ctx
+            .session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "post-dream activity" }),
+            )
+            .await
+            .unwrap();
+        assert!(later > boundary);
+
+        let after_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+        assert!(
+            after_later_event
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == ctx.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_kb_source_does_not_reuse_the_previous_dream_boundary() {
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
         let original = project_knowledge_registry_entry();
@@ -2122,13 +2218,13 @@ mod tests {
         );
         session
             .db
-            .record_knowledge_dream_watermark(original_key, 100, 110)
+            .record_knowledge_dream_boundary(original_key, 100, 110)
             .await
             .unwrap();
         assert!(
             session
                 .db
-                .knowledge_dream_watermark(replacement_key)
+                .knowledge_dream_boundary(replacement_key)
                 .await
                 .unwrap()
                 .is_none()
@@ -2139,9 +2235,9 @@ mod tests {
     fn fresh_retrieval_reports_its_conservative_first_use_search() {
         let freshness = FreshSessionRetrieval {
             hits: Vec::new(),
-            watermark_knowledge_bases: Vec::new(),
-            oldest_watermark_unix_ms: None,
-            missing_watermark_knowledge_bases: vec!["project".to_string()],
+            boundary_knowledge_bases: Vec::new(),
+            oldest_boundary_session_event_seq: None,
+            missing_boundary_knowledge_bases: vec!["project".to_string()],
         };
 
         let rendered = render_knowledge_retrieval(&[], &freshness, &RedactionTable::empty());

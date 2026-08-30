@@ -534,13 +534,15 @@ async fn invoke_forwarded(
             let Some(approver) = ctx.approver.as_ref() else {
                 return Ok(mcp_tool_denial(entry.name(), tool, true));
             };
-            approver
-                .authorize(crate::approval::AuthorizationRequest::ForwardedMcpTool {
-                    display_name: entry.redacted_display_name(),
-                    tool,
-                    transport: entry.transport_kind(),
-                    identity: &entry.safe_display_identity(),
-                })
+            epoch
+                .await_approval(approver.authorize(
+                    crate::approval::AuthorizationRequest::ForwardedMcpTool {
+                        display_name: entry.redacted_display_name(),
+                        tool,
+                        transport: entry.transport_kind(),
+                        identity: &entry.safe_display_identity(),
+                    },
+                ))
                 .await?
         }
     };

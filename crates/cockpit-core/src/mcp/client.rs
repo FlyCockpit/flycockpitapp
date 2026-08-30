@@ -163,12 +163,14 @@ impl McpConnectContext {
             bail!("editor-forwarded MCP connection refused: no approval client is attached");
         };
         let identity = entry.safe_display_identity();
-        match approver
-            .authorize(AuthorizationRequest::ForwardedMcpServerConnect {
-                display_name: entry.redacted_display_name(),
-                transport: entry.transport_kind(),
-                identity: &identity,
-            })
+        match epoch
+            .await_approval(
+                approver.authorize(AuthorizationRequest::ForwardedMcpServerConnect {
+                    display_name: entry.redacted_display_name(),
+                    transport: entry.transport_kind(),
+                    identity: &identity,
+                }),
+            )
             .await?
         {
             Decision::Allow { scope } => {

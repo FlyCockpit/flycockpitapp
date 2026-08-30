@@ -130,21 +130,76 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
     let source_root = manifest.join("src");
     let mut files = Vec::new();
     collect_rust_files(&source_root, &mut files);
-    let declaration_paths = files
+    let production = files
         .iter()
-        .filter_map(|path| {
+        .map(|path| {
             let source = fs::read_to_string(path).expect("read Rust source");
-            // Test-only fixture code deliberately names forbidden sinks to
-            // assert the ratchet; it is not a production declaration path.
-            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
-            (production.contains("AcpForwardedMcpDeclarationV1")
-                || production.contains("AcpForwardedMcpIngressV1"))
-            .then_some((path, production.to_string()))
+            let source = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            (
+                path.strip_prefix(&source_root)
+                    .expect("path below source root"),
+                source,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // This is the complete production capability graph for editor-provided
+    // values.  A new helper, trait implementation, or renamed sink must first
+    // become a declared graph member; the test then subjects that member to
+    // the sink checks below instead of relying on a spelling next to ingress.
+    let allowed_capability_files = [
+        Path::new("approval/mod.rs"),
+        Path::new("approval/policy.rs"),
+        Path::new("daemon/acp_catalog_composition.rs"),
+        Path::new("daemon/session_worker/handle.rs"),
+        Path::new("mcp/catalog.rs"),
+        Path::new("mcp/client.rs"),
+        Path::new("mcp/forwarded.rs"),
+        Path::new("session/lifecycle.rs"),
+        Path::new("session/mod.rs"),
+    ];
+    let capability_markers = [
+        "AcpForwarded",
+        "ForwardedCatalogSlot",
+        "ForwardedMcpTool",
+        "ForwardedMcpServerConnect",
+        "SOURCE_ACP_FORWARDED",
+    ];
+    let capability_paths = production
+        .iter()
+        .filter_map(|(path, source)| {
+            capability_markers
+                .iter()
+                .any(|marker| source.contains(marker))
+                .then_some((*path, *source))
         })
         .collect::<Vec<_>>();
     assert!(
-        !declaration_paths.is_empty(),
-        "the repository-wide forwarded-declaration audit needs at least one producer"
+        !capability_paths.is_empty(),
+        "forwarded capability graph is empty"
+    );
+    for (path, _) in &capability_paths {
+        assert!(
+            allowed_capability_files.contains(path),
+            "unreviewed forwarded capability consumer {} could bypass the audited funnel",
+            path.display()
+        );
+    }
+
+    // Raw ingress is confined to conversion/validation and composition.  No
+    // persistence, credential, replay, cache, log, or durable-grant API may
+    // enter either endpoint of that graph.
+    let raw_declaration_paths = capability_paths
+        .iter()
+        .filter(|(_, source)| {
+            source.contains("AcpForwardedMcpDeclarationV1")
+                || source.contains("AcpForwardedMcpIngressV1")
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        !raw_declaration_paths.is_empty(),
+        "forwarded ingress has no audited producer"
     );
     for forbidden in [
         "McpConfig::write_private",
@@ -162,7 +217,7 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         "serde::Serialize",
         "derive(Serialize",
     ] {
-        for (path, source) in &declaration_paths {
+        for (path, source) in &raw_declaration_paths {
             assert!(
                 !source.contains(forbidden),
                 "{} lets ACP-forwarded declarations reach {forbidden}",
@@ -180,6 +235,13 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         .split("fn server_requires_secret_store")
         .next()
         .expect("forwarded connection boundary");
+    let forwarded_connect_approval = client
+        .split("async fn authorize_forwarded_connect(")
+        .nth(1)
+        .expect("forwarded connection approval function")
+        .split("/// Connect a validated ACP-forwarded entry")
+        .next()
+        .expect("forwarded connection approval boundary");
     for forbidden in [
         "CredentialStore",
         "SecretVault",
@@ -225,6 +287,40 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         );
     }
 
+    // The only code that can await a forwarded approval is the two audited
+    // funnels.  They must route it through the epoch cancellation gate, and
+    // neither may reach the durable MCP grant store by a helper call.
+    for (path, source, boundary) in [
+        (
+            Path::new("mcp/catalog.rs"),
+            forwarded_invoke,
+            "tool approval",
+        ),
+        (
+            Path::new("mcp/client.rs"),
+            forwarded_connect_approval,
+            "connect approval",
+        ),
+    ] {
+        assert!(
+            source.contains(".await_approval("),
+            "{} forwarded {boundary} bypasses epoch cancellation",
+            path.display()
+        );
+        for forbidden in [
+            "GrantStore",
+            "record_mcp_tool",
+            "record_mcp_server_connect",
+            "self.store",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} forwarded {boundary} reaches durable approval path {forbidden}",
+                path.display()
+            );
+        }
+    }
+
     let policy = fs::read_to_string(manifest.join("src/approval/policy.rs"))
         .expect("read approval policy source");
     let forwarded_approval = policy
@@ -247,8 +343,11 @@ fn forwarded_catalog_is_reachable_only_from_tool_context_session_and_monty_catal
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let session = fs::read_to_string(manifest.join("src/session/mod.rs")).expect("session source");
     let catalog = fs::read_to_string(manifest.join("src/mcp/catalog.rs")).expect("catalog source");
+    let mcp_module =
+        fs::read_to_string(manifest.join("src/mcp/mod.rs")).expect("MCP module source");
     let mcp_tool =
         fs::read_to_string(manifest.join("src/tools/mcp_tool.rs")).expect("MCP tool source");
+    assert!(mcp_module.contains("pub(crate) mod forwarded;"));
     assert!(session.contains("forwarded_mcp_catalog"));
     assert!(catalog.contains("ctx.session.forwarded_mcp_catalog()"));
     assert!(catalog.contains("invoke_forwarded"));

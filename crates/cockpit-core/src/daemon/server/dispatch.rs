@@ -5687,26 +5687,34 @@ async fn handle_serialized_request_impl(
                     remote_operation,
                 ))
                 .await;
-                if let Err(rollback_error) = rollback {
-                    return Err(internal(anyhow::anyhow!(
-                        "ACP catalog create composition failed ({}) and attachment rollback failed ({})",
-                        error.message,
-                        rollback_error.message,
-                    )));
-                }
                 // A create must not leave a durable runnable root behind when
                 // its catalog cannot be composed. Archiving revokes the root
                 // worker/catalog and makes the provisional root undiscoverable.
-                if let Err(rollback_error) =
-                    super::sessions::archive_session(ctx, base.attachment.root_id.0, true).await
-                {
-                    return Err(internal(anyhow::anyhow!(
+                // This compensation is deliberately attempted even if closing
+                // the attachment failed.  The root itself is the durable,
+                // runnable resource; leaving it behind is worse than losing
+                // the more-specific attachment rollback diagnostic.
+                let root_rollback =
+                    super::sessions::archive_session(ctx, base.attachment.root_id.0, true).await;
+                return match (rollback, root_rollback) {
+                    (Ok(_), Ok(_)) => Err(error),
+                    (Err(attachment_error), Ok(_)) => Err(internal(anyhow::anyhow!(
+                        "ACP catalog create composition failed ({}) and attachment rollback failed ({})",
+                        error.message,
+                        attachment_error.message,
+                    ))),
+                    (Ok(_), Err(root_error)) => Err(internal(anyhow::anyhow!(
                         "ACP catalog create composition failed ({}) and root rollback failed ({})",
                         error.message,
-                        rollback_error.message,
-                    )));
-                }
-                return Err(error);
+                        root_error.message,
+                    ))),
+                    (Err(attachment_error), Err(root_error)) => Err(internal(anyhow::anyhow!(
+                        "ACP catalog create composition failed ({}) and attachment rollback failed ({}) and root rollback failed ({})",
+                        error.message,
+                        attachment_error.message,
+                        root_error.message,
+                    ))),
+                };
             }
             Ok(Response::CodeRootWithAcpIngressCreated(
                 proto::CreateCodeRootWithAcpIngressV1Result { base },

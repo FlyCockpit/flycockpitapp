@@ -6,6 +6,7 @@
 //! disk cache, and durable approval grants.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -135,7 +136,7 @@ pub struct AcpForwardedMcpCatalogV1 {
     /// This is the converted representation, not the ingress bytes.  The
     /// latter retain non-canonical spellings (notably NFC names and URLs).
     /// Epoch sharing is defined over the semantic representation.
-    normalized_entries: BTreeMap<String, Arc<AcpForwardedMcpEntryV1>>,
+    normalized_entries: Vec<Arc<AcpForwardedMcpEntryV1>>,
     state: RwLock<EpochState>,
     cancellation: CancellationToken,
 }
@@ -220,10 +221,25 @@ impl AcpForwardedMcpCatalogV1 {
         declarations: &[AcpForwardedMcpDeclarationV1],
         persistent_names: impl IntoIterator<Item = String>,
     ) -> Result<bool> {
-        Ok(self.normalized_entries == validate_and_convert(declarations, persistent_names)?)
+        Ok(self.normalized_entries
+            == validate_and_convert(declarations, persistent_names)?.normalized)
     }
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+    /// Wait for a forwarded approval while the epoch remains live.  Final
+    /// release wins ties so a ready-but-stale approval cannot remain parked or
+    /// authorize a connection/invocation after revocation.
+    pub(crate) async fn await_approval<T>(
+        &self,
+        approval: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let cancellation = self.cancellation_token();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => bail!("acp_mcp_catalog_released"),
+            decision = approval => decision,
+        }
     }
     fn revoke(&self) {
         // One write lock is the final-release linearization point for every
@@ -318,8 +334,8 @@ impl AcpForwardedMcpRegistryV1 {
         let catalog = Arc::new(AcpForwardedMcpCatalogV1 {
             root_id,
             epoch: Uuid::new_v4(),
-            entries,
-            normalized_entries: entries.clone(),
+            entries: entries.by_name,
+            normalized_entries: entries.normalized,
             state: RwLock::new(EpochState::default()),
             cancellation: CancellationToken::new(),
         });
@@ -370,9 +386,10 @@ impl AcpForwardedMcpRegistryV1 {
 fn validate_and_convert(
     declarations: &[AcpForwardedMcpDeclarationV1],
     persistent_names: impl IntoIterator<Item = String>,
-) -> Result<BTreeMap<String, Arc<AcpForwardedMcpEntryV1>>> {
+) -> Result<ValidatedEntries> {
     let persistent_names: HashSet<String> = persistent_names.into_iter().collect();
-    let mut entries = BTreeMap::new();
+    let mut by_name = BTreeMap::new();
+    let mut normalized = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         declaration
             .validate()
@@ -381,7 +398,7 @@ fn validate_and_convert(
         if name == super::builtin::BUILTIN_SERVER_ID || persistent_names.contains(&name) {
             bail!("acp_mcp_catalog_name_collision");
         }
-        if entries.contains_key(&name) {
+        if by_name.contains_key(&name) {
             bail!("acp_mcp_duplicate_name");
         }
         let transport = match &declaration.transport {
@@ -415,12 +432,26 @@ fn validate_and_convert(
                 AcpForwardedTransportV1::Sse(validate_remote(url, headers)?)
             }
         };
-        entries.insert(
-            name.clone(),
-            Arc::new(AcpForwardedMcpEntryV1 { name, transport }),
-        );
+        let entry = Arc::new(AcpForwardedMcpEntryV1 {
+            name: name.clone(),
+            transport,
+        });
+        normalized.push(entry.clone());
+        by_name.insert(name, entry);
     }
-    Ok(entries)
+    Ok(ValidatedEntries {
+        by_name,
+        normalized,
+    })
+}
+
+/// The lookup map serves runtime name resolution; the vector is the exact
+/// normalized declaration ordering used for epoch identity.  Keeping both
+/// prevents a lookup optimization from silently changing the lifecycle
+/// contract.
+struct ValidatedEntries {
+    by_name: BTreeMap<String, Arc<AcpForwardedMcpEntryV1>>,
+    normalized: Vec<Arc<AcpForwardedMcpEntryV1>>,
 }
 
 fn validate_stdio_command(command: &str) -> Result<PathBuf> {
@@ -600,6 +631,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(shared.epoch(), epoch.epoch());
+    }
+
+    #[test]
+    fn reordered_normalized_declarations_conflict_with_the_active_epoch() {
+        let registry = AcpForwardedMcpRegistryV1::default();
+        let root = Uuid::new_v4();
+        let slot = Arc::new(ForwardedCatalogSlot::default());
+        let first = CodeRootAttachmentCapabilityV1::new_opaque("first").unwrap();
+        let second = CodeRootAttachmentCapabilityV1::new_opaque("second").unwrap();
+        let ordered = ingress(vec![
+            remote("docs", "https://example.com/docs"),
+            remote("search", "https://example.com/search"),
+        ]);
+        let reordered = ingress(vec![
+            remote("search", "https://example.com/search"),
+            remote("docs", "https://example.com/docs"),
+        ]);
+
+        let epoch = registry
+            .bind(root, &first, &ordered, Vec::new(), slot.clone())
+            .unwrap()
+            .unwrap();
+        let error = registry
+            .bind(root, &second, &reordered, Vec::new(), slot.clone())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("acp_mcp_catalog_conflict"));
+        assert_eq!(
+            slot.active().expect("original epoch remains live").epoch(),
+            epoch.epoch()
+        );
+        assert!(!epoch.is_released());
+    }
+
+    #[tokio::test]
+    async fn final_release_cancels_a_pending_forwarded_approval_wait() {
+        let registry = AcpForwardedMcpRegistryV1::default();
+        let root = Uuid::new_v4();
+        let slot = Arc::new(ForwardedCatalogSlot::default());
+        let attachment = CodeRootAttachmentCapabilityV1::new_opaque("attachment").unwrap();
+        let epoch = registry
+            .bind(
+                root,
+                &attachment,
+                &ingress(vec![remote("docs", "https://example.com/mcp")]),
+                Vec::new(),
+                slot,
+            )
+            .unwrap()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (_approval_tx, approval_rx) = tokio::sync::oneshot::channel::<()>();
+        let waiting_epoch = epoch.clone();
+        let wait = tokio::spawn(async move {
+            waiting_epoch
+                .await_approval(async move {
+                    started_tx.send(()).expect("approval waiter starts");
+                    approval_rx
+                        .await
+                        .map_err(|_| anyhow::anyhow!("approval answer channel closed"))
+                })
+                .await
+        });
+
+        started_rx
+            .await
+            .expect("wait is pending at approval barrier");
+        assert!(registry.release_attachment(root, &attachment));
+
+        let error = wait
+            .await
+            .expect("approval task completes after final release")
+            .unwrap_err();
+        assert!(error.to_string().contains("acp_mcp_catalog_released"));
     }
 
     #[test]

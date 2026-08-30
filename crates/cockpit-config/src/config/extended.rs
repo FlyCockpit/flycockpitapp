@@ -78,6 +78,11 @@ pub use tui::{
 /// retrieval is local today or hosted in a future deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnowledgeBaseRegistryEntry {
+    /// Immutable identity of this concrete workspace attachment. Generate a
+    /// new UUID when replacing an attachment, even if its user-facing `id`
+    /// remains the same. Durable dream state is scoped to this value.
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: uuid::Uuid,
     pub id: String,
     pub name: String,
     pub description: String,

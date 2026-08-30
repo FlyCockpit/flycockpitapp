@@ -56,6 +56,7 @@ fn knowledge_base_registry_round_trips_through_extended_config_doc() {
         &path,
         r#"{
           "knowledgeBases": [{
+            "attachmentId": "a87144f0-548d-4a70-b9cf-04452e334867",
             "id": "project",
             "name": "Project memory",
             "description": "Use for project retrieval; exclude personal notes.",
@@ -74,6 +75,10 @@ fn knowledge_base_registry_round_trips_through_extended_config_doc() {
     let config = doc.config();
     assert_eq!(config.knowledge_bases.len(), 1);
     let entry = &config.knowledge_bases[0];
+    assert_eq!(
+        entry.attachment_id,
+        uuid::Uuid::parse_str("a87144f0-548d-4a70-b9cf-04452e334867").unwrap()
+    );
     assert_eq!(entry.id, "project");
     assert_eq!(entry.dream_model.as_deref(), Some("openai:gpt-5"));
     assert_eq!(entry.dream_schedule.as_deref(), Some("0 2 * * *"));

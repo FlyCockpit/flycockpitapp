@@ -1366,6 +1366,7 @@ pub(crate) async fn attached_bundles(
     extended: &ExtendedConfig,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
     let mut seen = BTreeSet::new();
+    let mut seen_attachment_ids = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
     if let Some(assistant) = assistant_knowledge_registry_entry(session).await? {
@@ -1384,6 +1385,12 @@ pub(crate) async fn attached_bundles(
             bail!(
                 "knowledge base registry contains duplicate ID `{}`",
                 entry.id
+            );
+        }
+        if !seen_attachment_ids.insert(entry.attachment_id) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                entry.attachment_id
             );
         }
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
@@ -1465,6 +1472,7 @@ async fn assistant_knowledge_registry_entry(
     let cache_root = crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
     cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
     let entry = KnowledgeBaseRegistryEntry {
+        attachment_id: config.installation_id,
         id: format!("assistant-{}", config.installation_id),
         name: format!("Assistant: {name}"),
         description: format!("Knowledge installed with assistant `{name}`."),
@@ -1489,6 +1497,9 @@ async fn assistant_knowledge_registry_entry(
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
+    if entry.attachment_id.is_nil() {
+        bail!("knowledge base attachment IDs must not be nil");
+    }
     if entry.id.is_empty()
         || !entry
             .id
@@ -1703,6 +1714,12 @@ async fn retrieve_undreamed_session_hits(
     limit: usize,
     ctx: &ToolCtx,
 ) -> Result<FreshSessionRetrieval> {
+    let project_uuid = ctx
+        .session
+        .db
+        .authoritative_project_uuid(&ctx.session.project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
     let mut watermark_knowledge_bases = Vec::new();
     let mut missing_watermark_knowledge_bases = Vec::new();
     let mut oldest_watermark_unix_ms = None;
@@ -1710,7 +1727,10 @@ async fn retrieve_undreamed_session_hits(
         match ctx
             .session
             .db
-            .knowledge_dream_watermark(&bundle.entry.id)
+            .knowledge_dream_watermark(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                project_uuid,
+                knowledge_base_attachment_id: bundle.entry.attachment_id,
+            })
             .await?
         {
             Some(watermark) => {
@@ -2488,6 +2508,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         write_bundle(&knowledge_root);
         let session = test_session(tmp.path()).await;
         let available = KnowledgeBaseRegistryEntry {
+            attachment_id: uuid::Uuid::from_u128(0x10),
             id: "available".to_string(),
             name: "Available".to_string(),
             description: "Available local knowledge".to_string(),
@@ -2537,6 +2558,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         write_bundle(&knowledge_root);
         let session = test_session(tmp.path()).await;
         let available = KnowledgeBaseRegistryEntry {
+            attachment_id: uuid::Uuid::from_u128(0x20),
             id: "available".to_string(),
             name: "Available".to_string(),
             description: "Available local knowledge".to_string(),
@@ -2550,6 +2572,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             merge_policy: KnowledgeBaseMergePolicy::Auto,
         };
         let remote = KnowledgeBaseRegistryEntry {
+            attachment_id: uuid::Uuid::from_u128(0x21),
             id: "hosted".to_string(),
             name: "Hosted".to_string(),
             description: "Deferred hosted knowledge".to_string(),
@@ -2585,7 +2608,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         fs::write(
             tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"id":"available","name":"Available","description":"Available local knowledge","source":{"kind":"local","path":"available"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"},{"id":"hosted","name":"Hosted","description":"Deferred hosted knowledge","source":{"kind":"remote","url":"https://knowledge.example.test"},"embeddingOwnership":"remote-owned","trustRequired":false,"mergePolicy":"auto"}]}"#,
+            r#"{"knowledgeBases":[{"attachmentId":"00000000-0000-0000-0000-000000000010","id":"available","name":"Available","description":"Available local knowledge","source":{"kind":"local","path":"available"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"},{"attachmentId":"00000000-0000-0000-0000-000000000011","id":"hosted","name":"Hosted","description":"Deferred hosted knowledge","source":{"kind":"remote","url":"https://knowledge.example.test"},"embeddingOwnership":"remote-owned","trustRequired":false,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
         assert!(
@@ -2627,7 +2650,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         fs::write(
             tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+            r#"{"knowledgeBases":[{"attachmentId":"00000000-0000-0000-0000-000000000001","id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
@@ -2683,6 +2706,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
 
     fn project_knowledge_registry_entry() -> KnowledgeBaseRegistryEntry {
         KnowledgeBaseRegistryEntry {
+            attachment_id: uuid::Uuid::from_u128(1),
             id: "project".to_string(),
             name: "Project".to_string(),
             description: "Workspace project knowledge".to_string(),

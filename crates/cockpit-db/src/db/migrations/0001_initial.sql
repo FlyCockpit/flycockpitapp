@@ -3233,17 +3233,25 @@ CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
 
 -- ---- knowledge dream ledger -------------------------------------------------
--- Dream advances this per-KB watermark only after it has durably folded every
--- eligible session through the timestamp into that KB. Retrieval never writes
--- this table: it uses the watermark to bound its fresh-session fallback to
--- sessions that may not have been dreamed yet.
+-- Dream advances this per-concrete-KB-attachment watermark only after it has
+-- durably folded every session in that project through the timestamp into the
+-- attachment. Retrieval never writes this table: it uses the watermark to
+-- bound its fresh-session fallback to sessions that may not have been dreamed
+-- yet. `knowledge_base_attachment_id` is a config-owned UUID, deliberately
+-- distinct from the user-configured, workspace-local registry `id`.
 CREATE TABLE knowledge_dream_ledger (
-    knowledge_base_id TEXT PRIMARY KEY CHECK (
-        length(CAST(knowledge_base_id AS BLOB)) BETWEEN 1 AND 255
-        AND knowledge_base_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    project_uuid BLOB NOT NULL CHECK (
+        typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
+        AND project_uuid <> zeroblob(16)
+    ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,
+    knowledge_base_attachment_id BLOB NOT NULL CHECK (
+        typeof(knowledge_base_attachment_id) = 'blob'
+        AND length(knowledge_base_attachment_id) = 16
+        AND knowledge_base_attachment_id <> zeroblob(16)
     ),
     last_dreamed_at_unix_ms INTEGER NOT NULL,
-    updated_at_unix_ms INTEGER NOT NULL
+    updated_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_uuid, knowledge_base_attachment_id)
 );
 
 -- Event sync: `user_message` / `assistant_message` rows carry conversational

@@ -529,12 +529,24 @@ mod tests {
         let s = db.create_session("p", "/x", "a").await.unwrap();
 
         let first = db
-            .write_session_plan_doc(s.session_id, "one")
+            .write_session_plan_doc_if_revision(
+                s.session_id,
+                0,
+                "one",
+                crate::db::session_search::HistoryCallerTrust::Trusted,
+            )
             .await
+            .unwrap()
             .unwrap();
         let second = db
-            .write_session_plan_doc(s.session_id, "two")
+            .write_session_plan_doc_if_revision(
+                s.session_id,
+                1,
+                "two",
+                crate::db::session_search::HistoryCallerTrust::Trusted,
+            )
             .await
+            .unwrap()
             .unwrap();
         let loaded = db
             .get_session_plan_doc(s.session_id)
@@ -548,17 +560,47 @@ mod tests {
         assert_eq!(loaded.revision, 2);
 
         let stale = db
-            .write_session_plan_doc_if_revision(s.session_id, 1, "stale")
+            .write_session_plan_doc_if_revision(
+                s.session_id,
+                1,
+                "stale",
+                crate::db::session_search::HistoryCallerTrust::Trusted,
+            )
             .await
             .unwrap();
         assert!(stale.is_none());
         let current = db
-            .write_session_plan_doc_if_revision(s.session_id, 2, "three")
+            .write_session_plan_doc_if_revision(
+                s.session_id,
+                2,
+                "three",
+                crate::db::session_search::HistoryCallerTrust::Trusted,
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(current.content, "three");
         assert_eq!(current.revision, 3);
+        assert!(
+            db.get_session_plan_doc_for_trust(
+                s.session_id,
+                crate::db::session_search::HistoryCallerTrust::Untrusted,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.get_session_plan_doc_for_trust(
+                s.session_id,
+                crate::db::session_search::HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+            "three"
+        );
     }
 
     #[tokio::test]

@@ -3691,20 +3691,18 @@ pub fn goal_control(
     }
 }
 
-/// `Plan` — the user-facing read-only planning agent. It investigates the
+/// `Plan` — the user-facing planning agent. It investigates the
 /// project, keeps a session-scoped virtual plan document, and hands the final
-/// standalone plan to a fresh `Build` session when the user agrees. It holds no
-/// filesystem write or lock tools.
+/// standalone plan to a fresh `Build` session when the user agrees. Its sole
+/// intended mutation is the plan pseudofile through the generic `write` tool.
 pub fn plan(args: &SpawnArgs) -> Agent {
     let def = crate::agents::embedded_default("Plan").expect("Plan has an embedded definition");
     let base_tools = with_lsp_nav(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::write::WriteTool))
             .with(Arc::new(crate::tools::bash::BashTool::new())),
     ))
-    .with(Arc::new(crate::tools::plan_doc::PlanReadTool))
-    .with(Arc::new(crate::tools::plan_doc::PlanWriteTool))
-    .with(Arc::new(crate::tools::plan_doc::PlanEditTool))
     .with(Arc::new(crate::tools::plan_doc::StartBuildTool))
     .with(Arc::new(crate::tools::question::QuestionTool))
     .with(Arc::new(crate::tools::skill::SkillTool))

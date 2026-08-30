@@ -77,11 +77,21 @@ pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             "only `cockpit://session/<short_id>/plan` is writable",
         ));
     };
+    if session_id != ctx.session.id {
+        return Err(invalid_input(
+            "only the current session's plan pseudofile is writable",
+        ));
+    }
     if content.len() > 256 * 1024 {
         return Err(invalid_input("plan document exceeds 256 KiB"));
     }
 
-    let observed = ctx.session.db.get_session_plan_doc(session_id).await?;
+    let caller_trust = caller_history_trust(ctx);
+    let observed = ctx
+        .session
+        .db
+        .get_session_plan_doc_for_trust(session_id, caller_trust)
+        .await?;
     let expected_revision = parse_expected_revision(args)?;
     let current_revision = observed.as_ref().map(|doc| doc.revision).unwrap_or(0);
     if observed.is_some() && expected_revision.is_none() {
@@ -98,7 +108,7 @@ pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     let Some(doc) = ctx
         .session
         .db
-        .write_session_plan_doc_if_revision(session_id, expected_revision, content)
+        .write_session_plan_doc_if_revision(session_id, expected_revision, content, caller_trust)
         .await?
     else {
         return Err(invalid_input(
@@ -117,8 +127,9 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
     if !is_recall_path(requested) && !pattern.starts_with(PREFIX) {
         return Ok(None);
     }
-    let matcher = globset::Glob::new(pattern)
-        .map_err(|err| invalid_input(format!("invalid glob `{pattern}`: {err}")))?
+    let resolved_pattern = history_glob_pattern(pattern, path)?;
+    let matcher = globset::Glob::new(&resolved_pattern)
+        .map_err(|err| invalid_input(format!("invalid glob `{resolved_pattern}`: {err}")))?
         .compile_matcher();
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     for entry in history_entries(ctx).await? {
@@ -290,10 +301,10 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
         RecallPath::Plan(session_id) => Ok(Some(
             ctx.session
                 .db
-                .get_session_plan_doc(session_id)
+                .get_session_plan_doc_for_trust(session_id, caller_history_trust(ctx))
                 .await?
                 .map(|doc| format!("[revision={}]\n{}", doc.revision, doc.content))
-                .unwrap_or_default(),
+                .unwrap_or_else(|| "[revision=0]\n".to_string()),
         )),
         RecallPath::Artifact(session_id, artifact_id) => Ok(ctx
             .session
@@ -522,7 +533,15 @@ async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
             .short_id
             .unwrap_or_else(|| session.session_id.to_string());
         entries.push(format!("cockpit://session/{short}/transcript"));
-        entries.push(format!("cockpit://session/{short}/plan"));
+        if ctx
+            .session
+            .db
+            .get_session_plan_doc_for_trust(session.session_id, caller_history_trust(ctx))
+            .await?
+            .is_some()
+        {
+            entries.push(format!("cockpit://session/{short}/plan"));
+        }
         let compactions = ctx
             .session
             .db
@@ -544,6 +563,27 @@ async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
         }
     }
     Ok(entries)
+}
+
+/// `cockpit://history/` is a discovery pseudodirectory whose children are
+/// canonical `cockpit://session/...` pseudofiles. Rebase patterns expressed
+/// at that directory before matching the canonical names. This makes both
+/// `cockpit://history/**` and the standard scoped form (`path` + `pattern`)
+/// enumerate the same visible entries.
+fn history_glob_pattern(pattern: &str, path: Option<&str>) -> Result<String> {
+    const HISTORY: &str = "cockpit://history";
+    const SESSIONS: &str = "cockpit://session";
+
+    if let Some(suffix) = pattern.strip_prefix(HISTORY) {
+        return Ok(format!("{SESSIONS}{suffix}"));
+    }
+    match path.map(|value| value.trim_end_matches('/')) {
+        Some(HISTORY) => Ok(format!("{SESSIONS}/{pattern}")),
+        Some(other) if is_recall_path(other) => Err(invalid_input(
+            "`glob` supports `cockpit://history/` as its only recall directory",
+        )),
+        _ => Ok(pattern.to_string()),
+    }
 }
 
 async fn history_directory(ctx: &ToolCtx) -> Result<String> {
@@ -614,6 +654,7 @@ fn truncated_search_output(mut out: String) -> ToolOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn oversized_line_continuation_advances_within_the_line() {
@@ -657,5 +698,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.content.model_text(), "2|two\n");
+    }
+
+    #[test]
+    fn history_globs_rebase_to_canonical_session_entries() {
+        assert_eq!(
+            history_glob_pattern("cockpit://history/**", None).unwrap(),
+            "cockpit://session/**"
+        );
+        assert_eq!(
+            history_glob_pattern("*", Some("cockpit://history/")).unwrap(),
+            "cockpit://session/*"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_pseudofile_uses_read_write_revision_contract() {
+        let tmp = TempDir::new().unwrap();
+        let (ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let path = format!("cockpit://session/{}/plan", ctx.session.short_id());
+
+        let wrote = write(&json!({ "path": path.clone(), "content": "# Plan" }), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(wrote.content.model_text().contains("revision 1"));
+
+        let read = self::read(&json!({ "path": path.clone() }), &ctx)
+            .await
+            .unwrap();
+        assert!(read.content.model_text().contains("[revision=1]\n# Plan"));
+
+        let error = write(&json!({ "path": path, "content": "# Revised" }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected_revision"));
     }
 }

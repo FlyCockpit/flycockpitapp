@@ -1,8 +1,9 @@
 //! Ephemeral-fork loop execution (`keep_in_context = false`, GOALS §22).
 //!
 //! The whole loop runs inside one spawned task. Each iteration is a turn
-//! loop on an **ephemeral fork** branched from the main context as of loop
-//! registration:
+//! loop on an **ephemeral fork** branched from the live main context at its
+//! execution boundary. A compaction/successor handoff therefore changes the
+//! parent for a not-yet-run wake without recreating the timer:
 //!
 //! - `independent = false` (default): iterations accumulate in the fork's
 //!   own history (iteration 3 sees 1–2).
@@ -25,7 +26,7 @@ use tokio::time::Instant;
 
 use crate::engine::agent::{Agent, TurnEvent, TurnOutcome, turn};
 use crate::engine::message::{Message, extract_text};
-use crate::engine::schedule::authority::{ScheduleContext, ScheduleEvent};
+use crate::engine::schedule::authority::{LiveScheduleContext, ScheduleContext, ScheduleEvent};
 use crate::engine::schedule::spec::{LoopStartArgs, ScheduleKind};
 use crate::engine::tool::ToolBox;
 use crate::intel::budget::BudgetedWriter;
@@ -42,7 +43,10 @@ pub struct LoopRunCtx {
     pub job_id: String,
     pub label: String,
     pub args: LoopStartArgs,
-    pub ctx: ScheduleContext,
+    /// The authority's live context. It is deliberately shared rather than
+    /// cloned at task spawn so a successor handoff reaches a timer that is
+    /// already waiting for its next wake.
+    pub ctx: LiveScheduleContext,
     /// Engine event channel — UI-only signals (notes, progress).
     pub turn_tx: mpsc::Sender<TurnEvent>,
     /// Authority→driver channel — the terminal completion.
@@ -76,59 +80,28 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         active_idle_wake,
     } = run;
 
-    // Branch a fork from main as of registration (tail snapshot). The fork
-    // shares the parent's project/agent/model/provider config.
-    let fork_session = match crate::session::Session::create_fork(
-        ctx.session.db.clone(),
-        ctx.session.id,
-        None,
-        ctx.session.redaction_key_resolver().clone(),
-        ctx.session.secret_vault().clone(),
-    ) {
-        Ok(s) => {
-            s.set_external_journal(ctx.session.external_journal());
-            s.set_message_media_authority(ctx.session.message_media_authority());
-            // Inherit the parent's command-secret cache so the scheduled loop
-            // fork's store funnel injects resolved command outputs.
-            s.set_command_secret_cache(ctx.session.command_secret_cache());
-            // Inherit the parent's descendant containment handle so the scheduled
-            // loop fork's lifecycle hooks run under a proven lease instead of
-            // failing open as unsupported.
-            s.set_process_containment(ctx.session.process_containment());
-            Arc::new(s)
-        }
-        Err(e) => {
-            let _ = event_tx
-                .send(ScheduleEvent::Completed {
-                    job_id,
-                    label,
-                    kind: args.kind(),
-                    result: format!("loop fork failed: {e:#}"),
-                    failed: true,
-                    requests: Vec::new(),
-                })
-                .await;
-            return;
-        }
-    };
-
     // Ordinary forked loops retain their state until terminal promotion. Idle
     // loops instead get a fresh state and toolbox for every wake, so their
     // action accounting is local to that one wake.
     let persistent_state = (!args.idle).then(|| Arc::new(ForkScheduleState::new(job_id.clone())));
-    let persistent_agent = persistent_state.as_ref().map(|state| {
-        Arc::new(build_fork_agent(
-            &ctx.agent,
-            state.clone(),
-            turn_tx.clone(),
-            false,
-        ))
-    });
-
     let limit = args.limit.unwrap_or(u64::MAX);
     let mut delay = args.interval_secs;
-    let mut watch_digest =
-        (!args.watch_paths.is_empty()).then(|| local_change_digest(&ctx.cwd, &args.watch_paths));
+    let mut migration_rx = ctx.subscribe_migrations();
+    let initial_generation = *migration_rx.borrow();
+    let initial_ctx = ctx.snapshot();
+    let mut watch_digest = (!args.watch_paths.is_empty()).then(|| {
+        (
+            initial_generation,
+            local_change_digest(&initial_ctx.cwd, &args.watch_paths),
+        )
+    });
+    // A fork persists across wakes exactly as before, but a handoff replaces
+    // it so no later wake remains rooted in the retired context.
+    let mut fork_session: Option<(u64, Arc<crate::session::Session>)> = None;
+    // A handoff while a fork is executing re-runs the already-due wake against
+    // the successor. It does not sleep again, so a bounded idle timer retains
+    // its activity-derived deadline rather than gaining a fresh one.
+    let mut wake_ready = false;
 
     // Accumulated history for `independent = false`. Reset each iteration
     // for `independent = true`.
@@ -148,39 +121,59 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     });
 
     while iteration < limit {
-        // Wait the interval before each iteration (a timer with limit=1
-        // therefore fires after one interval — matching "one-shot delayed
-        // prompt").
-        match wait_for_next_wake(delay, args.interval_secs, idle_activity_rx.as_mut()).await {
-            WakeWait::Elapsed { activity_seen } => {
-                // Activity restarts both this countdown and any backoff. The
-                // next wake therefore fires after the configured interval from
-                // the last accepted user message, never an old deadline.
-                if activity_seen {
-                    delay = args.interval_secs;
+        if !wake_ready {
+            // Wait the interval before each iteration (a timer with limit=1
+            // therefore fires after one interval — matching "one-shot delayed
+            // prompt").
+            match wait_for_next_wake(delay, args.interval_secs, idle_activity_rx.as_mut()).await {
+                WakeWait::Elapsed { activity_seen } => {
+                    // Activity restarts both this countdown and any backoff. The
+                    // next wake therefore fires after the configured interval from
+                    // the last accepted user message, never an old deadline.
+                    if activity_seen {
+                        delay = args.interval_secs;
+                    }
+                }
+                WakeWait::ActivityChannelClosed => {
+                    // An idle timer without its authority must never degrade into
+                    // an immediate loop. It cannot observe a future reset, so end
+                    // visibly and let the driver's normal failed-completion path
+                    // reconcile the bounded registry entry.
+                    last_result = "idle activity authority closed".to_string();
+                    errored = true;
+                    break;
                 }
             }
-            WakeWait::ActivityChannelClosed => {
-                // An idle timer without its authority must never degrade into
-                // an immediate loop. It cannot observe a future reset, so end
-                // visibly and let the driver's normal failed-completion path
-                // reconcile the bounded registry entry.
-                last_result = "idle activity authority closed".to_string();
-                errored = true;
-                break;
-            }
         }
+        wake_ready = false;
 
         if cancelled {
             break;
         }
 
+        // A timer may have spent its whole countdown while the foreground
+        // thread compacted or moved to a successor. Snapshot only after the
+        // wait so this iteration cannot fork from the retired context.
+        // Mark all migrations observed before this execution boundary as
+        // incorporated, then snapshot. A replacement racing the snapshot is
+        // still observed by the select around `run_iteration` below.
+        let live_generation = *migration_rx.borrow_and_update();
+        let live_ctx = ctx.snapshot();
+
         if args.independent {
             fork_history.clear();
         }
 
-        if let Some(previous_digest) = watch_digest.as_mut() {
-            let current_digest = local_change_digest(&ctx.cwd, &args.watch_paths);
+        if let Some((watch_generation, previous_digest)) = watch_digest.as_mut() {
+            let current_digest = local_change_digest(&live_ctx.cwd, &args.watch_paths);
+            if *watch_generation != live_generation {
+                // A successor has its own working context. Establish its watch
+                // baseline without treating predecessor metadata as a change.
+                *watch_generation = live_generation;
+                *previous_digest = current_digest;
+                delay = args.interval_secs;
+                continue;
+            }
             if current_digest == *previous_digest {
                 iteration += 1;
                 if args.backoff {
@@ -192,6 +185,36 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             delay = args.interval_secs;
         }
 
+        let source_changed = fork_session
+            .as_ref()
+            .map_or(true, |(source_generation, _)| {
+                *source_generation != live_generation
+            });
+        if source_changed {
+            if fork_session.is_some() {
+                // The old fork was rooted in the retired thread. Its local
+                // transcript must not be carried into the successor context.
+                fork_history.clear();
+            }
+            let session = match fork_from_live_context(&live_ctx) {
+                Ok(session) => session,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(ScheduleEvent::Completed {
+                            job_id,
+                            label,
+                            kind: args.kind(),
+                            result: format!("loop fork failed: {e:#}"),
+                            failed: true,
+                            requests: Vec::new(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            fork_session = Some((live_generation, session));
+        }
+
         let state = persistent_state
             .clone()
             .unwrap_or_else(|| Arc::new(ForkScheduleState::new(job_id.clone())));
@@ -200,25 +223,52 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 return;
             }
         }
-        let fork_agent = persistent_agent.clone().unwrap_or_else(|| {
-            Arc::new(build_fork_agent(
-                &ctx.agent,
-                state.clone(),
-                turn_tx.clone(),
-                true,
-            ))
-        });
+        let fork_agent = Arc::new(build_fork_agent(
+            &live_ctx.agent,
+            state.clone(),
+            turn_tx.clone(),
+            args.idle,
+        ));
 
-        match run_iteration(
-            &fork_agent,
-            &mut fork_history,
-            wake_prompt.as_deref().unwrap_or(&args.prompt),
-            fork_session.clone(),
-            &ctx,
-            &turn_tx,
-        )
-        .await
-        {
+        let iteration_result = tokio::select! {
+            biased;
+            changed = migration_rx.changed() => Err(changed.is_ok()),
+            result = run_iteration(
+                &fork_agent,
+                &mut fork_history,
+                wake_prompt.as_deref().unwrap_or(&args.prompt),
+                fork_session
+                    .as_ref()
+                    .expect("a fork is created before every iteration")
+                    .1
+                    .clone(),
+                &live_ctx,
+                &turn_tx,
+            ) => Ok(result),
+        };
+        let iteration_result = match iteration_result {
+            Ok(result) => result,
+            Err(true) => {
+                // Discard predecessor-only deferred output before rerunning
+                // this wake in the successor context. Effects that already
+                // crossed their native boundary cannot be undone, but no
+                // predecessor fork result may be published after migration.
+                let _ = state.take_notes();
+                let _ = state.take_requests();
+                let _ = state.take_actions();
+                fork_session = None;
+                fork_history.clear();
+                wake_ready = true;
+                continue;
+            }
+            Err(false) => {
+                last_result = "live schedule context authority closed".to_string();
+                errored = true;
+                break;
+            }
+        };
+
+        match iteration_result {
             Ok(text) => last_result = text,
             Err(e) => {
                 last_result = format!("loop iteration error: {e:#}");
@@ -352,6 +402,25 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             requests,
         })
         .await;
+}
+
+fn fork_from_live_context(ctx: &ScheduleContext) -> anyhow::Result<Arc<crate::session::Session>> {
+    let session = crate::session::Session::create_fork(
+        ctx.session.db.clone(),
+        ctx.session.id,
+        None,
+        ctx.session.redaction_key_resolver().clone(),
+        ctx.session.secret_vault().clone(),
+    )?;
+    session.set_external_journal(ctx.session.external_journal());
+    session.set_message_media_authority(ctx.session.message_media_authority());
+    // Inherit the parent's command-secret cache so the scheduled loop fork's
+    // store funnel injects resolved command outputs.
+    session.set_command_secret_cache(ctx.session.command_secret_cache());
+    // Inherit the parent's descendant containment handle so the scheduled loop
+    // fork's lifecycle hooks run under a proven lease instead of failing open.
+    session.set_process_containment(ctx.session.process_containment());
+    Ok(Arc::new(session))
 }
 
 fn wake_has_durable_dispatch(state: &ForkScheduleState) -> bool {

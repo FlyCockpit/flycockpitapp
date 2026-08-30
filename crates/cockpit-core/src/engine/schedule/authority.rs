@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -271,6 +271,61 @@ impl ScheduleContext {
     }
 }
 
+/// The mutable owner context for scheduled work.  The authority keeps one
+/// handle for its whole lifetime, so a thread handoff can replace the complete
+/// context without recreating the registry, idle activity epoch, or workers.
+///
+/// Spawned runners deliberately hold this handle rather than a context clone:
+/// they snapshot it at their next execution boundary, ensuring a timer that
+/// survived compaction forks from the successor rather than its predecessor.
+#[derive(Clone)]
+pub struct LiveScheduleContext {
+    ctx: Arc<RwLock<ScheduleContext>>,
+    /// Only successor/compaction replacement publishes here. Ordinary context
+    /// refreshes are adopted at the next wake; a live handoff must also stop a
+    /// currently executing predecessor fork before it can publish.
+    migration_tx: watch::Sender<u64>,
+}
+
+impl LiveScheduleContext {
+    fn new(ctx: ScheduleContext) -> Self {
+        let (migration_tx, _) = watch::channel(0);
+        Self {
+            ctx: Arc::new(RwLock::new(ctx)),
+            migration_tx,
+        }
+    }
+
+    pub fn snapshot(&self) -> ScheduleContext {
+        self.ctx
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace(&self, ctx: ScheduleContext) {
+        *self
+            .ctx
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ctx;
+        self.migration_tx
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ScheduleContext)) {
+        update(
+            &mut *self
+                .ctx
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    pub fn subscribe_migrations(&self) -> watch::Receiver<u64> {
+        self.migration_tx.subscribe()
+    }
+}
+
 /// The worker kind scheduled through the recursive `Swarm` authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnWorkerKind {
@@ -397,7 +452,7 @@ pub struct ScheduleAuthority {
     turn_tx: mpsc::Sender<TurnEvent>,
     /// Shared per-session context for spawning ephemeral-fork loops +
     /// background jobs.
-    ctx: ScheduleContext,
+    ctx: LiveScheduleContext,
     /// Global cap on simultaneously-running recursive `Swarm` subagents
     /// across the whole tree (GOALS §24, `swarm.max_concurrency`). `0` =
     /// unlimited. This is a **separate** budget from [`Self::max_concurrent`]
@@ -424,13 +479,14 @@ impl ScheduleAuthority {
         &mut self,
         compiler: crate::computer::guidance::service::GuidanceCompiler,
     ) {
-        self.ctx.guidance_compiler = Some(compiler);
+        self.ctx
+            .update(|ctx| ctx.guidance_compiler = Some(compiler));
     }
 
     /// Install the durable write-scope cell into the context this authority
     /// hands to every spawned job.
     pub fn set_write_scope_source(&mut self, write_scope: crate::write_scope::WriteScopeSource) {
-        self.ctx.write_scope = Some(write_scope);
+        self.ctx.update(|ctx| ctx.write_scope = Some(write_scope));
     }
 
     /// Rebind scheduled work to the context that remains live after a thread
@@ -438,12 +494,11 @@ impl ScheduleAuthority {
     /// in this authority: replacing either would duplicate live timers or lose
     /// an idle wake's accepted-user anchor.
     ///
-    /// Today's compaction resets the session in place, but keeping this as an
-    /// explicit boundary also gives a successor-session handoff one place to
-    /// retarget work created after the handoff without recreating the live
-    /// schedule state.
-    pub(crate) fn migrate_to_live_context(&mut self, session: Arc<Session>) {
-        self.ctx.session = session;
+    /// The replacement is the entire context, not merely the session: a
+    /// successor owns its locks, redaction table, cwd, configuration, agent,
+    /// and scope authorities as one coherent execution boundary.
+    pub(crate) fn migrate_to_live_context(&mut self, ctx: ScheduleContext) {
+        self.ctx.replace(ctx);
     }
 
     /// Bind the daemon-ingress activity epoch. The worker handle publishes to
@@ -471,7 +526,7 @@ impl ScheduleAuthority {
             event_tx,
             cmd_tx,
             turn_tx,
-            ctx,
+            ctx: LiveScheduleContext::new(ctx),
             swarm_max_concurrency: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
@@ -499,12 +554,11 @@ impl ScheduleAuthority {
         self.running_swarm
     }
 
-    /// Refresh the redaction table cloned into newly spawned scheduled work.
-    /// Existing in-flight tasks keep the table they started with; every
-    /// schedule/loop/background task started after this boundary inherits the
-    /// new one.
+    /// Refresh the redaction table used by newly spawned scheduled work and by
+    /// the next wake of every live loop. An iteration already executing keeps
+    /// its snapshot until it completes or a successor migration aborts it.
     pub fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
-        self.ctx.redact = table;
+        self.ctx.update(|ctx| ctx.redact = table);
     }
 
     /// Refresh the session config reader handed to async-job turns. In-flight
@@ -516,18 +570,19 @@ impl ScheduleAuthority {
         &mut self,
         config: crate::daemon::session_worker::SessionConfigHandle,
     ) {
-        self.ctx.config = config;
+        self.ctx.update(|ctx| ctx.config = config);
     }
 
     pub fn set_local_installations(
         &mut self,
         local_installations: crate::agents::LocalInstallationResolver,
     ) {
-        self.ctx.local_installations = local_installations;
+        self.ctx
+            .update(|ctx| ctx.local_installations = local_installations);
     }
 
     pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
-        self.ctx.redact.clone()
+        self.ctx.snapshot().redact
     }
 
     /// Number of recursive `Swarm` spawns waiting on a free slot.
@@ -589,7 +644,7 @@ impl ScheduleAuthority {
             job_id: job_id.clone(),
             label: label.clone(),
             spec,
-            ctx: self.ctx.clone(),
+            ctx: self.ctx.snapshot(),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
@@ -832,7 +887,7 @@ impl ScheduleAuthority {
             command: args.command.clone(),
             cwd,
             launch,
-            redact: self.ctx.redact.clone(),
+            redact: self.ctx.snapshot().redact,
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
         });
@@ -1092,7 +1147,7 @@ impl ScheduleAuthority {
     /// Emit the UI-only `started` signal.
     fn emit_started(&self, job_id: &str, label: &str, kind: ScheduleKind) {
         let _ = self.turn_tx.try_send(TurnEvent::ScheduleStarted {
-            session_id: self.ctx.session.id,
+            session_id: self.ctx.snapshot().session.id,
             job_id: job_id.to_string(),
             label: label.to_string(),
             kind: kind.as_str().to_string(),
@@ -1115,15 +1170,15 @@ impl ScheduleAuthority {
 
     /// Rebind the fork context's agent after a primary swap (`/plan` ↔
     /// `/build`, `plan.md §4.6.d`) so future ephemeral-fork loop iterations
-    /// run on the new primary's model/tool surface. Existing live jobs keep
-    /// the agent they were spawned with.
+    /// run on the new primary's model/tool surface. A live runner snapshots
+    /// this handle at each wake, so its next iteration adopts the new agent.
     pub fn set_agent(&mut self, agent: Arc<Agent>) {
-        self.ctx.agent = agent;
+        self.ctx.update(|ctx| ctx.agent = agent);
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_name_for_tests(&self) -> &str {
-        &self.ctx.agent.name
+    pub(crate) fn agent_name_for_tests(&self) -> String {
+        self.ctx.snapshot().agent.name.clone()
     }
 }
 
@@ -1381,7 +1436,7 @@ mod tests {
         }))
         .unwrap();
         let job_id = auth.start_loop_in_context(args);
-        let db = auth.ctx.session.db.clone();
+        let db = auth.ctx.snapshot().session.db.clone();
         let successor = Arc::new(
             crate::session::Session::create_for_test(
                 db,
@@ -1392,8 +1447,10 @@ mod tests {
             .unwrap(),
         );
 
-        auth.migrate_to_live_context(successor.clone());
-        assert_eq!(auth.ctx.session.id, successor.id);
+        let mut successor_context = auth.ctx.snapshot();
+        successor_context.session = successor.clone();
+        auth.migrate_to_live_context(successor_context);
+        assert_eq!(auth.ctx.snapshot().session.id, successor.id);
         assert_eq!(
             auth.snapshot().len(),
             1,
@@ -1414,6 +1471,55 @@ mod tests {
             }
         ));
         assert!(auth.snapshot().is_empty(), "the bound remains one firing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn migrated_idle_timer_forks_from_the_successor_once() {
+        let (mut auth, _events, _ui, tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 5, "prompt": "check", "limit": 1, "idle": true
+        }))
+        .unwrap();
+        let job_id = auth.start_loop_in_context(args);
+        let predecessor = auth.ctx.snapshot().session;
+        let successor = Arc::new(
+            crate::session::Session::create_for_test(
+                predecessor.db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+
+        let mut successor_context = auth.ctx.snapshot();
+        successor_context.session = successor.clone();
+        auth.migrate_to_live_context(successor_context);
+        assert_eq!(auth.snapshot().len(), 1, "migration retains one timer");
+        assert_eq!(auth.snapshot()[0].job_id, job_id);
+        assert_eq!(auth.snapshot()[0].limit, Some(1));
+
+        // Let the task reach its wait before advancing the paused clock, then
+        // prove the wake created its fork from the successor, not the context
+        // cloned when this timer was registered.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            predecessor
+                .db
+                .list_forks(predecessor.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the predecessor must not gain a post-migration timer fork"
+        );
+        assert_eq!(
+            successor.db.list_forks(successor.id).await.unwrap().len(),
+            1,
+            "the bounded idle timer fires exactly once in the successor context"
+        );
     }
 
     /// `loop.cancel` ends a live in-context loop early and emits a

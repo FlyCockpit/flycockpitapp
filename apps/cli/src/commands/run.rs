@@ -1,16 +1,8 @@
 //! `cockpit run` — one-shot non-interactive prompt through the daemon.
 //!
-//! Lifecycle (GOALS §8b + the user's refinement on the `--ephemeral`
-//! flag):
-//!
-//! - **Default:** attach to a long-running daemon if one is up;
-//!   otherwise spawn an ephemeral daemon that exits when the run
-//!   completes.
-//! - **`--ephemeral`:** prefer a reference-counted daemon that exits after
-//!   the final client detaches; an existing owner is always reused.
-//!   completes, unless a persistent daemon already holds the exclusive
-//!   ledger lock — then this run attaches to that owner and leaves it
-//!   running.
+//! Lifecycle: attach to a shareable daemon when one is already up; otherwise
+//! this one-shot command owns a private in-process ephemeral daemon for the
+//! duration of the run.
 //!
 //! Behavior:
 //!
@@ -20,11 +12,8 @@
 //! 4. Send the prompt and pump events until `TurnComplete`.
 //! 5. In `default` format we stream assistant text to stdout; in
 //!    `json` format we emit one envelope per line.
-//! 6. If we own the daemon (ephemeral path), shut it down. An
-//!    The owned-session RAII fallback (Layer A) guarantees this fires on every
-//!    exit — happy path, early `?` error, panic/unwind, or
-//!    SIGINT/SIGTERM — never on a run that attached to a pre-existing
-//!    persistent daemon.
+//! 6. If the operation booted an in-process owner, its guard shuts it down on
+//!    every exit; a run attached to an existing daemon leaves that owner up.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,7 +24,7 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
+use crate::daemon::client::{OwnedDaemonRunError, ScopedDaemonClient};
 use crate::daemon::proto::{self, Request, Response, send_user_message_v2::MessageIngressV2};
 
 #[derive(Debug, thiserror::Error)]
@@ -251,9 +240,6 @@ pub(crate) struct RunPumpOptions<'a> {
 pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) -> Result<()> {
     let format = args.output_format();
     let json_mode = matches!(format, OutputFormat::Json);
-    if let Err(error) = validate_ephemeral_continuation(&args) {
-        exit_run_error(format, 2, "invalid_arguments", &error.to_string());
-    }
     let cwd = match resolve_run_cwd(args.cwd.as_deref(), project_alias) {
         Ok(cwd) => cwd,
         Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
@@ -266,14 +252,9 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         exit_run_error(format, 2, "empty_prompt", &error.to_string());
     }
 
-    let mode = if args.ephemeral {
-        OwnedSessionMode::AttachOrEphemeral
-    } else {
-        OwnedSessionMode::AttachOrEphemeral
-    };
     let seed_unset_trust = args.cwd.is_none() && project_alias.is_none();
 
-    let result = crate::daemon::client::run_owned_daemon(mode, |client| {
+    let result = crate::daemon::client::run_one_shot_daemon(|client| {
         Box::pin(async move {
             // Preflight via daemon RPCs — the CLI never opens SQLite.
             emit_org_logging_indicator_via_daemon(&client, &cwd).await;
@@ -441,7 +422,7 @@ async fn run_turn(
 /// completion, returning the run exit code. Shared by `cockpit run` and
 /// `cockpit init` so both drive the identical non-interactive turn over
 /// the daemon. The caller owns the daemon lifecycle (probe/spawn +
-/// ephemeral guard).
+/// one-shot owner guard).
 pub(crate) async fn attach_send_pump(
     client: &ScopedDaemonClient<'_>,
     prompt: String,
@@ -914,15 +895,6 @@ fn build_prompt_from_reader(args: &RunArgs, root: &Path, stdin: &mut impl Read) 
 fn validate_prompt(prompt: &str) -> Result<()> {
     if prompt.trim().is_empty() {
         anyhow::bail!("no prompt: pass a message, --prompt-file, or pipe stdin");
-    }
-    Ok(())
-}
-
-fn validate_ephemeral_continuation(args: &RunArgs) -> Result<()> {
-    if args.ephemeral && (args.continue_session || args.session.is_some()) {
-        anyhow::bail!(
-            "--ephemeral sessions cannot be continued; drop --ephemeral or start a new session"
-        );
     }
     Ok(())
 }
@@ -2028,7 +2000,6 @@ mod tests {
             follow: false,
             file: Vec::new(),
             thinking: false,
-            ephemeral: false,
             max_turns: None,
             timeout: None,
             permission_mode: None,
@@ -2357,22 +2328,6 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_rejects_continuation() {
-        let mut args = run_args();
-        args.ephemeral = true;
-        args.continue_session = true;
-        assert_eq!(
-            validate_ephemeral_continuation(&args)
-                .unwrap_err()
-                .to_string(),
-            "--ephemeral sessions cannot be continued; drop --ephemeral or start a new session"
-        );
-
-        args.continue_session = false;
-        args.session = Some(Uuid::new_v4().to_string());
-        assert!(validate_ephemeral_continuation(&args).is_err());
-    }
-
     #[test]
     fn model_override_is_a_complete_new_session_selection() {
         let selection = parse_model_override(Some(" openai/gpt-5 "), false)
@@ -2455,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_flag_combinations_dispatch() {
+    fn attached_snapshot_does_not_finish_before_submission() {
         let session_id = Uuid::new_v4();
         let mut outcome = RunOutcome::new(true);
         // An attach snapshot may contain the daemon's pre-submission idle

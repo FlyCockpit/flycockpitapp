@@ -2350,10 +2350,10 @@ pub struct DaemonContext {
     /// on the first broadcast after construction.
     redaction_generation: std::sync::atomic::AtomicU64,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
-    /// Live client state. Each successfully attached client increments the
+    /// Live client state. Each accepted transport connection increments the
     /// count and permanently records that this owner has served a client.
     /// Ephemeral owners need both facts: a watch receiver may coalesce a
-    /// fast `0 -> 1 -> 0`, but it must still reap after that first client
+    /// fast `0 -> 1 -> 0`, but it must still reap after that first connection
     /// leaves.
     client_presence: tokio::sync::watch::Sender<ClientPresence>,
     /// Daemon-wide graceful-shutdown gate
@@ -3512,19 +3512,19 @@ impl DaemonContext {
     fn track_client(self: &Arc<Self>) -> ClientGuard {
         self.client_presence.send_modify(|presence| {
             presence.count += 1;
-            presence.has_attached = true;
+            presence.has_connected = true;
         });
         ClientGuard { ctx: self.clone() }
     }
 }
 
-/// The observed client state of one daemon owner. `has_attached` is monotonic
-/// for the owner's lifetime, so the first complete attach cannot be erased by
+/// The observed client state of one daemon owner. `has_connected` is monotonic
+/// for the owner's lifetime, so the first complete connection cannot be erased by
 /// a later disconnect before the lifecycle reaper observes the watch channel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClientPresence {
     pub(crate) count: usize,
-    pub(crate) has_attached: bool,
+    pub(crate) has_connected: bool,
 }
 
 /// Decrements the daemon's connected-client count when a client task
@@ -4953,7 +4953,10 @@ async fn run_in_process_client(
     mut request_rx: mpsc::Receiver<cockpit_client::InProcessRequest>,
     event_tx: mpsc::Sender<proto::Event>,
 ) {
-    let mut client_guard = None;
+    // An in-process endpoint is handed only to the owning foreground process;
+    // opening it is therefore the same lifetime reference as a completed
+    // socket handshake.
+    let _client_guard = ctx.track_client();
     let client_instance_id = Uuid::new_v4();
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
@@ -5073,7 +5076,6 @@ async fn run_in_process_client(
                         });
                         continue;
                     }
-                    let is_attach = matches!(&request, Request::Attach { .. });
                     let mut effects = ClientRequestEffects::default();
                     let result = dispatch::handle_serialized_request(
                         request,
@@ -5084,14 +5086,11 @@ async fn run_in_process_client(
                     )
                     .await;
                     let attached = matches!(&result, Ok(Response::Attached { .. }));
-                    if (is_attach && attached) || state.attached.is_none() {
+                    if attached || state.attached.is_none() {
                         shared = state.shared_snapshot();
                     }
-                    if is_attach && attached {
-                        client_guard.get_or_insert_with(|| ctx.track_client());
-                    }
                     let _ = reply.send(result);
-                    if is_attach && attached {
+                    if attached {
                         let session_id = state
                             .attached
                             .as_ref()
@@ -5233,6 +5232,10 @@ async fn handle_client_transport_as<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // The server has accepted the connection and is about to emit its hello.
+    // Holding this RAII guard through transport teardown covers detached RPC
+    // clients and pre-Attach failures as well as session-attached clients.
+    let _client_guard = ctx.track_client();
     let proto = ProtoStream::new(stream);
     let (reader, writer) = proto.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -5683,10 +5686,6 @@ async fn run_client_executor(
     );
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
-    // A connection becomes a lifetime reference only after a successful
-    // session Attach. Discovery/hello probes must not race a newly spawned
-    // ephemeral owner into shutdown.
-    let mut client_guard = None;
     loop {
         tokio::select! {
             biased;
@@ -5708,7 +5707,6 @@ async fn run_client_executor(
                             frame,
                             &mut state,
                             &mut shared,
-                            &mut client_guard,
                             &ctx,
                             &event_cmd_tx,
                             &writer_tx,
@@ -5733,39 +5731,23 @@ async fn handle_client_frame(
     frame: RecvFrame,
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
-    client_guard: &mut Option<ClientGuard>,
     ctx: &Arc<DaemonContext>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<bool> {
     match frame {
-        RecvFrame::Envelope(env) => {
-            let is_attach = matches!(
-                &env.body,
-                Body::Request {
-                    request: Request::Attach { .. },
-                    ..
-                }
-            );
-            let was_attached = state.attached.is_some();
-            handle_envelope(
-                *env,
-                state,
-                shared,
-                ctx,
-                event_cmd_tx,
-                writer_tx,
-                concurrent,
-            )
-            .await
-            .map(|()| {
-                if is_attach && !was_attached && state.attached.is_some() {
-                    client_guard.get_or_insert_with(|| ctx.track_client());
-                }
-                true
-            })
-        }
+        RecvFrame::Envelope(env) => handle_envelope(
+            *env,
+            state,
+            shared,
+            ctx,
+            event_cmd_tx,
+            writer_tx,
+            concurrent,
+        )
+        .await
+        .map(|()| true),
         RecvFrame::VersionMismatch { v, kind, id } => {
             if kind == "req"
                 && let Some(id) = id

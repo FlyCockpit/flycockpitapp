@@ -272,6 +272,31 @@ async fn connect_uses_registered_in_process_context_without_socket() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn one_shot_daemon_uses_an_in_process_owner_without_socket_metadata() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
+
+    let response = super::run_one_shot_daemon(|client| {
+        Box::pin(async move { client.request_ok(Request::DaemonStatus).await })
+    })
+    .await
+    .expect("one-shot daemon status");
+    assert!(matches!(response, Response::DaemonStatus { .. }));
+
+    let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
+    assert!(
+        !paths.socket.exists(),
+        "one-shot in-process owner must not bind {}",
+        paths.socket.display()
+    );
+    assert!(
+        !paths.pid_file.exists(),
+        "one-shot in-process owner must not publish a pid record"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn in_process_auto_promote_hellos_without_os_socket() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let runtime = env.path().expect("isolated runtime root").join("runtime");

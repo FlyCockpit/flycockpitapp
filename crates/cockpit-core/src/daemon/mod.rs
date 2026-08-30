@@ -1913,8 +1913,9 @@ async fn run_foreground_inner_with_boot_db(
     };
 
     // A reference-counted ephemeral owner remains available until at least
-    // one client has attached, then begins the normal drain immediately when
-    // the final client detaches. This deliberately has no idle timeout.
+    // one client has established a transport connection, then begins the
+    // normal drain immediately when the final client disconnects. This
+    // deliberately has no idle timeout.
     let lifecycle_task = if paths.ephemeral {
         let ctx = ctx.clone();
         let client_presence = ctx.client_presence();
@@ -2058,7 +2059,7 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
     Ok(())
 }
 
-/// Wait for an ephemeral owner to acquire its first client and then request
+/// Wait for an ephemeral owner to acquire its first connected client and then request
 /// teardown as soon as the reference count returns to zero. The first-client
 /// gate prevents a freshly spawned daemon from racing its creator's initial
 /// handshake.
@@ -2069,7 +2070,7 @@ async fn ephemeral_last_client_reaper(
 ) {
     loop {
         let observed = *presence.borrow_and_update();
-        if observed.has_attached && observed.count == 0 {
+        if observed.has_connected && observed.count == 0 {
             tracing::info!("ephemeral daemon lost its final client; beginning teardown");
             on_reap();
             return;
@@ -2766,7 +2767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_reaps_when_first_attach_and_disconnect_precede_reaper() {
+    async fn ephemeral_reaps_when_first_connection_and_disconnect_precede_reaper() {
         let (presence_tx, presence_rx) =
             tokio::sync::watch::channel(server::ClientPresence::default());
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2777,18 +2778,59 @@ mod tests {
         }));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
-            presence.has_attached = true;
+            presence.has_connected = true;
         });
         presence_tx.send_modify(|presence| presence.count = 0);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("the durable first-attach marker must survive a coalesced disconnect")
+            .expect("the durable first-connection marker must survive a coalesced disconnect")
             .expect("reaper task joins");
         assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
-    async fn ephemeral_socket_owner_waits_for_its_last_attached_client() {
+    async fn ephemeral_socket_owner_reaps_after_detached_rpc_client_disconnects() {
+        let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let paths = harness.ephemeral_paths("detached-rpc-client");
+        let daemon_paths = paths.clone();
+        let daemon_db = harness.db.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_foreground_inner_with_boot_db(
+                daemon_paths,
+                Duration::from_millis(300),
+                false,
+                crate::daemon::terminal::test_host_factory(),
+                Some(daemon_db),
+            )
+            .await
+        });
+        wait_until(|| paths.socket.exists(), Duration::from_secs(2)).await;
+
+        let client = cockpit_client::DaemonClient::connect(&paths.socket)
+            .await
+            .expect("connect detached socket client");
+        client
+            .request_ok(proto::Request::DaemonStatus)
+            .await
+            .expect("detached client RPC succeeds without Attach");
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(3), daemon_task)
+            .await
+            .expect("detached client disconnect must reap the ephemeral owner")
+            .expect("daemon task joins")
+            .expect("daemon drain completes after detached client disconnect");
+        assert!(!paths.socket.exists(), "last client removes the socket");
+        assert!(
+            !paths.pid_file.exists(),
+            "last client removes the pid record"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_socket_owner_waits_for_its_last_connected_client() {
         let harness = DaemonTestHarness::new();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;

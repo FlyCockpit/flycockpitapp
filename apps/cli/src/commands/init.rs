@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use cockpit_core::init::{InitMode, build_init_prompt, display_target, resolve_target};
 
 use crate::cli::InitArgs;
-use crate::daemon::client::OwnedSessionMode;
 
 /// `cockpit init [path]` — headless. Resolves the target, refuses to
 /// clobber an existing file unless `--force` (no interactive prompt in
@@ -52,24 +51,22 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
 
     let prompt = build_init_prompt(&shown, mode);
 
-    let mode_lc = if args.ephemeral {
-        OwnedSessionMode::AttachOrEphemeral
-    } else {
-        OwnedSessionMode::AttachOrEphemeral
-    };
     eprintln!("Exploring the project and writing `{shown}`…");
-    let exit_code = crate::daemon::client::run_owned_daemon(mode_lc, |client| {
-        Box::pin(async move {
-            crate::commands::run::attach_send_pump(
-                &client,
-                prompt,
-                no_sandbox,
-                crate::cli::OutputFormat::Default,
-                crate::commands::run::RunPumpOptions::default(),
-            )
-            .await
-        })
-    })
+    let exit_code = crate::daemon::client::run_owned_daemon(
+        crate::daemon::client::OwnedSessionMode::AttachOrEphemeral,
+        |client| {
+            Box::pin(async move {
+                crate::commands::run::attach_send_pump(
+                    &client,
+                    prompt,
+                    no_sandbox,
+                    crate::cli::OutputFormat::Default,
+                    crate::commands::run::RunPumpOptions::default(),
+                )
+                .await
+            })
+        },
+    )
     .await?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit init` ran but the agent reported an error");

@@ -8,31 +8,28 @@
 use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
-use crate::daemon::client::OwnedSessionMode;
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     let subject = subject_from_parts(&args.sources);
     let prompt = build_learn_prompt(&subject);
-    let mode = if args.ephemeral {
-        OwnedSessionMode::AttachOrEphemeral
-    } else {
-        OwnedSessionMode::AttachOrEphemeral
-    };
     eprintln!("Authoring a reusable skill from the supplied sources…");
-    let exit_code = crate::daemon::client::run_owned_daemon(mode, |client| {
-        Box::pin(async move {
-            crate::commands::run::attach_send_pump(
-                &client,
-                prompt,
-                no_sandbox,
-                crate::cli::OutputFormat::Default,
-                crate::commands::run::RunPumpOptions::default(),
-            )
-            .await
-            .context("running learn turn")
-        })
-    })
+    let exit_code = crate::daemon::client::run_owned_daemon(
+        crate::daemon::client::OwnedSessionMode::AttachOrEphemeral,
+        |client| {
+            Box::pin(async move {
+                crate::commands::run::attach_send_pump(
+                    &client,
+                    prompt,
+                    no_sandbox,
+                    crate::cli::OutputFormat::Default,
+                    crate::commands::run::RunPumpOptions::default(),
+                )
+                .await
+                .context("running learn turn")
+            })
+        },
+    )
     .await?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit assistants learn` ran but the agent reported an error");

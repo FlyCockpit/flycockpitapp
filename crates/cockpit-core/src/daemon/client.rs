@@ -46,6 +46,7 @@ pub(crate) struct ConnectedDaemon {
 /// Foreground CLI connection scoped to one operation.
 struct OwnedDaemonSession {
     client: DaemonClient,
+    in_process_owner: Option<crate::daemon::InProcessDaemonGuard>,
 }
 
 /// Foreground command lifecycle preferences.
@@ -72,6 +73,68 @@ impl OwnedDaemonSession {
         }
         Ok(Self {
             client: connected.client,
+            in_process_owner: None,
+        })
+    }
+
+    /// Attach to a shareable owner when one exists; otherwise boot a private
+    /// in-process ephemeral owner for this one foreground operation.
+    async fn connect_one_shot() -> Result<Self> {
+        use crate::daemon::{DaemonPaths, discover};
+
+        let discovered = discover().await;
+        match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
+            DiscoverAttachPlan::AttachRunning => {
+                let connected = attach_running_with_skew_check(discovered.paths, None).await?;
+                return Ok(Self {
+                    client: connected.client,
+                    in_process_owner: None,
+                });
+            }
+            DiscoverAttachPlan::WaitForRestart => {
+                let observed_pid =
+                    cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
+                match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
+                    Ok(client) => {
+                        return Ok(Self {
+                            client,
+                            in_process_owner: None,
+                        });
+                    }
+                    Err(SharedWaitError::Released) => {}
+                    Err(SharedWaitError::Wedged) => {
+                        anyhow::bail!(
+                            "shared daemon pid is live but socket never became ready: {}",
+                            discovered.paths.socket.display()
+                        );
+                    }
+                }
+            }
+            DiscoverAttachPlan::Spawn => {}
+            DiscoverAttachPlan::FailIncompatible | DiscoverAttachPlan::FailUnreachable => {
+                if let Some(hello) = discovered.hello.as_ref() {
+                    anyhow::bail!(
+                        "{}",
+                        proto::incompatible_daemon_protocol_message(hello.protocol_version)
+                    );
+                }
+                anyhow::bail!(
+                    "shared daemon pid is live but socket is unreachable: {}",
+                    discovered.paths.socket.display()
+                );
+            }
+        }
+
+        let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
+        let (endpoint, in_process_owner) =
+            crate::daemon::boot_in_process(paths, crate::daemon::terminal::default_host_factory())
+                .await?;
+        let client =
+            DaemonClient::connect_endpoint(&cockpit_client::ClientEndpoint::InProcess(endpoint))
+                .await?;
+        Ok(Self {
+            client,
+            in_process_owner,
         })
     }
 
@@ -80,7 +143,26 @@ impl OwnedDaemonSession {
     }
 
     async fn finish<T>(self, result: Result<T>) -> Result<T> {
-        result
+        let Self {
+            client,
+            in_process_owner,
+        } = self;
+        // Retire the operation's transport reference before asking an
+        // in-process owner to drain. This mirrors socket last-client teardown
+        // and prevents a live client task from retaining the owner context.
+        drop(client);
+        let shutdown = match in_process_owner {
+            Some(owner) => owner.shutdown().await,
+            None => Ok(()),
+        };
+        match (result, shutdown) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(error).context("shutting down one-shot in-process daemon"),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(shutdown_error)) => Err(error).context(format!(
+                "one-shot operation failed and in-process daemon shutdown also failed: {shutdown_error:#}"
+            )),
+        }
     }
 }
 
@@ -152,6 +234,30 @@ where
         >,
 {
     let session = OwnedDaemonSession::connect(mode)
+        .await
+        .map_err(OwnedDaemonRunError::Connect)?;
+    let result = operation(ScopedDaemonClient {
+        client: session.client(),
+    })
+    .await;
+    session
+        .finish(result)
+        .await
+        .map_err(OwnedDaemonRunError::OperationOrCleanup)
+}
+
+/// Run a one-shot foreground operation. It attaches to an existing shareable
+/// owner, or otherwise owns a private in-process daemon for the operation.
+/// This is reserved for callers that are their owner's only client.
+pub async fn run_one_shot_daemon<T, F>(operation: F) -> std::result::Result<T, OwnedDaemonRunError>
+where
+    F: for<'client> std::ops::FnOnce(
+            ScopedDaemonClient<'client>,
+        ) -> std::pin::Pin<
+            std::boxed::Box<dyn std::future::Future<Output = anyhow::Result<T>> + 'client>,
+        >,
+{
+    let session = OwnedDaemonSession::connect_one_shot()
         .await
         .map_err(OwnedDaemonRunError::Connect)?;
     let result = operation(ScopedDaemonClient {

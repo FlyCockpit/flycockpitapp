@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use super::*;
 
 #[derive(Debug)]
@@ -341,24 +343,47 @@ fn replay_memo_has_reserved_dispatch(
 async fn cancel_replayed_reserved_dispatch(
     session: &Session,
     memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
-) {
+) -> Result<()> {
     let Some(memo) = memo.filter(replay_memo_has_reserved_dispatch) else {
-        return;
+        return Ok(());
     };
-    let _ = session
+    cancel_verification_dispatch_no_submission(
+        session,
+        memo.operation_id,
+        memo.dispatch_attempt_revision,
+        b"verification-selected-replay-authorization-refused",
+    )
+    .await
+}
+
+/// Cancellation occurs before the host-effect boundary, so a failure to
+/// terminalize its durable reservation must fail the live call closed. In
+/// particular, do not report a normal refusal or denial while a CAS or
+/// database failure could have left the dispatch attempt unresolved.
+async fn cancel_verification_dispatch_no_submission(
+    session: &Session,
+    operation_id: uuid::Uuid,
+    attempt_revision: i64,
+    proof: &'static [u8],
+) -> Result<()> {
+    session
         .db
         .cancel_verification_dispatch_no_submission(
             session.id,
-            memo.operation_id,
-            memo.dispatch_attempt_revision,
+            operation_id,
+            attempt_revision,
             crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                crate::db::verification_ledger::VerificationDigest::of(
-                    b"verification-selected-replay-authorization-refused",
-                ),
+                crate::db::verification_ledger::VerificationDigest::of(proof),
             ),
             chrono::Utc::now().timestamp_millis(),
         )
-        .await;
+        .await
+        .with_context(|| {
+            format!(
+                "verification dispatch {operation_id} could not be terminalized safely; recovery must reconcile the reservation"
+            )
+        })?;
+    Ok(())
 }
 
 /// Apply the argument-dependent repeat authorities to one canonical call.
@@ -1261,7 +1286,7 @@ async fn execute_ordinary_call_unscoped(
         || cage_block.is_some()
         || !repair_outcome.valid;
     if selected_replay_denied_before_intercept {
-        cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await;
+        cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
     }
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
@@ -1307,7 +1332,8 @@ async fn execute_ordinary_call_unscoped(
             permission_kind,
         } = authorize_btw_native_call(env, resolved_name, &args).await?
         {
-            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await;
+            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref())
+                .await?;
             // A /btw approval denial early-returns before the common deny-audit
             // site below, so `permissionDenied` must fire here (observe-only /
             // fail-open) with the matching deny kind — otherwise a real
@@ -1358,7 +1384,8 @@ async fn execute_ordinary_call_unscoped(
         )
         .await;
         if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
-            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await;
+            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref())
+                .await?;
             // The deny is already recorded by `run_pre_tool_hooks` via
             // `record_hook_run`. Return the deterministic model-visible
             // rejected-tool diagnostic; the tool is never executed and no
@@ -1424,26 +1451,21 @@ async fn execute_ordinary_call_unscoped(
                         return (Err(crate::engine::interrupt::InterruptParked.into()), 0);
                     }
                     Ok(_) | Err(_) => {
+                        if let Err(error) = cancel_verification_dispatch_no_submission(
+                            env.session,
+                            operation_id,
+                            plan.attempt_revision,
+                            b"verification-projection-escalation-declined",
+                        )
+                        .await
+                        {
+                            return (Err(error), 0);
+                        }
                         verification_blocked = true;
                         // This is a real user-approval boundary, unlike an
                         // ordinary verification block. Preserve its observer
                         // audit after the rejected tool result is durable.
                         permission_denied_kind = Some("blocked_verification");
-                        let _ = env
-                            .session
-                            .db
-                            .cancel_verification_dispatch_no_submission(
-                                env.session.id,
-                                operation_id,
-                                plan.attempt_revision,
-                                crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                                    crate::db::verification_ledger::VerificationDigest::of(
-                                        b"verification-projection-escalation-declined",
-                                    ),
-                                ),
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                            .await;
                         crate::engine::verification::VerificationOutcome::Block {
                             message: "verification could not safely project this action for automatic approval and the user declined to run it manually; revise and re-emit".into(),
                             operation_id: Some(operation_id),
@@ -1527,22 +1549,17 @@ async fn execute_ordinary_call_unscoped(
                 };
                 match authorization {
                     RevisedCallAuthorization::Refused(message) => {
+                        if let Err(error) = cancel_verification_dispatch_no_submission(
+                            env.session,
+                            operation_id,
+                            plan.attempt_revision,
+                            b"verification-revised-call-authorization-refused",
+                        )
+                        .await
+                        {
+                            return (Err(error), 0);
+                        }
                         verification_blocked = true;
-                        let _ = env
-                            .session
-                            .db
-                            .cancel_verification_dispatch_no_submission(
-                                env.session.id,
-                                operation_id,
-                                plan.attempt_revision,
-                                crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                                    crate::db::verification_ledger::VerificationDigest::of(
-                                        b"verification-revised-call-authorization-refused",
-                                    ),
-                                ),
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                            .await;
                         (Err(invalid_input(message)), 0)
                     }
                     RevisedCallAuthorization::Ready {
@@ -1582,22 +1599,17 @@ async fn execute_ordinary_call_unscoped(
                             tc.id.as_str(),
                             &authorized_args,
                         ) {
+                            if let Err(error) = cancel_verification_dispatch_no_submission(
+                                env.session,
+                                operation_id,
+                                plan.attempt_revision,
+                                b"verification-provider-signature-rewrite-refused",
+                            )
+                            .await
+                            {
+                                return (Err(error), 0);
+                            }
                             verification_blocked = true;
-                            let _ = env
-                                .session
-                                .db
-                                .cancel_verification_dispatch_no_submission(
-                                    env.session.id,
-                                    operation_id,
-                                    plan.attempt_revision,
-                                    crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                                        crate::db::verification_ledger::VerificationDigest::of(
-                                            b"verification-provider-signature-rewrite-refused",
-                                        ),
-                                    ),
-                                    chrono::Utc::now().timestamp_millis(),
-                                )
-                                .await;
                             let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
                                 .to_string();
                             payload.verification =

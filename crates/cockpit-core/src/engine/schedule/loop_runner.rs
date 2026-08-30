@@ -94,7 +94,9 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         )
     });
     // A fork persists across wakes exactly as before, but a handoff replaces
-    // it so no later wake remains rooted in the retired context.
+    // its session so no later wake remains rooted in the retired context. Its
+    // non-independent transcript belongs to the logical loop, rather than to
+    // that disposable fork session, and therefore crosses the handoff.
     let mut fork_session: Option<(u64, Arc<crate::session::Session>)> = None;
 
     // Accumulated history for `independent = false`. Reset each iteration
@@ -184,11 +186,11 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 *source_generation != live_generation
             });
         if source_changed {
-            if fork_session.is_some() {
-                // The old fork was rooted in the retired thread. Its local
-                // transcript must not be carried into the successor context.
-                fork_history.clear();
-            }
+            // A successor requires a fresh session rooted at its live
+            // context, but it does not reset the logical loop. Keep the
+            // bounded transcript so a non-independent iteration after the
+            // handoff still sees the preceding iterations. Independent loops
+            // clear it at the execution boundary above.
             let session = match fork_from_live_context(&live_ctx) {
                 Ok(session) => session,
                 Err(e) => {

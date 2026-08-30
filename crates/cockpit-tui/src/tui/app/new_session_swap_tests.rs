@@ -1,4 +1,7 @@
-use super::{App, Dialog, SESSION_SWITCH_SPINNER_THRESHOLD, SideConversation};
+use super::{
+    App, Dialog, SESSION_SWITCH_SPINNER_THRESHOLD, SessionMode, SideConversation,
+    StartupWorkspaceTrust,
+};
 use crate::tui::agent_runner::{AgentRunner, RunnerInput, SessionSwitchOutcome, SessionTarget};
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
@@ -12,6 +15,21 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use cockpit_client::submission::ClientUserSubmission as UserSubmission;
+
+#[test]
+fn composed_constructor_keeps_the_requested_session_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = App::new_composed_with_session_mode(
+        Some(tmp.path()),
+        false,
+        SessionMode::Computer,
+        StartupWorkspaceTrust::Decided,
+        None,
+        cockpit_client::LifecycleClient::disconnected(),
+    );
+
+    assert_eq!(app.session_mode(), Some(SessionMode::Computer));
+}
 
 #[test]
 fn new_session_swap_reads_no_config_from_disk() {
@@ -74,7 +92,6 @@ fn app_with_only_session_switch_pending(started_at: Instant) -> App {
     app.pane = None;
     app.dialog = Dialog::None;
     app.question_dialog = None;
-    app.daemon_prompt = None;
     let kind = AsyncActionKind::Internal("session.switch");
     app.async_actions.start(
         kind.clone(),
@@ -126,6 +143,7 @@ fn switch_outcome_with_epoch(
         target: SessionTarget::New,
         session_id,
         session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
+        promoted_from_ephemeral: false,
         short_id: short_id.to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],

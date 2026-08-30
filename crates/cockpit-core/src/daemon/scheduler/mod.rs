@@ -140,6 +140,7 @@ pub struct DaemonSchedulerHandle {
     scheduler: Arc<DaemonScheduler>,
     wake_tx: watch::Sender<u64>,
     callbacks: Option<CallbackRegistry>,
+    task_abort: tokio::task::AbortHandle,
 }
 
 impl DaemonSchedulerHandle {
@@ -149,6 +150,12 @@ impl DaemonSchedulerHandle {
 
     pub fn wake_generation(&self) -> u64 {
         *self.wake_tx.borrow()
+    }
+
+    /// Stop this scheduler task when a not-yet-published owner promotion
+    /// rolls back. Normal daemon shutdown still uses `ShutdownSignal`.
+    pub fn abort(&self) {
+        self.task_abort.abort();
     }
 
     pub fn register_callback<F, Fut>(&self, subsystem: impl Into<String>, callback: F) -> Result<()>
@@ -283,7 +290,7 @@ impl DaemonScheduler {
         self: Arc<Self>,
         shutdown: crate::daemon::shutdown::ShutdownSignal,
     ) -> DaemonSchedulerHandle {
-        self.start_with_sleeper(shutdown, Arc::new(TokioSchedulerSleeper), None)
+        self.start_with_sleeper(shutdown, Arc::new(TokioSchedulerSleeper), None, None)
     }
 
     pub fn start_with_callbacks(
@@ -291,7 +298,26 @@ impl DaemonScheduler {
         shutdown: crate::daemon::shutdown::ShutdownSignal,
         callbacks: CallbackRegistry,
     ) -> DaemonSchedulerHandle {
-        self.start_with_sleeper(shutdown, Arc::new(TokioSchedulerSleeper), Some(callbacks))
+        self.start_with_sleeper(
+            shutdown,
+            Arc::new(TokioSchedulerSleeper),
+            Some(callbacks),
+            None,
+        )
+    }
+
+    pub fn start_with_callbacks_gated(
+        self: Arc<Self>,
+        shutdown: crate::daemon::shutdown::ShutdownSignal,
+        callbacks: CallbackRegistry,
+        start_gate: Option<watch::Receiver<bool>>,
+    ) -> DaemonSchedulerHandle {
+        self.start_with_sleeper(
+            shutdown,
+            Arc::new(TokioSchedulerSleeper),
+            Some(callbacks),
+            start_gate,
+        )
     }
 
     pub fn start_with_sleeper(
@@ -299,14 +325,26 @@ impl DaemonScheduler {
         shutdown: crate::daemon::shutdown::ShutdownSignal,
         sleeper: Arc<dyn SchedulerSleeper>,
         callbacks: Option<CallbackRegistry>,
+        start_gate: Option<watch::Receiver<bool>>,
     ) -> DaemonSchedulerHandle {
         let (wake_tx, wake_rx) = watch::channel(0u64);
+        let scheduler = self.clone();
+        let task = tokio::spawn(async move {
+            if let Some(mut start_gate) = start_gate {
+                while !*start_gate.borrow_and_update() {
+                    if start_gate.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }
+            run_scheduler_loop(scheduler, sleeper, wake_rx, shutdown).await;
+        });
         let handle = DaemonSchedulerHandle {
-            scheduler: self.clone(),
+            scheduler: self,
             wake_tx,
             callbacks,
+            task_abort: task.abort_handle(),
         };
-        tokio::spawn(run_scheduler_loop(self, sleeper, wake_rx, shutdown));
         handle
     }
 
@@ -2775,9 +2813,10 @@ mod tests {
 
         let sleeper = Arc::new(RecordingSleeper::default());
         let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
-        let handle = scheduler
-            .clone()
-            .start_with_sleeper(shutdown.clone(), sleeper.clone(), None);
+        let handle =
+            scheduler
+                .clone()
+                .start_with_sleeper(shutdown.clone(), sleeper.clone(), None, None);
         wait_for_sleeper_calls(&sleeper, 1).await;
         assert_eq!(sleeper.last_wake(), Some(1_060));
         assert_eq!(sleeper.max_active(), 1);
@@ -2811,6 +2850,7 @@ mod tests {
             shutdown.clone(),
             Arc::new(RecordingSleeper::default()),
             Some(executor.callback_registry()),
+            None,
         );
         let runs = Arc::new(AtomicUsize::new(0));
         let callback_runs = runs.clone();

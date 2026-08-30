@@ -452,6 +452,9 @@ pub(crate) enum ControlApplied {
         text: String,
     },
     RepairResume,
+    ExitGuardStatus,
+    ExitAfterStoppingWork,
+    ExitAfterBackgroundPromotion,
     /// Settings Behavior tokenizer refresh confirmation (correlated
     /// ConfigRefreshed + ConfigSnapshot).
     ResponseMetricsTokenizer {
@@ -473,62 +476,14 @@ enum FirstRunFlow {
 }
 
 /// Required launch modals share one precedence order for drawing and input.
-/// A trust decision gates all startup work, so it is above a daemon prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartupModal {
     WorkspaceTrust,
-    Daemon,
-}
-
-struct StartupDaemonState {
-    prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
-    connected: bool,
-    socket: Option<std::path::PathBuf>,
-    daemonless: bool,
-    notice: Option<String>,
 }
 
 fn footer_agent_picker_height(picker: Option<&FooterAgentPicker>) -> u16 {
     let rows = picker.map(|p| p.entries.len()).unwrap_or(0).min(12) as u16;
     rows + 4
-}
-
-fn startup_daemon_state(
-    autostart: cockpit_config::extended::DaemonAutostart,
-) -> StartupDaemonState {
-    match autostart {
-        cockpit_config::extended::DaemonAutostart::Ask => StartupDaemonState {
-            prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new()),
-            connected: false,
-            socket: None,
-            daemonless: false,
-            notice: None,
-        },
-        cockpit_config::extended::DaemonAutostart::Private => StartupDaemonState {
-            prompt: None,
-            connected: true,
-            socket: None,
-            daemonless: true,
-            notice: daemon_autostart_notice(
-                false,
-                "started a private cockpit daemon for this window only",
-            ),
-        },
-        cockpit_config::extended::DaemonAutostart::Shared => StartupDaemonState {
-            prompt: None,
-            connected: true,
-            socket: None,
-            daemonless: false,
-            notice: None,
-        },
-    }
-}
-
-fn daemon_autostart_notice(notice_seen: bool, text: &str) -> Option<String> {
-    if notice_seen {
-        return None;
-    }
-    Some(text.to_string())
 }
 
 #[cfg(test)]
@@ -597,8 +552,6 @@ impl App {
     pub(super) fn startup_modal_on_top(&self) -> Option<StartupModal> {
         if self.dialog.is_workspace_trust() {
             Some(StartupModal::WorkspaceTrust)
-        } else if self.daemon_prompt.is_some() {
-            Some(StartupModal::Daemon)
         } else {
             None
         }
@@ -711,9 +664,7 @@ impl App {
             self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
-        if self.daemon_prompt.is_none() {
-            self.maybe_open_add_provider_wizard();
-        }
+        self.maybe_open_add_provider_wizard();
     }
 }
 
@@ -1128,22 +1079,16 @@ pub(super) fn decide_ctrl_c(
 /// - no runner exists yet (`!has_runner`) — a live runner already shows the
 ///   id, and a poisoned `Some(Err)` from a *first-message* attempt is left
 ///   alone (it was already surfaced to the user);
-/// - the "daemon not running" prompt is closed (`!prompt_open`) — never spawn
-///   a daemon out from under the user's pending choice;
-/// - not daemonless (`!daemonless`) — eager-attaching there would spawn the
-///   owned ephemeral daemon purely to display an id (a deliberate non-goal);
 /// - we believe a daemon should be reachable (`daemon_connected`); and
 /// - the canonical daemon actually answers right now (`probe_when()`) — so we
 ///   don't fire against the not-yet-bound socket in the "Start and connect"
 ///   startup gap.
 fn should_attempt_display_attach(
     has_runner: bool,
-    prompt_open: bool,
-    daemonless: bool,
     daemon_connected: bool,
     probe_when: impl FnOnce() -> bool,
 ) -> bool {
-    if has_runner || prompt_open || daemonless || !daemon_connected {
+    if has_runner || !daemon_connected {
         return false;
     }
     probe_when()
@@ -1367,6 +1312,7 @@ pub(super) enum LocalChoice {
     ResumeRepair(PendingResumeRepair),
     RedactionToggle(uuid::Uuid),
     ModelComparison(uuid::Uuid),
+    ExitGuard(uuid::Uuid),
 }
 
 impl LocalChoice {
@@ -1378,6 +1324,7 @@ impl LocalChoice {
             Self::RedactionToggle(interrupt_id) | Self::ModelComparison(interrupt_id) => {
                 *interrupt_id
             }
+            Self::ExitGuard(interrupt_id) => *interrupt_id,
         }
     }
 
@@ -1873,6 +1820,7 @@ pub struct App {
     /// a newer runner.
     sealed_capability_bindings: HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
     exit_requested: bool,
+    exit_notice: Option<String>,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
@@ -2059,8 +2007,7 @@ pub struct App {
     /// read this instead of shelling out to git themselves.
     pub(super) worktree_root: Arc<Mutex<Option<std::path::PathBuf>>>,
     pub(super) dialog: Dialog,
-    /// User-opened modal/pane overlays. Required prompts (`daemon_prompt` and
-    /// `question_dialog`) stay separate so they can shadow and resume this
+    /// User-opened modal/pane overlays. Required question dialogs stay separate so they can shadow and resume this
     /// state without destroying the user's underlying overlay.
     pub(super) overlay: Overlay,
     /// Inline session-setup panel below the banner on a fresh session.
@@ -2073,9 +2020,6 @@ pub struct App {
     pub(super) session_setup_focused: bool,
     /// One-line hint shown after collapse, naming where each control lives.
     pub(super) session_setup_collapse_hint: Option<String>,
-    /// "Daemon not running" prompt shown at startup. Once the user picks,
-    /// this is taken and the prompt closes.
-    pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
     /// Answering dialog for a `question`-tool interrupt (GOALS §3b).
     /// Opened from `TurnEvent::InterruptRaised`, replaces the composer,
     /// and on submit/cancel sends `ResolveInterrupt` back to the daemon.
@@ -2099,13 +2043,9 @@ pub struct App {
     pub(super) pending_local_choice: Option<LocalChoice>,
     /// True after we've successfully connected to (or started) the daemon.
     pub(super) daemon_connected: bool,
-    /// Daemonless mode (`DaemonChoice::ContinueWithout`): this TUI owns its
-    /// own pid+nonce *ephemeral* daemon, fully isolated from the canonical
-    /// persistent daemon and from any other TUI's ephemeral daemon. Set when
-    /// the user picks "Continue without daemon" at the launch prompt; it
-    /// flips the agent-runner lifecycle to `AlwaysEphemeral` so we spawn (and
-    /// own) a fresh daemon rather than auto-promoting the canonical one.
-    pub(super) daemonless: bool,
+    /// Select the default owner lifetime when this TUI must acquire the
+    /// ledger. A pre-existing persistent owner always wins.
+    pub(super) ephemeral_preference: bool,
     /// Lines emitted by an in-flight `/fetch-models` task. The event
     /// loop drains this each tick and appends to history.
     pub(super) fetch_models_progress: Arc<Mutex<Vec<String>>>,
@@ -2141,7 +2081,6 @@ pub struct App {
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
-    startup_daemon_notice: Option<String>,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.
     startup_dependency_notice: Option<String>,
@@ -3427,7 +3366,6 @@ impl App {
         // `prepare_session_setup_for_fresh_session`.
         app.session_setup_collapsed = true;
         app.session_setup_focused = false;
-        app.daemon_prompt = None;
         // First-run Add-Provider is a production launch convenience. Opening it
         // here queues leftover settings.effect work (guidance-trace) that later
         // steals a fixture attached-request channel when a test drains.
@@ -3487,10 +3425,31 @@ impl App {
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,
     ) -> Self {
+        Self::new_composed_with_session_mode(
+            project,
+            no_sandbox,
+            SessionMode::Code,
+            trust,
+            launch_start,
+            lifecycle,
+        )
+    }
+
+    /// Construct an interactive app with the caller's requested setup mode.
+    /// The daemon remains authoritative after the initial attach; this value
+    /// only controls the first new-session request.
+    pub fn new_composed_with_session_mode(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        session_mode: SessionMode,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
         Self::new_inner(
             project,
             no_sandbox,
-            Some(SessionMode::Code),
+            Some(session_mode),
             trust,
             launch_start,
             Some(lifecycle),
@@ -3624,10 +3583,9 @@ impl App {
         let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
         let worktree_root = Arc::new(Mutex::new(None));
 
-        // Probe the daemon synchronously up front so startup can either
-        // autostart it per config or show the ask-mode/failure prompt on the
-        // first frame.
-        let daemon_state = startup_daemon_state(extended.daemon.autostart);
+        // The global background-agents setting selects the owner lifetime
+        // only if lifecycle acquisition has to spawn a new owner.
+        let ephemeral_preference = !extended.daemon.background_agents;
         timer.phase("daemon_probe");
         #[cfg(feature = "remote")]
         let org_sync_disclosure = None;
@@ -3674,7 +3632,15 @@ impl App {
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
             session_mode,
-            lifecycle: lifecycle.unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
+            lifecycle: lifecycle
+                .map(|lifecycle| {
+                    lifecycle.with_default_intent(if ephemeral_preference {
+                        cockpit_client::LifecycleIntent::AttachOrEphemeral
+                    } else {
+                        cockpit_client::LifecycleIntent::AttachOrPersistent
+                    })
+                })
+                .unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
@@ -3683,6 +3649,7 @@ impl App {
             pending_sealed_operations: HashMap::new(),
             sealed_capability_bindings: HashMap::new(),
             exit_requested: false,
+            exit_notice: None,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.
@@ -3755,14 +3722,13 @@ impl App {
             // never Tab away from the panel, so they own the composer.
             session_setup_focused: !cfg!(test),
             session_setup_collapse_hint: None,
-            daemon_prompt: daemon_state.prompt,
             question_dialog: None,
             question_dialog_btw: false,
             pending_btw_interrupt: None,
             last_composer_edit_at: None,
             pending_local_choice: None,
-            daemon_connected: daemon_state.connected,
-            daemonless: daemon_state.daemonless,
+            daemon_connected: true,
+            ephemeral_preference,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
             pending_runner_attach: None,
@@ -3777,11 +3743,10 @@ impl App {
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
             startup_background: StartupBackground {
-                daemon_socket: daemon_state.socket,
+                daemon_socket: None,
                 daemon_endpoint: None,
                 started: false,
             },
-            startup_daemon_notice: daemon_state.notice,
             startup_dependency_notice,
             chat_area: None,
             sticky_header_area: None,
@@ -4018,10 +3983,9 @@ impl App {
             StartupWorkspaceTrust::Pending(root) => {
                 app.dialog = Dialog::open_workspace_trust(root);
             }
-            StartupWorkspaceTrust::Decided if app.daemon_prompt.is_none() => {
+            StartupWorkspaceTrust::Decided => {
                 app.maybe_open_add_provider_wizard();
             }
-            StartupWorkspaceTrust::Decided => {}
         }
         app
     }
@@ -4031,50 +3995,7 @@ impl App {
             &self.launch.cwd.join(".cockpit").join("exports"),
         )
         .await;
-        if let Some(notice) = self.startup_daemon_notice.take() {
-            let key = cockpit_proto::AppFlagKey::DaemonAutostartNotice;
-            // Startup is already async. Await the daemon directly so the runtime
-            // worker remains available to the daemon connection and terminal
-            // event sources instead of synchronously re-entering it.
-            let state = async {
-                let client = crate::tui::settings::settings_daemon_client(&self.lifecycle)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                client
-                    .request(cockpit_proto::Request::GetAppFlag { key })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())
-            }
-            .await;
-            match state {
-                Ok(cockpit_proto::Response::AppFlag { seen: true, .. }) => {}
-                Ok(cockpit_proto::Response::AppFlag {
-                    seen: false,
-                    version,
-                    ..
-                }) => {
-                    let _ = async {
-                        let client = crate::tui::settings::settings_daemon_client(&self.lifecycle)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        client
-                            .request(cockpit_proto::Request::MarkAppFlagSeen {
-                                key,
-                                expected_version: version,
-                            })
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .map_err(|error| error.to_string())
-                    }
-                    .await;
-                    self.show_toast(notice, ToastKind::Info);
-                }
-                _ => self.show_toast(notice, ToastKind::Info),
-            }
-        }
-        // Apply the latest completed dependency policy after any one-shot
-        // daemon notice so the required-dependency warning remains visible.
+        // Apply the latest completed dependency policy after startup.
         if let Some(notice) = self.startup_dependency_notice.take() {
             self.show_toast(notice, ToastKind::Warning);
         }
@@ -4185,17 +4106,6 @@ impl App {
                 async_shutdown.export_cleanup_retry_scheduled,
             );
         }
-        // Daemonless teardown (happy path): reap the owned ephemeral daemon
-        // and stop its signal watcher. The guard routes a synchronous
-        // `StopDaemon` through the daemon's single graceful drain path, so
-        // an in-flight ephemeral daemon drains before exiting. This fires on
-        // a clean quit *and* the error path below (the guard's `Drop` is the
-        // backstop if `run` returns early); SIGINT/SIGTERM are covered by the
-        // signal task. The self-reaping idle watchdog remains the backstop
-        // for an uncatchable death (SIGKILL). Reaping here is independent of
-        // whether a message was sent — a persisted session never keeps an
-        // owned ephemeral daemon alive past its owner's exit.
-
         // Build the exit-tail text while we still own the alt screen
         // (history is in memory; rendering is irrelevant — we want
         // the plaintext projection of recent entries).
@@ -4210,6 +4120,9 @@ impl App {
         // pre-alt-screen, so the user can scroll back through both.
         for line in tail {
             println!("{line}");
+        }
+        if let Some(notice) = self.exit_notice.take() {
+            println!("{notice}");
         }
         // Attach now flushes a durable sessions row, so print the id even
         // when the user never submitted a message. Prefer the 6-char short
@@ -4681,7 +4594,6 @@ impl App {
             || self.async_action_animation_active(now)
             || self.dialog.is_active()
             || self.question_dialog.is_some()
-            || self.daemon_prompt.is_some()
             // Keep the 100ms tick alive while a `/leaks` secret is revealed so
             // its 30s TTL expires (and clears the screen) even on an idle pane.
             || self.leaks_reveal_active()
@@ -4778,7 +4690,7 @@ fn spawn_git_refresh(
         loop {
             interval.tick().await;
             // Only overwrite on a successful RPC. A transiently unavailable
-            // daemon (or the daemonless fallback) leaves the last-known pill
+            // daemon leaves the last-known pill
             // in place instead of clearing it; a successful `None` (not in a
             // repo / detached HEAD) still clears it, matching the old local
             // behaviour.

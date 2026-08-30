@@ -30,7 +30,7 @@ impl App {
         if self.dialog.is_active() {
             return PrimaryPasteLayer::Settings;
         }
-        if self.question_dialog.is_some() || self.daemon_prompt.is_some() {
+        if self.question_dialog.is_some() {
             return PrimaryPasteLayer::Dialog;
         }
         if self.overlay.is_open() {

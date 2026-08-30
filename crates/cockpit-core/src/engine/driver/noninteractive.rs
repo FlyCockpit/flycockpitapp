@@ -10262,6 +10262,8 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
     }
     let ctx = crate::engine::tool::ToolCtx {
         agent_id: agent.name.clone(),
+        executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+        knowledge_access_trusted: agent.model.is_trusted(),
         caller_model: Some(crate::engine::tool::CallerModel::from_model(
             agent.model.as_ref(),
         )),

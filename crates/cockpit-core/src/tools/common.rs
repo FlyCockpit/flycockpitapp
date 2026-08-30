@@ -398,6 +398,8 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     (
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
             caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),

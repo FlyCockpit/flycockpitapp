@@ -153,6 +153,12 @@ pub async fn check_native_access(
                 lease.visibility_root.display()
             )));
         }
+        // A workspace lease limits where a delegated agent may operate; it
+        // does not override the model-trust boundary for a local KB. Keep
+        // this check on the lease path as well as the ambient path below so
+        // every native filesystem consumer of this choke point is fenced.
+        crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
+            .map_err(|error| invalid_input(error.to_string()))?;
         return Ok(effective);
     }
 
@@ -178,6 +184,12 @@ pub async fn check_native_access(
             )));
         }
     };
+
+    // Trust-required local KBs are a hard filesystem boundary. This common
+    // native-path choke point covers read, write, edit, LSP, skills, and every
+    // future native tool that obtains host-path authority through this helper.
+    crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
+        .map_err(|error| invalid_input(error.to_string()))?;
 
     if within_boundary(ctx, &effective) {
         return Ok(effective);
@@ -722,6 +734,8 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
             caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
@@ -823,6 +837,55 @@ mod tests {
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_lease_does_not_bypass_trust_required_local_knowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let knowledge_root = tmp.path().join("knowledge");
+        std::fs::create_dir(&knowledge_root).unwrap();
+        let target = knowledge_root.join("notes.md");
+
+        let mut ctx = sandboxed_ctx(tmp.path());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended
+            .knowledge_bases
+            .push(crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                "private".to_string(),
+                "Private".to_string(),
+                "Trusted local knowledge".to_string(),
+                crate::config::extended::KnowledgeBaseSource::Local {
+                    path: std::path::PathBuf::from("knowledge"),
+                },
+                crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                None,
+                None,
+                true,
+                crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+            ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            tmp.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        )));
+
+        let error = check_native_access(&ctx, &target, SandboxPathAccess::ReadWrite)
+            .await
+            .expect_err("an untrusted leased agent must not access a protected local KB");
+        assert!(
+            error
+                .to_string()
+                .contains("local knowledge base that requires a trusted model"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]

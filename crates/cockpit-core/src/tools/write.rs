@@ -1705,6 +1705,8 @@ mod tests {
         );
         let ctx = ToolCtx {
             agent_id: "helper".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
             caller_model: None,
             agent_instance_id: None,
             lock_identity: "helper".to_string(),

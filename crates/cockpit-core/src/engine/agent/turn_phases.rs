@@ -2234,6 +2234,7 @@ pub(crate) async fn run_turn(
         agent.definition.as_deref(),
         &config,
         redact.clone(),
+        model.is_trusted(),
         tx,
     )
     .await;
@@ -3359,6 +3360,8 @@ pub(crate) async fn run_turn(
     // Tool dispatch.
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
+        executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+        knowledge_access_trusted: agent.model.is_trusted(),
         caller_model: Some(crate::engine::tool::CallerModel::from_model(
             agent.model.as_ref(),
         )),
@@ -3680,6 +3683,7 @@ async fn inject_volatile_context(
     definition: Option<&crate::agents::AgentDef>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
+    executing_model_trusted: bool,
     tx: &mpsc::Sender<TurnEvent>,
 ) {
     inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history).await;
@@ -3696,6 +3700,7 @@ async fn inject_volatile_context(
         config,
         &knowledge_query,
         redact.clone(),
+        executing_model_trusted,
     )
     .await;
 
@@ -4212,6 +4217,8 @@ mod tests {
             active_tools: agent.tools.clone(),
             tool_ctx: crate::engine::tool::ToolCtx {
                 agent_id: agent.name.clone(),
+                executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+                knowledge_access_trusted: agent.model.is_trusted(),
                 caller_model: Some(crate::engine::tool::CallerModel::from_model(
                     agent.model.as_ref(),
                 )),

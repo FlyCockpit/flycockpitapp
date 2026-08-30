@@ -309,7 +309,7 @@ pub async fn build_sandboxed_command(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> Result<tokio::process::Command> {
-    build_sandboxed_command_with_workspace_scratch(
+    build_sandboxed_command_with_sandbox_roots(
         command,
         cwd,
         tmp_dir,
@@ -318,11 +318,17 @@ pub async fn build_sandboxed_command(
         session_env,
         extra_paths,
         write_scope,
+        &[],
     )
     .await
 }
 
-pub async fn build_sandboxed_command_with_workspace_scratch(
+/// Build a confined command while carving protected roots out of both read
+/// and write authority. Deny entries take precedence over the workspace root,
+/// which keeps a trusted local KB inaccessible even when it lives below cwd.
+/// The durable workspace scratch is an explicit read/write capability.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_sandboxed_command_with_sandbox_roots(
     command: &str,
     cwd: &std::path::Path,
     tmp_dir: Option<&std::path::Path>,
@@ -331,6 +337,7 @@ pub async fn build_sandboxed_command_with_workspace_scratch(
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
+    denied_paths: &[std::path::PathBuf],
 ) -> Result<tokio::process::Command> {
     build_sandboxed_command_with_visibility_root(
         command,
@@ -344,6 +351,7 @@ pub async fn build_sandboxed_command_with_workspace_scratch(
         write_scope,
         false,
         true,
+        denied_paths,
     )
     .await
 }
@@ -365,6 +373,7 @@ pub async fn build_sandboxed_command_with_visibility_root(
     write_scope: Option<&std::path::Path>,
     restrict_to_visibility: bool,
     workspace_write_allowed: bool,
+    denied_paths: &[std::path::PathBuf],
 ) -> Result<tokio::process::Command> {
     // The ephemeral tmp remains lease-local, while the session's durable
     // scratch is an explicit capability and remains available outside a child
@@ -431,6 +440,10 @@ pub async fn build_sandboxed_command_with_visibility_root(
 
     for path in &policy.allow_write_roots {
         sandbox = sandbox.allow_write(path.clone());
+    }
+
+    for path in denied_paths {
+        sandbox = sandbox.deny_read(path.clone()).deny_write(path.clone());
     }
 
     if workspace_write_allowed

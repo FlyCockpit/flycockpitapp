@@ -49,6 +49,10 @@ pub struct BackgroundLaunch {
     pub tmp_dir: Option<PathBuf>,
     pub workspace_scratch_dir: Option<PathBuf>,
     pub session_env: HashMap<String, String>,
+    /// Protected local-KB roots carved out of the shell sandbox. A launch
+    /// carrying these paths must always be confined; driver construction owns
+    /// that invariant.
+    denied_knowledge_paths: Vec<PathBuf>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
 }
@@ -60,6 +64,7 @@ impl BackgroundLaunch {
             tmp_dir: None,
             workspace_scratch_dir: None,
             session_env,
+            denied_knowledge_paths: Vec::new(),
             #[cfg(test)]
             test_sandbox_build: None,
         }
@@ -70,11 +75,26 @@ impl BackgroundLaunch {
         workspace_scratch_dir: PathBuf,
         session_env: HashMap<String, String>,
     ) -> Self {
+        Self::confined_with_denied_knowledge_paths(
+            tmp_dir,
+            workspace_scratch_dir,
+            session_env,
+            Vec::new(),
+        )
+    }
+
+    pub fn confined_with_denied_knowledge_paths(
+        tmp_dir: Option<PathBuf>,
+        workspace_scratch_dir: PathBuf,
+        session_env: HashMap<String, String>,
+        denied_knowledge_paths: Vec<PathBuf>,
+    ) -> Self {
         Self {
             confine: true,
             tmp_dir,
             workspace_scratch_dir: Some(workspace_scratch_dir),
             session_env,
+            denied_knowledge_paths,
             #[cfg(test)]
             test_sandbox_build: None,
         }
@@ -650,7 +670,7 @@ async fn build_confined_background_command(
         }
     }
 
-    crate::tools::shell_sandbox::build_sandboxed_command_with_workspace_scratch(
+    crate::tools::shell_sandbox::build_sandboxed_command_with_sandbox_roots(
         command,
         cwd,
         launch.tmp_dir.as_deref(),
@@ -659,6 +679,7 @@ async fn build_confined_background_command(
         &launch.session_env,
         &[],
         None,
+        &launch.denied_knowledge_paths,
     )
     .await
 }

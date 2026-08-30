@@ -220,6 +220,13 @@ pub(crate) async fn read_impl_outcome_with_path(
     path: PathBuf,
     read_file: impl FnOnce(&Path) -> io::Result<Vec<u8>>,
 ) -> Result<ReadOutcome> {
+    // `read_impl_*` is also used by narrow internal consumers that do not go
+    // through `ReadTool::call`; retain the KB trust fence at the byte-read
+    // implementation boundary as well as the common native-path gate.
+    let path = crate::tools::sandbox::effective_native_path(&path)
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
+    crate::knowledge::ensure_local_knowledge_path_access(ctx, &path)
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     // Directory case: `read` needs a single file. Detect it with a portable
     // `is_dir()` check (never errno/ErrorKind — `os error 21` is Unix-only) so
     // the branch fires identically on every platform, and return a non-fatal

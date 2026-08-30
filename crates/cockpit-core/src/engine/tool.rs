@@ -1053,6 +1053,15 @@ impl ToolOutput {
 /// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
     pub(crate) agent_id: String,
+    /// History-read trust of the concrete tool frame. This is carried from the
+    /// agent frame rather than inferred from the session's active model;
+    /// delegated frames remain untrusted even when a host-selected fallback
+    /// model is trusted, because their custody is redacted-untrusted.
+    pub(crate) executing_model_trusted: bool,
+    /// Provider/model trust for KB access. This intentionally remains distinct
+    /// from `executing_model_trusted`: a delegated model may receive redacted
+    /// history while still being explicitly trusted for a local KB.
+    pub(crate) knowledge_access_trusted: bool,
     /// Exact provider/model identity of the agent that issued this tool call.
     ///
     /// This is intentionally dispatch-scoped rather than derived from the
@@ -1254,6 +1263,8 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            executing_model_trusted: self.executing_model_trusted,
+            knowledge_access_trusted: self.knowledge_access_trusted,
             caller_model: self.caller_model.clone(),
             agent_instance_id: self.agent_instance_id,
             lock_identity: self.lock_identity.clone(),

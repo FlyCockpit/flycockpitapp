@@ -108,6 +108,13 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // The normal tool dispatcher applies this fence too, but retain it at
+        // the opaque MCP host boundary: a model-authored script can invoke any
+        // configured third-party server, including one with filesystem or
+        // command access. This also protects direct Tool callers from
+        // bypassing the common dispatcher.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())?;
+
         let script = args
             .get("script")
             .and_then(Value::as_str)
@@ -163,6 +170,53 @@ mod tests {
             .find(|definition| definition.name == "mcp")
             .unwrap()
             .description
+    }
+
+    #[tokio::test]
+    async fn untrusted_model_cannot_reach_configured_mcp_through_trusted_kb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let protected_root = tmp.path().join(".cockpit/knowledge");
+        std::fs::create_dir_all(&protected_root).unwrap();
+
+        let entry = crate::config::extended::KnowledgeBaseRegistryEntry::new(
+            "private".to_string(),
+            "Private".to_string(),
+            "Private local knowledge".to_string(),
+            crate::config::extended::KnowledgeBaseSource::Local {
+                path: std::path::PathBuf::from(".cockpit/knowledge"),
+            },
+            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            true,
+            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+        );
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![entry],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let error = McpTool
+            .call(
+                serde_json::json!({ "script": "mcp.invoke('local', 'read', {})" }),
+                &ctx,
+            )
+            .await
+            .expect_err("untrusted models must not reach opaque MCP servers");
+
+        assert!(error.to_string().contains("access denied"), "{error:#}");
+        assert!(error.to_string().contains("mcp"), "{error:#}");
+        assert!(
+            error.to_string().contains("requires a trusted model"),
+            "{error:#}"
+        );
     }
 
     #[test]

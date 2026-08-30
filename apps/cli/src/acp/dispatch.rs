@@ -2,10 +2,9 @@
 //!
 //! Cockpit's parser gates each frame and retains raw `params`; the admitted
 //! request is then routed through jsonrpsee's raw-request dispatch API. The
-//! production transport deliberately has no session ingress owner yet, so its
-//! session methods fail closed. Tests can inject a recording owner to exercise
-//! the DTO-to-bridge conversion seam without pretending that a daemon API
-//! exists.
+//! the default module fails closed when no ingress owner is supplied. The
+//! `cockpit acp` command supplies the socket-daemon Code-root ingress; tests
+//! can inject a recording owner to exercise the DTO-to-bridge seam.
 
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +26,7 @@ const JSONRPSEE_RAW_PARAMS_API: for<'a, 'p> fn(&'a Params<'p>) -> Option<&'a str
 
 const INBOUND_METHODS: &[&str] = &[
     "initialize",
+    "session/list",
     "session/new",
     "session/load",
     "session/cancel",
@@ -59,6 +59,12 @@ pub trait SessionIngress: Send {
         counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError>;
 
+    fn list(
+        &mut self,
+        raw_params: &str,
+        counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError>;
+
     fn cancel(
         &mut self,
         raw_params: &str,
@@ -72,7 +78,7 @@ pub trait SessionIngress: Send {
     ) -> Result<serde_json::Value, SessionIngressError>;
 }
 
-/// The only production owner until the out-of-scope daemon adaptation lands.
+/// Fail-closed owner for callers that do not compose a daemon ingress.
 #[derive(Debug, Default)]
 pub struct UnavailableSessionIngress;
 
@@ -84,6 +90,14 @@ impl SessionIngress for UnavailableSessionIngress {
     fn admit(
         &mut self,
         _admission: SessionAdmissionDto,
+        _counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError> {
+        Err(SessionIngressError::Unavailable)
+    }
+
+    fn list(
+        &mut self,
+        _raw_params: &str,
         _counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError> {
         Err(SessionIngressError::Unavailable)
@@ -136,6 +150,23 @@ fn build_rpc_module_from_arc<I: SessionIngress + 'static>(
             Ok::<_, ErrorObjectOwned>(initialize_result())
         })
         .expect("initialize is unique");
+    module
+        .register_method("session/list", |params, context, _| {
+            let raw = context
+                .raw_params
+                .clone()
+                .or_else(|| JSONRPSEE_RAW_PARAMS_API(&params).map(str::to_string))
+                .unwrap_or_else(|| "{}".to_string());
+            ensure_session_ingress_available(context)?;
+            let mut counters = context.counters.lock().expect("dispatch counters");
+            context
+                .session_ingress
+                .lock()
+                .expect("session ingress")
+                .list(&raw, &mut counters)
+                .map_err(ingress_error)
+        })
+        .expect("session/list is unique");
     module
         .register_method("session/new", |params, context, _| {
             let raw = required_raw_params(&params, context)?;

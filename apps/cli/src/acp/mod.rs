@@ -16,6 +16,7 @@ mod dto;
 pub(crate) mod envelope;
 pub(crate) mod raw_json;
 pub(crate) mod registry;
+pub(crate) mod server;
 
 pub(crate) use codec::{
     ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1, ACP_JSON_FRAME_MAX_BYTES_V1, AcpFrame, AcpFrameError,

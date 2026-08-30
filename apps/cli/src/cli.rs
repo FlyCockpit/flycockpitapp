@@ -85,6 +85,8 @@ pub struct PublicCli {
 
 #[derive(Debug, Subcommand)]
 pub enum PublicCommand {
+    /// Run the local Agent Client Protocol stdio server.
+    Acp,
     Ask(AskArgs),
     Run(RunArgs),
     #[command(subcommand)]
@@ -127,6 +129,7 @@ impl From<PublicCli> for Cli {
             debug_last_message: value.debug_last_message,
             no_sandbox: value.no_sandbox,
             command: value.command.map(|command| match command {
+                PublicCommand::Acp => Command::Acp,
                 PublicCommand::Ask(args) => Command::Ask(args),
                 PublicCommand::Run(args) => Command::Run(args),
                 PublicCommand::Agent(args) => Command::Agent(args),
@@ -149,6 +152,9 @@ impl From<PublicCli> for Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the local Agent Client Protocol stdio server for Code roots.
+    Acp,
+
     /// Ask a registered dependency package using the read-only docs agent.
     Ask(AskArgs),
 

@@ -56,6 +56,14 @@ impl SessionIngress for RecordingSessionIngress {
         Ok(json!({ "sessionId": session_id }))
     }
 
+    fn list(
+        &mut self,
+        _raw_params: &str,
+        _counters: &mut AcpTransportCounters,
+    ) -> Result<serde_json::Value, SessionIngressError> {
+        Ok(json!({ "sessions": [] }))
+    }
+
     fn cancel(
         &mut self,
         _raw_params: &str,
@@ -152,7 +160,8 @@ fn acp_transport_initialize_capability_serialization() {
     .unwrap();
     assert_jsonrpc_2_0(&response);
     assert!(response.contains("\"protocolVersion\":1"));
-    assert!(response.contains("\"loadSession\":false"));
+    assert!(response.contains("\"loadSession\":true"));
+    assert!(response.contains("\"sessionCapabilities\""));
     assert!(!response.contains("promptCapabilities"));
     assert!(!response.contains("mcpCapabilities"));
     assert!(!response.contains("elicitation"));
@@ -161,6 +170,7 @@ fn acp_transport_initialize_capability_serialization() {
         registered_method_names(),
         [
             "initialize",
+            "session/list",
             "session/new",
             "session/load",
             "session/cancel",

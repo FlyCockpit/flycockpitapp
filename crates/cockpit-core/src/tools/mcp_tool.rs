@@ -113,8 +113,6 @@ impl Tool for McpTool {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`script` (a Python string) is required"))?;
 
-        ctx.mcp_resolver
-            .observe_config_generation(ctx.config.snapshot().generation);
         let catalog = ctx.mcp_resolver.catalog();
         if catalog.has_reserved_builtin_server_config()
             && let Some(text) = ctx.session.mcp_reserved_cockpit_server_notice()

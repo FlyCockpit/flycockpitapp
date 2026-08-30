@@ -14137,16 +14137,16 @@ async fn handle_serialized_request_impl(
                         .map_err(bad_config)?
                         .ok_or_else(|| bad_request(format!("agent `{agent}` was not found")))?;
                     let catalog = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
-                        &cwd, 0, &def,
+                        &cwd, &def,
                     )
                     .catalog();
-                    let entry = catalog.servers.get(&server).ok_or_else(|| {
+                    let entry = catalog.get(&server).ok_or_else(|| {
                         bad_request(format!("MCP server `{server}` is not available to agent `{agent}`"))
                     })?;
                     if !entry.agent_bound {
                         return Err(bad_request(format!(
                             "MCP OAuth agent selector requires an agent-package server; `{server}` comes from {} scope",
-                            entry.source.as_str()
+                            entry.source().as_str()
                         )));
                     }
                     if entry.profile != profile {
@@ -14155,7 +14155,11 @@ async fn handle_serialized_request_impl(
                             entry.profile
                         )));
                     }
-                    entry.server.clone()
+                    entry.persistent_server().cloned().ok_or_else(|| {
+                        bad_request(format!(
+                            "MCP OAuth cannot authenticate the built-in `{server}` pseudo-server"
+                        ))
+                    })?
                 } else {
                     let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
                     let config = mcp_config_from_paths(&paths)?;
@@ -20156,13 +20160,12 @@ fn redacted_mcp_config_snapshot(
         crate::mcp::resolver::discover_effective_catalog(cwd)
     });
     let mut shadowed = catalog
-        .shadowed
-        .iter()
+        .shadowed_entries()
         .filter_map(|entry| {
             entry.shadowed_by.map(|shadowed_by| {
                 serde_json::json!({
-                    "server": entry.name,
-                    "source": entry.source.as_str(),
+                    "server": entry.name(),
+                    "source": entry.source().as_str(),
                     "shadowed_by": shadowed_by.as_str(),
                 })
             })
@@ -20173,18 +20176,18 @@ fn redacted_mcp_config_snapshot(
             continue;
         };
         let agent_catalog =
-            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, 0, &def).catalog();
-        shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
+            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, &def).catalog();
+        shadowed.extend(agent_catalog.shadowed_entries().filter_map(|entry| {
             let shadowed_by = entry.shadowed_by?;
-            if entry.source != crate::mcp::resolver::McpScope::Agent
+            if entry.source() != crate::mcp::resolver::McpScope::Agent
                 && shadowed_by != crate::mcp::resolver::McpScope::Agent
             {
                 return None;
             }
             Some(serde_json::json!({
                 "agent": listing.name,
-                "server": entry.name,
-                "source": entry.source.as_str(),
+                "server": entry.name(),
+                "source": entry.source().as_str(),
                 "shadowed_by": shadowed_by.as_str(),
             }))
         }));
@@ -27099,6 +27102,8 @@ async fn run_docs_ask_pipeline(
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd.clone())
+            .catalog(),
         model_override: None,
         delegation_model: None,
         delegated: true,

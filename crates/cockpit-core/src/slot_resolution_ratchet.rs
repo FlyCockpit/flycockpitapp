@@ -230,8 +230,7 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         function_body(&builtin, "fn rebuild_from_pinned_definition"),
         &[
             "load_resolved_def",
-            "parent_reachable()",
-            "with_parent_reachable",
+            "rebuilt.mcp_resolver = agent.mcp_resolver.clone()",
         ],
         "rebuild_from_pinned_definition",
     );

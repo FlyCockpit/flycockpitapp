@@ -4444,12 +4444,7 @@ impl Driver {
             },
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
-            mcp_resolver: {
-                agent
-                    .mcp_resolver
-                    .observe_config_generation(self.config.snapshot().generation);
-                agent.mcp_resolver.clone()
-            },
+            mcp_resolver: agent.mcp_resolver.clone(),
         };
         let call = crate::engine::message::ToolCall {
             id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -14034,6 +14029,7 @@ impl Driver {
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
             mcp_parent_reachable: None,
+            mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),
             // Root construction may consume explicit/resumed selection
             // provenance or a legacy plan-level override. vNext children
             // discard it at the delegated-spawn boundary and resolve their own
@@ -14128,7 +14124,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             ..self.spawn_args(interactive)
         }
     }
@@ -14203,7 +14199,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
             ..self.spawn_args(interactive)
         }

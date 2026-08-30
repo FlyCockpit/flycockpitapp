@@ -6350,6 +6350,10 @@ pub(super) async fn run_worker(
         // it gets the cross-session recall tools.
         interactive: true,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(
+            project_root.clone(),
+        )
+        .catalog(),
         // Root-selection provenance: an explicit fresh choice or an installed
         // root's persisted resume choice must pass through vNext slot /
         // derived-definition validation. Legacy plan-level pins retain their

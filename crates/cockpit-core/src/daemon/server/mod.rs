@@ -2619,6 +2619,16 @@ impl DaemonContext {
                 db.clone(),
                 registry.clone(),
             ));
+            // Register daemon-owned callbacks before the scheduler is started.
+            // `DaemonContext::new` is intentionally infallible, while a
+            // handle-level registration can fail for executors that do not
+            // expose a callback registry. This production executor always
+            // owns one, so install the callback at construction instead.
+            let keep_warm_registry = registry.clone();
+            executor.register_callback("keep_warm", move |job| {
+                let registry = keep_warm_registry.clone();
+                async move { registry.run_keep_warm_job(job).await }
+            });
             let callbacks = executor.callback_registry();
             Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
                 db.clone(),
@@ -2631,11 +2641,6 @@ impl DaemonContext {
         let scheduler: Option<crate::daemon::scheduler::DaemonSchedulerHandle> = None;
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
-            let keep_warm_registry = registry.clone();
-            handle.register_callback("keep_warm", move |job| {
-                let registry = keep_warm_registry.clone();
-                async move { registry.run_keep_warm_job(job).await }
-            })?;
         }
         let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
         let host_capability_probes =

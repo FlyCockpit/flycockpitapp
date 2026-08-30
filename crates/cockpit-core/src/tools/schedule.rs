@@ -152,7 +152,8 @@ pub struct ForkScheduleState {
     own_job_id: String,
     notes: Mutex<Vec<String>>,
     requests: Mutex<Vec<SpawnRequest>>,
-    actions: Mutex<Vec<String>>,
+    actions: Mutex<Vec<(u64, String)>>,
+    next_action_id: std::sync::atomic::AtomicU64,
     cancelled: std::sync::atomic::AtomicBool,
     sealed_for_cancellation: std::sync::atomic::AtomicBool,
 }
@@ -164,6 +165,7 @@ impl ForkScheduleState {
             notes: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             actions: Mutex::new(Vec::new()),
+            next_action_id: std::sync::atomic::AtomicU64::new(0),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             sealed_for_cancellation: std::sync::atomic::AtomicBool::new(false),
         }
@@ -205,22 +207,32 @@ impl ForkScheduleState {
         true
     }
 
-    fn push_action(&self, action: String) -> bool {
+    fn begin_action(&self, action: String) -> Option<u64> {
         if self
             .sealed_for_cancellation
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return false;
+            return None;
         }
         let mut actions = self.actions.lock().unwrap();
         if self
             .sealed_for_cancellation
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return false;
+            return None;
         }
-        actions.push(action);
-        true
+        let id = self
+            .next_action_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        actions.push((id, action));
+        Some(id)
+    }
+
+    fn discard_action(&self, id: u64) {
+        self.actions
+            .lock()
+            .unwrap()
+            .retain(|(action_id, _)| *action_id != id);
     }
 
     fn cancel(&self) {
@@ -258,12 +270,14 @@ impl ForkScheduleState {
         std::mem::take(&mut *self.requests.lock().unwrap())
     }
 
-    /// Drain effectful ordinary-tool calls. These are intentionally recorded
-    /// before dispatch: an external cancellation may abort the future after a
-    /// tool has already changed local or remote state, and must not turn that
-    /// wake into an apparent no-op.
+    /// Drain effectful ordinary-tool calls. In-flight potentially stateful
+    /// calls retain their reservation on external cancellation because their
+    /// host effect is uncertain; normal failures retract it before this point.
     pub fn take_actions(&self) -> Vec<String> {
         std::mem::take(&mut *self.actions.lock().unwrap())
+            .into_iter()
+            .map(|(_, action)| action)
+            .collect()
     }
 }
 
@@ -395,6 +409,10 @@ impl Tool for IdleWakeActionTool {
         self.inner.effect()
     }
 
+    fn completed_call_effect(&self, args: &Value, output: &ToolOutput) -> ToolEffect {
+        self.inner.completed_call_effect(args, output)
+    }
+
     fn authorizes_own_effects(&self) -> bool {
         self.inner.authorizes_own_effects()
     }
@@ -420,15 +438,39 @@ impl Tool for IdleWakeActionTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        if !self
-            .state
-            .push_action(format!("invoked stateful tool `{}`", self.inner.name()))
-        {
-            return Err(anyhow::anyhow!(
-                "idle wake was cancelled before the tool could run"
-            ));
+        // A dynamic capability is not proof that this invocation mutated
+        // anything. Reserve an action only for calls that are not proven
+        // read-only, then retract it on ordinary failure. If cancellation
+        // drops the in-flight future, the reservation deliberately survives:
+        // the host call may already have changed state and the authority must
+        // not turn that uncertain result into a false no-op.
+        let action = if self.inner.effect() == ToolEffect::ReadOnly {
+            None
+        } else {
+            Some(
+                self.state
+                    .begin_action(format!("completed stateful tool `{}`", self.inner.name()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("idle wake was cancelled before the tool could run")
+                    })?,
+            )
+        };
+        match self.inner.call(args.clone(), ctx).await {
+            Ok(output) => {
+                if self.inner.completed_call_effect(&args, &output) == ToolEffect::ReadOnly {
+                    if let Some(action) = action {
+                        self.state.discard_action(action);
+                    }
+                }
+                Ok(output)
+            }
+            Err(error) => {
+                if let Some(action) = action {
+                    self.state.discard_action(action);
+                }
+                Err(error)
+            }
         }
-        self.inner.call(args, ctx).await
     }
 
     fn ledger_args(&self, args: &Value) -> Value {
@@ -609,7 +651,44 @@ impl Tool for ForkScheduleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use serde_json::json;
+
+    struct DynamicTestTool {
+        succeeds: bool,
+        completed_effect: ToolEffect,
+    }
+
+    #[async_trait]
+    impl Tool for DynamicTestTool {
+        fn name(&self) -> &str {
+            "dynamic-test"
+        }
+
+        fn description(&self) -> &str {
+            "test dynamic tool"
+        }
+
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::Dynamic
+        }
+
+        fn completed_call_effect(&self, _args: &Value, _output: &ToolOutput) -> ToolEffect {
+            self.completed_effect
+        }
+
+        fn parameters(&self) -> Value {
+            Value::Null
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            if self.succeeds {
+                Ok(ToolOutput::text("status clean"))
+            } else {
+                Err(invalid_input("bad args"))
+            }
+        }
+    }
 
     fn remove_descriptions(value: &mut Value) {
         match value {
@@ -864,6 +943,44 @@ mod tests {
             TurnEvent::ScheduleNote { text, .. } => assert_eq!(text, "halfway there"),
             other => panic!("expected ScheduleNote, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn idle_dynamic_tool_failure_retracts_its_provisional_action() {
+        let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        let tool = IdleWakeActionTool::new(
+            Arc::new(DynamicTestTool {
+                succeeds: false,
+                completed_effect: ToolEffect::Dynamic,
+            }),
+            state.clone(),
+        );
+        let (_dir, ctx) = test_ctx();
+
+        assert!(tool.call(Value::Null, &ctx).await.is_err());
+        assert!(
+            !state.has_persistent_action(),
+            "a failed dynamic call must leave an idle wake ephemeral"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_dynamic_read_only_completion_retracts_its_provisional_action() {
+        let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        let tool = IdleWakeActionTool::new(
+            Arc::new(DynamicTestTool {
+                succeeds: true,
+                completed_effect: ToolEffect::ReadOnly,
+            }),
+            state.clone(),
+        );
+        let (_dir, ctx) = test_ctx();
+
+        tool.call(Value::Null, &ctx).await.unwrap();
+        assert!(
+            !state.has_persistent_action(),
+            "a proven read-only dynamic call must leave an idle wake ephemeral"
+        );
     }
 
     #[test]

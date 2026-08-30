@@ -4052,20 +4052,10 @@ async fn handle_send_user_message(
         Ok(result) => result,
         Err(error) => return Err(error),
     };
-    // Inline/media admission is now durable. Publish both activity epochs at
-    // ingress, before returning the queue acknowledgement: the worker handle's
-    // watch sender reaches in-process idle forks even while the driver is busy,
-    // and the daemon scheduler owns persistent jobs. Oversized FCM2 advances
-    // both epochs at phase-two materialization in the driver instead.
-    if origin == proto::UserMessageOrigin::ExternalRoot && artifact_admission.is_none() {
-        handle.record_user_activity();
-        if let Some(scheduler) = &ctx.scheduler {
-            scheduler.record_user_activity().await;
-        }
-    }
-    // Oversized activity is advanced by the driver only after phase-two
-    // materialization. The dispatch path must not create an accepted-turn
-    // side effect merely because phase one reserved a lease.
+    // The worker publishes inline/media activity at its fresh-insert boundary,
+    // before it resolves this acknowledgement. Replays intentionally never
+    // reach that publication. Oversized FCM2 still advances activity only at
+    // its phase-two materialization boundary in the driver.
     Ok(Response::UserMessageQueued { item, queue })
 }
 

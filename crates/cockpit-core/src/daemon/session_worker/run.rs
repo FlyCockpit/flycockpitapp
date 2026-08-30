@@ -6864,7 +6864,7 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
-    driver.set_idle_activity_sender(idle_activity_tx);
+    driver.set_idle_activity_sender(idle_activity_tx.clone());
     driver.bind_enqueue_target(foreground_input_target.clone());
     let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
     driver.set_adopted_process_registry(adopted_processes.clone());
@@ -6896,6 +6896,10 @@ pub(super) async fn run_worker(
     if let Some(scheduler) = resource_scheduler {
         driver.set_resource_scheduler(scheduler);
     }
+    // Inline user-message admission is owned by this worker, while oversized
+    // admission becomes durable in the driver. Keep a separate scheduler
+    // source for the former so its reset can happen before acknowledgement.
+    let ingress_scheduler = scheduler.clone();
     driver.set_daemon_scheduler_source(scheduler);
     driver.set_write_scope_source(write_scope.clone());
     // Durable lifecycle rows foreign-key to `sessions`. A resumed session is
@@ -9994,6 +9998,12 @@ pub(super) async fn run_worker(
                     artifact_admission,
                     respond_to,
                 } => {
+                    // Inline external-root submissions become accepted at the
+                    // queue insert below. Oversized submissions have only a
+                    // phase-one reservation here; their activity stays owned
+                    // by the driver's phase-two materialization path.
+                    let reset_idle_timer =
+                        artifact_admission.is_none() && submission.origin.advances_activity_epoch();
                     let client_submission_id = submission
                         .client_submissions
                         .first()
@@ -11037,6 +11047,24 @@ pub(super) async fn run_worker(
                         };
                         let _ = respond_to.send(Err(rejection));
                         continue;
+                    }
+                    if reset_idle_timer
+                        && matches!(outcome, crate::engine::message::IdempotentPush::Inserted)
+                    {
+                        // `push_idempotent_on_live_target` returns without a
+                        // further await. Publish the in-process epoch before
+                        // any later await, so a due idle timer cannot run in
+                        // the accepted-message gap. The scheduler updates its
+                        // persistent idle timeline before its own
+                        // wake/rebuild await as well.
+                        let _ = idle_activity_tx.send(tokio::time::Instant::now());
+                        let scheduler = ingress_scheduler
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(scheduler) = scheduler {
+                            scheduler.record_user_activity().await;
+                        }
                     }
                     let queue: Vec<proto::QueueItem> =
                         snapshot.into_iter().map(queue_item_to_proto).collect();

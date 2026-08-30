@@ -486,6 +486,15 @@ pub trait Tool: Send + Sync {
         ToolEffect::Dynamic
     }
 
+    /// Call-specific effect classification used by ephemeral idle wakes after
+    /// a call has completed. `Dynamic` remains the conservative default: a
+    /// tool that can prove this exact successful invocation was read-only
+    /// overrides this method. This is deliberately separate from [`Self::effect`],
+    /// whose capability/approval meaning must stay conservative before a call.
+    fn completed_call_effect(&self, _args: &Value, _output: &ToolOutput) -> ToolEffect {
+        self.effect()
+    }
+
     /// Whether the tool owns a narrower, composite authorization chokepoint
     /// inside its implementation. Such a tool still advertises its real effect
     /// and remains subject to review-cage and loop controls, but ordinary-tool

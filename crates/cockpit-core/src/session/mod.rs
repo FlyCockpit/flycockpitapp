@@ -20,6 +20,7 @@
 
 #![allow(deprecated)]
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -94,6 +95,10 @@ pub struct SessionCompactionRecord<'a> {
 #[derive(Default)]
 pub(crate) struct KnowledgeReadSnapshotStore {
     entries: std::collections::HashMap<Uuid, KnowledgeReadSnapshot>,
+    /// Least-recently-used at the front. Snapshot citations are a bounded
+    /// convenience cache, not durable session state: retaining a newer source
+    /// must never make later searches unavailable for the life of a session.
+    recency: VecDeque<Uuid>,
     total_bytes: usize,
 }
 
@@ -104,6 +109,67 @@ pub(crate) struct KnowledgeReadSnapshot {
 }
 
 const MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+impl KnowledgeReadSnapshotStore {
+    fn mark_knowledge_read_snapshot_recent(&mut self, id: Uuid) {
+        if let Some(position) = self.recency.iter().position(|candidate| *candidate == id) {
+            self.recency.remove(position);
+        }
+        self.recency.push_back(id);
+    }
+
+    fn retain(&mut self, contents: String, trust_required: bool, capacity: usize) -> Result<Uuid> {
+        if let Some((id, _)) = self.entries.iter().find(|(_, snapshot)| {
+            snapshot.contents == contents && snapshot.trust_required == trust_required
+        }) {
+            self.mark_knowledge_read_snapshot_recent(*id);
+            return Ok(*id);
+        }
+        anyhow::ensure!(
+            contents.len() <= capacity,
+            "knowledge search source is larger than the per-session {} MiB cited-read cache",
+            capacity / (1024 * 1024)
+        );
+        while self.total_bytes > capacity - contents.len() {
+            let evicted_id = self.recency.pop_front().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge read snapshot cache lost its eviction order while retaining a source"
+                )
+            })?;
+            let evicted = self.entries.remove(&evicted_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge read snapshot cache eviction order references a missing source"
+                )
+            })?;
+            self.total_bytes = self
+                .total_bytes
+                .checked_sub(evicted.contents.len())
+                .context("knowledge read snapshot byte count underflow during eviction")?;
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(contents.len())
+            .context("knowledge read snapshot byte count overflow")?;
+        let id = Uuid::new_v4();
+        self.entries.insert(
+            id,
+            KnowledgeReadSnapshot {
+                contents,
+                trust_required,
+            },
+        );
+        self.recency.push_back(id);
+        Ok(id)
+    }
+
+    fn get(&mut self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
+        let snapshot = self.entries.get(&id).cloned();
+        if snapshot.is_some() {
+            self.mark_knowledge_read_snapshot_recent(id);
+        }
+        snapshot
+    }
+}
 
 tokio::task_local! {
     static SESSION_EVENT_LINEAGE: Option<SessionEventLineage>;
@@ -551,39 +617,15 @@ impl Session {
             .knowledge_read_snapshots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((id, _)) = snapshots.entries.iter().find(|(_, snapshot)| {
-            snapshot.contents == contents && snapshot.trust_required == trust_required
-        }) {
-            return Ok(*id);
-        }
-        let new_total = snapshots
-            .total_bytes
-            .checked_add(contents.len())
-            .context("knowledge read snapshot byte count overflow")?;
-        anyhow::ensure!(
-            new_total <= MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES,
-            "knowledge read snapshots exceed the per-session {} MiB limit; rerun the needed search after reducing attachment scope",
-            MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES / (1024 * 1024)
-        );
-        let id = Uuid::new_v4();
-        snapshots.total_bytes = new_total;
-        snapshots.entries.insert(
-            id,
-            KnowledgeReadSnapshot {
-                contents,
-                trust_required,
-            },
-        );
-        Ok(id)
+        snapshots.retain(contents, trust_required, MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES)
     }
 
     pub(crate) fn knowledge_read_snapshot(&self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
-        self.knowledge_read_snapshots
+        let mut snapshots = self
+            .knowledge_read_snapshots
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entries
-            .get(&id)
-            .cloned()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.get(id)
     }
 
     /// The session-owned knowledge-dream attachment-consent cell.
@@ -2150,6 +2192,21 @@ mod tests {
             assert!(scope.read().unwrap().is_some());
         }
         assert!(scope.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn knowledge_read_snapshots_evict_the_least_recently_used_source() {
+        let mut snapshots = KnowledgeReadSnapshotStore::default();
+        let first = snapshots.retain("one".to_string(), false, 6).unwrap();
+        let second = snapshots.retain("two".to_string(), false, 6).unwrap();
+
+        assert_eq!(snapshots.get(first).unwrap().contents, "one");
+        let third = snapshots.retain("six".to_string(), false, 6).unwrap();
+
+        assert!(snapshots.get(second).is_none());
+        assert_eq!(snapshots.get(first).unwrap().contents, "one");
+        assert_eq!(snapshots.get(third).unwrap().contents, "six");
+        assert_eq!(snapshots.total_bytes, 6);
     }
 
     #[tokio::test]

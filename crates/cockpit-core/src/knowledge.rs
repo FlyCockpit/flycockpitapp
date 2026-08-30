@@ -320,6 +320,10 @@ pub(crate) struct SearchResult {
     pub snippet: String,
     pub citations: Vec<Citation>,
     pub score: f64,
+    /// A structured predicate selected this exact row rather than merely its
+    /// owning concept. Its snippet is the row's JSON object and the cited
+    /// snapshot is the markdown table or sibling resource that contains it.
+    matched_structured_row: bool,
     /// The immutable source bytes from which this hit was indexed. This is
     /// consumed before rendering into a session-scoped read pseudofile.
     snapshot_source: Option<String>,
@@ -2104,6 +2108,13 @@ fn finish_bundle(
         markdown_files,
         markdown_bytes,
     )?;
+    let mut source_documents = source_documents;
+    // Structured resource hits cite their retained CSV/JSONL source directly,
+    // just as markdown hits cite their retained concept document. The index is
+    // disposable, so a follow-up read must never reopen the mutable resource.
+    for resource in &resources {
+        source_documents.insert(resource.path.clone(), resource.body.clone());
+    }
     Ok(KnowledgeBundle {
         root,
         index_md,
@@ -3378,9 +3389,16 @@ fn structured_search_index(
     conn: &Connection,
     query: &StructuredSearchQuery,
 ) -> Result<Vec<SearchResult>> {
-    let mut sql = String::from(
-        "SELECT c.id, c.path, c.body, c.citations_json\n         FROM concepts c\n         WHERE 1 = 1",
-    );
+    let matches_structured_rows = !query.structured_filters.is_empty();
+    let mut sql = if matches_structured_rows {
+        String::from(
+            "SELECT c.id, sr.source_path, sr.row_index, sr.values_json, c.citations_json\n             FROM concepts c\n             JOIN structured_rows sr ON sr.concept_id = c.id\n             WHERE 1 = 1",
+        )
+    } else {
+        String::from(
+            "SELECT c.id, c.path, 0, c.body, c.citations_json\n             FROM concepts c\n             WHERE 1 = 1",
+        )
+    };
     let mut values = Vec::new();
 
     if let Some(query) = query.query.as_deref() {
@@ -3420,8 +3438,7 @@ fn structured_search_index(
             values.push(SqlValue::Text(normalized_rfc3339_timestamp(before)?));
         }
     }
-    if !query.structured_filters.is_empty() {
-        sql.push_str("\n AND EXISTS (SELECT 1 FROM structured_rows sr WHERE sr.concept_id = c.id");
+    if matches_structured_rows {
         for filter in &query.structured_filters {
             sql.push_str(
                 "\n AND EXISTS (SELECT 1 FROM structured_values sv WHERE sv.row_id = sr.id AND sv.column_name = ? AND ",
@@ -3430,7 +3447,6 @@ fn structured_search_index(
             append_structured_value_predicate(&mut sql, &mut values, &filter.equals)?;
             sql.push(')');
         }
-        sql.push(')');
     }
     sql.push_str("\n ORDER BY c.id\n LIMIT ?");
     values.push(SqlValue::Integer(
@@ -3439,16 +3455,17 @@ fn structured_search_index(
 
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
-        let citations_json: String = row.get(3)?;
+        let citations_json: String = row.get(4)?;
         Ok(SearchResult {
             knowledge_base_id: String::new(),
             knowledge_base_name: String::new(),
             concept_id: row.get(0)?,
             source_path: row.get(1)?,
-            chunk_index: 0,
-            snippet: row.get(2)?,
+            chunk_index: row.get::<_, i64>(2)? as usize,
+            snippet: row.get(3)?,
             citations: serde_json::from_str(&citations_json).unwrap_or_default(),
             score: 1.0,
+            matched_structured_row: matches_structured_rows,
             snapshot_source: None,
             snapshot_trust_required: false,
         })
@@ -3546,6 +3563,7 @@ fn rrf_merge(
                     snippet: row.get(3)?,
                     citations,
                     score,
+                    matched_structured_row: false,
                     snapshot_source: None,
                     snapshot_trust_required: false,
                 })
@@ -6052,7 +6070,12 @@ fn render_structured_tool_results(results: &[SearchResult], redact: &RedactionTa
         out.push_str("- ");
         out.push_str(&result.concept_id);
         out.push_str(" — ");
-        out.push_str(&short_summary(&result.snippet));
+        if result.matched_structured_row {
+            out.push_str("matching row: ");
+            out.push_str(&result.snippet);
+        } else {
+            out.push_str(&short_summary(&result.snippet));
+        }
         out.push_str(" [");
         out.push_str(&citation_label(result));
         out.push_str("]\n");
@@ -6115,6 +6138,7 @@ mod tests {
             snippet: "Deploy through the retained lane.".to_string(),
             citations: Vec::new(),
             score: 1.0,
+            matched_structured_row: false,
             snapshot_source: None,
             snapshot_trust_required: false,
         }];
@@ -6930,7 +6954,18 @@ Inventory facts for warehouse operations.
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].concept_id, "structured");
+        assert!(results[0].matched_structured_row);
+        assert_eq!(results[0].source_path, "inventory.csv");
+        assert_eq!(
+            results[0].snippet,
+            r#"{"active":true,"count":4,"sku":"A-1"}"#
+        );
         assert_eq!(results[0].citations[0].target, "docs/inventory.md");
+        let bundle = parse_bundle(tmp.path()).unwrap();
+        assert_eq!(
+            snapshot_source_for_result(&bundle, &results[0]).unwrap(),
+            "sku,count,active\nA-1,4,true\n"
+        );
     }
 
     #[tokio::test]

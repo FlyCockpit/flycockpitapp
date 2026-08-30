@@ -467,12 +467,18 @@ pub(crate) async fn turn_toolbox(
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
+    let executing_model = format!(
+        "{}:{}",
+        agent.model.provider_id(),
+        agent.model.model_id_ref()
+    );
     toolbox = crate::knowledge::with_memory_search_if_attached(
         toolbox,
         session,
         cwd,
         agent.definition.as_deref(),
         config,
+        &executing_model,
     )
     .await;
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());

@@ -476,9 +476,10 @@ impl Model {
         .await
     }
 
-    /// Captured completion with the same request-local sealed egress table as
-    /// an already-prepared foreground request.  The metadata fork uses this
-    /// to extend that request's prefix without changing any redacted bytes.
+    /// Captured completion with the same request-local sealed egress table and
+    /// endpoint-recovery normalization policy as an already-prepared
+    /// foreground request. The metadata fork uses this to extend that
+    /// request's prefix without changing any rendered bytes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_captured_with_sealed_egress(
         &self,
@@ -488,6 +489,7 @@ impl Model {
         tools: &[ToolDefinition],
         params: ModelParams,
         agent_name: &str,
+        endpoint_recovery_enabled: bool,
         cancel: &CancellationToken,
         sealed_egress: Option<&crate::redact::RedactionTable>,
     ) -> Result<(
@@ -502,7 +504,7 @@ impl Model {
             &prompt,
             tools,
             &params,
-            false,
+            endpoint_recovery_enabled,
             sealed_egress,
         )?;
         self.complete_prepared_with_pre_drain(

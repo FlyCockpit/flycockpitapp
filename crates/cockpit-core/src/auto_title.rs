@@ -428,6 +428,7 @@ pub(crate) async fn generate_session_metadata_fork(
     mut history: Vec<Message>,
     source_prompt: Message,
     tools: Vec<crate::engine::message::ToolDefinition>,
+    endpoint_recovery_enabled: bool,
     work: MetadataWork,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
@@ -475,6 +476,7 @@ pub(crate) async fn generate_session_metadata_fork(
                 &tools,
                 params.clone(),
                 &agent_name,
+                endpoint_recovery_enabled,
                 &cancel,
                 sealed_egress.as_deref(),
             ) => completion,
@@ -483,10 +485,24 @@ pub(crate) async fn generate_session_metadata_fork(
             return;
         };
         let calls = collect_tool_calls(&content);
-        let Some(call) = calls.iter().find(|call| call.function.name == "mcp") else {
+        let Some((monty_call_index, call)) = calls
+            .iter()
+            .enumerate()
+            .find(|(_, call)| call.function.name == "mcp")
+        else {
             // The fork is not allowed to act on ordinary assistant prose or a
-            // non-Monty tool call. A single recovery turn may still use the
-            // injected skeleton, then it stops.
+            // non-Monty tool call. Retain this failed attempt so the recovery
+            // turn still receives the concrete skeleton it refers to. Every
+            // ignored tool call also receives an ephemeral result, preserving
+            // the provider's assistant/tool-result pairing invariant.
+            history.push(prompt);
+            history.push(Message::Assistant { id: None, content });
+            for ignored_call in calls {
+                history.push(tool_result_message(
+                    &ignored_call,
+                    metadata_fork_ignored_tool_result(),
+                ));
+            }
             prompt = Message::user(metadata_fork_retry_instruction());
             continue;
         };
@@ -519,16 +535,30 @@ pub(crate) async fn generate_session_metadata_fork(
             .ok()
             .and_then(|value| value.get("updated").and_then(serde_json::Value::as_bool))
             .unwrap_or(false);
-        // The successful metadata function has already performed its atomic
-        // update. The assistant/tool messages are retained only in this
-        // ephemeral fork for the one permitted recovery turn.
-        history.push(Message::Assistant { id: None, content });
-        history.push(tool_result_message(call, result));
         if updated {
             return;
         }
+        // The metadata function has already declined its conditional write.
+        // Keep the complete first exchange only in the ephemeral fork before
+        // the one permitted recovery turn. Any additional calls are never
+        // executed, but receive synthetic results so their history pairing
+        // remains valid.
+        history.push(prompt);
+        history.push(Message::Assistant { id: None, content });
+        for (index, ignored_call) in calls.into_iter().enumerate() {
+            let output = if index == monty_call_index {
+                result.clone()
+            } else {
+                metadata_fork_ignored_tool_result()
+            };
+            history.push(tool_result_message(&ignored_call, output));
+        }
         prompt = Message::user(metadata_fork_retry_instruction());
     }
+}
+
+fn metadata_fork_ignored_tool_result() -> String {
+    r#"{"ignored":true,"reason":"The metadata fork only executes Monty calls."}"#.to_string()
 }
 
 /// Cancels the revocation watcher once this short-lived, ephemeral fork has

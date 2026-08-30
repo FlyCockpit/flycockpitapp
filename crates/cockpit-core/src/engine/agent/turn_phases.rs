@@ -2357,6 +2357,7 @@ pub(crate) async fn run_turn(
                     })
                 },
             });
+    let endpoint_recovery_enabled = endpoint_recovery.is_some();
 
     // Dispatch-time recording (`inference-timeout-and-failure-
     // observability.md` #4): persist the attempt's captured body BEFORE the
@@ -2427,7 +2428,7 @@ pub(crate) async fn run_turn(
         &prompt,
         &tools,
         &agent.params,
-        endpoint_recovery.is_some(),
+        endpoint_recovery_enabled,
         sealed_egress.as_deref(),
     )?;
     // The immutable post-render request body for this dispatched-target attempt.
@@ -2658,6 +2659,7 @@ pub(crate) async fn run_turn(
                 history,
                 prompt,
                 tools,
+                endpoint_recovery_enabled,
                 work,
                 cwd,
                 config,

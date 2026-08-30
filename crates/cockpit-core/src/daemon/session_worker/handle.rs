@@ -1649,6 +1649,7 @@ impl SessionWorkerHandle {
             &work,
             SessionWork::ReplaceConfigSnapshot { .. }
                 | SessionWork::Cancel
+                | SessionWork::CancelAll
                 | SessionWork::Shutdown { .. }
         );
         // Reserve capacity before taking the publication read fence. Holding
@@ -2173,6 +2174,16 @@ pub struct OversizedRunInvocationAdmission {
 #[derive(Debug)]
 pub enum SessionWork {
     WakeGoal,
+    /// A daemon-scheduled, observed-hit-gated cache refresh. It is never a
+    /// user message and never advances away/resume activity.
+    KeepWarm {
+        cache_send_at_unix_millis: i64,
+        cache_send_id: Uuid,
+        after_secs: u64,
+        idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        respond_to: oneshot::Sender<std::result::Result<String, String>>,
+    },
     ProbeUserMessage {
         client_submission_id: Uuid,
         wire_fingerprint: String,
@@ -2380,10 +2391,23 @@ pub enum SessionWork {
     CancelSchedule {
         job_id: String,
     },
+    /// Cancel the foreground turn and every scheduled/background job as one
+    /// ordered worker command for the exit guard's "Stop all" choice.
+    CancelAll,
     /// Run `/prune` (snapshot dedup) on the foreground agent now.
     Prune,
     /// Run `/compact` (fresh-thread handoff) on the foreground agent.
     Compact,
+    /// Build a non-mutating away-resume offer from an exact rolling snapshot.
+    PrepareResumeCompaction {
+        idle_for_secs: u64,
+        respond_to:
+            oneshot::Sender<std::result::Result<Option<proto::ResumeCompactionOffer>, String>>,
+    },
+    /// Apply a previously offered exact rolling compaction without inference.
+    ResumeFromCompaction {
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
         text: String,

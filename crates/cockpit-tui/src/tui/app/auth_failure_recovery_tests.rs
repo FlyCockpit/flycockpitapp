@@ -114,7 +114,6 @@ fn auth_failure_notice_actions() {
     write_provider(tmp.path(), None, "https://example.test/v1");
     seed_daemon_workspace_trust(tmp.path());
     let mut app = app_for_provider(tmp.path());
-    app.daemon_prompt = None;
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
         status: 403,
     }));

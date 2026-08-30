@@ -1459,6 +1459,225 @@ mod backup_fallback_tests {
         .await
     }
 
+    struct CapabilityFlippingTool {
+        required_binary: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::tool::Tool for CapabilityFlippingTool {
+        fn name(&self) -> &str {
+            "capability_flipping_tool"
+        }
+
+        fn description(&self) -> &str {
+            "A test tool whose callability follows a per-turn binary probe."
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+            vec![crate::capabilities::BinaryRequirement::required(
+                self.required_binary.clone(),
+                crate::capabilities::CapabilityRemedy::prose("test-only requirement"),
+            )]
+        }
+
+        async fn call(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &crate::engine::tool::ToolCtx,
+        ) -> Result<crate::engine::tool::ToolOutput> {
+            Ok(crate::engine::tool::ToolOutput::text("called"))
+        }
+    }
+
+    /// Exercises the full interactive egress path rather than preparing a
+    /// hand-built tool slice. `turn_with_backup` dispatches through
+    /// `run_turn`, whose `turn_toolbox` result is projected by
+    /// `advertised_definitions` before `prepare_completion_request` sends the
+    /// provider request. The second turn makes the only tool non-callable via
+    /// its capability probe; it must nevertheless retain the identical schema
+    /// in the provider cache prefix.
+    #[tokio::test]
+    async fn dispatched_turns_keep_provider_tools_stable_across_capability_toggle() {
+        use crate::config::providers::WireApi;
+        use cockpit_test_support::provider::{ScriptedProvider, Turn};
+
+        let provider = ScriptedProvider::builder()
+            .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+            .turn(Turn::Text("first response".into()))
+            .turn(Turn::Text("second response".into()))
+            .start()
+            .await;
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "local".to_string(),
+            ProviderEntry {
+                url: provider.base_url(),
+                wire_api: WireApi::Completions,
+                ..ProviderEntry::default()
+            },
+        );
+        let model = Arc::new(
+            Model::for_provider(
+                &providers,
+                "local",
+                "cache-stability-test-model",
+                Arc::new(RedactionTable::empty()),
+            )
+            .expect("scripted provider model builds"),
+        );
+        let test_binary = std::env::current_exe().expect("locate test binary");
+        let available_bin_dir = test_binary
+            .parent()
+            .expect("test binary parent directory")
+            .to_path_buf();
+        let required_binary = test_binary
+            .file_name()
+            .expect("test binary file name")
+            .to_string_lossy()
+            .into_owned();
+        let mut agent = agent_with(model);
+        agent.system = "session-stable system prefix".to_string();
+        agent.role_prompt = agent.system.clone();
+        agent.tools = crate::engine::tool::ToolBox::new()
+            .with(Arc::new(CapabilityFlippingTool { required_binary }));
+
+        let (tmp, session, locks, redact) = ctx();
+        agent.env_overlay.write().unwrap().insert(
+            "PATH".to_string(),
+            available_bin_dir.to_string_lossy().into_owned(),
+        );
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        assert!(
+            crate::engine::agent::turn_toolbox(&agent, &session, tmp.path(), &config)
+                .await
+                .get("capability_flipping_tool")
+                .is_some(),
+            "the first turn must prove the tool is callable before the toggle"
+        );
+
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        let mut first_history = vec![Message::user("[time: first turn] volatile context")];
+        turn_with_backup(
+            &agent,
+            None,
+            &[],
+            &mut first_history,
+            Message::user("first prompt"),
+            session.clone(),
+            locks.clone(),
+            redact.clone(),
+            tmp.path().to_path_buf(),
+            config.clone(),
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            &tx,
+            None,
+        )
+        .await
+        .expect("first turn dispatches");
+
+        agent.env_overlay.write().unwrap().insert(
+            "PATH".to_string(),
+            tmp.path()
+                .join("unavailable-bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(
+            crate::engine::agent::turn_toolbox(&agent, &session, tmp.path(), &config)
+                .await
+                .get("capability_flipping_tool")
+                .is_none(),
+            "the second turn must prove the capability toggle removed callability"
+        );
+
+        let mut second_history = vec![Message::user("[knowledge] second volatile context")];
+        turn_with_backup(
+            &agent,
+            None,
+            &[],
+            &mut second_history,
+            Message::user("second prompt"),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            config,
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            &tx,
+            None,
+        )
+        .await
+        .expect("second turn dispatches");
+
+        let requests: Vec<_> = provider
+            .captured()
+            .into_iter()
+            .filter(|request| request.request_line.starts_with("POST "))
+            .collect();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one provider request per dispatched turn"
+        );
+        fn system_message(
+            request: &cockpit_test_support::provider::CapturedRequest,
+        ) -> &serde_json::Value {
+            request.body["messages"]
+                .as_array()
+                .expect("chat-completions messages")
+                .iter()
+                .find(|message| message["role"] == "system")
+                .expect("system preamble")
+        }
+        assert_eq!(
+            serde_json::to_vec(system_message(&requests[0])).unwrap(),
+            serde_json::to_vec(system_message(&requests[1])).unwrap(),
+            "volatile turn history must not change the provider system prefix"
+        );
+        assert_eq!(
+            serde_json::to_vec(&requests[0].body["tools"]).unwrap(),
+            serde_json::to_vec(&requests[1].body["tools"]).unwrap(),
+            "a capability toggle may change callability but never the provider tools prefix"
+        );
+        assert_ne!(
+            serde_json::to_vec(&requests[0].body["messages"]).unwrap(),
+            serde_json::to_vec(&requests[1].body["messages"]).unwrap(),
+            "the two dispatched turns carry distinct volatile history"
+        );
+    }
+
     /// Drain currently-buffered events into a vec (the turn is over by now).
     fn drain(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
         let mut out = Vec::new();

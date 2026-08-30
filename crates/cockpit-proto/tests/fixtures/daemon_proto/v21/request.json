@@ -1,10 +1,4 @@
 {
-  "get_app_flag": {
-    "params": {
-      "key": "daemon_autostart_notice"
-    },
-    "request": "get_app_flag"
-  },
   "get_startup_disclosures": {
     "params": {
       "project_root": "/tmp/project"
@@ -16,13 +10,6 @@
       "project_root": "/tmp/project"
     },
     "request": "get_workspace_trust"
-  },
-  "mark_app_flag_seen": {
-    "params": {
-      "expected_version": 7,
-      "key": "daemon_autostart_notice"
-    },
-    "request": "mark_app_flag_seen"
   },
   "resolve_assistant_session": {
     "params": {
@@ -721,6 +708,9 @@
   },
   "restart_if_idle": {
     "request": "restart_if_idle"
+  },
+  "resume_from_compaction": {
+    "request": "resume_from_compaction"
   },
   "resume_paused_work": {
     "params": {

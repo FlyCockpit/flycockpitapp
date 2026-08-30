@@ -11,9 +11,9 @@ const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventor
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
     "4cc96eb1a1ecda99b42a98071a9792a0456703df22f5f4f69f58eb8d4b3d6585";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
-    "17924064e7f641b661f831770b2d0ebadecb978c339bf03f2a8f8d7dc101b2f7";
+    "6629f9d6c8f8f8dac6f62e3ac7e24739259349037db4b4ec24cf351a0757cf14";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "c8908acd258948a6ae5eeb6f528276bd6ca0bfc7483388226ea5293208a91eb5";
+    "a316cd34225b8d240b6f0d966e01eb479194d6f977fc0b24551fcd78129891de";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {

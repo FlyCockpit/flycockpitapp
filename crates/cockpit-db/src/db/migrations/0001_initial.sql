@@ -119,6 +119,25 @@ CREATE TABLE sessions (
     description        TEXT CHECK (
         description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
     ),                                            -- generated old-session context (§17d)
+    -- A generated description is model-authored durable content. Preserve its
+    -- exact source identity so history search can apply the same trust fence
+    -- as it does to event-owned FTS rows. All provenance is absent together
+    -- for sessions without a description; a description may never fail open
+    -- through NULL trust.
+    description_provider_id TEXT,
+    description_model_id    TEXT,
+    description_model_trust TEXT,
+    CHECK (
+        (description IS NULL
+         AND description_provider_id IS NULL
+         AND description_model_id IS NULL
+         AND description_model_trust IS NULL)
+        OR
+        (description IS NOT NULL
+         AND description_provider_id IS NOT NULL
+         AND description_model_id IS NOT NULL
+         AND description_model_trust IN ('trusted', 'untrusted'))
+    ),
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -3319,9 +3338,11 @@ BEGIN
              )
            ELSE json_extract(old.data_json, '$.text') END
     FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
     DELETE FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
 END;
 
 CREATE TRIGGER session_fts_events_au AFTER UPDATE ON session_events
@@ -3348,9 +3369,11 @@ BEGIN
              )
            ELSE json_extract(old.data_json, '$.text') END
     FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
     DELETE FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
     INSERT INTO session_fts_docs (row_kind, session_id, seq)
     SELECT CASE WHEN new.type = 'session_compacted' THEN 'compaction' ELSE 'message' END,
            new.session_id,
@@ -3465,7 +3488,8 @@ BEGIN
              ELSE json_extract(e.data_json, '$.text')
            END
     FROM session_fts_docs AS d
-    LEFT JOIN session_events AS e ON e.seq = d.seq
+    LEFT JOIN session_events AS e
+           ON e.session_id = d.session_id AND e.seq = d.seq
     LEFT JOIN session_text_artifacts AS a
            ON a.session_id = d.session_id AND a.artifact_id = d.artifact_id
     WHERE d.session_id = old.session_id;

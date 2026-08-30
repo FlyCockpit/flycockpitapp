@@ -353,7 +353,8 @@ impl Db {
                     "SELECT f.seq
                        FROM session_fts
                        JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
-                       JOIN session_events AS e ON e.seq = f.seq
+                       JOIN session_events AS e
+                         ON e.session_id = f.session_id AND e.seq = f.seq
                       WHERE session_fts MATCH ?1
                         AND f.row_kind = 'message'
                         AND f.session_id = ?2
@@ -479,7 +480,8 @@ fn search_candidates_inner(
                FROM session_fts
                JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
                JOIN sessions AS s ON s.session_id = f.session_id
-          LEFT JOIN session_events AS e ON e.seq = f.seq
+          LEFT JOIN session_events AS e
+                 ON e.session_id = f.session_id AND e.seq = f.seq
           LEFT JOIN compaction_handoffs AS h
                  ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                 AND h.session_id = e.session_id
@@ -491,7 +493,12 @@ fn search_candidates_inner(
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
-                AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                AND (?5
+                     OR f.row_kind = 'title'
+                     OR (f.row_kind = 'description'
+                         AND s.description_model_trust = 'untrusted')
+                     OR (f.row_kind NOT IN ('title', 'description')
+                         AND (e.model_trust IS NULL OR e.model_trust <> 'trusted')))
                 AND (?6 IS NULL
                      OR s.project_id = ?6
                      OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
@@ -609,7 +616,8 @@ fn search_candidates_in_sessions_inner(
                    FROM session_fts
                    JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
                    JOIN sessions AS s ON s.session_id = f.session_id
-              LEFT JOIN session_events AS e ON e.seq = f.seq
+              LEFT JOIN session_events AS e
+                     ON e.session_id = f.session_id AND e.seq = f.seq
               LEFT JOIN compaction_handoffs AS h
                      ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                     AND h.session_id = e.session_id
@@ -618,7 +626,12 @@ fn search_candidates_in_sessions_inner(
                   WHERE session_fts MATCH ?1
                     AND f.row_kind <> 'artifact'
                     AND f.session_id = ?2
-                    AND (?3 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                    AND (?3
+                         OR f.row_kind = 'title'
+                         OR (f.row_kind = 'description'
+                             AND s.description_model_trust = 'untrusted')
+                         OR (f.row_kind NOT IN ('title', 'description')
+                             AND (e.model_trust IS NULL OR e.model_trust <> 'trusted')))
                     AND (s.project_id = ?4
                          OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
                                      WHERE reader.project_id = ?4
@@ -1062,6 +1075,7 @@ mod tests {
     use super::*;
     use crate::db::history_scope::WorkspaceHistoryScope;
     use crate::db::session_log::{SessionEventContext, SessionEventKind};
+    use crate::db::sessions::SessionDescriptionProvenance;
     use rusqlite::params;
     use serde_json::json;
 
@@ -1863,14 +1877,15 @@ mod tests {
     async fn descriptions_are_indexed_as_history_discovery_rows() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "Build").await.unwrap();
-        let id = session.session_id.to_string();
-        db.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET description = ?1 WHERE session_id = ?2",
-                ["durable sapphire migration context", id.as_str()],
-            )?;
-            Ok(())
-        })
+        db.set_session_description(
+            session.session_id,
+            "durable sapphire migration context",
+            SessionDescriptionProvenance {
+                provider_id: "test-provider",
+                model_id: "test-model",
+                model_trust: "untrusted",
+            },
+        )
         .await
         .unwrap();
 
@@ -1880,6 +1895,51 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("sapphire"));
+    }
+
+    #[tokio::test]
+    async fn trusted_descriptions_are_hidden_from_untrusted_history_search() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        db.set_session_description(
+            session.session_id,
+            "trusted zircon migration context",
+            SessionDescriptionProvenance {
+                provider_id: "trusted-provider",
+                model_id: "trusted-model",
+                model_trust: "trusted",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.search_candidates_for_trust(
+                "zircon",
+                Some("p"),
+                None,
+                None,
+                10,
+                HistoryCallerTrust::Untrusted,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            db.search_candidates_for_trust(
+                "zircon",
+                Some("p"),
+                None,
+                None,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1920,7 +1980,8 @@ mod tests {
                  INSERT INTO session_fts (rowid, body)
                  SELECT d.rowid, json_extract(e.data_json, '$.text')
                  FROM session_fts_docs AS d
-                 JOIN session_events AS e ON e.seq = d.seq
+                 JOIN session_events AS e
+                   ON e.session_id = d.session_id AND e.seq = d.seq
                  WHERE d.row_kind = 'message';",
             )?;
             Ok(())

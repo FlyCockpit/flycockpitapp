@@ -502,7 +502,8 @@ impl Db {
                    FROM session_text_artifacts a
                    JOIN session_text_artifact_event_refs r
                      ON r.session_id=a.session_id AND r.artifact_id=a.artifact_id
-                   JOIN session_events e ON e.seq=r.event_seq
+                   JOIN session_events e
+                     ON e.session_id = r.session_id AND e.seq = r.event_seq
                   WHERE a.session_id=?1 AND a.artifact_id=?2
                     AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')",
                 params![session_id.to_string(), artifact_id.to_string(), permitted],
@@ -533,7 +534,8 @@ impl Db {
                    FROM session_text_artifacts AS a
                    JOIN session_text_artifact_event_refs AS r
                      ON r.session_id = a.session_id AND r.artifact_id = a.artifact_id
-                   JOIN session_events AS e ON e.seq = r.event_seq
+                   JOIN session_events AS e
+                     ON e.session_id = r.session_id AND e.seq = r.event_seq
                    JOIN sessions AS s ON s.session_id = a.session_id
                   WHERE a.session_id = ?1 AND a.artifact_id = ?2
                     AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
@@ -608,7 +610,8 @@ impl Db {
                    FROM session_text_artifacts a
                    JOIN session_text_artifact_event_refs r
                      ON r.session_id=a.session_id AND r.artifact_id=a.artifact_id
-                   JOIN session_events e ON e.seq=r.event_seq
+                   JOIN session_events e
+                     ON e.session_id = r.session_id AND e.seq = r.event_seq
                   WHERE a.session_id=?1
                     AND (?2 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
                   ORDER BY a.created_at,a.artifact_id",

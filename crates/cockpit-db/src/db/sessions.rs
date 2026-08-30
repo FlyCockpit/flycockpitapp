@@ -186,6 +186,12 @@ pub struct SessionRow {
     pub fork_point_turn_id: Option<String>,
     /// Auto-generated or user-set title (GOALS §17d).
     pub title: Option<String>,
+    /// Generated old-session context and immutable identity of the model that
+    /// produced it. Descriptions are absent with all provenance fields absent.
+    pub description: Option<String>,
+    pub description_provider_id: Option<String>,
+    pub description_model_id: Option<String>,
+    pub description_model_trust: Option<String>,
     /// `true` when the user has manually set [`title`]. Locks out the
     /// utility-model auto-titling pass.
     pub user_renamed: bool,
@@ -288,6 +294,10 @@ impl SessionRow {
             parent_session_id,
             fork_point_turn_id: row.get("fork_point_turn_id")?,
             title: row.get("title")?,
+            description: row.get("description")?,
+            description_provider_id: row.get("description_provider_id")?,
+            description_model_id: row.get("description_model_id")?,
+            description_model_trust: row.get("description_model_trust")?,
             user_renamed: user_renamed != 0,
             last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
             archived_at_unix_ms: row.get("archived_at_unix_ms")?,
@@ -311,6 +321,34 @@ impl SessionRow {
                 .get::<_, String>("lifecycle")
                 .unwrap_or_else(|_| "active".to_string()),
         })
+    }
+}
+
+/// Resolved model identity for generated session-description content. A
+/// description is not written without it, so untrusted history readers never
+/// receive trusted model text through a missing-trust fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionDescriptionProvenance<'a> {
+    pub provider_id: &'a str,
+    pub model_id: &'a str,
+    pub model_trust: &'a str,
+}
+
+impl SessionDescriptionProvenance<'_> {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            matches!(self.model_trust, "trusted" | "untrusted"),
+            "session description model trust must be `trusted` or `untrusted`"
+        );
+        ensure!(
+            !self.provider_id.is_empty(),
+            "session description provider_id must not be empty"
+        );
+        ensure!(
+            !self.model_id.is_empty(),
+            "session description model_id must not be empty"
+        );
+        Ok(())
     }
 }
 
@@ -658,6 +696,10 @@ fn build_session_row(
         parent_session_id: None,
         fork_point_turn_id: None,
         title: None,
+        description: None,
+        description_provider_id: None,
+        description_model_id: None,
+        description_model_trust: None,
         user_renamed: false,
         last_viewed_at_unix_ms: None,
         archived_at_unix_ms: None,
@@ -1377,6 +1419,10 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: None,
             title: None,
+            description: None,
+            description_provider_id: None,
+            description_model_id: None,
+            description_model_trust: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1534,6 +1580,10 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: fork_point_turn_id.clone(),
             title: None,
+            description: None,
+            description_provider_id: None,
+            description_model_id: None,
+            description_model_trust: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1777,6 +1827,62 @@ impl Db {
         let title = title.to_owned();
         self.write(move |conn| Self::rename_session_conn(conn, session_id, &title))
             .await
+    }
+
+    /// Store model-generated old-session context with the resolved source
+    /// identity used by history search's model-trust fence. Describe-fork
+    /// orchestration (issue #124) supplies this input; no generic SQL writer
+    /// may create a description without its provenance.
+    pub fn set_session_description_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        description: &str,
+        provenance: SessionDescriptionProvenance<'_>,
+    ) -> Result<bool> {
+        provenance.validate()?;
+        let affected = conn
+            .execute(
+                "UPDATE sessions
+                    SET description = ?1,
+                        description_provider_id = ?2,
+                        description_model_id = ?3,
+                        description_model_trust = ?4
+                  WHERE session_id = ?5 AND ephemeral = 0",
+                params![
+                    description,
+                    provenance.provider_id,
+                    provenance.model_id,
+                    provenance.model_trust,
+                    session_id.to_string(),
+                ],
+            )
+            .context("setting session description")?;
+        Ok(affected > 0)
+    }
+
+    pub async fn set_session_description(
+        &self,
+        session_id: Uuid,
+        description: &str,
+        provenance: SessionDescriptionProvenance<'_>,
+    ) -> Result<bool> {
+        let description = description.to_owned();
+        let provider_id = provenance.provider_id.to_owned();
+        let model_id = provenance.model_id.to_owned();
+        let model_trust = provenance.model_trust.to_owned();
+        self.write(move |conn| {
+            Self::set_session_description_conn(
+                conn,
+                session_id,
+                &description,
+                SessionDescriptionProvenance {
+                    provider_id: &provider_id,
+                    model_id: &model_id,
+                    model_trust: &model_trust,
+                },
+            )
+        })
+        .await
     }
 
     /// Set the title from the auto-titling pass. Refuses to overwrite a

@@ -10437,6 +10437,7 @@ pub(crate) async fn run_noninteractive_resumable(
     // the immediately following request.
     let mut computer_coordinator = None;
     let mut computer_contract = None;
+    let mut computer_coordinator_config = None;
     let mut pending_computer_continuations = Vec::new();
     // A resumable vNext child is itself a delegation parent. Keep its direct
     // child admission state for this whole invocation, so a nested batch has
@@ -11521,6 +11522,7 @@ pub(crate) async fn run_noninteractive_resumable(
             delegation_id,
             &mut computer_coordinator,
             &mut computer_contract,
+            &mut computer_coordinator_config,
             &mut pending_computer_continuations,
         )
         .await

@@ -139,12 +139,13 @@ pub(crate) async fn open_native_computer_for_delegation(
     }
 }
 
-/// Reconcile the live coordinator with the model's *current* wire support at
-/// every turn boundary. Endpoint fallback can change an OpenAI model from
-/// Responses to Chat Completions after a coordinator was opened; retaining
-/// Responses-only continuations across that change would make the next wire
-/// request invalid. Both foreground and noninteractive loops use this one
-/// lifecycle rule.
+/// Reconcile the live coordinator with the agent's *current* wire and policy
+/// boundary at every turn boundary. Endpoint fallback can change an OpenAI
+/// model from Responses to Chat Completions after a coordinator was opened;
+/// a live rebuild can also change its target or approval policy. Retaining a
+/// coordinator across either change would make the next request invalid or
+/// bypass the rebuilt policy. Both foreground and noninteractive loops use
+/// this one lifecycle rule.
 pub(crate) async fn reconcile_native_computer_for_delegation(
     agent: &mut Agent,
     session: &Arc<Session>,
@@ -152,16 +153,33 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     delegation_id: String,
     coordinator: &mut Option<ComputerActionCoordinator>,
     contract: &mut Option<ComputerToolContract>,
+    coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let retained_is_compatible = coordinator.is_some()
-        && contract.is_some_and(|contract| agent.model.supports_native_computer_contract(contract));
+    let current_config = agent
+        .params
+        .native_computer
+        .as_ref()
+        .map(crate::computer::NativeComputerToolConfig::coordinator_config);
+    let retained_is_compatible = matches!(
+        (
+            coordinator.as_ref(),
+            *contract,
+            *coordinator_config,
+            current_config,
+        ),
+        (Some(_), Some(contract), Some(opened_config), Some(current_config))
+            if contract == opened_config.contract
+                && agent.model.supports_native_computer_contract(contract)
+                && opened_config == current_config
+    );
     if retained_is_compatible {
         return Ok(());
     }
 
     if let Some(mut previous) = coordinator.take() {
         *contract = None;
+        *coordinator_config = None;
         pending_continuations.clear();
         if let Some(candidate) = agent.params.native_computer.as_mut() {
             // Geometry describes a live, contract-specific coordinator. Keep
@@ -175,7 +193,7 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
             // a capability whose wire contract no longer matches.
             tracing::warn!(error = %error, "closing incompatible native computer coordinator failed");
         }
-    } else if contract.take().is_some() {
+    } else if contract.take().is_some() || coordinator_config.take().is_some() {
         // Preserve the same invariant even if a prior open failed halfway
         // through a driver-frame update: no contract/geometry/continuation is
         // retained without its matching coordinator.
@@ -203,11 +221,16 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     let opened =
         open_native_computer_for_delegation(agent, session, approver, delegation_id).await?;
     if let Some(opened) = opened {
-        *contract = agent
+        let opened_config = agent
             .params
             .native_computer
             .as_ref()
-            .map(|config| config.contract);
+            .map(crate::computer::NativeComputerToolConfig::coordinator_config)
+            .ok_or_else(|| {
+                anyhow::anyhow!("native computer coordinator opened without configuration")
+            })?;
+        *contract = Some(opened_config.contract);
+        *coordinator_config = Some(opened_config);
         *coordinator = Some(opened);
     }
     Ok(())

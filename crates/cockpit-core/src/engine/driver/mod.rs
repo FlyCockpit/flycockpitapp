@@ -840,6 +840,10 @@ pub struct AgentSession {
     pub agent: Arc<Agent>,
     pub computer_coordinator: Option<crate::computer::coordinator::ComputerActionCoordinator>,
     pub computer_contract: Option<crate::computer::ComputerToolContract>,
+    /// The target and policy boundary of `computer_coordinator`. Rebuilt
+    /// agents must match it before the coordinator can be reused.
+    pub(crate) computer_coordinator_config:
+        Option<crate::computer::NativeComputerCoordinatorConfig>,
     pub pending_computer_continuations: Vec<serde_json::Value>,
     /// Durable lifecycle identity for this concrete executor.  Agent display
     /// names are intentionally not used as identity: several task children can
@@ -1999,7 +2003,14 @@ impl Driver {
     /// native-computer request. Candidate scans leave geometry unset; this is
     /// the only path that turns that metadata into a live capability.
     async fn open_native_computer_for_active_frame(&mut self) -> Result<()> {
-        let (mut agent, delegation_id, mut coordinator, mut contract, mut pending) = {
+        let (
+            mut agent,
+            delegation_id,
+            mut coordinator,
+            mut contract,
+            mut coordinator_config,
+            mut pending,
+        ) = {
             let Some(frame) = self.stack.last_mut() else {
                 return Ok(());
             };
@@ -2012,6 +2023,7 @@ impl Driver {
                     .to_string(),
                 frame.computer_coordinator.take(),
                 frame.computer_contract.take(),
+                frame.computer_coordinator_config.take(),
                 std::mem::take(&mut frame.pending_computer_continuations),
             )
         };
@@ -2022,6 +2034,7 @@ impl Driver {
             delegation_id,
             &mut coordinator,
             &mut contract,
+            &mut coordinator_config,
             &mut pending,
         )
         .await?;
@@ -2029,6 +2042,7 @@ impl Driver {
         frame.agent = Arc::new(agent);
         frame.computer_coordinator = coordinator;
         frame.computer_contract = contract;
+        frame.computer_coordinator_config = coordinator_config;
         frame.pending_computer_continuations = pending;
         Ok(())
     }
@@ -2199,6 +2213,7 @@ impl Driver {
                     agent: frame.agent.clone(),
                     computer_coordinator: None,
                     computer_contract: frame.computer_contract,
+                    computer_coordinator_config: frame.computer_coordinator_config,
                     pending_computer_continuations: Vec::new(),
                     agent_instance_id: frame.agent_instance_id,
                     endpoint_generation: frame.endpoint_generation,
@@ -2584,6 +2599,7 @@ impl Driver {
                 agent: root,
                 computer_coordinator: None,
                 computer_contract: None,
+                computer_coordinator_config: None,
                 pending_computer_continuations: Vec::new(),
                 agent_instance_id: None,
                 endpoint_generation: None,
@@ -4131,6 +4147,7 @@ impl Driver {
             agent: Arc::new(child),
             computer_coordinator: None,
             computer_contract: None,
+            computer_coordinator_config: None,
             pending_computer_continuations: Vec::new(),
             agent_instance_id: Some(recovery.agent_instance_id),
             endpoint_generation: Some(endpoint_generation),
@@ -13549,6 +13566,7 @@ impl Driver {
                         agent: Arc::new(child),
                         computer_coordinator: None,
                         computer_contract: None,
+                        computer_coordinator_config: None,
                         pending_computer_continuations: Vec::new(),
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),

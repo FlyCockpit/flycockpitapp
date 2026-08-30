@@ -1489,7 +1489,27 @@ pub struct NativeComputerToolConfig {
     pub approval_required: bool,
 }
 
+/// The configuration boundary a live native-computer coordinator was opened
+/// under. Geometry is deliberately excluded: it is backend-reported,
+/// request-local state, rather than agent policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeComputerCoordinatorConfig {
+    pub contract: ComputerToolContract,
+    pub target: DisplayTarget,
+    pub require_backend: bool,
+    pub approval_required: bool,
+}
+
 impl NativeComputerToolConfig {
+    pub(crate) fn coordinator_config(&self) -> NativeComputerCoordinatorConfig {
+        NativeComputerCoordinatorConfig {
+            contract: self.contract,
+            target: self.target,
+            require_backend: self.require_backend,
+            approval_required: self.approval_required,
+        }
+    }
+
     pub fn wire(&self) -> NativeComputerWire {
         let geometry = self
             .geometry
@@ -3099,6 +3119,36 @@ mod tests {
             },
             scale_factor: ScaleFactor(2.0),
         }
+    }
+
+    #[test]
+    fn coordinator_config_excludes_geometry_but_preserves_policy_boundary() {
+        let config = NativeComputerToolConfig {
+            contract: ComputerToolContract::OpenAiResponses,
+            target: DisplayTarget::Virtual,
+            require_backend: false,
+            geometry: Some(test_geometry()),
+            approval_required: false,
+        };
+        let opened_config = config.coordinator_config();
+        assert_eq!(
+            opened_config,
+            NativeComputerCoordinatorConfig {
+                contract: ComputerToolContract::OpenAiResponses,
+                target: DisplayTarget::Virtual,
+                require_backend: false,
+                approval_required: false,
+            }
+        );
+
+        let real_desktop = NativeComputerToolConfig {
+            target: DisplayTarget::RealDesktop,
+            require_backend: true,
+            approval_required: true,
+            geometry: None,
+            ..config
+        };
+        assert_ne!(opened_config, real_desktop.coordinator_config());
     }
 
     fn sample_actions() -> Vec<ComputerAction> {

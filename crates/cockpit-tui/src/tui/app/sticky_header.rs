@@ -67,9 +67,13 @@ impl App {
     }
 
     fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
-        // Carving or releasing the two-line header is a layout change, not a
-        // user gesture. Keep the selection grid and offset-from-bottom so a
-        // header flip cannot yank the viewport or empty the copy map.
+        let was_visible = self.sticky_header_area.is_some();
+        // Offset-from-bottom stays put so the header cannot yank the
+        // viewport. Screen-space selections are invalid across a carve
+        // flip because the history rows move by two cells.
+        if was_visible != visible {
+            self.selection = None;
+        }
         self.sticky_header_area = visible.then(|| Rect {
             x: pane.x,
             y: pane.y,

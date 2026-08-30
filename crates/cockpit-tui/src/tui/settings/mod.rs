@@ -1550,6 +1550,7 @@ enum ProviderNavigation {
     },
 }
 
+#[derive(Clone)]
 enum ProviderMutationNavigation {
     List { status: String },
     Edit { provider_id: String, status: String },
@@ -4109,8 +4110,15 @@ impl SettingsCx {
                         self.queue_settlement_query(client_operation_id, settlement_pending);
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
-                        self.queue_settlement_query(client_operation_id, settlement_pending);
+                        if completion.authoritative_rejection {
+                            self.completed_provider_mutation = Some(Err(error.clone()));
+                            self.completed_provider_mutation_navigation =
+                                self.pending_provider_mutation_navigation.take();
+                            self.extended_warnings = vec![format!("save failed: {error}")];
+                        } else {
+                            tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
+                            self.queue_settlement_query(client_operation_id, settlement_pending);
+                        }
                     }
                 }
             }
@@ -6554,6 +6562,7 @@ impl SettingsDialog {
             self.apply_daemon_completion(completion);
         }
         self.cx.daemon_effects.extend(skipped);
+        self.apply_completed_provider_navigation();
     }
 
     #[cfg(test)]
@@ -6577,6 +6586,63 @@ impl SettingsDialog {
                 break;
             }
         }
+        self.apply_completed_provider_navigation();
+    }
+
+    fn apply_completed_provider_navigation(&mut self) {
+        let Some((navigation, config)) = self.cx.completed_provider_navigation.take() else {
+            return;
+        };
+        let requested_provider_id = match &navigation {
+            ProviderNavigation::Edit { provider_id, .. }
+            | ProviderNavigation::Models { provider_id } => provider_id.clone(),
+        };
+        if let Some(entry) = config.providers.get(&requested_provider_id).cloned() {
+            let parent = EditState::new(requested_provider_id.clone(), entry.clone());
+            self.page = match navigation {
+                ProviderNavigation::Edit {
+                    provider_id,
+                    oauth_expired,
+                } => {
+                    let oauth_provider = oauth_expired
+                        .then(|| match entry.effective_template(&provider_id) {
+                            Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
+                                Some(OAuthProvider::Codex)
+                            }
+                            Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok") => {
+                                Some(OAuthProvider::Grok)
+                            }
+                            _ => None,
+                        })
+                        .flatten();
+                    if let Some(provider) = oauth_provider {
+                        providers_page(ProvidersPage::OAuthSetup {
+                            state: Box::new(providers::OAuthFlowState::new(provider)),
+                            parent: Box::new(parent),
+                        })
+                    } else {
+                        providers_page(ProvidersPage::Edit(parent))
+                    }
+                }
+                ProviderNavigation::Models { provider_id } => {
+                    providers_page(ProvidersPage::Models {
+                        editor: Box::new(ModelEditor::new(
+                            entry.effective_template(&provider_id).map(str::to_owned),
+                            entry.models.clone(),
+                        )),
+                        parent: Box::new(parent),
+                    })
+                }
+            };
+        } else {
+            self.page = providers_page(ProvidersPage::List {
+                cursor: 0,
+                status: Some(format!(
+                    "provider `{requested_provider_id}` is no longer configured"
+                )),
+                delete_pending: false,
+            });
+        }
     }
 
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
@@ -6599,59 +6665,7 @@ impl SettingsDialog {
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
                     page.apply_authoritative_settings_completion(&mut self.cx, sidecar_completion);
                 }
-                if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
-                    let requested_provider_id = match &navigation {
-                        ProviderNavigation::Edit { provider_id, .. }
-                        | ProviderNavigation::Models { provider_id } => provider_id.clone(),
-                    };
-                    if let Some(entry) = config.providers.get(&requested_provider_id).cloned() {
-                        let parent = EditState::new(requested_provider_id.clone(), entry.clone());
-                        self.page = match navigation {
-                            ProviderNavigation::Edit {
-                                provider_id,
-                                oauth_expired,
-                            } => {
-                                let oauth_provider = oauth_expired
-                                    .then(|| match entry.effective_template(&provider_id) {
-                                        Some(
-                                            cockpit_core::auth::codex_oauth::CREDENTIAL_KEY
-                                            | "codex",
-                                        ) => Some(OAuthProvider::Codex),
-                                        Some(
-                                            cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok",
-                                        ) => Some(OAuthProvider::Grok),
-                                        _ => None,
-                                    })
-                                    .flatten();
-                                if let Some(provider) = oauth_provider {
-                                    providers_page(ProvidersPage::OAuthSetup {
-                                        state: Box::new(providers::OAuthFlowState::new(provider)),
-                                        parent: Box::new(parent),
-                                    })
-                                } else {
-                                    providers_page(ProvidersPage::Edit(parent))
-                                }
-                            }
-                            ProviderNavigation::Models { provider_id } => {
-                                providers_page(ProvidersPage::Models {
-                                    editor: Box::new(ModelEditor::new(
-                                        entry.effective_template(&provider_id).map(str::to_owned),
-                                        entry.models.clone(),
-                                    )),
-                                    parent: Box::new(parent),
-                                })
-                            }
-                        };
-                    } else {
-                        self.page = providers_page(ProvidersPage::List {
-                            cursor: 0,
-                            status: Some(format!(
-                                "provider `{requested_provider_id}` is no longer configured"
-                            )),
-                            delete_pending: false,
-                        });
-                    }
-                }
+                self.apply_completed_provider_navigation();
                 if let Some(prompt) = self.cx.pending_shadow_prompt.take()
                     && let Some(page) = self.page.downcast_mut::<CategoryPage>()
                 {
@@ -7715,7 +7729,18 @@ impl SettingsDialog {
                     .page
                     .downcast_ref::<ProvidersPage>()
                     .is_some_and(ProvidersPage::has_unsettled_oauth_acknowledgement);
-            if oauth_cancel || oauth_ack_retry {
+            let deep_fetch_control = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                && key.modifiers.is_empty()
+                && self
+                    .page
+                    .downcast_ref::<ProvidersPage>()
+                    .is_some_and(|page| {
+                        matches!(
+                            page,
+                            ProvidersPage::DeepFetch { state, .. } if state.is_running()
+                        )
+                    });
+            if oauth_cancel || oauth_ack_retry || deep_fetch_control {
                 let nav = self.page.handle_key(&mut self.cx, key);
                 return self.apply_nav(nav);
             }
@@ -8824,7 +8849,12 @@ impl SettingsCx {
         );
         self.extended_warnings = vec!["saving provider settings…".into()];
         #[cfg(test)]
-        self.flush_request_daemon_effects();
+        {
+            self.flush_request_daemon_effects();
+            if let Some(Err(error)) = &self.completed_provider_mutation {
+                return Err(error.clone());
+            }
+        }
         Ok(())
     }
 
@@ -8911,6 +8941,59 @@ impl SettingsCx {
             }
         }
         result
+    }
+
+    fn page_from_provider_mutation_nav(&self, navigation: ProviderMutationNavigation) -> PageBox {
+        match navigation {
+            ProviderMutationNavigation::List { status } => providers_page(ProvidersPage::List {
+                cursor: providers::initial_list_cursor(&self.config),
+                status: Some(status),
+                delete_pending: false,
+            }),
+            ProviderMutationNavigation::Edit {
+                provider_id,
+                status,
+            } => {
+                let entry = self
+                    .config
+                    .providers
+                    .get(&provider_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut edit = EditState::new(provider_id, entry);
+                edit.status = Some(status);
+                providers_page(ProvidersPage::Edit(edit))
+            }
+        }
+    }
+
+    pub(in crate::tui::settings) fn commit_provider_mutation(
+        &mut self,
+        navigation: ProviderMutationNavigation,
+    ) -> Nav {
+        self.pending_provider_mutation_navigation = Some(navigation.clone());
+        match self.save_config() {
+            Ok(()) => match self.completed_provider_mutation_navigation.take() {
+                Some(done) => Nav::Replace(self.page_from_provider_mutation_nav(done)),
+                None => Nav::Stay,
+            },
+            Err(error) => {
+                self.pending_provider_mutation_navigation = None;
+                self.completed_provider_mutation_navigation = None;
+                let failed = match navigation {
+                    ProviderMutationNavigation::List { .. } => ProviderMutationNavigation::List {
+                        status: format!("save failed: {error}"),
+                    },
+                    ProviderMutationNavigation::Edit { provider_id, .. } => {
+                        ProviderMutationNavigation::Edit {
+                            provider_id,
+                            status: format!("save failed: {error}"),
+                        }
+                    }
+                };
+                Nav::Replace(self.page_from_provider_mutation_nav(failed))
+            }
+        }
     }
 
     fn delete_provider_and_stored_secrets(

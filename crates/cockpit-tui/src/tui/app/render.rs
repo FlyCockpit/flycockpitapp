@@ -2374,13 +2374,20 @@ impl App {
         let max_offset = self
             .chat_total_lines
             .saturating_sub(self.chat_visible_lines.max(1));
-        self.chat_scroll_offset = offset.min(max_offset);
-        if self.chat_scroll_offset == 0 {
+        // A non-zero request means "leave the tail", even when geometry has
+        // not been measured yet. Clamping that request to 0 would pin to
+        // the newest rows and hide the beginning-of-conversation marker.
+        if offset == 0 {
             self.pin_chat_to_tail();
-        } else {
-            self.chat_pinned_to_tail = false;
-            self.capture_chat_scroll_anchor_from_current_offset();
+            return;
         }
+        self.chat_pinned_to_tail = false;
+        self.chat_scroll_offset = if max_offset == 0 {
+            offset
+        } else {
+            offset.min(max_offset)
+        };
+        self.capture_chat_scroll_anchor_from_current_offset();
     }
 
     pub(super) fn restore_chat_scroll_state(

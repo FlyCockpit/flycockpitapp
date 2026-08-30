@@ -979,7 +979,8 @@ impl NotesPane {
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(highlight)
-                .highlight_symbol(""),
+                .highlight_symbol("")
+                .highlight_spacing(ratatui::widgets::HighlightSpacing::Never),
             list_content,
             &mut self.sidebar,
         );
@@ -1415,15 +1416,21 @@ mod tests {
                 (!symbol.is_empty()).then_some(symbol)
             })
             .collect::<String>();
+        let chars: Vec<char> = rendered.chars().collect();
         let mut compact = String::new();
-        for ch in rendered.chars() {
-            if ch == ' '
-                && compact
+        for (index, &ch) in chars.iter().enumerate() {
+            if ch == ' ' {
+                let prev_wide = compact
                     .chars()
                     .last()
-                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2))
-            {
-                continue;
+                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2));
+                let next_wide = chars
+                    .get(index + 1)
+                    .copied()
+                    .is_some_and(|next| unicode_width::UnicodeWidthChar::width(next) == Some(2));
+                if prev_wide && next_wide {
+                    continue;
+                }
             }
             compact.push(ch);
         }

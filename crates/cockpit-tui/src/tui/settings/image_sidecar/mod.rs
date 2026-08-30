@@ -1439,9 +1439,9 @@ fn sidecar_layout(frame: &mut Frame, area: Rect, mode: SidecarViewportMode) -> R
             let info = Paragraph::new(vec![
                 Line::from("Layout: Full"),
                 Line::from(""),
-                Line::from("Trust is not consent."),
+                Line::from("Trust does not grant egress."),
                 Line::from("Grants: once/session/project."),
-                Line::from("No global option."),
+                Line::from("Once, session, and project only."),
             ])
             .block(Block::default().borders(Borders::ALL).title(" Context "))
             .wrap(Wrap { trim: false });
@@ -1454,7 +1454,7 @@ fn sidecar_layout(frame: &mut Frame, area: Rect, mode: SidecarViewportMode) -> R
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(area);
             frame.render_widget(
-                Paragraph::new(Line::from("Layout: Compact — trust is not consent")),
+                Paragraph::new(Line::from("Layout: Compact — trust does not grant egress")),
                 rows[0],
             );
             rows[1]
@@ -2200,6 +2200,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     .find(|i| i.invocation_id == *id)
             }) {
                 rows.push((inv.row_text(), None));
+                rows.push((format!("state={}", inv.state.as_str()), None));
                 rows.push((
                     format!(
                         "timestamps created={} dispatched={} terminal={}",

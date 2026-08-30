@@ -1620,7 +1620,10 @@ fn image_sidecar_settings_cursor_and_a11y_follow_rendered_rows() {
     let a11y = page.a11y();
     assert_eq!(
         a11y.focused_label,
-        "Effective: 32 source=configured hard_ceiling=128"
+        format!(
+            "Effective: {} source=configured hard_ceiling=128",
+            MediaResourceLimits::defaults().sidecar_invocations_per_session
+        )
     );
     assert!(a11y.project_grant_warning.is_none());
     page.handle_key(&mut test_dialog(), press(KeyCode::Down));

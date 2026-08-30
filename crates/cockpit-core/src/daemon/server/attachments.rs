@@ -42,8 +42,7 @@ pub(super) async fn admit_image_ingress(
         .ok_or_else(|| bad_request("image ingress project is unavailable"))?;
     let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
     let storage = ctx
-        .media_storage_recovery
-        .as_ref()
+        .active_media_storage_recovery()
         .ok_or_else(|| internal("durable media storage unavailable"))?;
     // This digest is the durable idempotency binding. For terminal ingress it
     // contains only a one-way digest of the opaque bearer, never the bearer or
@@ -376,8 +375,7 @@ pub(super) async fn discard_image_ingress_draft(
     let project_digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
     let principal_digest = super::run_invocation::principal_digest(&state.principal);
     let storage = ctx
-        .media_storage_recovery
-        .as_ref()
+        .active_media_storage_recovery()
         .ok_or_else(|| internal("media storage authority is unavailable"))?;
     if let Some(receipt) = storage
         .image_ingress_draft_discard_receipt(
@@ -1326,8 +1324,7 @@ pub(super) async fn finish_attachment_upload_admitted(
                 internal("attachment upload is missing its evaluated media policy")
             })?;
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("durable media storage unavailable"))?;
             ctx.media_ledger
                 .destroy_local_artifacts(

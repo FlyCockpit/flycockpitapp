@@ -510,6 +510,13 @@ pub trait SealedHostAction: Send + Sync {
     /// The immutable declaration this instance was compiled from.
     fn descriptor(&self) -> &SealedActionDescriptor;
 
+    /// The immutable KB attachment this action permits as a sealed-copy
+    /// destination. Ordinary actions return `None`, so their grants can never
+    /// be repurposed to create a KB capability.
+    fn knowledge_base_copy_target(&self) -> Option<&super::identity::SealedKnowledgeBaseId> {
+        None
+    }
+
     /// Perform the Owner-defined effect. The return value is host-side only:
     /// the runtime discards it, including the error, without inspecting it.
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, params: &SealedParams) -> Result<()>;

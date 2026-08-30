@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::cli::{TrustCommand, TrustModeArg, TrustSetArgs, TrustStatusArgs};
+use crate::cli::{HistoryScopeArgs, TrustCommand, TrustModeArg, TrustSetArgs, TrustStatusArgs};
 use crate::config::trust::TrustRoot;
 use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, Response, WorkspaceTrustMode};
@@ -13,6 +13,39 @@ pub async fn run(command: TrustCommand) -> Result<()> {
     match command {
         TrustCommand::Status(args) => status(args).await,
         TrustCommand::Set(args) => set(args).await,
+        TrustCommand::HistoryScope(args) => history_scope(args).await,
+    }
+}
+
+async fn history_scope(args: HistoryScopeArgs) -> Result<()> {
+    let path = path_or_current_dir(args.path)?;
+    let trust_root = crate::config::trust::resolve_trust_root(&path)?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for workspace history scope")?;
+    let response = daemon
+        .client
+        .request(Request::SetWorkspaceHistoryScope {
+            project_root: trust_root.root.display().to_string(),
+            outbound: args.outbound,
+            inbound: args.inbound,
+        })
+        .await
+        .context("requesting workspace history scope set from daemon")?
+        .map_err(|error| {
+            anyhow::anyhow!("daemon rejected workspace history scope request: {error}")
+        })?;
+    match response {
+        Response::WorkspaceHistoryScope { outbound, inbound } => {
+            print!(
+                "trust root: {}\nhistory outbound: {outbound}\nhistory inbound: {inbound}\n",
+                trust_root.root.display()
+            );
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "daemon returned unexpected response to workspace history scope: {other:?}"
+        ),
     }
 }
 

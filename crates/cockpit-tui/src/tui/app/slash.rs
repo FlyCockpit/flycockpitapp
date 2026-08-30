@@ -1854,29 +1854,30 @@ impl App {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let Some(endpoint) = self.attached_daemon_endpoint() else {
-            self.push_plain(
-                "/assistant: Unavailable — reconnect to the daemon, then Retry".to_string(),
-            );
-            return;
-        };
         let request = cockpit_proto::Request::ResolveAssistantSession {
             assistant_id: name.to_string(),
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
             mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         };
         let source_session_id = self.launch.session_id;
+        let lifecycle = self.lifecycle.clone();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_at_blocking(&endpoint, request)? {
-                cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
-                    Ok(AsyncActionPayload::AssistantSessionResolved {
-                        session_id: session.session_id,
-                        source_session_id,
-                    })
+            move || {
+                let resolution =
+                    agent_runner::resolve_assistant_session_blocking(lifecycle, request)?;
+                match resolution.response {
+                    cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
+                        Ok(AsyncActionPayload::AssistantSessionResolved {
+                            session_id: session.session_id,
+                            source_session_id,
+                            startup_notice: resolution.startup_notice,
+                            promoted_from_ephemeral: resolution.promoted_from_ephemeral,
+                        })
+                    }
+                    other => Err(format!("unexpected assistant response: {other:?}")),
                 }
-                other => Err(format!("unexpected assistant response: {other:?}")),
             },
         );
     }
@@ -2521,11 +2522,11 @@ impl App {
         };
         let ctx = SealedScopeContext {
             session_id: runner.session_id().to_string(),
-            project_key: cockpit_core::sealed::identity::SealedProjectKey::canonical(
-                &self.launch.cwd,
-            )
-            .as_str()
-            .to_string(),
+            // The attached runner's project id is the daemon-established
+            // canonical project identity for this exact session. Reusing it
+            // avoids a second, fallible filesystem canonicalization here and
+            // keeps a project-scoped sealed operation bound to its session.
+            project_key: runner.project_id.clone(),
         };
         match plan_dispatch(&cmd, &ctx) {
             SealedDispatch::Metadata(request) => self.dispatch_sealed_metadata(request),
@@ -3588,7 +3589,6 @@ mod table_tests {
     fn favorite_uses_daemon_confirmed_session_model_not_stale_default() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.config_snapshot.providers.providers.insert(
             "p".to_string(),
@@ -3660,7 +3660,6 @@ mod table_tests {
         let cmd = *slash_command_by_name("help").expect("/help registry row");
         let mut app = App::new(Some(tmp.path()), false);
         app.dialog = Dialog::None;
-        app.daemon_prompt = None;
         app.question_dialog = None;
 
         app.composer.set("/help".to_string());
@@ -3945,7 +3944,6 @@ mod tests {
     fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = crate::tui::settings::Dialog::None;
         let (attached_request_tx, attached_request_rx) = mpsc::channel::<AttachedRequest>(8);
         let runner = AgentRunner::test_fixture(TestRunnerOverrides {

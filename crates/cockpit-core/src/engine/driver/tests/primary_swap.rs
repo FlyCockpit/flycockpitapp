@@ -408,8 +408,8 @@ async fn stale_owner_cleanup_bounds_repeated_removed_calls() {
 }
 
 /// Regression (implementation note): agent A
-/// (`Build`, has the write tool) calls a write tool and a `read`; swap to
-/// agent B (`Plan`, read-only) and send a message — every historical
+/// (`Build`, has the edit tool) calls an edit and a `read`; swap to
+/// agent B (`Plan`, which lacks edit) and send a message — every historical
 /// write-tool call carries a wire-only note naming A and the tool, while
 /// the `read` call (a tool B still has) is left unannotated.
 #[tokio::test]
@@ -448,13 +448,13 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
         ),
     );
 
-    // Swap to `Plan` (read-only — lacks `edit`). No annotation yet —
+    // Swap to `Plan` (lacks `edit`). No annotation yet —
     // deferred to the next message.
     driver.swap_primary("Plan", &tx).await;
     assert_eq!(driver.active_agent(), "Plan");
     assert!(
         driver.stack[0].agent.tools.get("edit").is_none(),
-        "Plan lacks the write tool"
+        "Plan lacks the edit tool"
     );
     assert!(
         !tool_result_text_for(&driver, "w1").contains("[Called by"),
@@ -490,9 +490,9 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
     assert_eq!(w2, w, "re-evaluation does not double-annotate");
 }
 
-/// Per-call ownership across a swap (implementation note): write calls made
-/// under `Build`, then a swap to `Plan` (read-only). On the next message each
-/// write call is attributed to the agent that ACTUALLY made it — "the previous
+/// Per-call ownership across a swap (implementation note): unavailable tools
+/// called under `Build`, then a swap to `Plan`. On the next message each call
+/// is attributed to the agent that ACTUALLY made it — "the previous
 /// agent" is not enough.
 #[tokio::test]
 async fn annotation_attributes_each_call_to_its_actual_maker() {
@@ -500,7 +500,7 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     reroot_real(&mut driver, "Build");
 
-    // A (`Build`) makes a write call.
+    // A (`Build`) makes two calls Plan cannot make.
     driver.stack[0].history.push(tool_call_turn("b1", "edit"));
     driver.stack[0].history.push(
         crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -512,19 +512,19 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
         ),
     );
 
-    // A second write call is still attributed to Build before the read-only swap.
-    driver.stack[0].history.push(tool_call_turn("s1", "write"));
+    // A second unavailable call is still attributed to Build before the swap.
+    driver.stack[0].history.push(tool_call_turn("s1", "unlock"));
     driver.stack[0].history.push(
         crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "s1".to_string(),
             None,
             None,
-            "write",
+            "unlock",
             "build-write-2",
         ),
     );
 
-    // Swap to `Plan` (read-only) and annotate at the next message.
+    // Swap to `Plan` and annotate at the next message.
     driver.swap_primary("Plan", &tx).await;
     driver.annotate_absent_tool_calls();
 
@@ -535,8 +535,8 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
     );
     let s = tool_result_text_for(&driver, "s1");
     assert!(
-        s.contains("[Called by `Build`, which had the `write` tool."),
-        "the second write call is attributed to `Build`: {s:?}"
+        s.contains("[Called by `Build`, which had the `unlock` tool."),
+        "the second unavailable call is attributed to `Build`: {s:?}"
     );
 }
 
@@ -568,7 +568,7 @@ async fn roster_trim_swap_to_removed_swarm_keeps_locks_with_build() {
 }
 
 #[tokio::test]
-async fn primary_swap_releases_locks_when_incoming_is_read_only() {
+async fn primary_swap_transfers_locks_when_incoming_plan_can_write() {
     let (mut driver, _t) = test_driver(1);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     reroot_real(&mut driver, "Build");
@@ -583,27 +583,38 @@ async fn primary_swap_releases_locks_when_incoming_is_read_only() {
     driver.swap_primary("Plan", &tx).await;
 
     assert_eq!(driver.active_agent(), "Plan");
-    assert!(driver.locks.holder(&path).is_none());
+    assert_eq!(
+        driver
+            .locks
+            .holder(&path)
+            .map(|(_, agent)| agent)
+            .as_deref(),
+        Some("Plan")
+    );
+    driver
+        .locks
+        .check_write_permitted(&path, "Plan", driver.session.id)
+        .unwrap();
 }
 
-/// A swapped-in read-only agent (`Plan`) does not re-issue a write tool
+/// A swapped-in planning agent (`Plan`) does not re-issue an edit tool
 /// whose past calls are now annotated
 /// (implementation note). The behavioral
 /// guarantee is the annotation: the write call's outcome now reads as
 /// "another agent made this; you lack this tool", and `Plan`'s own surface
-/// holds no write tool, so a re-issue is impossible.
+/// holds no edit tool, so a re-issue is impossible.
 #[tokio::test]
-async fn read_only_agent_cannot_reissue_annotated_write_tool() {
+async fn plan_agent_cannot_reissue_annotated_edit_tool() {
     let (mut driver, _t) = test_driver(1);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     reroot_real(&mut driver, "Build");
-    driver.stack[0].history.push(tool_call_turn("w1", "write"));
+    driver.stack[0].history.push(tool_call_turn("w1", "edit"));
     driver.stack[0].history.push(
         crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "w1".to_string(),
             None,
             None,
-            "write",
+            "edit",
             "[hash=def ok]",
         ),
     );
@@ -613,8 +624,8 @@ async fn read_only_agent_cannot_reissue_annotated_write_tool() {
 
     // Annotation present (the guarantee).
     assert!(tool_result_text_for(&driver, "w1").contains("You (`Plan`) do not have this tool."));
-    // And `Plan`'s surface genuinely holds no write tool to re-issue.
-    assert!(driver.stack[0].agent.tools.get("write").is_none());
+    // Plan has generic `write` for its plan pseudofile, but no targeted host
+    // edit tool to re-issue.
     assert!(driver.stack[0].agent.tools.get("edit").is_none());
 }
 

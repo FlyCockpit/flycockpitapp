@@ -76,7 +76,9 @@ pub enum SealedCommand {
 pub enum SealedActionCommand {
     /// `/sealed action list`
     List,
-    /// `/sealed action create <kind-id> --project <id> --description <safe-text> --origin-id <id> --projection-id <id>`
+    /// `/sealed action create <kind-id> --project <id> --description <safe-text> --origin-id <id> --projection-id <id>`.
+    /// For `knowledge_base_copy`, `origin_id` is the configured KB registry
+    /// label; the daemon resolves and pins its immutable sealed namespace.
     Create {
         kind_id: String,
         project_id: String,

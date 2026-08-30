@@ -123,6 +123,7 @@ fn scope_kind_wire(scope: &SealedScopeKind) -> &'static str {
         SealedScopeKind::Session => "session",
         SealedScopeKind::Project => "project",
         SealedScopeKind::Global => "global",
+        SealedScopeKind::KnowledgeBase => "knowledge_base",
     }
 }
 
@@ -139,6 +140,9 @@ fn create_begin(
         SealedScopeKind::Session => ctx.session_id.clone(),
         SealedScopeKind::Project => ctx.project_key.clone(),
         SealedScopeKind::Global => String::new(),
+        // KB-scoped values are created by the KB flow, which supplies an exact
+        // KB id. The generic /sealed overlay has no ambient KB attachment.
+        SealedScopeKind::KnowledgeBase => String::new(),
     };
     Request::BeginSealedOwnerOperation {
         disposition: "create".to_string(),
@@ -266,6 +270,7 @@ fn scope_kind_label(kind: SealedOwnerScopeKind) -> &'static str {
         SealedOwnerScopeKind::Session => "session",
         SealedOwnerScopeKind::Project => "project",
         SealedOwnerScopeKind::Global => "global",
+        SealedOwnerScopeKind::KnowledgeBase => "knowledge base",
     }
 }
 

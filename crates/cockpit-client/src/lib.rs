@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -22,7 +23,7 @@ use anyhow::Context;
 use anyhow::{Result, anyhow};
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -172,30 +173,287 @@ pub enum LifecycleIntent {
     /// Attach to the current owner, or start a reference-counted ephemeral
     /// owner at the shared ledger socket.
     AttachOrEphemeral,
-    EnsurePersistent,
+    /// Require a persistent owner. If the shared ledger is currently owned by
+    /// an ephemeral daemon, the lifecycle host promotes it before returning.
+    PromoteToPersistent,
 }
 
+impl LifecycleIntent {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::AttachOrPersistent => 0,
+            Self::AttachOrEphemeral => 1,
+            Self::PromoteToPersistent => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::AttachOrPersistent,
+            1 => Self::AttachOrEphemeral,
+            2 => Self::PromoteToPersistent,
+            _ => unreachable!("invalid lifecycle intent"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct LifecycleResolution {
     pub endpoint: ClientEndpoint,
     pub owns_daemon: bool,
+    /// Whether the resolved owner is reference-counted and therefore needs an
+    /// explicit live-work detach decision.
+    pub ephemeral_owner: bool,
     pub socket: PathBuf,
     pub startup_notice: Option<String>,
+    /// The lifecycle host replaced an ephemeral owner while resolving this
+    /// request. This is an ownership transition, not presentation text: a
+    /// caller holding a client for the predecessor must reconnect.
+    pub promoted_from_ephemeral: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleSpawnAuthorizationState {
+    Active,
+    CreatingOwner,
+    OwnerCreated,
+    Cancelled,
+}
+
+/// Request-scoped authority to create the first daemon owner.
+///
+/// Cancellation and owner creation serialize through this state. A caller
+/// whose resolution timeout fires waits for an already-authorized creation to
+/// finish before returning, so a request that has returned as cancelled can
+/// no longer create an owner using its lifetime preference.
+struct LifecycleSpawnAuthority {
+    state: Mutex<LifecycleSpawnAuthorizationState>,
+    changed: watch::Sender<()>,
+}
+
+impl LifecycleSpawnAuthority {
+    fn new() -> Arc<Self> {
+        let (changed, _) = watch::channel(());
+        Arc::new(Self {
+            state: Mutex::new(LifecycleSpawnAuthorizationState::Active),
+            changed,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => *state == LifecycleSpawnAuthorizationState::Cancelled,
+            Err(_) => true,
+        }
+    }
+
+    fn authorize_owner_spawn(self: &Arc<Self>) -> Result<LifecycleSpawnPermit, String> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "daemon lifecycle spawn authority was poisoned".to_string())?;
+            match *state {
+                LifecycleSpawnAuthorizationState::Active => {
+                    *state = LifecycleSpawnAuthorizationState::CreatingOwner;
+                }
+                LifecycleSpawnAuthorizationState::Cancelled => {
+                    return Err("daemon lifecycle request was cancelled before owner spawn".into());
+                }
+                LifecycleSpawnAuthorizationState::CreatingOwner
+                | LifecycleSpawnAuthorizationState::OwnerCreated => {
+                    return Err(
+                        "daemon lifecycle request already used its owner-spawn authority".into(),
+                    );
+                }
+            }
+        }
+        self.changed.send_replace(());
+        Ok(LifecycleSpawnPermit {
+            authority: Arc::clone(self),
+            owner_created: false,
+        })
+    }
+
+    fn release_authorization(&self) {
+        let changed = match self.state.lock() {
+            Ok(mut state) if *state == LifecycleSpawnAuthorizationState::CreatingOwner => {
+                *state = LifecycleSpawnAuthorizationState::Active;
+                true
+            }
+            Ok(_) => false,
+            Err(_) => false,
+        };
+        if changed {
+            self.changed.send_replace(());
+        }
+    }
+
+    fn record_owner_created(&self) {
+        let changed = match self.state.lock() {
+            Ok(mut state) if *state == LifecycleSpawnAuthorizationState::CreatingOwner => {
+                *state = LifecycleSpawnAuthorizationState::OwnerCreated;
+                true
+            }
+            Ok(_) => false,
+            Err(_) => false,
+        };
+        if changed {
+            self.changed.send_replace(());
+        }
+    }
+
+    fn cancel_if_active(&self) {
+        let changed = match self.state.lock() {
+            Ok(mut state) if *state == LifecycleSpawnAuthorizationState::Active => {
+                *state = LifecycleSpawnAuthorizationState::Cancelled;
+                true
+            }
+            Ok(_) => false,
+            // A poisoned authority fails closed for future authorization.
+            Err(_) => false,
+        };
+        if changed {
+            self.changed.send_replace(());
+        }
+    }
+
+    async fn cancel(&self) {
+        loop {
+            // Subscribe before inspecting the state so a creation completing
+            // between the inspection and `changed` cannot be missed.
+            let mut changed = self.changed.subscribe();
+            let wait_for_creator = match self.state.lock() {
+                Ok(mut state) => match *state {
+                    LifecycleSpawnAuthorizationState::Active => {
+                        *state = LifecycleSpawnAuthorizationState::Cancelled;
+                        false
+                    }
+                    LifecycleSpawnAuthorizationState::CreatingOwner => true,
+                    LifecycleSpawnAuthorizationState::OwnerCreated
+                    | LifecycleSpawnAuthorizationState::Cancelled => return,
+                },
+                // A poisoned authority must never grant a later spawn.
+                Err(_) => return,
+            };
+            if !wait_for_creator {
+                self.changed.send_replace(());
+                return;
+            }
+            let _ = changed.changed().await;
+        }
+    }
+}
+
+/// A linear permit held from authorization through the exact owner-creation
+/// call. Dropping an unused permit returns the request to a cancellable state.
+pub struct LifecycleSpawnPermit {
+    authority: Arc<LifecycleSpawnAuthority>,
+    owner_created: bool,
+}
+
+impl LifecycleSpawnPermit {
+    /// Record that the owner-creation call succeeded. This releases a
+    /// concurrent timeout only after that irreversible operation is complete.
+    pub fn owner_created(&mut self) {
+        self.authority.record_owner_created();
+        self.owner_created = true;
+    }
+}
+
+impl Drop for LifecycleSpawnPermit {
+    fn drop(&mut self) {
+        if !self.owner_created {
+            self.authority.release_authorization();
+        }
+    }
 }
 
 pub struct LifecycleRequest {
     pub intent: LifecycleIntent,
     pub reply: oneshot::Sender<Result<LifecycleResolution, String>>,
+    spawn_authority: Arc<LifecycleSpawnAuthority>,
+}
+
+impl LifecycleRequest {
+    /// Atomically claim this request's one-time authority to create an owner.
+    /// The returned permit must cover the exact owner-creation operation.
+    pub fn authorize_owner_spawn(&self) -> Result<LifecycleSpawnPermit, String> {
+        self.spawn_authority.authorize_owner_spawn()
+    }
+
+    /// Whether the waiting caller has cancelled this request. Discovery may
+    /// still attach to an existing owner, but creation must fail closed.
+    pub fn is_cancelled(&self) -> bool {
+        self.spawn_authority.is_cancelled()
+    }
+}
+
+struct LifecycleRequestCancellation {
+    authority: Arc<LifecycleSpawnAuthority>,
+    armed: bool,
+}
+
+impl LifecycleRequestCancellation {
+    fn new(authority: Arc<LifecycleSpawnAuthority>) -> Self {
+        Self {
+            authority,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn cancel(&mut self) {
+        self.authority.cancel().await;
+        self.disarm();
+    }
+}
+
+impl Drop for LifecycleRequestCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.authority.cancel_if_active();
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct LifecycleClient {
     requests: mpsc::Sender<LifecycleRequest>,
+    default_intent: Arc<AtomicU8>,
 }
 
 impl LifecycleClient {
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<LifecycleRequest>) {
         let (requests, receive) = mpsc::channel(capacity);
-        (Self { requests }, receive)
+        (
+            Self {
+                requests,
+                default_intent: Arc::new(AtomicU8::new(
+                    LifecycleIntent::AttachOrPersistent.as_u8(),
+                )),
+            },
+            receive,
+        )
+    }
+
+    /// Bind the TUI's configured default lifetime to this presentation-owned
+    /// capability. Explicit lifecycle resolution remains available for host
+    /// composition; ordinary TUI consumers use [`Self::resolve_default`].
+    pub fn with_default_intent(&self, default_intent: LifecycleIntent) -> Self {
+        self.set_default_intent(default_intent);
+        self.clone()
+    }
+
+    /// Update the selected default for every clone of this capability. The
+    /// TUI calls this after applying a live config snapshot so subsequent
+    /// background work cannot retain a stale lifetime preference.
+    pub fn set_default_intent(&self, default_intent: LifecycleIntent) {
+        self.default_intent
+            .store(default_intent.as_u8(), Ordering::Release);
     }
 
     /// An explicitly unavailable lifecycle capability for presentation state
@@ -208,17 +466,47 @@ impl LifecycleClient {
 
     pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
         let (reply, receive) = oneshot::channel();
-        tokio::time::timeout(
+        let spawn_authority = LifecycleSpawnAuthority::new();
+        let mut cancellation = LifecycleRequestCancellation::new(Arc::clone(&spawn_authority));
+        let enqueue = tokio::time::timeout(
             REQUEST_TIMEOUT,
-            self.requests.send(LifecycleRequest { intent, reply }),
+            self.requests.send(LifecycleRequest {
+                intent,
+                reply,
+                spawn_authority,
+            }),
         )
         .await
         .map_err(|_| "daemon lifecycle request enqueue timed out".to_string())?
-        .map_err(|_| "daemon lifecycle resolver has stopped".to_string())?;
-        tokio::time::timeout(REQUEST_TIMEOUT, receive)
-            .await
-            .map_err(|_| "daemon lifecycle resolution timed out".to_string())?
-            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())?
+        .map_err(|_| "daemon lifecycle resolver has stopped".to_string());
+        if let Err(error) = enqueue {
+            cancellation.cancel().await;
+            return Err(error);
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
+            Ok(Ok(resolution)) => {
+                cancellation.disarm();
+                resolution
+            }
+            Ok(Err(_)) => {
+                cancellation.cancel().await;
+                Err("daemon lifecycle resolver dropped its reply".to_string())
+            }
+            Err(_) => {
+                // Do not return while a creation authorization is outstanding:
+                // that would let a timed-out request retain write authority.
+                cancellation.cancel().await;
+                Err("daemon lifecycle resolution timed out".to_string())
+            }
+        }
+    }
+
+    /// Resolve using the lifetime selected for this presentation capability.
+    /// The configured lifetime applies only if this request must create a new
+    /// owner; the lifecycle host still attaches to an existing owner first.
+    pub async fn resolve_default(&self) -> Result<LifecycleResolution, String> {
+        let intent = LifecycleIntent::from_u8(self.default_intent.load(Ordering::Acquire));
+        self.resolve(intent).await
     }
 }
 
@@ -1014,6 +1302,7 @@ mod tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            resume_compaction_offer: None,
             daemon_version: proto::DAEMON_VERSION.to_string(),
             compatible: true,
             env_baseline: None,
@@ -1673,12 +1962,25 @@ mod tests {
                         sensitive,
                     )),
                     owns_daemon: true,
+                    ephemeral_owner: true,
                     socket: PathBuf::from("in-process"),
                     startup_notice: None,
+                    promoted_from_ephemeral: false,
                 }))
                 .is_ok()
         );
         let _resolution = resolve.await.expect("resolve task");
+    }
+
+    #[tokio::test]
+    async fn configured_default_lifecycle_resolution_sends_selected_intent() {
+        let (client, mut requests) = LifecycleClient::channel(1);
+        let client = client.with_default_intent(LifecycleIntent::AttachOrEphemeral);
+        let resolve = tokio::spawn(async move { client.resolve_default().await });
+        let request = requests.recv().await.expect("lifecycle request");
+        assert_eq!(request.intent, LifecycleIntent::AttachOrEphemeral);
+        drop(request);
+        assert!(resolve.await.expect("resolve task").is_err());
     }
 
     #[tokio::test]
@@ -1691,6 +1993,41 @@ mod tests {
         resolve.abort();
         let _ = resolve.await;
         assert!(request.reply.is_closed());
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_owner_creation_have_one_authority_winner() {
+        let authority = LifecycleSpawnAuthority::new();
+        let mut permit = authority
+            .authorize_owner_spawn()
+            .expect("active request may claim owner creation");
+
+        let cancelling_authority = Arc::clone(&authority);
+        let cancellation = tokio::spawn(async move {
+            cancelling_authority.cancel().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !cancellation.is_finished(),
+            "cancellation must wait for an authorized creation to finish"
+        );
+
+        permit.owner_created();
+        cancellation.await.expect("cancellation task");
+        assert!(
+            authority.authorize_owner_spawn().is_err(),
+            "an already-resolved request cannot create a second owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_claimed_first_rejects_owner_creation() {
+        let authority = LifecycleSpawnAuthority::new();
+        authority.cancel().await;
+        assert!(
+            authority.authorize_owner_spawn().is_err(),
+            "a cancelled request cannot create an owner"
+        );
     }
 
     #[tokio::test]

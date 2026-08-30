@@ -54,7 +54,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
 fn resolve_current_project_id() -> Result<String> {
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("resolving cwd: {e}"))?;
     let root = crate::git::find_worktree_root(&cwd).unwrap_or(cwd);
-    Ok(project_id_for(&root))
+    project_id_for(&root)
 }
 
 // ---- JSON ------------------------------------------------------------------

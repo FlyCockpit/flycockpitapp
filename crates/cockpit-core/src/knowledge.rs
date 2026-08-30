@@ -4198,20 +4198,22 @@ struct ResolvedLocalKnowledgeBase {
 /// capability: they remain available only through retrieval tools.
 async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLocalKnowledgeBase>> {
     let mut registry = Vec::with_capacity(ctx.config.extended().knowledge_bases.len() + 1);
-    if let Some(assistant) = assistant_knowledge_registry_entry(&ctx.session).await? {
-        registry.push(assistant.entry);
+    // Native filesystem admission must not make every ordinary tool operation
+    // depend on an assistant snapshot read. The snapshot is an additional KB
+    // source, not a prerequisite for using unrelated workspace files. A
+    // successfully resolved source is still fenced below; an unavailable one
+    // cannot contribute a filesystem capability.
+    match assistant_knowledge_registry_entry(&ctx.session).await {
+        Ok(Some(assistant)) => registry.push(assistant.entry),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "ignoring unavailable assistant knowledge source for native path policy")
+        }
     }
     registry.extend(ctx.config.extended().knowledge_bases.iter().cloned());
 
-    let mut seen = BTreeSet::new();
     let mut local = Vec::new();
     for entry in registry {
-        if !seen.insert(entry.id.clone()) {
-            bail!(
-                "knowledge base registry contains duplicate ID `{}`",
-                entry.id
-            );
-        }
         let KnowledgeBaseSource::Local { path } = entry.source else {
             continue;
         };
@@ -4220,12 +4222,11 @@ async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLoc
         } else {
             ctx.cwd.join(path)
         };
-        let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
-            anyhow::anyhow!(
-                "cannot resolve local knowledge base `{}` source: {error}",
-                entry.id
-            )
-        })?;
+        // A dangling source must not brick a read of an unrelated path. Keep
+        // its lexical root in the policy so a target beneath that configured
+        // path remains fail-closed; once the source becomes resolvable the
+        // normal symlink-aware effective path replaces this fallback.
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
         local.push(ResolvedLocalKnowledgeBase {
             id: entry.id,
             root,
@@ -4235,21 +4236,41 @@ async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLoc
     Ok(local)
 }
 
+fn native_knowledge_base_permitted(
+    ctx: &ToolCtx,
+    knowledge_base: &ResolvedLocalKnowledgeBase,
+) -> bool {
+    !ctx.allowed_knowledge_bases
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        && (!knowledge_base.trust_required || ctx.executing_model_trusted)
+}
+
 /// Return the registry-resolved local roots that the calling agent may read.
 /// This is intentionally a read-only capability: native writes continue
 /// through the ordinary path-approval and write gates.
 pub(crate) async fn attached_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
-        if ctx
-            .allowed_knowledge_bases
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
-            || (knowledge_base.trust_required && !ctx.knowledge_access_trusted)
-        {
+        if !native_knowledge_base_permitted(ctx, &knowledge_base) {
             continue;
         }
         if !roots.iter().any(|root| root == &knowledge_base.root) {
+            roots.push(knowledge_base.root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Return every registry-resolved local root that is not a native read
+/// capability for this frame. Recursive native tools use this to keep a walk
+/// rooted in the workspace from crossing into a nested, withheld KB.
+pub(crate) async fn denied_native_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if !native_knowledge_base_permitted(ctx, &knowledge_base)
+            && !roots.iter().any(|root| root == &knowledge_base.root)
+        {
             roots.push(knowledge_base.root);
         }
     }
@@ -4264,6 +4285,7 @@ pub(crate) async fn check_native_local_knowledge_path_access(
     ctx: &ToolCtx,
     path: &Path,
 ) -> Result<bool> {
+    let mut attached = false;
     for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
         if !cockpit_host::path_containment::contained_under(&knowledge_base.root, path) {
             continue;
@@ -4279,26 +4301,55 @@ pub(crate) async fn check_native_local_knowledge_path_access(
                 knowledge_base.id
             );
         }
-        if knowledge_base.trust_required && !ctx.knowledge_access_trusted {
+        if knowledge_base.trust_required && !ctx.executing_model_trusted {
             bail!(
                 "access denied: `{}` is in a local knowledge base that requires a trusted model",
                 path.display()
             );
         }
-        return Ok(true);
+        // Overlapping KB roots are an intersection of capabilities. A later
+        // containing root may be restricted even when an earlier one is not.
+        attached = true;
     }
-    Ok(false)
+    Ok(attached)
 }
 
-/// Return canonical local KB roots withheld from this model. The result is
-/// shared by native-path and shell confinement gates so trust-required source
-/// Markdown cannot be reached through an ordinary filesystem surface.
+/// Return local KB roots withheld from this native/shell frame. The result is
+/// shared by opaque-host and shell confinement gates so a source that is not
+/// attached to this agent (or requires a trusted executor) cannot be reached
+/// through an ordinary filesystem surface.
 pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
     denied_local_knowledge_roots_for_model(
         &ctx.cwd,
         &ctx.config.extended(),
-        ctx.knowledge_access_trusted,
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
     )
+}
+
+/// Return every configured local KB root. Shell execution uses this separate
+/// write fence: an attached source may be readable there, but generic shell
+/// writes must never mutate a KB outside the dream/human-owned paths.
+pub(crate) fn configured_local_knowledge_roots(
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for entry in &extended.knowledge_bases {
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let root = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 /// Return canonical local KB roots withheld from a model without requiring a
@@ -4307,14 +4358,14 @@ pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>
 pub(crate) fn denied_local_knowledge_roots_for_model(
     cwd: &Path,
     extended: &ExtendedConfig,
-    knowledge_access_trusted: bool,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
 ) -> Result<Vec<PathBuf>> {
-    if knowledge_access_trusted {
-        return Ok(Vec::new());
-    }
     let mut roots = Vec::new();
     for entry in &extended.knowledge_bases {
-        if !entry.trust_required {
+        if !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&entry.id))
+            && (!entry.trust_required || executing_model_trusted)
+        {
             continue;
         }
         let KnowledgeBaseSource::Local { path } = &entry.source else {
@@ -4325,12 +4376,7 @@ pub(crate) fn denied_local_knowledge_roots_for_model(
         } else {
             cwd.join(path)
         };
-        let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
-            anyhow::anyhow!(
-                "cannot resolve trust-required knowledge base `{}` source: {error}",
-                entry.id
-            )
-        })?;
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
         if !roots.iter().any(|existing| existing == &root) {
             roots.push(root);
         }

@@ -386,6 +386,8 @@ async fn call_bash_inner(
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
     let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+    let write_denied_knowledge_paths =
+        crate::knowledge::configured_local_knowledge_roots(&ctx.cwd, &ctx.config.extended());
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -470,14 +472,17 @@ async fn call_bash_inner(
             "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    if !denied_knowledge_paths.is_empty() && options.force_unconfined {
+    if (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+        && options.force_unconfined
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash cannot run unconfined while a local knowledge base requires a trusted model.",
+            "Access denied: bash cannot run unconfined while a local knowledge base is configured.",
         ));
     }
     let sandbox_on = if ctx.write_scope.is_some()
         || ctx.workspace_lease.is_some()
         || !denied_knowledge_paths.is_empty()
+        || !write_denied_knowledge_paths.is_empty()
     {
         true
     } else {
@@ -495,9 +500,11 @@ async fn call_bash_inner(
     let is_container_run = !options.force_unconfined
         && ctx.workspace_lease.is_none()
         && ctx.session.sandbox_mode().is_container();
-    if is_container_run && !denied_knowledge_paths.is_empty() {
+    if is_container_run
+        && (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash is unavailable for this model because container execution cannot exclude a local knowledge base that requires a trusted model.",
+            "Access denied: bash is unavailable because container execution cannot enforce the local knowledge-base filesystem fence.",
         ));
     }
     // Reject legacy sealed binding fields before any lookup or spawn.
@@ -731,6 +738,7 @@ async fn call_bash_inner(
         &session_env,
         &extra_sandbox_paths,
         &denied_knowledge_paths,
+        &write_denied_knowledge_paths,
         ctx,
         timeout_ms,
         &mut resource_lease,
@@ -806,6 +814,7 @@ async fn call_bash_inner(
     if confine
         && !options.escalated
         && denied_knowledge_paths.is_empty()
+        && write_denied_knowledge_paths.is_empty()
         && ctx.write_scope.is_none()
         && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
@@ -874,6 +883,7 @@ async fn call_bash_inner(
                 &session_env,
                 &extra_sandbox_paths,
                 &denied_knowledge_paths,
+                &write_denied_knowledge_paths,
                 ctx,
                 timeout_ms,
                 &mut resource_lease,
@@ -2655,6 +2665,7 @@ async fn run_shell(
     session_env: &std::collections::HashMap<String, String>,
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     denied_knowledge_paths: &[PathBuf],
+    write_denied_knowledge_paths: &[PathBuf],
     ctx: &ToolCtx,
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
@@ -2694,6 +2705,7 @@ async fn run_shell(
                 .map(|lease| lease.allows_write())
                 .unwrap_or(true),
             denied_knowledge_paths,
+            write_denied_knowledge_paths,
         )
         .await
         {

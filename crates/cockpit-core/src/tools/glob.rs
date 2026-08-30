@@ -127,9 +127,17 @@ impl Tool for GlobTool {
             .session
             .secret_path_matcher(&ctx.config.extended().redact)
             .clone();
+        let denied_knowledge_roots =
+            crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
         let root = canonical_root.clone();
         let out = tokio::task::spawn_blocking(move || {
-            glob_blocking(&set, &walk_root, &root, &secret_paths)
+            glob_blocking(
+                &set,
+                &walk_root,
+                &root,
+                &secret_paths,
+                &denied_knowledge_roots,
+            )
         })
         .await
         .map_err(|e| anyhow::anyhow!("glob worker joined: {e}"))??;
@@ -142,6 +150,7 @@ fn glob_blocking(
     walk_root: &Path,
     canonical_root: &Path,
     secret_paths: &crate::secret_paths::SecretPathMatcher,
+    denied_knowledge_roots: &[std::path::PathBuf],
 ) -> Result<ToolOutput> {
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     let mut count = 0usize;
@@ -161,7 +170,12 @@ fn glob_blocking(
             continue;
         }
         let path = entry.path();
-        if !sandbox::within_root(canonical_root, path) || secret_paths.is_secret_path(path) {
+        if !sandbox::within_root(canonical_root, path)
+            || secret_paths.is_secret_path(path)
+            || denied_knowledge_roots
+                .iter()
+                .any(|root| cockpit_host::path_containment::contained_under(root, path))
+        {
             continue;
         }
         let rel = path
@@ -301,5 +315,52 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("concept.md"), "got: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn skips_a_nested_local_knowledge_base_not_attached_to_the_agent() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(workspace.path(), "visible.md", "visible");
+        write(workspace.path(), "private/hidden.md", "hidden");
+        let mut ctx = test_ctx(workspace.path());
+        ctx.allowed_knowledge_bases =
+            Some(std::collections::BTreeSet::from(["workspace".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        for (id, path) in [
+            ("workspace", workspace.path().to_path_buf()),
+            ("private", workspace.path().join("private")),
+        ] {
+            extended.knowledge_bases.push(
+                crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    id.to_string(),
+                    id.to_string(),
+                    format!("{id} local knowledge"),
+                    crate::config::extended::KnowledgeBaseSource::Local { path },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                ),
+            );
+        }
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let out = GlobTool
+            .call(serde_json::json!({ "pattern": "**/*.md" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("visible.md"), "got: {}", out.content);
+        assert!(
+            !out.content.contains("private/hidden.md"),
+            "got: {}",
+            out.content
+        );
     }
 }

@@ -1280,6 +1280,7 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            allowed_knowledge_bases: self.allowed_knowledge_bases.clone(),
             executing_model_trusted: self.executing_model_trusted,
             knowledge_access_trusted: self.knowledge_access_trusted,
             caller_model: self.caller_model.clone(),

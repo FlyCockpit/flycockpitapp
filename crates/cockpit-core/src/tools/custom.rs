@@ -190,7 +190,11 @@ impl Tool for CustomBashTool {
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
-        let sandbox_on = ctx.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
+        let write_denied_knowledge_paths =
+            crate::knowledge::configured_local_knowledge_roots(&ctx.cwd, &ctx.config.extended());
+        let sandbox_on = ctx.session.sandbox_enabled()
+            || !denied_knowledge_paths.is_empty()
+            || !write_denied_knowledge_paths.is_empty();
         let confine = match crate::tools::shell_sandbox::gate_decision(
             sandbox_on,
             crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
@@ -198,9 +202,9 @@ impl Tool for CustomBashTool {
             crate::tools::shell_sandbox::SandboxGate::Confine => true,
             crate::tools::shell_sandbox::SandboxGate::Unconfined => false,
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
-                if !denied_knowledge_paths.is_empty() {
+                if !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty() {
                     return Ok(ToolOutput::text(format!(
-                        "Access denied: custom tools cannot run because the required shell confinement is unavailable ({reason}) while a local knowledge base requires a trusted model."
+                        "Access denied: custom tools cannot run because the required shell confinement is unavailable ({reason}) while a local knowledge-base filesystem fence is required."
                     )));
                 }
                 return Ok(ToolOutput::text(format!(
@@ -259,6 +263,7 @@ impl Tool for CustomBashTool {
                 &[],
                 ctx.write_scope.as_deref(),
                 &denied_knowledge_paths,
+                &write_denied_knowledge_paths,
             )
             .await?
         } else {

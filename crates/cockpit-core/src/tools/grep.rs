@@ -130,6 +130,8 @@ impl Tool for GrepTool {
             .session
             .secret_path_matcher(&ctx.config.extended().redact)
             .clone();
+        let denied_knowledge_roots =
+            crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
         let display_root = canonical_root.clone();
         let guard_root = canonical_root.clone();
         let query = pattern.clone();
@@ -149,7 +151,11 @@ impl Tool for GrepTool {
         };
         let out = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
-                sandbox::within_root(&guard_root, path) && !secret_paths.is_secret_path(path)
+                sandbox::within_root(&guard_root, path)
+                    && !secret_paths.is_secret_path(path)
+                    && !denied_knowledge_roots
+                        .iter()
+                        .any(|root| cockpit_host::path_containment::contained_under(root, path))
             })
             .map(|outcome| render_search_outcome(outcome, &query))
         })
@@ -314,6 +320,57 @@ mod tests {
             .unwrap();
         assert!(
             out.content.contains("concept.md:1:"),
+            "got: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_a_nested_local_knowledge_base_not_attached_to_the_agent() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(workspace.path(), "visible.md", "needle visible\n");
+        write(workspace.path(), "private/hidden.md", "needle hidden\n");
+        let mut ctx = test_ctx(workspace.path());
+        ctx.allowed_knowledge_bases =
+            Some(std::collections::BTreeSet::from(["workspace".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        for (id, path) in [
+            ("workspace", workspace.path().to_path_buf()),
+            ("private", workspace.path().join("private")),
+        ] {
+            extended.knowledge_bases.push(
+                crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    id.to_string(),
+                    id.to_string(),
+                    format!("{id} local knowledge"),
+                    crate::config::extended::KnowledgeBaseSource::Local { path },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                ),
+            );
+        }
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let out = GrepTool
+            .call(serde_json::json!({ "pattern": "needle" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("visible.md:1:"),
+            "got: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("private/hidden.md"),
             "got: {}",
             out.content
         );

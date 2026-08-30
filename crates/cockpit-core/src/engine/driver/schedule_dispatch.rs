@@ -429,12 +429,20 @@ impl Driver {
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots_for_model(
             &self.cwd,
             &self.config.extended(),
-            agent.model.is_trusted(),
+            agent
+                .definition
+                .as_ref()
+                .and_then(crate::agents::AgentDef::allowed_knowledge_bases),
+            !agent.delegated && agent.model.is_trusted(),
         )
         .map_err(|error| {
             format!("Error: cannot resolve local knowledge-base access policy: {error}")
         })?;
-        let sandbox_on = self.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
+        let write_denied_knowledge_paths =
+            crate::knowledge::configured_local_knowledge_roots(&self.cwd, &self.config.extended());
+        let sandbox_on = self.session.sandbox_enabled()
+            || !denied_knowledge_paths.is_empty()
+            || !write_denied_knowledge_paths.is_empty();
         let availability = if sandbox_on {
             background_sandbox_availability(cwd).await
         } else {
@@ -451,10 +459,11 @@ impl Driver {
                     self.session.workspace_scratch_dir(),
                     session_env,
                     denied_knowledge_paths,
+                    write_denied_knowledge_paths,
                 ),
             ),
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
-                if denied_knowledge_paths.is_empty() {
+                if denied_knowledge_paths.is_empty() && write_denied_knowledge_paths.is_empty() {
                     Err(background_sandbox_unavailable_refusal(&reason))
                 } else {
                     Err(background_knowledge_sandbox_unavailable_refusal(&reason))

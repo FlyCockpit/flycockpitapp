@@ -53,6 +53,7 @@ pub struct BackgroundLaunch {
     /// carrying these paths must always be confined; driver construction owns
     /// that invariant.
     denied_knowledge_paths: Vec<PathBuf>,
+    write_denied_knowledge_paths: Vec<PathBuf>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
 }
@@ -65,6 +66,7 @@ impl BackgroundLaunch {
             workspace_scratch_dir: None,
             session_env,
             denied_knowledge_paths: Vec::new(),
+            write_denied_knowledge_paths: Vec::new(),
             #[cfg(test)]
             test_sandbox_build: None,
         }
@@ -80,6 +82,7 @@ impl BackgroundLaunch {
             workspace_scratch_dir,
             session_env,
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -88,6 +91,7 @@ impl BackgroundLaunch {
         workspace_scratch_dir: PathBuf,
         session_env: HashMap<String, String>,
         denied_knowledge_paths: Vec<PathBuf>,
+        write_denied_knowledge_paths: Vec<PathBuf>,
     ) -> Self {
         Self {
             confine: true,
@@ -95,6 +99,7 @@ impl BackgroundLaunch {
             workspace_scratch_dir: Some(workspace_scratch_dir),
             session_env,
             denied_knowledge_paths,
+            write_denied_knowledge_paths,
             #[cfg(test)]
             test_sandbox_build: None,
         }
@@ -680,6 +685,7 @@ async fn build_confined_background_command(
         &[],
         None,
         &launch.denied_knowledge_paths,
+        &launch.write_denied_knowledge_paths,
     )
     .await
 }

@@ -13337,6 +13337,7 @@ impl Driver {
                     remaining_depth,
                     granted_tools,
                     seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13551,6 +13552,22 @@ impl Driver {
                     // publish together.  A restart can therefore observe
                     // either an unstarted task child or a fully-addressable
                     // interactive executor, never the old orphaned middle.
+                    let seed_read_claim = match self
+                        .session
+                        .claim_seed_read_receipt(seed_reads_receipt.as_deref(), &seed_reads)
+                    {
+                        Ok(claim) => claim,
+                        Err(error) => {
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                            continue;
+                        }
+                    };
                     let child_agent_instance_id = match self
                         .session
                         .db
@@ -13625,6 +13642,9 @@ impl Driver {
                             continue;
                         }
                     };
+                    if let Some(claim) = seed_read_claim {
+                        claim.commit();
+                    }
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
                     let child_context_policy = child.context_policy.clone();
                     self.emit_subagent_routing_amend(
@@ -13788,6 +13808,7 @@ impl Driver {
                     context,
                     granted_tools,
                     seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -14057,6 +14078,7 @@ impl Driver {
                             .map(|lease| lease.id.to_string()),
                         granted_tools,
                         seed_reads,
+                        seed_reads_receipt,
                         todo_ids,
                         child_recursion,
                         repair_notes,

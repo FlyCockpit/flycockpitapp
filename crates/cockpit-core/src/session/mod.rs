@@ -194,6 +194,65 @@ impl UnjournaledInferenceReason {
     }
 }
 
+const MAX_SEED_READ_RECEIPTS: usize = 64;
+const SEED_READ_RECEIPT_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+struct SeedReadReceiptEntry {
+    seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+    issued_at: std::time::Instant,
+    state: SeedReadReceiptState,
+}
+
+enum SeedReadReceiptState {
+    Available,
+    Claimed,
+}
+
+fn retire_stale_seed_read_receipts(
+    receipts: &mut std::collections::HashMap<Uuid, SeedReadReceiptEntry>,
+) {
+    receipts.retain(|_, entry| {
+        matches!(entry.state, SeedReadReceiptState::Claimed)
+            || entry.issued_at.elapsed() < SEED_READ_RECEIPT_TTL
+    });
+}
+
+pub(crate) struct SeedReadReceiptClaim {
+    session: Arc<Session>,
+    id: Uuid,
+    committed: bool,
+}
+
+impl SeedReadReceiptClaim {
+    pub(crate) fn commit(mut self) {
+        self.session
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+        self.committed = true;
+    }
+}
+
+impl Drop for SeedReadReceiptClaim {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut receipts = self
+            .session
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = receipts.get_mut(&self.id)
+            && matches!(entry.state, SeedReadReceiptState::Claimed)
+        {
+            entry.state = SeedReadReceiptState::Available;
+        }
+        retire_stale_seed_read_receipts(&mut receipts);
+    }
+}
+
 /// Per-conversation session state. Cloned through `Arc` into every
 /// tool invocation. Owns a clone of the `Db` handle (the underlying
 /// connection is shared).
@@ -235,8 +294,7 @@ pub struct Session {
     /// deliberately memory-only: a resumed process fails closed and requires
     /// a fresh explore selection rather than accepting model-synthesized seed
     /// calls after losing the host provenance boundary.
-    seed_read_receipts:
-        Mutex<std::collections::HashMap<Uuid, Vec<crate::engine::seed_reads::SeedRead>>>,
+    seed_read_receipts: Mutex<std::collections::HashMap<Uuid, SeedReadReceiptEntry>>,
     /// Turn-pinned transcription egress composed from the same resolved
     /// provider credential, endpoint, capability metadata, and journal.
     transcription_dispatch: Mutex<
@@ -534,18 +592,53 @@ impl Session {
     pub(crate) fn issue_seed_read_receipt(
         &self,
         seed_reads: &[crate::engine::seed_reads::SeedRead],
-    ) -> String {
+    ) -> Option<String> {
         let receipt = Uuid::new_v4();
-        self.seed_read_receipts
+        let argument_bytes = seed_reads.iter().try_fold(0usize, |total, seed| {
+            serde_json::to_vec(&seed.args)
+                .ok()
+                .and_then(|encoded| total.checked_add(encoded.len()))
+        });
+        if seed_reads.len() > crate::engine::seed_reads::MAX_SEED_READ_CALLS
+            || argument_bytes
+                .is_none_or(|bytes| bytes > crate::engine::seed_reads::MAX_SEED_READ_ARGUMENT_BYTES)
+        {
+            return None;
+        }
+        let mut receipts = self
+            .seed_read_receipts
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(receipt, seed_reads.to_vec());
-        receipt.to_string()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retire_stale_seed_read_receipts(&mut receipts);
+        while receipts.len() >= MAX_SEED_READ_RECEIPTS {
+            let Some(oldest) = receipts
+                .iter()
+                .filter(|(_, entry)| matches!(entry.state, SeedReadReceiptState::Available))
+                .min_by_key(|(_, entry)| entry.issued_at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            receipts.remove(&oldest);
+        }
+        if receipts.len() >= MAX_SEED_READ_RECEIPTS {
+            // Every retained entry is in the narrow admission claim window.
+            // Fail closed without growing session memory. Callers omit the
+            // selection rather than reporting calls with an unusable receipt.
+            return None;
+        }
+        receipts.insert(
+            receipt,
+            SeedReadReceiptEntry {
+                seed_reads: seed_reads.to_vec(),
+                issued_at: std::time::Instant::now(),
+                state: SeedReadReceiptState::Available,
+            },
+        );
+        Some(receipt.to_string())
     }
 
-    /// Consume a host-issued seed receipt only when the declarative handoff
-    /// carries the exact calls that the explore fork selected.
-    pub(crate) fn consume_seed_read_receipt(
+    pub(crate) fn validate_seed_read_receipt(
         &self,
         receipt: &str,
         seed_reads: &[crate::engine::seed_reads::SeedRead],
@@ -556,12 +649,47 @@ impl Session {
             .seed_read_receipts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retire_stale_seed_read_receipts(&mut receipts);
         match receipts.get(&receipt) {
-            Some(expected) if expected == seed_reads => {
-                receipts.remove(&receipt);
-                Ok(())
+            Some(entry) if entry.seed_reads != seed_reads => {
+                Err("seed_reads do not match their host-issued explore receipt".to_string())
             }
-            Some(_) => Err("seed_reads do not match their host-issued explore receipt".to_string()),
+            Some(entry) if matches!(entry.state, SeedReadReceiptState::Available) => Ok(()),
+            Some(_) => Err("seed_reads receipt is already being redeemed".to_string()),
+            None => Err("seed_reads receipt is unknown, expired, or already used".to_string()),
+        }
+    }
+
+    pub(crate) fn claim_seed_read_receipt(
+        self: &Arc<Self>,
+        receipt: Option<&str>,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+    ) -> std::result::Result<Option<SeedReadReceiptClaim>, String> {
+        if seed_reads.is_empty() {
+            return Ok(None);
+        }
+        let raw = receipt
+            .ok_or_else(|| "seed_reads require the host-issued explore receipt".to_string())?;
+        let id = Uuid::parse_str(raw)
+            .map_err(|_| "seed_reads receipt is not a host-issued UUID".to_string())?;
+        let mut receipts = self
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retire_stale_seed_read_receipts(&mut receipts);
+        match receipts.get_mut(&id) {
+            Some(entry) if entry.seed_reads != seed_reads => {
+                Err("seed_reads do not match their host-issued explore receipt".to_string())
+            }
+            Some(entry) if matches!(entry.state, SeedReadReceiptState::Available) => {
+                entry.state = SeedReadReceiptState::Claimed;
+                Ok(Some(SeedReadReceiptClaim {
+                    session: self.clone(),
+                    id,
+                    committed: false,
+                }))
+            }
+            Some(_) => Err("seed_reads receipt is already being redeemed".to_string()),
             None => Err("seed_reads receipt is unknown, expired, or already used".to_string()),
         }
     }

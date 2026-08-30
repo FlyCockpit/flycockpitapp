@@ -460,6 +460,7 @@ async fn scheduler_delegate_probe_is_side_effect_free_until_attempt_admission() 
         context: crate::engine::agent::TaskContext::Fresh,
         granted_tools: Vec::new(),
         seed_reads: Vec::new(),
+        seed_reads_receipt: None,
         todo_ids: Vec::new(),
         repair_notes: Vec::new(),
         task_call_id: "probe-no-consume".to_string(),
@@ -492,6 +493,44 @@ async fn scheduler_delegate_probe_is_side_effect_free_until_attempt_admission() 
             .expect("probe left the entire retry budget untouched");
     }
     assert!(driver.consume_delegation_retry_budget().is_err());
+}
+
+#[test]
+fn seed_receipt_claim_rolls_back_before_admission_and_commits_once() {
+    let (driver, _tmp) = test_driver(1);
+    let seeds = vec![crate::engine::seed_reads::SeedRead {
+        tool: "read".to_string(),
+        args: serde_json::json!({"path": "src/lib.rs"}),
+    }];
+    let receipt = driver
+        .session
+        .issue_seed_read_receipt(&seeds)
+        .expect("bounded receipt table accepts one selection");
+
+    driver
+        .session
+        .validate_seed_read_receipt(&receipt, &seeds)
+        .expect("structural authorization does not consume the receipt");
+    drop(
+        driver
+            .session
+            .claim_seed_read_receipt(Some(&receipt), &seeds)
+            .expect("first admission claim")
+            .expect("non-empty seeds produce a claim"),
+    );
+    let claim = driver
+        .session
+        .claim_seed_read_receipt(Some(&receipt), &seeds)
+        .expect("a pre-admission failure releases the exact claim")
+        .expect("retry produces a claim");
+    claim.commit();
+    assert!(
+        driver
+            .session
+            .claim_seed_read_receipt(Some(&receipt), &seeds)
+            .is_err(),
+        "a published child retires the receipt permanently"
+    );
 }
 
 fn exact_model_selector(model: &str) -> crate::engine::model_roles::DelegationModelSelector {
@@ -665,6 +704,7 @@ fn single_task(
         workspace_lease: None,
         granted_tools: Vec::new(),
         seed_reads: Vec::new(),
+        seed_reads_receipt: None,
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),

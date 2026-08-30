@@ -61,6 +61,7 @@ pub enum TurnOutcome {
         /// Read-only calls selected by a prior explore fork. The child runs
         /// these through ordinary dispatch before its first inference.
         seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+        seed_reads_receipt: Option<String>,
         todo_ids: Vec<uuid::Uuid>,
         repair_notes: Vec<String>,
         /// Outstanding tool-call id the driver must answer when the
@@ -109,6 +110,7 @@ pub enum TurnOutcome {
         /// only. Empty when the parent granted nothing.
         granted_tools: Vec<String>,
         seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+        seed_reads_receipt: Option<String>,
         todo_ids: Vec<uuid::Uuid>,
         repair_notes: Vec<String>,
         task_call_id: String,

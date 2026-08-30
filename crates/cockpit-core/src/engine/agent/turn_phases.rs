@@ -1914,13 +1914,16 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             ));
                         }
                     };
-                let seed_reads_receipt = args.get("seed_reads_receipt").and_then(Value::as_str);
+                let seed_reads_receipt = args
+                    .get("seed_reads_receipt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 if let Err(err) = crate::engine::seed_reads::authorize_handoff(
                     session,
                     agent,
                     &child,
                     &seed_reads,
-                    seed_reads_receipt,
+                    seed_reads_receipt.as_deref(),
                 ) {
                     return_structural!(task_refusal(
                         &tc.id,
@@ -2019,6 +2022,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         remaining_depth,
                         granted_tools,
                         seed_reads,
+                        seed_reads_receipt,
                         todo_ids,
                         repair_notes,
                         task_call_id: tc.id.to_string(),
@@ -2045,6 +2049,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     context,
                     granted_tools,
                     seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id: tc.id.to_string(),

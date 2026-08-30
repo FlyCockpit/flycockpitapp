@@ -649,6 +649,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) workspace_lease: Option<String>,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
     pub(in crate::engine::driver) seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+    pub(in crate::engine::driver) seed_reads_receipt: Option<String>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
     pub(in crate::engine::driver) child_recursion:
         crate::engine::builtin::DelegationRecursionContext,
@@ -2091,6 +2092,7 @@ impl Driver {
             granted_tools,
             seed_reads: crate::engine::seed_reads::parse_seed_reads(entry.get("seed_reads"))
                 .map_err(anyhow::Error::msg)?,
+            seed_reads_receipt: None,
             todo_ids: entry
                 .get("todo_ids")
                 .and_then(serde_json::Value::as_array)
@@ -2249,6 +2251,7 @@ impl Driver {
             granted_tools,
             seed_reads: crate::engine::seed_reads::parse_seed_reads(entry.get("seed_reads"))
                 .map_err(anyhow::Error::msg)?,
+            seed_reads_receipt: None,
             todo_ids: entry
                 .get("todo_ids")
                 .and_then(serde_json::Value::as_array)
@@ -3015,6 +3018,25 @@ impl Driver {
                     ));
                 }
             };
+            let seed_read_claim = match self
+                .session
+                .claim_seed_read_receipt(task.seed_reads_receipt.as_deref(), &task.seed_reads)
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            &task.repair_notes,
+                            error,
+                        )
+                        .await,
+                    ));
+                }
+            };
             let Some(parent_agent_instance_id) =
                 self.stack.last().and_then(|frame| frame.agent_instance_id)
             else {
@@ -3109,6 +3131,9 @@ impl Driver {
                         .await;
                 }),
             );
+            if let Some(claim) = seed_read_claim {
+                claim.commit();
+            }
             Ok(None)
         })
     }
@@ -3185,6 +3210,7 @@ impl Driver {
             context,
             granted_tools,
             seed_reads,
+            seed_reads_receipt,
             todo_ids,
             repair_notes,
             task_call_id,
@@ -3227,6 +3253,7 @@ impl Driver {
             workspace_lease,
             granted_tools,
             seed_reads,
+            seed_reads_receipt,
             todo_ids,
             child_recursion,
             repair_notes,
@@ -3921,6 +3948,7 @@ impl Driver {
             workspace_lease,
             granted_tools,
             seed_reads,
+            seed_reads_receipt: _,
             todo_ids,
             child_recursion,
             repair_notes,
@@ -12095,6 +12123,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 context: _,
                 granted_tools,
                 seed_reads,
+                seed_reads_receipt: _,
                 todo_ids: _,
                 repair_notes,
                 task_call_id,

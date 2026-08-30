@@ -14,6 +14,8 @@ use crate::engine::message::{AssistantContent, Message, collect_tool_calls};
 /// newly read-only effect classification here by accident would widen the
 /// cross-agent capability without an explicit product decision.
 pub const ALLOWED_SEED_READ_TOOLS: &[&str] = &["read", "grep", "code", "graph", "search"];
+pub const MAX_SEED_READ_CALLS: usize = 32;
+pub const MAX_SEED_READ_ARGUMENT_BYTES: usize = 64 * 1024;
 const COMPLETION_NOTICE: &str = "The host executed the explore-selected read-only seed calls above. Use their fresh results and continue with the delegated implementation brief without rediscovering them.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,8 +70,25 @@ pub fn parse_seed_reads(value: Option<&Value>) -> Result<Vec<SeedRead>, String> 
     let calls = value
         .as_array()
         .ok_or_else(|| "seed_reads must be an array".to_string())?;
-    if calls.len() > 32 {
-        return Err("seed_reads accepts at most 32 calls".to_string());
+    if calls.len() > MAX_SEED_READ_CALLS {
+        return Err(format!(
+            "seed_reads accepts at most {MAX_SEED_READ_CALLS} calls"
+        ));
+    }
+    let argument_bytes = calls.iter().try_fold(0usize, |total, call| {
+        let args = call.get("args").unwrap_or(&Value::Null);
+        serde_json::to_vec(args)
+            .map_err(|error| format!("serializing seed_reads arguments: {error}"))
+            .and_then(|encoded| {
+                total
+                    .checked_add(encoded.len())
+                    .ok_or_else(|| "seed_reads arguments are too large".to_string())
+            })
+    })?;
+    if argument_bytes > MAX_SEED_READ_ARGUMENT_BYTES {
+        return Err(format!(
+            "seed_reads arguments exceed the {MAX_SEED_READ_ARGUMENT_BYTES}-byte limit"
+        ));
     }
     calls
         .iter()
@@ -194,8 +213,14 @@ pub async fn select_from_explore_fork(
         .ok()
         .and_then(|mut selected| selected.take())
         .unwrap_or_default();
-    let receipt = (!calls.is_empty() && session.parent_session_id.is_none())
-        .then(|| session.issue_seed_read_receipt(&calls));
+    let receipt = if !calls.is_empty() && session.parent_session_id.is_none() {
+        let Some(receipt) = session.issue_seed_read_receipt(&calls) else {
+            return SeedReadSelection::empty();
+        };
+        Some(receipt)
+    } else {
+        None
+    };
     SeedReadSelection { calls, receipt }
 }
 
@@ -210,9 +235,9 @@ pub fn append_to_report(mut report: String, selection: &SeedReadSelection) -> St
     report
 }
 
-/// Enforce the cross-agent ownership boundary before a structural `task`
-/// outcome exists. Only the root `Build` agent may redeem the one-use receipt,
-/// and only to the implementation `builder` role.
+/// Validate the cross-agent ownership boundary before a structural `task`
+/// outcome exists. Redemption is deliberately deferred to the driver's durable
+/// child-admission boundary so a refused attempt does not burn the receipt.
 pub fn authorize_handoff(
     session: &crate::session::Session,
     parent_agent: &crate::engine::agent::Agent,
@@ -236,7 +261,7 @@ pub fn authorize_handoff(
     let receipt = receipt
         .filter(|receipt| !receipt.trim().is_empty())
         .ok_or_else(|| "seed_reads require the host-issued explore receipt".to_string())?;
-    session.consume_seed_read_receipt(receipt, seed_reads)
+    session.validate_seed_read_receipt(receipt, seed_reads)
 }
 
 /// Synthetic seed calls already declared in history but lacking a paired tool
@@ -461,6 +486,16 @@ mod tests {
             .unwrap();
             assert_eq!(calls[0].tool, *tool);
         }
+    }
+
+    #[test]
+    fn rejects_oversized_seed_arguments() {
+        let oversized = "x".repeat(MAX_SEED_READ_ARGUMENT_BYTES + 1);
+        let error = parse_seed_reads(Some(&serde_json::json!([
+            {"tool": "read", "args": {"path": oversized}}
+        ])))
+        .unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
     }
 
     #[test]

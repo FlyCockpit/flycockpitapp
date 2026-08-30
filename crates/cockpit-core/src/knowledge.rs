@@ -4243,6 +4243,24 @@ async fn effective_local_knowledge_bases(
             .map(|entry| (entry, false)),
     );
 
+    // IDs name retrieval authorities across the complete effective registry,
+    // not merely its local subset. A remote entry sharing an assistant or
+    // configured local entry's ID makes that label ambiguous, so the local
+    // root must remain a denied fence rather than inheriting native access.
+    let duplicate_ids: BTreeSet<_> = registry
+        .iter()
+        .map(|(entry, _)| entry.id.as_str())
+        .fold(BTreeMap::new(), |mut counts, id| {
+            *counts.entry(id).or_insert(0_usize) += 1;
+            counts
+        })
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id.to_owned()))
+        .collect();
+    if !duplicate_ids.is_empty() {
+        tracing::warn!(ids = ?duplicate_ids, "denying duplicate knowledge-base registry IDs in filesystem policy");
+    }
+
     let mut local = Vec::new();
     for (entry, policy_denied) in registry {
         let KnowledgeBaseSource::Local { path } = entry.source else {
@@ -4261,25 +4279,9 @@ async fn effective_local_knowledge_bases(
             id: entry.id,
             root,
             trust_required: entry.trust_required,
-            registry_id_conflicted: false,
+            registry_id_conflicted: duplicate_ids.contains(&entry.id),
             policy_denied,
         });
-    }
-    let duplicate_ids: BTreeSet<_> = local
-        .iter()
-        .map(|knowledge_base| knowledge_base.id.as_str())
-        .fold(BTreeMap::new(), |mut counts, id| {
-            *counts.entry(id).or_insert(0_usize) += 1;
-            counts
-        })
-        .into_iter()
-        .filter_map(|(id, count)| (count > 1).then_some(id.to_owned()))
-        .collect();
-    if !duplicate_ids.is_empty() {
-        tracing::warn!(ids = ?duplicate_ids, "denying duplicate knowledge-base registry IDs in filesystem policy");
-        for knowledge_base in &mut local {
-            knowledge_base.registry_id_conflicted = duplicate_ids.contains(&knowledge_base.id);
-        }
     }
     local
 }
@@ -7621,6 +7623,86 @@ timestamp: 2026-08-29T12:00:00Z
                 .iter()
                 .any(|result| result.concept_id == "replacement")
         );
+    }
+
+    #[tokio::test]
+    async fn remote_duplicate_of_assistant_id_denies_only_assistant_native_root() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        env.set_var("XDG_DATA_HOME", tmp.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let home = crate::assistants::default_home_dir("helper-bot").unwrap();
+        let installation_id = uuid::Uuid::from_u128(43);
+        crate::assistants::create_assistant_with_installation_id(
+            &db,
+            crate::assistants::CreateAssistantSpec {
+                name: "helper-bot".to_string(),
+                description: "Helper bot".to_string(),
+                prompt: "Help with tests.".to_string(),
+                home_dir: home.clone(),
+            },
+            installation_id,
+        )
+        .await
+        .unwrap();
+        write_bundle(&home.join("knowledge"));
+        let ordinary_root = tmp.path().join("ordinary");
+        write_bundle(&ordinary_root);
+        let session = crate::session::Session::create_assistant_deferred_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "helper-bot",
+            "helper-bot",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let remote_duplicate = KnowledgeBaseRegistryEntry::new(
+            format!("assistant-{installation_id}"),
+            "Remote duplicate".to_string(),
+            "A remote source with the assistant's registry ID.".to_string(),
+            KnowledgeBaseSource::Remote {
+                url: "https://knowledge.example.test".to_string(),
+            },
+            KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let ordinary = KnowledgeBaseRegistryEntry::new(
+            "ordinary".to_string(),
+            "Ordinary".to_string(),
+            "An unrelated local source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("ordinary"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![remote_duplicate, ordinary],
+            ..Default::default()
+        };
+
+        let resolved = effective_local_knowledge_bases(&session, tmp.path(), &extended).await;
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved.iter().any(|entry| {
+                entry.root == home.join("knowledge") && entry.registry_id_conflicted
+            })
+        );
+        assert!(resolved.iter().any(|entry| {
+            entry.root == ordinary_root && !entry.registry_id_conflicted && !entry.policy_denied
+        }));
+
+        let denied =
+            denied_local_knowledge_roots_for_model(&session, tmp.path(), &extended, None, true)
+                .await
+                .unwrap();
+        assert_eq!(denied, vec![home.join("knowledge")]);
     }
 
     #[tokio::test]

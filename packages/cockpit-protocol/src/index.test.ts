@@ -9,6 +9,7 @@ import remoteOperationIdentityFixture from "../fixtures/remote-operation-identit
   type: "json",
 };
 import {
+  acpForwardedMcpIngressV1Schema,
   activeModelStateSchema,
   canonicalToolResultContentSchema,
   clientEnvelopeSchema,
@@ -31,6 +32,61 @@ import {
   sandboxEscalationSchema,
   serverMessageSchema,
 } from ".";
+
+describe("ACP forwarded MCP ingress v1", () => {
+  const ingress = {
+    version: 1,
+    declarations: [
+      {
+        name: "server",
+        transport: {
+          type: "stdio",
+          command: "mcp",
+          args: ["--stdio"],
+          env: [{ name: "ROUTING_HINT", value: "blue" }],
+        },
+      },
+    ],
+    client_provenance_id: "editor-1",
+    ingress_request_id: "request-1",
+  } as const;
+
+  it("normalizes NFC and accepts each stable transport", () => {
+    for (const transport of [
+      ingress.declarations[0]!.transport,
+      { type: "http", url: "https://example.invalid/mcp", headers: [] },
+      { type: "sse", url: "https://example.invalid/events", headers: [] },
+    ]) {
+      const parsed = acpForwardedMcpIngressV1Schema.parse({
+        ...ingress,
+        declarations: [{ name: "e\u0301", transport }],
+      });
+      expect(parsed.declarations[0]!.name).toBe("é");
+    }
+  });
+
+  it("rejects unknown fields, variants, semantic duplicates, and independent bounds", () => {
+    expect(acpForwardedMcpIngressV1Schema.safeParse({ ...ingress, _meta: {} }).success).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse({
+        ...ingress,
+        declarations: [{ name: "server", transport: { type: "websocket", url: "wss://x" } }],
+      }).success,
+    ).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse({
+        ...ingress,
+        declarations: [ingress.declarations[0], ingress.declarations[0]],
+      }).success,
+    ).toBe(false);
+    expect(
+      acpForwardedMcpIngressV1Schema.safeParse({
+        ...ingress,
+        declarations: [{ ...ingress.declarations[0], name: "🦀".repeat(65) }],
+      }).success,
+    ).toBe(false);
+  });
+});
 
 const goldenFiles = [
   requestsFixture,

@@ -468,6 +468,123 @@ export const closeCodeRootAttachmentV1RequestSchema = z
     client_request_id: opaqueAsciiId128V1Schema,
   })
   .strict();
+const acpBoundedNfcString = (maxScalars: number, maxBytes: number, allowEmpty: boolean) =>
+  z
+    .string()
+    .transform((value) => value.normalize("NFC"))
+    .superRefine((value, context) => {
+      const scalars = Array.from(value).length;
+      if ((!allowEmpty && value.length === 0) || scalars > maxScalars) {
+        context.addIssue({ code: "custom", message: `must contain at most ${maxScalars} scalars` });
+      }
+      if (new TextEncoder().encode(value).length > maxBytes) {
+        context.addIssue({
+          code: "custom",
+          message: `must contain at most ${maxBytes} UTF-8 bytes`,
+        });
+      }
+      if (/\p{Cc}/u.test(value)) {
+        context.addIssue({ code: "custom", message: "must not contain control characters" });
+      }
+    });
+const acpForwardedMcpNameSchema = acpBoundedNfcString(64, 256, false);
+const acpForwardedMcpEndpointSchema = acpBoundedNfcString(4096, 4096, false);
+const acpForwardedMcpItemSchema = acpBoundedNfcString(8192, 8192, true);
+const acpForwardedMcpPairSchema = z
+  .object({ name: acpBoundedNfcString(8192, 8192, false), value: acpForwardedMcpItemSchema })
+  .strict();
+const uniquePairs = (
+  pairs: Array<{ name: string; value: string }>,
+  context: z.RefinementCtx,
+  asciiCaseInsensitive: boolean,
+) => {
+  const names = new Set<string>();
+  for (const pair of pairs) {
+    const name = asciiCaseInsensitive ? pair.name.toLowerCase() : pair.name;
+    if (names.has(name)) {
+      context.addIssue({ code: "custom", message: "duplicate semantic name" });
+      return;
+    }
+    names.add(name);
+  }
+};
+export const acpForwardedMcpTransportV1Schema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("stdio"),
+      command: acpForwardedMcpEndpointSchema,
+      args: z.array(acpForwardedMcpItemSchema).max(64),
+      env: z
+        .array(acpForwardedMcpPairSchema)
+        .max(64)
+        .superRefine((pairs, context) => uniquePairs(pairs, context, false)),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("http"),
+      url: acpForwardedMcpEndpointSchema,
+      headers: z
+        .array(acpForwardedMcpPairSchema)
+        .max(64)
+        .superRefine((pairs, context) => uniquePairs(pairs, context, true)),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("sse"),
+      url: acpForwardedMcpEndpointSchema,
+      headers: z
+        .array(acpForwardedMcpPairSchema)
+        .max(64)
+        .superRefine((pairs, context) => uniquePairs(pairs, context, true)),
+    })
+    .strict(),
+]);
+export const acpForwardedMcpDeclarationV1Schema = z
+  .object({ name: acpForwardedMcpNameSchema, transport: acpForwardedMcpTransportV1Schema })
+  .strict()
+  .superRefine((declaration, context) => {
+    if (new TextEncoder().encode(JSON.stringify(declaration)).length > 131072) {
+      context.addIssue({ code: "custom", message: "canonical declaration exceeds 131072 bytes" });
+    }
+  });
+export const acpForwardedMcpIngressV1Schema = z
+  .object({
+    version: z.literal(1),
+    declarations: z.array(acpForwardedMcpDeclarationV1Schema).max(32),
+    client_provenance_id: opaqueAsciiId128V1Schema,
+    ingress_request_id: opaqueAsciiId128V1Schema,
+  })
+  .strict()
+  .superRefine((ingress, context) => {
+    const names = new Set<string>();
+    for (const declaration of ingress.declarations) {
+      if (names.has(declaration.name)) {
+        context.addIssue({ code: "custom", message: "duplicate forwarded MCP server name" });
+        break;
+      }
+      names.add(declaration.name);
+    }
+    if (new TextEncoder().encode(JSON.stringify(ingress.declarations)).length > 1048576) {
+      context.addIssue({
+        code: "custom",
+        message: "canonical declaration vector exceeds 1048576 bytes",
+      });
+    }
+  });
+export const createCodeRootWithAcpIngressV1RequestSchema = z
+  .object({ base: createCodeRootV1RequestSchema, ingress: acpForwardedMcpIngressV1Schema })
+  .strict();
+export const attachExistingCodeRootWithAcpIngressV1RequestSchema = z
+  .object({ base: attachExistingCodeRootV1RequestSchema, ingress: acpForwardedMcpIngressV1Schema })
+  .strict();
+export const closeAcpCodeRootAttachmentV1RequestSchema = z
+  .object({
+    attachment_capability: codeRootAttachmentCapabilityV1Schema,
+    client_request_id: opaqueAsciiId128V1Schema,
+  })
+  .strict();
 export const discoverCodeRootsV1RequestSchema = z
   .object({
     workspace_selector: z.object({ path: z.string().min(1).max(32768) }).strict(),
@@ -506,6 +623,17 @@ export type CreateCodeRootV1Request = z.infer<typeof createCodeRootV1RequestSche
 export type AttachExistingCodeRootV1Request = z.infer<typeof attachExistingCodeRootV1RequestSchema>;
 export type CloseCodeRootAttachmentV1Request = z.infer<
   typeof closeCodeRootAttachmentV1RequestSchema
+>;
+export type AcpForwardedMcpDeclarationV1 = z.infer<typeof acpForwardedMcpDeclarationV1Schema>;
+export type AcpForwardedMcpIngressV1 = z.infer<typeof acpForwardedMcpIngressV1Schema>;
+export type CreateCodeRootWithAcpIngressV1Request = z.infer<
+  typeof createCodeRootWithAcpIngressV1RequestSchema
+>;
+export type AttachExistingCodeRootWithAcpIngressV1Request = z.infer<
+  typeof attachExistingCodeRootWithAcpIngressV1RequestSchema
+>;
+export type CloseAcpCodeRootAttachmentV1Request = z.infer<
+  typeof closeAcpCodeRootAttachmentV1RequestSchema
 >;
 export type DiscoverCodeRootsV1Request = z.infer<typeof discoverCodeRootsV1RequestSchema>;
 export type ReadCodeRootV1Request = z.infer<typeof readCodeRootV1RequestSchema>;
@@ -797,6 +925,10 @@ const requestParamSchemas = {
   create_code_root_v1: createCodeRootV1RequestSchema,
   attach_existing_code_root_v1: attachExistingCodeRootV1RequestSchema,
   close_code_root_attachment_v1: closeCodeRootAttachmentV1RequestSchema,
+  create_code_root_with_acp_ingress_v1: createCodeRootWithAcpIngressV1RequestSchema,
+  attach_existing_code_root_with_acp_ingress_v1:
+    attachExistingCodeRootWithAcpIngressV1RequestSchema,
+  close_acp_code_root_attachment_v1: closeAcpCodeRootAttachmentV1RequestSchema,
   discover_code_roots_v1: discoverCodeRootsV1RequestSchema,
   read_code_root_v1: readCodeRootV1RequestSchema,
   read_code_root_deliveries_v1: readCodeRootDeliveriesV1RequestSchema,
@@ -1184,6 +1316,18 @@ const clientRequestVariants = [
     "close_code_root_attachment_v1",
     requestParamSchemas.close_code_root_attachment_v1,
   ),
+  requestVariant(
+    "create_code_root_with_acp_ingress_v1",
+    requestParamSchemas.create_code_root_with_acp_ingress_v1,
+  ),
+  requestVariant(
+    "attach_existing_code_root_with_acp_ingress_v1",
+    requestParamSchemas.attach_existing_code_root_with_acp_ingress_v1,
+  ),
+  requestVariant(
+    "close_acp_code_root_attachment_v1",
+    requestParamSchemas.close_acp_code_root_attachment_v1,
+  ),
   requestVariant("discover_code_roots_v1", requestParamSchemas.discover_code_roots_v1),
   requestVariant("read_code_root_v1", requestParamSchemas.read_code_root_v1),
   requestVariant("read_code_root_deliveries_v1", requestParamSchemas.read_code_root_deliveries_v1),
@@ -1352,6 +1496,9 @@ export const responseNameSchema = z.enum([
   "code_root_created",
   "code_root_attached",
   "code_root_attachment_closed",
+  "code_root_with_acp_ingress_created",
+  "code_root_with_acp_ingress_attached",
+  "acp_code_root_attachment_closed",
   "code_roots_discovered",
   "code_root_read",
   "code_root_deliveries",
@@ -1698,6 +1845,15 @@ export const createCodeRootV1ResultSchema = z
   .object({ attachment: codeRootAttachmentV1Schema, root: codeRootReadV1Schema })
   .strict();
 export const attachExistingCodeRootV1ResultSchema = createCodeRootV1ResultSchema;
+export const createCodeRootWithAcpIngressV1ResultSchema = z
+  .object({ base: createCodeRootV1ResultSchema })
+  .strict();
+export const attachExistingCodeRootWithAcpIngressV1ResultSchema = z
+  .object({ base: attachExistingCodeRootV1ResultSchema })
+  .strict();
+export const closeAcpCodeRootAttachmentV1ResultSchema = z
+  .object({ outcome: z.enum(["closed", "already_closed"]) })
+  .strict();
 export const codeRootSummaryV1Schema = z
   .object({
     root_id: codeRootIdV1Schema,
@@ -1732,6 +1888,15 @@ export type CodeRootAttachmentV1 = z.infer<typeof codeRootAttachmentV1Schema>;
 export type CodeRootReadV1 = z.infer<typeof codeRootReadV1Schema>;
 export type CreateCodeRootV1Result = z.infer<typeof createCodeRootV1ResultSchema>;
 export type AttachExistingCodeRootV1Result = z.infer<typeof attachExistingCodeRootV1ResultSchema>;
+export type CreateCodeRootWithAcpIngressV1Result = z.infer<
+  typeof createCodeRootWithAcpIngressV1ResultSchema
+>;
+export type AttachExistingCodeRootWithAcpIngressV1Result = z.infer<
+  typeof attachExistingCodeRootWithAcpIngressV1ResultSchema
+>;
+export type CloseAcpCodeRootAttachmentV1Result = z.infer<
+  typeof closeAcpCodeRootAttachmentV1ResultSchema
+>;
 export type CodeRootSummaryV1 = z.infer<typeof codeRootSummaryV1Schema>;
 export type DiscoverCodeRootsV1Result = z.infer<typeof discoverCodeRootsV1ResultSchema>;
 export type CodeRootDeliveryV1 = z.infer<typeof codeRootDeliveryV1Schema>;
@@ -1825,6 +1990,12 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   responseVariant("code_root_created", createCodeRootV1ResultSchema),
   responseVariant("code_root_attached", attachExistingCodeRootV1ResultSchema),
   responseVariant("code_root_attachment_closed", z.enum(["closed", "already_closed"])),
+  responseVariant("code_root_with_acp_ingress_created", createCodeRootWithAcpIngressV1ResultSchema),
+  responseVariant(
+    "code_root_with_acp_ingress_attached",
+    attachExistingCodeRootWithAcpIngressV1ResultSchema,
+  ),
+  responseVariant("acp_code_root_attachment_closed", closeAcpCodeRootAttachmentV1ResultSchema),
   responseVariant("code_roots_discovered", discoverCodeRootsV1ResultSchema),
   responseVariant("code_root_read", z.object({ root: codeRootReadV1Schema }).strict()),
   responseVariant(

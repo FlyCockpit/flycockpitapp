@@ -1009,6 +1009,30 @@ impl Driver {
             return;
         }
         let result = (&mut task.handle).await.ok();
+        self.publish_shadow_brief_result(task, result).await;
+    }
+
+    /// Drain shadow work when the owning driver is exiting.  Unlike an idle
+    /// poll, this joins an in-flight task so a successful rolling summary
+    /// cannot be discarded between its final turn boundary and durable
+    /// persistence during shutdown.
+    pub(in crate::engine::driver) async fn drain_shadow_brief_on_shutdown(&mut self) {
+        let Some(state) = self.shadow_brief.take() else {
+            return;
+        };
+        let ShadowBriefState::InFlight(mut task) = state else {
+            self.shadow_brief = Some(state);
+            return;
+        };
+        let result = (&mut task.handle).await.ok();
+        self.publish_shadow_brief_result(task, result).await;
+    }
+
+    async fn publish_shadow_brief_result(
+        &mut self,
+        task: ShadowBriefInFlight,
+        result: Option<crate::engine::compact_draft::CompactDraftOutcome>,
+    ) {
         if task.generation == self.shadow_brief_generation
             && !task.cancel.is_cancelled()
             && let Some(crate::engine::compact_draft::CompactDraftOutcome::Success(success)) =

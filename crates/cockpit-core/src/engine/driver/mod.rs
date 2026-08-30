@@ -5103,6 +5103,21 @@ impl Driver {
     pub async fn run_main_loop(
         &mut self,
         input_queue: crate::engine::message::UserSubmissionQueue,
+        control_rx: mpsc::Receiver<DriverControl>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        let outcome = self.run_main_loop_inner(input_queue, control_rx, tx).await;
+        // A rolling summary is utility work, but once it has completed it is
+        // the durable resume candidate.  Do not let the driver return (and
+        // subsequently drop/abort the task) until that result has either been
+        // persisted or classified as non-successful.
+        self.drain_shadow_brief_on_shutdown().await;
+        outcome
+    }
+
+    async fn run_main_loop_inner(
+        &mut self,
+        input_queue: crate::engine::message::UserSubmissionQueue,
         mut control_rx: mpsc::Receiver<DriverControl>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {

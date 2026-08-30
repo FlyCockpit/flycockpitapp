@@ -3690,6 +3690,76 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
     );
 }
 
+/// A completed rolling summary must be published before the idle driver
+/// returns on control-channel closure.  The shutdown boundary is the only
+/// time no subsequent turn/control event is available to settle the task.
+#[tokio::test]
+async fn completed_rolling_shadow_persists_before_idle_driver_shutdown() {
+    use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let session = driver.session.clone();
+    let snapshot_history = driver.stack[0].history.clone();
+    driver.shadow_brief_generation = 7;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 7,
+        snapshot_history,
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        handle: tokio::spawn(async {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(
+                crate::engine::compact_draft::CompactDraftSuccess {
+                    brief: "summary completed before shutdown".to_string(),
+                    fit_rung: CompactFitRung::Verbatim,
+                    input_coverage: CompactInputCoverage::Full,
+                    attempts: 1,
+                },
+            )
+        }),
+    }));
+
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let (control_tx, control_rx) = mpsc::channel(1);
+    drop(control_tx);
+
+    driver
+        .run_main_loop(queue, control_rx, &tx)
+        .await
+        .expect("idle control closure exits cleanly");
+
+    let stored = session
+        .db
+        .compaction_shadow(session.id)
+        .await
+        .unwrap()
+        .expect("shutdown must persist the completed rolling summary");
+    let DurableCompactionShadow::ReadyBrief(ready) =
+        serde_json::from_str::<DurableCompactionShadow>(&stored.payload_json).unwrap()
+    else {
+        panic!("shutdown must retain a ready rolling summary");
+    };
+    assert_eq!(ready.generation, 7);
+    assert_eq!(ready.brief, "summary completed before shutdown");
+
+    let mut restored = Driver::new(
+        session,
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.stack[0].agent.clone(),
+    );
+    restored.load_compaction_shadow_from_store().await;
+    assert!(matches!(
+        &restored.shadow_brief,
+        Some(ShadowBriefState::Ready(ready)) if ready.generation == 7
+            && ready.brief == "summary completed before shutdown"
+    ));
+}
+
 /// Manual `/compact` bypasses the auto-compaction gate: even when the gate
 /// is in a suppressing state (`UntilActivity`), `do_compact` proceeds
 /// because it never calls `suppresses()`.  Only `maybe_auto_compact`

@@ -5694,9 +5694,12 @@ impl StartupWorkInbox {
     }
 
     fn has_live_work(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|work| !matches!(work, SessionWork::Cancel | SessionWork::Shutdown { .. }))
+        self.pending.iter().any(|work| {
+            !matches!(
+                work,
+                SessionWork::Cancel | SessionWork::CancelAll | SessionWork::Shutdown { .. }
+            )
+        })
     }
 
     fn has_shutdown(&self) -> bool {
@@ -5820,6 +5823,7 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::SetDelegationRecursion { .. }
         | SessionWork::SetTandemModels { .. }
         | SessionWork::CancelSchedule { .. }
+        | SessionWork::CancelAll
         | SessionWork::Prune
         | SessionWork::Compact
         | SessionWork::Pin { .. } => {}
@@ -5868,6 +5872,7 @@ mod startup_work_inbox_tests {
         match work {
             SessionWork::UserMessage { submission, .. } => Some(submission.text.as_str()),
             SessionWork::Cancel => Some("cancel"),
+            SessionWork::CancelAll => Some("cancel all"),
             SessionWork::Shutdown { .. } => Some("shutdown"),
             _ => None,
         }
@@ -11388,7 +11393,7 @@ pub(super) async fn run_worker(
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
                 }
-                SessionWork::Cancel => {
+                work @ (SessionWork::Cancel | SessionWork::CancelAll) => {
                     // User ctrl+c (`CancelTurn`). Fire the in-flight run's
                     // cancellation token: the driver's `turn` aborts the
                     // streaming inference (returning an `InferenceCancelled`
@@ -11432,6 +11437,15 @@ pub(super) async fn run_worker(
                                         .to_string(),
                                 },
                             ),
+                        }
+                    }
+                    if matches!(work, SessionWork::CancelAll) {
+                        if job_cmd_tx
+                            .send(crate::engine::schedule::ScheduleCommand::CancelAll)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(session_id = %session_id, "job command channel closed");
                         }
                     }
                 }

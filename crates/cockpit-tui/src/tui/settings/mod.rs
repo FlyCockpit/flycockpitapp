@@ -96,15 +96,14 @@ use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersC
 
 use providers::initial_list_cursor;
 
-/// Settings-side operations that need provider secrets must use the persistent
-/// daemon.  Keeping this tiny helper here makes accidental local vault opens
-/// in settings code both unnecessary and easy for the boundary ratchet to
-/// reject.
+/// Settings-side operations use the TUI's configured daemon lifetime. Keeping
+/// this tiny helper here makes accidental local vault opens in settings code
+/// both unnecessary and easy for the boundary ratchet to reject.
 pub(crate) async fn settings_daemon_client(
     lifecycle: &cockpit_client::LifecycleClient,
 ) -> anyhow::Result<cockpit_client::DaemonClient> {
     let resolved = lifecycle
-        .resolve(cockpit_client::LifecycleIntent::EnsurePersistent)
+        .resolve_default()
         .await
         .map_err(anyhow::Error::msg)?;
     cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint).await

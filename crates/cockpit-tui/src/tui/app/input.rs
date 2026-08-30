@@ -500,18 +500,13 @@ impl App {
             return self.handle_ctrl_c();
         }
         // Ctrl+D preserves terminal EOF muscle memory only when the TUI is
-        // truly idle. If work or modal state is active, route through the
-        // same guarded exit policy as Ctrl+C so it cannot accidentally detach
-        // the user from active/background work.
+        // truly idle.  Unlike Ctrl+C, it is an exit gesture: live work must
+        // therefore enter the exit guard rather than interrupting that work.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('d'))
         {
-            return if self.ctrl_d_can_exit_immediately() {
-                self.request_guarded_exit()
-            } else {
-                self.handle_ctrl_c()
-            };
+            return self.request_guarded_exit();
         }
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -519,7 +514,6 @@ impl App {
             && !self.dialog.is_active()
             && matches!(self.overlay, Overlay::None)
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
         {
             match key.code {
                 KeyCode::Char('m') if self.auth_failure_notice.is_some() => {
@@ -733,48 +727,6 @@ impl App {
             return false;
         }
 
-        if self.startup_modal_on_top() == Some(StartupModal::Daemon)
-            && let Some(prompt) = self.daemon_prompt.as_mut()
-        {
-            let should_close = prompt.handle_key(key);
-            if !should_close {
-                return false;
-            }
-            let choice = prompt.take_choice();
-            match choice {
-                Some(crate::tui::daemon_prompt::DaemonChoice::StartAndConnect) => {
-                    // Resolution and any required spawn occur asynchronously
-                    // in the CLI-owned lifecycle composition task.
-                    self.daemon_connected = true;
-                    self.daemon_prompt = None;
-                    self.reset_display_attach_backoff();
-                    self.maybe_open_add_provider_wizard();
-                }
-                Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
-                    // Daemonless mode: this TUI owns its own pid+nonce
-                    // ephemeral daemon (isolated from the canonical daemon
-                    // and from any other TUI's), spawned on the first attach
-                    // and reaped when this TUI exits. Flip the lifecycle flag
-                    // and mark "connected" — the latter so daemon-aware UI
-                    // (e.g. the `/sessions` pane's live-RPC path) treats this
-                    // window as connected. The eager display attach
-                    // deliberately skips daemonless mode, so this does *not*
-                    // spawn the owned ephemeral daemon just to show an id; the
-                    // short id appears once the first message brings it up.
-                    self.daemonless = true;
-                    self.daemon_connected = true;
-                    self.push_plain("daemon: running a private daemon for this window only — it shuts down when you exit"
-                                .to_string());
-                    self.daemon_prompt = None;
-                    self.maybe_open_add_provider_wizard();
-                }
-                Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
-                    return self.request_guarded_exit();
-                }
-            }
-            return false;
-        }
-
         // Answering dialog (GOALS §3b) — same modal rule. It replaces the
         // composer, so it routes before the settings dialog / picker. On
         // close, send the resolution back to the daemon as
@@ -879,7 +831,6 @@ impl App {
         if matches!(self.overlay, Overlay::None)
             && self.session_setup_inline_visible()
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
             && !self.dialog.is_active()
         {
             let captures_all_input = self
@@ -1216,7 +1167,6 @@ impl App {
             && !self.dialog.is_active()
             && !self.overlay.is_open()
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
             && self.pane.is_none()
         {
             self.open_transcript_find();
@@ -1234,7 +1184,6 @@ impl App {
             && !self.dialog.is_active()
             && !self.overlay.is_open()
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
             && self.pane.is_none()
         {
             self.open_scratchpad_pane();
@@ -1462,29 +1411,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    fn ctrl_d_can_exit_immediately(&self) -> bool {
-        self.composer.is_empty()
-            && !self.busy
-            && self.queue.is_empty()
-            && self.pending.is_none()
-            && self.active_schedules.is_empty()
-            && matches!(self.dialog, Dialog::None)
-            && !self.overlay.is_open()
-            && self.daemon_prompt.is_none()
-            && self.question_dialog.is_none()
-            && self.pending_local_choice.is_none()
-            && !self.pending_prune_confirm
-            && self.pending_stop_confirm.is_none()
-            && self.pending_compact.is_none()
-            && self.pending_mcp_local.is_none()
-            && !self.pending_external_edit
-            && self.context_menu.is_none()
-            && self.pane.is_none()
-            && self.pin_pick.is_none()
-            && self.pins_review.is_none()
-            && self.keys_overlay.is_none()
     }
 
     pub(super) fn handle_key_insert(&mut self, key: KeyEvent) -> bool {
@@ -3666,26 +3592,24 @@ impl App {
             }
             return;
         }
-        if self.daemon_prompt.is_some()
-            || matches!(
-                self.overlay,
-                Overlay::Stats(_)
-                    | Overlay::Usage(_)
-                    | Overlay::Sessions(_)
-                    | Overlay::Skills(_)
-                    | Overlay::Tools(_)
-                    | Overlay::GoalSettings(_)
-                    | Overlay::Permissions(_)
-                    | Overlay::Resources(_)
-                    | Overlay::Quick(_)
-                    | Overlay::Context(_)
-                    | Overlay::Leaks(_)
-                    | Overlay::Sealed(_)
-                    | Overlay::Diff(_)
-                    | Overlay::GuidanceReview(_)
-                    | Overlay::Help(_)
-            )
-            || self.context_menu.is_some()
+        if matches!(
+            self.overlay,
+            Overlay::Stats(_)
+                | Overlay::Usage(_)
+                | Overlay::Sessions(_)
+                | Overlay::Skills(_)
+                | Overlay::Tools(_)
+                | Overlay::GoalSettings(_)
+                | Overlay::Permissions(_)
+                | Overlay::Resources(_)
+                | Overlay::Quick(_)
+                | Overlay::Context(_)
+                | Overlay::Leaks(_)
+                | Overlay::Sealed(_)
+                | Overlay::Diff(_)
+                | Overlay::GuidanceReview(_)
+                | Overlay::Help(_)
+        ) || self.context_menu.is_some()
             || self.pin_pick.is_some()
             || self.fork_pick.is_some()
             || self.copy_pick.is_some()
@@ -3919,7 +3843,6 @@ impl App {
     pub(super) fn structured_paste_composer_eligible(&self) -> bool {
         !(self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
             || (self.pane_focused && self.pane.is_some()))
-            && self.daemon_prompt.is_none()
             && !matches!(
                 self.overlay,
                 Overlay::Stats(_)
@@ -5181,7 +5104,6 @@ mod paste_routing_tests {
 
     fn input_ready_app(tmp: &tempfile::TempDir) -> App {
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         crate::tui::app::seed_ready_model_for_tests(&mut app);
         app
@@ -6125,7 +6047,6 @@ mod chat_scrollback_key_tests {
     fn scrollable_app() -> App {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.chat_total_lines = 20;
         app.chat_visible_lines = 6;
@@ -6342,7 +6263,6 @@ mod shift_enter_keyboard_protocol_tests {
 
     fn app(tmp: &tempfile::TempDir) -> App {
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.composer.set_vim_enabled(false);
         crate::tui::app::seed_ready_model_for_tests(&mut app);

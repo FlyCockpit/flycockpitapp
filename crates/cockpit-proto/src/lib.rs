@@ -2721,12 +2721,6 @@ pub enum FlycockpitOrgSyncOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AppFlagKey {
-    DaemonAutostartNotice,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum AssistantSessionResolutionMode {
     MostRecentOrCreate,
 }
@@ -2737,7 +2731,6 @@ mod tui_ownership_rpc_contract_tests {
 
     #[test]
     fn missing_rpc_protocol_contract_rejects_open_ended_policy_values() {
-        assert!(serde_json::from_str::<AppFlagKey>(r#""arbitrary-string""#).is_err());
         assert!(serde_json::from_str::<WorkspaceTrustMode>(r#""future-mode""#).is_err());
         assert!(
             serde_json::from_str::<AssistantSessionResolutionMode>(r#""create-always""#).is_err()
@@ -4535,7 +4528,6 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "git_diff_file",
         "git_status",
         "get_inventory_bundle",
-        "get_app_flag",
         "get_startup_disclosures",
         "get_session_setup_snapshot",
         "list_guidance_proposals",
@@ -4552,6 +4544,8 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "resolve_agent_decision",
         "resolve_assistant_session",
         "restart_if_idle",
+        "exit_guard_status",
+        "release_exit_guard",
         "resume_paused_work",
         "send_user_message",
         "send_user_message_bulk",
@@ -4562,7 +4556,6 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "set_default_model",
         "set_model_favorite",
         "share_session",
-        "mark_app_flag_seen",
         "stats_rollup",
         "unarchive_session",
     ];
@@ -4575,8 +4568,6 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         // Migrated to a typed bulk transfer reference.
         "export_session_data",
         "attached",
-        "app_flag",
-        "app_flag_seen",
         "assistant_session_resolved",
         "forked",
         "fs_list",
@@ -4588,6 +4579,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "history_page",
         "inventory_bundle",
         "restart_decision",
+        "exit_guard_status",
         "run_invocation_cancel_result",
         "run_invocation_status",
         "session_messages",
@@ -8326,12 +8318,6 @@ mod tests {
     #[test]
     fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
         let fixture = proto_fixture_files::read_fixture("response.json");
-        assert!(
-            fixture["app_flag"]["data"]
-                .get("client_operation_id")
-                .is_none()
-        );
-        assert!(fixture["app_flag"]["data"].get("request_hash").is_none());
         let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
         assert_eq!(
             denylist[0]["consumed_entry_id"],

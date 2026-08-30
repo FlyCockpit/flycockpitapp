@@ -1921,7 +1921,7 @@ fn ensure_vec_table(conn: &Connection, dimensions: usize) -> Result<()> {
     if stored == Some(dimensions) && table_exists(conn, "vec_chunks")? {
         return Ok(());
     }
-    if stored.is_some_and(|stored| stored != dimensions) {
+    if let Some(stored) = stored.filter(|&stored| stored != dimensions) {
         bail!("knowledge embedding dimensions changed from {stored} to {dimensions}");
     }
     conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
@@ -1982,7 +1982,7 @@ fn chunk_text(text: &str) -> Vec<String> {
 
 fn content_hash(body: &str) -> String {
     use sha2::{Digest as _, Sha256};
-    format!("{:x}", Sha256::digest(body.as_bytes()))
+    crate::intel::hex_lower(&Sha256::digest(body.as_bytes()))
 }
 
 fn rel_string(path: &Path) -> String {

@@ -1998,10 +1998,10 @@ impl Driver {
     /// Open the selected delegation's backend before its first advertised
     /// native-computer request. Candidate scans leave geometry unset; this is
     /// the only path that turns that metadata into a live capability.
-    async fn open_native_computer_for_active_frame(&mut self) {
+    async fn open_native_computer_for_active_frame(&mut self) -> Result<()> {
         let (mut agent, delegation_id, mut coordinator, mut contract, mut pending) = {
             let Some(frame) = self.stack.last_mut() else {
-                return;
+                return Ok(());
             };
             (
                 frame.agent.as_ref().clone(),
@@ -2024,12 +2024,13 @@ impl Driver {
             &mut contract,
             &mut pending,
         )
-        .await;
+        .await?;
         let frame = self.stack.last_mut().expect("stack nonempty");
         frame.agent = Arc::new(agent);
         frame.computer_coordinator = coordinator;
         frame.computer_contract = contract;
         frame.pending_computer_continuations = pending;
+        Ok(())
     }
 
     /// Build the Driver authority used by a detached/nested turn loop to drain
@@ -4629,7 +4630,7 @@ impl Driver {
             if !active_frame_has_scheduled_turn {
                 self.maybe_auto_prune(tx).await;
             }
-            self.open_native_computer_for_active_frame().await;
+            self.open_native_computer_for_active_frame().await?;
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
@@ -12402,7 +12403,7 @@ impl Driver {
             if !active_frame_has_scheduled_turn {
                 self.maybe_auto_prune(tx).await;
             }
-            self.open_native_computer_for_active_frame().await;
+            self.open_native_computer_for_active_frame().await?;
 
             let agent = {
                 let top = self.stack.last().expect("stack never empty");

@@ -2,9 +2,10 @@
 //!
 //! This module is the platform action layer only. It exposes no model-facing
 //! tools; later prompts translate provider-native tool schemas into these typed
-//! actions and add approvals/redaction/audit. The default target is a Cockpit
-//! owned virtual display. Real-desktop control is refused unless a
-//! machine-local grant file matches this machine.
+//! actions and add approvals/redaction/audit. Delegated workers use a Cockpit-
+//! owned virtual display; the standalone Computer primary defaults to the real
+//! desktop. Real-desktop control is refused unless a machine-local grant file
+//! matches this machine.
 //!
 //! Target identity and host-global physical keys live in [`host_identity`] and
 //! [`target`]; platform evidence adapters are under [`platform`].
@@ -402,6 +403,18 @@ impl RealDesktopGrantStore {
         };
         stored.trim() == current_machine_fingerprint().trim()
     }
+
+    /// Resolve the existing machine-local real-desktop grant under Cockpit's
+    /// private data root. Merely selecting yolo never creates this file.
+    pub fn for_cockpit_data_dir() -> Result<Self, ComputerError> {
+        let path = crate::config::resolve::cockpit_data_dir()
+            .map_err(|error| ComputerError::CommandFailed {
+                program: "computer grant".to_string(),
+                detail: error.to_string(),
+            })?
+            .join("computer-real-desktop-grant");
+        Ok(Self::new(path))
+    }
 }
 
 pub struct VirtualDisplayBackend {
@@ -451,6 +464,9 @@ impl VirtualDisplayBackend {
                 if !grant_store.is_some_and(RealDesktopGrantStore::has_current_machine_grant) {
                     return Err(ComputerError::RealDesktopGrantMissing);
                 }
+                // TODO(issue #180 per-OS backend dependencies): dispatch to
+                // the native macOS, Windows, X11, or Wayland action backend
+                // once the corresponding host backend is available.
                 Err(unsupported_platform())
             }
         }
@@ -1445,6 +1461,13 @@ pub struct NativeComputerWire {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeComputerToolConfig {
     pub contract: ComputerToolContract,
+    /// Backend target selected by the owning agent. The standalone Computer
+    /// primary defaults to real desktop; delegated computer workers retain
+    /// their isolated virtual display.
+    pub target: DisplayTarget,
+    /// A primary must fail its turn when its requested backend cannot open.
+    /// Delegated workers retain the existing optional-capability behavior.
+    pub require_backend: bool,
     /// Geometry reported by the opened backend at the selected-delegation
     /// open-before-advertise step. `None` means the coordinator has not yet
     /// opened (candidate scan), open failed (tool not advertised), or the

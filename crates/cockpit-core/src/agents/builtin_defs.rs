@@ -948,6 +948,39 @@ mod tests {
     }
 
     #[test]
+    fn computer_primary_is_hidden_and_keeps_delegated_computer_worker() {
+        let primary = embedded_internal_default("Computer").expect("Computer primary");
+        let worker = embedded_internal_default("computer").expect("computer worker");
+
+        assert!(is_builtin_primary("Computer"));
+        assert!(is_hidden_primary("Computer"));
+        assert!(is_feature_primary("Computer"));
+        assert_eq!(primary.mode, AgentMode::Primary);
+        assert_eq!(worker.mode, AgentMode::Subagent);
+        assert_eq!(
+            primary.tools,
+            Some(["read", "bash", "task"].into_iter().map(String::from).collect())
+        );
+        let children = &primary
+            .vnext
+            .expect("Computer vNext definition")
+            .delegation
+            .allowed_children;
+        assert!(children.iter().any(|child| matches!(
+            child,
+            AllowedChild::PortableRef { portable_agent_ref }
+                if portable_agent_ref == "cockpit/builder"
+        )));
+        assert_eq!(
+            worker
+                .vnext
+                .expect("computer worker vNext definition")
+                .execution_kind,
+            ExecutionKind::Computer
+        );
+    }
+
+    #[test]
     fn dream_agent_chain_has_no_direct_mutation_or_shell_capability() {
         let dream = embedded_internal_default("Dream").expect("Dream definition");
         let worker = embedded_internal_default("dream-worker").expect("worker definition");

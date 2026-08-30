@@ -289,6 +289,8 @@ fn resolved_computer_use_for_model(
             .and_then(|capability| capability.contract)
             .map(|contract| crate::computer::NativeComputerToolConfig {
                 contract: contract.into(),
+                target: crate::computer::DisplayTarget::Virtual,
+                require_backend: false,
                 geometry: None,
                 approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
             })
@@ -364,15 +366,23 @@ fn computer_use_criteria_for_role<'a>(
 fn computer_primary_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
+    target: crate::computer::DisplayTarget,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
-    computer_candidate(providers, cwd, false, "Computer")
+    computer_candidate(providers, cwd, false, "Computer", target, true)
 }
 
 fn computer_subagent_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
-    computer_candidate(providers, cwd, true, "computer")
+    computer_candidate(
+        providers,
+        cwd,
+        true,
+        "computer",
+        crate::computer::DisplayTarget::Virtual,
+        false,
+    )
 }
 
 fn computer_candidate(
@@ -380,12 +390,25 @@ fn computer_candidate(
     cwd: &Path,
     require_subagent_invokable: bool,
     agent: &str,
+    target: crate::computer::DisplayTarget,
+    require_backend: bool,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
         for model in &provider.models {
-            let tier =
-                providers.resolve_computer_use_effective(provider_id, &model.id, configured, None);
+            let tier = if require_backend {
+                crate::config::extended::ComputerUseMode::most_restrictive(
+                    [
+                        providers.resolve_computer_use_catalog(provider_id, &model.id),
+                        configured,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )
+                .unwrap_or(crate::config::extended::ComputerUseMode::Ask)
+            } else {
+                providers.resolve_computer_use_effective(provider_id, &model.id, configured, None)
+            };
             if tier == crate::config::extended::ComputerUseMode::Disabled {
                 continue;
             }
@@ -433,6 +456,8 @@ fn computer_candidate(
                 model.id.clone(),
                 crate::computer::NativeComputerToolConfig {
                     contract: contract.into(),
+                    target,
+                    require_backend,
                     geometry: None,
                     approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
                 },
@@ -2003,7 +2028,7 @@ pub(crate) fn is_docs_pipeline(name: &str) -> bool {
 fn is_internal_agent_def_name(name: &str) -> bool {
     matches!(
         name,
-        "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker"
+        "Computer" | "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker"
     )
 }
 
@@ -3609,11 +3634,19 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
     }) {
         bail!("workspace lease does not permit computer use");
     }
-    let (_extended, providers) = args.config.configs();
+    let (extended, providers) = args.config.configs();
     let candidate = if require_subagent_invokable {
         computer_subagent_candidate(&providers, &args.cwd)
     } else {
-        computer_primary_candidate(&providers, &args.cwd)
+        let target = match extended.computer_target {
+            crate::config::extended::ComputerTarget::Virtual => {
+                crate::computer::DisplayTarget::Virtual
+            }
+            crate::config::extended::ComputerTarget::RealDesktop => {
+                crate::computer::DisplayTarget::RealDesktop
+            }
+        };
+        computer_primary_candidate(&providers, &args.cwd, target)
     };
     let Some((provider_id, model_id, native_computer)) = candidate
     else {
@@ -3675,7 +3708,8 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
         );
     }
     let mut child_args = args.clone();
-    child_args.model = model;
+    child_args.model = model.clone();
+    child_args.model_override = Some(model);
     child_args.params.native_computer = Some(native_computer);
     let def = crate::agents::embedded_internal_default(name)
         .expect("computer agent has an internal definition");

@@ -2429,6 +2429,8 @@ fn opened_openai_computer_params() -> ModelParams {
     ModelParams {
         native_computer: Some(crate::computer::NativeComputerToolConfig {
             contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            target: crate::computer::DisplayTarget::Virtual,
+            require_backend: false,
             geometry: Some(crate::computer::DisplayGeometry {
                 physical: crate::computer::PixelSize {
                     width: 1280,
@@ -2463,6 +2465,8 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let current = ModelParams {
             native_computer: Some(crate::computer::NativeComputerToolConfig {
                 contract: crate::computer::ComputerToolContract::Anthropic20251124,
+                target: crate::computer::DisplayTarget::Virtual,
+                require_backend: false,
                 geometry: Some(geometry.clone()),
                 approval_required: false,
             }),
@@ -2501,6 +2505,8 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let older = ModelParams {
             native_computer: Some(crate::computer::NativeComputerToolConfig {
                 contract: crate::computer::ComputerToolContract::Anthropic20250124,
+                target: crate::computer::DisplayTarget::Virtual,
+                require_backend: false,
                 geometry: Some(geometry),
                 approval_required: false,
             }),
@@ -2612,6 +2618,8 @@ fn computer_live_detach_inherited_native_computer_clears_advertisement() {
     let mut params = ModelParams {
         native_computer: Some(crate::computer::NativeComputerToolConfig {
             contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            target: crate::computer::DisplayTarget::Virtual,
+            require_backend: false,
             geometry: Some(crate::computer::DisplayGeometry {
                 physical: crate::computer::PixelSize {
                     width: 1280,
@@ -2636,6 +2644,8 @@ fn computer_openai_native_tool_is_responses_endpoint_scoped() {
     let params = ModelParams {
         native_computer: Some(crate::computer::NativeComputerToolConfig {
             contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            target: crate::computer::DisplayTarget::Virtual,
+            require_backend: false,
             geometry: Some(crate::computer::DisplayGeometry {
                 physical: crate::computer::PixelSize {
                     width: 1280,

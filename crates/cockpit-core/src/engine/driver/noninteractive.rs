@@ -11514,7 +11514,7 @@ pub(crate) async fn run_noninteractive_resumable(
             .unwrap_or(session.id)
             .hyphenated()
             .to_string();
-        super::computer_native::reconcile_native_computer_for_delegation(
+        if let Err(error) = super::computer_native::reconcile_native_computer_for_delegation(
             Arc::make_mut(&mut agent),
             &session,
             approver.clone(),
@@ -11523,7 +11523,15 @@ pub(crate) async fn run_noninteractive_resumable(
             &mut computer_contract,
             &mut pending_computer_continuations,
         )
-        .await;
+        .await
+        {
+            return Err(NoninteractiveRunError::new(
+                error.context("opening native computer backend"),
+                history,
+                fallback_decision,
+                fallback_tried,
+            ));
+        }
         let agent_tree_steer_dispatch_permit = active_agent_tree_steer_permit.clone();
         let mut turn_metadata = BackupTurnMetadata::default();
         // Model-comparison tandem (shadow) set for this leaf subagent turn

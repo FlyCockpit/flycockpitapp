@@ -36,27 +36,51 @@ pub(crate) async fn open_native_computer_for_delegation(
     session: &Arc<Session>,
     approver: Option<Arc<crate::approval::Approver>>,
     delegation_id: String,
-) -> Option<ComputerActionCoordinator> {
-    let candidate = agent.params.native_computer.clone()?;
+) -> anyhow::Result<Option<ComputerActionCoordinator>> {
+    let Some(candidate) = agent.params.native_computer.clone() else {
+        return Ok(None);
+    };
     if !agent
         .model
         .supports_native_computer_contract(candidate.contract)
     {
-        return None;
+        if candidate.require_backend {
+            anyhow::bail!(
+                "Computer primary model no longer supports its native computer_use contract"
+            );
+        }
+        return Ok(None);
     }
     let Some(approver) = approver else {
         agent.params.native_computer = None;
-        return None;
+        if candidate.require_backend {
+            anyhow::bail!("Computer primary requires the session approval service");
+        }
+        return Ok(None);
+    };
+    let grant_store = if candidate.target == crate::computer::DisplayTarget::RealDesktop {
+        Some(crate::computer::RealDesktopGrantStore::for_cockpit_data_dir()?)
+    } else {
+        None
     };
     let backend = match crate::computer::VirtualDisplayBackend::construct(
-        crate::computer::DisplayTarget::Virtual,
-        None,
+        candidate.target,
+        grant_store.as_ref(),
     ) {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!(error = %error, "native computer backend open failed");
             agent.params.native_computer = None;
-            return None;
+            if candidate.require_backend {
+                anyhow::bail!(
+                    "Computer primary could not open its {} backend: {error}. Set `computer_target` to `virtual` to use the isolated display instead",
+                    match candidate.target {
+                        crate::computer::DisplayTarget::Virtual => "virtual-display",
+                        crate::computer::DisplayTarget::RealDesktop => "real-desktop",
+                    }
+                );
+            }
+            return Ok(None);
         }
     };
     let handoff_journal = session.external_journal().map(|journal| {
@@ -102,12 +126,15 @@ pub(crate) async fn open_native_computer_for_delegation(
                 geometry: None,
                 ..candidate
             });
-            Some(coordinator)
+            Ok(Some(coordinator))
         }
         Err(error) => {
             tracing::warn!(error = %error, "native computer coordinator open failed");
             agent.params.native_computer = None;
-            None
+            if candidate.require_backend {
+                anyhow::bail!("Computer primary could not open its action coordinator: {error}");
+            }
+            Ok(None)
         }
     }
 }
@@ -126,11 +153,11 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     coordinator: &mut Option<ComputerActionCoordinator>,
     contract: &mut Option<ComputerToolContract>,
     pending_continuations: &mut Vec<serde_json::Value>,
-) {
+) -> anyhow::Result<()> {
     let retained_is_compatible = coordinator.is_some()
         && contract.is_some_and(|contract| agent.model.supports_native_computer_contract(contract));
     if retained_is_compatible {
-        return;
+        return Ok(());
     }
 
     if let Some(mut previous) = coordinator.take() {
@@ -159,16 +186,22 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     }
 
     let Some(candidate) = agent.params.native_computer.as_ref() else {
-        return;
+        return Ok(());
     };
     if !agent
         .model
         .supports_native_computer_contract(candidate.contract)
     {
-        return;
+        if candidate.require_backend {
+            anyhow::bail!(
+                "Computer primary model does not support its required native computer_use contract"
+            );
+        }
+        return Ok(());
     }
 
-    let opened = open_native_computer_for_delegation(agent, session, approver, delegation_id).await;
+    let opened =
+        open_native_computer_for_delegation(agent, session, approver, delegation_id).await?;
     if let Some(opened) = opened {
         *contract = agent
             .params
@@ -177,6 +210,7 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
             .map(|config| config.contract);
         *coordinator = Some(opened);
     }
+    Ok(())
 }
 
 /// Overlay opened backend geometry onto a request-local agent clone.
@@ -776,6 +810,8 @@ mod tests {
             params: ModelParams {
                 native_computer: Some(crate::computer::NativeComputerToolConfig {
                     contract: ComputerToolContract::OpenAiResponses,
+                    target: crate::computer::DisplayTarget::Virtual,
+                    require_backend: false,
                     geometry: Some(geometry),
                     approval_required: false,
                 }),
@@ -810,7 +846,7 @@ mod tests {
         let opened =
             open_native_computer_for_delegation(&mut agent, &session, None, "delegation-1".into())
                 .await;
-        assert!(opened.is_none());
+        assert!(opened.unwrap().is_none());
         assert!(
             agent.params.native_computer.is_none(),
             "failed open must leave native_computer: None so the tool is not advertised"
@@ -851,6 +887,8 @@ mod tests {
             params: crate::engine::model::ModelParams {
                 native_computer: Some(crate::computer::NativeComputerToolConfig {
                     contract: ComputerToolContract::OpenAiResponses,
+                    target: crate::computer::DisplayTarget::Virtual,
+                    require_backend: false,
                     geometry,
                     approval_required: false,
                 }),

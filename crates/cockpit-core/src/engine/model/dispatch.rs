@@ -538,8 +538,7 @@ impl Model {
     )> {
         let params = self.with_resolved_model_params(params);
         let prepared = self.prepare_completion_request(
-            system,
-            history,
+            AgentPromptParts::new(system, history),
             &prompt,
             tools,
             &params,
@@ -636,8 +635,7 @@ impl Model {
     )> {
         let params = self.with_resolved_model_params(params);
         let prepared = self.prepare_completion_request(
-            system,
-            history,
+            AgentPromptParts::new(system, history),
             &prompt,
             tools,
             &params,
@@ -1464,8 +1462,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_completion_request(
         &self,
-        system: &str,
-        history: &[Message],
+        prompt_parts: AgentPromptParts<'_>,
         prompt: &Message,
         tools: &[ToolDefinition],
         params: &ModelParams,
@@ -1483,7 +1480,11 @@ impl Model {
     ) -> Result<PreparedCompletionRequest> {
         let prep_started = std::time::Instant::now();
         let params = self.with_resolved_model_params(params.clone());
-        let history = self.prepare_history_for_request(history);
+        let AgentPromptParts {
+            stable_prefix,
+            volatile_messages,
+        } = prompt_parts;
+        let history = self.prepare_history_for_request(volatile_messages);
 
         // Non-bypassable redaction chokepoint (GOALS §7,
         // `redaction-cover-all-llm-requests.md`): scrub every dynamic text
@@ -1497,7 +1498,7 @@ impl Model {
         // entry as its actionable marker instead of the generic placeholder, so
         // it can never widen custody.
         let redact = sealed_egress.unwrap_or_else(|| self.redact());
-        let system = redact.scrub(system);
+        let system = redact.scrub(stable_prefix);
         let mut history = history;
         let mut prompt = prompt.clone();
         // Trusted raw custody sends raw bytes and skips the wire walk entirely.

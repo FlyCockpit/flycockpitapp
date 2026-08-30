@@ -871,9 +871,8 @@ async fn execute_ordinary_call_unscoped(
     // call short-circuits to a model-readable hard-fail *without*
     // dispatching the tool.
     let schema = env
-        .agent
-        .tools
-        .get(resolved_name)
+        .active_tools
+        .advertised_tool(resolved_name)
         .map(|t| t.parameters())
         .unwrap_or(Value::Null);
     args = crate::engine::model::wire_schema::strip_wire_nulls(&schema, args);
@@ -1022,6 +1021,12 @@ async fn execute_ordinary_call_unscoped(
         })
         .await;
 
+    // The provider was told an advertised-but-unavailable tool exists, so its
+    // call must produce that availability result directly. In particular, do
+    // not let a stale repeated-call signature turn an unavailable capability
+    // into an approval prompt or loop-guard refusal.
+    let unavailable_call = env.active_tools.unavailable_call_message(resolved_name);
+
     // Loop guard (GOALS §1/§12): block a back-to-back identical tool
     // call (same name + canonical post-repair `wire_input`) pending
     // approval. Only schema-valid calls are guarded — a malformed call
@@ -1042,7 +1047,7 @@ async fn execute_ordinary_call_unscoped(
         env,
         resolved_name,
         &args,
-        repair_outcome.valid && !placeholder_blocked,
+        repair_outcome.valid && !placeholder_blocked && unavailable_call.is_none(),
     )
     .await?;
     let repeated_recoverable_tool_call = match &repeat_authorization {
@@ -1096,7 +1101,8 @@ async fn execute_ordinary_call_unscoped(
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
     let mut gate_block_status = "blocked_safety_gate";
-    let gate_block: Option<String> = if !placeholder_blocked
+    let gate_block: Option<String> = if unavailable_call.is_none()
+        && !placeholder_blocked
         && repair_outcome.valid
         && !loop_guard_reject
         && super::is_gated_tool(resolved_name)
@@ -1133,15 +1139,16 @@ async fn execute_ordinary_call_unscoped(
     ) {
         recheck_result = true;
     }
-    let cage_block: Option<String> = if !placeholder_blocked && repair_outcome.valid {
-        env.ctx
-            .review_cage
-            .as_ref()
-            .and_then(|cage| cage.allow_dispatch(resolved_name).err())
-            .map(|err| err.to_string())
-    } else {
-        None
-    };
+    let cage_block: Option<String> =
+        if unavailable_call.is_none() && !placeholder_blocked && repair_outcome.valid {
+            env.ctx
+                .review_cage
+                .as_ref()
+                .and_then(|cage| cage.allow_dispatch(resolved_name).err())
+                .map(|err| err.to_string())
+        } else {
+            None
+        };
 
     // Dispatch only when validate-then-repair produced a schema-valid
     // call AND the loop guard didn't reject it AND the safety gate didn't
@@ -1197,13 +1204,16 @@ async fn execute_ordinary_call_unscoped(
         } else {
             Some("schema_invalid_unrepairable")
         }
-    } else if env.active_tools.get(resolved_name).is_none() {
+    } else if env.active_tools.call_availability(resolved_name)
+        == crate::engine::tool::ToolCallAvailability::NotAdvertised
+    {
         Some("not_in_advertised_set")
     } else {
         None
     };
     let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
-        && env.active_tools.get(resolved_name).is_some();
+        && env.active_tools.call_availability(resolved_name)
+            != crate::engine::tool::ToolCallAvailability::NotAdvertised;
     // Pin the AUTHORING model's frame inputs ONCE — its `(provider, model)`, the
     // config handle, and the pre-policy session table (captured as one Arc) — at
     // the authoring point, and reuse them for EVERY model-authored event AND the
@@ -1304,6 +1314,7 @@ async fn execute_ordinary_call_unscoped(
         || loop_guard_reject
         || gate_blocked
         || cage_block.is_some()
+        || unavailable_call.is_some()
         || !repair_outcome.valid;
     if selected_replay_denied_before_intercept {
         cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
@@ -1346,6 +1357,11 @@ async fn execute_ordinary_call_unscoped(
         (Err(invalid_input(msg)), 0)
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
+    } else if let Some(message) = unavailable_call {
+        // The provider was told this tool exists, so a call is not a
+        // hallucination. Return a normal call-time availability result without
+        // entering approvals, hooks, verification, or the tool body.
+        (Err(anyhow::anyhow!(message)), 0)
     } else if repair_outcome.valid {
         if let BtwNativeAuthorization::Refused {
             message,
@@ -3351,6 +3367,37 @@ mod tests {
         }
     }
 
+    struct CapabilityUnavailableTool {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for CapabilityUnavailableTool {
+        fn name(&self) -> &str {
+            "capability_unavailable_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Requires a deliberately absent test binary."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+            vec![crate::capabilities::BinaryRequirement::required(
+                "cockpit-test-binary-that-is-deliberately-unavailable-4f59b779",
+                crate::capabilities::CapabilityRemedy::prose("test-only requirement"),
+            )]
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.called.store(true, Ordering::SeqCst);
+            anyhow::bail!("CapabilityUnavailableTool was dispatched")
+        }
+    }
+
     struct IntegerOnlyTool {
         called: Arc<AtomicBool>,
     }
@@ -5282,6 +5329,141 @@ mod tests {
             .find(|event| event.kind == "tool_rejected")
             .expect("tool_rejected event");
         assert_eq!(rejected.data["reason"], "not_in_advertised_set");
+    }
+
+    /// Issue #135: an advertised schema stays in the provider prefix even when
+    /// its host capability disappears. A matching model call is therefore a
+    /// call-time availability failure, never a hallucinated-tool rejection.
+    #[tokio::test]
+    async fn advertised_capability_unavailable_tool_returns_availability_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(CapabilityUnavailableTool {
+            called: called.clone(),
+        }));
+        let tools = tools.apply_capabilities(
+            &HashMap::new(),
+            tmp.path(),
+            crate::capabilities::ExecutionTarget::Host,
+        );
+        assert_eq!(
+            tools.call_availability("capability_unavailable_tool"),
+            crate::engine::tool::ToolCallAvailability::AdvertisedUnavailable,
+            "the capability gate changes callability, not provider visibility"
+        );
+        assert!(
+            tools
+                .advertised_definitions(crate::agents::ToolSteering::Terse)
+                .iter()
+                .any(|definition| definition.name == "capability_unavailable_tool"),
+            "the model receives the unavailable tool's stable schema"
+        );
+
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 1,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("capability_unavailable_tool", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "capability_unavailable_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "capability_unavailable_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            history.len(),
+            4,
+            "each unavailable call receives its own result"
+        );
+        assert!(
+            last_tool_result_text(&history).contains("currently unavailable"),
+            "a repeated unavailable call returns availability, not a loop refusal"
+        );
+        assert!(
+            !last_tool_result_text(&history).contains("Loop blocked"),
+            "unavailable calls must not enter the loop-guard approval path"
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "capability_unavailable_tool")
+        );
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(TurnEvent::ToolError { tool, error, kind, .. })
+                    if tool == "capability_unavailable_tool"
+                        && kind == crate::engine::tool::ToolFailKind::Execution
+                        && error.contains("currently unavailable")
+            ),
+            "unavailability is a call-time execution result"
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "capability_unavailable_tool")
+        );
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(TurnEvent::ToolError { tool, error, kind, .. })
+                    if tool == "capability_unavailable_tool"
+                        && kind == crate::engine::tool::ToolFailKind::Execution
+                        && error.contains("currently unavailable")
+            ),
+            "a repeated unavailable call remains a call-time execution result"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "an unavailable tool must not reach its backend"
+        );
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .expect("tool audit rows load");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.hard_fail));
+        assert!(
+            session
+                .db
+                .list_session_events(session.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|event| event.kind != "tool_rejected"),
+            "provider-advertised unavailable calls are not hallucinations"
+        );
     }
 
     /// AC20 (`computer-coordinator-live-loop-and-dispatch-wiring.md` §4):

@@ -20,8 +20,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
 
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &history,
+            AgentPromptParts::new("system", &history),
             &prompt,
             &[],
             &ModelParams::default(),
@@ -62,8 +61,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
         captured,
         model
             .prepare_completion_request(
-                "system",
-                &history,
+                AgentPromptParts::new("system", &history),
                 &prompt,
                 &[],
                 &ModelParams::default(),
@@ -74,6 +72,60 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
             .captured,
         "prepared payload remains byte-identical to the canonical assembly"
     );
+}
+
+#[test]
+fn cache_boundary_keeps_system_and_tools_byte_identical_across_volatile_turns() {
+    let (_tmp, redact) = secret_table();
+    let model = model_at("http://127.0.0.1:1/v1", redact);
+    let tools = [crate::engine::message::ToolDefinition {
+        name: "memory_search".to_string(),
+        description: "search attached OKF memory bundles with citations".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }];
+    let stable_prefix = "session-stable system prefix";
+    let first_history = [Message::user("[time: first turn]\n\nhello")];
+    let second_history = [Message::user(
+        "[knowledge]\nnew retrieval\n\n[project guidance notice] changed",
+    )];
+
+    let first = model
+        .prepare_completion_request(
+            AgentPromptParts::new(stable_prefix, &first_history),
+            &Message::user("first prompt"),
+            &tools,
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    let second = model
+        .prepare_completion_request(
+            AgentPromptParts::new(stable_prefix, &second_history),
+            &Message::user("second prompt"),
+            &tools,
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(first.system, second.system);
+    assert_eq!(
+        serde_json::to_vec(&first.captured["tools"]).unwrap(),
+        serde_json::to_vec(&second.captured["tools"]).unwrap(),
+        "the serialized provider tools array must stay cache-identical"
+    );
+    assert_ne!(
+        serde_json::to_value(&first.history).unwrap(),
+        serde_json::to_value(&second.history).unwrap()
+    );
+    assert!(!first.system.contains("[time:") && !first.system.contains("[knowledge]"));
 }
 
 #[tokio::test]
@@ -141,8 +193,7 @@ async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_
         .expect("foreground request");
     let without_recovery = model
         .prepare_completion_request(
-            "shared system prompt",
-            &history,
+            AgentPromptParts::new("shared system prompt", &history),
             &foreground_prompt,
             &tools,
             &params,
@@ -4216,8 +4267,7 @@ async fn capture_anthropic_body(
     );
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &[],
+            AgentPromptParts::new("system", &[]),
             &Message::user("hi"),
             &[],
             &params,
@@ -7294,8 +7344,7 @@ fn untrusted_json_tool_result_values_and_keys_are_scrubbed() {
 
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &history,
+            AgentPromptParts::new("system", &history),
             &prompt,
             &[],
             &ModelParams::default(),
@@ -7381,8 +7430,7 @@ fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
     // Drive the PRODUCTION entry point and assert on the scrubbed message.
     let prepared = model
         .prepare_completion_request(
-            "system",
-            std::slice::from_ref(&msg),
+            AgentPromptParts::new("system", std::slice::from_ref(&msg)),
             &Message::user("continue"),
             &[],
             &ModelParams::default(),
@@ -7414,8 +7462,7 @@ fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
     // byte-stable no-op (the terminal collision object never re-renders).
     let reprepared = model
         .prepare_completion_request(
-            "system",
-            std::slice::from_ref(&prepared.history[0]),
+            AgentPromptParts::new("system", std::slice::from_ref(&prepared.history[0])),
             &Message::user("continue"),
             &[],
             &ModelParams::default(),
@@ -7499,8 +7546,7 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
     assert!(raw.contains(SECRET) && raw.contains(base64_secret.as_str()));
     let prepared = model
         .prepare_completion_request(
-            "system",
-            &[message],
+            AgentPromptParts::new("system", &[message]),
             &Message::user("go"),
             &[],
             &ModelParams::default(),
@@ -7555,8 +7601,7 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         // failure BEFORE any network I/O.
         let err = untrusted
             .prepare_completion_request(
-                "system",
-                &[media()],
+                AgentPromptParts::new("system", &[media()]),
                 &Message::user("go"),
                 &[],
                 &ModelParams::default(),
@@ -7625,8 +7670,7 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         .unwrap();
         assert!(trusted.is_trusted());
         let trusted_prep = trusted.prepare_completion_request(
-            "system",
-            &[media()],
+            AgentPromptParts::new("system", &[media()]),
             &Message::user("go"),
             &[],
             &ModelParams::default(),
@@ -7959,8 +8003,7 @@ async fn untrusted_provider_wire_inventory_is_closed() {
     );
     let prepared = chat
         .prepare_completion_request(
-            "system",
-            &full_history,
+            AgentPromptParts::new("system", &full_history),
             &Message::user(format!("final {SECRET}")),
             &[],
             &ModelParams::default(),

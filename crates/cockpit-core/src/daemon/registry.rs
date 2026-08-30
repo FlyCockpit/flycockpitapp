@@ -1049,6 +1049,10 @@ impl SessionRegistry {
             .next()
             .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a cache-send time"))?
             .parse::<i64>()?;
+        let cache_send_id = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a cache-send identity"))?
+            .parse::<uuid::Uuid>()?;
         let after_secs = parts
             .next()
             .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a delay"))?
@@ -1060,7 +1064,7 @@ impl SessionRegistry {
         let _nonce = parts
             .next()
             .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a nonce"))?
-            .parse::<i64>()?;
+            .parse::<uuid::Uuid>()?;
         anyhow::ensure!(
             parts.next().is_none(),
             "keep-warm callback job id has extra fields"
@@ -1086,6 +1090,7 @@ impl SessionRegistry {
         handle
             .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
                 cache_send_at_unix_millis,
+                cache_send_id,
                 after_secs,
                 idle_window_secs,
                 cancel,

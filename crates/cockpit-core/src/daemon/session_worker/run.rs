@@ -5801,6 +5801,12 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         SessionWork::SetLongcache { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
+        SessionWork::KeepWarm {
+            cancel, respond_to, ..
+        } => {
+            cancel.cancel();
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
         SessionWork::AuthorizeHostCapabilitiesRefresh { respond_to } => {
             let _ = respond_to.send(Err(HostCapabilitiesRefreshError::Internal(STOPPED.into())));
         }
@@ -9868,6 +9874,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::KeepWarm {
                     cache_send_at_unix_millis,
+                    cache_send_id,
                     after_secs,
                     idle_window_secs,
                     cancel,
@@ -9877,6 +9884,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::KeepWarm {
                             cache_send_at_unix_millis,
+                            cache_send_id,
                             after_secs,
                             idle_window_secs,
                             cancel,

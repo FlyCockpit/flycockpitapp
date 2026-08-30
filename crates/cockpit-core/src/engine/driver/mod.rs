@@ -81,7 +81,7 @@ use crate::{
 };
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
-use crate::session::Session;
+use crate::session::{InferenceSendIdentity, Session};
 
 /// Out-of-band control requests routed to the driver from the daemon
 /// worker — `/prune`, `/compact`, `/pin`. Drained on the same boundary
@@ -94,6 +94,7 @@ pub enum DriverControl {
     /// the idle window. This is cost-only and carries no resume semantics.
     KeepWarm {
         cache_send_at_unix_millis: i64,
+        cache_send_id: uuid::Uuid,
         after_secs: u64,
         idle_window_secs: u64,
         cancel: tokio_util::sync::CancellationToken,
@@ -5745,6 +5746,7 @@ impl Driver {
             }
             DriverControl::KeepWarm {
                 cache_send_at_unix_millis,
+                cache_send_id,
                 after_secs,
                 idle_window_secs,
                 cancel,
@@ -5752,7 +5754,10 @@ impl Driver {
             } => {
                 let _ = respond_to.send(
                     self.run_keep_warm(
-                        cache_send_at_unix_millis,
+                        InferenceSendIdentity {
+                            unix_millis: cache_send_at_unix_millis,
+                            send_id: cache_send_id,
+                        },
                         after_secs,
                         idle_window_secs,
                         cancel,
@@ -9447,26 +9452,27 @@ impl Driver {
                     tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
                     return;
                 };
-                let Some(cache_send_at_unix_millis) = self.session.last_send_unix_millis() else {
+                let Some(cache_send_identity) = self.session.last_send_identity() else {
                     // An observed cache hit necessarily follows a foreground
                     // send in production. If that in-memory send marker is
                     // absent (for example after a worker restart), fail
                     // closed rather than inventing a later idle origin.
                     return;
                 };
-                let unique_millis = chrono::Utc::now().timestamp_millis();
                 let job = crate::daemon::proto::ScheduledJobCreate {
                     id: format!(
-                        "keep-warm.{}.{}.{}.{}.{}",
+                        "keep-warm.{}.{}.{}.{}.{}.{}",
                         self.session.id.simple(),
-                        cache_send_at_unix_millis,
+                        cache_send_identity.unix_millis,
+                        cache_send_identity.send_id,
                         schedule.after_secs,
                         schedule.idle_window_secs,
-                        unique_millis,
+                        uuid::Uuid::new_v4(),
                     ),
                     owner: "system:keep_warm".to_string(),
                     schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
-                        at: cache_send_at_unix_millis
+                        at: cache_send_identity
+                            .unix_millis
                             .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
                             .saturating_add(999)
                             .div_euclid(1_000),
@@ -9517,7 +9523,7 @@ impl Driver {
     /// cache activity clock.
     async fn run_keep_warm(
         &mut self,
-        cache_send_at_unix_millis: i64,
+        cache_send_identity: InferenceSendIdentity,
         after_secs: u64,
         idle_window_secs: u64,
         cancel: tokio_util::sync::CancellationToken,
@@ -9525,18 +9531,17 @@ impl Driver {
     ) -> std::result::Result<String, String> {
         let elapsed = chrono::Utc::now()
             .timestamp_millis()
-            .saturating_sub(cache_send_at_unix_millis)
+            .saturating_sub(cache_send_identity.unix_millis)
             .max(0) as u64;
         let elapsed = elapsed / 1_000;
         if elapsed < after_secs {
             return Ok("skipped: before keep-warm deadline".to_string());
         }
-        let Some((last_send_at_unix_millis, last_send_age)) =
-            self.session.last_send_identity_and_age()
+        let Some((last_send_identity, last_send_age)) = self.session.last_send_identity_and_age()
         else {
             return Ok("skipped: cache-producing send unavailable".to_string());
         };
-        if last_send_at_unix_millis != cache_send_at_unix_millis || last_send_age < after_secs {
+        if last_send_identity != cache_send_identity || last_send_age < after_secs {
             return Ok("skipped: newer session activity".to_string());
         }
         if elapsed >= idle_window_secs || last_send_age >= idle_window_secs {

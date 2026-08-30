@@ -3392,7 +3392,7 @@ async fn keep_warm_yields_to_queued_user_reentry() {
     let cancel = tokio_util::sync::CancellationToken::new();
     let result = driver
         .run_keep_warm(
-            driver.session.last_send_unix_millis().unwrap(),
+            driver.session.last_send_identity().unwrap(),
             0,
             60,
             cancel.clone(),
@@ -3415,7 +3415,10 @@ async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
     let queue = crate::engine::message::UserSubmissionQueue::new(updates);
     let result = driver
         .run_keep_warm(
-            chrono::Utc::now().timestamp_millis(),
+            crate::session::InferenceSendIdentity {
+                unix_millis: chrono::Utc::now().timestamp_millis(),
+                send_id: uuid::Uuid::new_v4(),
+            },
             30,
             60,
             tokio_util::sync::CancellationToken::new(),
@@ -3425,9 +3428,13 @@ async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
         .unwrap();
     assert_eq!(result, "skipped: before keep-warm deadline");
 
+    driver
+        .session
+        .note_send_at_for_test(std::time::Duration::from_secs(120));
+    let expired_send_identity = driver.session.last_send_identity().unwrap();
     let result = driver
         .run_keep_warm(
-            chrono::Utc::now().timestamp_millis() - 120_000,
+            expired_send_identity,
             0,
             60,
             tokio_util::sync::CancellationToken::new(),
@@ -3449,13 +3456,13 @@ async fn keep_warm_uses_the_cache_producing_send_for_its_original_deadline() {
     driver
         .session
         .note_send_at_for_test(std::time::Duration::from_secs(61));
-    let cache_send_at_unix_millis = driver.session.last_send_unix_millis().unwrap();
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
     let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates);
 
     let result = driver
         .run_keep_warm(
-            cache_send_at_unix_millis,
+            cache_send_identity,
             0,
             60,
             tokio_util::sync::CancellationToken::new(),
@@ -3465,6 +3472,33 @@ async fn keep_warm_uses_the_cache_producing_send_for_its_original_deadline() {
         .unwrap();
 
     assert_eq!(result, "skipped: idle window elapsed");
+}
+
+#[tokio::test]
+async fn keep_warm_rejects_a_later_send_with_the_same_millisecond_timestamp() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver
+        .session
+        .note_send_at_for_test(std::time::Duration::from_secs(30));
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    driver
+        .session
+        .note_send_with_unix_millis_for_test(cache_send_identity.unix_millis);
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+
+    let result = driver
+        .run_keep_warm(
+            cache_send_identity,
+            0,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, "skipped: newer session activity");
 }
 
 #[tokio::test]
@@ -3478,13 +3512,13 @@ async fn keep_warm_fences_a_live_idle_window_reduction() {
     driver
         .session
         .note_send_at_for_test(std::time::Duration::from_secs(20));
-    let cache_send_at_unix_millis = driver.session.last_send_unix_millis().unwrap();
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
     let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates);
 
     let result = driver
         .run_keep_warm(
-            cache_send_at_unix_millis,
+            cache_send_identity,
             0,
             60,
             tokio_util::sync::CancellationToken::new(),

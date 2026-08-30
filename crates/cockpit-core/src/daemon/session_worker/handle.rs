@@ -2175,6 +2175,7 @@ pub enum SessionWork {
     /// user message and never advances away/resume activity.
     KeepWarm {
         cache_send_at_unix_millis: i64,
+        cache_send_id: Uuid,
         after_secs: u64,
         idle_window_secs: u64,
         cancel: tokio_util::sync::CancellationToken,

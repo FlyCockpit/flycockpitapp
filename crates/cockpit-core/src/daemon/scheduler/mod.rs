@@ -177,6 +177,23 @@ impl DaemonSchedulerHandle {
         Ok(summary)
     }
 
+    /// Create a daemon-minted callback job. This is intentionally crate-only:
+    /// the public daemon protocol may schedule prompts, but it may never name
+    /// a callback subsystem or impersonate a `system:*` owner.
+    pub(crate) async fn create_system_callback_job(
+        &self,
+        job: ScheduledJobCreate,
+    ) -> Result<ScheduledJobSummary> {
+        let ScheduledJobPayload::Callback { subsystem } = &job.payload else {
+            bail!("internal callback creation requires a callback payload");
+        };
+        anyhow::ensure!(
+            job.owner == format!("system:{subsystem}"),
+            "internal callback owner mismatch"
+        );
+        self.create_job(job).await
+    }
+
     pub async fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
         self.scheduler.list_jobs(owner).await
     }
@@ -912,6 +929,17 @@ pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {
                 bail!("Callback owner must be `{expected}`");
             }
         }
+    }
+    Ok(())
+}
+
+/// Validate the remotely callable scheduling surface. Callback payloads are
+/// daemon capabilities, not a user-facing job type: matching the conventional
+/// `system:<subsystem>` owner is not provenance.
+pub fn validate_public_job_create(job: &ScheduledJobCreate) -> Result<()> {
+    validate_job_create(job)?;
+    if matches!(&job.payload, ScheduledJobPayload::Callback { .. }) {
+        bail!("callback scheduled jobs are daemon-owned and cannot be created by clients");
     }
     Ok(())
 }
@@ -2665,6 +2693,15 @@ mod tests {
         assert!(validate_job_create(&callback).is_err());
         callback.owner = "system:test".to_string();
         assert!(validate_job_create(&callback).is_ok());
+        assert!(validate_public_job_create(&callback).is_err());
+
+        // `system:keep_warm` is not a client capability merely because the
+        // payload/owner convention is guessed correctly.
+        callback.owner = "system:keep_warm".to_string();
+        callback.payload = ScheduledJobPayload::Callback {
+            subsystem: "keep_warm".to_string(),
+        };
+        assert!(validate_public_job_create(&callback).is_err());
     }
 
     #[tokio::test]

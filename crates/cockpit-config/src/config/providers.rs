@@ -2578,7 +2578,17 @@ impl ProvidersConfig {
             return CacheRetentionProfile::None;
         }
 
-        match provider.to_ascii_lowercase().as_str() {
+        // Provider map keys are user-renamable connection labels. Curated
+        // retention knowledge belongs only to the immutable template identity;
+        // custom endpoints never inherit a vendor profile from a chosen name.
+        let Some(template) = self
+            .providers
+            .get(provider)
+            .and_then(|entry| entry.effective_template(provider))
+        else {
+            return CacheRetentionProfile::Observed;
+        };
+        match template.to_ascii_lowercase().as_str() {
             "openai" | "chatgpt" | "codex" => CacheRetentionProfile::KnownFloor { secs: 30 * 60 },
             "anthropic" | "claude" | "gemini" | "google" => CacheRetentionProfile::KnownFloor {
                 secs: cache.ttl_secs,

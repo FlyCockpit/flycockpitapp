@@ -9870,6 +9870,7 @@ pub(super) async fn run_worker(
                     armed_at_unix_secs,
                     after_secs,
                     idle_window_secs,
+                    cancel,
                     respond_to,
                 } => {
                     if !send_driver_control_or_fail(
@@ -9878,6 +9879,7 @@ pub(super) async fn run_worker(
                             armed_at_unix_secs,
                             after_secs,
                             idle_window_secs,
+                            cancel,
                             respond_to,
                         },
                         &event_tx,

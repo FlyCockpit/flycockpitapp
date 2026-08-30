@@ -2177,6 +2177,7 @@ pub enum SessionWork {
         armed_at_unix_secs: i64,
         after_secs: u64,
         idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
         respond_to: oneshot::Sender<std::result::Result<String, String>>,
     },
     ProbeUserMessage {

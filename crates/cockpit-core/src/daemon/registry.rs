@@ -53,6 +53,16 @@ use crate::{
     session::Session,
 };
 
+/// Ties the scheduler callback future's lifetime to the delivered refresh.
+/// Dropping a timed-out callback must cancel the driver-owned provider call.
+struct KeepWarmCallbackGuard(tokio_util::sync::CancellationToken);
+
+impl Drop for KeepWarmCallbackGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("session entry mode conflict: session is {actual}, attach requested {requested}")]
 pub(crate) struct SessionEntryModeConflict {
@@ -1021,6 +1031,11 @@ impl SessionRegistry {
         &self,
         job: crate::daemon::scheduler::ScheduledJob,
     ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            job.owner == "system:keep_warm"
+                && matches!(&job.payload, crate::daemon::proto::ScheduledJobPayload::Callback { subsystem } if subsystem == "keep_warm"),
+            "keep-warm callback has invalid daemon ownership"
+        );
         let mut parts = job.id.split('.');
         anyhow::ensure!(
             parts.next() == Some("keep-warm"),
@@ -1062,12 +1077,18 @@ impl SessionRegistry {
                 ),
             )
             .await?;
+        // `ProductionJobExecutor` cancels this future when its callback
+        // deadline expires. The guard propagates that cancellation into the
+        // delivered driver control so no paid refresh outlives the callback.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_callback_drop = KeepWarmCallbackGuard(cancel.clone());
         let (respond_to, response) = tokio::sync::oneshot::channel();
         handle
             .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
                 armed_at_unix_secs,
                 after_secs,
                 idle_window_secs,
+                cancel,
                 respond_to,
             })
             .await?;

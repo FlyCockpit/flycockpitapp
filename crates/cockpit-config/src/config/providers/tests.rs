@@ -1344,6 +1344,7 @@ fn cache_retention_profile_is_curated_and_conservative() {
         cfg.providers.insert(
             provider.to_string(),
             ProviderEntry {
+                template: (provider != "self-hosted").then(|| provider.to_string()),
                 cache: CacheConfig {
                     mode: CacheMode::Ephemeral,
                     ttl_secs: 300,
@@ -1371,6 +1372,31 @@ fn cache_retention_profile_is_curated_and_conservative() {
     );
     assert_eq!(
         cfg.resolve_cache_retention_profile("self-hosted", "model"),
+        CacheRetentionProfile::Observed
+    );
+
+    // Connection keys are mutable labels. Curated behavior follows only the
+    // persisted vendor template, so a renamed OpenAI connection keeps its
+    // floor while a custom endpoint named `openai` remains observed-only.
+    let renamed_openai = cfg.providers.remove("openai").unwrap();
+    cfg.providers
+        .insert("work-connection".into(), renamed_openai);
+    cfg.providers.insert(
+        "openai".into(),
+        ProviderEntry {
+            cache: CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: 300,
+            },
+            ..ProviderEntry::default()
+        },
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("work-connection", "gpt"),
+        CacheRetentionProfile::KnownFloor { secs: 30 * 60 }
+    );
+    assert_eq!(
+        cfg.resolve_cache_retention_profile("openai", "gpt"),
         CacheRetentionProfile::Observed
     );
 }

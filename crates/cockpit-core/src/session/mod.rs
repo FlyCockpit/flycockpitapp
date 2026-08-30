@@ -392,6 +392,11 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
+    /// The configured endpoint that reported the last real prompt-cache hit.
+    /// This is deliberately separate from `last_usage`: context chrome may use
+    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// the endpoint it is about to refresh.
+    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
     /// Wall-clock instant of the most recent inference send. Stamped by
     /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
     /// it to decide whether the provider's prompt-cache TTL has elapsed.

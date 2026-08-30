@@ -2746,7 +2746,7 @@ pub(crate) async fn run_turn(
         (false, false) => format!("{channel_reasoning}\n{inline_chip}"),
     };
     if let Some(u) = usage {
-        if let Err(e) = record_usage_blocking(session.clone(), call_id, u).await {
+        if let Err(e) = record_usage_blocking(session.clone(), call_id, u, model).await {
             tracing::warn!(error = %e, "session.record_usage failed");
         }
         // Feed the round into tokenizer calibration only after the cheap

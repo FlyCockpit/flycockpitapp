@@ -96,6 +96,7 @@ pub enum DriverControl {
         armed_at_unix_secs: i64,
         after_secs: u64,
         idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
     },
     /// Deliver an already-durable late user steer to the exact live executor
@@ -5746,11 +5747,18 @@ impl Driver {
                 armed_at_unix_secs,
                 after_secs,
                 idle_window_secs,
+                cancel,
                 respond_to,
             } => {
                 let _ = respond_to.send(
-                    self.run_keep_warm(armed_at_unix_secs, after_secs, idle_window_secs)
-                        .await,
+                    self.run_keep_warm(
+                        armed_at_unix_secs,
+                        after_secs,
+                        idle_window_secs,
+                        cancel,
+                        input_queue,
+                    )
+                    .await,
                 );
             }
             DriverControl::FlushSendNow => {
@@ -9403,9 +9411,7 @@ impl Driver {
         let profile = providers.resolve_cache_retention_profile(&provider, &model);
         let observed_cache_hit = self
             .session
-            .last_usage()
-            .and_then(|usage| usage.hit_rate())
-            .is_some_and(|rate| rate > 0.0);
+            .has_observed_cache_hit_for_endpoint(&provider, &model);
         let decision = crate::keep_warm::decide(
             context.keep_warm,
             context.idle_window_secs,
@@ -9462,7 +9468,7 @@ impl Driver {
                     enabled: true,
                     missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
                 };
-                match scheduler.create_job(job).await {
+                match scheduler.create_system_callback_job(job).await {
                     Ok(_) => {
                         if let Err(error) = self
                             .session
@@ -9504,6 +9510,8 @@ impl Driver {
         armed_at_unix_secs: i64,
         after_secs: u64,
         idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        input_queue: &crate::engine::message::UserSubmissionQueue,
     ) -> std::result::Result<String, String> {
         let elapsed = chrono::Utc::now()
             .timestamp()
@@ -9531,9 +9539,7 @@ impl Driver {
             context.idle_window_secs,
             providers.resolve_cache_retention_profile(&provider, &model_id),
             self.session
-                .last_usage()
-                .and_then(|usage| usage.hit_rate())
-                .is_some_and(|rate| rate > 0.0),
+                .has_observed_cache_hit_for_endpoint(&provider, &model_id),
         );
         if let crate::keep_warm::KeepWarmDecision::Skip(reason) = decision {
             return Ok(format!("skipped: {}", reason.as_str()));
@@ -9547,12 +9553,16 @@ impl Driver {
         let system = root.agent.system.clone();
         let history = root.history.clone();
         let agent = root.agent.name.clone();
-        let cancel = self
-            .cancel_current
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .unwrap_or_default();
+        // Keep-warm is the current cancellable activity while it runs. The
+        // scheduler owns this token too, so its callback timeout/drop aborts
+        // the provider call instead of merely abandoning the response waiter.
+        let _cancel_guard = {
+            *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
+            CancelSlotGuard {
+                slot: self.cancel_current.clone(),
+            }
+        };
+        let active_target_id = self.active_queue_target_id();
         let call_id = uuid::Uuid::new_v4();
         let refresh = tokio::time::timeout(
             crate::engine::model::UtilityCallSite::KeepWarm.timeout(),
@@ -9567,8 +9577,19 @@ impl Driver {
                 &cancel,
                 None,
             ),
-        )
-        .await
+        );
+        let refresh = tokio::select! {
+            biased;
+            has_user = input_queue.wait_for_pending_for(Some(&active_target_id)) => {
+                if has_user {
+                    cancel.cancel();
+                    return Ok("skipped: user re-entered".to_string());
+                }
+                return Ok("skipped: input queue closed".to_string());
+            }
+            _ = cancel.cancelled() => return Ok("skipped: keep-warm cancelled".to_string()),
+            result = refresh => result,
+        }
         .map_err(|_| "keep-warm request timed out".to_string())?
         .map_err(|error| format!("keep-warm request failed: {error:#}"))?;
         let ((_, _, usage), captured, _) = refresh;

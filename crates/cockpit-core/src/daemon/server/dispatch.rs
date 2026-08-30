@@ -10563,6 +10563,7 @@ async fn handle_serialized_request_impl(
 
         Request::CreateScheduledJob { job } => {
             let scheduler = require_scheduler(ctx)?;
+            crate::daemon::scheduler::validate_public_job_create(&job).map_err(internal)?;
             let job = scheduler.create_job(job).await.map_err(internal)?;
             Ok(Response::ScheduledJob { job })
         }

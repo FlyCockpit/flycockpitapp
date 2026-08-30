@@ -3359,6 +3359,85 @@ async fn ineffective_prunes_escalate_to_compaction_below_compact_line() {
     while rx.recv().await.is_some() {}
 }
 
+/// Keep-warm is a background control, so a user already queued at dispatch
+/// wins before the provider future is polled. The cancellation token is the
+/// same slot the worker exposes for ctrl+c and scheduler callback expiry.
+#[tokio::test]
+async fn keep_warm_yields_to_queued_user_reentry() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 60;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver.session.note_send();
+    driver.session.note_cache_hit_for_endpoint(
+        "lmstudio",
+        "local",
+        crate::tokens::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 1,
+            cached_input_tokens: 90,
+            cache_creation_input_tokens: 0,
+        },
+    );
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    queue
+        .push(
+            crate::engine::message::UserSubmission::text("I'm back"),
+            driver.active_queue_target(),
+        )
+        .await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let result = driver
+        .run_keep_warm(
+            chrono::Utc::now().timestamp(),
+            0,
+            60,
+            cancel.clone(),
+            &queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "skipped: user re-entered");
+    assert!(cancel.is_cancelled());
+    assert!(
+        queue.has_pending_for(None).await,
+        "re-entry stays queued for normal dispatch"
+    );
+}
+
+#[tokio::test]
+async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let result = driver
+        .run_keep_warm(
+            chrono::Utc::now().timestamp(),
+            30,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "skipped: before keep-warm deadline");
+
+    let result = driver
+        .run_keep_warm(
+            chrono::Utc::now().timestamp() - 120,
+            0,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "skipped: idle window elapsed");
+}
+
 /// No `context_length` known → the ctx%-gated paths are inert: the
 /// threshold auto-prune branch and auto-compact both skip, but the
 /// cache-cold auto-prune branch still fires.

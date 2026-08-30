@@ -8,6 +8,7 @@ use super::sessions::*;
 use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
 use crate::daemon::agent_management::{bad_config, conflict};
+use crate::daemon::code_roots::CodeRootProjectionWriterV1;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 use sha2::{Digest, Sha256};
@@ -5632,6 +5633,466 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::CreateCodeRootV1(request) => {
+            if let Some(result) = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .replay_create(&request)
+                .map_err(code_root_contract_error)?
+            {
+                if state.attached.as_ref().is_none_or(|attached| {
+                    attached.handle.session_id != result.attachment.root_id.0
+                }) {
+                    let options = request.options.clone();
+                    let principal = state.principal.clone();
+                    Box::pin(attach(
+                        state,
+                        ctx,
+                        Some(result.attachment.root_id.0),
+                        None,
+                        None,
+                        options.initial_model,
+                        options.no_sandbox,
+                        options.interactive,
+                        Some(proto::SessionEntryMode::Code),
+                        options.model_override,
+                        options.client_protocol_version,
+                        options.env_snapshot,
+                        options.env_policy,
+                        &principal,
+                        effects,
+                    ))
+                    .await?;
+                }
+                if let Some(attached) = state.attached.as_mut() {
+                    attached.code_root_capability =
+                        Some(result.attachment.attachment_capability.clone());
+                }
+                return Ok(Response::CodeRootCreated(result));
+            }
+            crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .preflight_new_attachment()
+                .map_err(code_root_contract_error)?;
+            let canonical = crate::daemon::fs_api::canonical_project_root(
+                &request.workspace_selector.path,
+            )?;
+            let options = request.options.clone();
+            let principal = state.principal.clone();
+            let attached = Box::pin(attach(
+                state,
+                ctx,
+                None,
+                None,
+                Some(canonical.to_string_lossy().into_owned()),
+                options.initial_model,
+                options.no_sandbox,
+                options.interactive,
+                Some(proto::SessionEntryMode::Code),
+                options.model_override,
+                options.client_protocol_version,
+                options.env_snapshot,
+                options.env_policy,
+                &principal,
+                effects,
+            ))
+            .await?;
+            let mut root = code_root_read_from_attached_response(ctx, attached).await?;
+            if let Some(attached) = state.attached.as_ref() {
+                scrub_code_root_read(&mut root, &attached.handle.redaction_table());
+            }
+            if let Some(attached) = state.attached.as_ref() {
+                attached.handle.persist_if_needed().map_err(internal)?;
+            }
+            let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
+                ctx.db.clone(),
+            );
+            let initial = writer
+                .write_root_state_changed(root.root_id)
+                .await
+                .map_err(internal)?;
+            let result = {
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                let capture_generation = authority.next_capture_generation();
+                let attachment = authority
+                    .mint_attachment(
+                        root.root_id,
+                        request.logical_client_id.clone(),
+                        capture_generation,
+                        initial.cursor,
+                    )
+                    .map_err(code_root_contract_error)?;
+                let result = proto::CreateCodeRootV1Result { attachment, root };
+                authority
+                    .record_create(&request, result.clone())
+                    .map_err(code_root_contract_error)?;
+                result
+            };
+            if let Some(attached) = state.attached.as_mut() {
+                attached.code_root_capability =
+                    Some(result.attachment.attachment_capability.clone());
+            }
+            Ok(Response::CodeRootCreated(result))
+        }
+
+        Request::AttachExistingCodeRootV1(request) => {
+            if let Some(result) = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .replay_attach(&request)
+                .map_err(code_root_contract_error)?
+            {
+                if state.attached.as_ref().is_none_or(|attached| {
+                    attached.handle.session_id != result.attachment.root_id.0
+                }) {
+                    let options = request.options.clone();
+                    let principal = state.principal.clone();
+                    Box::pin(attach(
+                        state,
+                        ctx,
+                        Some(result.attachment.root_id.0),
+                        None,
+                        None,
+                        options.initial_model,
+                        options.no_sandbox,
+                        options.interactive,
+                        Some(proto::SessionEntryMode::Code),
+                        options.model_override,
+                        options.client_protocol_version,
+                        options.env_snapshot,
+                        options.env_policy,
+                        &principal,
+                        effects,
+                    ))
+                    .await?;
+                }
+                if let Some(attached) = state.attached.as_mut() {
+                    attached.code_root_capability =
+                        Some(result.attachment.attachment_capability.clone());
+                }
+                return Ok(Response::CodeRootAttached(result));
+            }
+            crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .preflight_new_attachment()
+                .map_err(code_root_contract_error)?;
+            if let Some(cursor) = &request.replay_cursor {
+                ctx.db
+                    .read_code_root_projection_deliveries(
+                        request.root_id.0,
+                        Some(cursor.expose_opaque()),
+                        1,
+                    )
+                    .await
+                    .map_err(code_root_contract_error)?;
+            }
+            let options = request.options.clone();
+            let principal = state.principal.clone();
+            let attached = Box::pin(attach(
+                state,
+                ctx,
+                Some(request.root_id.0),
+                None,
+                None,
+                options.initial_model,
+                options.no_sandbox,
+                options.interactive,
+                Some(proto::SessionEntryMode::Code),
+                options.model_override,
+                options.client_protocol_version,
+                options.env_snapshot,
+                options.env_policy,
+                &principal,
+                effects,
+            ))
+            .await?;
+            let mut root = code_root_read_from_attached_response(ctx, attached).await?;
+            if let Some(attached) = state.attached.as_ref() {
+                scrub_code_root_read(&mut root, &attached.handle.redaction_table());
+            }
+            let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
+                ctx.db.clone(),
+            );
+            let initial = writer
+                .write_root_state_changed(root.root_id)
+                .await
+                .map_err(internal)?;
+            let replay_cursor = match request.replay_cursor.clone() {
+                Some(cursor) => cursor,
+                None => ctx
+                    .db
+                    .code_root_replay_cursor_for_client(
+                        root.root_id.0,
+                        request.logical_client_id.as_str(),
+                    )
+                    .await
+                    .map_err(internal)?
+                    .map(proto::CodeRootReplayCursorV1::from_daemon_opaque)
+                    .transpose()
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?
+                    .unwrap_or(initial.cursor),
+            };
+            let result = {
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                let capture_generation = authority.next_capture_generation();
+                let attachment = authority
+                    .mint_attachment(
+                        root.root_id,
+                        request.logical_client_id.clone(),
+                        capture_generation,
+                        replay_cursor,
+                    )
+                    .map_err(code_root_contract_error)?;
+                let result = proto::AttachExistingCodeRootV1Result { attachment, root };
+                authority
+                    .record_attach(&request, result.clone())
+                    .map_err(code_root_contract_error)?;
+                result
+            };
+            if let Some(attached) = state.attached.as_mut() {
+                attached.code_root_capability =
+                    Some(result.attachment.attachment_capability.clone());
+            }
+            Ok(Response::CodeRootAttached(result))
+        }
+
+        Request::CloseCodeRootAttachmentV1(request) => {
+            let (root_id, outcome) = {
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                let record = authority
+                    .record_for_capability(&request.attachment_capability)
+                    .map_err(code_root_contract_error)?;
+                if let Some(outcome) = authority
+                    .replay_close(&record.logical_client_id, &request)
+                    .map_err(code_root_contract_error)?
+                {
+                    return Ok(Response::CodeRootAttachmentClosed(outcome));
+                }
+                authority
+                    .preflight_idempotency()
+                    .map_err(code_root_contract_error)?;
+                let root_id = record.root_id;
+                let outcome = authority
+                    .close(&request.attachment_capability)
+                    .map_err(code_root_contract_error)?;
+                authority
+                    .record_close(&record.logical_client_id, &request, outcome)
+                    .map_err(code_root_contract_error)?;
+                if state
+                    .attached
+                    .as_ref()
+                    .is_none_or(|attached| attached.handle.session_id != root_id.0)
+                {
+                    return Ok(Response::CodeRootAttachmentClosed(outcome));
+                }
+                (root_id, outcome)
+            };
+            debug_assert!(state
+                .attached
+                .as_ref()
+                .is_some_and(|attached| attached.handle.session_id == root_id.0));
+            drain_client_attachment_ownership(state, ctx, "Code-root attachment close").await?;
+            Ok(Response::CodeRootAttachmentClosed(outcome))
+        }
+
+        Request::DiscoverCodeRootsV1(request) => {
+            let canonical = crate::daemon::fs_api::canonical_project_root(
+                &request.workspace_selector.path,
+            )?
+            .to_string_lossy()
+            .into_owned();
+            let result = if let Some(cursor) = &request.cursor {
+                crate::sync::lock_or_recover(&ctx.code_root_authority)
+                    .continue_discovery(
+                        cursor,
+                        &canonical,
+                        &request.logical_client_id,
+                        request.limit,
+                    )
+                    .map_err(code_root_contract_error)?
+            } else {
+                let rows = ctx
+                    .db
+                    .list_sessions(false, u32::MAX)
+                    .await
+                    .map_err(internal)?;
+                let mut roots = Vec::new();
+                for row in rows {
+                    if row.session_entry_mode != "code" || row.project_root != canonical {
+                        continue;
+                    }
+                    let lifecycle = if row.archived_at_unix_ms.is_some() {
+                        proto::CodeRootLifecycleV1::Archived
+                    } else if row.ended_at_unix_ms.is_some() {
+                        proto::CodeRootLifecycleV1::Ended
+                    } else {
+                        proto::CodeRootLifecycleV1::Active
+                    };
+                    roots.push(proto::CodeRootSummaryV1 {
+                        root_id: proto::CodeRootIdV1(row.session_id),
+                        title: row.title,
+                        short_id: row.short_id.unwrap_or_default(),
+                        workspace_path: row.project_root,
+                        last_active_at_unix_ms: row.last_active_at_unix_ms,
+                        lifecycle,
+                        capture_generation: u64::try_from(row.active_model_revision)
+                            .unwrap_or_default(),
+                    });
+                }
+                crate::sync::lock_or_recover(&ctx.code_root_authority)
+                    .begin_discovery(
+                        canonical,
+                        request.logical_client_id,
+                        roots,
+                        request.limit,
+                    )
+                    .map_err(code_root_contract_error)?
+            };
+            Ok(Response::CodeRootsDiscovered(result))
+        }
+
+        Request::ReadCodeRootV1(request) => {
+            let record = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .authenticate(&request.attachment_capability)
+                .map_err(code_root_contract_error)?
+                .clone();
+            let attached = require_attached(state)?;
+            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            let root = code_root_read_snapshot(ctx, attached, record.root_id).await?;
+            Ok(Response::CodeRootRead(proto::ReadCodeRootV1Result {
+                root,
+            }))
+        }
+
+        Request::ReadCodeRootDeliveriesV1(request) => {
+            let record = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .authenticate(&request.attachment_capability)
+                .map_err(code_root_contract_error)?
+                .clone();
+            let attached = require_attached(state)?;
+            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            let mut projection = code_root_read_snapshot(ctx, attached, record.root_id).await?;
+            scrub_code_root_read(&mut projection, &attached.handle.redaction_table());
+            let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
+                ctx.db.clone(),
+            );
+            for entry in projection.history {
+                writer
+                    .write_history(record.root_id, entry)
+                    .await
+                    .map_err(internal)?;
+            }
+            for entry in projection.attention {
+                writer
+                    .write_attention(record.root_id, entry)
+                    .await
+                    .map_err(internal)?;
+            }
+            let rows = ctx
+                .db
+                .read_code_root_projection_deliveries(
+                    record.root_id.0,
+                    request.after.as_ref().map(|cursor| cursor.expose_opaque()),
+                    request.limit,
+                )
+                .await
+                .map_err(code_root_contract_error)?;
+            let mut high_water_cursor = request
+                .after
+                .unwrap_or_else(|| record.replay_cursor.clone());
+            let mut deliveries = Vec::with_capacity(rows.len());
+            for row in rows {
+                let cursor = proto::CodeRootReplayCursorV1::from_daemon_opaque(row.replay_cursor)
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                let payload = serde_json::from_str(&row.payload_json).map_err(internal)?;
+                high_water_cursor = cursor.clone();
+                deliveries.push(proto::CodeRootDeliveryV1 {
+                    delivery_id: row.delivery_id,
+                    cursor,
+                    payload,
+                    created_at_unix_ms: row.created_at_unix_ms,
+                });
+            }
+            Ok(Response::CodeRootDeliveries(
+                proto::ReadCodeRootDeliveriesV1Result {
+                    deliveries,
+                    high_water_cursor,
+                },
+            ))
+        }
+
+        Request::AckCodeRootDeliveriesV1(request) => {
+            let record = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .authenticate(&request.attachment_capability)
+                .map_err(code_root_contract_error)?
+                .clone();
+            if let Some(result) = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .replay_ack(&record.logical_client_id, &request)
+                .map_err(code_root_contract_error)?
+            {
+                return Ok(Response::CodeRootDeliveriesAcked(result));
+            }
+            crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .preflight_idempotency()
+                .map_err(code_root_contract_error)?;
+            ctx.db
+                .acknowledge_code_root_projection(
+                    record.root_id.0,
+                    record.logical_client_id.as_str(),
+                    request.through.expose_opaque(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(code_root_contract_error)?;
+            let result = proto::AckCodeRootDeliveriesV1Result {
+                acked_through: request.through.clone(),
+            };
+            crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .record_ack(&record.logical_client_id, &request, result.clone())
+                .map_err(code_root_contract_error)?;
+            Ok(Response::CodeRootDeliveriesAcked(result))
+        }
+
+        Request::ResolveCodeRootInterruptV1(request) => {
+            let record = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .authenticate(&request.attachment_capability)
+                .map_err(code_root_contract_error)?
+                .clone();
+            let attached = require_attached(state)?;
+            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            let attention_id = Uuid::parse_str(request.attention_id.as_str()).map_err(|_| {
+                ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "Code-root attention id is invalid".into(),
+                }
+            })?;
+            let decision_request_id = ctx
+                .db
+                .decision_attention_page(record.root_id.0, None, 256)
+                .await
+                .map_err(internal)?
+                .entries
+                .into_iter()
+                .find(|entry| entry.attention_id == attention_id)
+                .map(|entry| entry.decision.decision_request_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "Code-root attention is no longer available".into(),
+                })?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            attached
+                .handle
+                .send_work(SessionWork::ResolveAgentDecision {
+                    decision_request_id,
+                    answer: crate::agent_tree::PublicDecisionAnswer::option(
+                        request.selected_choice.as_str().to_owned(),
+                    ),
+                    respond_to,
+                })
+                .await
+                .map_err(session_work_error)?;
+            let outcome = match response_rx.await {
+                Ok(Ok(_)) => proto::ResolveCodeRootInterruptResultV1::Accepted,
+                Ok(Err(_)) => proto::ResolveCodeRootInterruptResultV1::AlreadyResolvedOther,
+                Err(_) => proto::ResolveCodeRootInterruptResultV1::Cancelled,
+            };
+            Ok(Response::CodeRootInterruptResolved(outcome))
+        }
+
         Request::Attach {
             session_id,
             since_seq,
@@ -5655,7 +6116,7 @@ async fn handle_serialized_request_impl(
                 initial_model,
                 no_sandbox,
                 interactive,
-                session_entry_mode,
+                Some(session_entry_mode.into()),
                 model_override,
                 client_protocol_version,
                 env_snapshot,
@@ -25977,6 +26438,189 @@ pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHa
     })
 }
 
+pub(super) fn code_root_contract_error(error: anyhow::Error) -> ErrorPayload {
+    let message = error.to_string();
+    let code = if message.contains("idempotency conflict") {
+        ErrorCode::Conflict
+    } else if message.contains("capability") || message.contains("closed") {
+        ErrorCode::Authorization
+    } else if message.contains("capacity") {
+        ErrorCode::Conflict
+    } else {
+        ErrorCode::BadRequest
+    };
+    ErrorPayload { code, message }
+}
+
+async fn code_root_read_from_attached_response(
+    ctx: &DaemonContext,
+    response: Response,
+) -> std::result::Result<proto::CodeRootReadV1, ErrorPayload> {
+    let Response::Attached {
+        session_id,
+        session_entry_mode,
+        short_id,
+        project_root,
+        project_id,
+        active_agent,
+        active_agent_path,
+        foreground_target,
+        active_subagent,
+        active_model_state,
+        history,
+        paused_work,
+        repair_required,
+        daemon_version,
+        compatible,
+        env_baseline,
+        env_session,
+        env_drift,
+        env_policy_applied,
+        btw_fork,
+    } = response
+    else {
+        return Err(internal(anyhow::anyhow!(
+            "Code-root attach returned a non-attach response"
+        )));
+    };
+    if session_entry_mode != proto::SessionEntryMode::Code {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "closed Code-root route resolved a non-Code session".into(),
+        });
+    }
+    let title = ctx
+        .db
+        .get_session(session_id)
+        .await
+        .map_err(internal)?
+        .and_then(|row| row.title);
+    let attention = ctx
+        .db
+        .decision_attention_page(session_id, None, 256)
+        .await
+        .map_err(internal)?
+        .entries
+        .into_iter()
+        .map(agent_attention_wire)
+        .collect();
+    Ok(proto::CodeRootReadV1 {
+        root_id: proto::CodeRootIdV1(session_id),
+        workspace_path: project_root,
+        title,
+        short_id,
+        project_id,
+        active_agent,
+        active_agent_path,
+        foreground_target,
+        active_subagent,
+        active_model_state,
+        history,
+        paused_work,
+        repair_required,
+        daemon_version,
+        compatible,
+        env_baseline,
+        env_session,
+        env_drift,
+        env_policy_applied,
+        btw_fork,
+        attention,
+    })
+}
+
+async fn code_root_read_snapshot(
+    ctx: &DaemonContext,
+    attached: &AttachedSession,
+    root_id: proto::CodeRootIdV1,
+) -> std::result::Result<proto::CodeRootReadV1, ErrorPayload> {
+    let handle = &attached.handle;
+    let row = ctx
+        .db
+        .get_session(root_id.0)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown Code root {}", root_id.0),
+        })?;
+    if row.session_entry_mode != "code" {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "Code-root capability resolved a non-Code session".into(),
+        });
+    }
+    let extended = handle.config_snapshot().extended;
+    let foreground = handle.foreground_snapshot();
+    let active_subagent = foreground.active_subagent.clone();
+    let history = ctx
+        .db
+        .read(move |conn| {
+            let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
+                conn, root_id.0, &extended,
+            );
+            crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
+                conn,
+                root_id.0,
+                &root_agent,
+                active_subagent.as_ref(),
+            )
+        })
+        .await
+        .map_err(internal)?;
+    let attention = ctx
+        .db
+        .decision_attention_page(root_id.0, None, 256)
+        .await
+        .map_err(internal)?
+        .entries
+        .into_iter()
+        .map(agent_attention_wire)
+        .collect();
+    let paused_work = ctx
+        .db
+        .paused_session_work(root_id.0)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(paused_work_to_proto)
+        .collect();
+    let active_agent = foreground
+        .active_agent_path
+        .last()
+        .cloned()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| handle.active_agent_name.clone());
+    Ok(proto::CodeRootReadV1 {
+        root_id,
+        workspace_path: row.project_root,
+        title: row.title,
+        short_id: row.short_id.unwrap_or_default(),
+        project_id: row.project_id,
+        active_agent,
+        active_agent_path: foreground.active_agent_path,
+        foreground_target: Some(foreground.foreground_target),
+        active_subagent: foreground.active_subagent,
+        active_model_state: handle.authoritative_active_model_state(),
+        history,
+        paused_work,
+        repair_required: handle.repair_required().map(Box::new),
+        daemon_version: proto::DAEMON_VERSION.to_string(),
+        compatible: true,
+        env_baseline: None,
+        env_session: None,
+        env_drift: None,
+        env_policy_applied: EnvDriftPolicy::Daemon,
+        btw_fork: ctx
+            .db
+            .live_btw_fork_info(root_id.0)
+            .await
+            .map_err(internal)?
+            .map(btw_info_to_proto),
+        attention,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn attach(
     state: &mut MutableClientState,
@@ -26303,6 +26947,7 @@ pub(super) async fn attach(
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
         handle,
+        code_root_capability: None,
         workspace_identity: Some(workspace_identity),
         _interactive_guard: interactive_guard,
     });

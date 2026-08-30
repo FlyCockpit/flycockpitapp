@@ -1998,6 +1998,57 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn first_party_session_attach_request(
+    session_id: Option<Uuid>,
+    project_root: String,
+    initial_model: Option<cockpit_config::providers::ActiveModelRef>,
+    no_sandbox: bool,
+    entry_mode: proto::SessionEntryMode,
+    model_override: Option<cockpit_config::providers::ActiveModelRef>,
+    client_protocol_version: u32,
+    env_snapshot: Option<proto::EnvSnapshotWire>,
+) -> Request {
+    if entry_mode == proto::SessionEntryMode::Code {
+        return match session_id {
+            Some(session_id) => proto::attach_existing_code_root_v1_request(
+                session_id,
+                initial_model,
+                no_sandbox,
+                true,
+                model_override,
+                client_protocol_version,
+                env_snapshot,
+                cockpit_proto::EnvDriftPolicy::Client,
+            ),
+            None => proto::create_code_root_v1_request(
+                project_root,
+                initial_model,
+                no_sandbox,
+                true,
+                model_override,
+                client_protocol_version,
+                env_snapshot,
+                cockpit_proto::EnvDriftPolicy::Client,
+            ),
+        };
+    }
+    Request::Attach {
+        session_id,
+        since_seq: None,
+        project_root: Some(project_root),
+        initial_model,
+        no_sandbox,
+        interactive: true,
+        session_entry_mode: proto::NonCodeSessionEntryMode::try_from(entry_mode)
+            .expect("Code handled above"),
+        model_override,
+        client_protocol_version,
+        env_snapshot,
+        env_policy: cockpit_proto::EnvDriftPolicy::Client,
+    }
+}
+
 async fn switch_session_with_attach_request<F, Fut>(
     attach_context: Arc<RwLock<AttachRequestContext>>,
     target: SessionTarget,
@@ -2017,24 +2068,21 @@ where
             since_seq,
         } => (Some(session_id), since_seq),
     };
-    let response = send_request(Request::Attach {
-        session_id: target_session_id,
-        since_seq,
-        project_root: Some(ctx.project_root.clone()),
-        initial_model: None,
-        no_sandbox: ctx.no_sandbox,
-        interactive: true,
-        session_entry_mode: target_session_id
-            .is_none()
-            .then_some(ctx.session_entry_mode),
-        model_override: None,
+    let _ = since_seq;
+    let request = first_party_session_attach_request(
+        target_session_id,
+        ctx.project_root.clone(),
+        None,
+        ctx.no_sandbox,
+        ctx.session_entry_mode,
+        None,
         client_protocol_version,
-        env_snapshot: Some(ctx.env_snapshot.clone()),
-        env_policy: cockpit_proto::EnvDriftPolicy::Client,
-    })
+        Some(ctx.env_snapshot.clone()),
+    );
+    let response = send_request(request)
     .await
     .map_err(|e| format!("attach: {e}"))?;
-    let outcome = match response {
+    let outcome = match response.map(Response::into_first_party_attached) {
         Ok(Response::Attached {
             session_id,
             short_id,
@@ -2331,26 +2379,19 @@ async fn try_spawn_inner(
             .map_err(|error| format!("daemon connect: {error}"))?;
         let project_root = cwd.to_string_lossy().into_owned();
         let (env_snapshot, _env_diagnostic) = cockpit_core::env_snapshot::capture_tui_shell_env();
-        let attached = match client
-            .request(Request::Attach {
-                session_id,
-                since_seq: None,
-                project_root: Some(project_root),
-                initial_model,
-                no_sandbox,
-                // The TUI can answer interrupts (approval / loop-guard /
-                // `question` prompts) — mark this attach interactive so
-                // the loop guard prompts here instead of auto-rejecting.
-                interactive: true,
-                session_entry_mode: requested_session_entry_mode,
-                model_override: root_model_override,
-                client_protocol_version: client.negotiated().version,
-                env_snapshot: Some(env_snapshot.to_wire()),
-                env_policy: cockpit_proto::EnvDriftPolicy::Client,
-            })
-            .await
-        {
-            Ok(Ok(response)) => response,
+        let entry_mode = requested_session_entry_mode.unwrap_or(proto::SessionEntryMode::Code);
+        let request = first_party_session_attach_request(
+            session_id,
+            project_root,
+            initial_model,
+            no_sandbox,
+            entry_mode,
+            root_model_override,
+            client.negotiated().version,
+            Some(env_snapshot.to_wire()),
+        );
+        let attached = match client.request(request).await {
+            Ok(Ok(response)) => response.into_first_party_attached(),
             Ok(Err(error)) if error.code == ErrorCode::ProtocolVersion => {
                 return Err(incompatible_protocol_chip().to_string());
             }
@@ -3841,22 +3882,20 @@ where
     F: FnOnce(Request) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<std::result::Result<Response, ErrorPayload>>>,
 {
-    let response = send_request(Request::Attach {
-        session_id: Some(session_id),
-        since_seq: current_last_applied_seq(last_applied_seq),
-        project_root: Some(attach_context.project_root.clone()),
-        initial_model: None,
-        no_sandbox: attach_context.no_sandbox,
-        interactive: true,
-        session_entry_mode: None,
-        model_override: None,
+    let _ = current_last_applied_seq(last_applied_seq);
+    let response = send_request(first_party_session_attach_request(
+        Some(session_id),
+        attach_context.project_root.clone(),
+        None,
+        attach_context.no_sandbox,
+        attach_context.session_entry_mode,
+        None,
         client_protocol_version,
-        env_snapshot: Some(attach_context.env_snapshot.clone()),
-        env_policy: cockpit_proto::EnvDriftPolicy::Client,
-    })
+        Some(attach_context.env_snapshot.clone()),
+    ))
     .await
     .map_err(ReconnectAttachError::Retriable)?;
-    attach_payload_from_response(response)
+    attach_payload_from_response(response.map(Response::into_first_party_attached))
 }
 
 fn attach_payload_from_response(

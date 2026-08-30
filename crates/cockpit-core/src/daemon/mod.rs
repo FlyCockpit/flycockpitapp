@@ -31,6 +31,7 @@ pub mod bulk_staging;
 pub mod bulk_upload;
 pub mod caffeinate;
 pub mod client;
+pub mod code_roots;
 pub(crate) mod config_publication_recovery;
 pub(crate) mod config_refresh;
 pub mod config_source;

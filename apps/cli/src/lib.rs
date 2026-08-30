@@ -35,7 +35,7 @@ pub(crate) mod daemon {
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
             OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, ensure_persistent_daemon,
-            run_one_shot_daemon, run_owned_daemon,
+            acquire_acp_socket_daemon, run_one_shot_daemon, run_owned_daemon,
         };
     }
     #[cfg(test)]
@@ -237,24 +237,34 @@ pub mod integration {
             since_seq: Option<i64>,
             interactive: bool,
         ) -> Result<AttachedSession> {
+            let request = match session_id {
+                Some(session_id) => crate::daemon::proto::attach_existing_code_root_v1_request(
+                    session_id,
+                    None,
+                    false,
+                    interactive,
+                    None,
+                    self.inner.negotiated().version,
+                    None,
+                    crate::env_snapshot::EnvDriftPolicy::default(),
+                ),
+                None => crate::daemon::proto::create_code_root_v1_request(
+                    project_root.display().to_string(),
+                    None,
+                    false,
+                    interactive,
+                    None,
+                    self.inner.negotiated().version,
+                    None,
+                    crate::env_snapshot::EnvDriftPolicy::default(),
+                ),
+            };
+            let _ = since_seq;
             match self
                 .inner
-                .request_ok(crate::daemon::proto::Request::Attach {
-                    session_id,
-                    since_seq,
-                    project_root: Some(project_root.display().to_string()),
-                    initial_model: None,
-                    no_sandbox: false,
-                    interactive,
-                    session_entry_mode: session_id
-                        .is_none()
-                        .then_some(crate::daemon::proto::SessionEntryMode::Code),
-                    model_override: None,
-                    client_protocol_version: self.inner.negotiated().version,
-                    env_snapshot: None,
-                    env_policy: crate::env_snapshot::EnvDriftPolicy::default(),
-                })
+                .request_ok(request)
                 .await?
+                .into_first_party_attached()
             {
                 crate::daemon::proto::Response::Attached {
                     session_id,

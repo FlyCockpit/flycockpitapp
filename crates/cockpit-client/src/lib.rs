@@ -722,8 +722,17 @@ async fn run_io(
                             Body::Response { id, response } => {
                                 let response = *response;
                                 if let Some(tx) = pending.remove(&id) {
-                                    if let Response::Attached { session_id, .. } = &response {
-                                        attached_session = Some(*session_id);
+                                    match &response {
+                                        Response::Attached { session_id, .. } => {
+                                            attached_session = Some(*session_id);
+                                        }
+                                        Response::CodeRootCreated(result) => {
+                                            attached_session = Some(result.root.root_id.0);
+                                        }
+                                        Response::CodeRootAttached(result) => {
+                                            attached_session = Some(result.root.root_id.0);
+                                        }
+                                        _ => {}
                                     }
                                     let _ = tx.send(Ok(response));
                                 } else if is_nil_daemon_status_hello(id, &response) {

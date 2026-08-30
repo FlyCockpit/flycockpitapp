@@ -44,6 +44,7 @@ pub use acp::{
     DiscoverCodeRootsV1Result, OpaqueAsciiId128V1, ReadCodeRootDeliveriesV1Request,
     ReadCodeRootDeliveriesV1Result, ReadCodeRootV1Request, ReadCodeRootV1Result,
     ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+    attach_existing_code_root_v1_request, create_code_root_v1_request,
 };
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -587,6 +588,36 @@ pub enum SessionEntryMode {
     Code,
     Assistant,
     Computer,
+}
+
+/// Closed discriminator for the legacy generic attachment surface. Code is
+/// intentionally unrepresentable; Code roots use the named v1 routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonCodeSessionEntryMode {
+    Assistant,
+    Computer,
+}
+
+impl From<NonCodeSessionEntryMode> for SessionEntryMode {
+    fn from(value: NonCodeSessionEntryMode) -> Self {
+        match value {
+            NonCodeSessionEntryMode::Assistant => Self::Assistant,
+            NonCodeSessionEntryMode::Computer => Self::Computer,
+        }
+    }
+}
+
+impl TryFrom<SessionEntryMode> for NonCodeSessionEntryMode {
+    type Error = &'static str;
+
+    fn try_from(value: SessionEntryMode) -> Result<Self, Self::Error> {
+        match value {
+            SessionEntryMode::Assistant => Ok(Self::Assistant),
+            SessionEntryMode::Computer => Ok(Self::Computer),
+            SessionEntryMode::Code => Err("Code roots require the closed Code-root routes"),
+        }
+    }
 }
 
 impl SessionEntryMode {
@@ -1273,12 +1304,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// daemon-owned setup inventory, and moves media preview bytes from a raw JSON
 /// number array to bounded base64. v20 and every older fixture remain frozen
 /// migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
 /// compacted v1 ships. v21 is current-only: the V2 ingress cutover and preview
 /// encoding change are an explicit breaking contract with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -4156,8 +4187,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[22];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5687,7 +5718,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -8267,13 +8298,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v21 config_refreshed fixture")
+                .expect("current v22 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -8288,14 +8319,14 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v21 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v22 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
                 "current v21 {response_name} must freeze the inclusive verification cap"

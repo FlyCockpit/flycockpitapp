@@ -1070,6 +1070,9 @@ CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_
 -- item can replace the plaintext without a rebuild dance.
 CREATE TABLE sealed_values (
     session_id TEXT NOT NULL,
+    source_key TEXT CHECK (
+        source_key IS NULL OR length(CAST(source_key AS BLOB)) BETWEEN 1 AND 128
+    ),
     value_id   TEXT NOT NULL,
     value      TEXT,
     reason     TEXT NOT NULL,
@@ -2695,6 +2698,9 @@ CREATE TABLE code_root_projection_deliveries (
         AND replay_cursor NOT GLOB '*[^0-9a-f]*'
     ),
     session_id TEXT NOT NULL,
+    source_key TEXT CHECK (
+        source_key IS NULL OR length(CAST(source_key AS BLOB)) BETWEEN 1 AND 128
+    ),
     kind TEXT NOT NULL CHECK (kind IN (
         'history', 'attention', 'root_state_changed', 'client_incompatible'
     )),
@@ -2710,6 +2716,9 @@ CREATE TABLE code_root_projection_deliveries (
 
 CREATE INDEX idx_code_root_projection_session_sequence
     ON code_root_projection_deliveries(session_id, sequence);
+CREATE UNIQUE INDEX uq_code_root_projection_source
+    ON code_root_projection_deliveries(session_id, kind, source_key)
+    WHERE source_key IS NOT NULL;
 
 -- Durable logical-client ACK state. The capability authenticates each live
 -- request in memory; only the bounded caller id and acknowledged projection

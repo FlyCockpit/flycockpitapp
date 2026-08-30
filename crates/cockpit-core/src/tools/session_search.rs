@@ -454,6 +454,41 @@ mod tests {
         .unwrap();
     }
 
+    fn write_trusted_provider(root: &std::path::Path) {
+        let providers = root.join(".cockpit/providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(root.join(".cockpit/config.json"), r#"{}"#).unwrap();
+        std::fs::write(
+            providers.join("local.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{
+                    "id": "local-model",
+                    "trust": "trusted",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn history_trust_follows_the_executing_context_not_session_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_trusted_provider(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
+        ctx.session
+            .set_active_model("local", "local-model")
+            .unwrap();
+
+        assert_eq!(caller_history_trust(&ctx), HistoryCallerTrust::Untrusted);
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
+        assert_eq!(caller_history_trust(&ctx), HistoryCallerTrust::Trusted);
+    }
+
     fn persist_empty_target_table(ctx: &ToolCtx, target: uuid::Uuid) {
         ctx.session
             .secret_vault()

@@ -77,6 +77,7 @@ pub use tui::{
 /// explicit provider-neutral reference so callers do not need to care whether
 /// retrieval is local today or hosted in a future deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeBaseRegistryEntry {
     pub id: String,
     pub name: String,
@@ -100,6 +101,82 @@ pub struct KnowledgeBaseRegistryEntry {
     pub trust_required: bool,
     #[serde(rename = "mergePolicy")]
     pub merge_policy: KnowledgeBaseMergePolicy,
+
+    // Workspace configuration does not get to assert a durable attachment
+    // identity. For configured KBs the identity is derived from `source`, so
+    // replacing a source cannot retain its predecessor's dream watermark.
+    // Installed assistants are host-owned attachments whose installation ID is
+    // assigned outside the workspace configuration document.
+    #[serde(skip)]
+    attachment_identity: Option<uuid::Uuid>,
+}
+
+impl KnowledgeBaseRegistryEntry {
+    pub fn new(
+        id: String,
+        name: String,
+        description: String,
+        source: KnowledgeBaseSource,
+        embedding_ownership: KnowledgeBaseEmbeddingOwnership,
+        dream_model: Option<String>,
+        dream_schedule: Option<String>,
+        trust_required: bool,
+        merge_policy: KnowledgeBaseMergePolicy,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            source,
+            embedding_ownership,
+            dream_model,
+            dream_schedule,
+            trust_required,
+            merge_policy,
+            attachment_identity: None,
+        }
+    }
+
+    /// Return the identity used to scope durable dream state.
+    ///
+    /// A host-owned installer, or the local attachment resolver, may bind a
+    /// concrete identity. Unbound workspace entries use a deterministic
+    /// provisional source identity so configuration validation can identify
+    /// duplicates before a local source is resolved. Durable consumers must
+    /// resolve local sources before using that provisional identity.
+    pub fn attachment_id(&self) -> uuid::Uuid {
+        self.attachment_identity
+            .unwrap_or_else(|| source_attachment_identity(&self.source))
+    }
+
+    /// Bind a concrete attachment identity assigned by its owning resolver.
+    ///
+    /// This is deliberately not serializable: a workspace configuration cannot
+    /// retain or assert this identity.
+    pub fn with_bound_attachment_identity(mut self, attachment_id: uuid::Uuid) -> Self {
+        self.attachment_identity = Some(attachment_id);
+        self
+    }
+
+    /// Whether an installer or source resolver has bound a concrete identity.
+    pub fn has_bound_attachment_identity(&self) -> bool {
+        self.attachment_identity.is_some()
+    }
+}
+
+fn source_attachment_identity(source: &KnowledgeBaseSource) -> uuid::Uuid {
+    let mut name = b"flycockpit/knowledge-attachment/v1\0".to_vec();
+    match source {
+        KnowledgeBaseSource::Local { path } => {
+            name.extend_from_slice(b"local\0");
+            name.extend_from_slice(path.to_string_lossy().as_bytes());
+        }
+        KnowledgeBaseSource::Remote { url } => {
+            name.extend_from_slice(b"remote\0");
+            name.extend_from_slice(url.as_bytes());
+        }
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

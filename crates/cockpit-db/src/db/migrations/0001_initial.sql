@@ -3245,6 +3245,30 @@ CREATE UNIQUE INDEX session_fts_docs_one_title
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
 
+-- ---- knowledge dream ledger -------------------------------------------------
+-- Dream snapshots the project's global `session_events.seq` before it reads
+-- input, then advances this per-concrete-KB-attachment boundary only after it
+-- has durably folded every event through that sequence into the attachment.
+-- Retrieval never writes this table: it uses the exact ordering boundary to
+-- find sessions with a later event that may not have been dreamed yet.
+-- `knowledge_base_attachment_id` is a source-derived UUID (or a
+-- host-installer UUID), deliberately distinct from the user-configured,
+-- workspace-local registry `id`.
+CREATE TABLE knowledge_dream_ledger (
+    project_uuid BLOB NOT NULL CHECK (
+        typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
+        AND project_uuid <> zeroblob(16)
+    ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,
+    knowledge_base_attachment_id BLOB NOT NULL CHECK (
+        typeof(knowledge_base_attachment_id) = 'blob'
+        AND length(knowledge_base_attachment_id) = 16
+        AND knowledge_base_attachment_id <> zeroblob(16)
+    ),
+    last_dreamed_session_event_seq INTEGER NOT NULL CHECK (last_dreamed_session_event_seq >= 0),
+    updated_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_uuid, knowledge_base_attachment_id)
+);
+
 -- Event sync: `user_message` / `assistant_message` rows carry conversational
 -- text at data_json.'$.text'. `session_compacted` rows carry model-written
 -- summaries at data_json.'$.brief_text' / '$.handoff_text', or in the spilled

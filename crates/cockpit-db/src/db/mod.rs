@@ -64,6 +64,7 @@ pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;
 pub mod installation_operations;
+pub mod knowledge_dreams;
 pub mod lang;
 pub mod local_operation_receipts;
 pub mod locks;

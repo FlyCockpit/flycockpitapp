@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -63,6 +64,7 @@ const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const KNOWLEDGE_RETRIEVE_TOOL_NAME: &str = "knowledge_retrieve";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
 const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
@@ -72,7 +74,11 @@ const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
-    &[MEMORY_SEARCH_TOOL_NAME, KNOWLEDGE_DREAM_APPLY_TOOL_NAME]
+    &[
+        MEMORY_SEARCH_TOOL_NAME,
+        KNOWLEDGE_RETRIEVE_TOOL_NAME,
+        KNOWLEDGE_DREAM_APPLY_TOOL_NAME,
+    ]
 }
 
 unsafe extern "C" {
@@ -3404,6 +3410,7 @@ pub(crate) async fn attached_bundles(
     extended: &ExtendedConfig,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
     let mut seen = BTreeSet::new();
+    let mut seen_attachment_ids = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
     if let Some(assistant) = assistant_knowledge_registry_entry(session).await? {
@@ -3416,24 +3423,14 @@ pub(crate) async fn attached_bundles(
             .cloned()
             .map(workspace_knowledge_base),
     );
-    for RegistryKnowledgeBase { entry, local } in registry {
-        validate_registry_entry(&entry)?;
+    for RegistryKnowledgeBase { mut entry, local } in registry {
         if !seen.insert(entry.id.clone()) {
             bail!(
                 "knowledge base registry contains duplicate ID `{}`",
                 entry.id
             );
         }
-        if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
-            continue;
-        }
-        if entry.trust_required
-            && !crate::config::trust::runtime_policy()
-                .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
-        {
-            continue;
-        }
-        let local = local.map(|local| {
+        let mut local = local.map(|local| {
             let root = if local.root.is_absolute() {
                 local.root
             } else {
@@ -3446,12 +3443,163 @@ pub(crate) async fn attached_bundles(
                 sidecars: Some(sidecars),
             }
         });
+        // Relative local paths are interpreted against this invocation's
+        // workspace root. Workspace-local sources are then bound to the
+        // concrete directory object, not merely that path spelling. This
+        // prevents a replacement directory (or a changed symlink target) from
+        // inheriting the predecessor's dream boundary. Installer-owned entries
+        // already carry their installation identity and intentionally retain it.
+        if let Some(local) = &mut local {
+            if !entry.has_bound_attachment_identity() {
+                match local_source_attachment_identity(&local.root)? {
+                    Some((root, attachment_id)) => {
+                        // Workspace-local sidecars live beside the source and
+                        // must follow a canonicalized root. Assistant-owned
+                        // sidecars intentionally live in their private cache
+                        // and retain that separate location.
+                        if local
+                            .sidecars
+                            .as_ref()
+                            .is_some_and(|sidecars| sidecars.root() == local.root)
+                        {
+                            local.sidecars = Some(KbSidecars::in_root(&root));
+                        }
+                        local.root = root;
+                        entry = entry.with_bound_attachment_identity(attachment_id);
+                    }
+                    // An unavailable local provider cannot serve KB results.
+                    // Give it an invocation-local identity so fresh-session
+                    // retrieval never mistakes a predecessor's boundary for
+                    // proof that this absent source has been dreamed.
+                    None => entry = entry.with_bound_attachment_identity(uuid::Uuid::new_v4()),
+                }
+            }
+            entry.source = KnowledgeBaseSource::Local {
+                path: local.root.clone(),
+            };
+        }
+        validate_registry_entry(&entry)?;
+        let attachment_id = entry.attachment_id();
+        if !seen_attachment_ids.insert(attachment_id) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                attachment_id
+            );
+        }
+        if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
+            continue;
+        }
+        if entry.trust_required
+            && !crate::config::trust::runtime_policy()
+                .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
+        {
+            continue;
+        }
         let Some(provider) = provider_for(entry.clone(), local)? else {
             continue;
         };
         knowledge_bases.push(AttachedKnowledgeBase { entry, provider });
     }
     Ok(knowledge_bases)
+}
+
+/// Resolve a workspace-local KB to the filesystem object that owns it.
+///
+/// The identity includes the canonical target so symlink spelling is never the
+/// identity, a stable identity of the target directory, and a digest of the
+/// bounded Markdown snapshot the KB actually serves. A dream writer records
+/// its boundary after committing its KB output, so it binds that boundary to
+/// the resulting source snapshot. An unrelated replacement, whether it swaps
+/// the directory, changes a symlink target, or rewrites the source in place,
+/// therefore cannot inherit the predecessor's boundary. A missing root is
+/// unavailable rather than a ledger lookup candidate.
+fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid::Uuid)>> {
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("resolving local knowledge base source {}", root.display())
+            });
+        }
+    };
+    let metadata = std::fs::metadata(&root)
+        .with_context(|| format!("reading local knowledge base source {}", root.display()))?;
+    if !metadata.is_dir() {
+        bail!(
+            "local knowledge base source {} is not a directory",
+            root.display()
+        );
+    }
+
+    let mut name = b"flycockpit/knowledge-local-attachment/v2\0".to_vec();
+    append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        name.extend_from_slice(&metadata.dev().to_le_bytes());
+        name.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        name.extend_from_slice(&metadata.creation_time().to_le_bytes());
+        name.extend_from_slice(&metadata.file_attributes().to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let created = metadata
+            .created()
+            .context("reading local knowledge base source creation time")?
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("local knowledge base source creation time predates the Unix epoch")?;
+        name.extend_from_slice(&created.as_secs().to_le_bytes());
+        name.extend_from_slice(&created.subsec_nanos().to_le_bytes());
+    }
+    let mut documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+        &root,
+        MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_ENTRIES,
+        MAX_KNOWLEDGE_DEPTH,
+        MAX_KNOWLEDGE_FILE_BYTES,
+        MAX_KNOWLEDGE_TOTAL_BYTES,
+    )
+    .with_context(|| {
+        format!(
+            "snapshotting local knowledge base source {}",
+            root.display()
+        )
+    })?;
+    documents.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut source_fingerprint = Sha256::new();
+    source_fingerprint.update(b"flycockpit/knowledge-local-source/v1\0");
+    for (path, body) in documents {
+        update_attachment_identity_component(
+            &mut source_fingerprint,
+            path.to_string_lossy().as_bytes(),
+        );
+        update_attachment_identity_component(&mut source_fingerprint, body.as_bytes());
+    }
+    let source_fingerprint: [u8; 32] = source_fingerprint.finalize().into();
+    name.extend_from_slice(&source_fingerprint);
+
+    Ok(Some((
+        root,
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &name),
+    )))
+}
+
+fn append_attachment_identity_component(name: &mut Vec<u8>, component: &[u8]) {
+    name.extend_from_slice(&(component.len() as u64).to_le_bytes());
+    name.extend_from_slice(component);
+}
+
+fn update_attachment_identity_component(hasher: &mut Sha256, component: &[u8]) {
+    hasher.update((component.len() as u64).to_le_bytes());
+    hasher.update(component);
 }
 
 /// Production dream-write entry point. The daemon's dream executor supplies
@@ -3539,17 +3687,18 @@ async fn assistant_knowledge_registry_entry(
     }
     let cache_root = crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
     cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
-    let entry = KnowledgeBaseRegistryEntry {
-        id: format!("assistant-{}", config.installation_id),
-        name: format!("Assistant: {name}"),
-        description: format!("Knowledge installed with assistant `{name}`."),
-        source: KnowledgeBaseSource::Local { path: root.clone() },
-        embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-        dream_model: None,
-        dream_schedule: None,
-        trust_required: false,
-        merge_policy: KnowledgeBaseMergePolicy::Auto,
-    };
+    let entry = KnowledgeBaseRegistryEntry::new(
+        format!("assistant-{}", config.installation_id),
+        format!("Assistant: {name}"),
+        format!("Knowledge installed with assistant `{name}`."),
+        KnowledgeBaseSource::Local { path: root.clone() },
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    )
+    .with_bound_attachment_identity(config.installation_id);
     Ok(Some(RegistryKnowledgeBase {
         entry,
         local: Some(RegistryLocalKb {
@@ -3566,6 +3715,9 @@ async fn assistant_knowledge_registry_entry(
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
+    if entry.attachment_id().is_nil() {
+        bail!("knowledge base attachment IDs must not be nil");
+    }
     if entry.id.is_empty()
         || !entry
             .id
@@ -3807,6 +3959,208 @@ impl Tool for KnowledgeDreamApplyTool {
             &extended,
         )
         .await?;
+        /* Retrieval implementation is defined below beside the stable memory search surface.
+                        if bundles.is_empty() {
+                            return Ok(ToolOutput::text(
+                                "No attached knowledge bundles are available; no fresh-session subset was searched.",
+                            ));
+                        }
+
+                        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
+                        let results =
+                            match production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session)
+                                .await?
+                            {
+                                Some(embedder) => {
+                                    retrieve_from_knowledge_bases(&bundles, embedder, &args.query, limit).await?
+                                }
+                                None => Vec::new(),
+                            };
+                        let freshness = retrieve_undreamed_session_hits(&bundles, &args.query, limit, ctx).await?;
+                        Ok(ToolOutput::text(render_knowledge_retrieval(
+                            &results,
+                            &freshness,
+                            ctx.redact.as_ref(),
+                        )))
+                    }
+                }
+
+        struct FreshSessionRetrieval {
+                    hits: Vec<crate::db::session_search::SearchHit>,
+                    boundary_knowledge_bases: Vec<String>,
+                    oldest_boundary_session_event_seq: Option<i64>,
+                    missing_boundary_knowledge_bases: Vec<String>,
+                }
+
+                async fn retrieve_undreamed_session_hits(
+                    bundles: &[AttachedKnowledgeBase],
+                    query: &str,
+                    limit: usize,
+                    ctx: &ToolCtx,
+                ) -> Result<FreshSessionRetrieval> {
+                    let project_uuid = ctx
+                        .session
+                        .db
+                        .authoritative_project_uuid(&ctx.session.project_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
+                    let mut boundary_knowledge_bases = Vec::new();
+                    let mut missing_boundary_knowledge_bases = Vec::new();
+                    let mut oldest_boundary_session_event_seq = None;
+                    for bundle in bundles {
+                        match ctx
+                            .session
+                            .db
+                            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                                project_uuid,
+                                knowledge_base_attachment_id: bundle.entry.attachment_id(),
+                            })
+                            .await?
+                        {
+                            Some(boundary) => {
+                                boundary_knowledge_bases.push(bundle.entry.id.clone());
+                                oldest_boundary_session_event_seq = Some(
+                                    oldest_boundary_session_event_seq
+                                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
+                                        .unwrap_or(boundary.last_dreamed_session_event_seq),
+                                );
+                            }
+                            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
+                        }
+                    }
+
+                    // A missing ordering boundary is not evidence that history has been dreamed. On
+                    // first use (and whenever any attached KB lacks a ledger row), search the
+                    // project's matching session history conservatively instead of silently
+                    // returning no fresh results. Once every attached KB has a boundary, the
+                    // oldest exact event boundary safely bounds the shared candidate set.
+                    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
+                        match oldest_boundary_session_event_seq {
+                            // The DB predicate is strictly greater than this durable global
+                            // event sequence. A later commit receives a greater sequence even
+                            // when it shares the dream snapshot's millisecond timestamp.
+                            Some(boundary) => (Some(boundary), true),
+                            None => (None, false),
+                        }
+                    } else {
+                        (None, true)
+                    };
+                    let hits = if search_enabled {
+                        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
+                        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
+                        let hits = match after_session_event_seq {
+                            Some(boundary) => {
+                                ctx.session
+                                    .db
+                                    .search_candidates_after_session_event_seq_for_trust(
+                                        query,
+                                        Some(ctx.session.project_id.as_str()),
+                                        None,
+                                        boundary,
+                                        pool,
+                                        caller_trust,
+                                    )
+                                    .await?
+                            }
+                            None => {
+                                ctx.session
+                                    .db
+                                    .search_candidates_for_trust(
+                                        query,
+                                        Some(ctx.session.project_id.as_str()),
+                                        None,
+                                        None,
+                                        pool,
+                                        caller_trust,
+                                    )
+                                    .await?
+                            }
+                        };
+                        hits.into_iter().take(limit).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(FreshSessionRetrieval {
+                        hits,
+                        boundary_knowledge_bases,
+                        oldest_boundary_session_event_seq,
+                        missing_boundary_knowledge_bases,
+                    })
+                }
+
+                fn render_knowledge_retrieval(
+                    results: &[SearchResult],
+                    freshness: &FreshSessionRetrieval,
+                    redact: &RedactionTable,
+                ) -> String {
+                    let mut out = String::from("knowledge_retrieve results:\n");
+                    if results.is_empty() {
+                        out.push_str(
+                            "- No matching knowledge-base entries (or no embedding model is configured).\n",
+                        );
+                    } else {
+                        out.push_str("Knowledge-base citations:\n");
+                        for result in results {
+                            out.push_str("- ");
+                            out.push_str(&result.concept_id);
+                            out.push_str(" — ");
+                            out.push_str(&short_summary(&result.snippet));
+                            out.push_str(" [");
+                            out.push_str(&citation_label(result));
+                            out.push_str("]\n");
+                        }
+                    }
+
+                    if !freshness.missing_boundary_knowledge_bases.is_empty() {
+                        out.push_str(
+                            "Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
+                        );
+                        render_fresh_session_hits(&mut out, &freshness.hits);
+                    } else {
+                        match freshness.oldest_boundary_session_event_seq {
+                            Some(boundary) => {
+                                out.push_str(
+                                    "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence ",
+                                );
+                                out.push_str(&boundary.to_string());
+                                out.push_str(" for KB(s) ");
+                                out.push_str(&freshness.boundary_knowledge_bases.join(", "));
+                                out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
+                                render_fresh_session_hits(&mut out, &freshness.hits);
+                            }
+                            None => out.push_str(
+                                "Fresh-session staleness check: no eligible fresh-session boundary is available.\n",
+                            ),
+                        }
+                    }
+                    if !freshness.missing_boundary_knowledge_bases.is_empty() {
+                        out.push_str("KB(s) without a dream ordering boundary: ");
+                        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
+                        out.push_str(".\n");
+                    }
+                    redact.scrub(&out)
+                }
+
+                fn render_fresh_session_hits(out: &mut String, hits: &[crate::db::session_search::SearchHit]) {
+                    if hits.is_empty() {
+                        out.push_str("- No matching undreamed-session updates.\n");
+                    } else {
+                        out.push_str("Undreamed-session citations:\n");
+                        for hit in hits {
+                            let fallback_reference = hit.session_id.to_string();
+                            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
+                            out.push_str("- session ");
+                            out.push_str(reference);
+                            out.push_str(" — ");
+                            out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
+                            out.push_str(" — ");
+                            out.push_str(&short_summary(&hit.snippet));
+                            out.push_str(" [session ref: ");
+                            out.push_str(&hit.session_id.to_string());
+                            out.push_str("]\n");
+                        }
+            }
+        */
         let knowledge_base = bundles
             .iter()
             .find(|knowledge_base| knowledge_base.entry.id == args.knowledge_base_id)
@@ -4099,6 +4453,318 @@ fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutp
     ToolOutput::text(text)
 }
 
+/// Read-only retrieval surface used by the built-in `knowledge` specialist.
+/// It combines cited KB matches with a bounded view of sessions that may have
+/// advanced since the shared dream boundary.
+pub(crate) struct KnowledgeRetrieveTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+impl KnowledgeRetrieveTool {
+    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            allowed_knowledge_bases,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for KnowledgeRetrieveTool {
+    fn name(&self) -> &str {
+        KNOWLEDGE_RETRIEVE_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "retrieve cited knowledge-base results and bounded undreamed-session updates"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Search attached knowledge bases through their configured providers and return cited results plus a bounded, trust-filtered view of sessions newer than the recorded dream boundary."
+                .to_string(),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "retrieval query" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum cited results from each source" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: MemorySearchArgs = typed_args(args)?;
+        if args.query.trim().is_empty() {
+            return Err(invalid_input("knowledge_retrieve query must not be empty"));
+        }
+        let extended = ctx.config.extended();
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+        )
+        .await?;
+        if bundles.is_empty() {
+            return Ok(ToolOutput::text(
+                "No attached knowledge bundles are available; no fresh-session subset was searched.",
+            ));
+        }
+
+        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
+        let results =
+            match production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session)
+                .await?
+            {
+                Some(embedder) => {
+                    retrieve_from_knowledge_bases(&bundles, embedder, &args.query, limit).await?
+                }
+                None => Vec::new(),
+            };
+
+        let project_uuid = ctx
+            .session
+            .db
+            .authoritative_project_uuid(&ctx.session.project_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
+        let mut oldest_boundary = None;
+        let mut missing_boundaries = Vec::new();
+        for bundle in &bundles {
+            match ctx
+                .session
+                .db
+                .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                    project_uuid,
+                    knowledge_base_attachment_id: bundle.entry.attachment_id(),
+                })
+                .await?
+            {
+                Some(boundary) => {
+                    oldest_boundary = Some(
+                        oldest_boundary
+                            .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
+                            .unwrap_or(boundary.last_dreamed_session_event_seq),
+                    );
+                }
+                None => missing_boundaries.push(bundle.entry.id.as_str()),
+            }
+        }
+        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
+        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
+        let fresh_hits = match oldest_boundary.filter(|_| missing_boundaries.is_empty()) {
+            Some(boundary) => {
+                ctx.session
+                    .db
+                    .search_candidates_after_session_event_seq_for_trust(
+                        &args.query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        boundary,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+            None => {
+                ctx.session
+                    .db
+                    .search_candidates_for_trust(
+                        &args.query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        None,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+        };
+
+        let mut out = render_tool_results(&results, ctx.redact.as_ref());
+        if let Some(boundary) = oldest_boundary.filter(|_| missing_boundaries.is_empty()) {
+            out.push_str(&format!(
+                "Fresh-session staleness check: sessions with events after dream boundary sequence {boundary}.\n"
+            ));
+        } else {
+            out.push_str("Fresh-session staleness check: no boundary is recorded for every attached KB; matching project sessions were searched conservatively.\n");
+        }
+        if !missing_boundaries.is_empty() {
+            out.push_str("KB(s) without a dream ordering boundary: ");
+            out.push_str(&missing_boundaries.join(", "));
+            out.push_str(".\n");
+        }
+        if fresh_hits.is_empty() {
+            out.push_str("- No matching undreamed-session updates.\n");
+        } else {
+            out.push_str("Undreamed-session citations:\n");
+            for hit in fresh_hits.into_iter().take(limit) {
+                let reference = hit.short_id.as_deref().unwrap_or_default();
+                out.push_str(&format!(
+                    "- session {reference} — {} — {} [session ref: {}]\n",
+                    hit.title.as_deref().unwrap_or("(untitled)"),
+                    short_summary(&hit.snippet),
+                    hit.session_id,
+                ));
+            }
+        }
+        Ok(ToolOutput::text(ctx.redact.scrub(&out)))
+    }
+}
+
+struct FreshSessionRetrieval {
+    hits: Vec<crate::db::session_search::SearchHit>,
+    boundary_knowledge_bases: Vec<String>,
+    oldest_boundary_session_event_seq: Option<i64>,
+    missing_boundary_knowledge_bases: Vec<String>,
+}
+
+async fn retrieve_undreamed_session_hits(
+    bundles: &[AttachedKnowledgeBase],
+    query: &str,
+    limit: usize,
+    ctx: &ToolCtx,
+) -> Result<FreshSessionRetrieval> {
+    let project_uuid = ctx
+        .session
+        .db
+        .authoritative_project_uuid(&ctx.session.project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
+    let mut boundary_knowledge_bases = Vec::new();
+    let mut missing_boundary_knowledge_bases = Vec::new();
+    let mut oldest_boundary_session_event_seq = None;
+    for bundle in bundles {
+        match ctx
+            .session
+            .db
+            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                project_uuid,
+                knowledge_base_attachment_id: bundle.entry.attachment_id(),
+            })
+            .await?
+        {
+            Some(boundary) => {
+                boundary_knowledge_bases.push(bundle.entry.id.clone());
+                oldest_boundary_session_event_seq = Some(
+                    oldest_boundary_session_event_seq
+                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
+                        .unwrap_or(boundary.last_dreamed_session_event_seq),
+                );
+            }
+            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
+        }
+    }
+    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
+        match oldest_boundary_session_event_seq {
+            Some(boundary) => (Some(boundary), true),
+            None => (None, false),
+        }
+    } else {
+        (None, true)
+    };
+    let hits = if search_enabled {
+        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
+        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
+        let hits = match after_session_event_seq {
+            Some(boundary) => {
+                ctx.session
+                    .db
+                    .search_candidates_after_session_event_seq_for_trust(
+                        query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        boundary,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+            None => {
+                ctx.session
+                    .db
+                    .search_candidates_for_trust(
+                        query,
+                        Some(ctx.session.project_id.as_str()),
+                        None,
+                        None,
+                        pool,
+                        caller_trust,
+                    )
+                    .await?
+            }
+        };
+        hits.into_iter().take(limit).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(FreshSessionRetrieval {
+        hits,
+        boundary_knowledge_bases,
+        oldest_boundary_session_event_seq,
+        missing_boundary_knowledge_bases,
+    })
+}
+
+fn render_knowledge_retrieval(
+    results: &[SearchResult],
+    freshness: &FreshSessionRetrieval,
+    redact: &RedactionTable,
+) -> String {
+    let mut out = String::from("knowledge_retrieve results:\n");
+    if results.is_empty() {
+        out.push_str(
+            "- No matching knowledge-base entries (or no embedding model is configured).\n",
+        );
+    } else {
+        out.push_str("Knowledge-base citations:\n");
+        for result in results {
+            out.push_str(&format!(
+                "- {} — {} [{}]\n",
+                result.concept_id,
+                short_summary(&result.snippet),
+                citation_label(result),
+            ));
+        }
+    }
+    match freshness.oldest_boundary_session_event_seq {
+        Some(boundary) if freshness.missing_boundary_knowledge_bases.is_empty() => out.push_str(&format!(
+            "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence {boundary} for KB(s) {}.\n",
+            freshness.boundary_knowledge_bases.join(", "),
+        )),
+        _ => out.push_str("Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so matching project sessions were searched conservatively.\n"),
+    }
+    if !freshness.missing_boundary_knowledge_bases.is_empty() {
+        out.push_str("KB(s) without a dream ordering boundary: ");
+        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
+        out.push_str(".\n");
+    }
+    if freshness.hits.is_empty() {
+        out.push_str("- No matching undreamed-session updates.\n");
+    } else {
+        out.push_str("Undreamed-session citations:\n");
+        for hit in &freshness.hits {
+            out.push_str(&format!(
+                "- session {} — {} — {} [session ref: {}]\n",
+                hit.short_id.as_deref().unwrap_or_default(),
+                hit.title.as_deref().unwrap_or("(untitled)"),
+                short_summary(&hit.snippet),
+                hit.session_id,
+            ));
+        }
+    }
+    redact.scrub(&out)
+}
+
 #[derive(Debug, Deserialize)]
 struct MemorySearchArgs {
     query: String,
@@ -4300,6 +4966,316 @@ mod tests {
             0.0
         };
         vec![exact_anchor, deploy, incident]
+    }
+
+    #[test]
+    fn composite_retrieval_renders_kb_and_undreamed_session_citations() {
+        let results = vec![SearchResult {
+            knowledge_base_id: "project".to_string(),
+            knowledge_base_name: "Project knowledge".to_string(),
+            concept_id: "deploy-policy".to_string(),
+            source_path: "concepts/deploy.md".to_string(),
+            chunk_index: 0,
+            snippet: "Deploy through the green lane.".to_string(),
+            citations: Vec::new(),
+            score: 1.0,
+        }];
+        let session_id = uuid::Uuid::new_v4();
+        let freshness = FreshSessionRetrieval {
+            hits: vec![crate::db::session_search::SearchHit {
+                session_id,
+                project_id: "project".to_string(),
+                short_id: Some("ab12cd".to_string()),
+                title: Some("Recent deploy discussion".to_string()),
+                last_active_at_unix_ms: 101,
+                snippet: "The rollout is waiting for approval.".to_string(),
+                bm25: -1.0,
+            }],
+            boundary_knowledge_bases: vec!["project".to_string()],
+            oldest_boundary_session_event_seq: Some(100),
+            missing_boundary_knowledge_bases: Vec::new(),
+        };
+
+        let rendered = render_knowledge_retrieval(&results, &freshness, &RedactionTable::empty());
+        assert!(rendered.contains("concepts/deploy.md#chunk-0"));
+        assert!(rendered.contains("session ab12cd"));
+        assert!(rendered.contains(&session_id.to_string()));
+        assert!(rendered.contains("may not yet be dreamed"));
+    }
+
+    #[tokio::test]
+    async fn fresh_retrieval_includes_the_current_session_before_the_first_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "current session has the windfall launch decision" }),
+            )
+            .await
+            .unwrap();
+        let entry = project_knowledge_registry_entry();
+        let bundles = vec![AttachedKnowledgeBase {
+            provider: Arc::new(RemoteKb {
+                entry: entry.clone(),
+            }),
+            entry,
+        }];
+
+        let freshness = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            freshness.missing_boundary_knowledge_bases,
+            vec!["project".to_string()]
+        );
+        assert!(
+            freshness
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == ctx.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_retrieval_uses_the_event_sequence_boundary_not_a_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let entry = project_knowledge_registry_entry();
+        let bundles = vec![AttachedKnowledgeBase {
+            provider: Arc::new(RemoteKb {
+                entry: entry.clone(),
+            }),
+            entry,
+        }];
+        let first = ctx
+            .session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "windfall decision before dream" }),
+            )
+            .await
+            .unwrap();
+        let project_uuid = ctx
+            .session
+            .db
+            .authoritative_project_uuid(&ctx.session.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let boundary = ctx
+            .session
+            .db
+            .snapshot_knowledge_dream_boundary(project_uuid)
+            .await
+            .unwrap();
+        assert_eq!(boundary, first);
+        ctx.session
+            .db
+            .record_knowledge_dream_boundary(
+                crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+                    project_uuid,
+                    knowledge_base_attachment_id: bundles[0].entry.attachment_id(),
+                },
+                boundary,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let before_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+        assert!(before_later_event.hits.is_empty());
+
+        let later = ctx
+            .session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "post-dream activity" }),
+            )
+            .await
+            .unwrap();
+        assert!(later > boundary);
+
+        let after_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
+            .await
+            .unwrap();
+        assert!(
+            after_later_event
+                .hits
+                .iter()
+                .any(|hit| hit.session_id == ctx.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_kb_directory_at_the_same_path_does_not_reuse_the_previous_dream_boundary()
+    {
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![entry],
+            ..Default::default()
+        };
+        let original = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
+        let project_uuid = session
+            .db
+            .authoritative_project_uuid(&session.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_key = crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+            project_uuid,
+            knowledge_base_attachment_id: original.attachment_id(),
+        };
+        session
+            .db
+            .record_knowledge_dream_boundary(original_key, 100, 110)
+            .await
+            .unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        write_bundle(&root);
+        let replacement = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
+        let replacement_key = crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
+            project_uuid,
+            knowledge_base_attachment_id: replacement.attachment_id(),
+        };
+
+        assert_ne!(
+            original_key.knowledge_base_attachment_id,
+            replacement_key.knowledge_base_attachment_id
+        );
+        assert!(
+            session
+                .db
+                .knowledge_dream_boundary(replacement_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changed_local_kb_symlink_target_has_a_new_attachment_identity() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let first_target = tmp.path().join("first-knowledge");
+        let second_target = tmp.path().join("second-knowledge");
+        let link = tmp.path().join("knowledge");
+        write_bundle(&first_target);
+        write_bundle(&second_target);
+        symlink(&first_target, &link).unwrap();
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![entry],
+            ..Default::default()
+        };
+        let first = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
+
+        fs::remove_file(&link).unwrap();
+        symlink(&second_target, &link).unwrap();
+        let second = attached_bundles(&session, tmp.path(), None, &extended)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .entry;
+
+        assert_ne!(first.attachment_id(), second.attachment_id());
+    }
+
+    #[test]
+    fn rewritten_local_kb_source_has_a_new_attachment_identity() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let (_, first) = local_source_attachment_identity(tmp.path())
+            .unwrap()
+            .unwrap();
+
+        fs::write(
+            tmp.path().join("deploy.md"),
+            "---\ntype: decision\n---\n\nA replacement knowledge source.",
+        )
+        .unwrap();
+        let (_, second) = local_source_attachment_identity(tmp.path())
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn fresh_retrieval_reports_its_conservative_first_use_search() {
+        let freshness = FreshSessionRetrieval {
+            hits: Vec::new(),
+            boundary_knowledge_bases: Vec::new(),
+            oldest_boundary_session_event_seq: None,
+            missing_boundary_knowledge_bases: vec!["project".to_string()],
+        };
+
+        let rendered = render_knowledge_retrieval(&[], &freshness, &RedactionTable::empty());
+        assert!(rendered.contains("searched conservatively"));
+        assert!(rendered.contains("no session history can yet be proven dreamed"));
     }
 
     fn write_bundle(root: &Path) {
@@ -5110,19 +6086,19 @@ timestamp: 2026-08-29T12:00:00Z
         let knowledge_root = tmp.path().join("available");
         write_bundle(&knowledge_root);
         let session = test_session(tmp.path()).await;
-        let available = KnowledgeBaseRegistryEntry {
-            id: "available".to_string(),
-            name: "Available".to_string(),
-            description: "Available local knowledge".to_string(),
-            source: KnowledgeBaseSource::Local {
+        let available = KnowledgeBaseRegistryEntry::new(
+            "available".to_string(),
+            "Available".to_string(),
+            "Available local knowledge".to_string(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("available"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        };
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
         let mut missing = available.clone();
         missing.id = "missing".to_string();
         missing.name = "Missing".to_string();
@@ -5159,32 +6135,32 @@ timestamp: 2026-08-29T12:00:00Z
         let knowledge_root = tmp.path().join("available");
         write_bundle(&knowledge_root);
         let session = test_session(tmp.path()).await;
-        let available = KnowledgeBaseRegistryEntry {
-            id: "available".to_string(),
-            name: "Available".to_string(),
-            description: "Available local knowledge".to_string(),
-            source: KnowledgeBaseSource::Local {
+        let available = KnowledgeBaseRegistryEntry::new(
+            "available".to_string(),
+            "Available".to_string(),
+            "Available local knowledge".to_string(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("available"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        };
-        let remote = KnowledgeBaseRegistryEntry {
-            id: "hosted".to_string(),
-            name: "Hosted".to_string(),
-            description: "Deferred hosted knowledge".to_string(),
-            source: KnowledgeBaseSource::Remote {
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let remote = KnowledgeBaseRegistryEntry::new(
+            "hosted".to_string(),
+            "Hosted".to_string(),
+            "Deferred hosted knowledge".to_string(),
+            KnowledgeBaseSource::Remote {
                 url: "https://knowledge.example.test".to_string(),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::RemoteOwned,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        };
+            KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
         let extended = ExtendedConfig {
             knowledge_bases: vec![available, remote],
             ..Default::default()
@@ -5902,19 +6878,19 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     fn project_knowledge_registry_entry() -> KnowledgeBaseRegistryEntry {
-        KnowledgeBaseRegistryEntry {
-            id: "project".to_string(),
-            name: "Project".to_string(),
-            description: "Workspace project knowledge".to_string(),
-            source: KnowledgeBaseSource::Local {
+        KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from(".cockpit/knowledge"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: None,
-            dream_schedule: None,
-            trust_required: true,
-            merge_policy: crate::config::extended::KnowledgeBaseMergePolicy::Auto,
-        }
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            true,
+            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+        )
     }
 
     async fn test_session(root: &Path) -> Session {

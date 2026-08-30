@@ -84,6 +84,7 @@ pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
 pub(crate) const HISTORY_PROMPT: &str = include_str!("history.md");
+pub(crate) const KNOWLEDGE_PROMPT: &str = include_str!("knowledge.md");
 pub(crate) const DEEPTHINK_PROMPT: &str = include_str!("deepthink.md");
 pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
 pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
@@ -545,6 +546,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_invoke",
         "session_search",
         "session_lineage_search",
+        "knowledge_retrieve",
         "todo",
         "write",
         "edit",
@@ -698,6 +700,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             name: "session_lineage_search",
             summary: "Search the current session's compaction lineage.",
             condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "knowledge_retrieve",
+            summary: "Retrieve cited attached-KB knowledge and bounded fresh-session updates.",
+            condition: Some("knowledge retrieval subagent"),
         },
         BuiltinToolInventoryItem {
             family: "Session",
@@ -1058,6 +1066,10 @@ pub(crate) fn materialize_tool_by_name(
         "session_lineage_search" => {
             tb.with(Arc::new(tools::session_search::SessionLineageSearchTool))
         }
+        "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
+            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                .cloned(),
+        ))),
         "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
             args.swarm_depth,
             args.swarm_max_depth,
@@ -2776,7 +2788,11 @@ pub(crate) async fn unknown_agent_rejection(
 /// The bundled reachable subagent set for `Plan` plus any user-authored
 /// custom subagent (`mode` `subagent`/`all`).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
-    let mut out: Vec<String> = vec!["explore".to_string(), "history".to_string()];
+    let mut out: Vec<String> = vec![
+        "explore".to_string(),
+        "history".to_string(),
+        "knowledge".to_string(),
+    ];
     append_custom_subagents(&mut out, cwd);
     out
 }
@@ -2796,6 +2812,7 @@ fn build_subagents(
         "builder".to_string(),
         "explore".to_string(),
         "history".to_string(),
+        "knowledge".to_string(),
         "docs".to_string(),
     ];
     if computer_subagent_reachable(config, cwd) {
@@ -3365,13 +3382,13 @@ pub fn build(args: &SpawnArgs) -> Agent {
         "task",
         crate::engine::tool::ToolDescOverride {
             text: Some(
-                "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates, knowledge retrieves cited KB context); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
             verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
-                 well-scoped piece to `builder` to write/edit files, or to `explore` for \
-                 read-only investigation, with a complete standalone brief (goal, constraints, \
+                 well-scoped piece to `builder` to write/edit files, `explore` for \
+                 read-only investigation, or `knowledge` for cited KB retrieval, with a complete standalone brief (goal, constraints, \
                  exact files, what \"done\" looks like). Each `builder` task is one \
                  implementation slice, not a bundle of unrelated asks. If the user asks for a \
                  follow-up implementation iteration after `builder` returns, start a fresh \
@@ -3454,6 +3471,13 @@ pub fn explore(args: &SpawnArgs) -> Agent {
 /// compaction lineage in its own context, then returns a short report.
 pub fn history(args: &SpawnArgs) -> Agent {
     embedded_agent("history", args)
+}
+
+/// `knowledge` — read-only KB retrieval specialist. Its only explicit tool
+/// aggregates provider-backed KB citations with the dream-bounded fresh
+/// session subset; it cannot write either source.
+pub fn knowledge(args: &SpawnArgs) -> Agent {
+    embedded_agent("knowledge", args)
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It is intentionally a
@@ -4368,6 +4392,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn knowledge_agent_has_only_cited_read_only_retrieval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("knowledge", &args).unwrap();
+        let names = agent.tools.names();
+
+        assert!(names.contains(&"knowledge_retrieve"));
+        for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
+            assert!(
+                !names.contains(&forbidden),
+                "knowledge must not receive `{forbidden}`: {names:?}"
+            );
+        }
+        assert!(agent.role_prompt.contains("cited synthesis"));
+        assert!(agent.role_prompt.contains("staleness"));
+    }
+
+    #[test]
+    fn knowledge_is_reachable_from_builtin_task_surfaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        assert!(
+            build_subagents(&config, tmp.path())
+                .iter()
+                .any(|agent| agent == "knowledge"),
+            "Build-family task surfaces must expose knowledge retrieval"
+        );
+        assert!(
+            plan_subagents(tmp.path())
+                .iter()
+                .any(|agent| agent == "knowledge"),
+            "Plan task surfaces must expose knowledge retrieval"
+        );
+    }
+
+    #[test]
     fn bundled_agents_without_defer_to_orchestrator_stay_without_it() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -4412,6 +4473,7 @@ pub(crate) mod tests {
             ("builder", builder as fn(&SpawnArgs) -> Agent),
             ("explore", explore as fn(&SpawnArgs) -> Agent),
             ("history", history as fn(&SpawnArgs) -> Agent),
+            ("knowledge", knowledge as fn(&SpawnArgs) -> Agent),
         ] {
             let loaded = load(name, &args).unwrap();
             let factory_agent = factory(&args);

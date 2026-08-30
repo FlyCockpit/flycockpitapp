@@ -3307,26 +3307,12 @@ pub(crate) async fn run_turn(
     }
 
     // Tool dispatch.
-    let dream_read_scope = crate::engine::tool::dream_read_scope_for_session(session.id);
-    if active_tools.get("knowledge_dream_sources").is_some()
-        || active_tools.get("knowledge_dream_apply").is_some()
-    {
-        // A dream-capable turn has no implicit cross-session read authority.
-        // `knowledge_dream_sources` replaces this empty set with the exact
-        // attached, unledgered source set before the orchestrator delegates.
-        let mut scope = dream_read_scope
-            .write()
-            .expect("dream read scope lock poisoned");
-        if scope.is_none() {
-            *scope = Some(std::collections::BTreeSet::new());
-        }
-    }
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
         agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
-        dream_read_scope,
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
         tool_steering: agent.tool_steering,

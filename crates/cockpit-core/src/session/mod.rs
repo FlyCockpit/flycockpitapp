@@ -186,6 +186,11 @@ pub struct Session {
     /// false even when their durable row is still idle.
     freshly_created: bool,
     pub db: Db,
+    /// Ephemeral attachment consent for an in-progress knowledge dream.  This
+    /// belongs to the session rather than an individual tool dispatch because
+    /// the orchestrator and its delegated readers reconstruct their `ToolCtx`
+    /// independently between model turns.
+    dream_read_scope: Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
     /// Daemon-injected wrap-key vault. Session fork, sealed persist, and
     /// redaction-table load use this handle instead of opening a second vault.
     secret_vault: Arc<crate::secure_key::SecretVault>,
@@ -459,6 +464,13 @@ pub struct Session {
 }
 
 impl Session {
+    /// The session-owned knowledge-dream attachment-consent cell.
+    pub(crate) fn dream_read_scope(
+        &self,
+    ) -> Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>> {
+        self.dream_read_scope.clone()
+    }
+
     pub(crate) fn is_freshly_created(&self) -> bool {
         self.freshly_created
     }

@@ -13,7 +13,7 @@
 //! and trusted-model rows may contain secrets because trusted outbound redaction
 //! is a no-op; history text must only reach models as ordinary tool output.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -101,7 +101,16 @@ impl Tool for SessionSearchTool {
             .get("all_projects")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let project_id = if all_projects {
+        let dream_scope = ctx
+            .dream_read_scope
+            .read()
+            .expect("dream read scope lock poisoned")
+            .clone();
+        ensure!(
+            dream_scope.is_none() || !all_projects,
+            "session_search denied: knowledge dreams may not widen attachment-scoped recall"
+        );
+        let project_id = if dream_scope.is_some() || all_projects {
             None
         } else {
             Some(ctx.session.project_id.as_str())
@@ -122,7 +131,7 @@ impl Tool for SessionSearchTool {
         // ranking seam has room to reorder before we truncate (future
         // embedding re-ranker; identity today).
         let pool = (limit.saturating_mul(3)).clamp(limit, MAX_LIMIT * 3);
-        let hits = ctx
+        let mut hits = ctx
             .session
             .db
             .search_candidates_for_trust(
@@ -135,9 +144,18 @@ impl Tool for SessionSearchTool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
+        if let Some(scope) = dream_scope {
+            // Dream consent is attachment-based, not project-based. Search
+            // globally so attached sessions in other projects remain usable,
+            // then discard every non-attached result before it can contribute
+            // a title, snippet, or even a result count.
+            hits.retain(|hit| scope.contains(&hit.session_id));
+        }
 
         if hits.is_empty() {
-            let scope = if all_projects {
+            let scope = if dream_scope.is_some() {
+                "attached dream sources".to_string()
+            } else if all_projects {
                 "any project".to_string()
             } else {
                 format!("project `{}`", ctx.session.project_id)
@@ -208,6 +226,13 @@ impl Tool for SessionLineageSearchTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        ensure!(
+            ctx.dream_read_scope
+                .read()
+                .expect("dream read scope lock poisoned")
+                .is_none(),
+            "session_lineage_search denied: knowledge dreams may read only attached source sessions"
+        );
         ctx.session
             .db
             .fts5_available()

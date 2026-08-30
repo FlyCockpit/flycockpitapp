@@ -1798,7 +1798,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: scope,
-                    dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                    dream_read_scope: self.dream_read_scope.clone(),
                     workspace_lease: None,
                 },
             );
@@ -1852,7 +1852,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: scope,
-                    dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                    dream_read_scope: self.dream_read_scope.clone(),
                     workspace_lease: None,
                 },
             );
@@ -4041,7 +4041,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: Some(format!("{child_agent}#{}", task_call_id)),
                         write_scope: resolved_write_scope,
-                        dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                        dream_read_scope: self.dream_read_scope.clone(),
                         workspace_lease: recovered_workspace_lease.clone().map(Arc::new),
                     },
                 ),
@@ -4383,7 +4383,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: None,
                         write_scope: resolved_write_scope.clone(),
-                        dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                        dream_read_scope: self.dream_read_scope.clone(),
                         workspace_lease: resolved_workspace_lease.clone().map(std::sync::Arc::new),
                     },
                 );
@@ -4688,7 +4688,7 @@ impl Driver {
                         DelegationConfinement {
                             lock_identity: None,
                             write_scope: resolved_write_scope.clone(),
-                            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                            dream_read_scope: self.dream_read_scope.clone(),
                             workspace_lease: resolved_workspace_lease
                                 .clone()
                                 .map(std::sync::Arc::new),
@@ -4741,7 +4741,7 @@ impl Driver {
                         DelegationConfinement {
                             lock_identity: None,
                             write_scope: resolved_write_scope.clone(),
-                            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                            dream_read_scope: self.dream_read_scope.clone(),
                             workspace_lease: resolved_workspace_lease
                                 .clone()
                                 .map(std::sync::Arc::new),
@@ -6891,7 +6891,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: None,
                         write_scope: resolved_write_scope.clone(),
-                        dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                        dream_read_scope: self.dream_read_scope.clone(),
                         workspace_lease: workspace_lease.clone().map(crate::workspace_lease::share),
                     },
                 ),
@@ -7303,7 +7303,7 @@ impl Driver {
                             DelegationConfinement {
                                 lock_identity: None,
                                 write_scope: resolved_write_scope.clone(),
-                                dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                                dream_read_scope: driver.dream_read_scope.clone(),
                                 workspace_lease: None,
                             },
                         )
@@ -7444,7 +7444,7 @@ impl Driver {
                         let docs_args = crate::engine::builtin::SpawnArgs {
                             config: pinned.clone(),
                             write_scope: resolved_write_scope.clone(),
-                            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                            dream_read_scope: driver.dream_read_scope.clone(),
                             workspace_lease: workspace_lease.clone().map(Arc::new),
                             ..driver.spawn_args_delegated_in_cwd(
                                 &child_cwd.resolved,
@@ -7531,7 +7531,7 @@ impl Driver {
                                     entry.child_agent, entry.label
                                 )),
                                 write_scope: resolved_write_scope.clone(),
-                                dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                                dream_read_scope: driver.dream_read_scope.clone(),
                                 workspace_lease: workspace_lease.clone().map(Arc::new),
                             },
                         )
@@ -10273,7 +10273,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         agent_instance_id: Some(agent_instance_id),
         lock_identity: agent.name.clone(),
         write_scope: agent.write_scope.clone(),
-        dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
         tool_steering: agent.tool_steering,
@@ -12153,7 +12153,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     granted_tools,
                     lock_identity: None,
                     write_scope: resolved_write_scope.clone(),
-                    dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                    dream_read_scope: session.dream_read_scope(),
                     workspace_lease: live_lease.clone().map(Arc::new),
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
                     media_availability:
@@ -12658,7 +12658,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         granted_tools: entry.granted_tools.clone(),
                         lock_identity: None,
                         write_scope: resolved_write_scope,
-                        dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                        dream_read_scope: session.dream_read_scope(),
                         workspace_lease: live_lease.clone().map(Arc::new),
                         credential_store: session
                             .provider_credential_store(&config.providers())

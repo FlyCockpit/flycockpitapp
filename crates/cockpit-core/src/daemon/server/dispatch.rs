@@ -5771,11 +5771,10 @@ async fn handle_serialized_request_impl(
                 code: ErrorCode::BadRequest,
                 message: "project_root must identify an existing canonical workspace".to_string(),
             })?;
-            let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
-                &ctx.db, &cwd,
-            )
-            .await
-            .map_err(internal)?;
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                    .await
+                    .map_err(internal)?;
             let (providers, extended) = ctx
                 .config_source()
                 .load_effective_for_daemon(&cwd, &trust_policy)
@@ -5800,13 +5799,14 @@ async fn handle_serialized_request_impl(
                         .to_string(),
                 });
             }
-            let model = crate::knowledge::dream::resolve_dream_model(
-                knowledge_base,
-                &extended,
-                &providers,
-            )
-            .map_err(daemon_config_error)?;
-            let consumer = ctx.db.ensure_installation_identity().await.map_err(internal)?;
+            let model =
+                crate::knowledge::dream::resolve_dream_model(knowledge_base, &extended, &providers)
+                    .map_err(daemon_config_error)?;
+            let consumer = ctx
+                .db
+                .ensure_installation_identity()
+                .await
+                .map_err(internal)?;
             let undreamed_session_ids = ctx
                 .db
                 .undreamed_sessions_for_knowledge_base(&knowledge_base_id, consumer.as_hex())

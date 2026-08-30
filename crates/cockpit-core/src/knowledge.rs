@@ -4022,6 +4022,7 @@ impl Tool for KnowledgeDreamApplyTool {
         let engine = dream::DreamEngine::new(ctx.session.clone());
         let executing_model = self.executing_model.clone();
         let reader_redaction = ctx.redact.clone();
+        let dream_read_scope = ctx.dream_read_scope.clone();
         // A dispatcher timeout drops this tool future.  The provider write
         // itself is blocking and cannot be cancelled by that drop, so the
         // operation which owns the per-KB guard must outlive the caller too:
@@ -4030,6 +4031,7 @@ impl Tool for KnowledgeDreamApplyTool {
         // handle deliberately detaches this task; it keeps the guard, sink
         // transaction, and completion-ledger continuation together.
         let apply = tokio::spawn(async move {
+            let _clear_dream_scope = DreamReadScopeReset(dream_read_scope);
             engine
                 .apply_orchestrated_change_set(
                     &entry,
@@ -4039,7 +4041,7 @@ impl Tool for KnowledgeDreamApplyTool {
                     &reader_redaction,
                     change_set,
                     &sink,
-                    cancel.cancel,
+                    cancel.cancel.clone(),
                 )
                 .await
         });
@@ -4053,6 +4055,16 @@ impl Tool for KnowledgeDreamApplyTool {
 struct DreamWriteCancellation {
     cancel: CancellationToken,
     shutdown_watcher: tokio::task::JoinHandle<()>,
+}
+
+/// Clears ephemeral attachment consent when the task that owns the matching
+/// dream attempt exits, including cancellation and panic unwinds.
+struct DreamReadScopeReset(Arc<std::sync::RwLock<Option<BTreeSet<uuid::Uuid>>>>);
+
+impl Drop for DreamReadScopeReset {
+    fn drop(&mut self) {
+        *self.0.write().expect("dream read scope lock poisoned") = None;
+    }
 }
 
 impl Drop for DreamWriteCancellation {

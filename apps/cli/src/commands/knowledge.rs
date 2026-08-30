@@ -115,7 +115,9 @@ async fn dream_status(
             model,
             undreamed_session_ids,
         }),
-        other => anyhow::bail!("daemon returned unexpected response to knowledge dream status: {other:?}"),
+        other => anyhow::bail!(
+            "daemon returned unexpected response to knowledge dream status: {other:?}"
+        ),
     }
 }
 

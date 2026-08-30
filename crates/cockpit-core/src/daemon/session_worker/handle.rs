@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use super::{helpers::*, lifecycle::*, run::run_worker, *};
 
 /// Handle one or more client tasks hold to drive a session. Cheap to
@@ -1651,6 +1653,7 @@ impl SessionWorkerHandle {
             &work,
             SessionWork::ReplaceConfigSnapshot { .. }
                 | SessionWork::Cancel
+                | SessionWork::CancelAll
                 | SessionWork::Shutdown { .. }
         );
         // Reserve capacity before taking the publication read fence. Holding
@@ -2175,6 +2178,16 @@ pub struct OversizedRunInvocationAdmission {
 #[derive(Debug)]
 pub enum SessionWork {
     WakeGoal,
+    /// A daemon-scheduled, observed-hit-gated cache refresh. It is never a
+    /// user message and never advances away/resume activity.
+    KeepWarm {
+        cache_send_at_unix_millis: i64,
+        cache_send_id: Uuid,
+        after_secs: u64,
+        idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        respond_to: oneshot::Sender<std::result::Result<String, String>>,
+    },
     ProbeUserMessage {
         client_submission_id: Uuid,
         wire_fingerprint: String,
@@ -2385,10 +2398,23 @@ pub enum SessionWork {
     CancelSchedule {
         job_id: String,
     },
+    /// Cancel the foreground turn and every scheduled/background job as one
+    /// ordered worker command for the exit guard's "Stop all" choice.
+    CancelAll,
     /// Run `/prune` (snapshot dedup) on the foreground agent now.
     Prune,
     /// Run `/compact` (fresh-thread handoff) on the foreground agent.
     Compact,
+    /// Build a non-mutating away-resume offer from an exact rolling snapshot.
+    PrepareResumeCompaction {
+        idle_for_secs: u64,
+        respond_to:
+            oneshot::Sender<std::result::Result<Option<proto::ResumeCompactionOffer>, String>>,
+    },
+    /// Apply a previously offered exact rolling compaction without inference.
+    ResumeFromCompaction {
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
         text: String,
@@ -2398,7 +2424,8 @@ pub enum SessionWork {
     },
 }
 
-/// One-shot constructor: spawn the worker and return its handle.
+/// One-shot constructor: persist its initial redaction boundary, then spawn the
+/// worker and return its handle.
 ///
 /// `client_no_sandbox` is the attaching client's `--no-sandbox` flag
 /// (sandboxing part 2): `Some(true)` means the client asked for new
@@ -2442,11 +2469,11 @@ pub fn spawn(
     media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     config_snapshot: SessionConfigSnapshot,
-) -> (
+) -> Result<(
     SessionWorkerHandle,
     tokio::task::JoinHandle<()>,
     WorkerStartPermit,
-) {
+)> {
     let session_id = session.id;
     // The primary the chrome's active-agent slot opens on. Spawn is sync, so
     // it uses the session's in-memory active agent, which is hydrated from the
@@ -2520,9 +2547,9 @@ pub fn spawn(
     // approved-secret-file registration, or per-turn refresh can be in flight.
     // It happens-before every locked writer, so it can neither read a stale table
     // nor be clobbered by one.
-    if let Err(error) = session.persist_redaction_table(&redact) {
-        tracing::warn!(error = %error, %session_id, "persisting initial redaction table failed");
-    }
+    session
+        .persist_redaction_table(&redact)
+        .context("persisting initial redaction table")?;
     for origin in legacy_disk_origins
         .iter()
         .filter(|origin| !redact.has_origin(origin))
@@ -2647,7 +2674,7 @@ pub fn spawn(
         crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });
 
-    (handle, join, WorkerStartPermit(Some(start_tx)))
+    Ok((handle, join, WorkerStartPermit(Some(start_tx))))
 }
 
 /// One-shot authority that makes a newly spawned worker runnable only after

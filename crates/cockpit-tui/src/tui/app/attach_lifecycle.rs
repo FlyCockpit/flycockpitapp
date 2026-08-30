@@ -12,19 +12,15 @@ impl App {
     ///   eager loop; a poisoned `Some(Err)` from a *previous first-message*
     ///   attempt would too, so this also short-circuits then — only the
     ///   `None` state retries here.
-    /// - The "daemon not running" prompt is closed — we don't spawn a
-    ///   daemon out from under the user's choice.
-    /// - The canonical daemon probe is allowed to start. After "Start and
-    ///   connect" the just-spawned socket isn't bound for a beat; probing in
-    ///   the background lets us wait quietly and attach the instant it's up
-    ///   without blocking this tick.
+    /// - The canonical daemon probe is allowed to start. A just-spawned
+    ///   owner's socket may not be bound for a beat, so probing in the
+    ///   background lets us wait quietly and attach without blocking a tick.
     pub(super) fn ensure_session_for_display(&mut self) {
         // Evaluate the cheap struct-only gates first; the daemon probe is the
         // only costly check, so only start it when everything else already
         // permits an attach (`probe_when` is lazy for exactly this reason).
         let should_probe = should_attempt_display_attach(
             self.agent_runner.is_some(),
-            self.daemon_prompt.is_some(),
             self.daemon_connected,
             || true,
         );
@@ -65,7 +61,6 @@ impl App {
         }
         let attach = should_attempt_display_attach(
             self.agent_runner.is_some(),
-            self.daemon_prompt.is_some(),
             self.daemon_connected,
             || true,
         );
@@ -174,10 +169,22 @@ impl App {
                             )
                             .await
                         }
-                        None => {
-                            agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                        None => match requested_session_id {
+                            Some(session_id) => {
+                                agent_runner::attach_to_session(
+                                    &worker_cwd,
+                                    session_id,
+                                    no_sandbox,
+                                    lifecycle,
+                                    intent,
+                                )
                                 .await
-                        }
+                            }
+                            None => {
+                                agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                                    .await
+                            }
+                        },
                     }?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
@@ -317,6 +324,7 @@ impl App {
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
+            let resume_compaction_offer = r.resume_compaction_offer.clone();
             self.reset_display_attach_backoff();
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
@@ -364,6 +372,9 @@ impl App {
             self.refresh_guidance_estimate_from_daemon(r.endpoint.clone());
             if let Some(info) = live_btw_fork {
                 self.open_btw_pane_from_info(info, true);
+            }
+            if let Some(offer) = resume_compaction_offer {
+                self.arm_resume_compaction_confirm(offer);
             }
         }
         let refresh_skills = runner.is_ok();

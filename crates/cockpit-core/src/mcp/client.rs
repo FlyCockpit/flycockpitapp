@@ -36,6 +36,10 @@ pub struct McpConnectContext {
     credential_profile: String,
     agent_id: String,
     agent_bound: bool,
+    /// A trusted-KB policy decision captured from the live tool context. It
+    /// is checked before any configured MCP connection can initialize a
+    /// server, enumerate its tools, or issue a tools/call request.
+    host_access_denial: Option<String>,
 }
 
 impl Default for McpConnectContext {
@@ -51,6 +55,7 @@ impl Default for McpConnectContext {
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
             agent_id: String::new(),
             agent_bound: false,
+            host_access_denial: None,
         }
     }
 }
@@ -71,6 +76,9 @@ impl McpConnectContext {
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
             agent_id: ctx.agent_id.clone(),
             agent_bound: false,
+            host_access_denial: crate::knowledge::ensure_mcp_host_access(ctx)
+                .err()
+                .map(|error| error.to_string()),
         }
     }
 
@@ -100,6 +108,13 @@ impl McpConnectContext {
 
     pub(super) fn cache_agent_identity(&self, agent_bound: bool) -> Option<&str> {
         agent_bound.then_some(self.agent_id.as_str())
+    }
+
+    fn ensure_host_access(&self) -> Result<()> {
+        if let Some(message) = &self.host_access_denial {
+            bail!("{message}");
+        }
+        Ok(())
     }
 
     async fn authorize_connect(&self, name: &str, cfg: &ServerConfig) -> Result<()> {
@@ -283,6 +298,10 @@ pub async fn connect_with_context(
     cfg: &ServerConfig,
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
+    // A configured MCP server is arbitrary host code. Enforce the same
+    // trusted-KB policy before any transport can initialize it; this covers
+    // discovery/schema listing as well as the eventual tools/call request.
+    context.ensure_host_access()?;
     context.authorize_connect(name, cfg).await?;
     // Re-derive the same non-secret identity that the authorization prompt
     // bound. Every concrete transport boundary below compares this exact

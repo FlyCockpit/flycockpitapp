@@ -2186,7 +2186,11 @@ pub(crate) async fn run_turn(
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
     let media_available = active_tools.has_direct_native_media();
-    let mut tools = active_tools.definitions(agent.tool_steering);
+    // The provider sees the stable schema projection, while dispatch below
+    // keeps using `active_tools` and enforces transient availability at call
+    // time. This is the cache boundary for dynamic media, memory, and host
+    // capability probes.
+    let mut tools = active_tools.advertised_definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
@@ -2194,17 +2198,14 @@ pub(crate) async fn run_turn(
     // pre-classification stream deltas through the buffered delivery sink. The
     // SAME predicate drives both so schema advertisement and stream withholding
     // cannot drift. Computed on the pre-append tool set: a trusted or
-    // tool-disabled (empty `tools`) route is never eligible.
+    // tool-disabled (empty `tools`) route is never eligible. Its only inputs
+    // are the agent/model posture, so a change accompanies the intentional
+    // model failover or agent rebuild cache boundary, never live availability.
     let report_leak_eligible =
         crate::leak_report::route_advertises_report_leak(model.is_trusted(), &tools);
     if report_leak_eligible {
         tools.push(crate::leak_report::report_leak_tool_definition());
     }
-
-    inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history)
-        .await;
-    let active_tool_names = active_tools.names();
-    super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.
@@ -2221,28 +2222,22 @@ pub(crate) async fn run_turn(
     // prefix.
     session.note_send();
 
-    inject_initial_project_guidance(&agent.name, history, &cwd, &config, redact.clone(), tx).await;
-    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, &prompt);
-    crate::knowledge::inject_knowledge_for_turn(
-        history,
+    inject_volatile_context(
+        agent,
         &session,
+        &active_tools,
+        is_root,
+        context_usage,
+        history,
+        &prompt,
         &cwd,
+        agent.definition.as_deref(),
         &config,
-        &knowledge_query,
         redact.clone(),
+        model.is_trusted(),
+        tx,
     )
-    .await;
-
-    // Live instructions-file diff injection (prompt
-    // `instructions-file-live-diff.md`). Guidance now rides as user-role
-    // project notes rather than raw system text, so live in-place edits do the
-    // same. Gated to the session root: subagents inject their own current
-    // guidance once when their first model turn starts. The baseline advances
-    // on inject, so each distinct change is injected exactly once.
-    if is_root && let Some(message) = session.guidance_change_injection(&cwd).await {
-        inject_live_project_guidance_change(history, &cwd, &config, redact.clone(), tx, &message)
-            .await;
-    }
+    .await?;
 
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
@@ -2357,6 +2352,7 @@ pub(crate) async fn run_turn(
                     })
                 },
             });
+    let endpoint_recovery_enabled = endpoint_recovery.is_some();
 
     // Dispatch-time recording (`inference-timeout-and-failure-
     // observability.md` #4): persist the attempt's captured body BEFORE the
@@ -2421,13 +2417,18 @@ pub(crate) async fn run_turn(
     )
     .await;
 
+    // Remove root-bound metadata work from the session-wide slot before any
+    // fallible request preparation. The work remains local until the actual
+    // provider handoff seam below, so preparation or audit failures discard it
+    // with this turn instead of letting a later inference reuse a stale prefix.
+    let scheduled_metadata_work = take_scheduled_metadata_work(&session, is_root);
+
     let mut prepared_request = model.prepare_completion_request(
-        &agent.system,
-        history,
+        crate::engine::model::AgentPromptParts::new(&agent.system, history),
         &prompt,
         &tools,
         &agent.params,
-        endpoint_recovery.is_some(),
+        endpoint_recovery_enabled,
         sealed_egress.as_deref(),
     )?;
     // The immutable post-render request body for this dispatched-target attempt.
@@ -2541,6 +2542,18 @@ pub(crate) async fn run_turn(
     let display_slot =
         Some(shared_display_slot.unwrap_or_else(|| new_display_attempt_slot(&session, &config)));
 
+    // Claim the locally held metadata work at the exact foreground dispatch
+    // seam. Earlier preparation failures have already dropped it; it cannot
+    // remain queued for a later inference.
+    let metadata_work =
+        scheduled_metadata_work.and_then(|work| match session.activate_metadata_fork(work) {
+            Ok(work) => Some(work),
+            Err(error) => {
+                tracing::warn!(%error, "metadata fork: activation failed; dropping work");
+                None
+            }
+        });
+
     let completion = model
         .complete_prepared_with_pre_drain(
             prepared_request,
@@ -2615,6 +2628,45 @@ pub(crate) async fn run_turn(
             return Err(provider_error_remains_primary(e, audit_settled));
         }
     };
+
+    if let Some(work) = metadata_work {
+        // This runs only after the foreground request completed successfully.
+        // `history`, `prompt`, `tools`, system, model, and parameters are the
+        // same values that prepared that request, after all pruning and live
+        // injections. The foreground request therefore owns cache warming
+        // before the detached trailing metadata instruction can dispatch.
+        let session = session.clone();
+        let model = model.clone();
+        let system = agent.system.clone();
+        let agent_name = agent.name.clone();
+        let params = agent.params.clone();
+        let history = history.clone();
+        let prompt = prompt.clone();
+        let tools = tools.clone();
+        let cwd = cwd.to_path_buf();
+        let config = config.clone();
+        let cancel = cancel.clone();
+        let sealed_egress = sealed_egress.clone();
+        tokio::spawn(async move {
+            crate::auto_title::generate_session_metadata_fork(
+                session,
+                model,
+                system,
+                agent_name,
+                params,
+                history,
+                prompt,
+                tools,
+                endpoint_recovery_enabled,
+                work,
+                cwd,
+                config,
+                cancel,
+                sealed_egress,
+            )
+            .await;
+        });
+    }
 
     // Settle the dispatch-time record to `completed`, filling the phase-timestamp
     // columns now known (`first_token_ms` / `completed_ms`) WITHOUT touching the
@@ -2746,7 +2798,7 @@ pub(crate) async fn run_turn(
         (false, false) => format!("{channel_reasoning}\n{inline_chip}"),
     };
     if let Some(u) = usage {
-        if let Err(e) = record_usage_blocking(session.clone(), call_id, u).await {
+        if let Err(e) = record_usage_blocking(session.clone(), call_id, u, model).await {
             tracing::warn!(error = %e, "session.record_usage failed");
         }
         // Feed the round into tokenizer calibration only after the cheap
@@ -3308,9 +3360,15 @@ pub(crate) async fn run_turn(
     // Tool dispatch.
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
+        executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+        knowledge_access_trusted: agent.model.is_trusted(),
+        caller_model: Some(crate::engine::tool::CallerModel::from_model(
+            agent.model.as_ref(),
+        )),
         agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
         tool_steering: agent.tool_steering,
@@ -3367,12 +3425,7 @@ pub(crate) async fn run_turn(
             )
         },
         config: config.clone(),
-        mcp_resolver: {
-            agent
-                .mcp_resolver
-                .observe_config_generation(config.snapshot().generation);
-            agent.mcp_resolver.clone()
-        },
+        mcp_resolver: agent.mcp_resolver.clone(),
     };
 
     // ── Capability-aware turn scheduler (issue #57) ──────────────────────
@@ -3501,6 +3554,49 @@ pub(crate) async fn run_turn(
     })
 }
 
+/// Move work scheduled by the driver into the current root turn before request
+/// preparation begins. Once this returns, failure in any later preparation
+/// stage cannot leave the work in the session-global queue for another turn.
+fn take_scheduled_metadata_work(
+    session: &Session,
+    is_root: bool,
+) -> Option<crate::session::MetadataWork> {
+    is_root.then(|| session.take_metadata_fork()).flatten()
+}
+
+#[cfg(test)]
+mod metadata_fork_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn root_turn_removes_queued_metadata_before_request_preparation() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-preparation-failure"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let work = session
+            .note_user_content_for_metadata("schedule metadata before a failed request")
+            .expect("first user boundary schedules metadata");
+        session.queue_metadata_fork(work);
+
+        let held_for_this_turn = take_scheduled_metadata_work(&session, true);
+        assert!(held_for_this_turn.is_some());
+        assert!(
+            session.take_metadata_fork().is_none(),
+            "request preparation cannot leave this turn's metadata in the session queue"
+        );
+
+        // A request-preparation error drops this local work. A later root turn
+        // must not be able to claim it.
+        drop(held_for_this_turn);
+        assert!(session.take_metadata_fork().is_none());
+    }
+}
+
 #[cfg(test)]
 mod inference_audit_tests {
     use super::provider_error_remains_primary;
@@ -3520,11 +3616,24 @@ async fn inject_turn_start_system_messages(
     is_root: bool,
     context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
-) {
+) -> Result<()> {
     let active_tool_names = active_tools.names();
     let sandbox_escalate_present = active_tool_names.contains(&"escalate");
     if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
         history.push(Message::System { content: notice });
+    }
+    // Dream completion is volatile session state. Deliver it only as a
+    // root-turn history message; the stable KB snapshot in the cached system
+    // prefix is intentionally never rewritten.
+    if is_root {
+        for notice in session.knowledge_base_freshness_notices().await? {
+            if !history
+                .iter()
+                .any(|message| matches!(message, Message::System { content } if content == &notice))
+            {
+                history.push(Message::System { content: notice });
+            }
+        }
     }
     if let Some(nudge) =
         session.unnamed_session_title_nudge(active_tool_names.contains(&"mcp"), is_root)
@@ -3570,6 +3679,55 @@ async fn inject_turn_start_system_messages(
     {
         history.push(Message::System { content: nudge });
     }
+    Ok(())
+}
+
+/// Inject every host-owned, per-turn prompt addition immediately before the
+/// provider request is assembled. The time prelude is already part of the
+/// inbound user message by this point; like every message appended here, it is
+/// deliberately volatile history rather than system-preamble text.
+async fn inject_volatile_context(
+    agent: &Agent,
+    session: &Session,
+    active_tools: &ToolBox,
+    is_root: bool,
+    context_usage: crate::engine::tool::ContextUsageSnapshot,
+    history: &mut Vec<Message>,
+    prompt: &Message,
+    cwd: &std::path::Path,
+    definition: Option<&crate::agents::AgentDef>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    redact: Arc<RedactionTable>,
+    executing_model_trusted: bool,
+    tx: &mpsc::Sender<TurnEvent>,
+) -> Result<()> {
+    inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history)
+        .await?;
+    let active_tool_names = active_tools.names();
+    super::inject_available_skills_catalog(history, cwd, config, &active_tool_names);
+
+    inject_initial_project_guidance(&agent.name, history, cwd, config, redact.clone(), tx).await;
+    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, prompt);
+    crate::knowledge::inject_knowledge_for_turn(
+        history,
+        session,
+        cwd,
+        definition,
+        config,
+        &knowledge_query,
+        redact.clone(),
+        executing_model_trusted,
+    )
+    .await;
+
+    // Live instructions-file diffs and knowledge retrieval are fresh turn
+    // observations, so they stay in history. The same seam is reserved for
+    // knowledge-base freshness notices; their names/descriptions and frozen
+    // `last_dreamed_at` snapshot belong to the spawn-time stable prefix.
+    if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
+        inject_live_project_guidance_change(history, cwd, config, redact, tx, &message).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3637,6 +3795,140 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn next_root_turn_injects_later_dream_without_changing_cached_kb_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let project_root = root.path().to_string_lossy().into_owned();
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+
+        // Exercise the non-empty production completion writer: the source must
+        // remain attached until the consumed snapshot is committed.
+        db.attach_session_to_knowledge_base("team", &project_root, session.id)
+            .await
+            .unwrap();
+        db.record_knowledge_dream_completion(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            &[session.id],
+        )
+        .await
+        .unwrap();
+        let mut history = Vec::new();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await
+        .unwrap();
+
+        assert!(history.iter().any(|message| {
+            matches!(message, Message::System { content }
+                if content.contains("KB Team Notes finished a new dream at")
+                    && content.contains("newer knowledge is now available"))
+        }));
+        assert_eq!(
+            session.knowledge_base_system_prompt(),
+            prefix_before,
+            "turn-start freshness delivery must leave the cached KB prefix byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_freshness_uses_revision_when_completion_clock_does_not_advance() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let project_root = root.path().to_string_lossy().into_owned();
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+        let mut history = Vec::new();
+
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await
+        .unwrap();
+        assert!(history.iter().any(|message| {
+            matches!(message, Message::System { content }
+                if content.contains("completion revision 2"))
+        }));
+
+        db.record_knowledge_dream_manual_empty_check("team", &project_root, consumer.as_hex(), 999)
+            .await
+            .unwrap();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| matches!(message, Message::System { content } if content.contains("KB Team Notes finished a new dream at")))
+                .count(),
+            2,
+            "a backwards clock must not collapse a later completion into an earlier notice"
+        );
+        assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
+    }
+
     fn tool_call(name: &str, args: Value) -> ToolCall {
         ToolCall {
             id: rig::message::ToolCallId::new_or_mint("call-1".to_string()),
@@ -3667,7 +3959,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         let nudges: Vec<_> = history
             .iter()
@@ -3686,7 +3979,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         let nudge_count = history
             .iter()
             .filter(|message| {
@@ -3713,7 +4007,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -3741,7 +4036,8 @@ mod tests {
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
-            .await;
+            .await
+            .unwrap();
 
         let compact_nudges: Vec<_> = history
             .iter()
@@ -3761,7 +4057,8 @@ mod tests {
         );
 
         inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
-            .await;
+            .await
+            .unwrap();
         let compact_nudge_count = history
             .iter()
             .filter(|message| {
@@ -3783,7 +4080,8 @@ mod tests {
             },
             &mut inactive_history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             inactive_history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("request_compact"))
@@ -3809,7 +4107,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -3825,7 +4124,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
@@ -3850,7 +4150,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         let adverts: Vec<_> = history
             .iter()
@@ -3880,7 +4181,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -4076,9 +4378,15 @@ mod tests {
             active_tools: agent.tools.clone(),
             tool_ctx: crate::engine::tool::ToolCtx {
                 agent_id: agent.name.clone(),
+                executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+                knowledge_access_trusted: agent.model.is_trusted(),
+                caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                    agent.model.as_ref(),
+                )),
                 agent_instance_id: None,
                 lock_identity: agent.lock_identity.clone(),
                 write_scope: None,
+                dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 workspace_lease: agent.workspace_lease.clone(),
                 current_tool_call_id: None,
                 tool_steering: agent.tool_steering,
@@ -4111,12 +4419,7 @@ mod tests {
                 media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
                 ),
                 config: config.clone(),
-                mcp_resolver: {
-                    agent
-                        .mcp_resolver
-                        .observe_config_generation(config.snapshot().generation);
-                    agent.mcp_resolver.clone()
-                },
+                mcp_resolver: agent.mcp_resolver.clone(),
             },
             session,
             config,

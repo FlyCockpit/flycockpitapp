@@ -798,13 +798,16 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         cwd: ctx.cwd.clone(),
         config: pinned.clone(),
         session_short_id: ctx.session.short_id(),
+        workspace_scratch_dir: ctx.session.workspace_scratch_dir(),
         // Inherit the parent agent's identity prefix so a `spawn` → bee/scout/goal
         // worker in an assistant session keeps the SOUL/USER identity.
         assistant_identity_prefix: ctx.agent.assistant_identity_prefix.clone(),
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
+        knowledge_base_system_prefix: ctx.session.knowledge_base_system_prompt(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
-        mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().reachable_bindings()),
+        mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().admitted_entries()),
+        mcp_root_catalog: ctx.agent.mcp_resolver.root_catalog(),
         // Plan-level overrides don't apply to ad-hoc swarm fan-out.
         model_override: None,
         delegation_model: None,
@@ -829,6 +832,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
             ),
             None => ctx.agent.write_scope.clone(),
         },
+        dream_read_scope: ctx.dream_read_scope.clone(),
         workspace_lease: crate::workspace_lease::inherit_or_select_lease(
             ctx.agent.workspace_lease.as_deref(),
             None,
@@ -1239,6 +1243,7 @@ mod tests {
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact: table.clone(),
@@ -1422,6 +1427,7 @@ mod tests {
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact: table.clone(),
@@ -1563,6 +1569,7 @@ mod tests {
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         });
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact,

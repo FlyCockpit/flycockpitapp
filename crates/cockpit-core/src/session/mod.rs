@@ -24,7 +24,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -36,6 +36,7 @@ use crate::db::Db;
 use crate::db::sessions::SessionRow;
 use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
+use crate::knowledge::KnowledgeBasePromptSnapshot;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
 pub mod export;
@@ -125,6 +126,29 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Work due for the cache-reusing, same-model metadata fork. The title slots
+/// refine both fields; later slots refresh the richer description while still
+/// requiring the atomic combined metadata call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAction {
+    None,
+    TitleAndDescribe,
+    Describe,
+}
+
+/// A scheduled self-metadata pass, fenced to the exact user-content
+/// generation that made it eligible. The durable token total fences newer user
+/// content, while the durable metadata-fork generation fences cancellation,
+/// drain, and superseding fork ownership before a generated write can publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataWork {
+    pub action: MetadataAction,
+    pub expected_user_content_tokens: usize,
+    /// Assigned at the foreground dispatch seam. It is included in the
+    /// generated write's durable CAS predicate.
+    pub expected_metadata_fork_generation: i64,
+}
+
 /// Process-wide audit counter: how many times any session waived the
 /// durable-before-handoff inference journal barrier. Read by doctor / audit
 /// surfaces; never reset in production. `nextest` runs each test in its own
@@ -186,6 +210,16 @@ pub struct Session {
     /// false even when their durable row is still idle.
     freshly_created: bool,
     pub db: Db,
+    /// Ephemeral attachment consent for an in-progress knowledge dream.  This
+    /// belongs to the session rather than an individual tool dispatch because
+    /// the orchestrator and its delegated readers reconstruct their `ToolCtx`
+    /// independently between model turns.
+    dream_read_scope: Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
+    /// The per-KB dream execution fence acquired by `knowledge_dream_sources`.
+    /// It remains session-owned while the orchestrator reads and reasons, then
+    /// moves into the detached apply owner so a dispatcher timeout cannot
+    /// release it before the completion ledger is settled.
+    dream_run_fence: Arc<Mutex<DreamRunFenceState>>,
     /// Daemon-injected wrap-key vault. Session fork, sealed persist, and
     /// redaction-table load use this handle instead of opening a second vault.
     secret_vault: Arc<crate::secure_key::SecretVault>,
@@ -264,6 +298,10 @@ pub struct Session {
     /// [`Self::tmp_dir`] access; removed on [`Self::end`] and on drop.
     /// `Mutex<Option<…>>` so creation is one-shot and `end()` can take it.
     tmp_dir: Mutex<Option<PathBuf>>,
+    /// Durable per-workspace scratch, partitioned by session under the Cockpit
+    /// state directory. Unlike [`Self::tmp_dir`], this directory deliberately
+    /// survives session end and daemon restart.
+    workspace_scratch_dir: PathBuf,
     /// Per-session host executable shims under the Cockpit data dir. These
     /// are separate from [`Self::tmp_dir`] so shell PATH shims live in a
     /// stable user-data location, but they share the same end/drop cleanup.
@@ -338,6 +376,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub btw_tangent: bool,
     title: Mutex<Option<String>>,
+    description: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
     active_agent: Mutex<String>,
     /// Complete session selection, including invocation preferences that are
@@ -351,6 +390,15 @@ pub struct Session {
     redaction_table_json: Mutex<Option<String>>,
     secret_path_matcher: OnceLock<crate::secret_paths::SecretPathMatcher>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
+    /// KB identity/freshness facts bound to the active root definition and
+    /// rendered into its cached system prefix. Frozen across turns and never
+    /// rewritten after a dream completes; root replacement is the sole
+    /// rebinding boundary.
+    knowledge_base_prompt_snapshot: RwLock<Arc<KnowledgeBasePromptSnapshot>>,
+    /// Kept separately from the snapshot value because an empty attachment
+    /// set is a valid completed capture. A false value means worker startup
+    /// was interrupted before the first root-definition-bound capture.
+    knowledge_base_prompt_snapshot_captured: AtomicBool,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -378,6 +426,10 @@ pub struct Session {
     /// resumed session has already passed any previous slot and must not
     /// re-nudge it.
     title_nudge_slot_pending: AtomicU8,
+    /// One metadata pass waiting for the foreground request that owns its
+    /// cached prefix to complete.  It is consumed by that request's turn
+    /// phase, never by a later user turn.
+    pending_metadata_fork: Mutex<Option<MetadataWork>>,
     /// In-memory two-shot latch for compact self-nudges (`0`, `1`, `2`).
     /// Reset only by successful compaction; prunes deliberately do not re-arm
     /// it because ctx% can oscillate around the threshold.
@@ -397,11 +449,17 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// Wall-clock instant of the most recent inference send. Stamped by
-    /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
-    /// it to decide whether the provider's prompt-cache TTL has elapsed.
-    /// In-memory only — a resumed session re-warms naturally.
-    last_send_at: Mutex<Option<std::time::Instant>>,
+    /// The configured endpoint that reported the last real prompt-cache hit.
+    /// This is deliberately separate from `last_usage`: context chrome may use
+    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// the endpoint it is about to refresh.
+    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
+    /// Monotonic instant and durable identity of the most recent inference
+    /// send. The cache-cold predicate uses the monotonic instant, while the
+    /// daemon-scheduled keep-warm callback carries the unique identity across
+    /// its durable job boundary. In-memory only — a resumed session re-warms
+    /// naturally.
+    last_send_at: Mutex<Option<InferenceSendTime>>,
     /// User messages pinned via `/pin` (GOALS §10 / `plan.md` T6.e):
     /// must-survive content injected verbatim into the `/compact`
     /// handoff, never summarized. In pin order.
@@ -464,8 +522,270 @@ pub struct Session {
 }
 
 impl Session {
+    /// The session-owned knowledge-dream attachment-consent cell.
+    pub(crate) fn dream_read_scope(
+        &self,
+    ) -> Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>> {
+        self.dream_read_scope.clone()
+    }
+
+    /// Starts a root turn with no inherited dream attachment consent. A
+    /// daemon-installed run fence is promoted for this one internal Dream
+    /// turn. The returned guard owns cleanup for every exit path,
+    /// including a source lookup that returns empty, errors while redacting,
+    /// times out, or never reaches `knowledge_dream_apply`.
+    pub(crate) fn begin_dream_read_scope_turn(&self) -> DreamReadScopeTurn {
+        let scope = self.dream_read_scope();
+        *scope.write().expect("dream read scope lock poisoned") = None;
+        let run_fence = self.dream_run_fence.clone();
+        let mut current = run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        *current = match std::mem::replace(&mut *current, DreamRunFenceState::Vacant) {
+            DreamRunFenceState::Pending(fence) => DreamRunFenceState::Held(fence),
+            _ => DreamRunFenceState::Vacant,
+        };
+        drop(current);
+        DreamReadScopeTurn(scope, run_fence)
+    }
+
+    /// Install the daemon-owned fence before its internal Dream turn enters
+    /// the driver. A later normal root turn cannot inherit this pending state.
+    pub(crate) fn install_dream_run_fence(&self, fence: DreamRunFence) -> Result<()> {
+        let mut current = self
+            .dream_run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if !matches!(&*current, DreamRunFenceState::Vacant) {
+            anyhow::bail!("knowledge dream execution fence was already installed for this session");
+        }
+        *current = DreamRunFenceState::Pending(fence);
+        Ok(())
+    }
+
+    /// Undo a not-yet-started daemon Dream turn. Once the driver promotes the
+    /// fence to `Held`, its root-turn guard or detached apply owner is solely
+    /// responsible for release.
+    pub(crate) fn clear_pending_dream_run_fence(&self) {
+        let mut current = self
+            .dream_run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if matches!(&*current, DreamRunFenceState::Pending(_)) {
+            *current = DreamRunFenceState::Vacant;
+        }
+    }
+
+    /// Acquire the one per-root/per-KB boundary before selecting dream
+    /// sources. The fence stays held through orchestrator model work and is
+    /// transferred by [`Self::take_dream_run_fence`] to the apply owner.
+    pub(crate) async fn acquire_dream_run_fence(
+        &self,
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let key = DreamRunFenceKey::new(project_root, knowledge_base_id);
+        let state = self.dream_run_fence.clone();
+        {
+            let mut current = state
+                .lock()
+                .expect("knowledge dream run fence state poisoned");
+            match &*current {
+                DreamRunFenceState::Vacant => {
+                    *current = DreamRunFenceState::Acquiring(key.clone());
+                }
+                DreamRunFenceState::Pending(_) => {
+                    anyhow::bail!(
+                        "knowledge dream source selection started before the daemon-owned execution fence entered its root turn"
+                    );
+                }
+                DreamRunFenceState::Acquiring(existing) => {
+                    anyhow::bail!(
+                        "knowledge dream source selection is already acquiring the per-KB execution fence for `{}`",
+                        existing.knowledge_base_id
+                    );
+                }
+                DreamRunFenceState::Held(existing) if existing.key == key => return Ok(()),
+                DreamRunFenceState::Held(existing) => {
+                    anyhow::bail!(
+                        "knowledge dream turn already owns the per-KB execution fence for `{}`",
+                        existing.key.knowledge_base_id
+                    );
+                }
+            }
+        }
+        let mut acquisition = DreamRunFenceAcquisition::new(state.clone(), key.clone());
+        let lock = crate::knowledge::dream::knowledge_dream_run_lock_for_root(
+            project_root,
+            knowledge_base_id,
+        );
+        let guard = tokio::select! {
+            guard = lock.lock_owned() => guard,
+            () = cancel.cancelled() => anyhow::bail!("knowledge dream cancelled while waiting for the KB execution fence"),
+        };
+        let mut current = state
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if !matches!(&*current, DreamRunFenceState::Acquiring(existing) if *existing == key) {
+            anyhow::bail!(
+                "knowledge dream execution fence lifecycle ended before source selection"
+            );
+        }
+        *current = DreamRunFenceState::Held(DreamRunFence::new(key, guard));
+        acquisition.commit();
+        Ok(())
+    }
+
+    /// Transfer the exact source-selection fence to the task that owns the
+    /// sink transaction and completion ledger. Applying without that prior
+    /// selection boundary fails closed.
+    pub(crate) fn take_dream_run_fence(
+        &self,
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+    ) -> Result<DreamRunFence> {
+        let key = DreamRunFenceKey::new(project_root, knowledge_base_id);
+        let mut current = self
+            .dream_run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        match std::mem::replace(&mut *current, DreamRunFenceState::Vacant) {
+            DreamRunFenceState::Pending(fence) => {
+                *current = DreamRunFenceState::Pending(fence);
+                anyhow::bail!(
+                    "knowledge dream apply started before its root turn accepted the execution fence"
+                );
+            }
+            DreamRunFenceState::Held(fence) if fence.key == key => Ok(fence),
+            DreamRunFenceState::Held(fence) => {
+                let selected_knowledge_base_id = fence.key.knowledge_base_id.clone();
+                *current = DreamRunFenceState::Held(fence);
+                anyhow::bail!(
+                    "knowledge dream apply targets `{knowledge_base_id}`, but source selection owns `{}`",
+                    selected_knowledge_base_id
+                );
+            }
+            DreamRunFenceState::Acquiring(fence) => {
+                *current = DreamRunFenceState::Acquiring(fence);
+                anyhow::bail!("knowledge dream apply requires completed source selection");
+            }
+            DreamRunFenceState::Vacant => {
+                anyhow::bail!(
+                    "knowledge dream apply requires a prior source-selection execution fence"
+                );
+            }
+        }
+    }
+
     pub(crate) fn is_freshly_created(&self) -> bool {
         self.freshly_created
+    }
+}
+
+/// Root-turn ownership of ephemeral dream attachment consent. A scope is
+/// deliberately never carried into the next reusable session turn.
+pub(crate) struct DreamReadScopeTurn(
+    Arc<std::sync::RwLock<Option<std::collections::BTreeSet<Uuid>>>>,
+    Arc<Mutex<DreamRunFenceState>>,
+);
+
+impl Drop for DreamReadScopeTurn {
+    fn drop(&mut self) {
+        *self.0.write().expect("dream read scope lock poisoned") = None;
+        *self
+            .1
+            .lock()
+            .expect("knowledge dream run fence state poisoned") = DreamRunFenceState::Vacant;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DreamRunFenceKey {
+    project_root: String,
+    knowledge_base_id: String,
+}
+
+impl DreamRunFenceKey {
+    fn new(
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+    ) -> Self {
+        Self {
+            project_root: project_root.as_str().to_owned(),
+            knowledge_base_id: knowledge_base_id.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DreamRunFence {
+    key: DreamRunFenceKey,
+    _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl DreamRunFence {
+    pub(crate) async fn acquire(
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+    ) -> Self {
+        let key = DreamRunFenceKey::new(project_root, knowledge_base_id);
+        let guard = crate::knowledge::dream::knowledge_dream_run_lock_for_root(
+            project_root,
+            knowledge_base_id,
+        )
+        .lock_owned()
+        .await;
+        Self::new(key, guard)
+    }
+
+    fn new(key: DreamRunFenceKey, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self {
+            key,
+            _guard: Arc::new(guard),
+        }
+    }
+}
+
+enum DreamRunFenceState {
+    Vacant,
+    Pending(DreamRunFence),
+    Acquiring(DreamRunFenceKey),
+    Held(DreamRunFence),
+}
+
+struct DreamRunFenceAcquisition {
+    state: Arc<Mutex<DreamRunFenceState>>,
+    key: DreamRunFenceKey,
+    committed: bool,
+}
+
+impl DreamRunFenceAcquisition {
+    fn new(state: Arc<Mutex<DreamRunFenceState>>, key: DreamRunFenceKey) -> Self {
+        Self {
+            state,
+            key,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DreamRunFenceAcquisition {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut current = self
+            .state
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if matches!(&*current, DreamRunFenceState::Acquiring(existing) if *existing == self.key) {
+            *current = DreamRunFenceState::Vacant;
+        }
     }
 }
 
@@ -484,6 +804,21 @@ struct LastToolCall {
 struct LastRecoverableToolCall {
     signature: String,
     message: String,
+}
+
+/// The durable identity for exactly one inference send. Wall-clock time
+/// supplies the scheduler deadline; `send_id` prevents two sends in one
+/// millisecond from being treated as the same cache-producing request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InferenceSendIdentity {
+    pub unix_millis: i64,
+    pub send_id: Uuid,
+}
+
+#[derive(Clone, Copy)]
+struct InferenceSendTime {
+    monotonic: std::time::Instant,
+    identity: InferenceSendIdentity,
 }
 
 /// Shared test-only redaction key resolver for constructing `Session`s in unit
@@ -926,6 +1261,91 @@ impl Session {
         self.model_system_prompt_snapshot.clone()
     }
 
+    /// Stable KB block for the cached root system prompt. Its source is a
+    /// root-definition-bound snapshot, never a live registry or dream-status
+    /// read.
+    pub fn knowledge_base_system_prompt(&self) -> String {
+        self.knowledge_base_prompt_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render_system_block()
+    }
+
+    /// Whether worker startup still has to bind the initial root's KB prompt
+    /// snapshot. This is intentionally independent of `freshly_created`: a
+    /// durable row can survive an interrupted first startup before capture.
+    pub(crate) fn needs_knowledge_base_prompt_snapshot_capture(&self) -> bool {
+        !self
+            .knowledge_base_prompt_snapshot_captured
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_knowledge_base_prompt_snapshot_for_test(&mut self, raw: &str) {
+        *self
+            .knowledge_base_prompt_snapshot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Arc::new(KnowledgeBasePromptSnapshot::from_json_str(raw));
+        self.knowledge_base_prompt_snapshot_captured
+            .store(true, Ordering::Release);
+    }
+
+    /// Return one-line, per-turn freshness facts for dreams that completed
+    /// after this session began. This does not update the cached system prompt.
+    /// A failed freshness read fails the turn before model dispatch rather than
+    /// sending a turn with a potentially stale prefix and no notice.
+    ///
+    /// This deliberately does not acknowledge a notice. The caller appends a
+    /// returned message to the live turn history immediately before dispatch;
+    /// that history is the delivery record. If a turn is cancelled, times out,
+    /// or is retried before dispatch, asking again returns the same notice, so
+    /// an acknowledgement can never outlive the history that delivers it.
+    pub async fn knowledge_base_freshness_notices(&self) -> Result<Vec<String>> {
+        let snapshot = self
+            .knowledge_base_prompt_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if snapshot.entries().is_empty() {
+            return Ok(Vec::new());
+        }
+        let consumer = self
+            .db
+            .ensure_installation_identity()
+            .await
+            .context("loading installation identity for knowledge freshness")?;
+        let project_root = self.project_root.to_string_lossy().into_owned();
+        let mut fresh = Vec::new();
+        for entry in snapshot.entries() {
+            let current = self
+                .db
+                .knowledge_dream_completion(&entry.id, &project_root, consumer.as_hex())
+                .await
+                .with_context(|| format!("loading knowledge freshness for `{}`", entry.id))?;
+            let Some(current) = current else {
+                continue;
+            };
+            if current.revision > entry.dream_completion_revision {
+                fresh.push((
+                    entry.id.clone(),
+                    entry.name.clone(),
+                    current.revision,
+                    current.completed_at_unix_ms,
+                ));
+            }
+        }
+        Ok(fresh
+            .into_iter()
+            .map(|(_id, name, revision, timestamp)| {
+                format!(
+                    "KB {name} finished a new dream at {} (completion revision {revision}); newer knowledge is now available.",
+                    crate::knowledge::format_dream_timestamp(timestamp)
+                )
+            })
+            .collect())
+    }
+
     /// Record that the model successfully used the dedicated tool `tool` this
     /// session, for the defensive bash-routing nudge's self-suppression
     /// (implementation note). Only the
@@ -986,10 +1406,14 @@ impl Session {
     }
 
     /// Stamp "an inference send just happened now." Drives the cache-TTL
-    /// arm of the cache-cold predicate (GOALS §10). Called once per
+    /// arm of the cache-cold predicate (GOALS §10) and establishes the
+    /// absolute origin of a keep-warm idle window. Called once per
     /// `model.complete` round-trip.
     pub fn note_send(&self) {
-        *self.last_send_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.note_send_at(
+            std::time::Instant::now(),
+            chrono::Utc::now().timestamp_millis(),
+        );
     }
 
     /// Seconds since the last inference send, or `None` if no send has
@@ -999,7 +1423,58 @@ impl Session {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| t.monotonic.elapsed().as_secs())
+    }
+
+    /// Snapshot the latest inference send's durable identity. The timestamp
+    /// is only for the daemon job deadline; elapsed-time policy continues to
+    /// use [`Self::seconds_since_last_send`] while the session is live.
+    pub(crate) fn last_send_identity(&self) -> Option<InferenceSendIdentity> {
+        self.last_send_at.lock().unwrap().map(|t| t.identity)
+    }
+
+    /// Atomically snapshot the latest send's durable identity and monotonic
+    /// origin. Keep-warm derives its absolute execution deadline directly
+    /// from this origin, so synchronous preparation cannot extend the idle
+    /// window between sampling elapsed time and arming a timer.
+    pub(crate) fn last_send_identity_and_origin(
+        &self,
+    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
+        self.last_send_at
+            .lock()
+            .unwrap()
+            .map(|t| (t.identity, t.monotonic))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_send_at_for_test(&self, elapsed: std::time::Duration) {
+        let elapsed_millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        self.note_send_at(
+            std::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(std::time::Instant::now),
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(elapsed_millis),
+        );
+    }
+
+    /// Force a timestamp collision between two otherwise distinct sends.
+    /// This test seam proves that keep-warm fences on the send identity, not
+    /// the millisecond used to calculate its deadline.
+    #[cfg(test)]
+    pub(crate) fn note_send_with_unix_millis_for_test(&self, unix_millis: i64) {
+        self.note_send_at(std::time::Instant::now(), unix_millis);
+    }
+
+    fn note_send_at(&self, monotonic: std::time::Instant, unix_millis: i64) {
+        *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
+            monotonic,
+            identity: InferenceSendIdentity {
+                unix_millis,
+                send_id: Uuid::new_v4(),
+            },
+        });
     }
 
     /// Record a dispatched tool call's loop-guard `signature` and return
@@ -1343,23 +1818,212 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-/// Hash the project root into a 12-char hex id. Stable across symlink
-/// shifts because the input is the realpath when available.
-pub fn project_id_for(root: &Path) -> String {
+/// Derive a workspace key from the held root directory object, not a path or
+/// workspace metadata. This is a read-only observation: resolving a workspace
+/// must work on read-only and metadata-limited filesystems, and no user-owned
+/// workspace state can change the key while that directory object is live.
+pub fn project_id_for(root: &Path) -> Result<String> {
+    let canonical = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    let authority =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            &canonical,
+        )
+        .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
+    Ok(project_id_from_workspace_object(authority.identity()))
+}
+
+fn project_id_from_workspace_object(object_identity: &str) -> String {
     use sha2::{Digest, Sha256};
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let s = canon.to_string_lossy();
     let mut h = Sha256::new();
-    h.update(s.as_bytes());
+    h.update(b"cockpit-workspace-object-identity-v1\0");
+    h.update(object_identity.as_bytes());
     let out = h.finalize();
-    let mut hex = String::with_capacity(12);
-    for byte in out.iter().take(6) {
+    let mut hex = String::with_capacity(64);
+    for byte in out {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
 }
 
+/// Resolve a workspace root to the single path spelling that may be persisted
+/// in session state or published in a workspace marker.
+fn canonical_workspace_root(project_root: &Path) -> Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(project_root)
+        .with_context(|| format!("canonicalizing workspace root `{}`", project_root.display()))?;
+    anyhow::ensure!(
+        canonical_root.is_dir(),
+        "workspace root `{}` is not a directory",
+        canonical_root.display()
+    );
+    Ok(canonical_root)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WorkspaceDirMarker {
+    project_id: String,
+    canonical_root: String,
+    created_at_unix_ms: i64,
+    last_used_at_unix_ms: i64,
+}
+
+/// Per-workspace process-local serialization for marker read/modify/write.
+///
+/// The marker itself is published with a crash-atomic replacement, so readers
+/// in other processes observe either the previous complete document or the
+/// next one. The mutex preserves the timestamp and canonical-root invariant
+/// between concurrent sessions in this daemon before that publication occurs.
+static WORKSPACE_MARKER_LOCKS: OnceLock<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn workspace_marker_lock(project_id: &str) -> Arc<Mutex<()>> {
+    let locks = WORKSPACE_MARKER_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(project_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Return the durable workspace root for a known `project_id`. This is a
+/// direct path calculation; it never scans project roots or re-hashes paths.
+pub fn workspace_dir_for_project_id(project_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !project_id.is_empty()
+            && project_id.len() <= 1024
+            && project_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid workspace project id"
+    );
+    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
+        .join("workspaces")
+        .join(project_id))
+}
+
+/// Recover the canonical workspace path recorded for `project_id`, without a
+/// filesystem scan or path re-hash. A missing marker means this workspace has
+/// not yet used durable scratch on this machine.
+pub fn workspace_root_for_project_id(project_id: &str) -> Result<Option<PathBuf>> {
+    let marker_path = workspace_dir_for_project_id(project_id)?.join(".workspace.json");
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+    anyhow::ensure!(
+        marker.project_id == project_id,
+        "workspace marker project id does not match directory"
+    );
+    let canonical_root = PathBuf::from(marker.canonical_root);
+    anyhow::ensure!(
+        canonical_root.is_absolute(),
+        "workspace marker canonical root must be absolute"
+    );
+    Ok(Some(canonical_root))
+}
+
+/// Return the reverse-map details needed by daemon-owned storage maintenance.
+/// This reads only the project-id marker; it never scans candidate workspace
+/// roots or attempts to rediscover a missing mount.
+pub fn workspace_storage_details_for_project_id(
+    project_id: &str,
+) -> Result<Option<(PathBuf, i64)>> {
+    let marker_path = workspace_dir_for_project_id(project_id)?.join(".workspace.json");
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+    anyhow::ensure!(
+        marker.project_id == project_id,
+        "workspace marker project id does not match directory"
+    );
+    let canonical_root = PathBuf::from(marker.canonical_root);
+    anyhow::ensure!(
+        canonical_root.is_absolute(),
+        "workspace marker canonical root must be absolute"
+    );
+    Ok(Some((canonical_root, marker.last_used_at_unix_ms)))
+}
+
+fn workspace_scratch_dir_for_session(
+    project_id: &str,
+    project_root: &Path,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    // The marker is the authoritative project_id -> path reverse map. Never
+    // publish a caller spelling here: relative paths and inaccessible roots
+    // would make its value cwd-dependent or noncanonical on later reads.
+    // Canonicalize before creating any durable workspace state so a failed
+    // session setup cannot leave a misleading workspace directory behind.
+    let canonical_root = canonical_workspace_root(project_root)?
+        .to_string_lossy()
+        .into_owned();
+
+    let workspace_dir = workspace_dir_for_project_id(project_id)?;
+    std::fs::create_dir_all(&workspace_dir)
+        .with_context(|| format!("creating `{}`", workspace_dir.display()))?;
+
+    let marker_path = workspace_dir.join(".workspace.json");
+    let marker_lock = workspace_marker_lock(project_id);
+    let _marker_guard = marker_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Utc::now().timestamp_millis();
+    let created_at_unix_ms = match std::fs::read(&marker_path) {
+        Ok(bytes) => {
+            let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+            anyhow::ensure!(
+                marker.project_id == project_id && marker.canonical_root == canonical_root,
+                "workspace marker does not match this project identity"
+            );
+            marker.created_at_unix_ms
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => now,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker = WorkspaceDirMarker {
+        project_id: project_id.to_string(),
+        canonical_root,
+        created_at_unix_ms,
+        last_used_at_unix_ms: now,
+    };
+    let mut marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    marker_bytes.push(b'\n');
+    cockpit_host::private_fs::write_private_file(&marker_path, &marker_bytes)
+        .with_context(|| format!("atomically publishing `{}`", marker_path.display()))?;
+
+    let session_dir = workspace_scratch_path_for_session(project_id, session_id)?;
+    std::fs::create_dir_all(&session_dir)
+        .with_context(|| format!("creating `{}`", session_dir.display()))?;
+    Ok(session_dir)
+}
+
+/// Calculate a session's durable scratch path without touching the filesystem.
+/// Consumers that inspect persisted history use this rather than recreating a
+/// marker or depending on the live session object.
+pub(crate) fn workspace_scratch_path_for_session(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(workspace_dir_for_project_id(project_id)?
+        .join("sessions")
+        .join(session_id.to_string()))
+}
+
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
+const METADATA_SCHEDULE_SLOTS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 fn normalize_title_slot(value: i64) -> u8 {
     match value {
@@ -1368,13 +2032,25 @@ fn normalize_title_slot(value: i64) -> u8 {
         2 | 3 => 2,
         4..=7 => 4,
         8..=15 => 8,
-        _ => 16,
+        16..=31 => 16,
+        32..=63 => 32,
+        64..=127 => 64,
+        _ => 128,
     }
 }
 
 fn scheduled_title_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
     let slot = u8::try_from(user_turns).ok()?;
     if TITLE_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+fn scheduled_metadata_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
+    let slot = u8::try_from(user_turns).ok()?;
+    if METADATA_SCHEDULE_SLOTS.contains(&slot) && slot > last_slot {
         Some(slot)
     } else {
         None
@@ -1398,6 +2074,87 @@ mod tests {
     use super::*;
     use crate::config::providers::{ProviderEntry, ProvidersConfig, WireApi};
     use serde_json::json;
+
+    #[test]
+    fn dream_read_scope_turn_clears_on_drop() {
+        let scope = Arc::new(std::sync::RwLock::new(Some(
+            [Uuid::nil()].into_iter().collect(),
+        )));
+        let run_fence = Arc::new(Mutex::new(DreamRunFenceState::Vacant));
+        {
+            let _turn = DreamReadScopeTurn(scope.clone(), run_fence.clone());
+            assert!(scope.read().unwrap().is_some());
+        }
+        assert!(scope.read().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dream_completion_injects_freshness_without_rewriting_kb_prefix() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        *session
+            .knowledge_base_prompt_snapshot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(
+            KnowledgeBasePromptSnapshot::from_json_str(
+                r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":null}]}"#,
+            ),
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let root = root.path().to_string_lossy().into_owned();
+        db.attach_session_to_knowledge_base("team", &root, session.id)
+            .await
+            .unwrap();
+        db.record_knowledge_dream_completion("team", &root, consumer.as_hex(), &[session.id])
+            .await
+            .unwrap();
+
+        let notices = session.knowledge_base_freshness_notices().await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("KB Team Notes finished a new dream at"));
+        assert!(notices[0].contains("newer knowledge is now available"));
+        assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
+        assert_eq!(
+            session.knowledge_base_freshness_notices().await.unwrap(),
+            notices,
+            "detecting freshness must not acknowledge it before the caller records it in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_base_freshness_read_failure_is_returned() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::create_for_test(
+            db,
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"","name":"Broken","description":"bad fixture","last_dreamed_at_unix_ms":null}]}"#,
+        );
+
+        let error = session
+            .knowledge_base_freshness_notices()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("loading knowledge freshness for ``"),
+            "{error:#}"
+        );
+    }
 
     fn providers_config(
         entries: impl IntoIterator<Item = (&'static str, ProviderEntry)>,
@@ -1683,6 +2440,101 @@ mod tests {
         assert!(s2.title().is_none());
         assert!(!s2.user_renamed());
         assert!(!s2.is_freshly_created());
+    }
+
+    #[test]
+    fn resume_restores_persisted_knowledge_base_prompt_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+        let snapshot = r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#;
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET knowledge_base_prompt_snapshot_json = ?1,
+                     knowledge_base_prompt_snapshot_captured = 1
+                 WHERE session_id = ?2",
+                rusqlite::params![snapshot, session_id.to_string()],
+            )
+            .context("persisting test knowledge-base prompt snapshot")?;
+            Ok(())
+        })
+        .unwrap();
+        drop(session);
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            resumed.knowledge_base_system_prompt(),
+            "Knowledge bases (root-definition snapshot):\n- Team Notes (id: team): Shared decisions\n  Last dreamed at: 1970-01-01T00:00:01+00:00\nNewer information may live in sessions after these timestamps; search it through the retrieval subagent.\n"
+        );
+        assert!(
+            !resumed.needs_knowledge_base_prompt_snapshot_capture(),
+            "a persisted snapshot must not be recaptured on resume"
+        );
+    }
+
+    #[test]
+    fn resume_distinguishes_uncommitted_kb_capture_from_captured_empty_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+        drop(session);
+
+        let interrupted = Session::resume_for_test(
+            db.clone(),
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            interrupted.needs_knowledge_base_prompt_snapshot_capture(),
+            "a durable row before initial capture must retry root binding"
+        );
+        drop(interrupted);
+
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET knowledge_base_prompt_snapshot_json = '{\"entries\":[]}',
+                     knowledge_base_prompt_snapshot_captured = 1
+                 WHERE session_id = ?1",
+                rusqlite::params![session_id.to_string()],
+            )
+            .context("persisting captured empty knowledge-base snapshot")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !resumed.needs_knowledge_base_prompt_snapshot_capture(),
+            "a captured empty snapshot is a completed stable-prefix binding"
+        );
     }
 
     #[tokio::test]
@@ -2274,6 +3126,148 @@ mod tests {
         assert!(!dir.exists(), "tmp dir must be cleaned up on session end");
     }
 
+    #[test]
+    fn test_constructor_supports_a_synthetic_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let synthetic_root = home.path().join("fixture-workspace-that-does-not-exist");
+        let db = Db::open_in_memory().unwrap();
+
+        let session = Session::create_for_test(
+            db,
+            synthetic_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        assert_eq!(session.project_root, synthetic_root);
+        assert!(session.workspace_scratch_dir().is_dir());
+        assert_eq!(
+            workspace_root_for_project_id(&session.project_id).unwrap(),
+            None,
+            "a synthetic fixture must not publish a canonical workspace marker"
+        );
+    }
+
+    #[test]
+    fn test_constructor_resumes_a_persisted_synthetic_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let synthetic_root = home.path().join("fixture-workspace-that-does-not-exist");
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            synthetic_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+
+        assert!(session.persist_if_needed().unwrap());
+        drop(session);
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.project_root, synthetic_root);
+    }
+
+    #[test]
+    fn workspace_scratch_is_durable_and_reverse_mapped_by_project_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let project_root = home.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let supplied_root = project_root.join(".");
+        let canonical_root = std::fs::canonicalize(&project_root).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let a = Session::create_for_test(
+            db.clone(),
+            supplied_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let b = Session::create_for_test(
+            db.clone(),
+            supplied_root,
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let scratch_a = a.workspace_scratch_dir();
+        let scratch_b = b.workspace_scratch_dir();
+        assert_ne!(
+            scratch_a, scratch_b,
+            "concurrent sessions get distinct scratch dirs"
+        );
+        assert!(scratch_a.ends_with(Path::new("sessions").join(a.id.to_string())));
+        assert!(scratch_b.ends_with(Path::new("sessions").join(b.id.to_string())));
+        assert_eq!(a.project_root, canonical_root);
+        let persisted = db
+            .blocking_write_for_sync_maintenance({
+                let session_id = a.id;
+                move |conn| crate::db::Db::get_session_conn(conn, session_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.project_root,
+            canonical_root.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            workspace_root_for_project_id(&a.project_id).unwrap(),
+            Some(canonical_root)
+        );
+
+        a.end().unwrap();
+        assert!(scratch_a.exists(), "durable scratch survives session end");
+    }
+
+    #[test]
+    fn concurrent_workspace_scratch_initialization_keeps_marker_parseable() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let project_root = home.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_id = project_id_for(&project_root).unwrap();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+
+        let (first_scratch, second_scratch) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                workspace_scratch_dir_for_session(&project_id, &project_root, first_id).unwrap()
+            });
+            let second = scope.spawn(|| {
+                workspace_scratch_dir_for_session(&project_id, &project_root, second_id).unwrap()
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_ne!(first_scratch, second_scratch);
+        assert_eq!(
+            workspace_root_for_project_id(&project_id).unwrap(),
+            Some(std::fs::canonicalize(&project_root).unwrap())
+        );
+    }
+
+    #[test]
+    fn workspace_scratch_rejects_uncanonicalizable_project_root() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let missing_root = home.path().join("missing-project");
+        let error = project_id_for(&missing_root).unwrap_err();
+
+        assert!(error.to_string().contains("canonicalizing workspace root"));
+    }
+
     #[tokio::test]
     async fn host_shim_dir_is_under_data_dir() {
         let data_dir = PathBuf::from("/data/cockpit");
@@ -2615,6 +3609,28 @@ mod tests {
         // Idempotent: a second flush is a no-op (returns `false`).
         assert!(!s.persist_if_needed().unwrap());
         assert_eq!(db.list_sessions(true, 100).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_dream_session_persists_its_audit_flag() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Dream",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        session.set_deferred_dream_session().unwrap();
+        assert!(session.persist_if_needed().unwrap());
+        assert!(
+            db.get_session(session.id)
+                .await
+                .unwrap()
+                .expect("persisted dream session")
+                .is_dream_session
+        );
     }
 
     #[tokio::test]
@@ -3164,5 +4180,35 @@ mod tests {
         // Editing to v3 injects, diffed from v2.
         std::fs::write(&path, "v3\n").unwrap();
         assert!(s.guidance_change_injection(tmp.path()).await.is_some());
+    }
+
+    #[test]
+    fn replacement_workspace_at_the_same_path_gets_a_new_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        std::fs::rename(&workspace, temp.path().join("retired-workspace")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let replacement = project_id_for(&workspace).unwrap();
+
+        assert_ne!(original, replacement);
+    }
+
+    #[test]
+    fn workspace_contents_cannot_change_a_live_workspace_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        // Workspace contents are not identity input. Their modification and
+        // cleanup must not detach a live workspace from its consent state.
+        let untracked = workspace.join("repository-artifact");
+        std::fs::write(&untracked, "edited by repository tooling").unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
+        std::fs::remove_file(untracked).unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
     }
 }

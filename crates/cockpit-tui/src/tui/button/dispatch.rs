@@ -51,9 +51,6 @@ pub(crate) enum ButtonDispatch {
     QuestionAction {
         index: usize,
     },
-    DaemonPrompt {
-        index: usize,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,9 +95,6 @@ pub(crate) enum RowDispatch {
     },
     DialogRow {
         surface: DialogSurface,
-        index: usize,
-    },
-    DaemonPrompt {
         index: usize,
     },
     FooterPicker {

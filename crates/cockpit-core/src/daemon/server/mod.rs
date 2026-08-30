@@ -4733,6 +4733,7 @@ struct MutableClientState {
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
     pending_acp_catalog_composition:
         Option<crate::daemon::acp_catalog_composition::PendingAcpCatalogCompositionV1>,
+    exit_guard_reservation: Option<Arc<()>>,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -4838,6 +4839,7 @@ impl MutableClientState {
             terminal_views: HashMap::new(),
             terminal_host,
             pending_acp_catalog_composition: None,
+            exit_guard_reservation: None,
         }
     }
 

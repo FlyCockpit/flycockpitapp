@@ -1798,6 +1798,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: scope,
+                    dream_read_scope: self.dream_read_scope.clone(),
                     workspace_lease: None,
                 },
             );
@@ -1851,6 +1852,7 @@ impl Driver {
                 DelegationConfinement {
                     lock_identity: None,
                     write_scope: scope,
+                    dream_read_scope: self.dream_read_scope.clone(),
                     workspace_lease: None,
                 },
             );
@@ -4039,6 +4041,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: Some(format!("{child_agent}#{}", task_call_id)),
                         write_scope: resolved_write_scope,
+                        dream_read_scope: self.dream_read_scope.clone(),
                         workspace_lease: recovered_workspace_lease.clone().map(Arc::new),
                     },
                 ),
@@ -4380,6 +4383,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: None,
                         write_scope: resolved_write_scope.clone(),
+                        dream_read_scope: self.dream_read_scope.clone(),
                         workspace_lease: resolved_workspace_lease.clone().map(std::sync::Arc::new),
                     },
                 );
@@ -4684,6 +4688,7 @@ impl Driver {
                         DelegationConfinement {
                             lock_identity: None,
                             write_scope: resolved_write_scope.clone(),
+                            dream_read_scope: self.dream_read_scope.clone(),
                             workspace_lease: resolved_workspace_lease
                                 .clone()
                                 .map(std::sync::Arc::new),
@@ -4736,6 +4741,7 @@ impl Driver {
                         DelegationConfinement {
                             lock_identity: None,
                             write_scope: resolved_write_scope.clone(),
+                            dream_read_scope: self.dream_read_scope.clone(),
                             workspace_lease: resolved_workspace_lease
                                 .clone()
                                 .map(std::sync::Arc::new),
@@ -6885,6 +6891,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: None,
                         write_scope: resolved_write_scope.clone(),
+                        dream_read_scope: self.dream_read_scope.clone(),
                         workspace_lease: workspace_lease.clone().map(crate::workspace_lease::share),
                     },
                 ),
@@ -7296,6 +7303,7 @@ impl Driver {
                             DelegationConfinement {
                                 lock_identity: None,
                                 write_scope: resolved_write_scope.clone(),
+                                dream_read_scope: driver.dream_read_scope.clone(),
                                 workspace_lease: None,
                             },
                         )
@@ -7436,6 +7444,7 @@ impl Driver {
                         let docs_args = crate::engine::builtin::SpawnArgs {
                             config: pinned.clone(),
                             write_scope: resolved_write_scope.clone(),
+                            dream_read_scope: driver.dream_read_scope.clone(),
                             workspace_lease: workspace_lease.clone().map(Arc::new),
                             ..driver.spawn_args_delegated_in_cwd(
                                 &child_cwd.resolved,
@@ -7522,6 +7531,7 @@ impl Driver {
                                     entry.child_agent, entry.label
                                 )),
                                 write_scope: resolved_write_scope.clone(),
+                                dream_read_scope: driver.dream_read_scope.clone(),
                                 workspace_lease: workspace_lease.clone().map(Arc::new),
                             },
                         )
@@ -9558,10 +9568,13 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             cwd: child_cwd.clone(),
             config: config.clone(),
             session_short_id: session.short_id(),
+            workspace_scratch_dir: session.workspace_scratch_dir(),
             assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+            knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
             interactive: false,
-            mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().reachable_bindings()),
+            mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().admitted_entries()),
+            mcp_root_catalog: parent_agent.mcp_resolver.root_catalog(),
             model_override: None,
             delegation_model: model,
             delegated: true,
@@ -9576,6 +9589,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             granted_tools,
             lock_identity: None,
             write_scope,
+            dream_read_scope: session.dream_read_scope(),
             workspace_lease: recovered_workspace_lease.clone().map(Arc::new),
             credential_store: session.provider_credential_store(&config.providers()).ok(),
             media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
@@ -10260,9 +10274,15 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
     }
     let ctx = crate::engine::tool::ToolCtx {
         agent_id: agent.name.clone(),
+        executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+        knowledge_access_trusted: agent.model.is_trusted(),
+        caller_model: Some(crate::engine::tool::CallerModel::from_model(
+            agent.model.as_ref(),
+        )),
         agent_instance_id: Some(agent_instance_id),
         lock_identity: agent.name.clone(),
         write_scope: agent.write_scope.clone(),
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
         tool_steering: agent.tool_steering,
@@ -10298,12 +10318,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         env_overlay: agent.env_overlay.clone(),
         config: config.clone(),
-        mcp_resolver: {
-            agent
-                .mcp_resolver
-                .observe_config_generation(config.snapshot().generation);
-            agent.mcp_resolver.clone()
-        },
+        mcp_resolver: agent.mcp_resolver.clone(),
     };
     let call = crate::engine::message::ToolCall {
         id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -12123,10 +12138,13 @@ pub(crate) async fn run_noninteractive_resumable(
                     cwd: child_cwd.clone(),
                     config: config.clone(),
                     session_short_id: session.short_id(),
+                    workspace_scratch_dir: session.workspace_scratch_dir(),
                     assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+                    knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
                     interactive: false,
-                    mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
+                    mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
+                    mcp_root_catalog: agent.mcp_resolver.root_catalog(),
                     model_override: None,
                     delegation_model: model,
                     delegated: true,
@@ -12142,6 +12160,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     granted_tools,
                     lock_identity: None,
                     write_scope: resolved_write_scope.clone(),
+                    dream_read_scope: session.dream_read_scope(),
                     workspace_lease: live_lease.clone().map(Arc::new),
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
                     media_availability:
@@ -12625,12 +12644,13 @@ pub(crate) async fn run_noninteractive_resumable(
                         cwd: child_cwd.clone(),
                         config: config.clone(),
                         session_short_id: session.short_id(),
+                        workspace_scratch_dir: session.workspace_scratch_dir(),
                         assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+                        knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
                         interactive: false,
-                        mcp_parent_reachable: Some(
-                            agent.mcp_resolver.catalog().reachable_bindings(),
-                        ),
+                        mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
+                        mcp_root_catalog: agent.mcp_resolver.root_catalog(),
                         model_override: None,
                         delegation_model: entry.model.clone(),
                         delegated: true,
@@ -12646,6 +12666,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         granted_tools: entry.granted_tools.clone(),
                         lock_identity: None,
                         write_scope: resolved_write_scope,
+                        dream_read_scope: session.dream_read_scope(),
                         workspace_lease: live_lease.clone().map(Arc::new),
                         credential_store: session
                             .provider_credential_store(&config.providers())

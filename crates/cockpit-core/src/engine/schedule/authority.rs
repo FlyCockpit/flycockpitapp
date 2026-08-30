@@ -61,6 +61,10 @@ pub enum ScheduleCommand {
     /// Cancel a job (loop / timer / background) by id. From the human
     /// ("stop checking the deploy", `/schedule cancel <id>`).
     Cancel { job_id: String },
+    /// Cancel every running or queued async job in this session. This is an
+    /// exit-guard operation, so it deliberately has broader scope than the
+    /// human `/schedule cancel <id>` command.
+    CancelAll,
     /// A running recursive `Swarm` child called `spawn` (GOALS
     /// §24). Per single-async-job authority a child does **not** spawn async
     /// work directly — it posts this request and main (the authority) decides:
@@ -225,6 +229,8 @@ pub struct ScheduleContext {
     /// rather than a resolved value: the coordinator is installed after the
     /// driver is built, so a snapshot taken here would always be `None`.
     pub write_scope: Option<crate::write_scope::WriteScopeSource>,
+    pub dream_read_scope:
+        std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
 }
 
 impl ScheduleContext {
@@ -818,6 +824,17 @@ impl ScheduleAuthority {
         true
     }
 
+    /// Cancel the complete live and queued async-job set. Snapshotting the
+    /// ids before removal keeps each cancellation on the same single authority
+    /// path and prevents iteration from observing its own mutation.
+    pub fn cancel_all(&mut self) {
+        self.swarm_queue.clear();
+        let job_ids = self.registry.keys().cloned().collect::<Vec<_>>();
+        for job_id in job_ids {
+            self.cancel(&job_id);
+        }
+    }
+
     /// A keep-in-context iteration finished. Advance the count; arm the
     /// next tick or terminate (limit reached).
     pub fn iteration_finished(&mut self, job_id: &str) {
@@ -867,6 +884,7 @@ impl ScheduleAuthority {
             ScheduleCommand::Cancel { job_id } => {
                 self.cancel(&job_id);
             }
+            ScheduleCommand::CancelAll => self.cancel_all(),
             // A running `Swarm` child requested a deeper spawn (GOALS §24).
             // Main is the single authority: schedule it or queue it under the
             // global cap. The pointer return is dropped here — the child
@@ -1105,6 +1123,7 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(64);
         let (turn_tx, turn_rx) = mpsc::channel(64);
         let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
             session,
             locks,
             redact,

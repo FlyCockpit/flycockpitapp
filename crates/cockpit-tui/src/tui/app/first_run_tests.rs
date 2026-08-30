@@ -52,30 +52,11 @@ fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
 }
 
 #[test]
-fn daemon_autostart_ask_shows_modal() {
-    let state = startup_daemon_state(cockpit_config::extended::DaemonAutostart::Ask);
-
-    assert!(state.prompt.is_some());
-    assert!(!state.connected);
-    assert!(!state.ephemeral_preference);
-}
-
-#[test]
-fn daemon_autostart_shared_defers_resolution_to_composition() {
-    let state = startup_daemon_state(cockpit_config::extended::DaemonAutostart::Shared);
-
-    assert!(state.prompt.is_none());
-    assert!(state.connected);
-    assert!(state.notice.is_none());
-}
-
-#[test]
 fn first_run_chains_provider_then_model() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
     write_config(tmp.path(), &config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
@@ -110,7 +91,6 @@ fn first_run_flow_completes_end_to_end() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
     write_config(tmp.path(), &config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
@@ -131,7 +111,6 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft from first run".to_string());
 
@@ -176,7 +155,6 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft message".to_string());
 
@@ -200,7 +178,6 @@ fn no_provider_send_opens_provider_setup_preserves_input() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft message".to_string());
 
@@ -213,10 +190,6 @@ fn no_provider_send_opens_provider_setup_preserves_input() {
     assert!(app.dialog.test_provider_is_add());
 }
 
-fn daemon_prompt(_tmp: &tempfile::TempDir) -> crate::tui::daemon_prompt::DaemonPromptDialog {
-    crate::tui::daemon_prompt::DaemonPromptDialog::new()
-}
-
 #[test]
 fn stacked_modal_focus_matches_render_order() {
     let tmp = tempfile::tempdir().unwrap();
@@ -227,7 +200,6 @@ fn stacked_modal_focus_matches_render_order() {
         false,
         StartupWorkspaceTrust::Pending(root),
     );
-    app.daemon_prompt = Some(daemon_prompt(&tmp));
 
     assert_eq!(
         app.startup_modal_on_top(),
@@ -256,7 +228,6 @@ async fn keypress_does_not_record_hidden_trust_decision() {
         false,
         StartupWorkspaceTrust::Pending(root.clone()),
     );
-    app.daemon_prompt = Some(daemon_prompt(&tmp));
 
     assert_eq!(
         app.startup_modal_on_top(),

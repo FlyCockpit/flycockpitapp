@@ -126,41 +126,46 @@ fn maximal_route_fixtures_hit_closed_ingress_and_identity_boundaries() {
 fn every_request_and_response_depth_rejects_unknown_fields() {
     let fixture = maximal_fixture();
     let minimal = minimal_fixture();
-    let create = &fixture["requests"]["create_max"];
-    for path in [
-        vec!["params"],
-        vec!["params", "base"],
-        vec!["params", "base", "workspace_selector"],
-        vec!["params", "ingress"],
-        vec!["params", "ingress", "declarations", "0"],
-        vec!["params", "ingress", "declarations", "0", "transport"],
+    for (name, paths) in [
+        (
+            "create_max",
+            vec![
+                vec![],
+                vec!["params"],
+                vec!["params", "base"],
+                vec!["params", "base", "workspace_selector"],
+                vec!["params", "base", "options"],
+                vec!["params", "ingress"],
+                vec!["params", "ingress", "declarations", "0"],
+                vec!["params", "ingress", "declarations", "0", "transport"],
+            ],
+        ),
+        (
+            "attach_max",
+            vec![
+                vec![],
+                vec!["params"],
+                vec!["params", "base"],
+                vec!["params", "base", "options"],
+                vec!["params", "ingress"],
+                vec!["params", "ingress", "declarations", "0"],
+                vec!["params", "ingress", "declarations", "0", "transport"],
+            ],
+        ),
+        ("close_max", vec![vec![], vec!["params"]]),
     ] {
-        let changed = if path.contains(&"0") {
-            let mut changed = create.clone();
-            let declaration = changed["params"]["ingress"]["declarations"]
-                .as_array_mut()
-                .unwrap()
-                .first_mut()
-                .unwrap();
-            let target = if path.last() == Some(&"transport") {
-                &mut declaration["transport"]
-            } else {
-                declaration
-            };
-            target
-                .as_object_mut()
-                .unwrap()
-                .insert("forbidden_extra".to_string(), json!(true));
-            changed
-        } else {
-            with_extra_at(create, &path)
-        };
-        assert!(serde_json::from_value::<Request>(changed).is_err());
+        let request = &fixture["requests"][name];
+        for path in paths {
+            assert!(
+                serde_json::from_value::<Request>(with_extra_at(request, &path)).is_err(),
+                "{name} accepted unknown field at {path:?}"
+            );
+        }
     }
 
     for name in ["create", "attach", "close_closed", "close_already_closed"] {
         let response = &minimal["responses"][name];
-        let mut paths = vec![vec!["data"]];
+        let mut paths = vec![vec![], vec!["data"]];
         if matches!(name, "create" | "attach") {
             paths.extend([
                 vec!["data", "base"],

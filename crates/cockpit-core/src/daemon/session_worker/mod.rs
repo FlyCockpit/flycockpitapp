@@ -409,14 +409,19 @@ async fn refresh_redaction_for_turn(
 ) -> bool {
     let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
-    match session.credential_store().and_then(|store| {
+    let new_table = session.credential_store().and_then(|store| {
         crate::redact::RedactionTable::build_with_env_and_credential_store(
             &cfg,
             project_root,
             env,
             &store,
         )
-    }) {
+    });
+    let new_table = match new_table {
+        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
+        Err(error) => Err(error),
+    };
+    match new_table {
         Ok(new_table) => {
             // H1: read the LATEST table, union, persist, and swap all under the
             // per-session redaction-table write lock so this refresh serializes

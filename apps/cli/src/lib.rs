@@ -35,7 +35,8 @@ pub(crate) mod daemon {
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
             OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, acquire_acp_socket_daemon,
-            ensure_persistent_daemon, run_one_shot_daemon, run_owned_daemon,
+            ensure_assistant_persistent_daemon, ensure_persistent_daemon, run_assistant_daemon,
+            run_one_shot_daemon, run_owned_daemon,
         };
     }
     #[cfg(test)]
@@ -861,6 +862,10 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
+        Some(Command::Knowledge(sub)) => commands::knowledge::run(sub).await,
+        Some(Command::Dream(args)) => {
+            commands::dream::run(args, cli.no_sandbox, cli.project.as_deref()).await
+        }
         #[cfg(feature = "extended")]
         Some(Command::Schedule(sub)) => commands::schedule::run(sub).await,
         Some(Command::Skill(sub)) => commands::skill::run(sub).await,

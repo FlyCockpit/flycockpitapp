@@ -1875,17 +1875,25 @@ fn paint_confirm_buttons_into(
 /// prefix of the full session id (defensive — short_id is always set on
 /// modern rows).
 pub fn card_description(s: &SessionSummary) -> String {
-    if let Some(t) = &s.title
+    let title = if let Some(t) = &s.title
         && !t.trim().is_empty()
     {
-        return t.clone();
-    }
-    if let Some(sid) = &s.short_id
+        t.clone()
+    } else if let Some(sid) = &s.short_id
         && !sid.is_empty()
     {
-        return sid.clone();
+        sid.clone()
+    } else {
+        short_id(&s.session_id.to_string())
+    };
+    match s
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        Some(description) => format!("{title} — {description}"),
+        None => title,
     }
-    short_id(&s.session_id.to_string())
 }
 
 /// Assemble one card's rendered rows (pure, terminal-free). A rounded
@@ -2235,6 +2243,7 @@ mod tests {
             turns: 0,
             active_agent: "builder".into(),
             title: None,
+            description: None,
             parent_session_id: None,
             fork_count: 0,
             descendant_count: 0,

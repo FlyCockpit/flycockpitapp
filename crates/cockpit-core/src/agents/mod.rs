@@ -48,7 +48,7 @@ mod vnext;
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
     BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_builtin_primary,
-    is_hidden_primary, is_removed_primary, resolve_primary,
+    is_feature_primary, is_hidden_primary, is_removed_primary, resolve_primary,
 };
 pub use invariants::validate_invariants;
 pub use profile::{
@@ -172,12 +172,42 @@ pub struct ContextPolicy {
         skip_serializing_if = "Option::is_none"
     )]
     pub inline_caps: Option<InlineCapsProfile>,
+    /// UTF-8 byte size above which a text tool result or user paste is kept
+    /// behind a `cockpit://` pseudofile instead of being retained inline.
+    #[serde(
+        rename = "artifactSpillBytes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_spill_bytes: Option<usize>,
+    /// Number of leading lines included in the immutable model-facing preview
+    /// for an artifact-backed payload.
+    #[serde(
+        rename = "artifactPreviewLines",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_preview_lines: Option<usize>,
 }
 
 impl ContextPolicy {
     /// The default auto-compact percentage (80) used when the def does not
     /// declare one.
     pub const DEFAULT_AUTO_COMPACT_PCT: u8 = 80;
+    pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize =
+        crate::db::text_artifacts::DEFAULT_ARTIFACT_SPILL_BYTES;
+    pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize =
+        crate::db::text_artifacts::DEFAULT_ARTIFACT_PREVIEW_LINES;
+
+    pub fn artifact_spill_bytes(&self) -> usize {
+        self.artifact_spill_bytes
+            .unwrap_or(Self::DEFAULT_ARTIFACT_SPILL_BYTES)
+    }
+
+    pub fn artifact_preview_lines(&self) -> usize {
+        self.artifact_preview_lines
+            .unwrap_or(Self::DEFAULT_ARTIFACT_PREVIEW_LINES)
+    }
 }
 
 /// The resolved posture of one agent node (issue #75): the single value the
@@ -665,7 +695,7 @@ fn tool_family(name: &str) -> &'static str {
         | "defer_to_orchestrator"
         | "schedule"
         | "start_build" => "coordination",
-        "session_search" | "session_read" | "session_lineage_search" | "todo" => "memory",
+        "history_search" | "knowledge_retrieve" | "todo" => "memory",
         "skill" | "skill_manage" | "mcp" => "extensions",
         "grep" | "glob" => "sandbox",
         _ => "other",
@@ -953,6 +983,15 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
+    /// The knowledge-base restriction authored in this exact definition.
+    /// Running agents retain an `AgentDef` snapshot, so knowledge access is
+    /// governed by that snapshot rather than a same-named reloaded definition.
+    pub(crate) fn allowed_knowledge_bases(&self) -> Option<&BTreeSet<String>> {
+        self.vnext
+            .as_ref()
+            .and_then(|vnext| vnext.allowed_knowledge_bases.as_ref())
+    }
+
     /// Non-fatal diagnostics emitted by the local definition loader. Keeping
     /// these separate from invariant errors lets loading warn without silently
     /// changing the definition's grants.
@@ -1230,6 +1269,12 @@ impl AgentDef {
         if let Some(verification) = &vnext.verification {
             fm.insert("verification".into(), serde_yaml::to_value(verification)?);
         }
+        if let Some(knowledge_bases) = &vnext.allowed_knowledge_bases {
+            fm.insert(
+                "allowedKnowledgeBases".into(),
+                serde_yaml::to_value(knowledge_bases)?,
+            );
+        }
         if let Some(capabilities) = &self.capabilities {
             fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
         }
@@ -1362,6 +1407,8 @@ fn parse_agent_with_scope(
         questions: Option<QuestionPolicy>,
         #[serde(default)]
         verification: Option<VerificationPolicy>,
+        #[serde(rename = "allowedKnowledgeBases", default)]
+        allowed_knowledge_bases: Option<BTreeSet<String>>,
         #[serde(default)]
         description: String,
         #[serde(default)]
@@ -1506,6 +1553,7 @@ fn parse_agent_with_scope(
                 delegation: fm.delegation.unwrap_or_default(),
                 questions: fm.questions,
                 verification: fm.verification,
+                allowed_knowledge_bases: fm.allowed_knowledge_bases,
             };
             definition.validate_for_scope(scope).map_err(|error| {
                 anyhow::anyhow!(

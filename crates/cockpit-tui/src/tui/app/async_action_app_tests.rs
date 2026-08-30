@@ -1,5 +1,7 @@
 use super::{App, HistoryEntry, LOCAL_CMD_DISPLAY_LINES};
-use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionPolicy};
+use crate::tui::async_action::{
+    AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy, AsyncActionResult,
+};
 use std::fs;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -110,6 +112,49 @@ fn attach_coalescing_retains_typed_model_and_btw_continuations() {
         continuation,
         super::RunnerAttachContinuation::BtwCommand(args) if args == "new explain this"
     )));
+}
+
+#[test]
+fn assistant_promotion_preserves_startup_notice_and_reattaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    let persistent_session = uuid::Uuid::new_v4();
+    app.agent_runner = Some(Err("ephemeral runner has exited".to_string()));
+
+    app.apply_async_action_result(AsyncActionResult {
+        id: AsyncActionId::from_raw_for_test(71),
+        kind: AsyncActionKind::DaemonRpc("assistant.resolve"),
+        presentation_stale: false,
+        payload: Ok(AsyncActionPayload::AssistantSessionResolved {
+            session_id: persistent_session,
+            source_session_id: None,
+            startup_notice: Some("daemon version skew resolved".to_string()),
+            promoted_from_ephemeral: true,
+        }),
+    });
+
+    assert!(app.history.iter().any(|entry| matches!(
+        entry,
+        HistoryEntry::Plain { line } if line == "daemon version skew resolved"
+    )));
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some(cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE)
+    );
+    assert!(
+        app.agent_runner.is_none(),
+        "the runner bound to the terminated ephemeral owner must be dropped"
+    );
+    assert_eq!(app.launch.session_id, Some(persistent_session));
+    let pending = app
+        .pending_runner_attach
+        .as_ref()
+        .expect("persistent session reattach started");
+    assert_eq!(pending.requested_session_id, Some(persistent_session));
+    assert!(matches!(
+        pending.continuations.as_slice(),
+        [super::RunnerAttachContinuation::RetryRetainedSubmissions]
+    ));
 }
 
 #[tokio::test]

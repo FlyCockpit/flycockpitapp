@@ -38,7 +38,7 @@ use super::{
         CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set,
         input_cost_microusd,
     },
-    generate::{CollectionInput, collect_candidates},
+    generate::{CollectedCandidate, CollectionInput, collect_candidates},
     recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target},
 };
 
@@ -58,6 +58,10 @@ pub(crate) enum VerificationOutcome {
         message: String,
         operation_id: Option<Uuid>,
     },
+    /// The automatic adjudicator could not safely receive this action. The
+    /// original call is durably selected and reserved, but must be approved
+    /// by the user before it can enter the host-effect boundary.
+    Escalate { plan: VerificationDispatchPlan },
     /// Revise mode: dispatch substituted args.
     Revise {
         args: Value,
@@ -371,19 +375,19 @@ async fn run_verification(
         // serialized envelope for every candidate. Candidate bodies are
         // separately reserved at the completion-token cap below.
         let candidate_envelopes = (0..rule.generators.len())
-            .map(|_| {
-                serde_json::json!({
-                    "candidate_id": Uuid::from_u128(u128::MAX),
-                    "kind": "approve_original",
-                    "args": null,
-                    "critique": "",
-                })
+            .map(|_| CollectedCandidate {
+                candidate_id: Uuid::from_u128(u128::MAX),
+                answer: super::generate::GeneratorAnswer {
+                    kind: super::generate::CandidateKind::ApproveOriginal,
+                    args: None,
+                    critique: String::new(),
+                },
             })
             .collect::<Vec<_>>();
         let adjudicator_prompt = super::adjudicate::adjudication_prompt(
+            input.resolved_name,
             input.args,
             &candidate_envelopes,
-            &instructions,
         )?;
         let adjudicator_tool = serde_json::to_string(&super::adjudicate::verdict_tool())?;
         let adjudicator_fixed = format!(
@@ -594,6 +598,16 @@ async fn run_verification(
         Vec::new()
     };
     if recorded_action.is_none() {
+        // Validate the complete trusted-minimal boundary before the failure
+        // policy below can consider dispatching anything. In particular, an
+        // `on_adjudication_failure = dispatch_original` policy must never turn
+        // an unbuildable projection into an automatic allow.
+        let projection_ready = super::adjudicate::adjudication_prompt(
+            input.resolved_name,
+            input.args,
+            &collected,
+        )
+        .is_ok();
         let adjudicator = match adjudicator_model {
             Some(model) => Ok(model),
             None if !profile_snapshot_id.is_nil() => {
@@ -616,6 +630,9 @@ async fn run_verification(
             .saturating_add(ledger.collection_duration_ms);
         let adjudication = match collection_error {
             Some(error) => Err(error.context("verification candidate collection failed")),
+            None if !projection_ready => Err(anyhow::anyhow!(
+                "verification could not build a trusted-minimal approval projection"
+            )),
             None => match adjudicator {
                 Ok(adjudicator) => {
                     let mut adjudicator = adjudicator.as_ref().clone();
@@ -629,9 +646,9 @@ async fn run_verification(
                         &input.ctx.config,
                         &input.ctx.cancel,
                         &format!("{}:verification-adjudicator", input.agent.name),
+                        input.resolved_name,
                         input.args,
                         &collected,
-                        &instructions,
                         adjudication_deadline,
                     )
                     .await
@@ -641,6 +658,34 @@ async fn run_verification(
         };
         let verdict = match adjudication {
             Ok(verdict) => verdict,
+            Err(_) if !projection_ready => {
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                let dispatching = input
+                    .session
+                    .db
+                    .select_verification_original(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                let plan = reserve_dispatch(
+                    &input,
+                    created.operation_id,
+                    dispatching.revision,
+                    original_digest.clone(),
+                    VerificationSurrogateKind::NormalizedOriginal,
+                    input.args,
+                )
+                .await?;
+                return Ok(VerificationOutcome::Escalate { plan });
+            }
             Err(_)
                 if rule.resolved_on_adjudication_failure()
                     == crate::agents::OnAdjudicationFailure::DispatchOriginal =>
@@ -1350,6 +1395,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         definition.resolve_grant(&host()).expect("grant resolves")
     }
@@ -1393,9 +1439,13 @@ mod tests {
     ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: Some(agent_instance_id),
             lock_identity: "Build".to_string(),
             write_scope: None,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,
@@ -1514,6 +1564,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_failure_returns_a_durable_user_escalation() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(NamedFixtureTool {
+            name: "plan_write".into(),
+            called: Arc::new(AtomicBool::new(false)),
+        }));
+        let agent = test_agent(tools, Some(verify_grant_inheriting_cost()));
+        let (session, instance_id) = prepared_session(tmp.path()).await;
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
+        let args = serde_json::json!({
+            "content": "plan body",
+            "expected_revision": "not-an-integer",
+        });
+
+        let outcome = run_verification(
+            InterceptInput {
+                session: &session,
+                agent: &agent,
+                model: &model,
+                ctx: &ctx,
+                history: &[],
+                resolved_name: "plan_write",
+                args: &args,
+                call_id: "call-1",
+            },
+            ToolClass::ArtifactWrite,
+            instance_id,
+        )
+        .await
+        .unwrap();
+        crate::engine::verification::estimate::set_test_model_price(None);
+
+        let VerificationOutcome::Escalate { plan } = outcome else {
+            panic!("projection failure must escalate to user approval, got {outcome:?}");
+        };
+        assert!(plan.attempt_revision >= 0);
+        let operations = session
+            .db
+            .list_verification_operations_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_ne!(
+            operations[0].state,
+            crate::db::verification_ledger::VerificationOperationState::Failed,
+            "projection failure must retain the operation for user-authorized dispatch"
+        );
+    }
+
+    #[tokio::test]
     async fn non_matching_tool_produces_no_verification_row() {
         let (called, wire, rows, _, _) =
             dispatch_named("read", Some(verify_grant(VerificationAction::Verify))).await;
@@ -1616,6 +1719,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         let grant = definition.resolve_grant(&host()).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1694,6 +1798,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         definition.resolve_grant(&host()).unwrap()
     }
@@ -1727,6 +1832,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         definition.resolve_grant(&host()).unwrap()
     }

@@ -977,6 +977,7 @@ mod tests {
             delegation: cockpit_core::agents::DelegationPolicy::default(),
             questions: None,
             verification: None,
+            allowed_knowledge_bases: None,
         });
         focus_tool(&mut pane, "skill");
         pane.handle_key(KeyEvent::from(KeyCode::Char(' ')));

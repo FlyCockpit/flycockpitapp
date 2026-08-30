@@ -363,6 +363,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         }
     }
 

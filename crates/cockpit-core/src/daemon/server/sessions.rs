@@ -445,6 +445,9 @@ pub(super) async fn delete_session(
     if let Some(service) = ctx.acp_catalog_composition.as_ref() {
         service.revoke_root(session_id);
     }
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %session_id, "text artifact blob cleanup remains pending");
+    }
     Ok(Response::Ack)
 }
 

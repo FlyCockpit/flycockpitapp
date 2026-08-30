@@ -127,6 +127,11 @@ impl App {
         &mut self,
         extended: &cockpit_config::extended::ExtendedConfig,
     ) {
+        // This controls acquisition rather than rendering, but it must follow
+        // the same authoritative snapshot as the Settings UI so the next
+        // owner acquisition uses the current global preference.
+        self.ephemeral_preference = !extended.daemon.background_agents;
+        self.lifecycle.set_default_intent(self.lifecycle_intent());
         let tui_cfg = extended.tui.clone();
         self.vim_setting = tui_cfg.vim_mode;
         self.thinking_setting = tui_cfg.thinking;

@@ -8062,6 +8062,7 @@ fn remote_state_with_grants(
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
         pending_acp_catalog_composition: None,
+        exit_guard_reservation: None,
     }
 }
 
@@ -8104,6 +8105,7 @@ fn owner_state() -> MutableClientState {
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
         pending_acp_catalog_composition: None,
+        exit_guard_reservation: None,
     }
 }
 
@@ -15130,6 +15132,7 @@ async fn attached_state_with_worker_receiver(
             terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
             pending_acp_catalog_composition: None,
+            exit_guard_reservation: None,
         },
         session_row.session_id,
         work_rx,
@@ -33802,6 +33805,7 @@ async fn btw_concurrent_with_parent_turn() {
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
         pending_acp_catalog_composition: None,
+        exit_guard_reservation: None,
     };
     let parent_session_id = parent_row.session_id;
     let ctx_for_parent = ctx.clone();
@@ -33880,6 +33884,7 @@ async fn btw_concurrent_with_parent_turn() {
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
         pending_acp_catalog_composition: None,
+        exit_guard_reservation: None,
     };
     let btw_session_id = created.info.session_id;
     let ctx_for_btw = ctx.clone();

@@ -1514,11 +1514,26 @@ fn validate_dream_models(
 /// shared by native-path and shell confinement gates so trust-required source
 /// Markdown cannot be reached through an ordinary filesystem surface.
 pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
-    if ctx.knowledge_access_trusted {
+    denied_local_knowledge_roots_for_model(
+        &ctx.cwd,
+        &ctx.config.extended(),
+        ctx.knowledge_access_trusted,
+    )
+}
+
+/// Return canonical local KB roots withheld from a model without requiring a
+/// full tool context. Driver-owned execution paths (for example scheduled
+/// shell jobs) use this before a [`ToolCtx`] exists.
+pub(crate) fn denied_local_knowledge_roots_for_model(
+    cwd: &Path,
+    extended: &ExtendedConfig,
+    knowledge_access_trusted: bool,
+) -> Result<Vec<PathBuf>> {
+    if knowledge_access_trusted {
         return Ok(Vec::new());
     }
     let mut roots = Vec::new();
-    for entry in &ctx.config.extended().knowledge_bases {
+    for entry in &extended.knowledge_bases {
         if !entry.trust_required {
             continue;
         }
@@ -1528,7 +1543,7 @@ pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>
         let root = if path.is_absolute() {
             path.clone()
         } else {
-            ctx.cwd.join(path)
+            cwd.join(path)
         };
         let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
             anyhow::anyhow!(
@@ -1554,6 +1569,31 @@ pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> 
         }
     }
     Ok(())
+}
+
+/// Reject a local media path that resolves inside a protected KB before the
+/// media authority opens its held descriptor. Media path sources are always
+/// relative to the session project root; unlike ordinary native tools, they do
+/// not pass through `check_native_access`.
+pub(crate) fn ensure_local_knowledge_media_path_access(ctx: &ToolCtx, path: &str) -> Result<()> {
+    let path = Path::new(path);
+    // Match the local media authority's lexical policy. It rejects absolute,
+    // dot, and parent components itself, so leave those invalid spellings to
+    // that existence-hiding admission path rather than probing them here.
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(());
+    }
+    let candidate = ctx.session.project_root.join(path);
+    let effective = crate::tools::sandbox::effective_native_path(&candidate).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot resolve local media source `{}` for knowledge-base access: {error}",
+            path.display()
+        )
+    })?;
+    ensure_local_knowledge_path_access(ctx, &effective)
 }
 
 /// Workspace-wide inspection and opaque host-proxy tools cannot safely prove

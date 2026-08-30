@@ -48,6 +48,10 @@ pub struct BackgroundLaunch {
     pub confine: bool,
     pub tmp_dir: Option<PathBuf>,
     pub session_env: HashMap<String, String>,
+    /// Protected local-KB roots carved out of the shell sandbox. A launch
+    /// carrying these paths must always be confined; driver construction owns
+    /// that invariant.
+    denied_knowledge_paths: Vec<PathBuf>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
 }
@@ -58,16 +62,26 @@ impl BackgroundLaunch {
             confine: false,
             tmp_dir: None,
             session_env,
+            denied_knowledge_paths: Vec::new(),
             #[cfg(test)]
             test_sandbox_build: None,
         }
     }
 
     pub fn confined(tmp_dir: Option<PathBuf>, session_env: HashMap<String, String>) -> Self {
+        Self::confined_with_denied_knowledge_paths(tmp_dir, session_env, Vec::new())
+    }
+
+    pub fn confined_with_denied_knowledge_paths(
+        tmp_dir: Option<PathBuf>,
+        session_env: HashMap<String, String>,
+        denied_knowledge_paths: Vec<PathBuf>,
+    ) -> Self {
         Self {
             confine: true,
             tmp_dir,
             session_env,
+            denied_knowledge_paths,
             #[cfg(test)]
             test_sandbox_build: None,
         }
@@ -643,7 +657,7 @@ async fn build_confined_background_command(
         }
     }
 
-    crate::tools::shell_sandbox::build_sandboxed_command(
+    crate::tools::shell_sandbox::build_sandboxed_command_with_denied_paths(
         command,
         cwd,
         launch.tmp_dir.as_deref(),
@@ -651,6 +665,7 @@ async fn build_confined_background_command(
         &launch.session_env,
         &[],
         None,
+        &launch.denied_knowledge_paths,
     )
     .await
 }

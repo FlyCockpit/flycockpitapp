@@ -97,6 +97,253 @@ async fn recovery_activation_gate_blocks_until_claim_and_abort_never_executes() 
     assert!(aborted.wait().await.is_err());
 }
 
+/// A real interactive admission must atomically publish the seed declarations
+/// and consume the explore receipt.  A new driver then takes the same
+/// `DriverControl` recovery path used by the worker: it may attach the exact
+/// child while its claim is pending, but it must not run until the claim is
+/// consumed and the worker's deferred activation gate is released.
+#[tokio::test]
+async fn recovered_interactive_task_admission_replays_durable_seed_before_inference() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    std::fs::write(tmp.path().join("recovery-seed.txt"), "RECOVERED_SEED_BODY").unwrap();
+    let seed_reads = vec![crate::engine::seed_reads::SeedRead {
+        tool: "read".to_string(),
+        args: serde_json::json!({"path": "recovery-seed.txt"}),
+    }];
+    let receipt = driver
+        .session
+        .issue_seed_read_receipt(&seed_reads)
+        .expect("host issued explore receipt");
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::ToolCall {
+            id: "task-recovery-seed".to_string(),
+            name: "task".to_string(),
+            arguments: serde_json::json!({
+                "agent": "builder",
+                "prompt": "durable interactive handoff",
+                "mode": "subagent_interactive",
+                "seed_reads": &seed_reads,
+                "seed_reads_receipt": &receipt,
+            }),
+        })
+        // The post-publication parent retry remains open while the test drops
+        // the daemon. The child itself must not load: that is the fallible
+        // post-publication boundary this recovery fixture exercises.
+        .turn(Turn::Hang)
+        .start()
+        .await;
+
+    let cockpit = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit).unwrap();
+    std::fs::write(
+        cockpit.join("config.json"),
+        r#"{"tools":{"read":{"enabled":true,"command":"echo hi"}}}"#,
+    )
+    .unwrap();
+    driver.refresh_config_from_disk_for_tests();
+
+    {
+        use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
+
+        let providers = std::collections::BTreeMap::from([(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: provider.base_url(),
+                headers: vec![],
+                wire_api: WireApi::Completions,
+                ..ProviderEntry::default()
+            },
+        )]);
+        let config = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "local".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        Arc::make_mut(&mut driver.stack[0].agent).model = Arc::new(
+            crate::engine::model::Model::from_config(
+                &config,
+                Arc::new(crate::redact::RedactionTable::empty()),
+            )
+            .expect("scripted parent and child model"),
+        );
+    }
+
+    let session = driver.session.clone();
+    let locks = driver.locks.clone();
+    let redact = driver.redact.clone();
+    let cwd = driver.cwd.clone();
+    let root = driver.stack[0].agent.clone();
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let input_queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(256);
+    {
+        let admission = driver.run_user_input(
+            UserSubmission::text("admit an interactive builder with the explore seed"),
+            &input_queue,
+            &turn_tx,
+        );
+        tokio::pin!(admission);
+
+        let parent_request = tokio::select! {
+            request = provider.next_request() => request,
+            result = &mut admission => panic!("admission ended before the parent request: {result:?}"),
+        };
+        assert!(
+            parent_request.body.to_string().contains("task"),
+            "the real parent turn must own the task admission"
+        );
+        let post_failure_parent_request = tokio::select! {
+            request = provider.next_request() => request,
+            result = &mut admission => panic!("admission ended before the post-publication child-load failure: {result:?}"),
+        };
+        assert!(
+            post_failure_parent_request
+                .body
+                .to_string()
+                .contains("failed to load subagent `builder`"),
+            "the parent receives the post-publication child-load failure before retrying"
+        );
+    }
+    drop(driver);
+    std::fs::remove_file(cockpit.join("config.json"))
+        .expect("recovery restores the valid child builtin configuration");
+
+    let child = session
+        .db
+        .task_delegation_recovery_descriptors_for_job(session.id, "task-recovery-seed".to_string())
+        .await
+        .expect("real admission publishes a recovery descriptor")
+        .pop()
+        .expect("real admission publishes one interactive child");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&child.snapshot_json).expect("real admission writes JSON snapshot");
+    let history: Vec<Message> = serde_json::from_value(
+        snapshot
+            .get("history")
+            .cloned()
+            .expect("real admission snapshot includes history"),
+    )
+    .expect("real admission snapshot history decodes");
+    let declarations = crate::engine::seed_reads::pending_declared_seed_calls(&history);
+    assert_eq!(
+        declarations.len(),
+        1,
+        "snapshot retains one seed declaration"
+    );
+    assert_eq!(declarations[0].function.name, "read");
+    assert_eq!(
+        declarations[0].function.arguments,
+        serde_json::json!({"path": "recovery-seed.txt"}),
+        "the real admission snapshot retains the seed arguments"
+    );
+    assert!(
+        session
+            .claim_seed_read_receipt(Some(&receipt), &seed_reads)
+            .is_err(),
+        "the real admission commits the receipt only after publication"
+    );
+
+    let recovery_epoch = uuid::Uuid::new_v4();
+    let tree_recovery = crate::agent_tree::AgentTreeLifecycle::new(session.db.clone())
+        .recover_session(
+            session.id,
+            recovery_epoch,
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+        .expect("worker recovery claims the published child");
+    assert!(
+        tree_recovery
+            .claimed_agents
+            .contains(&child.agent_instance_id),
+        "the recovery worker owns the exact durable child claim before reattach"
+    );
+    let payload = session
+        .db
+        .load_task_delegation_payload(&child.task_call_id, &child.label)
+        .await
+        .expect("real admission payload remains available for recovery");
+
+    let mut recovered_driver =
+        Driver::with_max_schedules(session.clone(), locks, redact, cwd, root, 8);
+    bind_test_session_root(&mut recovered_driver);
+    let (recovery_updates_tx, _recovery_updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let recovery_queue = crate::engine::message::UserSubmissionQueue::new(recovery_updates_tx);
+    let (recovery_turn_tx, _recovery_turn_rx) = mpsc::channel::<TurnEvent>(256);
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let recovered_main = tokio::spawn(async move {
+        recovered_driver
+            .run_main_loop(recovery_queue, control_rx, &recovery_turn_tx)
+            .await
+    });
+    let activation_gate = RecoveryActivationGate::new();
+    let (respond_to, attached) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(DriverControl::ReattachInteractiveTaskChild {
+            recovery: RecoveredInteractiveTaskChild {
+                agent_instance_id: child.agent_instance_id,
+                parent_agent_instance_id: child.parent_agent_instance_id,
+                task_call_id: child.task_call_id,
+                label: child.label,
+                child_agent: child.child_agent,
+                original_args_json: child.original_args_json,
+                snapshot_json: child.snapshot_json,
+                payload: payload.body,
+                accepted_late_steer: None,
+                activation_gate: activation_gate.clone(),
+            },
+            respond_to,
+        })
+        .await
+        .expect("worker control channel remains live");
+    attached
+        .await
+        .expect("driver answers recovery control")
+        .expect("driver attaches the exact recovered interactive child");
+    assert_eq!(
+        provider.request_count(),
+        2,
+        "reattach alone cannot consume its recovery marker or infer before the worker claim"
+    );
+
+    let claimed_child = session
+        .db
+        .agent_instance(session.id, child.agent_instance_id)
+        .await
+        .expect("read exact recovery claim revision")
+        .expect("published child remains durable");
+    assert!(
+        session
+            .db
+            .consume_agent_resume_claims_atomically(
+                session.id,
+                vec![(child.agent_instance_id, claimed_child.revision)],
+                recovery_epoch,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .expect("consume exact recovered child claim"),
+        "the worker must acknowledge the claim before it releases execution"
+    );
+    activation_gate.release();
+    let recovered_child_request = provider.next_request().await;
+    assert!(
+        recovered_child_request
+            .body
+            .to_string()
+            .contains("RECOVERED_SEED_BODY"),
+        "consuming the real recovery marker replays the durable tool declaration before inference"
+    );
+    recovered_main.abort();
+}
+
 /// An accepted interactive steer can park on a later QuestionTool after its
 /// provider handoff. On restart the task snapshot still contains the pre-tool
 /// prompt, so recovery must bind the exact accepted receipt to the frame and

@@ -3053,7 +3053,7 @@ impl Driver {
                     .await,
                 ));
             };
-            if let Err(error) = self
+            let publication = match self
                 .session
                 .db
                 .publish_task_delegation_children_and_agents(
@@ -3071,7 +3071,29 @@ impl Driver {
                 )
                 .await
             {
-                tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
+                Ok(publication) => publication,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            &task.repair_notes,
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        )
+                        .await,
+                    ));
+                }
+            };
+            // The child descriptor is durable before policy reduction. Retire
+            // the one-shot seed receipt before any subsequent fallible work.
+            if let Some(claim) = seed_read_claim {
+                claim.commit();
+            }
+            if let Some(error) = publication.post_publication_error() {
+                tracing::warn!(%error, %task_call_id, "single task child published but automatic-answer policy application failed");
                 return Ok(Some(
                     self.refuse_minted_noninteractive_workspace_leases(
                         [task.workspace_lease.clone()],
@@ -3131,9 +3153,6 @@ impl Driver {
                         .await;
                 }),
             );
-            if let Some(claim) = seed_read_claim {
-                claim.commit();
-            }
             Ok(None)
         })
     }
@@ -6625,7 +6644,7 @@ impl Driver {
                 }
             })
             .collect();
-        if let Err(error) = self
+        let publication = match self
             .session
             .db
             .publish_task_delegation_children_and_agents(
@@ -6637,7 +6656,23 @@ impl Driver {
             )
             .await
         {
-            tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
+            Ok(publication) => publication,
+            Err(error) => {
+                tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        minted_workspace_leases.clone(),
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await);
+            }
+        };
+        if let Some(error) = publication.post_publication_error() {
+            tracing::warn!(%error, %task_call_id, "batch task children published but automatic-answer policy application failed");
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
                     minted_workspace_leases.clone(),

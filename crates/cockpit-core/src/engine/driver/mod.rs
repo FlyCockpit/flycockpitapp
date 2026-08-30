@@ -13640,7 +13640,7 @@ impl Driver {
                             continue;
                         }
                     };
-                    let child_agent_instance_id = match self
+                    let publication = match self
                         .session
                         .db
                         .publish_task_delegation_children_and_agents(
@@ -13661,14 +13661,9 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(mut children) if children.len() == 1 => {
-                            children
-                                .pop()
-                                .expect("one published interactive child")
-                                .agent_instance_id
-                        }
-                        Ok(_) => {
-                            tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
+                        Ok(publication) => publication,
+                        Err(error) => {
+                            tracing::warn!(%error, %task_call_id, "atomically publishing interactive task child and agent tree identity failed");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -13681,8 +13676,37 @@ impl Driver {
                             );
                             continue;
                         }
-                        Err(error) => {
-                            tracing::warn!(%error, %task_call_id, "atomically publishing interactive task child and agent tree identity failed");
+                    };
+                    // Publication commits the recovery descriptor before the
+                    // fallible policy reduction and child builtin load below.
+                    // From this point a restart can recover the child, so the
+                    // receipt must not be made claimable again.
+                    if let Some(claim) = seed_read_claim {
+                        claim.commit();
+                    }
+                    if let Some(error) = publication.post_publication_error() {
+                        tracing::warn!(%error, %task_call_id, "interactive task child published but automatic-answer policy application failed");
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                &repair_notes,
+                            ),
+                        );
+                        continue;
+                    }
+                    let child_agent_instance_id = match publication.into_children() {
+                        mut children if children.len() == 1 => {
+                            children
+                                .pop()
+                                .expect("one published interactive child")
+                                .agent_instance_id
+                        }
+                        _ => {
+                            tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -13714,9 +13738,6 @@ impl Driver {
                             continue;
                         }
                     };
-                    if let Some(claim) = seed_read_claim {
-                        claim.commit();
-                    }
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
                     let child_context_policy = child.context_policy.clone();
                     self.emit_subagent_routing_amend(

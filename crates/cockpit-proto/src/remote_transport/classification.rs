@@ -1205,16 +1205,6 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "get_app_flag",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "mark_app_flag_seen",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
         "resolve_assistant_session",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2045,16 +2035,6 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "startup_disclosures",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "app_flag",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "app_flag_seen",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),

@@ -9,8 +9,12 @@ pub struct DaemonConfig {
     /// Whether a newly acquired ledger owner remains alive after its last
     /// terminal client exits. Existing persistent owners are always attached
     /// regardless of this default.
-    #[serde(default)]
+    #[serde(default = "default_background_agents")]
     pub background_agents: bool,
+}
+
+const fn default_background_agents() -> bool {
+    true
 }
 
 impl Default for DaemonConfig {
@@ -75,6 +79,14 @@ mod tests {
     #[test]
     fn background_agents_defaults_to_persistent_owners() {
         assert!(DaemonConfig::default().background_agents);
+    }
+
+    #[test]
+    fn missing_background_agents_deserializes_to_persistent_owners() {
+        let config: DaemonConfig =
+            serde_json::from_value(serde_json::json!({})).expect("daemon config");
+
+        assert!(config.background_agents);
     }
 
     #[test]

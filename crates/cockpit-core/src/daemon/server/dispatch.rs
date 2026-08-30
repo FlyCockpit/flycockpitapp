@@ -2743,12 +2743,6 @@ impl std::fmt::Display for GoalMutationRejected {
 #[cfg(feature = "remote")]
 impl std::error::Error for GoalMutationRejected {}
 
-fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
-    match key {
-        proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
-    }
-}
-
 /// How much workspace authority a mode grants, most restrictive first. This is
 /// the *only* ordering used to classify a trust transition; it is deliberately
 /// derived from what each mode lets a workspace do, not from enum declaration
@@ -7848,51 +7842,6 @@ async fn handle_serialized_request_impl(
                 connector,
                 config_generation: inventory::current_config_generation(),
             });
-        }
-        Request::GetAppFlag { key } => {
-            let db_key = app_flag_db_key(key);
-            let version = ctx
-                .db
-                .read(move |conn| crate::db::Db::app_flag_version_conn(conn, db_key))
-                .await
-                .map_err(internal)?;
-            Ok(Response::AppFlag {
-                key,
-                seen: version > 0,
-                version,
-            })
-        }
-        Request::MarkAppFlagSeen {
-            key,
-            expected_version,
-        } => {
-            // `mark_app_flag_seen` is classified `local_only`: app flags are
-            // daemon-local UI acknowledgements, NOT a remoted owner mutation, so
-            // the request never reserves a transactional remote-operation ledger
-            // row. `admit_remote_operation` already denies a remote non-owner
-            // (the `local_only` class resolves to no remote class) and returns
-            // `None` for the owner, so any `remote_operation` identity is inert
-            // here by construction — persist locally only. See
-            // `mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger`.
-            let db_key = app_flag_db_key(key);
-            let outcome = ctx
-                .db
-                .write(move |conn| {
-                    crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)
-                })
-                .await
-                .map_err(internal)?;
-            let Some((version, changed)) = outcome else {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: "app flag version changed; refresh before retrying".into(),
-                });
-            };
-            Ok(Response::AppFlagSeen {
-                key,
-                version,
-                changed,
-            })
         }
         Request::ResolveAssistantSession {
             assistant_id,

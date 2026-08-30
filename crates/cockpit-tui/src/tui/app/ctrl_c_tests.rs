@@ -375,9 +375,6 @@ fn exit_routes_share_the_app_wide_authority_gate() {
     assert!(input.contains(
         "self.ctrl_d_can_exit_immediately() {\n                self.request_guarded_exit()"
     ));
-    assert!(input.contains(
-        "DaemonChoice::Exit) | None => {\n                    return self.request_guarded_exit();"
-    ));
     assert!(
         slash.contains(
             "fn run_exit(app: &mut App, _: &str) -> bool {\n    app.request_guarded_exit()"

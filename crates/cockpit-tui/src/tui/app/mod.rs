@@ -3945,7 +3945,6 @@ impl App {
             StartupWorkspaceTrust::Decided => {
                 app.maybe_open_add_provider_wizard();
             }
-            StartupWorkspaceTrust::Decided => {}
         }
         app
     }

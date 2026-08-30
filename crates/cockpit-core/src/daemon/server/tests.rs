@@ -1800,9 +1800,10 @@ async fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         })
     };
     let read = Request::DaemonStatus;
-    let mutation = Request::MarkAppFlagSeen {
-        key: proto::AppFlagKey::DaemonAutostartNotice,
-        expected_version: 0,
+    let mutation = Request::RecordUsage {
+        kind: proto::UsageKind::Slash,
+        key: "/remote-gate".into(),
+        project_id: None,
     };
     let reachable_mutation = Request::CancelRunInvocation {
         client_submission_id: Uuid::now_v7(),
@@ -2481,9 +2482,10 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     handle_envelope(
         Envelope::request(
             local_id,
-            Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
+            Request::RecordUsage {
+                kind: proto::UsageKind::Slash,
+                key: "/local-owner-gate".into(),
+                project_id: None,
             },
         ),
         &mut state,
@@ -10947,39 +10949,6 @@ async fn delete_session_remote_path_commits_transactional_ledger() {
 
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
-    // `mark_app_flag_seen` is classified `local_only`. Even if an operation
-    // identity is injected (which `admit_remote_operation` never produces for a
-    // `local_only` class), the daemon must persist locally and reserve NO
-    // transactional ledger row.
-    let ctx = persistent_test_ctx();
-    let mut state = owner_state();
-    let shared = state.shared_snapshot();
-    let operation = remote_owner_operation().await;
-    let request = Request::MarkAppFlagSeen {
-        key: proto::AppFlagKey::DaemonAutostartNotice,
-        expected_version: 0,
-    };
-    let response = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
-        .await
-        .expect("mark app flag seen succeeds");
-    let Response::AppFlagSeen {
-        version, changed, ..
-    } = response
-    else {
-        panic!("expected AppFlagSeen response");
-    };
-    assert!(changed);
-    assert_eq!(version, 1, "the local app flag write must have applied");
-    assert_eq!(
-        remote_ledger_state(&ctx, &operation).await,
-        None,
-        "a local_only mutation must NOT reserve any transactional ledger row"
-    );
-}
-
-#[tokio::test]
-#[cfg(feature = "remote")]
 async fn transactional_mutation_inventory_has_ledger_site() {
     // Every `transactional_mutation` classification row that a remote actor can
     // be admitted for must have a real daemon ledger site. Owner-only rows are
@@ -17284,8 +17253,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "create_goal"
         | "get_workspace_trust"
         | "get_startup_disclosures"
-        | "get_app_flag"
-        | "mark_app_flag_seen"
         | "set_workspace_trust"
         | "guidance_estimate"
         | "list_guidance_proposals"
@@ -17843,8 +17810,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("stats_rollup"),
         authz_owner_only("get_workspace_trust"),
         authz_owner_only("get_startup_disclosures"),
-        authz_owner_only("get_app_flag"),
-        authz_owner_only("mark_app_flag_seen"),
         authz_owner_only("set_workspace_trust"),
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
@@ -19477,13 +19442,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "get_workspace_trust" => Request::GetWorkspaceTrust { project_root: root },
         "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
-        "get_app_flag" => Request::GetAppFlag {
-            key: proto::AppFlagKey::DaemonAutostartNotice,
-        },
-        "mark_app_flag_seen" => Request::MarkAppFlagSeen {
-            key: proto::AppFlagKey::DaemonAutostartNotice,
-            expected_version: 0,
-        },
         "set_workspace_trust" => Request::SetWorkspaceTrust {
             project_root: root,
             mode: proto::WorkspaceTrustMode::Trust,
@@ -26963,25 +26921,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::GetAppFlag {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-            },
-            kind: "get_app_flag",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
-            },
-            kind: "mark_app_flag_seen",
-            session_id: None,
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
             request: Request::ResolveAssistantSession {
                 assistant_id: "a".into(),
                 project_root: project_root.clone(),
@@ -27445,8 +27384,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetWorkspaceTrust,
         GetWorkspaceTrust,
         GetStartupDisclosures,
-        GetAppFlag,
-        MarkAppFlagSeen,
         ResolveAssistantSession,
         ListAssistants,
         UpsertAssistant,

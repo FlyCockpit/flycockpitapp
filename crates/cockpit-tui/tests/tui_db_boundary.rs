@@ -1412,8 +1412,6 @@ fn tui_db_inventory_converted() {
     for rpc in [
         "SetWorkspaceTrust",
         "GetStartupDisclosures",
-        "GetAppFlag",
-        "MarkAppFlagSeen",
         "ResolveAssistantSession",
         "ReadSubagentHistoryPage",
         "StatsRollup",

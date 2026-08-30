@@ -877,13 +877,6 @@ pub enum Request {
     GetStartupDisclosures {
         project_root: String,
     },
-    GetAppFlag {
-        key: AppFlagKey,
-    },
-    MarkAppFlagSeen {
-        key: AppFlagKey,
-        expected_version: u64,
-    },
     ResolveAssistantSession {
         assistant_id: String,
         project_root: String,
@@ -4094,8 +4087,6 @@ macro_rules! request_variants {
             (Request::SetWorkspaceTrust { .. }, "set_workspace_trust");
             (Request::GetWorkspaceTrust { .. }, "get_workspace_trust");
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
-            (Request::GetAppFlag { .. }, "get_app_flag");
-            (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
@@ -4404,8 +4395,6 @@ macro_rules! command {
             (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
             (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
-            (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
-            (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
@@ -5024,7 +5013,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
             "struct:ProviderEntry:v1"
         }
         "ActiveModelSwitchTrigger"
-        | "AppFlagKey"
         | "ApprovalMode"
         | "AssistantSessionResolutionMode"
         | "AttachmentPurpose"

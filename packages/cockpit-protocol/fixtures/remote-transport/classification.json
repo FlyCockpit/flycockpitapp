@@ -1719,18 +1719,6 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "get_app_flag"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "mark_app_flag_seen"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
         "tag": "resolve_assistant_session"
       },
       {
@@ -2700,18 +2688,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "startup_disclosures"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "app_flag"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "app_flag_seen"
       },
       {
         "class": "bounded_request_response",

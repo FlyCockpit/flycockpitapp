@@ -231,6 +231,12 @@ pub struct Session {
     /// the same root-scoped epoch and no declaration enters durable session
     /// state.
     forwarded_mcp_catalog: Arc<crate::mcp::forwarded::ForwardedCatalogSlot>,
+    /// One-use host receipts for explore-selected seed reads.  The receipt is
+    /// deliberately memory-only: a resumed process fails closed and requires
+    /// a fresh explore selection rather than accepting model-synthesized seed
+    /// calls after losing the host provenance boundary.
+    seed_read_receipts:
+        Mutex<std::collections::HashMap<Uuid, Vec<crate::engine::seed_reads::SeedRead>>>,
     /// Turn-pinned transcription egress composed from the same resolved
     /// provider credential, endpoint, capability metadata, and journal.
     transcription_dispatch: Mutex<
@@ -522,6 +528,44 @@ pub struct Session {
 }
 
 impl Session {
+    /// Bind an explore fork's host-captured calls to one subsequent
+    /// `Build -> builder` handoff. The opaque receipt is not a capability on
+    /// its own: redemption also compares the exact validated calls.
+    pub(crate) fn issue_seed_read_receipt(
+        &self,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+    ) -> String {
+        let receipt = Uuid::new_v4();
+        self.seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(receipt, seed_reads.to_vec());
+        receipt.to_string()
+    }
+
+    /// Consume a host-issued seed receipt only when the declarative handoff
+    /// carries the exact calls that the explore fork selected.
+    pub(crate) fn consume_seed_read_receipt(
+        &self,
+        receipt: &str,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+    ) -> std::result::Result<(), String> {
+        let receipt = Uuid::parse_str(receipt)
+            .map_err(|_| "seed_reads receipt is not a host-issued UUID".to_string())?;
+        let mut receipts = self
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match receipts.get(&receipt) {
+            Some(expected) if expected == seed_reads => {
+                receipts.remove(&receipt);
+                Ok(())
+            }
+            Some(_) => Err("seed_reads do not match their host-issued explore receipt".to_string()),
+            None => Err("seed_reads receipt is unknown, expired, or already used".to_string()),
+        }
+    }
+
     /// The session-owned knowledge-dream attachment-consent cell.
     pub(crate) fn dream_read_scope(
         &self,

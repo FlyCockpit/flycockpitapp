@@ -107,6 +107,7 @@ const DELEGATE_KEYS: &[&str] = &[
     "write_scope",
     "grant_tools",
     "seed_reads",
+    "seed_reads_receipt",
     "todo_ids",
 ];
 
@@ -712,7 +713,8 @@ mod tests {
                 "payload": {
                     "agent": "builder",
                     "prompt": "implement",
-                    "seed_reads": [{"tool": "read", "args": {"path": "src/lib.rs"}}]
+                    "seed_reads": [{"tool": "read", "args": {"path": "src/lib.rs"}}],
+                    "seed_reads_receipt": "host-issued-receipt"
                 }
             }),
             &known(),
@@ -722,6 +724,7 @@ mod tests {
             panic!("expected delegate");
         };
         assert_eq!(args["seed_reads"][0]["tool"], "read");
+        assert_eq!(args["seed_reads_receipt"], "host-issued-receipt");
     }
 
     #[test]

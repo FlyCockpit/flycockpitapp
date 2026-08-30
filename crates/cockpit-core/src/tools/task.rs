@@ -98,7 +98,7 @@ impl TaskTool {
              - models: {{ \"intent\": \"models\" }} \
              - query: {{ \"intent\": \"query\", \"payload\": {{ \"task_call_id\": \"...\", \"message\": \"...\" }} }} \
              If a noninteractive task returns a backgrounded task_delegation JSON envelope, the original tool call is closed and the child is still running detached with result_pending=true. Do not treat it as the report or redelegate solely because it backgrounded; continue the current conversation and use the async task_delegation result or task status/query/list with task_call_id. Read each child status and optional error; backgrounded children can later complete, fail, be cancelled, or be lost. task steer applies at the next child turn boundary only if still running/actionable. resume_handle is not a universal background-task control channel. \
-             When explore returns a host-authored seed_reads array, copy it unchanged to the promptly-following builder delegate payload; the builder executes those read-only calls before its first inference. Multiple independent delegate calls may be emitted separately; each keeps its own call/task lifecycle and the host may run proven read-only children concurrently. Use batch only for one grouped result or explicit depends_on edges. Do not add legacy delegate/batch/control siblings. Query/steer require message."
+             When explore returns host-authored seed_reads and seed_reads_receipt fields, copy both unchanged to the promptly-following builder delegate payload; the builder executes those read-only calls before its first inference. Multiple independent delegate calls may be emitted separately; each keeps its own call/task lifecycle and the host may run proven read-only children concurrently. Use batch only for one grouped result or explicit depends_on edges. Do not add legacy delegate/batch/control siblings. Query/steer require message."
         );
         let model_selector_schema = serde_json::json!({
             "type": "object",
@@ -189,6 +189,10 @@ impl TaskTool {
                         "required": ["tool", "args"],
                         "additionalProperties": false
                     }
+                },
+                "seed_reads_receipt": {
+                    "type": "string",
+                    "description": "Opaque host-issued receipt paired with explore-selected seed_reads; copy unchanged"
                 },
                 "todo_ids": {
                     "type": "array",
@@ -286,6 +290,7 @@ impl TaskTool {
                 "workspace_lease": delegate_payload["properties"]["workspace_lease"].clone(),
                 "grant_tools": delegate_payload["properties"]["grant_tools"].clone(),
                 "seed_reads": delegate_payload["properties"]["seed_reads"].clone(),
+                "seed_reads_receipt": delegate_payload["properties"]["seed_reads_receipt"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
                 "task_call_id": control_payload["properties"]["task_call_id"].clone(),
@@ -506,6 +511,10 @@ mod tests {
                 payload_props["seed_reads"]["items"]["properties"]["tool"]["enum"],
                 serde_json::json!(["read", "grep", "code", "graph", "search"]),
                 "seed_reads exposes the closed read-only allowlist: {schema}"
+            );
+            assert_eq!(
+                payload_props["seed_reads_receipt"]["type"], "string",
+                "seed_reads carries the opaque host receipt needed to enforce explore provenance: {schema}"
             );
             assert!(
                 !payload_props.contains_key("seed"),

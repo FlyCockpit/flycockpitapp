@@ -14,6 +14,7 @@ use crate::engine::message::{AssistantContent, Message, collect_tool_calls};
 /// newly read-only effect classification here by accident would widen the
 /// cross-agent capability without an explicit product decision.
 pub const ALLOWED_SEED_READ_TOOLS: &[&str] = &["read", "grep", "code", "graph", "search"];
+const COMPLETION_NOTICE: &str = "The host executed the explore-selected read-only seed calls above. Use their fresh results and continue with the delegated implementation brief without rediscovering them.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,24 @@ pub struct SeedRead {
     pub tool: String,
     #[serde(default)]
     pub args: Value,
+}
+
+/// Host-authored output of an ephemeral explore selection. The opaque receipt
+/// proves the calls crossed the Monty-only fork boundary; the parent must pass
+/// it with the unchanged list to the single allowed implementation handoff.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedReadSelection {
+    pub calls: Vec<SeedRead>,
+    pub receipt: Option<String>,
+}
+
+impl SeedReadSelection {
+    fn empty() -> Self {
+        Self {
+            calls: Vec::new(),
+            receipt: None,
+        }
+    }
 }
 
 impl SeedRead {
@@ -79,13 +98,17 @@ pub async fn select_from_explore_fork(
     config: crate::daemon::session_worker::SessionConfigHandle,
     cancel: tokio_util::sync::CancellationToken,
     sealed_egress: Arc<crate::redact::RedactionTable>,
-) -> Vec<SeedRead> {
+) -> SeedReadSelection {
     if agent_name != "explore" || cancel.is_cancelled() {
-        return Vec::new();
+        return SeedReadSelection::empty();
     }
     let slot = Arc::new(Mutex::new(None));
-    let host =
-        crate::mcp::builtin::HostContext::seed_reads_fork(session, cwd, config, slot.clone());
+    let host = crate::mcp::builtin::HostContext::seed_reads_fork(
+        session.clone(),
+        cwd,
+        config,
+        slot.clone(),
+    );
     let prompt = Message::user(
         "Select only the read-only calls an implementation subagent should rerun before its first inference to avoid rediscovery while keeping results fresh. Call Monty exactly once with a script that invokes mcp.invoke('cockpit', 'seed_reads', {'calls': [...]}); each call is {'tool': one of read/grep/code/graph/search, 'args': {...}}. The script may compute the list programmatically. Do not execute the calls and do not explain.",
     );
@@ -104,7 +127,7 @@ pub async fn select_from_explore_fork(
         )
         .await;
     let Ok(((_, content, usage), captured, _)) = completion else {
-        return Vec::new();
+        return SeedReadSelection::empty();
     };
     // This is a real provider inference even though its output is consumed
     // only by the host. Keep the captured request, token cost, and timeline
@@ -158,26 +181,107 @@ pub async fn select_from_explore_fork(
                 .map(str::to_owned)
         })
     else {
-        return Vec::new();
+        return SeedReadSelection::empty();
     };
     if crate::mcp::sandbox::run_with_host(&script, &crate::mcp::config::McpConfig::default(), &host)
         .await
         .is_err()
     {
-        return Vec::new();
+        return SeedReadSelection::empty();
     }
-    slot.lock()
+    let calls = slot
+        .lock()
         .ok()
         .and_then(|mut selected| selected.take())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let receipt = (!calls.is_empty() && session.parent_session_id.is_none())
+        .then(|| session.issue_seed_read_receipt(&calls));
+    SeedReadSelection { calls, receipt }
 }
 
-pub fn append_to_report(mut report: String, seed_reads: &[SeedRead]) -> String {
-    let payload = serde_json::json!({"seed_reads": seed_reads});
+pub fn append_to_report(mut report: String, selection: &SeedReadSelection) -> String {
+    let payload = serde_json::json!({
+        "seed_reads": selection.calls,
+        "seed_reads_receipt": selection.receipt,
+    });
     report.push_str("\n\n## Seed reads\n");
     report.push_str(&payload.to_string());
     report.push('\n');
     report
+}
+
+/// Enforce the cross-agent ownership boundary before a structural `task`
+/// outcome exists. Only the root `Build` agent may redeem the one-use receipt,
+/// and only to the implementation `builder` role.
+pub fn authorize_handoff(
+    session: &crate::session::Session,
+    parent_agent: &crate::engine::agent::Agent,
+    child_agent: &str,
+    seed_reads: &[SeedRead],
+    receipt: Option<&str>,
+) -> Result<(), String> {
+    if seed_reads.is_empty() {
+        return if receipt.is_some() {
+            Err("seed_reads_receipt requires a non-empty seed_reads list".to_string())
+        } else {
+            Ok(())
+        };
+    }
+    if parent_agent.delegated || parent_agent.name != "Build" {
+        return Err("seed_reads may be redeemed only by the root Build agent".to_string());
+    }
+    if child_agent != "builder" {
+        return Err("seed_reads may target only the builder implementation agent".to_string());
+    }
+    let receipt = receipt
+        .filter(|receipt| !receipt.trim().is_empty())
+        .ok_or_else(|| "seed_reads require the host-issued explore receipt".to_string())?;
+    session.consume_seed_read_receipt(receipt, seed_reads)
+}
+
+/// Synthetic seed calls already declared in history but lacking a paired tool
+/// result. This is the replay continuation source: it preserves the original
+/// call IDs so a parked seed can be resumed without dropping later seeds.
+pub fn pending_declared_seed_calls(history: &[Message]) -> Vec<crate::engine::message::ToolCall> {
+    let completed_call_ids = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            rig::message::UserContent::ToolResult(result) => Some(result.call.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    history
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            AssistantContent::ToolCall(call)
+                if call.id.as_str().starts_with("seed-read-")
+                    && !completed_call_ids.contains(call.id.as_str()) =>
+            {
+                SeedRead {
+                    tool: call.function.name.clone(),
+                    args: call.function.arguments.clone(),
+                }
+                .validate()
+                .ok()
+                .map(|_| call.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn completion_prompt() -> Message {
+    Message::user(COMPLETION_NOTICE)
 }
 
 /// Return only seeds whose synthetic call does not yet have its paired tool
@@ -297,6 +401,14 @@ pub async fn execute_before_first_inference(
         cwd,
         hooks: snapshot.hooks(),
     };
+    execute_declared_seed_calls(&env, history, calls).await
+}
+
+pub async fn execute_declared_seed_calls(
+    env: &crate::engine::agent::tool_dispatch::DispatchEnv<'_>,
+    history: &mut Vec<Message>,
+    calls: Vec<crate::engine::message::ToolCall>,
+) -> anyhow::Result<()> {
     for call in calls {
         let name = call.function.name.clone();
         crate::engine::agent::tool_dispatch::execute_ordinary_call(
@@ -378,6 +490,36 @@ mod tests {
             remaining_seed_reads(&history, vec![first, second.clone()]),
             vec![second],
             "a seed declaration is not completion; only its paired tool result suppresses replay"
+        );
+    }
+
+    #[test]
+    fn parked_seed_replay_retains_declared_suffix_by_original_call_id() {
+        let first = SeedRead {
+            tool: "read".to_string(),
+            args: serde_json::json!({"path": "first.rs"}),
+        };
+        let second = SeedRead {
+            tool: "grep".to_string(),
+            args: serde_json::json!({"pattern": "second", "path": "src"}),
+        };
+        let first_call = synthetic_seed_call("seed-read-first", &first);
+        let second_call = synthetic_seed_call("seed-read-second", &second);
+        let history = vec![
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    AssistantContent::ToolCall(first_call.clone()),
+                    AssistantContent::ToolCall(second_call.clone()),
+                ],
+            },
+            crate::engine::message::tool_result_message(&first_call, "approved".to_string()),
+        ];
+
+        assert_eq!(
+            pending_declared_seed_calls(&history),
+            vec![second_call],
+            "after a parked seed replays, the driver must retain every later declared seed for ordinary dispatch"
         );
     }
 }

@@ -1914,6 +1914,25 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             ));
                         }
                     };
+                let seed_reads_receipt = args.get("seed_reads_receipt").and_then(Value::as_str);
+                if let Err(err) = crate::engine::seed_reads::authorize_handoff(
+                    session,
+                    agent,
+                    &child,
+                    &seed_reads,
+                    seed_reads_receipt,
+                ) {
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        err
+                    ));
+                }
                 let todo_ids = task_todo_ids(&args);
                 if !noninteractive {
                     // Timeline event (Part B): an interactive `task`

@@ -4444,9 +4444,10 @@ impl Driver {
                 .context("driver stack is empty")?
                 .history;
             ensure_or_restore_parked_tool_call(history, &payload)?;
-            if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
-                return Ok(());
-            }
+            // A crash may occur after this seed's paired result commits but
+            // before its remaining siblings execute. Do not return early for
+            // a completed seed: the continuation below derives those
+            // siblings from the declared history and closes that gap.
         }
 
         let ctx = crate::engine::tool::ToolCtx {
@@ -4554,27 +4555,52 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            interrupt_id,
-            response,
-            question,
-            async {
-                let frame = self.stack.last_mut().context("driver stack is empty")?;
-                crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
-                    crate::engine::agent::tool_dispatch::execute_ordinary_call(
-                        &env,
-                        &mut frame.history,
-                        &call,
-                        &payload.tool,
-                        crate::db::tool_calls::Recovery::Clean,
-                        None,
-                    )
+        let call_completed = self.stack.last().is_some_and(|frame| {
+            crate::engine::agent::history_ends_with_tool_result_call(
+                &frame.history,
+                &payload.call_id,
+            )
+        });
+        if !call_completed {
+            crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                interrupt_id,
+                response,
+                question,
+                async {
+                    let frame = self.stack.last_mut().context("driver stack is empty")?;
+                    crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
+                        crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                            &env,
+                            &mut frame.history,
+                            &call,
+                            &payload.tool,
+                            crate::db::tool_calls::Recovery::Clean,
+                            None,
+                        )
+                        .await
+                    })
                     .await
-                })
-                .await
-            },
-        )
-        .await
+                },
+            )
+            .await?;
+        }
+        if payload.call_id.starts_with("seed-read-") {
+            let pending = self
+                .stack
+                .last()
+                .map(|frame| crate::engine::seed_reads::pending_declared_seed_calls(&frame.history))
+                .unwrap_or_default();
+            if !pending.is_empty() {
+                let frame = self.stack.last_mut().context("driver stack is empty")?;
+                crate::engine::seed_reads::execute_declared_seed_calls(
+                    &env,
+                    &mut frame.history,
+                    pending,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn execute_interactive_seed_reads(
@@ -4664,9 +4690,7 @@ impl Driver {
             self.loop_guard_threshold,
         )
         .await?;
-        Ok(Message::user(
-            "The host executed the explore-selected read-only seed calls above. Use their fresh results and continue with the delegated implementation brief without rediscovering them.",
-        ))
+        Ok(crate::engine::seed_reads::completion_prompt())
     }
 
     async fn continue_after_parked_interrupt_replay(
@@ -4772,6 +4796,19 @@ impl Driver {
                 }
                 Ok(PendingScheduledReentry::Advanced(result)) => Some(result),
             };
+            // A replayed seed call is a pre-inference continuation rather
+            // than a model turn. Once every declared seed has a result, feed
+            // the same host notice used by the uninterrupted path into the
+            // first inference without first duplicating it in history.
+            let seed_reads_completed = crate::engine::agent::tool_result_call_id(&next_prompt)
+                .is_some_and(|call_id| call_id.starts_with("seed-read-"))
+                && self.stack.last().is_some_and(|frame| {
+                    crate::engine::seed_reads::pending_declared_seed_calls(&frame.history)
+                        .is_empty()
+                });
+            if seed_reads_completed {
+                next_prompt = crate::engine::seed_reads::completion_prompt();
+            }
             self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
             let is_root = self.stack.len() == 1;

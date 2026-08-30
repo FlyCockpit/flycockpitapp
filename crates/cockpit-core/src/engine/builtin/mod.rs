@@ -1287,7 +1287,7 @@ fn compose_system_prompt_with(
 /// line. Project guidance is injected as user-role history, not system text.
 /// Used by the fresh-chat context
 /// indicator to size the actual baseline sent to the model, in both
-/// daemon (calibrated) and daemonless (raw cl100k) modes. Pass the empty
+/// daemon (calibrated) and isolated (raw cl100k) modes. Pass the empty
 /// string for `session_short_id` when no session exists yet — it simply
 /// omits the `Session:` line, matching what the engine sends.
 pub fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> String {

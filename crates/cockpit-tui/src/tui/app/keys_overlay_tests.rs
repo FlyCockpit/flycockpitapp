@@ -164,7 +164,6 @@ async fn app_with_sessions_preview_pane_async(tmp: &tempfile::TempDir) -> App {
 
 fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
     let dead_socket = tmp.path().join("no-daemon.sock");
-    app.daemon_prompt = None;
     app.daemon_connected = true;
     app.startup_background.daemon_socket = Some(dead_socket.clone());
     let session_id = Uuid::new_v4();

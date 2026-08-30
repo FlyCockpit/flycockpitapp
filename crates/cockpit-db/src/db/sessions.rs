@@ -2800,7 +2800,7 @@ impl Db {
 
     /// Assemble the `/sessions` browser rows for one level, the single
     /// source of truth shared by the daemon's `ListSessions` handler and
-    /// the TUI's daemonless direct-DB fallback. The level selection
+    /// the TUI's disconnected direct-DB fallback. The level selection
     /// mirrors the RPC contract:
     ///
     /// - `parent_session_id = Some(p)` → the direct forks of `p`
@@ -2812,7 +2812,7 @@ impl Db {
     /// (`latest_activity_at`), and open-interrupt count. Live-only fields
     /// (running/processing) are *not* part of this method — callers
     /// attach them separately (the daemon from its registry, the TUI
-    /// daemonless path not at all). A per-row auxiliary-query miss
+    /// disconnected path not at all). A per-row auxiliary-query miss
     /// degrades that field to its empty default rather than failing the
     /// whole list, matching the daemon handler's best-effort behavior.
     pub async fn list_session_summaries(
@@ -4948,7 +4948,7 @@ mod tests {
     #[tokio::test]
     async fn list_session_summaries_scopes_orders_and_groups_forks() {
         // The factored query is the single source of truth for the
-        // `/sessions` browser (daemon RPC + TUI daemonless). Assert the
+        // `/sessions` browser (daemon RPC + TUI disconnected fallback). Assert the
         // three level selections produce the same shape the daemon handler
         // used: project-scoped roots newest-first, forks grouped under a
         // parent, fork/descendant counts, and the all-projects fallback.
@@ -5245,7 +5245,7 @@ mod tests {
         let recent = db.most_recent_open_session_for("p").await.unwrap().unwrap();
         assert_eq!(recent.session_id, root.session_id);
 
-        // Browser summaries (the daemon + daemonless shared path).
+        // Browser summaries (the daemon + disconnected shared path).
         let summaries = db
             .list_session_summaries(Some("p"), None, 100)
             .await

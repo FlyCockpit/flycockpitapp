@@ -1596,7 +1596,7 @@ pub(in crate::engine::driver) fn overlapping_write_scope_pair(
 impl Driver {
     /// A child installation is immutable evidence only when its durable parent
     /// is itself pinned to a resolved installed-agent profile.  Legacy roots
-    /// (including daemonless callers) have no such profile, so publishing an
+    /// (including isolated callers) have no such profile, so publishing an
     /// installation UUID for them would create a row the ledger cannot prove.
     async fn published_child_installation_id(
         &self,

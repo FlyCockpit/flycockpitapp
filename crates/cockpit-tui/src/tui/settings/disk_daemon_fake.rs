@@ -1412,7 +1412,7 @@ fn save_mcp_config(
         serde_json::from_str(secret_values_json)
             .map_err(|error| format!("invalid MCP secret values: {error}"))?;
     if !secret_values.is_empty() {
-        return Err("daemonless MCP fallback cannot persist staged secrets".into());
+        return Err("unavailable daemon connection cannot persist staged secrets".into());
     }
     let mut raw: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -1455,7 +1455,7 @@ fn save_mcp_config(
                     &effective.servers[&name],
                 ) {
                     return Err(format!(
-                        "daemonless MCP fallback cannot materialize credential-bearing server `{name}`"
+                        "unavailable daemon connection cannot materialize credential-bearing server `{name}`"
                     ));
                 }
                 touched.insert(name.clone());
@@ -1504,7 +1504,7 @@ fn save_mcp_config(
             .ok_or_else(|| format!("MCP server `{name}` disappeared during validation"))?;
         if cockpit_core::mcp::config::server_has_credential_material(server) {
             return Err(format!(
-                "daemonless MCP fallback cannot persist credential-bearing server `{name}`"
+                "unavailable daemon connection cannot persist credential-bearing server `{name}`"
             ));
         }
     }

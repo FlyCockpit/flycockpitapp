@@ -472,6 +472,8 @@ pub(crate) async fn generate_session_metadata_fork(
             completion = model.complete_captured_with_sealed_egress(
                 &system,
                 &history,
+                // Retain the user instruction so a failed attempt can be
+                // represented in the recovery turn's provider history.
                 prompt.clone(),
                 &tools,
                 params.clone(),

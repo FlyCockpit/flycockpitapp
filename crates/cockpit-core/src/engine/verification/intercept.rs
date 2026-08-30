@@ -371,19 +371,19 @@ async fn run_verification(
         // serialized envelope for every candidate. Candidate bodies are
         // separately reserved at the completion-token cap below.
         let candidate_envelopes = (0..rule.generators.len())
-            .map(|_| {
-                serde_json::json!({
-                    "candidate_id": Uuid::from_u128(u128::MAX),
-                    "kind": "approve_original",
-                    "args": null,
-                    "critique": "",
-                })
+            .map(|_| CollectedCandidate {
+                candidate_id: Uuid::from_u128(u128::MAX),
+                answer: super::generate::GeneratorAnswer {
+                    kind: super::generate::CandidateKind::ApproveOriginal,
+                    args: None,
+                    critique: String::new(),
+                },
             })
             .collect::<Vec<_>>();
         let adjudicator_prompt = super::adjudicate::adjudication_prompt(
+            input.resolved_name,
             input.args,
             &candidate_envelopes,
-            &instructions,
         )?;
         let adjudicator_tool = serde_json::to_string(&super::adjudicate::verdict_tool())?;
         let adjudicator_fixed = format!(
@@ -594,6 +594,16 @@ async fn run_verification(
         Vec::new()
     };
     if recorded_action.is_none() {
+        // Validate the complete trusted-minimal boundary before the failure
+        // policy below can consider dispatching anything. In particular, an
+        // `on_adjudication_failure = dispatch_original` policy must never turn
+        // an unbuildable projection into an automatic allow.
+        let projection_ready = super::adjudicate::adjudication_prompt(
+            input.resolved_name,
+            input.args,
+            &collected,
+        )
+        .is_ok();
         let adjudicator = match adjudicator_model {
             Some(model) => Ok(model),
             None if !profile_snapshot_id.is_nil() => {
@@ -616,6 +626,9 @@ async fn run_verification(
             .saturating_add(ledger.collection_duration_ms);
         let adjudication = match collection_error {
             Some(error) => Err(error.context("verification candidate collection failed")),
+            None if !projection_ready => Err(anyhow::anyhow!(
+                "verification could not build a trusted-minimal approval projection"
+            )),
             None => match adjudicator {
                 Ok(adjudicator) => {
                     let mut adjudicator = adjudicator.as_ref().clone();
@@ -629,9 +642,9 @@ async fn run_verification(
                         &input.ctx.config,
                         &input.ctx.cancel,
                         &format!("{}:verification-adjudicator", input.agent.name),
+                        input.resolved_name,
                         input.args,
                         &collected,
-                        &instructions,
                         adjudication_deadline,
                     )
                     .await
@@ -641,6 +654,30 @@ async fn run_verification(
         };
         let verdict = match adjudication {
             Ok(verdict) => verdict,
+            Err(_) if !projection_ready => {
+                let op = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared")?;
+                input
+                    .session
+                    .db
+                    .suppress_verification_synthesis(
+                        input.session.id,
+                        created.operation_id,
+                        op.revision,
+                        VerificationSynthesisTerminal::Failed,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                return Ok(VerificationOutcome::Block {
+                    message: "verification could not safely project this action for automatic approval; user approval is required"
+                        .into(),
+                    operation_id: Some(created.operation_id),
+                });
+            }
             Err(_)
                 if rule.resolved_on_adjudication_failure()
                     == crate::agents::OnAdjudicationFailure::DispatchOriginal =>

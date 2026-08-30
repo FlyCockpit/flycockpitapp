@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::config::extended::RedactConfig;
@@ -30,7 +31,7 @@ use crate::config::extended::{
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
 use crate::engine::message::Message;
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
 
@@ -62,6 +63,7 @@ const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
 const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
 const MAX_KNOWLEDGE_DEPTH: usize = 32;
@@ -70,7 +72,7 @@ const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
-    &[MEMORY_SEARCH_TOOL_NAME]
+    &[MEMORY_SEARCH_TOOL_NAME, KNOWLEDGE_DREAM_APPLY_TOOL_NAME]
 }
 
 unsafe extern "C" {
@@ -166,6 +168,7 @@ pub(crate) trait KbProvider: Send + Sync {
         &self,
         dream: &KnowledgeDreamCommit,
         mutation: &dyn KnowledgeDreamMutation,
+        cancel: &CancellationToken,
     ) -> Result<KnowledgeDreamGitOutcome>;
     fn with_embedder(&self, embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider>;
 }
@@ -713,12 +716,20 @@ enum PreparedKnowledgeGit {
     Deferred(String),
 }
 
-/// Acquire the same stable, cross-process KB fence used by sidecar rebuilds.
-/// The fence covers the full fetch -> apply -> commit -> push transaction;
-/// Git's index locks only protect individual subprocesses.
-fn acquire_knowledge_write_process_lock(root: &Path) -> Result<SidecarProcessLock> {
+/// Wait for the write fence without pinning an async executor worker.  The
+/// caller supplies the turn/shutdown cancellation token, which is consulted
+/// between non-blocking lock attempts.  Once the fence is acquired, the
+/// transaction deliberately runs to its clean commit/defer boundary rather
+/// than abandoning Git halfway through a mutation.
+fn acquire_knowledge_write_process_lock_cancellable(
+    root: &Path,
+    cancel: &CancellationToken,
+) -> Result<SidecarProcessLock> {
     let sidecars = KbSidecars::in_root(root).canonicalized()?;
     loop {
+        if cancel.is_cancelled() {
+            bail!("knowledge dream write cancelled while waiting for the knowledge base fence");
+        }
         if let Some(lock) = SidecarProcessLock::try_acquire(&sidecars)? {
             return Ok(lock);
         }
@@ -741,12 +752,29 @@ pub(crate) fn apply_knowledge_dream<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    apply_knowledge_dream_cancellable(root, merge_policy, dream, &CancellationToken::new(), apply)
+}
+
+/// Blocking Git transaction used by the async provider boundary below and by
+/// focused synchronous tests.  Cancellation is intentionally honored before
+/// the callback is entered; after that point rollback/commit must complete so
+/// a cancelled request never leaves a staged or rebasing repository behind.
+fn apply_knowledge_dream_cancellable<F>(
+    root: &Path,
+    merge_policy: KnowledgeBaseMergePolicy,
+    dream: &KnowledgeDreamCommit,
+    cancel: &CancellationToken,
+    apply: F,
+) -> Result<KnowledgeDreamGitOutcome>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
     // The model mutation itself is fenced, not just Git. Losing the private
     // process fence is a hard error because otherwise two daemons can write
     // the same OKF files concurrently.
-    let process_lock = acquire_knowledge_write_process_lock(root)?;
+    let process_lock = acquire_knowledge_write_process_lock_cancellable(root, cancel)?;
     process_lock.revalidate_root()?;
     let mutation_root = process_lock.mutation_root();
     let prepared = prepare_knowledge_git(&mutation_root, merge_policy, &dream.knowledge_base_id);
@@ -784,6 +812,9 @@ where
 
     // The supplied path is descriptor-bound on Linux and has been proven to
     // name the held root everywhere else. Callers must write only through it.
+    if cancel.is_cancelled() {
+        bail!("knowledge dream write cancelled before applying model output");
+    }
     process_lock.revalidate_root()?;
     let applied = apply(&mutation_root);
     if let Err(error) = applied {
@@ -967,6 +998,18 @@ fn prepare_knowledge_git(
 
     if let Some(remote_name) = remote.as_deref() {
         if let Err(error) = knowledge_git_fetch(root, remote_name) {
+            return PreparedKnowledgeGit::Deferred(error.to_string());
+        }
+        // A prior run can have committed successfully yet deferred after a
+        // transport failure.  Synchronize that already-created commit before
+        // invoking the deterministic model mutation again: otherwise the
+        // retry can be a no-op and the remote would remain behind forever.
+        if let Err(error) = synchronize_pending_knowledge_dream_pushes(
+            root,
+            remote_name,
+            &branch,
+            knowledge_base_id,
+        ) {
             return PreparedKnowledgeGit::Deferred(error.to_string());
         }
     }
@@ -1464,6 +1507,99 @@ fn knowledge_git_push(root: &Path, remote: &str, branch: &str) -> Result<crate::
     knowledge_git(root, &["push", remote, &destination])
 }
 
+/// Finish publication of commits retained locally by an earlier deferred
+/// dream.  This happens before the next mutation, so a ledger retry whose
+/// deterministic write is now empty still catches the remote up.  The base
+/// branch is rebased first; review branches are independent proposals and are
+/// pushed by explicit refspec without checking them out or rebasing them onto
+/// a newly accepted base.
+fn synchronize_pending_knowledge_dream_pushes(
+    root: &Path,
+    remote: &str,
+    base_branch: &str,
+    knowledge_base_id: &str,
+) -> Result<()> {
+    synchronize_pending_knowledge_base_branch(root, remote, base_branch)?;
+
+    let review_prefix = format!("cockpit/dream/{}/", git_branch_component(knowledge_base_id));
+    let branches = knowledge_git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/cockpit/dream",
+        ],
+    )?;
+    if !branches.success {
+        bail!(
+            "listing pending knowledge review branches failed: {}",
+            branches.stderr.trim()
+        );
+    }
+    for branch in branches
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty() && branch.starts_with(&review_prefix))
+    {
+        let remote_contains_branch = knowledge_git_remote_ref(root, remote, branch)?
+            .map(|remote_ref| knowledge_git_is_ancestor(root, branch, &remote_ref))
+            .transpose()?
+            .unwrap_or(false);
+        if remote_contains_branch {
+            continue;
+        }
+        let destination = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let pushed = knowledge_git(root, &["push", remote, &destination])?;
+        if !pushed.success {
+            bail!(
+                "pushing pending knowledge review branch `{branch}` failed: {}",
+                pushed.stderr.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn synchronize_pending_knowledge_base_branch(
+    root: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<()> {
+    if let Some(remote_ref) = knowledge_git_remote_ref(root, remote, branch)? {
+        if !knowledge_git_is_ancestor(root, &remote_ref, branch)? {
+            knowledge_git_rebase_remote_branch(root, remote, branch, true)?;
+        }
+        if knowledge_git_is_ancestor(root, branch, &remote_ref)? {
+            return Ok(());
+        }
+    }
+    let pushed = knowledge_git_push(root, remote, branch)?;
+    if !pushed.success {
+        bail!(
+            "pushing pending knowledge dream commit failed: {}",
+            pushed.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn knowledge_git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let check = knowledge_git(root, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    if check.success {
+        return Ok(true);
+    }
+    // Git uses exit status 1 for the ordinary "not an ancestor" result.
+    // Any stderr is instead a malformed/missing ref and must fail closed.
+    if check.stderr.trim().is_empty() {
+        return Ok(false);
+    }
+    bail!(
+        "checking pending knowledge history ancestry failed: {}",
+        check.stderr.trim()
+    )
+}
+
 fn git_branch_component(value: &str) -> String {
     let component: String = value
         .chars()
@@ -1645,6 +1781,7 @@ impl KbProvider for LocalKb {
         &self,
         dream: &KnowledgeDreamCommit,
         mutation: &dyn KnowledgeDreamMutation,
+        cancel: &CancellationToken,
     ) -> Result<KnowledgeDreamGitOutcome> {
         if self.snapshot.is_some() {
             bail!(
@@ -1652,9 +1789,13 @@ impl KbProvider for LocalKb {
                 self.entry.id
             );
         }
-        apply_knowledge_dream(&self.root, self.entry.merge_policy, dream, |root| {
-            mutation.apply(root)
-        })
+        apply_knowledge_dream_cancellable(
+            &self.root,
+            self.entry.merge_policy,
+            dream,
+            cancel,
+            |root| mutation.apply(root),
+        )
     }
 
     fn with_embedder(&self, embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider> {
@@ -1683,6 +1824,7 @@ impl KbProvider for RemoteKb {
         &self,
         _dream: &KnowledgeDreamCommit,
         _mutation: &dyn KnowledgeDreamMutation,
+        _cancel: &CancellationToken,
     ) -> Result<KnowledgeDreamGitOutcome> {
         bail!(
             "remote knowledge-base dream writes are hosted and not implemented for `{}`",
@@ -3356,11 +3498,15 @@ pub(crate) async fn apply_registered_knowledge_dream<F>(
     allowed_knowledge_bases: Option<&BTreeSet<String>>,
     extended: &ExtendedConfig,
     dream: &KnowledgeDreamCommit,
+    cancel: CancellationToken,
     mutation: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: Fn(&Path) -> Result<()> + Send + Sync,
+    F: Fn(&Path) -> Result<()> + Send + Sync + 'static,
 {
+    if cancel.is_cancelled() {
+        bail!("knowledge dream write cancelled before resolving its provider");
+    }
     let bundles = attached_bundles(session, cwd, allowed_knowledge_bases, extended).await?;
     let knowledge_base = bundles
         .into_iter()
@@ -3371,9 +3517,13 @@ where
                 dream.knowledge_base_id
             )
         })?;
-    knowledge_base
-        .provider
-        .apply_dream(dream, &ClosureKnowledgeDreamMutation(mutation))
+    let provider = knowledge_base.provider;
+    let dream = dream.clone();
+    tokio::task::spawn_blocking(move || {
+        provider.apply_dream(&dream, &ClosureKnowledgeDreamMutation(mutation), &cancel)
+    })
+    .await
+    .context("knowledge dream write task terminated before completing")?
 }
 
 #[derive(Debug, Clone)]
@@ -3544,12 +3694,34 @@ pub(crate) async fn with_memory_search_if_attached(
     let allowed_knowledge_bases = definition
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
         .cloned();
-    if attached_bundles_available(session, cwd, allowed_knowledge_bases.as_ref(), config).await {
-        toolbox.with(Arc::new(MemorySearchTool {
+    let toolbox =
+        if attached_bundles_available(session, cwd, allowed_knowledge_bases.as_ref(), config).await
+        {
+            toolbox.with(Arc::new(MemorySearchTool {
+                allowed_knowledge_bases: allowed_knowledge_bases.clone(),
+            }))
+        } else {
+            toolbox.without(MEMORY_SEARCH_TOOL_NAME)
+        };
+    let extended = config.extended();
+    let dream_writes_enabled =
+        attached_bundles(session, cwd, allowed_knowledge_bases.as_ref(), &extended)
+            .await
+            .is_ok_and(|bundles| {
+                bundles.iter().any(|knowledge_base| {
+                    knowledge_base.entry.dream_model.is_some()
+                        && matches!(
+                            &knowledge_base.entry.source,
+                            KnowledgeBaseSource::Local { .. }
+                        )
+                })
+            });
+    if dream_writes_enabled {
+        toolbox.with(Arc::new(KnowledgeDreamApplyTool {
             allowed_knowledge_bases,
         }))
     } else {
-        toolbox.without(MEMORY_SEARCH_TOOL_NAME)
+        toolbox.without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
     }
 }
 
@@ -3558,6 +3730,333 @@ pub(crate) async fn with_memory_search_if_attached(
 /// call time without re-resolving a mutable, same-named agent definition.
 pub(crate) struct MemorySearchTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+/// The production model-facing dream executor.  It accepts a complete,
+/// validated OKF projection rather than a filesystem path, and invokes the
+/// registered-provider boundary so local writes always pass through the Git
+/// transaction/fence.  It is advertised only for attached local KBs that
+/// configure a dream model.
+pub(crate) struct KnowledgeDreamApplyTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeDreamApplyArgs {
+    knowledge_base_id: String,
+    sessions_dreamed: usize,
+    writes: Vec<KnowledgeDreamWrite>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KnowledgeDreamWrite {
+    path: String,
+    content: String,
+}
+
+#[async_trait]
+impl Tool for KnowledgeDreamApplyTool {
+    fn name(&self) -> &str {
+        KNOWLEDGE_DREAM_APPLY_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "Commit validated dream-produced OKF files to an attached knowledge base"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Write the complete changed OKF concept/resource files from a completed knowledge dream. \
+             The named KB must be attached and configured with a dream model. Paths are single files \
+             at the KB root; submit the full contents for every file changed by this dream. The daemon \
+             validates the resulting OKF bundle, records a structured Git commit when available, and \
+             safely defers remote publication rather than force-pushing."
+                .to_string(),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutating
+    }
+
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "knowledgeBaseId": {
+                    "type": "string",
+                    "description": "Attached local knowledge base ID"
+                },
+                "sessionsDreamed": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of source sessions included in this dream"
+                },
+                "writes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Single root-level OKF .md or referenced .csv/.jsonl/.ndjson file"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Complete replacement contents for this file"
+                            }
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["knowledgeBaseId", "sessionsDreamed", "writes"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: KnowledgeDreamApplyArgs = typed_args(args)?;
+        if args.knowledge_base_id.trim().is_empty() {
+            return Err(invalid_input(
+                "knowledgeDreamApply knowledgeBaseId must not be empty",
+            ));
+        }
+        if args.sessions_dreamed == 0 {
+            return Err(invalid_input(
+                "knowledgeDreamApply sessionsDreamed must be at least 1",
+            ));
+        }
+        let writes = validate_knowledge_dream_writes(args.writes)?;
+        let extended = ctx.config.extended();
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+        )
+        .await?;
+        let knowledge_base = bundles
+            .iter()
+            .find(|knowledge_base| knowledge_base.entry.id == args.knowledge_base_id)
+            .with_context(|| {
+                format!(
+                    "dream target knowledge base `{}` is not attached to this workspace/agent",
+                    args.knowledge_base_id
+                )
+            })?;
+        if !matches!(
+            &knowledge_base.entry.source,
+            KnowledgeBaseSource::Local { .. }
+        ) {
+            bail!(
+                "remote knowledge-base dream writes are hosted and not implemented for `{}`",
+                knowledge_base.entry.id
+            );
+        }
+        let model = knowledge_base.entry.dream_model.clone().with_context(|| {
+            format!(
+                "knowledge base `{}` has no configured dream model",
+                knowledge_base.entry.id
+            )
+        })?;
+        let concepts_written = writes
+            .iter()
+            .filter(|write| is_knowledge_dream_concept_path(&write.path))
+            .count();
+        let data_files_written = writes.len().saturating_sub(concepts_written);
+        let dream = KnowledgeDreamCommit {
+            knowledge_base_id: args.knowledge_base_id,
+            model,
+            sessions_dreamed: args.sessions_dreamed,
+            concepts_written,
+            data_files_written,
+        };
+        let cancel = dream_write_cancellation(ctx);
+        let session = ctx.session.clone();
+        let cwd = ctx.cwd.clone();
+        let outcome = apply_registered_knowledge_dream(
+            &session,
+            &cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+            &dream,
+            cancel.cancel.clone(),
+            move |root| apply_knowledge_dream_writes(root, &writes),
+        )
+        .await;
+        Ok(render_knowledge_dream_outcome(outcome?))
+    }
+}
+
+struct DreamWriteCancellation {
+    cancel: CancellationToken,
+    shutdown_watcher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DreamWriteCancellation {
+    fn drop(&mut self) {
+        self.shutdown_watcher.abort();
+    }
+}
+
+fn dream_write_cancellation(ctx: &ToolCtx) -> DreamWriteCancellation {
+    let cancel = ctx.cancel.child_token();
+    let shutdown = ctx.shutdown_gate.clone();
+    let shutdown_cancel = cancel.clone();
+    let shutdown_watcher = tokio::spawn(async move {
+        let mut updates = shutdown.subscribe();
+        loop {
+            if shutdown.is_draining() {
+                shutdown_cancel.cancel();
+                return;
+            }
+            if updates.changed().await.is_err() {
+                shutdown_cancel.cancel();
+                return;
+            }
+        }
+    });
+    DreamWriteCancellation {
+        cancel,
+        shutdown_watcher,
+    }
+}
+
+fn validate_knowledge_dream_writes(
+    writes: Vec<KnowledgeDreamWrite>,
+) -> Result<Vec<KnowledgeDreamWrite>> {
+    if writes.is_empty() {
+        return Err(invalid_input(
+            "knowledgeDreamApply writes must not be empty",
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    let mut total_bytes = 0_usize;
+    for write in &writes {
+        let path = Path::new(&write.path);
+        let mut components = path.components();
+        let Some(std::path::Component::Normal(leaf)) = components.next() else {
+            return Err(invalid_input(format!(
+                "knowledgeDreamApply path `{}` must be a single file at the knowledge-base root",
+                write.path
+            )));
+        };
+        if components.next().is_some() || leaf != std::ffi::OsStr::new(&write.path) {
+            return Err(invalid_input(format!(
+                "knowledgeDreamApply path `{}` must be a single file at the knowledge-base root",
+                write.path
+            )));
+        }
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "md" | "csv" | "jsonl" | "ndjson") {
+            return Err(invalid_input(format!(
+                "knowledgeDreamApply path `{}` must end in .md, .csv, .jsonl, or .ndjson",
+                write.path
+            )));
+        }
+        if KB_MACHINE_STATE_GITIGNORE.contains(&write.path.as_str()) {
+            return Err(invalid_input(format!(
+                "knowledgeDreamApply path `{}` is reserved for machine-local state",
+                write.path
+            )));
+        }
+        if !paths.insert(write.path.clone()) {
+            return Err(invalid_input(format!(
+                "knowledgeDreamApply contains duplicate path `{}`",
+                write.path
+            )));
+        }
+        if write.content.len() > MAX_KNOWLEDGE_FILE_BYTES {
+            return Err(invalid_input(format!(
+                "knowledgeDreamApply file `{}` exceeds the knowledge file size limit",
+                write.path
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(write.content.len())
+            .ok_or_else(|| {
+                invalid_input(
+                    "knowledgeDreamApply content length overflowed the knowledge size limit",
+                )
+            })?;
+        if total_bytes > MAX_KNOWLEDGE_TOTAL_BYTES {
+            return Err(invalid_input(
+                "knowledgeDreamApply writes exceed the aggregate knowledge size limit",
+            ));
+        }
+    }
+    Ok(writes)
+}
+
+fn is_knowledge_dream_concept_path(path: &str) -> bool {
+    path.ends_with(".md") && !matches!(path, "index.md" | "log.md")
+}
+
+fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<()> {
+    for write in writes {
+        fs::write(root.join(&write.path), &write.content)
+            .with_context(|| format!("writing dream output {}", write.path))?;
+    }
+    // Validate in the transaction callback so malformed model output is
+    // rolled back by the apply-error path rather than left as a dirty,
+    // permanently deferred worktree.
+    let versioned = versioned_knowledge_paths(root)?;
+    for write in writes {
+        if !versioned.contains(&PathBuf::from(&write.path)) {
+            bail!(
+                "dream output {} is not a committed OKF document or referenced data file",
+                write.path
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutput {
+    let text = match outcome {
+        KnowledgeDreamGitOutcome::Skipped { reason } => {
+            format!("Knowledge dream applied; Git history was skipped: {reason}")
+        }
+        KnowledgeDreamGitOutcome::NoChanges { branch } => {
+            format!("Knowledge dream produced no versioned changes on `{branch}`.")
+        }
+        KnowledgeDreamGitOutcome::Committed {
+            commit,
+            branch,
+            pushed,
+        } => format!(
+            "Knowledge dream committed `{commit}` on `{branch}`{}.",
+            if pushed { " and pushed it" } else { "" }
+        ),
+        KnowledgeDreamGitOutcome::Deferred {
+            branch,
+            commit,
+            reason,
+        } => format!(
+            "Knowledge dream output was retained{}{}; synchronization deferred: {reason}",
+            branch
+                .as_deref()
+                .map(|branch| format!(" on `{branch}`"))
+                .unwrap_or_default(),
+            commit
+                .as_deref()
+                .map(|commit| format!(" at `{commit}`"))
+                .unwrap_or_default(),
+        ),
+    };
+    ToolOutput::text(text)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4711,24 +5210,21 @@ timestamp: 2026-08-29T12:00:00Z
         fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         fs::write(
             tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"openai:gpt-5","trustRequired":true,"mergePolicy":"auto"}]}"#,
         )
         .unwrap();
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
-        assert!(
-            with_memory_search_if_attached(
-                base,
-                &session,
-                tmp.path(),
-                None,
-                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
-                    tmp.path()
-                )
-            )
-            .await
-            .names()
-            .contains(&"memory_search")
-        );
+        let attached_toolbox = with_memory_search_if_attached(
+            base,
+            &session,
+            tmp.path(),
+            None,
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        )
+        .await;
+        let attached = attached_toolbox.names();
+        assert!(attached.contains(&"memory_search"));
+        assert!(attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME));
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -4832,6 +5328,26 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[test]
+    fn cancelled_dream_does_not_enter_the_fenced_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = apply_knowledge_dream_cancellable(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            &cancel,
+            |root| {
+                fs::write(root.join("must-not-apply.md"), "not reached")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled while waiting"));
+        assert!(!tmp.path().join("must-not-apply.md").exists());
+    }
+
+    #[test]
     fn advanced_remote_rebases_and_retries_a_nonconflicting_dream_push() {
         let tmp = TempDir::new().unwrap();
         let remote = tmp.path().join("knowledge-remote.git");
@@ -4895,6 +5411,78 @@ timestamp: 2026-08-29T12:00:00Z
                 .unwrap();
         assert!(remote_tree.contains("local-concept.md"));
         assert!(remote_tree.contains("remote-concept.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_local_commit_is_pushed_before_a_noop_ledger_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("knowledge-remote.git");
+        let remote_arg = remote.to_string_lossy().into_owned();
+        crate::git::run_git_checked(tmp.path(), &["init", "-q", "--bare", &remote_arg]).unwrap();
+
+        let seed = tmp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        write_bundle(&seed);
+        crate::git::run_git_checked(&seed, &["init", "-q"]).unwrap();
+        configure_knowledge_git(&seed);
+        crate::git::run_git_checked(&seed, &["add", "--all"]).unwrap();
+        crate::git::run_git_checked(&seed, &["commit", "-q", "-m", "seed"]).unwrap();
+        crate::git::run_git_checked(&seed, &["branch", "-M", "main"]).unwrap();
+        crate::git::run_git_checked(&seed, &["remote", "add", "origin", &remote_arg]).unwrap();
+        crate::git::run_git_checked(&seed, &["push", "-q", "origin", "main"]).unwrap();
+
+        let root = tmp.path().join("writer");
+        let root_arg = root.to_string_lossy().into_owned();
+        crate::git::run_git_checked(
+            tmp.path(),
+            &["clone", "-q", "--branch", "main", &remote_arg, &root_arg],
+        )
+        .unwrap();
+        configure_knowledge_git(&root);
+        let hook = root.join(".git/hooks/pre-push");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let deferred = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            |root| {
+                write_dream_concept(root, "deferred", "Retained local dream output.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            deferred,
+            KnowledgeDreamGitOutcome::Deferred {
+                commit: Some(_),
+                ..
+            }
+        ));
+        fs::remove_file(&hook).unwrap();
+
+        let retry = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            |root| {
+                write_dream_concept(root, "deferred", "Retained local dream output.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(retry, KnowledgeDreamGitOutcome::NoChanges { .. }));
+        crate::git::run_git_checked(&root, &["fetch", "-q", "origin"]).unwrap();
+        let remote_tree =
+            crate::git::run_git_checked(&root, &["ls-tree", "-r", "--name-only", "origin/main"])
+                .unwrap();
+        assert!(remote_tree.contains("deferred.md"));
     }
 
     #[test]

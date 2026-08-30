@@ -651,9 +651,11 @@ mod tests {
     use crate::config::providers::{ModelTrust, ProviderEntry, ProvidersConfig};
     use crate::daemon::session_worker::SessionWorkerHandle;
     use crate::daemon::shutdown::ShutdownSignal;
+    use crate::db::session_log::SessionEventKind;
     use crate::db::workspace_trust::WorkspaceTrustMode;
     use crate::locks::LockManager;
     use crate::session::Session;
+    use serde_json::json;
 
     fn test_registry(db: &Db) -> SessionRegistry {
         let registry = SessionRegistry::new(
@@ -748,6 +750,7 @@ mod tests {
         providers.providers.insert(
             "p".into(),
             ProviderEntry {
+                url: "http://127.0.0.1:9/v1".to_string(),
                 trust: Some(ModelTrust::Trusted),
                 models: vec![crate::config::providers::ModelEntry {
                     id: "dream".into(),
@@ -1000,6 +1003,132 @@ mod tests {
             scheduled.await.unwrap().unwrap().disposition,
             DreamRunDisposition::Empty
         );
+    }
+
+    #[tokio::test]
+    async fn dream_run_creates_auditable_transcript_excluded_from_recall_and_future_sources() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(&db);
+        let entry = test_dream_entry(None);
+        let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let project_id = crate::session::project_id_for(root.path());
+        db.set_workspace_trust(root.path(), WorkspaceTrustMode::Trust)
+            .await
+            .unwrap();
+
+        let ordinary = db
+            .create_session(&project_id, project_root.as_str(), "Build")
+            .await
+            .unwrap();
+        db.attach_session_to_knowledge_base(&entry.id, project_root.as_str(), ordinary.session_id)
+            .await
+            .unwrap();
+
+        // Enter the actual scheduler-owned run path. Its real registry attach
+        // persists the Dream worker's deferred session row before the worker
+        // can receive the turn; no direct flag mutation is used in this test.
+        let run = tokio::spawn({
+            let db = db.clone();
+            let registry = registry.clone();
+            let workspace_root = root.path().to_path_buf();
+            let entry = entry.clone();
+            async move {
+                run_knowledge_dream(
+                    &db,
+                    &registry,
+                    &workspace_root,
+                    &entry,
+                    test_dream_model(),
+                    HistoryCallerTrust::Trusted,
+                    false,
+                    false,
+                )
+                .await
+            }
+        });
+
+        let dream_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(row) = db
+                    .list_sessions(true, 10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.is_dream_session)
+                {
+                    break row.session_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a non-empty dream run must persist its Dream transcript");
+
+        assert!(
+            db.get_session(dream_id)
+                .await
+                .unwrap()
+                .expect("Dream transcript row")
+                .is_dream_session,
+            "the scheduler's production session creation path must persist the audit flag"
+        );
+
+        let marker = "dream transcript acceptance marker";
+        for session_id in [ordinary.session_id, dream_id] {
+            db.insert_session_event(
+                session_id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": marker }),
+            )
+            .await
+            .unwrap();
+        }
+        db.attach_session_to_knowledge_base(&entry.id, project_root.as_str(), dream_id)
+            .await
+            .unwrap();
+
+        let undreamed = db
+            .undreamed_sessions_for_knowledge_base(
+                &entry.id,
+                project_root.as_str(),
+                "consumer",
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            undreamed
+                .iter()
+                .map(|source| source.session_id)
+                .collect::<Vec<_>>(),
+            vec![ordinary.session_id],
+            "the persisted Dream transcript must never re-enter a later dream source set"
+        );
+
+        let recall = db
+            .search_candidates(marker, Some(&project_id), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            recall.iter().map(|hit| hit.session_id).collect::<Vec<_>>(),
+            vec![ordinary.session_id],
+            "default recall must omit the same persisted Dream transcript"
+        );
+        assert!(
+            db.thread_turns(dream_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|turn| turn.text == marker),
+            "explicit session reads must retain the Dream transcript for audit"
+        );
+
+        run.abort();
+        let _ = run.await;
+        let _ = registry.interrupt_and_stop(dream_id).await;
     }
 
     #[tokio::test]

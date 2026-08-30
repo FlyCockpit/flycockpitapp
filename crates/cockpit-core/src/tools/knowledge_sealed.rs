@@ -15,6 +15,26 @@ use crate::sealed::{
 
 const CREATE_KB_SEALED_VALUE_TOOL: &str = "knowledge_sealed_create";
 const COPY_KB_SEALED_VALUE_TOOL: &str = "knowledge_sealed_copy";
+const SEALED_LITERAL_LEDGER_PLACEHOLDER: &str = "[sealed literal omitted]";
+
+/// Project arguments for tool identities whose inputs are sensitive even when
+/// the concrete tool is not present in the current toolbox. Ledger safety is a
+/// property of the resolved identity, not of transient tool availability.
+pub(crate) fn ledger_args_for_sensitive_tool(tool: &str, args: &Value) -> Option<Value> {
+    if tool != CREATE_KB_SEALED_VALUE_TOOL {
+        return None;
+    }
+
+    let mut projected = serde_json::Map::new();
+    if let Some(knowledge_base_id) = args.get("knowledge_base_id") {
+        projected.insert("knowledge_base_id".to_string(), knowledge_base_id.clone());
+    }
+    projected.insert(
+        "literal".to_string(),
+        Value::String(SEALED_LITERAL_LEDGER_PLACEHOLDER.to_string()),
+    );
+    Some(Value::Object(projected))
+}
 
 #[derive(Deserialize)]
 struct CreateArgs {
@@ -80,6 +100,11 @@ impl Tool for CreateKnowledgeBaseSealedValueTool {
         let reference = KnowledgeBaseSealedStore::new(ctx.session.secret_vault().clone())
             .create(kb_id, SealedLiteral::new(args.literal))?;
         Ok(ToolOutput::text(reference.token()?))
+    }
+
+    fn ledger_args(&self, args: &Value) -> Value {
+        ledger_args_for_sensitive_tool(self.name(), args)
+            .expect("knowledge_sealed_create has an identity-based ledger projection")
     }
 }
 
@@ -155,5 +180,34 @@ impl Tool for CopyKnowledgeBaseSealedValueTool {
             Ok(reference) => Ok(ToolOutput::text(reference.token()?)),
             Err(denied) => Ok(ToolOutput::text(denied.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_tool_identity_projection_omits_literal_and_unknown_fields() {
+        const SECRET: &str = "kb-sealed-ledger-secret";
+        let projected = ledger_args_for_sensitive_tool(
+            CREATE_KB_SEALED_VALUE_TOOL,
+            &serde_json::json!({
+                "knowledge_base_id": "kb-1",
+                "literal": SECRET,
+                "unexpected": SECRET,
+            }),
+        )
+        .expect("create tool has an identity projection");
+
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "knowledge_base_id": "kb-1",
+                "literal": SEALED_LITERAL_LEDGER_PLACEHOLDER,
+            })
+        );
+        assert!(!projected.to_string().contains(SECRET));
+        assert!(ledger_args_for_sensitive_tool("other", &serde_json::json!({})).is_none());
     }
 }

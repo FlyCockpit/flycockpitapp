@@ -262,29 +262,35 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     // private one-shot daemon; Code and Computer remain valid persistent
     // sessions as well.
     let result = if args.session.is_some() {
-        crate::daemon::client::run_assistant_daemon(|client, promoted_from_ephemeral| {
-            Box::pin(run_with_daemon(
-                client,
-                &args,
-                prompt,
-                no_sandbox,
-                &cwd,
-                seed_unset_trust,
-                promoted_from_ephemeral,
-            ))
+        crate::daemon::client::run_assistant_daemon(move |client, promoted_from_ephemeral| {
+            Box::pin(async move {
+                run_with_daemon(
+                    client,
+                    &args,
+                    prompt,
+                    no_sandbox,
+                    &cwd,
+                    seed_unset_trust,
+                    promoted_from_ephemeral,
+                )
+                .await
+            })
         })
         .await
     } else {
-        crate::daemon::client::run_one_shot_daemon(|client| {
-            Box::pin(run_with_daemon(
-                client,
-                &args,
-                prompt,
-                no_sandbox,
-                &cwd,
-                seed_unset_trust,
-                false,
-            ))
+        crate::daemon::client::run_one_shot_daemon(move |client| {
+            Box::pin(async move {
+                run_with_daemon(
+                    client,
+                    &args,
+                    prompt,
+                    no_sandbox,
+                    &cwd,
+                    seed_unset_trust,
+                    false,
+                )
+                .await
+            })
         })
         .await
     };

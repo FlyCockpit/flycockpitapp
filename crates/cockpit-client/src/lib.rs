@@ -197,6 +197,7 @@ impl LifecycleIntent {
     }
 }
 
+#[derive(Debug)]
 pub struct LifecycleResolution {
     pub endpoint: ClientEndpoint,
     pub owns_daemon: bool,

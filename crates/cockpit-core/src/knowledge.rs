@@ -22,8 +22,8 @@ use serde_json::json;
 #[cfg(test)]
 use crate::config::extended::RedactConfig;
 use crate::config::extended::{
-    ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseRegistryEntry,
-    KnowledgeBaseSource,
+    ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
+    KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
 };
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
@@ -108,7 +108,21 @@ pub(crate) struct IndexStats {
 #[derive(Debug, Clone)]
 pub(crate) struct AttachedKnowledgeBase {
     entry: KnowledgeBaseRegistryEntry,
-    local_root: Option<PathBuf>,
+    local: Option<AttachedLocalKb>,
+}
+
+#[derive(Debug, Clone)]
+struct AttachedLocalKb {
+    root: PathBuf,
+    /// Assistant knowledge is snapshotted by its provider through the verified
+    /// installation identity. Workspace KBs remain path-based.
+    assistant: Option<AssistantKnowledgeSource>,
+    sidecar_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct AssistantKnowledgeSource {
+    row: crate::db::assistants::AssistantRow,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +146,8 @@ pub(crate) trait KbProvider: Send + Sync {
 struct LocalKb {
     entry: KnowledgeBaseRegistryEntry,
     root: PathBuf,
+    assistant: Option<AssistantKnowledgeSource>,
+    sidecar_path: PathBuf,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -143,19 +159,61 @@ impl LocalKb {
     fn new(
         entry: KnowledgeBaseRegistryEntry,
         root: PathBuf,
+        assistant: Option<AssistantKnowledgeSource>,
+        sidecar_path: PathBuf,
         embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
         Self {
             entry,
             root,
+            assistant,
+            sidecar_path,
             embedder,
         }
+    }
+
+    fn assistant_knowledge_snapshot(&self) -> Result<Option<KnowledgeBundle>> {
+        let Some(assistant) = &self.assistant else {
+            return Ok(None);
+        };
+        let handle = match cockpit_config::config::open_config_directory_nofollow(&self.root) {
+            Ok(handle) => handle,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("opening assistant knowledge root {}", self.root.display())
+                });
+            }
+        };
+        drop(handle);
+        let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+            &self.root,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )?;
+        parse_bundle_snapshot(
+            PathBuf::from(format!("assistant://{}/knowledge", assistant.row.name)),
+            documents,
+        )
+        .map(Some)
     }
 }
 
 #[async_trait]
 impl KbProvider for LocalKb {
     async fn is_available(&self) -> Result<bool> {
+        if self.assistant.is_some() {
+            return Ok(self.assistant_knowledge_snapshot()?.is_some());
+        }
         match cockpit_config::config::open_config_directory_nofollow(&self.root) {
             Ok(handle) => {
                 drop(handle);
@@ -196,7 +254,12 @@ impl KbProvider for LocalKb {
             .into_iter()
             .next()
             .context("embedding query returned no vector")?;
-        let (index, _) = KnowledgeIndex::open(&self.root, embedder).await?;
+        let (index, _) = match self.assistant_knowledge_snapshot()? {
+            Some(snapshot) => {
+                KnowledgeIndex::open_snapshot(snapshot, self.sidecar_path.clone(), embedder).await?
+            }
+            None => KnowledgeIndex::open(&self.root, embedder).await?,
+        };
         let mut results = index.search_with_vector(&query_vector, query, limit)?;
         for result in &mut results {
             result.knowledge_base_id = self.entry.id.clone();
@@ -1134,12 +1197,13 @@ pub(crate) async fn inject_knowledge_for_turn(
     history: &mut Vec<Message>,
     session: &Session,
     cwd: &Path,
+    agent_name: &str,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     query: &str,
     redact: Arc<RedactionTable>,
 ) {
     let extended = config.extended();
-    let bundles = match attached_bundles(session, cwd, &extended).await {
+    let bundles = match attached_bundles(session, cwd, agent_name, &extended).await {
         Ok(bundles) => bundles,
         Err(error) => {
             tracing::warn!(%error, "refusing knowledge injection because assistant authority validation failed");
@@ -1204,6 +1268,24 @@ async fn retrieve_from_knowledge_bases(
     let mut all = Vec::new();
     for knowledge_base in knowledge_bases {
         let provider = provider_for(knowledge_base, Some(embedder.clone()))?;
+        match provider.is_available().await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    knowledge_base = %knowledge_base.entry.id,
+                    "skipping unavailable knowledge provider"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    knowledge_base = %knowledge_base.entry.id,
+                    "skipping knowledge provider whose availability could not be determined"
+                );
+                continue;
+            }
+        }
         all.extend(provider.retrieve(query, limit).await?);
     }
     all.sort_by(|a, b| {
@@ -1218,10 +1300,11 @@ async fn retrieve_from_knowledge_bases(
 pub(crate) async fn attached_bundles_available(
     session: &Session,
     cwd: &Path,
+    agent_name: &str,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> bool {
     let extended = config.extended();
-    match attached_bundles(session, cwd, &extended).await {
+    match attached_bundles(session, cwd, agent_name, &extended).await {
         Ok(bundles) => {
             for knowledge_base in bundles {
                 match provider_for(&knowledge_base, None) {
@@ -1253,18 +1336,29 @@ pub(crate) async fn attached_bundles_available(
 pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
+    agent_name: &str,
     extended: &ExtendedConfig,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
-    let active_agent = session.active_agent();
-    let allowed = crate::agents::resolve_with_assistant_db(cwd, &active_agent, &session.db)
+    let allowed = crate::agents::resolve_with_assistant_db(cwd, agent_name, &session.db)
         .await?
         .and_then(|agent| agent.vnext)
         .and_then(|vnext| vnext.allowed_knowledge_bases);
     let mut seen = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
-    for entry in &extended.knowledge_bases {
-        validate_registry_entry(entry)?;
-        if !seen.insert(entry.id.as_str()) {
+    let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
+    if let Some(assistant) = assistant_knowledge_registry_entry(session).await? {
+        registry.push(assistant);
+    }
+    registry.extend(
+        extended
+            .knowledge_bases
+            .iter()
+            .cloned()
+            .map(workspace_knowledge_base),
+    );
+    for RegistryKnowledgeBase { entry, local } in registry {
+        validate_registry_entry(&entry)?;
+        if !seen.insert(entry.id.clone()) {
             bail!(
                 "knowledge base registry contains duplicate ID `{}`",
                 entry.id
@@ -1279,20 +1373,91 @@ pub(crate) async fn attached_bundles(
         {
             continue;
         }
-        let local_root = match &entry.source {
-            KnowledgeBaseSource::Local { path } => Some(if path.is_absolute() {
-                path.clone()
+        let local = local.map(|local| {
+            let root = if local.root.is_absolute() {
+                local.root
             } else {
-                cwd.join(path)
-            }),
-            KnowledgeBaseSource::Remote { .. } => None,
-        };
-        knowledge_bases.push(AttachedKnowledgeBase {
-            entry: entry.clone(),
-            local_root,
+                cwd.join(local.root)
+            };
+            let sidecar_path = local
+                .sidecar_path
+                .unwrap_or_else(|| root.join(SIDE_CAR_FILE));
+            AttachedLocalKb {
+                root,
+                assistant: local.assistant,
+                sidecar_path,
+            }
         });
+        knowledge_bases.push(AttachedKnowledgeBase { entry, local });
     }
     Ok(knowledge_bases)
+}
+
+#[derive(Debug, Clone)]
+struct RegistryKnowledgeBase {
+    entry: KnowledgeBaseRegistryEntry,
+    local: Option<RegistryLocalKb>,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryLocalKb {
+    root: PathBuf,
+    assistant: Option<AssistantKnowledgeSource>,
+    sidecar_path: Option<PathBuf>,
+}
+
+fn workspace_knowledge_base(entry: KnowledgeBaseRegistryEntry) -> RegistryKnowledgeBase {
+    let local = match &entry.source {
+        KnowledgeBaseSource::Local { path } => Some(RegistryLocalKb {
+            root: path.clone(),
+            assistant: None,
+            sidecar_path: None,
+        }),
+        KnowledgeBaseSource::Remote { .. } => None,
+    };
+    RegistryKnowledgeBase { entry, local }
+}
+
+async fn assistant_knowledge_registry_entry(
+    session: &Session,
+) -> Result<Option<RegistryKnowledgeBase>> {
+    let Some(name) = &session.assistant_name else {
+        return Ok(None);
+    };
+    let Some(snapshot) = crate::assistants::snapshot(&session.db, name)
+        .await
+        .with_context(|| format!("validating assistant `{name}` knowledge root"))?
+    else {
+        return Ok(None);
+    };
+    let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
+    let config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&snapshot.row.config_json)
+            .context("parsing assistant identity for knowledge cache")?;
+    if config.installation_id.is_nil() {
+        bail!("assistant knowledge has no installation identity");
+    }
+    let cache_root = crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
+    cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
+    let entry = KnowledgeBaseRegistryEntry {
+        id: format!("assistant-{}", config.installation_id),
+        name: format!("Assistant: {name}"),
+        description: format!("Knowledge installed with assistant `{name}`."),
+        source: KnowledgeBaseSource::Local { path: root.clone() },
+        embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
+        dream_model: None,
+        dream_schedule: None,
+        trust_required: false,
+        merge_policy: KnowledgeBaseMergePolicy::Auto,
+    };
+    Ok(Some(RegistryKnowledgeBase {
+        entry,
+        local: Some(RegistryLocalKb {
+            root,
+            assistant: Some(AssistantKnowledgeSource { row: snapshot.row }),
+            sidecar_path: Some(cache_root.join(format!("{}.sqlite", config.installation_id))),
+        }),
+    }))
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
@@ -1353,10 +1518,12 @@ fn provider_for(
     knowledge_base: &AttachedKnowledgeBase,
     embedder: Option<Arc<dyn Embedder>>,
 ) -> Result<Arc<dyn KbProvider>> {
-    match (&knowledge_base.entry.source, &knowledge_base.local_root) {
-        (KnowledgeBaseSource::Local { .. }, Some(root)) => Ok(Arc::new(LocalKb::new(
+    match (&knowledge_base.entry.source, &knowledge_base.local) {
+        (KnowledgeBaseSource::Local { .. }, Some(local)) => Ok(Arc::new(LocalKb::new(
             knowledge_base.entry.clone(),
-            root.clone(),
+            local.root.clone(),
+            local.assistant.clone(),
+            local.sidecar_path.clone(),
             embedder,
         ))),
         (KnowledgeBaseSource::Remote { .. }, None) => Ok(Arc::new(RemoteKb {
@@ -1373,9 +1540,10 @@ pub(crate) async fn with_memory_search_if_attached(
     toolbox: crate::engine::tool::ToolBox,
     session: &Session,
     cwd: &Path,
+    agent_name: &str,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> crate::engine::tool::ToolBox {
-    if attached_bundles_available(session, cwd, config).await {
+    if attached_bundles_available(session, cwd, agent_name, config).await {
         toolbox.with(Arc::new(MemorySearchTool))
     } else {
         toolbox.without(MEMORY_SEARCH_TOOL_NAME)
@@ -1426,7 +1594,7 @@ impl Tool for MemorySearchTool {
             return Err(invalid_input("memory_search query must not be empty"));
         }
         let extended = ctx.config.extended();
-        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended).await?;
+        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &ctx.agent_id, &extended).await?;
         if bundles.is_empty() {
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
@@ -1809,7 +1977,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         };
 
         assert!(
-            attached_bundles(&session, tmp.path(), &extended)
+            attached_bundles(&session, tmp.path(), "test", &extended)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1819,14 +1987,14 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             WorkspaceTrustMode::Untrusted,
         );
         assert!(
-            attached_bundles(&session, tmp.path(), &extended)
+            attached_bundles(&session, tmp.path(), "test", &extended)
                 .await
                 .unwrap()
                 .is_empty()
         );
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
         assert_eq!(
-            attached_bundles(&session, tmp.path(), &extended)
+            attached_bundles(&session, tmp.path(), "test", &extended)
                 .await
                 .unwrap()
                 .len(),
@@ -1836,17 +2004,17 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[tokio::test]
-    async fn vnext_agent_allow_list_restricts_workspace_knowledge_registry() {
+    async fn executing_agent_allow_list_restricts_workspace_knowledge_registry() {
         let _env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
         session.set_active_agent("Build").unwrap();
-        let mut agent = crate::agents::embedded_default("Build").unwrap();
+        let mut agent = crate::agents::embedded_default("Plan").unwrap();
         agent.vnext.as_mut().unwrap().allowed_knowledge_bases =
             Some(BTreeSet::from(["project".to_string()]));
         let agent_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agent_dir).unwrap();
-        fs::write(agent_dir.join("Build.md"), agent.to_markdown().unwrap()).unwrap();
+        fs::write(agent_dir.join("Plan.md"), agent.to_markdown().unwrap()).unwrap();
 
         let mut project = project_knowledge_registry_entry();
         project.trust_required = false;
@@ -1861,11 +2029,122 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        let attached = attached_bundles(&session, tmp.path(), &extended)
+        let attached = attached_bundles(&session, tmp.path(), "Plan", &extended)
             .await
             .unwrap();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].entry.id, "project");
+    }
+
+    #[tokio::test]
+    async fn installed_assistant_knowledge_is_attached_as_a_verified_registry_entry() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        env.set_var("XDG_DATA_HOME", tmp.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let home = crate::assistants::default_home_dir("helper-bot").unwrap();
+        let installation_id = uuid::Uuid::from_u128(42);
+        crate::assistants::create_assistant_with_installation_id(
+            &db,
+            crate::assistants::CreateAssistantSpec {
+                name: "helper-bot".to_string(),
+                description: "Helper bot".to_string(),
+                prompt: "Help with tests.".to_string(),
+                home_dir: home.clone(),
+            },
+            installation_id,
+        )
+        .await
+        .unwrap();
+        write_bundle(&home.join("knowledge"));
+        let session = crate::session::Session::create_assistant_deferred_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "helper-bot",
+            "helper-bot",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let attached = attached_bundles(
+            &session,
+            tmp.path(),
+            "helper-bot",
+            &ExtendedConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].entry.id, format!("assistant-{installation_id}"));
+        assert!(
+            attached[0]
+                .local
+                .as_ref()
+                .and_then(|local| local.assistant.as_ref())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_knowledge_bases_do_not_block_available_retrieval() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let knowledge_root = tmp.path().join("available");
+        write_bundle(&knowledge_root);
+        let session = test_session(tmp.path()).await;
+        let available = KnowledgeBaseRegistryEntry {
+            id: "available".to_string(),
+            name: "Available".to_string(),
+            description: "Available local knowledge".to_string(),
+            source: KnowledgeBaseSource::Local {
+                path: PathBuf::from("available"),
+            },
+            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
+            dream_model: None,
+            dream_schedule: None,
+            trust_required: false,
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let mut missing = available.clone();
+        missing.id = "missing".to_string();
+        missing.name = "Missing".to_string();
+        missing.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("missing"),
+        };
+        let remote = KnowledgeBaseRegistryEntry {
+            id: "hosted".to_string(),
+            name: "Hosted".to_string(),
+            description: "Deferred hosted knowledge".to_string(),
+            source: KnowledgeBaseSource::Remote {
+                url: "https://knowledge.example.test".to_string(),
+            },
+            embedding_ownership: KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            dream_model: None,
+            dream_schedule: None,
+            trust_required: false,
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![available, missing, remote],
+            ..Default::default()
+        };
+
+        let attached = attached_bundles(&session, tmp.path(), "test", &extended)
+            .await
+            .unwrap();
+        let results = retrieve_from_knowledge_bases(
+            &attached,
+            mock_embedder(),
+            "release shipping procedure",
+            DEFAULT_SEARCH_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.knowledge_base_id == "available")
+        );
     }
 
     #[tokio::test]
@@ -1880,6 +2159,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 base.clone(),
                 &session,
                 tmp.path(),
+                "test",
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
                 )
@@ -1902,6 +2182,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 base,
                 &session,
                 tmp.path(),
+                "test",
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
                 )

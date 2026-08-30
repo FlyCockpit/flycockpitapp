@@ -472,7 +472,14 @@ pub(crate) async fn turn_toolbox(
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
-    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config).await;
+    toolbox = crate::knowledge::with_memory_search_if_attached(
+        toolbox,
+        session,
+        cwd,
+        &agent.name,
+        config,
+    )
+    .await;
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
     toolbox.apply_capabilities(&env, cwd, target)
 }

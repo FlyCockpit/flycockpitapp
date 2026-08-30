@@ -2227,6 +2227,7 @@ pub(crate) async fn run_turn(
         history,
         &session,
         &cwd,
+        &agent.name,
         &config,
         &knowledge_query,
         redact.clone(),

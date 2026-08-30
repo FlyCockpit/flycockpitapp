@@ -1090,6 +1090,20 @@ CREATE TABLE knowledge_dreamed_sessions (
 CREATE INDEX idx_knowledge_dreamed_sessions_last
     ON knowledge_dreamed_sessions(kb_id, consumer_id, dreamed_at_unix_ms DESC);
 
+-- Per-machine daemon dream scheduler state.  The completion ledger above is
+-- immutable evidence about individual source sessions; this row records the
+-- daemon's schedule cursor and also makes an empty scheduled fire visible to
+-- users as a successful check.
+CREATE TABLE knowledge_dream_schedule_state (
+    kb_id                       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    consumer_id                 TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
+    last_scheduled_at_unix_ms   INTEGER NOT NULL,
+    last_dreamed_at_unix_ms     INTEGER,
+    PRIMARY KEY (kb_id, consumer_id)
+);
+CREATE INDEX idx_knowledge_dream_schedule_state_last
+    ON knowledge_dream_schedule_state(kb_id, consumer_id, last_scheduled_at_unix_ms DESC);
+
 -- ---- sealed_values ---------------------------------------------------------
 -- Session-owned write-only values. The literal column is nullable so a vault
 -- item can replace the plaintext without a rebuild dance.

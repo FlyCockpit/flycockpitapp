@@ -5817,12 +5817,18 @@ async fn handle_serialized_request_impl(
                 .into_iter()
                 .map(|source| source.session_id)
                 .collect();
+            let last_dreamed_at_unix_ms = ctx
+                .db
+                .knowledge_base_last_dreamed_at(&knowledge_base_id, consumer.as_hex())
+                .await
+                .map_err(internal)?;
             Ok(Response::KnowledgeDreamStatus {
                 // CLI model selectors use the canonical `provider/model`
                 // spelling, while the dream engine's internal comparison is
                 // colon-delimited after attach.
                 model: format!("{}/{}", model.provider, model.model),
                 undreamed_session_ids,
+                last_dreamed_at_unix_ms,
             })
         }
 

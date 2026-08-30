@@ -172,12 +172,80 @@ impl Db {
         let consumer_id = consumer_id.to_owned();
         self.read(move |conn| {
             conn.query_row(
-                "SELECT MAX(dreamed_at_unix_ms) FROM knowledge_dreamed_sessions
-                 WHERE kb_id = ?1 AND consumer_id = ?2",
+                "SELECT MAX(last_dreamed_at_unix_ms) FROM (
+                    SELECT MAX(dreamed_at_unix_ms) AS last_dreamed_at_unix_ms
+                      FROM knowledge_dreamed_sessions
+                     WHERE kb_id = ?1 AND consumer_id = ?2
+                    UNION ALL
+                    SELECT last_dreamed_at_unix_ms
+                      FROM knowledge_dream_schedule_state
+                     WHERE kb_id = ?1 AND consumer_id = ?2
+                 )",
                 params![kb_id, consumer_id],
                 |row| row.get(0),
             )
             .context("loading knowledge-base last dreamed time")
+        })
+        .await
+    }
+
+    /// The daemon's successful schedule cursor. `checked_at_unix_ms` is
+    /// always advanced after a fire, while `last_dreamed_at_unix_ms` advances
+    /// only for the no-new-sessions fast path; non-empty runs publish their
+    /// displayed time through the immutable completion ledger instead.
+    pub async fn record_knowledge_dream_schedule_fire(
+        &self,
+        kb_id: &str,
+        consumer_id: &str,
+        checked_at_unix_ms: i64,
+        last_dreamed_at_unix_ms: Option<i64>,
+    ) -> Result<()> {
+        validate_kb_id(kb_id)?;
+        validate_consumer_id(consumer_id)?;
+        let kb_id = kb_id.to_owned();
+        let consumer_id = consumer_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO knowledge_dream_schedule_state
+                    (kb_id, consumer_id, last_scheduled_at_unix_ms, last_dreamed_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(kb_id, consumer_id) DO UPDATE SET
+                    last_scheduled_at_unix_ms = excluded.last_scheduled_at_unix_ms,
+                    last_dreamed_at_unix_ms = COALESCE(
+                        excluded.last_dreamed_at_unix_ms,
+                        knowledge_dream_schedule_state.last_dreamed_at_unix_ms
+                    )",
+                params![
+                    kb_id,
+                    consumer_id,
+                    checked_at_unix_ms,
+                    last_dreamed_at_unix_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn knowledge_base_last_scheduled_at(
+        &self,
+        kb_id: &str,
+        consumer_id: &str,
+    ) -> Result<Option<i64>> {
+        validate_kb_id(kb_id)?;
+        validate_consumer_id(consumer_id)?;
+        let kb_id = kb_id.to_owned();
+        let consumer_id = consumer_id.to_owned();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT last_scheduled_at_unix_ms
+                   FROM knowledge_dream_schedule_state
+                  WHERE kb_id = ?1 AND consumer_id = ?2",
+                params![kb_id, consumer_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("loading knowledge-base last scheduled time")
         })
         .await
     }
@@ -266,6 +334,33 @@ mod tests {
             db.record_knowledge_dream_completion("kb", "consumer", &[session.session_id])
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_empty_check_advances_displayed_time_without_a_completion_fact() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_knowledge_dream_schedule_fire("kb", "machine-a", 100, Some(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.knowledge_base_last_scheduled_at("kb", "machine-a")
+                .await
+                .unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            db.knowledge_base_last_dreamed_at("kb", "machine-a")
+                .await
+                .unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            db.knowledge_base_last_dreamed_at("kb", "machine-b")
+                .await
+                .unwrap(),
+            None,
+            "each machine keeps an independent schedule display"
         );
     }
 

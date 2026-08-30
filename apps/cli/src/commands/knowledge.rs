@@ -109,6 +109,7 @@ async fn dream_status(
         Response::KnowledgeDreamStatus {
             model,
             undreamed_session_ids,
+            ..
         } => Ok(DreamStatus {
             model,
             undreamed_session_ids,

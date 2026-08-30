@@ -34,6 +34,9 @@ pub enum Response {
     KnowledgeDreamStatus {
         model: String,
         undreamed_session_ids: Vec<Uuid>,
+        /// The per-machine displayed timestamp. A scheduled empty check
+        /// advances it even though no completion-ledger fact is inserted.
+        last_dreamed_at_unix_ms: Option<i64>,
     },
 
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),

@@ -368,6 +368,11 @@ async fn dispatch_tool_with_policy_unscoped(
                 "workspace lease is unavailable at this tool boundary: {error:#}"
             ))
         })?;
+    // Whole-workspace index/walk tools cannot prove their eventual file set
+    // before traversing. Keep trust-required KB sources out of those model
+    // operations at the common production dispatcher boundary.
+    crate::knowledge::ensure_workspace_tool_access(&ctx, name)
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
     // command/MCP/harness/filesystem/package/computer candidate carries facts

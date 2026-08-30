@@ -168,6 +168,64 @@ impl KnowledgeBaseRegistryEntry {
     }
 }
 
+/// Validate the KB policy that does not depend on the provider catalog.
+/// Remote KBs are served to arbitrary third-party agents, so a local-model
+/// trust promise is unenforceable and must be rejected at config load time.
+pub fn validate_knowledge_base_local_policy(entries: &[KnowledgeBaseRegistryEntry]) -> Result<()> {
+    for entry in entries {
+        if matches!(&entry.source, KnowledgeBaseSource::Remote { .. }) && entry.trust_required {
+            anyhow::bail!(
+                "knowledge base `{}` is remote and cannot set trustRequired; trustRequired is only enforceable for local knowledge bases",
+                entry.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate trust-required KBs against the effective provider catalog. This is
+/// intentionally a configuration boundary: a dream model that cannot access
+/// its KB must never be selected or persisted and only fail later at runtime.
+pub fn validate_knowledge_base_registry(
+    entries: &[KnowledgeBaseRegistryEntry],
+    providers: &crate::config::providers::ProvidersConfig,
+) -> Result<()> {
+    validate_knowledge_base_local_policy(entries)?;
+    for entry in entries {
+        if !entry.trust_required {
+            continue;
+        }
+        let Some(selector) = entry
+            .dream_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+        else {
+            continue;
+        };
+        let (provider, model) = selector
+            .split_once(':')
+            .or_else(|| selector.split_once('/'))
+            .filter(|(provider, model)| !provider.trim().is_empty() && !model.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge base `{}` dreamModel `{selector}` must use provider:model or provider/model",
+                    entry.id
+                )
+            })?;
+        if !providers
+            .resolve_trust(provider.trim(), model.trim())
+            .is_trusted()
+        {
+            anyhow::bail!(
+                "knowledge base `{}` requires a trusted dreamModel; `{selector}` is untrusted",
+                entry.id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn source_attachment_identity(source: &KnowledgeBaseSource) -> uuid::Uuid {
     let mut name = b"flycockpit/knowledge-attachment/v1\0".to_vec();
     match source {
@@ -2008,9 +2066,12 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
         }
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
+    let config = resolve_loaded_docs(&docs);
+    validate_knowledge_base_registry(&config.knowledge_bases, &providers)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
-        config: resolve_loaded_docs(&docs),
+        config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
     })
@@ -2060,6 +2121,8 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
     let config = resolve_loaded_docs(&docs);
+    validate_knowledge_base_registry(&config.knowledge_bases, &providers)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
         config,
@@ -2652,7 +2715,22 @@ impl ExtendedConfigDoc {
         parse_field!("compact_model", compact_model);
         parse_field!("btw_model", btw_model);
         parse_field!("embedding_model", embedding_model);
-        parse_field!("knowledgeBases", knowledge_bases);
+        if let Some(value) = raw.get("knowledgeBases") {
+            match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
+                Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {
+                    cfg.knowledge_bases = entries;
+                }
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                    );
+                    warnings.push(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         parse_field!("knowledge_inject_max_tokens", knowledge_inject_max_tokens);
         parse_field!("compact_prompt", compact_prompt);
         parse_field!("prompt_injection_guard", prompt_injection_guard);
@@ -2804,7 +2882,22 @@ impl ExtendedConfigDoc {
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
-        remove_malformed!("knowledgeBases", Vec<KnowledgeBaseRegistryEntry>);
+        if let Some(value) = obj.get("knowledgeBases") {
+            match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
+                Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {}
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                    );
+                    warnings.push(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                            .to_string(),
+                    );
+                    // An invalid upper registry must not reveal a lower one.
+                    obj.insert("knowledgeBases".into(), serde_json::json!([]));
+                }
+            }
+        }
         remove_malformed!("queuedMessagesAsSteering", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);

@@ -1500,49 +1500,88 @@ pub(crate) async fn attached_bundles(
     })
 }
 
-fn validate_dream_model_trust(
-    entry: &KnowledgeBaseRegistryEntry,
-    providers: &crate::config::providers::ProvidersConfig,
-) -> Result<()> {
-    if !entry.trust_required {
-        return Ok(());
-    }
-    let Some(selector) = entry
-        .dream_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(());
-    };
-    let (provider, model) = selector
-        .split_once(':')
-        .or_else(|| selector.split_once('/'))
-        .filter(|(provider, model)| !provider.trim().is_empty() && !model.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "knowledge base `{}` dream model `{selector}` must use provider:model or provider/model",
-                entry.id
-            )
-        })?;
-    if !providers
-        .resolve_trust(provider.trim(), model.trim())
-        .is_trusted()
-    {
-        bail!(
-            "knowledge base `{}` requires a trusted dream model; `{selector}` is untrusted",
-            entry.id
-        );
-    }
-    Ok(())
-}
-
 fn validate_dream_models(
     extended: &ExtendedConfig,
     providers: &crate::config::providers::ProvidersConfig,
 ) -> Result<()> {
-    for entry in &extended.knowledge_bases {
-        validate_dream_model_trust(entry, providers)?;
+    cockpit_config::config::extended::validate_knowledge_base_registry(
+        &extended.knowledge_bases,
+        providers,
+    )
+}
+
+/// Return canonical local KB roots withheld from this model. The result is
+/// shared by native-path and shell confinement gates so trust-required source
+/// Markdown cannot be reached through an ordinary filesystem surface.
+pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    if ctx.knowledge_access_trusted {
+        return Ok(Vec::new());
+    }
+    let mut roots = Vec::new();
+    for entry in &ctx.config.extended().knowledge_bases {
+        if !entry.trust_required {
+            continue;
+        }
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let root = if path.is_absolute() {
+            path.clone()
+        } else {
+            ctx.cwd.join(path)
+        };
+        let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot resolve trust-required knowledge base `{}` source: {error}",
+                entry.id
+            )
+        })?;
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Reject a direct native filesystem operation on a protected KB source.
+pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> Result<()> {
+    for root in denied_local_knowledge_roots(ctx)? {
+        if cockpit_host::path_containment::contained_under(&root, path) {
+            bail!(
+                "access denied: `{}` is in a local knowledge base that requires a trusted model",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Workspace-wide inspection tools walk their root internally and cannot
+/// safely prove which files a query will touch before traversal. Deny their
+/// entire operation whenever that root contains a trust-required local KB.
+/// Targeted native tools use [`ensure_local_knowledge_path_access`] instead.
+pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
+    const WORKSPACE_WALKERS: &[&str] = &[
+        "code",
+        "context_pack",
+        "change_impact",
+        "circular",
+        "deps",
+        "glob",
+        "graph",
+        "grep",
+        "hot",
+        "harness_invoke",
+        "search",
+        "symbol_find",
+        "tree",
+        "word",
+        "worktree_orchestrate",
+    ];
+    if WORKSPACE_WALKERS.contains(&tool_name) && !denied_local_knowledge_roots(ctx)?.is_empty() {
+        bail!(
+            "access denied: `{tool_name}` cannot inspect this workspace because it contains a local knowledge base that requires a trusted model"
+        );
     }
     Ok(())
 }
@@ -2904,7 +2943,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         )
         .expect_err("an untrusted dream model must be rejected for a trust-required KB");
 
-        assert!(error.to_string().contains("requires a trusted dream model"));
+        assert!(error.to_string().contains("requires a trusted dreamModel"));
         assert!(error.to_string().contains("untrusted-provider:dreamer"));
     }
 

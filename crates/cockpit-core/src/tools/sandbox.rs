@@ -173,6 +173,12 @@ pub async fn check_native_access(
         }
     };
 
+    // Trust-required local KBs are a hard filesystem boundary. This common
+    // native-path choke point covers read, write, edit, LSP, skills, and every
+    // future native tool that obtains host-path authority through this helper.
+    crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
+        .map_err(|error| invalid_input(error.to_string()))?;
+
     if within_boundary(ctx, &effective) {
         return Ok(effective);
     }

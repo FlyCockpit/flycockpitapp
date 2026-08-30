@@ -1164,6 +1164,36 @@ pub(crate) fn read_leaf_from_directory_handle(
     }
 }
 
+/// Capability-relative counterpart to [`read_leaf_from_directory_handle`] for
+/// a nested, normal relative path. The retained root stays authoritative for
+/// the entire traversal.
+pub(crate) fn read_relative_file_from_directory_handle(
+    directory: &std::fs::File,
+    relative: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("retained-directory relative read requires normal path components");
+    }
+    let mut current = directory.try_clone()?;
+    for component in &components[..components.len() - 1] {
+        let std::path::Component::Normal(component) = component else {
+            unreachable!("validated normal path component");
+        };
+        current = open_retained_child_directory_optional(&current, component)?
+            .context("knowledge resource directory does not exist")?;
+    }
+    let std::path::Component::Normal(leaf) = components[components.len() - 1] else {
+        unreachable!("validated normal path component");
+    };
+    read_leaf_from_directory_handle(&current, leaf, max_bytes)
+}
+
 /// Read one optional, bounded regular leaf beneath an already-open directory.
 ///
 /// This is the capability-relative counterpart of [`read_file_nofollow`].
@@ -1637,6 +1667,24 @@ pub(crate) fn snapshot_markdown_tree_nofollow(
     max_total_bytes: usize,
 ) -> Result<Vec<(PathBuf, String)>> {
     let root_handle = open_directory_handle_nofollow(root)?;
+    snapshot_markdown_tree_from_retained_directory_nofollow(
+        &root_handle,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )
+}
+
+pub(crate) fn snapshot_markdown_tree_from_retained_directory_nofollow(
+    root_handle: &std::fs::File,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<(PathBuf, String)>> {
     let mut output = Vec::new();
     let mut total = 0usize;
     let mut entries = 0usize;
@@ -1648,7 +1696,7 @@ pub(crate) fn snapshot_markdown_tree_nofollow(
         max_total_bytes,
     };
     snapshot_markdown_directory(
-        &root_handle,
+        root_handle,
         Path::new(""),
         &mut output,
         &mut total,

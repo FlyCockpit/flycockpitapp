@@ -8,14 +8,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
-#[cfg(test)]
 use std::fs;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -32,8 +33,13 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
 
-pub(crate) const SIDE_CAR_FILE: &str = ".cockpit-knowledge.sqlite";
-pub(crate) const INDEX_LOGIC_VERSION: i64 = 1;
+/// Durable, paid projection of local KB chunks.  This database deliberately
+/// contains no OKF metadata or FTS state, so rebuilding the other sidecar can
+/// reuse its vectors without talking to an embedding provider.
+pub(crate) const EMBEDDINGS_FILE: &str = "embeddings.sqlite";
+/// Disposable local projection of a KB's OKF markdown and sibling resources.
+pub(crate) const INDEX_FILE: &str = "index.sqlite";
+pub(crate) const INDEX_LOGIC_VERSION: i64 = 2;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
@@ -64,6 +70,14 @@ pub(crate) struct KnowledgeBundle {
     pub index_md: Option<String>,
     pub log_md: Option<String>,
     pub concepts: Vec<KnowledgeConcept>,
+    resources: Vec<KnowledgeResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnowledgeResource {
+    concept_id: String,
+    path: PathBuf,
+    body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,8 +149,425 @@ struct LocalKb {
     entry: KnowledgeBaseRegistryEntry,
     root: PathBuf,
     snapshot: Option<KnowledgeBundle>,
-    sidecar_path: PathBuf,
+    sidecars: KbSidecars,
     embedder: Option<Arc<dyn Embedder>>,
+}
+
+#[derive(Debug, Clone)]
+struct KbSidecars {
+    embeddings: PathBuf,
+    index: PathBuf,
+}
+
+impl KbSidecars {
+    fn in_root(root: &Path) -> Self {
+        Self {
+            embeddings: root.join(EMBEDDINGS_FILE),
+            index: root.join(INDEX_FILE),
+        }
+    }
+
+    /// Resolve the already-existing parent directories before using sidecar
+    /// paths as an identity. Registry entries may spell one KB through a
+    /// symlink or a lexical alias; the sidecar filenames themselves are not
+    /// allowed to be symlinks and are checked separately when opened.
+    fn canonicalized(&self) -> Result<Self> {
+        fn canonical_sidecar(path: &Path) -> Result<PathBuf> {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .context("knowledge sidecar has no parent directory")?;
+            let name = path
+                .file_name()
+                .context("knowledge sidecar has no file name")?;
+            Ok(fs::canonicalize(parent)
+                .with_context(|| {
+                    format!(
+                        "canonicalizing knowledge sidecar parent {}",
+                        parent.display()
+                    )
+                })?
+                .join(name))
+        }
+
+        Ok(Self {
+            embeddings: canonical_sidecar(&self.embeddings)?,
+            index: canonical_sidecar(&self.index)?,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        self.embeddings
+            .parent()
+            .expect("knowledge sidecar path always has its KB root as a parent")
+    }
+}
+
+fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("knowledge sidecar lock registry poisoned");
+    if let Some(lock) = locks.get(&sidecars.embeddings).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(sidecars.embeddings.clone(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Process-wide ownership of a KB while a provider call is in flight.
+///
+/// This fence is deliberately independent of either SQLite sidecar *and* the
+/// replaceable KB directory. Generated files and the entire KB root may be
+/// replaced while an embedding request is in flight. The Unix fence is a
+/// stable, private lock outside the KB, keyed by its canonical pathname; the
+/// retained directory descriptor separately anchors every sidecar read and
+/// publish to the root that was present when ownership began. On Windows a
+/// no-delete lease additionally keeps that root and its ancestors from being
+/// replaced while path-based sidecar operations are in flight. Windows also
+/// uses a named kernel mutex derived from the canonical pathname.
+struct SidecarProcessLock {
+    directory: fs::File,
+    #[cfg(unix)]
+    fence: fs::File,
+    #[cfg(windows)]
+    _directory_lease: cockpit_host::private_fs::held_directory::WindowsWorkspaceExecutionLease,
+    #[cfg(windows)]
+    mutex: std::os::windows::io::OwnedHandle,
+}
+
+impl SidecarProcessLock {
+    #[cfg(unix)]
+    fn try_acquire(sidecars: &KbSidecars) -> Result<Option<Self>> {
+        let directory = cockpit_config::config::open_config_directory_nofollow(sidecars.root())
+            .with_context(|| {
+                format!(
+                    "retaining knowledge base directory for process lock {}",
+                    sidecars.root().display()
+                )
+            })?;
+        let lock_dir =
+            cockpit_config::config::resolve::cockpit_state_dir()?.join("knowledge-sidecar-locks");
+        cockpit_host::private_fs::ensure_private_dir(&lock_dir)
+            .map_err(anyhow::Error::from)
+            .context("preparing private knowledge sidecar lock directory")?;
+        let identity = sidecars.root().as_os_str().as_encoded_bytes();
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(identity);
+        let leaf = format!(
+            "{}.lock",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let fence = cockpit_host::private_fs::open_private_file_at(
+            &lock_dir,
+            std::ffi::OsStr::new(&leaf),
+            cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
+            "knowledge sidecar process lock",
+        )
+        .map_err(anyhow::Error::from)
+        .context("opening stable knowledge sidecar process lock")?;
+        match try_lock_sidecar_fence(&fence)? {
+            true => Ok(Some(Self { directory, fence })),
+            false => Ok(None),
+        }
+    }
+
+    #[cfg(windows)]
+    fn try_acquire(sidecars: &KbSidecars) -> Result<Option<Self>> {
+        use sha2::{Digest as _, Sha256};
+        use std::ffi::OsStr;
+        use std::os::windows::{
+            ffi::OsStrExt as _,
+            io::{AsRawHandle as _, FromRawHandle as _},
+        };
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{FALSE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        let identity: Vec<u8> = sidecars
+            .root()
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let name = format!(
+            "Global\\FlycockpitKnowledgeSidecar-{:x}",
+            Sha256::digest(identity)
+        );
+        let name: Vec<u16> = OsStr::new(&name).encode_wide().chain(Some(0)).collect();
+        // SAFETY: the name is NUL-terminated and the returned handle is owned
+        // by this process once wrapped below.
+        let handle = unsafe { CreateMutexW(ptr::null(), FALSE, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error()).context("creating knowledge sidecar mutex");
+        }
+        // SAFETY: CreateMutexW returned a valid owned handle above.
+        let mutex = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+        // SAFETY: mutex is a valid mutex handle. A zero timeout makes this
+        // acquisition polling-compatible without blocking the Tokio runtime.
+        match unsafe { WaitForSingleObject(mutex.as_raw_handle() as _, 0) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                // A named mutex serializes callers by stable KB spelling, but
+                // does not itself retain the directory object. Take the
+                // retained authority and its no-delete lease only after the
+                // mutex is owned, so the snapshot and every later path-based
+                // sidecar operation refer to one unreplaceable root identity.
+                let authority = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(sidecars.root())
+                    .with_context(|| {
+                        format!(
+                            "retaining knowledge base directory for process lock {}",
+                            sidecars.root().display()
+                        )
+                    })?;
+                let directory_lease = authority
+                    .acquire_windows_execution_lease(sidecars.root())
+                    .with_context(|| {
+                        format!(
+                            "leasing knowledge base directory for process lock {}",
+                            sidecars.root().display()
+                        )
+                    })?;
+                let directory = authority
+                    .retained_directory_handle()
+                    .context("cloning retained knowledge base directory")?;
+                Ok(Some(Self {
+                    directory,
+                    _directory_lease: directory_lease,
+                    mutex,
+                }))
+            }
+            WAIT_TIMEOUT => Ok(None),
+            result => Err(io::Error::last_os_error()).with_context(|| {
+                format!("waiting for knowledge sidecar mutex failed with result {result}")
+            }),
+        }
+    }
+}
+
+impl SidecarProcessLock {
+    /// Return the root capability selected while the process fence was
+    /// acquired. Source snapshots and generated sidecars must use this exact
+    /// directory rather than reopen its diagnostic path spelling.
+    fn directory(&self) -> &fs::File {
+        &self.directory
+    }
+}
+
+impl Drop for SidecarProcessLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Err(error) = unlock_sidecar_fence(&self.fence) {
+            tracing::warn!(%error, "releasing knowledge sidecar process lock failed");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::System::Threading::ReleaseMutex;
+
+            // SAFETY: this instance acquired the mutex in try_acquire and has
+            // not released it yet. Closing the OwnedHandle follows this call.
+            if unsafe { ReleaseMutex(self.mutex.as_raw_handle() as _) } == 0 {
+                tracing::warn!(error = %io::Error::last_os_error(), "releasing knowledge sidecar process lock failed");
+            }
+        }
+    }
+}
+
+async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarProcessLock> {
+    loop {
+        if let Some(lock) = SidecarProcessLock::try_acquire(sidecars)? {
+            return Ok(lock);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Acquire the cross-process fence before reading source bytes. Returning both
+/// values makes it impossible for callers to discard the directory capability
+/// that selected the snapshot and later publish into a separately reopened KB
+/// pathname.
+async fn snapshot_bundle_with_sidecar_fence(
+    sidecars: &KbSidecars,
+) -> Result<(KnowledgeBundle, SidecarProcessLock)> {
+    let process_lock = acquire_process_sidecar_lock(sidecars).await?;
+    let bundle =
+        parse_bundle_from_retained_root(sidecars.root().to_path_buf(), process_lock.directory())?;
+    Ok((bundle, process_lock))
+}
+
+#[cfg(unix)]
+fn try_lock_sidecar_fence(fence: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fence` stays open for the lifetime of SidecarProcessLock.
+    // flock is advisory, non-blocking, and operates on this valid descriptor.
+    let rc = unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.kind() {
+        io::ErrorKind::WouldBlock => Ok(false),
+        _ => Err(error).context("locking stable knowledge sidecar fence"),
+    }
+}
+
+#[cfg(unix)]
+fn unlock_sidecar_fence(fence: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: this is the matching unlock for a lock acquired on `directory`.
+    if unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl SidecarProcessLock {
+    fn try_acquire(_sidecars: &KbSidecars) -> Result<Option<Self>> {
+        bail!("knowledge sidecar process locking is unsupported on this platform")
+    }
+}
+
+fn has_git_marker_in_ancestors(root: &Path) -> bool {
+    let contains_git_marker = |path: &Path| {
+        path.ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+    };
+    contains_git_marker(root)
+        || fs::canonicalize(root).is_ok_and(|canonical_root| contains_git_marker(&canonical_root))
+}
+
+fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
+    // Sidecars were canonicalized for lock identity. Resolve the KB root the
+    // same way before deciding which artifacts are inside a Git worktree.
+    // Assistant snapshot roots are synthetic (`assistant://...`) and simply
+    // remain outside their private cache sidecars.
+    let sidecar_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let sidecar_paths: Vec<_> = [&sidecars.embeddings, &sidecars.index]
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(&sidecar_root).ok())
+        .collect();
+    // Assistant sidecars deliberately live in Flycockpit's private cache, not
+    // in the installed assistant bundle. There is nothing in that source tree
+    // to ignore in this case.
+    if sidecar_paths.is_empty() {
+        return Ok(());
+    }
+    let prefix = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-prefix"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8(output.stdout).context("reading knowledge repository Git prefix")?
+        }
+        Ok(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
+        Ok(output) => bail!(
+            "checking Git ignore rules for local knowledge base {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
+        Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
+    };
+    let exclude = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .context("locating local knowledge repository exclusion file")?;
+    if !exclude.status.success() {
+        bail!(
+            "locating Git exclusion file for local knowledge base {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&exclude.stderr).trim()
+        );
+    }
+    let exclude_path = PathBuf::from(
+        String::from_utf8(exclude.stdout)
+            .context("reading local knowledge repository exclusion path")?
+            .trim(),
+    );
+    let exclude_path = if exclude_path.is_absolute() {
+        exclude_path
+    } else {
+        root.join(exclude_path)
+    };
+    let prefix = prefix.trim().trim_matches('/');
+    let root_prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    };
+    let mut rules = String::from("# Flycockpit generated knowledge sidecars\n");
+    for path in &sidecar_paths {
+        rules.push('/');
+        rules.push_str(&root_prefix);
+        rules.push_str(&rel_string(path));
+        rules.push('\n');
+    }
+
+    // Ignore rules do not apply retroactively to an index entry. Refuse before
+    // SQLite can mutate a committed derived artifact; removing it from Git is
+    // an explicit repository-owner action, never an implicit side effect.
+    for path in &sidecar_paths {
+        let repository_path = format!("{root_prefix}{}", rel_string(path));
+        let repository_pathspec = format!(":/{repository_path}");
+        let tracked = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "--error-unmatch", "--", &repository_pathspec])
+            .output()
+            .context("checking whether knowledge sidecar is tracked by Git")?;
+        if tracked.status.success() {
+            bail!(
+                "knowledge sidecar {} is tracked by Git; remove it from the repository before using this knowledge base",
+                repository_path
+            );
+        }
+        // `--error-unmatch` uses exit status 1 for the one expected negative
+        // result: this pathname is not tracked. Any other status means Git
+        // could not authoritatively answer the mutation-safety question.
+        if tracked.status.code() != Some(1) {
+            bail!(
+                "checking whether knowledge sidecar {} is tracked by Git failed: {}",
+                repository_path,
+                String::from_utf8_lossy(&tracked.stderr).trim()
+            );
+        }
+    }
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading Git exclusion file {}", exclude_path.display()));
+        }
+    };
+    if !existing.contains(&rules) {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .with_context(|| format!("opening Git exclusion file {}", exclude_path.display()))?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(rules.as_bytes())?;
+        file.sync_data()?;
+    }
+
+    Ok(())
 }
 
 struct RemoteKb {
@@ -148,14 +579,14 @@ impl LocalKb {
         entry: KnowledgeBaseRegistryEntry,
         root: PathBuf,
         snapshot: Option<KnowledgeBundle>,
-        sidecar_path: PathBuf,
+        sidecars: KbSidecars,
         embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
         Self {
             entry,
             root,
             snapshot,
-            sidecar_path,
+            sidecars,
             embedder,
         }
     }
@@ -167,18 +598,12 @@ impl LocalKb {
         entry: KnowledgeBaseRegistryEntry,
         root: PathBuf,
         snapshot_root: PathBuf,
-        sidecar_path: PathBuf,
+        sidecars: KbSidecars,
     ) -> Result<Option<Self>> {
         let Some(snapshot) = Self::snapshot_assistant(&root, snapshot_root)? else {
             return Ok(None);
         };
-        Ok(Some(Self::new(
-            entry,
-            root,
-            Some(snapshot),
-            sidecar_path,
-            None,
-        )))
+        Ok(Some(Self::new(entry, root, Some(snapshot), sidecars, None)))
     }
 
     fn snapshot_assistant(root: &Path, snapshot_root: PathBuf) -> Result<Option<KnowledgeBundle>> {
@@ -197,16 +622,21 @@ impl LocalKb {
                 });
             }
         };
-        drop(handle);
-        let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-            root,
-            MAX_KNOWLEDGE_FILES,
-            MAX_KNOWLEDGE_ENTRIES,
-            MAX_KNOWLEDGE_DEPTH,
-            MAX_KNOWLEDGE_FILE_BYTES,
-            MAX_KNOWLEDGE_TOTAL_BYTES,
-        )?;
-        parse_bundle_snapshot(snapshot_root, documents).map(Some)
+        let documents =
+            cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+                &handle,
+                MAX_KNOWLEDGE_FILES,
+                MAX_KNOWLEDGE_ENTRIES,
+                MAX_KNOWLEDGE_DEPTH,
+                MAX_KNOWLEDGE_FILE_BYTES,
+                MAX_KNOWLEDGE_TOTAL_BYTES,
+            )?;
+        // Both markdown and referenced sibling data are read through `handle`.
+        // The public source paths below remain synthetic so results never
+        // disclose an assistant's private installation path.
+        let mut snapshot = parse_bundle_snapshot(root.to_path_buf(), documents, &handle)?;
+        snapshot.root = snapshot_root;
+        Ok(Some(snapshot))
     }
 }
 
@@ -256,12 +686,40 @@ impl KbProvider for LocalKb {
             .into_iter()
             .next()
             .context("embedding query returned no vector")?;
+        if query_vector.is_empty() {
+            bail!("embedding query returned an empty vector");
+        }
+        // A missing KB remains reportable as unavailable. Once it exists,
+        // canonicalize its sidecars immediately before locking so aliases in
+        // registry entries converge on one in-process identity. The process
+        // fence must be acquired before reading markdown: it retains the KB
+        // object that will receive the derived sidecars.
+        let sidecars = self.sidecars.canonicalized()?;
+        let sidecar_lock = sidecar_lock(&sidecars);
+        let _sidecar_guard = sidecar_lock.lock().await;
         let (index, _) = match &self.snapshot {
             Some(snapshot) => {
-                KnowledgeIndex::open_snapshot(snapshot.clone(), self.sidecar_path.clone(), embedder)
-                    .await?
+                let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+                KnowledgeIndex::open_snapshot_locked(
+                    snapshot.clone(),
+                    sidecars.clone(),
+                    &process_lock,
+                    embedder,
+                    Some(query_vector.len()),
+                )
+                .await?
             }
-            None => KnowledgeIndex::open(&self.root, embedder).await?,
+            None => {
+                let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
+                KnowledgeIndex::open_snapshot_locked(
+                    bundle,
+                    sidecars,
+                    &process_lock,
+                    embedder,
+                    Some(query_vector.len()),
+                )
+                .await?
+            }
         };
         let mut results = index.search_with_vector(&query_vector, query, limit)?;
         for result in &mut results {
@@ -300,31 +758,27 @@ impl KbProvider for RemoteKb {
     }
 }
 
-struct ReindexPlan {
-    concepts: Vec<KnowledgeConcept>,
-    stats: IndexStats,
-    stored_dimensions: Option<usize>,
-    force_clear_before_apply: bool,
-}
-
-struct EmbeddedConcept {
-    concept: KnowledgeConcept,
-    path: String,
-    hash: String,
-    chunks: Vec<(ChunkDoc, Vec<f32>)>,
-}
-
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
-    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-        &root,
-        MAX_KNOWLEDGE_FILES,
-        MAX_KNOWLEDGE_ENTRIES,
-        MAX_KNOWLEDGE_DEPTH,
-        MAX_KNOWLEDGE_FILE_BYTES,
-        MAX_KNOWLEDGE_TOTAL_BYTES,
-    )?;
-    parse_bundle_snapshot(root, documents)
+    let handle = cockpit_config::config::open_config_directory_nofollow(&root)?;
+    parse_bundle_from_retained_root(root, &handle)
+}
+
+/// Parse a bundle from a retained root capability. The path is retained for
+/// diagnostics only; every markdown and sibling-resource read is anchored to
+/// `handle`, so callers can carry one KB object identity from snapshot through
+/// sidecar publication.
+fn parse_bundle_from_retained_root(root: PathBuf, handle: &fs::File) -> Result<KnowledgeBundle> {
+    let documents =
+        cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+            handle,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )?;
+    parse_bundle_snapshot(root, documents, handle)
 }
 
 fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Result<()> {
@@ -343,24 +797,109 @@ fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Re
 
 fn finish_bundle(
     root: PathBuf,
+    root_handle: &std::fs::File,
     index_md: Option<String>,
     log_md: Option<String>,
     mut concepts: Vec<KnowledgeConcept>,
+    markdown_files: usize,
+    markdown_bytes: usize,
 ) -> Result<KnowledgeBundle> {
     concepts.sort_by(|a, b| a.path.cmp(&b.path));
     validate_unique_concept_ids(&root, &concepts)?;
+    let resources = load_referenced_resources(
+        &root,
+        root_handle,
+        &concepts,
+        markdown_files,
+        markdown_bytes,
+    )?;
     Ok(KnowledgeBundle {
         root,
         index_md,
         log_md,
         concepts,
+        resources,
     })
+}
+
+fn load_referenced_resources(
+    root: &Path,
+    root_handle: &std::fs::File,
+    concepts: &[KnowledgeConcept],
+    markdown_files: usize,
+    markdown_bytes: usize,
+) -> Result<Vec<KnowledgeResource>> {
+    let mut resources = Vec::new();
+    let mut total_bytes = markdown_bytes;
+    let mut files = markdown_files;
+    for concept in concepts {
+        let Some(resource) = concept.frontmatter.get("resource") else {
+            continue;
+        };
+        let resource_path = PathBuf::from(resource);
+        if resource_path.is_absolute()
+            || resource_path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!(
+                "knowledge concept {} has an invalid resource path `{resource}`",
+                root.join(&concept.path).display()
+            );
+        }
+        let extension = resource_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "csv" | "jsonl" | "ndjson") {
+            bail!(
+                "knowledge resource {} must be a .csv, .jsonl, or .ndjson file",
+                resource_path.display()
+            );
+        }
+        let relative = concept
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(&resource_path);
+        let absolute = root.join(&relative);
+        files = files
+            .checked_add(1)
+            .filter(|count| *count <= MAX_KNOWLEDGE_FILES)
+            .ok_or_else(|| {
+                anyhow::anyhow!("knowledge snapshot exceeds its resource count limit")
+            })?;
+        let bytes = cockpit_config::config::read_config_relative_file_from_retained_directory(
+            root_handle,
+            &relative,
+            MAX_KNOWLEDGE_FILE_BYTES,
+        )
+        .with_context(|| format!("reading knowledge resource {}", absolute.display()))?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .filter(|total| *total <= MAX_KNOWLEDGE_TOTAL_BYTES)
+            .ok_or_else(|| {
+                anyhow::anyhow!("knowledge snapshot exceeds its aggregate byte limit")
+            })?;
+        resources.push(KnowledgeResource {
+            concept_id: concept.id.clone(),
+            path: relative,
+            body: String::from_utf8(bytes).with_context(|| {
+                format!("knowledge resource {} is not UTF-8", absolute.display())
+            })?,
+        });
+    }
+    Ok(resources)
 }
 
 fn parse_bundle_snapshot(
     root: PathBuf,
     documents: Vec<(PathBuf, String)>,
+    root_handle: &std::fs::File,
 ) -> Result<KnowledgeBundle> {
+    let markdown_files = documents.len();
+    let markdown_bytes = documents.iter().map(|(_, body)| body.len()).sum();
     let mut index_md = None;
     let mut log_md = None;
     let mut concepts = Vec::new();
@@ -375,7 +914,15 @@ fn parse_bundle_snapshot(
             }
         }
     }
-    finish_bundle(root, index_md, log_md, concepts)
+    finish_bundle(
+        root,
+        root_handle,
+        index_md,
+        log_md,
+        concepts,
+        markdown_files,
+        markdown_bytes,
+    )
 }
 
 pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
@@ -553,33 +1100,11 @@ fn parse_string_list(value: Option<&String>) -> Vec<String> {
         .collect()
 }
 
-async fn embedding_dimensions_probe(embedder: &dyn Embedder) -> Result<usize> {
-    let dimensions = embedder
-        .embed(&["cockpit knowledge embedding dimension probe"])
-        .await
-        .context("probing knowledge embedding dimensions")?
-        .into_iter()
-        .next()
-        .context("embedding dimension probe returned no vector")?
-        .len();
-    if dimensions == 0 {
-        bail!("embedding dimension probe returned an empty vector");
-    }
-    Ok(dimensions)
-}
-
-fn sidecar_vec_table_exists(sidecar: &Path) -> Result<bool> {
-    if !sidecar.exists() {
-        return Ok(false);
-    }
-    let conn = open_sidecar_connection(sidecar)?;
-    table_exists(&conn, "vec_chunks")
-}
-
 pub(crate) struct KnowledgeIndex {
     #[allow(dead_code)]
     bundle: KnowledgeBundle,
-    conn: Connection,
+    index: Connection,
+    embeddings: Connection,
 }
 
 impl KnowledgeIndex {
@@ -587,50 +1112,69 @@ impl KnowledgeIndex {
         root: impl AsRef<Path>,
         embedder: Arc<dyn Embedder>,
     ) -> Result<(Self, IndexStats)> {
-        let root = root.as_ref().to_path_buf();
-        let bundle = parse_bundle(&root)?;
-        Self::open_snapshot(bundle, root.join(SIDE_CAR_FILE), embedder).await
+        Self::open_with_query_dimensions(root, embedder, None).await
     }
 
-    async fn open_snapshot(
-        bundle: KnowledgeBundle,
-        sidecar_path: PathBuf,
+    async fn open_with_query_dimensions(
+        root: impl AsRef<Path>,
         embedder: Arc<dyn Embedder>,
+        query_dimensions: Option<usize>,
     ) -> Result<(Self, IndexStats)> {
-        let conn = open_sidecar_connection(&sidecar_path)?;
-        ensure_schema(&conn)?;
-        let mut plan = plan_reindex(&conn, &bundle)?;
-        drop(conn);
-        if !bundle.concepts.is_empty() {
-            let current_dimensions = embedding_dimensions_probe(embedder.as_ref()).await?;
-            let dimensions_changed = plan
-                .stored_dimensions
-                .is_some_and(|stored| stored != current_dimensions);
-            let dimensions_missing_for_existing_table =
-                plan.stored_dimensions.is_none() && sidecar_vec_table_exists(&sidecar_path)?;
-            if dimensions_changed || dimensions_missing_for_existing_table {
-                plan.concepts = bundle.concepts.clone();
-                plan.stats.reused_files = 0;
-                plan.stats.indexed_files = plan.concepts.len();
-                plan.force_clear_before_apply = true;
-            }
-        }
-        let (embedded, embedded_chunks) =
-            embed_planned_concepts(&plan.concepts, embedder.as_ref()).await?;
-        let conn = open_sidecar_connection(&sidecar_path)?;
-        ensure_schema(&conn)?;
-        if plan.force_clear_before_apply {
-            clear_index(&conn)?;
-        }
-        let mut stats = plan.stats;
-        stats.embedded_chunks = embedded_chunks;
-        apply_embedded_concepts(&conn, embedded)?;
-        conn.execute(
-            "INSERT INTO intel_meta(key, value) VALUES('index_logic_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![INDEX_LOGIC_VERSION.to_string()],
-        )?;
-        Ok((Self { bundle, conn }, stats))
+        let root = root.as_ref().to_path_buf();
+        let sidecars = KbSidecars::in_root(&root).canonicalized()?;
+        let lock = sidecar_lock(&sidecars);
+        let _guard = lock.lock().await;
+        // Selecting the process fence before the source snapshot makes the
+        // retained directory capability the sole identity for this rebuild.
+        // A replacement of the root can therefore only be observed by the
+        // next rebuild; it cannot receive this rebuild's old projection.
+        let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
+        Self::open_snapshot_locked(bundle, sidecars, &process_lock, embedder, query_dimensions)
+            .await
+    }
+
+    /// Caller must hold the per-KB sidecar lock and the process fence that was
+    /// acquired before snapshotting the source. SQLite receives only verified
+    /// sidecar bytes and runs in memory; no SQLite connection crosses the
+    /// await in `sync_embeddings`, so this remains valid in KbProvider's
+    /// required Send future.
+    async fn open_snapshot_locked(
+        bundle: KnowledgeBundle,
+        sidecars: KbSidecars,
+        process_lock: &SidecarProcessLock,
+        embedder: Arc<dyn Embedder>,
+        query_dimensions: Option<usize>,
+    ) -> Result<(Self, IndexStats)> {
+        // The process-level lock is acquired before the source snapshot and
+        // retained across the provider await in `sync_embeddings`. It
+        // complements the in-process Tokio mutex held by the caller and makes
+        // different daemon data directories serialize their paid work against
+        // the same external KB. It also serializes the Git exclusion update
+        // before either sidecar can be opened.
+        ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
+        let index = open_index_connection(&sidecars.index, process_lock)?;
+        ensure_index_schema(&index)?;
+        rebuild_index(&index, &bundle)?;
+        persist_private_sidecar_connection(&index, &sidecars.index, process_lock)?;
+        let stats = sync_embeddings(
+            &sidecars.embeddings,
+            process_lock,
+            &bundle,
+            embedder.as_ref(),
+            query_dimensions,
+        )
+        .await?;
+        let embeddings = open_embeddings_connection(&sidecars.embeddings, process_lock)?;
+        ensure_embeddings_schema(&embeddings)?;
+        persist_private_sidecar_connection(&embeddings, &sidecars.embeddings, process_lock)?;
+        Ok((
+            Self {
+                bundle,
+                index,
+                embeddings,
+            },
+            stats,
+        ))
     }
 
     pub(crate) fn search_with_vector(
@@ -642,42 +1186,120 @@ impl KnowledgeIndex {
         if keyword_query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let vector_arm = vector_search(&self.conn, query_vector, limit.max(DEFAULT_SEARCH_LIMIT))?;
-        let keyword_arm =
-            keyword_search(&self.conn, keyword_query, limit.max(DEFAULT_SEARCH_LIMIT))?;
-        let merged = rrf_merge(&self.conn, vector_arm, keyword_arm, limit)?;
-        Ok(merged)
-    }
-
-    #[cfg(test)]
-    fn set_logic_version_for_test(&self, version: i64) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO intel_meta(key, value) VALUES('index_logic_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![version.to_string()],
+        let vector_arm = vector_search(
+            &self.embeddings,
+            &self.index,
+            query_vector,
+            limit.max(DEFAULT_SEARCH_LIMIT),
         )?;
-        Ok(())
+        let keyword_arm =
+            keyword_search(&self.index, keyword_query, limit.max(DEFAULT_SEARCH_LIMIT))?;
+        let merged = rrf_merge(&self.index, vector_arm, keyword_arm, limit)?;
+        Ok(merged)
     }
 }
 
-fn open_sidecar_connection(sidecar: &Path) -> Result<Connection> {
-    if !sidecar.exists() {
-        match cockpit_host::private_fs::write_private_file_exclusive(sidecar, b"") {
-            Ok(()) => {}
-            Err(error) if sidecar.exists() => {
-                cockpit_host::private_fs::repair_private_file(sidecar, "knowledge sidecar")
-                    .map_err(anyhow::Error::from)
-                    .context("securing concurrently-created knowledge sidecar")?;
-                tracing::debug!(%error, "knowledge sidecar was created concurrently");
-            }
-            Err(error) => return Err(error).context("creating private knowledge sidecar"),
-        }
-    } else {
-        cockpit_host::private_fs::repair_private_file(sidecar, "knowledge sidecar")
-            .map_err(anyhow::Error::from)?;
+fn read_private_sidecar_bytes(
+    sidecar: &Path,
+    label: &str,
+    process_lock: &SidecarProcessLock,
+) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        let name = sidecar
+            .file_name()
+            .context("knowledge sidecar has no file name")?;
+        let mut file = cockpit_host::private_fs::open_private_file_in_dir_fd(
+            &process_lock.directory,
+            name,
+            cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
+            label,
+        )
+        .map_err(anyhow::Error::from)
+        .context("opening retained private knowledge sidecar")?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("reading knowledge sidecar {label}"))?;
+        return Ok(bytes);
     }
-    let conn = Connection::open(sidecar)
-        .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))?;
+    #[cfg(not(unix))]
+    {
+        let _ = process_lock;
+        if !sidecar.exists() {
+            match cockpit_host::private_fs::write_private_file_exclusive(sidecar, b"") {
+                Ok(()) => {}
+                Err(error) if sidecar.exists() => {
+                    cockpit_host::private_fs::repair_private_file(sidecar, label)
+                        .map_err(anyhow::Error::from)
+                        .context("securing concurrently-created knowledge sidecar")?;
+                    tracing::debug!(%error, "knowledge sidecar was created concurrently");
+                }
+                Err(error) => return Err(error).context("creating private knowledge sidecar"),
+            }
+        } else {
+            cockpit_host::private_fs::repair_private_file(sidecar, label)
+                .map_err(anyhow::Error::from)?;
+        }
+        cockpit_host::private_fs::read_private_file(sidecar, label)
+            .map_err(anyhow::Error::from)?
+            .context("knowledge sidecar disappeared before its verified read")
+    }
+}
+
+fn open_private_sidecar_connection(
+    sidecar: &Path,
+    label: &str,
+    process_lock: &SidecarProcessLock,
+) -> Result<Connection> {
+    let bytes = read_private_sidecar_bytes(sidecar, label, process_lock)?;
+    let mut conn = Connection::open_in_memory().context("opening in-memory knowledge sidecar")?;
+    if !bytes.is_empty() {
+        conn.deserialize_read_exact(MAIN_DB, bytes.as_slice(), bytes.len(), false)
+            .with_context(|| format!("loading verified knowledge sidecar {}", sidecar.display()))?;
+    }
+    Ok(conn)
+}
+
+fn persist_private_sidecar_connection(
+    conn: &Connection,
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+) -> Result<()> {
+    let bytes = conn
+        .serialize(MAIN_DB)
+        .with_context(|| format!("serializing knowledge sidecar {}", sidecar.display()))?;
+    #[cfg(unix)]
+    {
+        let name = sidecar
+            .file_name()
+            .context("knowledge sidecar has no file name")?;
+        cockpit_host::private_fs::write_private_file_in_dir_fd(
+            &process_lock.directory,
+            name,
+            sidecar,
+            &bytes,
+        )
+        .with_context(|| format!("publishing knowledge sidecar {}", sidecar.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process_lock;
+        cockpit_host::private_fs::write_private_file(sidecar, &bytes)
+            .with_context(|| format!("publishing knowledge sidecar {}", sidecar.display()))?;
+    }
+    Ok(())
+}
+
+fn open_index_connection(sidecar: &Path, process_lock: &SidecarProcessLock) -> Result<Connection> {
+    open_private_sidecar_connection(sidecar, "knowledge index sidecar", process_lock)
+}
+
+fn open_embeddings_connection(
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+) -> Result<Connection> {
+    let conn =
+        open_private_sidecar_connection(sidecar, "knowledge embeddings sidecar", process_lock)?;
     load_sqlite_vec_for_sidecar(&conn)?;
     Ok(conn)
 }
@@ -695,7 +1317,24 @@ fn load_sqlite_vec_for_sidecar(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+fn ensure_index_schema(conn: &Connection) -> Result<()> {
+    if stored_index_logic_version(conn)? != Some(INDEX_LOGIC_VERSION) {
+        // The index is deliberately disposable. A version mismatch means its
+        // table layout is not trustworthy, so discard every schema object we
+        // own before recreating the current projection. Do not apply a
+        // migration here: only embeddings.sqlite preserves paid state.
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS structured_values;
+            DROP TABLE IF EXISTS structured_rows;
+            DROP TABLE IF EXISTS chunks_fts;
+            DROP TABLE IF EXISTS chunks;
+            DROP TABLE IF EXISTS concept_frontmatter;
+            DROP TABLE IF EXISTS concepts;
+            DROP TABLE IF EXISTS intel_meta;
+            "#,
+        )?;
+    }
     conn.execute_batch(
         r#"
         PRAGMA foreign_keys = ON;
@@ -703,24 +1342,35 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS source_files (
-            path TEXT PRIMARY KEY,
-            hash TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS concepts (
             id TEXT PRIMARY KEY,
             path TEXT NOT NULL,
-            concept_type TEXT NOT NULL,
+            type TEXT NOT NULL,
+            title TEXT,
+            description TEXT,
+            resource TEXT,
+            tags_json TEXT NOT NULL,
+            timestamp TEXT,
+            frontmatter_json TEXT NOT NULL,
             body TEXT NOT NULL,
             citations_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS concept_frontmatter (
+            concept_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(concept_id, key),
+            FOREIGN KEY(concept_id) REFERENCES concepts(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY,
             concept_id TEXT NOT NULL,
             source_path TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
             body TEXT NOT NULL,
-            citations_json TEXT NOT NULL
+            citations_json TEXT NOT NULL,
+            FOREIGN KEY(concept_id) REFERENCES concepts(id) ON DELETE CASCADE
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             body,
@@ -728,73 +1378,39 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             content='chunks',
             content_rowid='id'
         );
+        CREATE TABLE IF NOT EXISTS structured_rows (
+            id INTEGER PRIMARY KEY,
+            concept_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            row_index INTEGER NOT NULL,
+            values_json TEXT NOT NULL,
+            FOREIGN KEY(concept_id) REFERENCES concepts(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS structured_values (
+            row_id INTEGER NOT NULL,
+            column_name TEXT NOT NULL,
+            value_type TEXT NOT NULL,
+            value_text TEXT,
+            value_integer INTEGER,
+            value_real REAL,
+            value_boolean INTEGER,
+            PRIMARY KEY(row_id, column_name),
+            FOREIGN KEY(row_id) REFERENCES structured_rows(id) ON DELETE CASCADE
+        );
         "#,
     )?;
     Ok(())
 }
 
-fn plan_reindex(conn: &Connection, bundle: &KnowledgeBundle) -> Result<ReindexPlan> {
-    let stored_version: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM intel_meta WHERE key='index_logic_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .and_then(|value| value.parse().ok());
-    let mut stats = IndexStats {
-        embedded_chunks: 0,
-        reused_files: 0,
-        indexed_files: 0,
-    };
-    if stored_version != Some(INDEX_LOGIC_VERSION) {
-        clear_index(conn)?;
+fn stored_index_logic_version(conn: &Connection) -> Result<Option<i64>> {
+    if !table_exists(conn, "intel_meta")? {
+        return Ok(None);
     }
-    let stored_dimensions = stored_embedding_dimensions(conn)?;
-    let force_clear_before_apply = false;
-
-    let bundle_paths: BTreeSet<String> = bundle
-        .concepts
-        .iter()
-        .map(|concept| rel_string(&concept.path))
-        .collect();
-    let indexed_paths = indexed_paths(conn)?;
-    for old in indexed_paths.difference(&bundle_paths) {
-        delete_file(conn, old)?;
-    }
-
-    let mut concepts_to_index = Vec::new();
-    for concept in &bundle.concepts {
-        let path = rel_string(&concept.path);
-        let hash = content_hash(&serialize_concept(concept));
-        let old_hash: Option<String> = conn
-            .query_row(
-                "SELECT hash FROM source_files WHERE path=?1",
-                params![path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if old_hash.as_deref() == Some(hash.as_str()) {
-            stats.reused_files += 1;
-            continue;
-        }
-        delete_file(conn, &path)?;
-        stats.indexed_files += 1;
-        concepts_to_index.push(concept.clone());
-    }
-
-    Ok(ReindexPlan {
-        concepts: concepts_to_index,
-        stats,
-        stored_dimensions,
-        force_clear_before_apply,
-    })
-}
-
-fn stored_embedding_dimensions(conn: &Connection) -> Result<Option<usize>> {
     Ok(conn
         .query_row(
-            "SELECT value FROM intel_meta WHERE key='embedding_dimensions'",
+            "SELECT value FROM intel_meta WHERE key='index_logic_version'",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -802,148 +1418,501 @@ fn stored_embedding_dimensions(conn: &Connection) -> Result<Option<usize>> {
         .and_then(|value| value.parse().ok()))
 }
 
-fn clear_index(conn: &Connection) -> Result<()> {
+fn ensure_embeddings_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-        DROP TABLE IF EXISTS vec_chunks;
-        DELETE FROM chunks_fts;
-        DELETE FROM chunks;
-        DELETE FROM concepts;
-        DELETE FROM source_files;
-        DELETE FROM intel_meta WHERE key IN ('index_logic_version', 'embedding_dimensions');
+        CREATE TABLE IF NOT EXISTS embedding_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS embedded_chunks (
+            id INTEGER PRIMARY KEY,
+            content_hash TEXT NOT NULL UNIQUE,
+            body TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())
 }
 
-fn indexed_paths(conn: &Connection) -> Result<BTreeSet<String>> {
-    let mut stmt = conn.prepare("SELECT path FROM source_files")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut out = BTreeSet::new();
-    for row in rows {
-        out.insert(row?);
-    }
-    Ok(out)
-}
-
-fn delete_file(conn: &Connection, path: &str) -> Result<()> {
-    let ids = chunk_ids_for_file(conn, path)?;
-    for id in ids {
-        conn.execute("DELETE FROM vec_chunks WHERE rowid=?1", params![id])
-            .ok();
-        conn.execute("DELETE FROM chunks_fts WHERE rowid=?1", params![id])?;
-    }
-    conn.execute("DELETE FROM chunks WHERE source_path=?1", params![path])?;
-    conn.execute("DELETE FROM concepts WHERE path=?1", params![path])?;
-    conn.execute("DELETE FROM source_files WHERE path=?1", params![path])?;
-    Ok(())
-}
-
-fn chunk_ids_for_file(conn: &Connection, path: &str) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM chunks WHERE source_path=?1")?;
-    let rows = stmt.query_map(params![path], |row| row.get::<_, i64>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-async fn embed_planned_concepts(
-    concepts: &[KnowledgeConcept],
-    embedder: &dyn Embedder,
-) -> Result<(Vec<EmbeddedConcept>, usize)> {
-    let mut embedded = Vec::new();
-    let mut embedded_chunks = 0;
-    for concept in concepts {
+fn rebuild_index(conn: &Connection, bundle: &KnowledgeBundle) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "DELETE FROM structured_values; DELETE FROM structured_rows; DELETE FROM chunks_fts; \
+         DELETE FROM chunks; DELETE FROM concept_frontmatter; DELETE FROM concepts;",
+    )?;
+    for concept in &bundle.concepts {
         let path = rel_string(&concept.path);
-        let hash = content_hash(&serialize_concept(concept));
-        let chunks = chunk_concept(concept, &path);
-        if chunks.is_empty() {
-            continue;
-        }
-        let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.body.as_str()).collect();
-        let embeddings = embedder
-            .embed(&texts)
-            .await
-            .context("embedding knowledge chunks")?;
-        if embeddings.len() != chunks.len() {
-            bail!(
-                "knowledge embedder returned {} vectors for {} chunks",
-                embeddings.len(),
-                chunks.len()
-            );
-        }
-        let chunks: Vec<(ChunkDoc, Vec<f32>)> = chunks.into_iter().zip(embeddings).collect();
-        embedded_chunks += chunks.len();
-        embedded.push(EmbeddedConcept {
-            concept: concept.clone(),
-            path,
-            hash,
-            chunks,
-        });
-    }
-    Ok((embedded, embedded_chunks))
-}
-
-fn apply_embedded_concepts(conn: &Connection, embedded: Vec<EmbeddedConcept>) -> Result<()> {
-    for embedded in embedded {
-        let Some(dim) = embedded
-            .chunks
-            .first()
-            .map(|(_, vector)| vector.len())
-            .filter(|dim| *dim > 0)
-        else {
-            continue;
-        };
-        ensure_vec_table(conn, dim)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO concepts(id, path, concept_type, body, citations_json)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
+        tx.execute(
+            "INSERT INTO concepts(id, path, type, title, description, resource, tags_json, timestamp, frontmatter_json, body, citations_json)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                embedded.concept.id,
-                embedded.path,
-                embedded.concept.concept_type,
-                embedded.concept.body,
-                serde_json::to_string(&embedded.concept.citations)?,
+                concept.id,
+                path,
+                concept.concept_type,
+                concept.frontmatter.get("title"),
+                concept.frontmatter.get("description"),
+                concept.frontmatter.get("resource"),
+                serde_json::to_string(&parse_string_list(concept.frontmatter.get("tags")))?,
+                concept.frontmatter.get("timestamp"),
+                serde_json::to_string(&concept.frontmatter)?,
+                concept.body,
+                serde_json::to_string(&concept.citations)?,
             ],
         )?;
-        for (chunk, embedding) in &embedded.chunks {
-            if embedding.len() != dim {
-                bail!("knowledge embedder returned mixed vector dimensions");
-            }
-            insert_chunk(conn, chunk, embedding)?;
+        for (key, value) in &concept.frontmatter {
+            tx.execute(
+                "INSERT INTO concept_frontmatter(concept_id, key, value) VALUES(?1, ?2, ?3)",
+                params![concept.id, key, value],
+            )?;
         }
+        for chunk in chunk_concept(concept, &path) {
+            let hash = content_hash(&chunk.body);
+            tx.execute(
+                "INSERT INTO chunks(concept_id, source_path, chunk_index, content_hash, body, citations_json)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    chunk.concept_id,
+                    chunk.source_path,
+                    chunk.chunk_index as i64,
+                    hash,
+                    chunk.body,
+                    serde_json::to_string(&chunk.citations)?,
+                ],
+            )?;
+            let rowid = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO chunks_fts(rowid, body, concept_id) VALUES(?1, ?2, ?3)",
+                params![rowid, chunk.body, chunk.concept_id],
+            )?;
+        }
+        project_markdown_tables(&tx, concept)?;
+    }
+    for resource in &bundle.resources {
+        project_resource(&tx, resource)?;
+    }
+    tx.execute(
+        "INSERT INTO intel_meta(key, value) VALUES('index_logic_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![INDEX_LOGIC_VERSION.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn project_markdown_tables(conn: &Connection, concept: &KnowledgeConcept) -> Result<()> {
+    let lines: Vec<&str> = concept.body.lines().collect();
+    let mut index = 0;
+    let mut table_index = 0;
+    while index + 1 < lines.len() {
+        let Some(headers) = markdown_table_row(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        if !markdown_table_separator(lines[index + 1], headers.len()) {
+            index += 1;
+            continue;
+        }
+        let table_name = format!("markdown:{}:{table_index}", rel_string(&concept.path));
+        table_index += 1;
+        index += 2;
+        let mut row_index = 0;
+        while index < lines.len() {
+            let Some(values) = markdown_table_row(lines[index]) else {
+                break;
+            };
+            if values.len() != headers.len() {
+                break;
+            }
+            let values = headers
+                .iter()
+                .cloned()
+                .zip(values.into_iter().map(|value| typed_value(&value)))
+                .collect();
+            insert_structured_row(
+                conn,
+                &concept.id,
+                "markdown-table",
+                &rel_string(&concept.path),
+                &table_name,
+                row_index,
+                values,
+            )?;
+            row_index += 1;
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn markdown_table_row(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    let line = line.strip_prefix('|')?.strip_suffix('|')?;
+    let values: Vec<String> = line
+        .split('|')
+        .map(|value| value.trim().to_string())
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
+fn markdown_table_separator(line: &str, columns: usize) -> bool {
+    markdown_table_row(line).is_some_and(|cells| {
+        cells.len() == columns
+            && cells.iter().all(|cell| {
+                let cell = cell.trim_matches(':').trim();
+                cell.len() >= 3 && cell.bytes().all(|byte| byte == b'-')
+            })
+    })
+}
+
+fn project_resource(conn: &Connection, resource: &KnowledgeResource) -> Result<()> {
+    let source_path = rel_string(&resource.path);
+    let extension = resource
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "csv" => {
+            let mut reader = csv::ReaderBuilder::new()
+                .flexible(false)
+                .from_reader(resource.body.as_bytes());
+            let headers: Vec<String> = reader.headers()?.iter().map(str::to_string).collect();
+            for (row_index, record) in reader.records().enumerate() {
+                let record = record?;
+                let values = headers
+                    .iter()
+                    .cloned()
+                    .zip(record.iter().map(|value| typed_value(value)))
+                    .collect();
+                insert_structured_row(
+                    conn,
+                    &resource.concept_id,
+                    "resource-csv",
+                    &source_path,
+                    &format!("resource:{source_path}"),
+                    row_index,
+                    values,
+                )?;
+            }
+        }
+        "jsonl" | "ndjson" => {
+            for (row_index, line) in resource
+                .body
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .enumerate()
+            {
+                let value: serde_json::Value = serde_json::from_str(line).with_context(|| {
+                    format!("parsing JSON Lines knowledge resource {source_path}")
+                })?;
+                let object = value.as_object().with_context(|| {
+                    format!("JSON Lines knowledge resource {source_path} must contain objects")
+                })?;
+                let values = object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                insert_structured_row(
+                    conn,
+                    &resource.concept_id,
+                    "resource-jsonl",
+                    &source_path,
+                    &format!("resource:{source_path}"),
+                    row_index,
+                    values,
+                )?;
+            }
+        }
+        _ => unreachable!("resource extensions are validated during bundle parsing"),
+    }
+    Ok(())
+}
+
+fn typed_value(value: &str) -> serde_json::Value {
+    if let Ok(value) = value.parse::<i64>() {
+        return serde_json::Value::from(value);
+    }
+    if let Ok(value) = value.parse::<f64>() {
+        return serde_json::Value::from(value);
+    }
+    if let Ok(value) = value.parse::<bool>() {
+        return serde_json::Value::from(value);
+    }
+    serde_json::Value::String(value.to_string())
+}
+
+fn insert_structured_row(
+    conn: &Connection,
+    concept_id: &str,
+    source_kind: &str,
+    source_path: &str,
+    table_name: &str,
+    row_index: usize,
+    values: BTreeMap<String, serde_json::Value>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO structured_rows(concept_id, source_kind, source_path, table_name, row_index, values_json)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            concept_id,
+            source_kind,
+            source_path,
+            table_name,
+            row_index as i64,
+            serde_json::to_string(&values)?,
+        ],
+    )?;
+    let row_id = conn.last_insert_rowid();
+    for (column_name, value) in values {
+        let (value_type, text, integer, real, boolean) = match value {
+            serde_json::Value::Null => ("null", None, None, None, None),
+            serde_json::Value::Bool(value) => {
+                ("boolean", None, None, None, Some(if value { 1 } else { 0 }))
+            }
+            serde_json::Value::Number(value) if value.is_i64() => {
+                ("integer", None, value.as_i64(), None, None)
+            }
+            serde_json::Value::Number(value) => ("real", None, None, value.as_f64(), None),
+            serde_json::Value::String(value) => ("text", Some(value), None, None, None),
+            value => (
+                "json",
+                Some(serde_json::to_string(&value)?),
+                None,
+                None,
+                None,
+            ),
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO source_files(path, hash) VALUES(?1, ?2)",
-            params![embedded.path, embedded.hash],
+            "INSERT INTO structured_values(row_id, column_name, value_type, value_text, value_integer, value_real, value_boolean)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![row_id, column_name, value_type, text, integer, real, boolean],
         )?;
     }
     Ok(())
 }
 
-fn insert_chunk(conn: &Connection, chunk: &ChunkDoc, embedding: &[f32]) -> Result<()> {
-    conn.execute(
-        "INSERT INTO chunks(concept_id, source_path, chunk_index, body, citations_json)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
-        params![
-            chunk.concept_id,
-            chunk.source_path,
-            chunk.chunk_index as i64,
-            chunk.body,
-            serde_json::to_string(&chunk.citations)?,
-        ],
+async fn sync_embeddings(
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+    bundle: &KnowledgeBundle,
+    embedder: &dyn Embedder,
+    query_dimensions: Option<usize>,
+) -> Result<IndexStats> {
+    let mut chunks = BTreeMap::new();
+    for concept in &bundle.concepts {
+        for chunk in chunk_concept(concept, &rel_string(&concept.path)) {
+            chunks
+                .entry(content_hash(&chunk.body))
+                .or_insert(chunk.body);
+        }
+    }
+    let model_identity = embedder.identity();
+    let prepared = prepare_embedding_sync(
+        sidecar,
+        process_lock,
+        &chunks,
+        &model_identity,
+        query_dimensions,
     )?;
-    let rowid = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO chunks_fts(rowid, body, concept_id) VALUES(?1, ?2, ?3)",
-        params![rowid, chunk.body, chunk.concept_id],
+    let reused_files = if prepared.reset {
+        0
+    } else {
+        bundle
+            .concepts
+            .iter()
+            .filter(|concept| {
+                chunk_concept(concept, &rel_string(&concept.path))
+                    .iter()
+                    .all(|chunk| !prepared.missing.contains_key(&content_hash(&chunk.body)))
+            })
+            .count()
+    };
+    if prepared.missing.is_empty() && !prepared.reset {
+        return Ok(IndexStats {
+            embedded_chunks: 0,
+            reused_files,
+            indexed_files: 0,
+        });
+    }
+    // All in-memory SQLite connections were dropped by prepare_embedding_sync
+    // before the awaited paid call. The caller's per-KB mutex owns this work
+    // interval.
+    let vectors = embed_chunks(&prepared.missing, embedder, query_dimensions).await?;
+    store_embeddings(
+        sidecar,
+        process_lock,
+        &prepared.missing,
+        vectors,
+        prepared.reset,
+        &model_identity,
     )?;
-    conn.execute(
-        "INSERT INTO vec_chunks(rowid, embedding) VALUES(?1, vec_f32(?2))",
-        params![rowid, vector_json(embedding)],
+    Ok(IndexStats {
+        embedded_chunks: prepared.missing.len(),
+        reused_files,
+        indexed_files: bundle.concepts.len().saturating_sub(reused_files),
+    })
+}
+
+struct PreparedEmbeddingSync {
+    missing: BTreeMap<String, String>,
+    reset: bool,
+}
+
+fn prepare_embedding_sync(
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+    chunks: &BTreeMap<String, String>,
+    model_identity: &str,
+    query_dimensions: Option<usize>,
+) -> Result<PreparedEmbeddingSync> {
+    let conn = open_embeddings_connection(sidecar, process_lock)?;
+    ensure_embeddings_schema(&conn)?;
+    let stored_model = stored_embedding_model_identity(&conn)?;
+    let model_changed = match stored_model {
+        Some(stored) => stored != model_identity,
+        None => {
+            table_exists(&conn, "vec_chunks")?
+                || conn
+                    .query_row("SELECT 1 FROM embedded_chunks LIMIT 1", [], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+        }
+    };
+    let dimensions_changed = query_dimensions
+        .zip(stored_embedding_dimensions(&conn)?)
+        .is_some_and(|(query, stored)| query != stored);
+    let reset = model_changed || dimensions_changed;
+    let mut missing = BTreeMap::new();
+    for (hash, body) in chunks {
+        let present = !reset
+            && conn
+                .query_row(
+                    "SELECT 1 FROM embedded_chunks WHERE content_hash=?1",
+                    params![hash],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+        if !present {
+            missing.insert(hash.clone(), body.clone());
+        }
+    }
+    Ok(PreparedEmbeddingSync { missing, reset })
+}
+
+async fn embed_chunks(
+    chunks: &BTreeMap<String, String>,
+    embedder: &dyn Embedder,
+    query_dimensions: Option<usize>,
+) -> Result<Vec<Vec<f32>>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let texts: Vec<&str> = chunks.values().map(String::as_str).collect();
+    let vectors = embedder
+        .embed(&texts)
+        .await
+        .context("embedding knowledge chunks")?;
+    if vectors.len() != texts.len() {
+        bail!(
+            "knowledge embedder returned {} vectors for {} chunks",
+            vectors.len(),
+            texts.len()
+        );
+    }
+    let dimension = vectors
+        .first()
+        .map(Vec::len)
+        .filter(|dimension| *dimension > 0)
+        .context("knowledge embedder returned an empty vector")?;
+    if vectors.iter().any(|vector| vector.len() != dimension) {
+        bail!("knowledge embedder returned mixed vector dimensions");
+    }
+    if let Some(query) = query_dimensions
+        && query != dimension
+    {
+        bail!(
+            "knowledge embedder returned {dimension}-dimensional document vectors for a {query}-dimensional query vector"
+        );
+    }
+    Ok(vectors)
+}
+
+fn store_embeddings(
+    sidecar: &Path,
+    process_lock: &SidecarProcessLock,
+    chunks: &BTreeMap<String, String>,
+    vectors: Vec<Vec<f32>>,
+    reset: bool,
+    model_identity: &str,
+) -> Result<()> {
+    let conn = open_embeddings_connection(sidecar, process_lock)?;
+    ensure_embeddings_schema(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    if reset {
+        clear_embeddings(&tx)?;
+    }
+    if let Some(vector) = vectors.first() {
+        ensure_vec_table(&tx, vector.len())?;
+    }
+    set_embedding_model_identity(&tx, model_identity)?;
+    for ((hash, body), vector) in chunks.iter().zip(vectors) {
+        tx.execute(
+            "INSERT INTO embedded_chunks(content_hash, body) VALUES(?1, ?2)",
+            params![hash, body],
+        )?;
+        let rowid = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO vec_chunks(rowid, embedding) VALUES(?1, vec_f32(?2))",
+            params![rowid, vector_json(&vector)],
+        )
+        .context("inserting sqlite-vec knowledge vector")?;
+    }
+    tx.commit()?;
+    persist_private_sidecar_connection(&conn, sidecar, process_lock)?;
+    Ok(())
+}
+
+fn stored_embedding_model_identity(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM embedding_meta WHERE key='embedding_model_identity'",
+        [],
+        |row| row.get(0),
     )
-    .context("inserting sqlite-vec knowledge vector")?;
+    .optional()
+    .map_err(Into::into)
+}
+
+fn set_embedding_model_identity(conn: &Connection, identity: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO embedding_meta(key, value) VALUES('embedding_model_identity', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![identity],
+    )?;
+    Ok(())
+}
+
+fn stored_embedding_dimensions(conn: &Connection) -> Result<Option<usize>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM embedding_meta WHERE key='embedding_dimensions'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse().ok()))
+}
+
+fn clear_embeddings(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS vec_chunks;
+        DELETE FROM embedded_chunks;
+        DELETE FROM embedding_meta;
+        "#,
+    )?;
     Ok(())
 }
 
@@ -952,8 +1921,8 @@ fn ensure_vec_table(conn: &Connection, dimensions: usize) -> Result<()> {
     if stored == Some(dimensions) && table_exists(conn, "vec_chunks")? {
         return Ok(());
     }
-    if stored.is_some_and(|stored| stored != dimensions) {
-        clear_index(conn)?;
+    if let Some(stored) = stored.filter(|&stored| stored != dimensions) {
+        bail!("knowledge embedding dimensions changed from {stored} to {dimensions}");
     }
     conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
     conn.execute(
@@ -961,7 +1930,7 @@ fn ensure_vec_table(conn: &Connection, dimensions: usize) -> Result<()> {
         [],
     )?;
     conn.execute(
-        "INSERT INTO intel_meta(key, value) VALUES('embedding_dimensions', ?1)
+        "INSERT INTO embedding_meta(key, value) VALUES('embedding_dimensions', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![dimensions.to_string()],
     )?;
@@ -1012,10 +1981,8 @@ fn chunk_text(text: &str) -> Vec<String> {
 }
 
 fn content_hash(body: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use sha2::{Digest as _, Sha256};
+    crate::intel::hex_lower(&Sha256::digest(body.as_bytes()))
 }
 
 fn rel_string(path: &Path) -> String {
@@ -1026,21 +1993,45 @@ fn vector_json(vector: &[f32]) -> String {
     serde_json::to_string(vector).unwrap_or_else(|_| "[]".to_string())
 }
 
-fn vector_search(conn: &Connection, vector: &[f32], limit: usize) -> Result<Vec<i64>> {
-    if !table_exists(conn, "vec_chunks")? {
+fn vector_search(
+    embeddings: &Connection,
+    index: &Connection,
+    vector: &[f32],
+    limit: usize,
+) -> Result<Vec<i64>> {
+    if !table_exists(embeddings, "vec_chunks")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    if stored_embedding_dimensions(embeddings)?.is_some_and(|stored| stored != vector.len()) {
+        bail!(
+            "knowledge query vector dimension {} does not match durable embedding dimension",
+            vector.len()
+        );
+    }
+    let mut stmt = embeddings.prepare(
         "SELECT rowid FROM vec_chunks
          WHERE embedding MATCH vec_f32(?1) AND k = ?2
          ORDER BY distance",
     )?;
-    let rows = stmt.query_map(params![vector_json(vector), limit as i64], |row| {
+    let rows = stmt.query_map(params![vector_json(vector), (limit * 4) as i64], |row| {
         row.get::<_, i64>(0)
     })?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        let embedding_id = row?;
+        let hash: String = embeddings.query_row(
+            "SELECT content_hash FROM embedded_chunks WHERE id=?1",
+            params![embedding_id],
+            |row| row.get(0),
+        )?;
+        let mut matching = index.prepare("SELECT id FROM chunks WHERE content_hash=?1")?;
+        let matching_rows = matching.query_map(params![hash], |row| row.get::<_, i64>(0))?;
+        for matching_row in matching_rows {
+            out.push(matching_row?);
+            if out.len() >= limit {
+                return Ok(out);
+            }
+        }
     }
     Ok(out)
 }
@@ -1367,13 +2358,11 @@ pub(crate) async fn attached_bundles(
             } else {
                 cwd.join(local.root)
             };
-            let sidecar_path = local
-                .sidecar_path
-                .unwrap_or_else(|| root.join(SIDE_CAR_FILE));
+            let sidecars = local.sidecars.unwrap_or_else(|| KbSidecars::in_root(&root));
             RegistryLocalKb {
                 root,
                 assistant_snapshot_root: local.assistant_snapshot_root,
-                sidecar_path: Some(sidecar_path),
+                sidecars: Some(sidecars),
             }
         });
         let Some(provider) = provider_for(entry.clone(), local)? else {
@@ -1394,7 +2383,7 @@ struct RegistryKnowledgeBase {
 struct RegistryLocalKb {
     root: PathBuf,
     assistant_snapshot_root: Option<PathBuf>,
-    sidecar_path: Option<PathBuf>,
+    sidecars: Option<KbSidecars>,
 }
 
 fn workspace_knowledge_base(entry: KnowledgeBaseRegistryEntry) -> RegistryKnowledgeBase {
@@ -1402,7 +2391,7 @@ fn workspace_knowledge_base(entry: KnowledgeBaseRegistryEntry) -> RegistryKnowle
         KnowledgeBaseSource::Local { path } => Some(RegistryLocalKb {
             root: path.clone(),
             assistant_snapshot_root: None,
-            sidecar_path: None,
+            sidecars: None,
         }),
         KnowledgeBaseSource::Remote { .. } => None,
     };
@@ -1449,7 +2438,9 @@ async fn assistant_knowledge_registry_entry(
                 "assistant://{}/knowledge",
                 snapshot.row.name
             ))),
-            sidecar_path: Some(cache_root.join(format!("{}.sqlite", config.installation_id))),
+            sidecars: Some(KbSidecars::in_root(
+                &cache_root.join(config.installation_id.to_string()),
+            )),
         }),
     }))
 }
@@ -1514,20 +2505,22 @@ fn provider_for(
 ) -> Result<Option<Arc<dyn KbProvider>>> {
     match (entry.source.clone(), local) {
         (KnowledgeBaseSource::Local { .. }, Some(local)) => {
-            let sidecar_path = local
-                .sidecar_path
-                .context("local knowledge provider has no sidecar path")?;
+            let sidecars = local
+                .sidecars
+                .context("local knowledge provider has no sidecar paths")?;
             if let Some(snapshot_root) = local.assistant_snapshot_root {
-                return LocalKb::assistant(entry, local.root, snapshot_root, sidecar_path).map(
+                cockpit_host::private_fs::ensure_private_dir(
+                    sidecars
+                        .index
+                        .parent()
+                        .context("assistant knowledge index has no parent")?,
+                )?;
+                return LocalKb::assistant(entry, local.root, snapshot_root, sidecars).map(
                     |provider| provider.map(|provider| Arc::new(provider) as Arc<dyn KbProvider>),
                 );
             }
             Ok(Some(Arc::new(LocalKb::new(
-                entry,
-                local.root,
-                None,
-                sidecar_path,
-                None,
+                entry, local.root, None, sidecars, None,
             ))))
         }
         (KnowledgeBaseSource::Remote { .. }, None) => Ok(Some(Arc::new(RemoteKb { entry }))),
@@ -1653,15 +2646,30 @@ fn render_tool_results(results: &[SearchResult], redact: &RedactionTable) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     struct MockEmbedder;
     struct DimEmbedder(usize);
+    struct CountingEmbedder {
+        calls: Arc<AtomicUsize>,
+    }
+    struct NamedCountingEmbedder {
+        identity: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+    struct SlowCountingEmbedder {
+        calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl Embedder for MockEmbedder {
         async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            "mock-v1".to_string()
         }
     }
 
@@ -1678,6 +2686,47 @@ mod tests {
                     vector
                 })
                 .collect())
+        }
+
+        fn identity(&self) -> String {
+            "dimension-test-model".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            "counting-v1".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for NamedCountingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            self.identity.to_string()
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for SlowCountingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            "slow-counting-v1".to_string()
         }
     }
 
@@ -1795,11 +2844,105 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert_eq!(bundle.concepts[0].concept_type, "made-up");
     }
 
+    #[test]
+    fn referenced_resources_share_the_markdown_snapshot_byte_budget() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("data.csv"), "id\n1\n").unwrap();
+        let handle = cockpit_config::config::open_config_directory_nofollow(tmp.path()).unwrap();
+        let mut frontmatter = BTreeMap::new();
+        frontmatter.insert("resource".to_string(), "data.csv".to_string());
+        let concept = KnowledgeConcept {
+            id: "catalog".to_string(),
+            path: PathBuf::from("catalog.md"),
+            concept_type: "catalog".to_string(),
+            frontmatter,
+            body: String::new(),
+            citations: Vec::new(),
+            valid_from: None,
+            supersedes: Vec::new(),
+            invalidated_by: None,
+        };
+        let error = load_referenced_resources(
+            tmp.path(),
+            &handle,
+            &[concept],
+            0,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("aggregate byte limit"));
+    }
+
+    #[tokio::test]
+    async fn index_projects_markdown_tables_and_referenced_resources() {
+        let tmp = TempDir::new().unwrap();
+        let concept_dir = tmp.path().join("services/api");
+        fs::create_dir_all(&concept_dir).unwrap();
+        fs::write(
+            concept_dir.join("inventory.csv"),
+            "sku,count,active\nA-1,4,true\n",
+        )
+        .unwrap();
+        fs::write(
+            concept_dir.join("structured.md"),
+            r#"---
+type: catalog
+title: Inventory
+description: Current inventory
+resource: inventory.csv
+tags: [warehouse, current]
+timestamp: 2026-08-29T12:00:00Z
+---
+
+| owner | priority |
+| --- | --- |
+| operations | 1 |
+"#,
+        )
+        .unwrap();
+
+        let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let markdown_rows: i64 = index
+            .index
+            .query_row(
+                "SELECT COUNT(*) FROM structured_rows WHERE source_kind='markdown-table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let resource_rows: i64 = index
+            .index
+            .query_row(
+                "SELECT COUNT(*) FROM structured_rows WHERE source_kind='resource-csv'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let count: i64 = index
+            .index
+            .query_row(
+                "SELECT value_integer FROM structured_values
+                 WHERE column_name='count' AND value_type='integer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(markdown_rows, 1);
+        assert_eq!(resource_rows, 1);
+        assert_eq!(count, 4);
+    }
+
     #[tokio::test]
     async fn index_rebuilds_from_bundle() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
-        let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Embedder> = Arc::new(CountingEmbedder {
+            calls: calls.clone(),
+        });
+        let (index, _) = KnowledgeIndex::open(tmp.path(), embedder.clone())
             .await
             .unwrap();
         let query_vector = mock_embedder()
@@ -1811,30 +2954,130 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             .search_with_vector(&query_vector, "release shipping procedure", 3)
             .unwrap();
         drop(index);
-        fs::remove_file(tmp.path().join(SIDE_CAR_FILE)).unwrap();
-        let (rebuilt, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
-            .await
-            .unwrap();
+        let before_rebuild = calls.load(Ordering::SeqCst);
+        fs::remove_file(tmp.path().join(INDEX_FILE)).unwrap();
+        let (rebuilt, stats) = KnowledgeIndex::open(tmp.path(), embedder).await.unwrap();
         let second = rebuilt
             .search_with_vector(&query_vector, "release shipping procedure", 3)
             .unwrap();
         assert_eq!(ids(&first), ids(&second));
+        assert_eq!(stats.embedded_chunks, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), before_rebuild);
     }
 
     #[tokio::test]
-    async fn index_version_bump_reindexes() {
+    async fn local_git_knowledge_sidecars_are_ignored_in_repository_metadata() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let init = Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let _ = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        for sidecar in [EMBEDDINGS_FILE, INDEX_FILE] {
+            let ignored = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["check-ignore", "-q", sidecar])
+                .status()
+                .unwrap();
+            assert!(
+                ignored.success(),
+                "{sidecar} must be ignored in a KB Git repository"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_git_knowledge_rejects_tracked_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let init = Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let _ = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["add", "--", EMBEDDINGS_FILE, INDEX_FILE])
+            .status()
+            .unwrap();
+        assert!(add.success());
+
+        let error = match KnowledgeIndex::open(tmp.path(), mock_embedder()).await {
+            Ok(_) => panic!("tracked sidecars must be rejected before opening"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("is tracked by Git"), "{error:#}");
+    }
+
+    #[test]
+    fn local_git_knowledge_refuses_indeterminate_tracked_file_check() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let init = Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        // rev-parse remains usable, but ls-files cannot establish whether a
+        // generated sidecar is tracked when the repository index is corrupt.
+        fs::write(tmp.path().join(".git/index"), b"not a Git index").unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let error = ensure_sidecars_gitignored(tmp.path(), &sidecars).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checking whether knowledge sidecar"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_version_bump_rebuilds_only_disposable_index() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
         let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
             .await
             .unwrap();
-        index.set_logic_version_for_test(0).unwrap();
         drop(index);
+        fs::remove_file(tmp.path().join(INDEX_FILE)).unwrap();
+        let stale = Connection::open(tmp.path().join(INDEX_FILE)).unwrap();
+        stale
+            .execute_batch(
+                "CREATE TABLE intel_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO intel_meta(key, value) VALUES('index_logic_version', '0'); \
+                 CREATE TABLE concepts (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        drop(stale);
+
         let (_, stats) = KnowledgeIndex::open(tmp.path(), mock_embedder())
             .await
             .unwrap();
-        assert!(stats.embedded_chunks >= 2, "{stats:?}");
-        assert_eq!(stats.reused_files, 0);
+        assert_eq!(stats.embedded_chunks, 0, "{stats:?}");
+        assert_eq!(stats.reused_files, 2);
+        let current = Connection::open(tmp.path().join(INDEX_FILE)).unwrap();
+        let has_current_concept_schema: bool = current
+            .prepare("PRAGMA table_info(concepts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "frontmatter_json");
+        assert!(has_current_concept_schema);
     }
 
     #[tokio::test]
@@ -1858,23 +3101,215 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[tokio::test]
-    async fn index_dimension_change_reindexes_all_hash_reused_files() {
+    async fn index_dimension_change_reembeds_unchanged_content() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
-        let (_, first) = KnowledgeIndex::open(tmp.path(), Arc::new(DimEmbedder(3)))
-            .await
-            .unwrap();
+        let (_, first) = KnowledgeIndex::open_with_query_dimensions(
+            tmp.path(),
+            Arc::new(DimEmbedder(3)),
+            Some(3),
+        )
+        .await
+        .unwrap();
         assert!(first.embedded_chunks >= 2);
 
-        let (index, second) = KnowledgeIndex::open(tmp.path(), Arc::new(DimEmbedder(4)))
-            .await
-            .unwrap();
+        let (index, second) = KnowledgeIndex::open_with_query_dimensions(
+            tmp.path(),
+            Arc::new(DimEmbedder(4)),
+            Some(4),
+        )
+        .await
+        .unwrap();
         assert_eq!(second.reused_files, 0);
-        assert!(second.indexed_files >= 2);
+        assert_eq!(second.indexed_files, 2);
         assert!(second.embedded_chunks >= 2);
         let query = DimEmbedder(4).embed(&["deploy"]).await.unwrap().remove(0);
         let results = index.search_with_vector(&query, "deploy", 2).unwrap();
         assert!(results.iter().any(|result| result.concept_id == "deploy"));
+    }
+
+    #[tokio::test]
+    async fn index_model_identity_change_reembeds_unchanged_content() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let first: Arc<dyn Embedder> = Arc::new(NamedCountingEmbedder {
+            identity: "model-a",
+            calls: first_calls.clone(),
+        });
+        let (_, first_stats) = KnowledgeIndex::open(tmp.path(), first).await.unwrap();
+        assert_eq!(
+            first_calls.load(Ordering::SeqCst),
+            first_stats.embedded_chunks
+        );
+
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let second: Arc<dyn Embedder> = Arc::new(NamedCountingEmbedder {
+            identity: "model-b",
+            calls: second_calls.clone(),
+        });
+        let (_, second_stats) = KnowledgeIndex::open(tmp.path(), second).await.unwrap();
+        assert_eq!(second_stats.reused_files, 0);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            first_stats.embedded_chunks
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_index_opens_embed_each_chunk_once() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Embedder> = Arc::new(SlowCountingEmbedder {
+            calls: calls.clone(),
+        });
+        let root = tmp.path().to_path_buf();
+        let (first, second) = tokio::join!(
+            KnowledgeIndex::open(root.clone(), embedder.clone()),
+            KnowledgeIndex::open(root, embedder),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let expected = first.1.embedded_chunks.max(second.1.embedded_chunks);
+        assert_eq!(calls.load(Ordering::SeqCst), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_lock_survives_knowledge_root_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        fs::create_dir(&root).unwrap();
+        let sidecars = KbSidecars::in_root(&root).canonicalized().unwrap();
+        let first = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("first owner acquires the stable KB fence");
+
+        let displaced = tmp.path().join("knowledge-displaced");
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement = KbSidecars::in_root(&root).canonicalized().unwrap();
+
+        assert!(
+            SidecarProcessLock::try_acquire(&replacement)
+                .unwrap()
+                .is_none(),
+            "replacement of the KB directory must not create a second lock domain"
+        );
+        cockpit_host::private_fs::write_private_file_in_dir_fd(
+            &first.directory,
+            std::ffi::OsStr::new(EMBEDDINGS_FILE),
+            &sidecars.embeddings,
+            b"old root only",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(displaced.join(EMBEDDINGS_FILE)).unwrap(),
+            b"old root only"
+        );
+        assert!(!replacement.embeddings.exists());
+        drop(first);
+        assert!(
+            SidecarProcessLock::try_acquire(&replacement)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fenced_snapshot_publishes_only_to_its_retained_knowledge_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        fs::create_dir(&root).unwrap();
+        write_bundle(&root);
+        let sidecars = KbSidecars::in_root(&root).canonicalized().unwrap();
+
+        // This is the production ordering: acquire the stable fence and
+        // retained root first, then take the source snapshot through that
+        // capability. Replacing the pathname after this point must not move
+        // either the snapshot or its derived sidecar publication.
+        let (bundle, lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await.unwrap();
+        assert!(bundle.concepts.iter().any(|concept| concept.id == "deploy"));
+
+        let displaced = tmp.path().join("knowledge-displaced");
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        write_bundle(&root);
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE retained_snapshot_identity (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        persist_private_sidecar_connection(&conn, &sidecars.index, &lock).unwrap();
+
+        assert!(displaced.join(INDEX_FILE).is_file());
+        assert!(
+            !root.join(INDEX_FILE).exists(),
+            "a replacement KB must never receive the prior root's projection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_connection_never_reopens_a_replaced_pathname() {
+        let tmp = TempDir::new().unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let lock = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("first owner acquires the stable KB fence");
+        let conn = open_index_connection(&sidecars.index, &lock).unwrap();
+
+        fs::remove_file(&sidecars.index).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("attacker.sqlite"), &sidecars.index).unwrap();
+
+        // This schema mutation is strictly in memory. Persistence re-checks
+        // the destination through the retained root and fails closed rather
+        // than letting SQLite reopen the replacement symlink.
+        conn.execute_batch("CREATE TABLE retained_identity_test (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let error = persist_private_sidecar_connection(&conn, &sidecars.index, &lock).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(!tmp.path().join("attacker.sqlite").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_lock_does_not_overlap_embeddings_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let _lock = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("first owner acquires the named mutex");
+        let conn = open_embeddings_connection(&sidecars.embeddings, &_lock).unwrap();
+        ensure_embeddings_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO embedding_meta(key, value) VALUES('lock-test', 'ok')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_index_opens_through_symlink_alias_embed_each_chunk_once() {
+        let tmp = TempDir::new().unwrap();
+        let aliases = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let alias = aliases.path().join("knowledge-alias");
+        std::os::unix::fs::symlink(tmp.path(), &alias).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Embedder> = Arc::new(SlowCountingEmbedder {
+            calls: calls.clone(),
+        });
+        let (first, second) = tokio::join!(
+            KnowledgeIndex::open(tmp.path(), embedder.clone()),
+            KnowledgeIndex::open(alias, embedder),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let expected = first.1.embedded_chunks.max(second.1.embedded_chunks);
+        assert_eq!(calls.load(Ordering::SeqCst), expected);
     }
 
     #[tokio::test]
@@ -1896,30 +3331,30 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             .remove(0);
 
         let vector_only_exact = rrf_merge(
-            &index.conn,
-            vector_search(&index.conn, &exact_vector, 1).unwrap(),
+            &index.index,
+            vector_search(&index.embeddings, &index.index, &exact_vector, 1).unwrap(),
             vec![],
             1,
         )
         .unwrap();
         let keyword_only_exact = rrf_merge(
-            &index.conn,
+            &index.index,
             vec![],
-            keyword_search(&index.conn, "E_CONNRESET-7749", 1).unwrap(),
+            keyword_search(&index.index, "E_CONNRESET-7749", 1).unwrap(),
             1,
         )
         .unwrap();
         let vector_only_paraphrase = rrf_merge(
-            &index.conn,
-            vector_search(&index.conn, &paraphrase_vector, 1).unwrap(),
+            &index.index,
+            vector_search(&index.embeddings, &index.index, &paraphrase_vector, 1).unwrap(),
             vec![],
             1,
         )
         .unwrap();
         let keyword_only_paraphrase = rrf_merge(
-            &index.conn,
+            &index.index,
             vec![],
-            keyword_search(&index.conn, "ship launch safely", 1).unwrap(),
+            keyword_search(&index.index, "ship launch safely", 1).unwrap(),
             1,
         )
         .unwrap();

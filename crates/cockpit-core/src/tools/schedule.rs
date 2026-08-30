@@ -31,7 +31,7 @@ use crate::engine::schedule::schemas::schema_for;
 use crate::engine::schedule::spec::{
     ScheduleAction, SpawnRequest, parse_action, parse_background_start, parse_loop_start,
 };
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
 /// The fixed schema for the `schedule` meta-tool.
 pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work without blocking the conversation; choose `action` (`loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, `list`) and put per-action details in `args`; use limit=1 for one-shot timers; set idle=true to reset a bounded timer after each user message";
@@ -152,7 +152,9 @@ pub struct ForkScheduleState {
     own_job_id: String,
     notes: Mutex<Vec<String>>,
     requests: Mutex<Vec<SpawnRequest>>,
+    actions: Mutex<Vec<String>>,
     cancelled: std::sync::atomic::AtomicBool,
+    sealed_for_cancellation: std::sync::atomic::AtomicBool,
 }
 
 impl ForkScheduleState {
@@ -161,16 +163,64 @@ impl ForkScheduleState {
             own_job_id,
             notes: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
+            actions: Mutex::new(Vec::new()),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            sealed_for_cancellation: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn push_note(&self, text: String) {
-        self.notes.lock().unwrap().push(text);
+    fn push_note(&self, text: String) -> bool {
+        if self
+            .sealed_for_cancellation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        let mut notes = self.notes.lock().unwrap();
+        if self
+            .sealed_for_cancellation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        notes.push(text);
+        true
     }
 
-    fn push_request(&self, req: SpawnRequest) {
-        self.requests.lock().unwrap().push(req);
+    fn push_request(&self, req: SpawnRequest) -> bool {
+        if self
+            .sealed_for_cancellation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        let mut requests = self.requests.lock().unwrap();
+        if self
+            .sealed_for_cancellation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        requests.push(req);
+        true
+    }
+
+    fn push_action(&self, action: String) -> bool {
+        if self
+            .sealed_for_cancellation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        let mut actions = self.actions.lock().unwrap();
+        if self
+            .sealed_for_cancellation
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        actions.push(action);
+        true
     }
 
     fn cancel(&self) {
@@ -182,11 +232,20 @@ impl ForkScheduleState {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn seal_for_cancellation(&self) {
+        self.sealed_for_cancellation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel();
+    }
+
     pub fn has_persistent_action(&self) -> bool {
         if !self.notes.lock().unwrap().is_empty() {
             return true;
         }
-        !self.requests.lock().unwrap().is_empty()
+        if !self.requests.lock().unwrap().is_empty() {
+            return true;
+        }
+        !self.actions.lock().unwrap().is_empty()
     }
 
     /// Drain accumulated notes (called once at termination).
@@ -197,6 +256,134 @@ impl ForkScheduleState {
     /// Drain accumulated spawn-requests (called once at termination).
     pub fn take_requests(&self) -> Vec<SpawnRequest> {
         std::mem::take(&mut *self.requests.lock().unwrap())
+    }
+
+    /// Drain effectful ordinary-tool calls. These are intentionally recorded
+    /// before dispatch: an external cancellation may abort the future after a
+    /// tool has already changed local or remote state, and must not turn that
+    /// wake into an apparent no-op.
+    pub fn take_actions(&self) -> Vec<String> {
+        std::mem::take(&mut *self.actions.lock().unwrap())
+    }
+}
+
+/// Authority-owned handoff for the one idle wake that is currently executing.
+/// Exactly one side may take the state: the runner after a normal iteration or
+/// the authority when cancellation aborts that runner.
+pub type ActiveIdleWake = Arc<Mutex<Option<Arc<ForkScheduleState>>>>;
+
+pub fn new_active_idle_wake() -> ActiveIdleWake {
+    Arc::new(Mutex::new(None))
+}
+
+pub fn install_active_idle_wake(active: &ActiveIdleWake, state: Arc<ForkScheduleState>) {
+    *active.lock().unwrap() = Some(state);
+}
+
+pub fn take_active_idle_wake_for_cancellation(
+    active: &ActiveIdleWake,
+) -> Option<Arc<ForkScheduleState>> {
+    let state = active.lock().unwrap().take();
+    if let Some(state) = state.as_ref() {
+        state.seal_for_cancellation();
+    }
+    state
+}
+
+pub fn take_active_idle_wake_if(
+    active: &ActiveIdleWake,
+    expected: &Arc<ForkScheduleState>,
+) -> bool {
+    let mut guard = active.lock().unwrap();
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        guard.take();
+        true
+    } else {
+        false
+    }
+}
+
+/// Track a possibly effectful parent operation in an idle fork. The wrapper
+/// preserves the original tool contract while making the call visible to the
+/// fork's authority-owned state before execution can be externally aborted.
+pub struct IdleWakeActionTool {
+    inner: Arc<dyn Tool>,
+    state: Arc<ForkScheduleState>,
+}
+
+impl IdleWakeActionTool {
+    pub fn new(inner: Arc<dyn Tool>, state: Arc<ForkScheduleState>) -> Self {
+        Self { inner, state }
+    }
+}
+
+#[async_trait]
+impl Tool for IdleWakeActionTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        self.inner.verbose_description()
+    }
+
+    fn effect(&self) -> ToolEffect {
+        self.inner.effect()
+    }
+
+    fn authorizes_own_effects(&self) -> bool {
+        self.inner.authorizes_own_effects()
+    }
+
+    fn is_registered_ordinary_operation(&self) -> bool {
+        self.inner.is_registered_ordinary_operation()
+    }
+
+    fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+        self.inner.binary_requirements()
+    }
+
+    fn presentation(&self, args: &Value) -> crate::engine::tool::ToolPresentation {
+        self.inner.presentation(args)
+    }
+
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+
+    fn verbose_parameters(&self) -> Option<Value> {
+        self.inner.verbose_parameters()
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        if !self
+            .state
+            .push_action(format!("invoked stateful tool `{}`", self.inner.name()))
+        {
+            return Err(anyhow::anyhow!(
+                "idle wake was cancelled before the tool could run"
+            ));
+        }
+        self.inner.call(args, ctx).await
+    }
+
+    fn ledger_args(&self, args: &Value) -> Value {
+        self.inner.ledger_args(args)
+    }
+
+    fn honors_dispatch_cancel(&self) -> bool {
+        self.inner.honors_dispatch_cancel()
+    }
+
+    async fn on_abandon(&self, ctx: &ToolCtx) -> Result<()> {
+        self.inner.on_abandon(ctx).await
     }
 }
 
@@ -229,8 +416,8 @@ impl Tool for NoteTool {
             "Send a short progress note to the human while you run inside a background loop. The \
              note is shown to the user live, but it does NOT enter the main conversation until \
              the loop finishes — at which point your notes are bundled with the final result. \
-             Use it to report what each iteration found or did. This is your only channel back \
-             to the main conversation from inside a fork; you cannot start new scheduled work from here."
+             Use it to report what each iteration found or did. Forked schedule requests are \
+             recorded for the main agent rather than launched directly from here."
                 .to_string(),
         )
     }
@@ -262,12 +449,18 @@ impl Tool for NoteTool {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| invalid_input("`text` is required"))?
             .to_string();
+        // Record before signaling UI so cancellation can promote a note that
+        // already became visible. A sealed wake cannot publish a new note.
+        if !self.state.push_note(text.clone()) {
+            return Err(anyhow::anyhow!(
+                "idle wake was cancelled before the note could be sent"
+            ));
+        }
         // Live UI signal (never enters main context here — token economy).
         let _ = self.turn_tx.try_send(TurnEvent::ScheduleNote {
             job_id: self.state.own_job_id.clone(),
-            text: text.clone(),
+            text,
         });
-        self.state.push_note(text);
         Ok(ToolOutput::text("noted"))
     }
 }
@@ -325,7 +518,11 @@ impl Tool for ForkScheduleTool {
             ScheduleAction::LoopStart => {
                 let parsed = parse_loop_start(&action_args)?;
                 let summary = SpawnRequest::Loop(parsed.clone()).summary();
-                self.state.push_request(SpawnRequest::Loop(parsed));
+                if !self.state.push_request(SpawnRequest::Loop(parsed)) {
+                    return Err(anyhow::anyhow!(
+                        "idle wake was cancelled before the request could be recorded"
+                    ));
+                }
                 Ok(ToolOutput::text(format!(
                     "request recorded — a fork cannot spawn scheduled work; the main agent will decide whether to start `{summary}`"
                 )))
@@ -333,7 +530,11 @@ impl Tool for ForkScheduleTool {
             ScheduleAction::BackgroundStart => {
                 let parsed = parse_background_start(&action_args)?;
                 let summary = SpawnRequest::Background(parsed.clone()).summary();
-                self.state.push_request(SpawnRequest::Background(parsed));
+                if !self.state.push_request(SpawnRequest::Background(parsed)) {
+                    return Err(anyhow::anyhow!(
+                        "idle wake was cancelled before the request could be recorded"
+                    ));
+                }
                 Ok(ToolOutput::text(format!(
                     "request recorded — a fork cannot spawn scheduled work; the main agent will decide whether to start `{summary}`"
                 )))
@@ -606,6 +807,20 @@ mod tests {
             TurnEvent::ScheduleNote { text, .. } => assert_eq!(text, "halfway there"),
             other => panic!("expected ScheduleNote, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cancellation_claim_seals_and_preserves_the_active_wake() {
+        let active = new_active_idle_wake();
+        let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        assert!(state.push_note("already acted".into()));
+        install_active_idle_wake(&active, state.clone());
+
+        let claimed = take_active_idle_wake_for_cancellation(&active).unwrap();
+        assert!(Arc::ptr_eq(&claimed, &state));
+        assert_eq!(claimed.take_notes(), vec!["already acted".to_string()]);
+        assert!(!claimed.push_note("must not be lost after cancellation".into()));
+        assert!(take_active_idle_wake_for_cancellation(&active).is_none());
     }
 
     /// Minimal `ToolCtx` for unit-testing fork tools (they don't touch the

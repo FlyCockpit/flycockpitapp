@@ -29,7 +29,10 @@ use crate::engine::schedule::authority::{ScheduleContext, ScheduleEvent};
 use crate::engine::schedule::spec::{LoopStartArgs, ScheduleKind};
 use crate::engine::tool::ToolBox;
 use crate::intel::budget::BudgetedWriter;
-use crate::tools::schedule::{ForkScheduleState, ForkScheduleTool, NoteTool};
+use crate::tools::schedule::{
+    ActiveIdleWake, ForkScheduleState, ForkScheduleTool, IdleWakeActionTool, NoteTool,
+    install_active_idle_wake, take_active_idle_wake_if,
+};
 
 use super::{ASYNC_RESULT_TOKEN_CAP, FORK_HISTORY_BYTE_CAP, FORK_HISTORY_MESSAGE_CAP};
 
@@ -46,6 +49,9 @@ pub struct LoopRunCtx {
     /// An accepted parent-thread user message publishes its instant here and
     /// restarts an idle timer's countdown from the actual activity time.
     pub idle_activity_rx: Option<watch::Receiver<Instant>>,
+    /// The authority owns this handoff while a wake runs. It can promote an
+    /// already-recorded action if external cancellation aborts the runner.
+    pub active_idle_wake: Option<ActiveIdleWake>,
 }
 
 /// Max turns one fork iteration may take before we cut it off (bounds a
@@ -66,6 +72,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         turn_tx,
         event_tx,
         mut idle_activity_rx,
+        active_idle_wake,
     } = run;
 
     // Branch a fork from main as of registration (tail snapshot). The fork
@@ -131,6 +138,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     let mut cancelled = false;
     let mut failed_idle_notes = Vec::new();
     let mut failed_idle_requests = Vec::new();
+    let mut failed_idle_actions = Vec::new();
     let wake_prompt = args.idle.then(|| {
         format!(
             "[idle wake] Do not invent work. Inspect only what is needed to determine whether a real change requires action. If nothing changed, take no action and send no message.\n\n{}",
@@ -186,6 +194,9 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         let state = persistent_state
             .clone()
             .unwrap_or_else(|| Arc::new(ForkScheduleState::new(job_id.clone())));
+        if let Some(active_idle_wake) = active_idle_wake.as_ref() {
+            install_active_idle_wake(active_idle_wake, state.clone());
+        }
         let fork_agent = persistent_agent.clone().unwrap_or_else(|| {
             Arc::new(build_fork_agent(
                 &ctx.agent,
@@ -213,11 +224,29 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 // it recorded before the failure in the terminal completion
                 // rather than silently dropping it with this wake's fork.
                 if args.idle {
+                    if !active_idle_wake
+                        .as_ref()
+                        .is_some_and(|active| take_active_idle_wake_if(active, &state))
+                    {
+                        return;
+                    }
                     failed_idle_notes = state.take_notes();
                     failed_idle_requests = state.take_requests();
+                    failed_idle_actions = state.take_actions();
                 }
                 break;
             }
+        }
+
+        // Normal runner completion and external cancellation race to claim
+        // this wake's state. If cancellation won, it already owns the only
+        // durable promotion and this aborted task must not emit a duplicate.
+        if args.idle
+            && !active_idle_wake
+                .as_ref()
+                .is_some_and(|active| take_active_idle_wake_if(active, &state))
+        {
+            return;
         }
 
         cap_fork_history(&mut fork_history);
@@ -227,11 +256,19 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             let acted = state.has_persistent_action() || !last_result.trim().is_empty();
             let notes = state.take_notes();
             let requests = state.take_requests();
+            let actions = state.take_actions();
             // A non-empty terminal assistant response is itself a message to
             // the user. `note` and forked create-requests are the other two
             // constrained effect channels in this toolbox.
             if acted {
-                let result = bundle_terminal(&label, args.kind(), iteration, &last_result, &notes);
+                let result = bundle_terminal(
+                    &label,
+                    args.kind(),
+                    iteration,
+                    &last_result,
+                    &notes,
+                    &actions,
+                );
                 let _ = event_tx
                     .send(ScheduleEvent::IdleWakeCompleted {
                         job_id: job_id.clone(),
@@ -264,13 +301,24 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     }
 
     // Promote the terminal iteration's result + accumulated notes to main.
-    let (notes, requests) = if args.idle {
-        (failed_idle_notes, failed_idle_requests)
+    let (notes, requests, actions) = if args.idle {
+        (failed_idle_notes, failed_idle_requests, failed_idle_actions)
     } else {
         let state = persistent_state.expect("non-idle loops retain one fork state");
-        (state.take_notes(), state.take_requests())
+        (
+            state.take_notes(),
+            state.take_requests(),
+            state.take_actions(),
+        )
     };
-    let result = bundle_terminal(&label, args.kind(), iteration, &last_result, &notes);
+    let result = bundle_terminal(
+        &label,
+        args.kind(),
+        iteration,
+        &last_result,
+        &notes,
+        &actions,
+    );
 
     let _ = event_tx
         .send(ScheduleEvent::Completed {
@@ -337,26 +385,67 @@ async fn wait_for_next_wake(
     }
 }
 
-/// Cheap local mtime/length/type digest. A file appearing, disappearing, or
-/// changing metadata counts as a change without an inference request.
+/// Cheap local metadata digest. A file appearing, disappearing, or changing
+/// metadata counts as a change without an inference request. Directory watch
+/// roots include every descendant so ordinary in-place file edits do not rely
+/// on the platform's directory mtime behaviour.
 fn local_change_digest(root: &std::path::Path, paths: &[String]) -> String {
-    let mut entries = paths
-        .iter()
-        .map(|path| match std::fs::metadata(root.join(path)) {
-            Ok(metadata) => {
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos())
-                    .unwrap_or_default();
-                format!("{path}:{}:{}:{modified}", metadata.len(), metadata.is_dir())
+    let mut entries = Vec::new();
+    for path in paths {
+        let absolute = root.join(path);
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => {
+                for entry in walkdir::WalkDir::new(&absolute)
+                    .follow_links(false)
+                    .sort_by_file_name()
+                {
+                    match entry {
+                        Ok(entry) => {
+                            let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                            match entry.metadata() {
+                                Ok(metadata) => entries
+                                    .push(metadata_digest(&relative.to_string_lossy(), &metadata)),
+                                Err(error) => entries.push(format!(
+                                    "{path}:metadata-error:{}:{}",
+                                    relative.to_string_lossy(),
+                                    error.kind()
+                                )),
+                            }
+                        }
+                        Err(error) => entries.push(format!(
+                            "{path}:walk-error:{}:{}",
+                            error.path().map_or_else(
+                                || "unknown".to_string(),
+                                |path| path.to_string_lossy().into_owned()
+                            ),
+                            error
+                        )),
+                    }
+                }
             }
-            Err(error) => format!("{path}:missing:{}", error.kind()),
-        })
-        .collect::<Vec<_>>();
+            Ok(metadata) => entries.push(metadata_digest(path, &metadata)),
+            Err(error) => entries.push(format!("{path}:missing:{}", error.kind())),
+        }
+    }
     entries.sort();
     entries.join("|")
+}
+
+fn metadata_digest(path: &str, metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let kind = if metadata.is_dir() {
+        "dir"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else {
+        "file"
+    };
+    format!("{path}:{}:{kind}:{modified}", metadata.len())
 }
 
 /// Run one iteration's turn loop in the fork. Returns the iteration's
@@ -511,17 +600,18 @@ fn build_fork_agent(
     idle: bool,
 ) -> Agent {
     // Idle no-op classification is sound only if every possible side effect
-    // crosses state owned below. Do not try to infer arbitrary effects after
-    // the fact (Git cannot see services, ignored files, or pre-existing dirty
-    // paths). Instead, admit only registered read-only operations and add the
-    // two fork-local channels whose effect is recorded in `state`.
+    // crosses state owned below. Retain the parent's ordinary mutation surface
+    // and wrap every non-read-only operation so its invocation is durably
+    // recorded before external cancellation can abort the wake.
     let mut tools: ToolBox = parent
         .tools
         .clone()
         .without("question")
         .without_direct_native_media();
     if idle {
-        tools = tools.registered_read_only_operations();
+        tools = tools.map_non_read_only_operations(|tool| {
+            Arc::new(IdleWakeActionTool::new(tool, state.clone()))
+        });
     }
     tools = tools.with(Arc::new(NoteTool::new(state.clone(), turn_tx)));
     tools = tools.with(Arc::new(ForkScheduleTool::new(state)));
@@ -565,6 +655,7 @@ fn bundle_terminal(
     iterations: u64,
     last_result: &str,
     notes: &[String],
+    actions: &[String],
 ) -> String {
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
     let _ = writer.writeln(&format!(
@@ -575,6 +666,12 @@ fn bundle_terminal(
         let _ = writer.writeln("Notes:");
         for n in notes {
             let _ = writer.writeln(&format!("- {n}"));
+        }
+    }
+    if !actions.is_empty() {
+        let _ = writer.writeln("Actions:");
+        for action in actions {
+            let _ = writer.writeln(&format!("- {action}"));
         }
     }
     let trimmed = last_result.trim();
@@ -680,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn question_absent_from_loop_fork_toolbox() {
+    fn idle_fork_keeps_mutation_tools_but_not_question() {
         let parent = parent_agent_with_question();
         assert!(parent.tools.names().contains(&"question"));
         assert!(parent.tools.names().contains(&"write"));
@@ -691,11 +788,28 @@ mod tests {
         let names = fork.tools.names();
 
         assert!(!names.contains(&"question"), "{names:?}");
-        assert!(!names.contains(&"write"), "{names:?}");
+        assert!(names.contains(&"write"), "{names:?}");
         assert!(names.contains(&"note"), "{names:?}");
         assert!(names.contains(&"schedule"), "{names:?}");
         assert!(names.contains(&"read"), "{names:?}");
         assert_eq!(fork.context_policy, parent.context_policy);
+    }
+
+    #[test]
+    fn directory_watch_digest_observes_descendant_file_modification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watched = tmp.path().join("watched");
+        std::fs::create_dir(&watched).unwrap();
+        let child = watched.join("status.txt");
+        std::fs::write(&child, "old").unwrap();
+        let before = local_change_digest(tmp.path(), &["watched".to_string()]);
+
+        // Rewriting an existing child does not reliably update the watched
+        // directory's own metadata; the recursive digest must still change.
+        std::fs::write(child, "updated").unwrap();
+        let after = local_change_digest(tmp.path(), &["watched".to_string()]);
+
+        assert_ne!(before, after);
     }
 
     #[tokio::test(start_paused = true)]

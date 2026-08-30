@@ -1827,6 +1827,35 @@ impl ToolBox {
         self
     }
 
+    /// Wrap every non-read-only callable operation on this toolbox.
+    ///
+    /// Background fork callers use this to retain the parent capability
+    /// surface while making every possible effect cross their own durable
+    /// accounting boundary. Direct-native media is normally stripped before
+    /// this method is used, but keep the dormant registry coherent too.
+    pub(crate) fn map_non_read_only_operations(
+        mut self,
+        map: impl Fn(Arc<dyn Tool>) -> Arc<dyn Tool>,
+    ) -> Self {
+        for tool in self.tools.values_mut() {
+            if tool.effect() != ToolEffect::ReadOnly {
+                *tool = map(tool.clone());
+            }
+        }
+        for tool in self.dormant_direct_native_media.values_mut() {
+            if tool.effect() != ToolEffect::ReadOnly {
+                *tool = map(tool.clone());
+            }
+        }
+        for entry in self.mcp_builtin_tools.values_mut() {
+            if entry.tool.effect() != ToolEffect::ReadOnly {
+                entry.tool = map(entry.tool.clone());
+            }
+        }
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
     pub fn with_discoverable_mcp(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.name().to_string();
         if is_monty_builtin_adaptable(&name) {

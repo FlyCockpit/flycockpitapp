@@ -7922,16 +7922,22 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
-        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
-            self.keep_warm_armed_for_idle_window = false;
-            self.schedule.record_user_activity();
-        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
             )
         );
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+            // Oversized submissions have not been accepted yet: phase-two
+            // materialization records activity only after its durable commit.
+            // This keeps rejected leases from resetting idle wakes and gives
+            // every accepted submission one, consistent activity timestamp.
+            if !has_oversized_artifact_lease {
+                self.schedule.record_user_activity();
+            }
+        }
         self.auto_compact_gate
             .observe_submission(submission.origin, has_oversized_artifact_lease);
     }

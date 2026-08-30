@@ -49,6 +49,9 @@ use crate::engine::schedule::spec::{
 };
 use crate::redact::RedactionTable;
 use crate::session::Session;
+use crate::tools::schedule::{
+    ActiveIdleWake, new_active_idle_wake, take_active_idle_wake_for_cancellation,
+};
 
 use super::{background, swarm};
 
@@ -175,6 +178,10 @@ struct ScheduleEntry {
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
     background: Option<Arc<background::BackgroundHandle>>,
+    /// The currently executing idle wake, if this is an idle fork. The
+    /// authority claims it during cancellation so an already-recorded action
+    /// cannot be lost when aborting the runner task.
+    active_idle_wake: Option<ActiveIdleWake>,
 }
 
 /// Per-iteration scheduling state for a keep-in-context loop. The
@@ -593,6 +600,7 @@ impl ScheduleAuthority {
             abort: Some(handle.abort_handle()),
             in_context: None,
             background: None,
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -706,6 +714,7 @@ impl ScheduleAuthority {
                 timer_abort: None,
             }),
             background: None,
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         self.emit_started(&job_id, &label, kind);
@@ -722,6 +731,7 @@ impl ScheduleAuthority {
         let kind = args.kind();
         let label = loop_label(&args);
         self.emit_started(&job_id, &label, kind);
+        let active_idle_wake = args.idle.then(new_active_idle_wake);
 
         let run_ctx = LoopRunCtx {
             job_id: job_id.clone(),
@@ -731,6 +741,7 @@ impl ScheduleAuthority {
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             idle_activity_rx: args.idle.then(|| self.idle_activity_tx.subscribe()),
+            active_idle_wake: active_idle_wake.clone(),
         };
         let handle = tokio::spawn(loop_runner::run_forked_loop(run_ctx));
         let entry = ScheduleEntry {
@@ -742,6 +753,7 @@ impl ScheduleAuthority {
             abort: Some(handle.abort_handle()),
             in_context: None,
             background: None,
+            active_idle_wake,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -784,6 +796,7 @@ impl ScheduleAuthority {
             abort: Some(abort),
             in_context: None,
             background: Some(Arc::new(handle)),
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -799,6 +812,14 @@ impl ScheduleAuthority {
         let Some(mut entry) = self.registry.remove(job_id) else {
             return false;
         };
+        // Claim the active idle wake before aborting its task. Its tools write
+        // effect records synchronously into this authority-owned state, so a
+        // cancellation racing an in-flight wake cannot erase an action that
+        // already happened.
+        let idle_wake = entry
+            .active_idle_wake
+            .as_ref()
+            .and_then(take_active_idle_wake_for_cancellation);
         // Stop any armed tick timer + spawned task.
         if let Some(ic) = &mut entry.in_context
             && let Some(t) = ic.timer_abort.take()
@@ -832,13 +853,48 @@ impl ScheduleAuthority {
         // to send its own.
         else {
             let was_swarm = entry.kind == ScheduleKind::Swarm;
+            let (result, requests) = if let Some(state) = idle_wake {
+                let notes = state.take_notes();
+                let requests = state.take_requests();
+                let actions = state.take_actions();
+                if notes.is_empty() && requests.is_empty() && actions.is_empty() {
+                    (
+                        format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                        requests,
+                    )
+                } else {
+                    let mut result = format!(
+                        "{} `{}` cancelled after an acting idle wake.",
+                        entry.kind.as_str(),
+                        entry.label
+                    );
+                    if !actions.is_empty() {
+                        result.push_str("\nActions:");
+                        for action in actions {
+                            result.push_str(&format!("\n- {action}"));
+                        }
+                    }
+                    if !notes.is_empty() {
+                        result.push_str("\nNotes:");
+                        for note in notes {
+                            result.push_str(&format!("\n- {note}"));
+                        }
+                    }
+                    (result, requests)
+                }
+            } else {
+                (
+                    format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                    Vec::new(),
+                )
+            };
             self.send_terminal_event(ScheduleEvent::Completed {
                 job_id: entry.job_id.clone(),
                 label: entry.label.clone(),
                 kind: entry.kind,
-                result: format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                result,
                 failed: false,
-                requests: Vec::new(),
+                requests,
             });
             // A swarm runner may ALSO publish its own terminal `Completed`
             // (`abort()` is not synchronous). Free the concurrency slot HERE,

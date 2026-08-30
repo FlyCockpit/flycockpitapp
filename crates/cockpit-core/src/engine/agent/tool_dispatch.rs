@@ -1972,8 +1972,8 @@ async fn execute_ordinary_call_unscoped(
     // Store-time projection must also rewrite the live assistant call.
     // Otherwise a marked value would survive in the just-built history until
     // restart even though the durable replay row correctly omits it.
-    let model_history_args = model_history_args(env, resolved_name, history_args);
-    rewrite_assistant_tool_call(history, &tc.id, &model_history_args);
+    let model_wire_args = model_history_args(env, resolved_name, history_args);
+    rewrite_assistant_tool_call(history, &tc.id, &model_wire_args);
     if let Some(signature) = repair_outcome
         .valid
         .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args))

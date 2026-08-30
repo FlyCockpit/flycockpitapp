@@ -906,7 +906,26 @@ fn validate_tool_artifact_projection_state(
     let provenance = provenance
         .as_object()
         .ok_or_else(|| anyhow!("tool artifact projection provenance must be an object"))?;
-    require_exact_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
+    let valid_provenance_keys = ["agent_id", "tool", "call_id", "source", "preview_lines"];
+    if !provenance.contains_key("agent_id")
+        || !provenance.contains_key("tool")
+        || !provenance.contains_key("call_id")
+        || !provenance
+            .keys()
+            .all(|key| valid_provenance_keys.contains(&key.as_str()))
+    {
+        bail!("tool artifact projection provenance has an invalid shape");
+    }
+    if provenance.contains_key("source")
+        && provenance.get("source").and_then(Value::as_str) != Some("tool_result")
+    {
+        bail!("tool artifact projection provenance source is invalid");
+    }
+    if let Some(preview_lines) = provenance.get("preview_lines")
+        && !matches!(preview_lines.as_u64(), Some(1..=10_000))
+    {
+        bail!("tool artifact projection provenance preview_lines is invalid");
+    }
     let agent = provenance
         .get("agent_id")
         .ok_or_else(|| anyhow!("tool artifact projection provenance lacks agent_id"))?;
@@ -942,7 +961,7 @@ fn validate_tool_artifact_projection_state(
             .get(field)
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("tool artifact projection lacks {field}"))?;
-        if value.len() > 2 * 1024 {
+        if value.len() > 16 * 1024 {
             bail!("tool artifact projection {field} exceeds the preview cap");
         }
         Ok(value)

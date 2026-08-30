@@ -83,11 +83,41 @@ pub async fn reconcile_cleanup_intents(db: &crate::db::Db) -> Result<usize> {
     let paths = db.pending_text_artifact_blob_cleanup_intents().await?;
     let mut completed = 0usize;
     for path in paths {
-        if let Err(error) = remove(&path) {
-            tracing::warn!(%error, %path, "text artifact blob cleanup remains pending");
-            continue;
+        // Keep the ownership check, unlink, and journal retirement in one
+        // writer transaction. A concurrent admission either claims the intent
+        // before this work starts, or sees it consumed and rolls back without
+        // publishing an artifact owner for a blob we removed.
+        let log_path = path.clone();
+        match db
+            .transaction(move |conn| {
+                let pending = conn.query_row(
+                    "SELECT 1 FROM text_artifact_blob_cleanup_intents WHERE blob_path=?1",
+                    rusqlite::params![&path],
+                    |_| Ok(()),
+                );
+                match pending {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                }
+                remove(&path)?;
+                let deleted = conn.execute(
+                    "DELETE FROM text_artifact_blob_cleanup_intents WHERE blob_path=?1",
+                    rusqlite::params![&path],
+                )?;
+                ensure!(
+                    deleted == 1,
+                    "text artifact blob cleanup intent disappeared"
+                );
+                Ok(true)
+            })
+            .await
+        {
+            Ok(deleted) => completed += usize::from(deleted),
+            Err(error) => {
+                tracing::warn!(%error, path = %log_path, "text artifact blob cleanup remains pending")
+            }
         }
-        completed += usize::from(db.complete_text_artifact_blob_cleanup_intent(path).await?);
     }
     Ok(completed)
 }

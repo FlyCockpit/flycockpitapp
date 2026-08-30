@@ -133,8 +133,10 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
         .compile_matcher();
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     for entry in history_entries(ctx).await? {
-        if matcher.is_match(&entry) && !writer.writeln(&entry) {
-            break;
+        if matcher.is_match(&entry) {
+            // The model view is token-capped, but retain the complete bounded
+            // discovery listing for the common configurable spill boundary.
+            let _ = writer.writeln(&entry);
         }
     }
     if writer.is_empty() {
@@ -143,10 +145,15 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
         )));
     }
     let truncated = writer.is_truncated();
+    let capture = writer.text_artifact_capture();
     let mut body = writer.into_string();
     if truncated {
         body.push_str("... [truncated; narrow the pattern]\n");
-        Ok(Some(ToolOutput::truncated_text(body)))
+        let output = ToolOutput::truncated_text(body);
+        Ok(Some(match capture {
+            Some(capture) => output.with_text_artifact_capture(capture),
+            None => output,
+        }))
     } else {
         Ok(Some(ToolOutput::text(body)))
     }

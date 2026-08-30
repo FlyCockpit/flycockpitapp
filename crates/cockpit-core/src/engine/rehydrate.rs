@@ -610,10 +610,22 @@ fn render_rehydrated_tool_artifact_frame<'a>(
         .get("provenance")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow!("tool artifact projection lacks provenance"))?;
-    if provenance.len() != 3
-        || !provenance.contains_key("agent_id")
+    let valid_provenance_keys = [
+        "agent_id",
+        "tool",
+        "call_id",
+        "source",
+        "preview_lines",
+        "blob_path",
+    ];
+    if !provenance.contains_key("agent_id")
         || !provenance.contains_key("tool")
         || !provenance.contains_key("call_id")
+        || !provenance
+            .keys()
+            .all(|key| valid_provenance_keys.contains(&key.as_str()))
+        || (provenance.contains_key("blob_path")
+            && (!provenance.contains_key("source") || !provenance.contains_key("preview_lines")))
     {
         return Err(anyhow!(
             "tool artifact projection provenance has an invalid shape"
@@ -655,7 +667,7 @@ fn render_rehydrated_tool_artifact_frame<'a>(
             .get(field)
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("tool artifact projection lacks {field}"))?;
-        if value.len() > 2 * 1024 {
+        if value.len() > 16 * 1024 {
             return Err(anyhow!(
                 "tool artifact projection {field} exceeds preview cap"
             ));
@@ -709,16 +721,25 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                 return Err(anyhow!("available tool artifact projection is malformed"));
             }
             let outbound_content = redaction.scrub(&artifact_content);
-            let preview_lines = artifact_provenance
-                .get("preview_lines")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
-            let preview_head = crate::engine::text_artifact_frame::utf8_preview_lines(
-                &outbound_content,
-                preview_lines,
-            );
-            let preview_tail = "";
+            let (preview_head, preview_tail) = if artifact_provenance.get("preview_lines").is_some()
+            {
+                let preview_lines = artifact_provenance
+                    .get("preview_lines")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                (
+                    crate::engine::text_artifact_frame::utf8_preview_lines(
+                        &outbound_content,
+                        preview_lines,
+                    ),
+                    "",
+                )
+            } else {
+                let (head, tail) =
+                    crate::engine::text_artifact_frame::utf8_preview_pair(&outbound_content);
+                (head.to_owned(), tail.to_owned())
+            };
             // Locally captured artifacts have already passed this boundary and
             // retain their durable previews. Imported (or newly matched)
             // content is rendered from the current safe view instead of
@@ -747,8 +768,8 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                         stored_source_bytes: artifact.stored_source_bytes,
                         content_bytes: artifact.content_bytes,
                         line_count: artifact_content.lines().count(),
-                        preview_head,
-                        preview_tail,
+                        preview_head: &preview_head,
+                        preview_tail: &preview_tail,
                     },
                 ),
             ))

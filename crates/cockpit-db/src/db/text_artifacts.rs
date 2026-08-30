@@ -1338,13 +1338,8 @@ fn validate_durable_tool_projection<'a>(
         .get("provenance")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow!("durable text-artifact projection lacks provenance"))?;
-    ensure!(
-        provenance.len() == 3
-            && provenance.contains_key("agent_id")
-            && provenance.contains_key("tool")
-            && provenance.contains_key("call_id"),
-        "durable text-artifact projection provenance has an invalid shape"
-    );
+    validate_tool_provenance(provenance)
+        .context("durable text-artifact projection provenance has an invalid shape")?;
     let call_id = provenance
         .get("call_id")
         .and_then(serde_json::Value::as_str)
@@ -1432,24 +1427,55 @@ fn validate_available_projection_artifact(
             "available durable projection {field} differs from its artifact"
         );
     }
+    let (expected_line_count, preview_head, preview_tail) =
+        if has_blob_path(&artifact.provenance_json)? {
+            // Blob-backed rows retain only this ingress-selected preview in
+            // SQLite. Core validates the complete body before rendering.
+            (
+                projection
+                    .get("line_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok()),
+                artifact.content.clone(),
+                String::new(),
+            )
+        } else if uses_ingress_line_preview(&artifact.provenance_json)? {
+            // Archives materialize the full body inline but preserve the
+            // original ingress line-preview contract.
+            let preview = artifact_inline_preview(
+                &artifact.content,
+                artifact_preview_lines(&artifact.provenance_json)?,
+            );
+            (
+                Some(artifact.content.lines().count()),
+                preview,
+                String::new(),
+            )
+        } else {
+            let (head, tail) = artifact_preview_pair(&artifact.content);
+            (
+                Some(artifact.content.lines().count()),
+                head.to_owned(),
+                tail.to_owned(),
+            )
+        };
     ensure!(
         projection
             .get("line_count")
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            == Some(artifact.content.lines().count()),
+            == expected_line_count,
         "available durable projection line count differs from its artifact"
     );
-    let (head, tail) = artifact_preview_pair(&artifact.content);
     ensure!(
         projection
             .get("preview_head")
             .and_then(serde_json::Value::as_str)
-            == Some(head)
+            == Some(preview_head.as_str())
             && projection
                 .get("preview_tail")
                 .and_then(serde_json::Value::as_str)
-                == Some(tail),
+                == Some(preview_tail.as_str()),
         "available durable projection preview differs from its artifact"
     );
     let provenance: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
@@ -1717,7 +1743,18 @@ fn projection_state(
         provenance.is_object(),
         "text artifact projection provenance must be an object"
     );
-    let (preview_head, preview_tail) = artifact_preview_pair(&candidate.content);
+    let (preview_head, preview_tail) = if uses_ingress_line_preview(&candidate.provenance_json)? {
+        (
+            artifact_inline_preview(
+                &candidate.content,
+                artifact_preview_lines(&candidate.provenance_json)?,
+            ),
+            String::new(),
+        )
+    } else {
+        let (head, tail) = artifact_preview_pair(&candidate.content);
+        (head.to_owned(), tail.to_owned())
+    };
     Ok(serde_json::json!({
         "version": 1,
         "status": status,
@@ -1739,8 +1776,9 @@ fn projection_state(
 
 /// The durable event state stores exactly the model-frame previews so an
 /// unavailable quota branch can regenerate the same frame without retaining a
-/// second copy of the omitted body. Keep this byte slicing identical to the
-/// core renderer's UTF-8-safe 2KiB/2KiB contract.
+/// second copy of the omitted body. Non-blob artifacts use the core renderer's
+/// UTF-8-safe 2KiB/2KiB preview pair; blob-backed artifacts use the selected
+/// ingress line preview above.
 fn artifact_preview_pair(value: &str) -> (&str, &str) {
     const EACH: usize = 2 * 1024;
     if value.len() <= EACH * 2 {
@@ -2084,6 +2122,15 @@ fn has_blob_path(provenance_json: &str) -> Result<bool> {
     Ok(blob_path_from_provenance(provenance_json)?.is_some())
 }
 
+/// Tool artifacts imported from an archive no longer have a daemon-local blob
+/// path, but retain their original `preview_lines` contract.  That contract,
+/// rather than current physical storage, decides the durable model frame.
+fn uses_ingress_line_preview(provenance_json: &str) -> Result<bool> {
+    let provenance: serde_json::Value =
+        serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
+    Ok(provenance.get("preview_lines").is_some())
+}
+
 fn blob_path_from_provenance(provenance_json: &str) -> Result<Option<String>> {
     let provenance: serde_json::Value =
         serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
@@ -2119,12 +2166,10 @@ fn artifact_inline_preview(content: &str, max_lines: usize) -> String {
         preview.push('\n');
     }
     if preview.is_empty() {
-        let end = content
-            .char_indices()
-            .take_while(|(index, _)| *index < MAX_BYTES)
-            .map(|(index, character)| index + character.len_utf8())
-            .last()
-            .unwrap_or(0);
+        let mut end = content.len().min(MAX_BYTES);
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
         preview.push_str(&content[..end]);
     }
     preview

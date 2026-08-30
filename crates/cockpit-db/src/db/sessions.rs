@@ -2170,19 +2170,6 @@ impl Db {
         .await
     }
 
-    pub async fn complete_text_artifact_blob_cleanup_intent(
-        &self,
-        blob_path: String,
-    ) -> Result<bool> {
-        self.transaction(move |conn| {
-            Ok(conn.execute(
-                "DELETE FROM text_artifact_blob_cleanup_intents WHERE blob_path=?1",
-                [blob_path],
-            )? == 1)
-        })
-        .await
-    }
-
     /// Replay durable filesystem cleanup. The intent is removed only after a
     /// successful unlink (or proof the file is already absent).
     pub async fn reconcile_delegation_sidecar_cleanup_intents(&self) -> Result<usize> {

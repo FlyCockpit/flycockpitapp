@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
-use crate::intel::budget::BudgetedWriter;
+use crate::intel::budget::{BudgetedWriter, capture_text_artifact_body};
 use crate::intel::thin::{ThinLimits, thin_line_output};
 use crate::tools::sandbox;
 use crate::tools::text_search::{SearchOptions, SearchOutcome, search_records_blocking};
@@ -183,6 +183,7 @@ fn render_search_outcome(outcome: SearchOutcome, query: &str) -> ToolOutput {
             body.push_str("... [truncated; narrow the pattern or pass a `path`]\n");
         }
         ToolOutput::truncated_text(body)
+            .with_text_artifact_capture(capture_text_artifact_body(&raw))
     } else {
         ToolOutput::text(body)
     }

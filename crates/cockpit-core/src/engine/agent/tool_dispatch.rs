@@ -1985,20 +1985,20 @@ async fn execute_ordinary_call_unscoped(
         .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
     if artifact_capture.is_none()
         && canonical_result_is_text_only
+        && result.as_ref().is_ok_and(|output| !output.truncated)
         && output_str.len() > artifact_spill_bytes
     {
         artifact_capture = Some(crate::intel::budget::capture_text_artifact_body(
             &output_str,
         ));
     }
-    let result_was_truncated = result.as_ref().is_ok_and(|output| output.truncated);
     let artifact_capture = artifact_capture.filter(|capture| {
         crate::engine::agent::text_artifact_capture_is_persistable(
             resolved_name,
             Some(capture),
             &output_str,
             recheck_modified_output,
-        ) && (capture.content.len() > artifact_spill_bytes || result_was_truncated)
+        ) && capture.content.len() > artifact_spill_bytes
     });
 
     let truncated = matches!(

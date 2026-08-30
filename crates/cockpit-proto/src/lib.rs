@@ -4558,6 +4558,8 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_live_status",
         "set_active_model",
         "set_workspace_trust",
+        "set_workspace_history_scope",
+        "get_workspace_history_scope",
         "set_agent",
         "set_default_model",
         "set_model_favorite",
@@ -4604,6 +4606,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "agent_tree_page",
         "user_message_queued",
         "workspace_trust_set",
+        "workspace_history_scope",
     ];
 
     #[test]

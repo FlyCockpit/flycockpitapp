@@ -48,7 +48,11 @@ describe("remote operation classification fixture", () => {
     }
     // Reclassified from local_only to owner-remoted by cli-existing-rpc-commands-via-daemon:
     // these consumed product RPCs now reserve a remote operation.
-    for (const tag of ["resolve_assistant_session", "set_workspace_trust"]) {
+    for (const tag of [
+      "resolve_assistant_session",
+      "set_workspace_trust",
+      "set_workspace_history_scope",
+    ]) {
       expect(byTag.get(tag)).toMatchObject({
         class: "transactional_mutation",
         strategy: "sql_transaction",

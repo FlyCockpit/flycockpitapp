@@ -2029,6 +2029,15 @@ impl Session {
         frame: Option<SessionEventModelFrame<'_>>,
     ) -> Result<i64> {
         const INLINE_HANDOFF_MAX_BYTES: usize = 16 * 1024;
+        let successor = self
+            .db
+            .get_session(record.successor_session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("compaction successor session does not exist"))?;
+        anyhow::ensure!(
+            successor.project_id == self.project_id,
+            "compaction successor must belong to the same workspace"
+        );
         let data = serde_json::json!({
             "kind": "compaction",
             "predecessor_session_id": self.id.to_string(),

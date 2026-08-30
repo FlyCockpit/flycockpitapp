@@ -505,6 +505,26 @@
     "request": "set_workspace_trust",
     "v": 21
   },
+  "set_workspace_history_scope": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "inbound": true,
+      "outbound": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_history_scope",
+    "v": 21
+  },
+  "get_workspace_history_scope": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_workspace_history_scope",
+    "v": 21
+  },
   "share_session": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",

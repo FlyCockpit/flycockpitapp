@@ -81,6 +81,73 @@ impl Db {
         })
         .await
     }
+
+    /// Resolve a session only when it is visible to `reader_project`.  The
+    /// lookup and both consent rows share one SQLite snapshot, so callers do
+    /// not turn an existence probe into a cross-workspace disclosure.
+    pub async fn session_access_allowed(
+        &self,
+        reader_project: &str,
+        session_id: uuid::Uuid,
+    ) -> Result<bool> {
+        validate_project_id(reader_project)?;
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| session_access_allowed_conn(conn, &reader_project, session_id))
+            .await
+    }
+
+    /// Same as [`Self::session_access_allowed`], but resolves a short id
+    /// without revealing how many inaccessible workspaces use that prefix.
+    pub async fn accessible_sessions_by_short_id(
+        &self,
+        reader_project: &str,
+        short_id: &str,
+    ) -> Result<Vec<uuid::Uuid>> {
+        validate_project_id(reader_project)?;
+        let reader_project = reader_project.to_string();
+        let short_id = short_id.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.session_id FROM sessions s
+                  WHERE s.short_id = ?1
+                    AND (s.project_id = ?2 OR (
+                        EXISTS (SELECT 1 FROM workspace_history_scopes reader
+                                WHERE reader.project_id = ?2 AND reader.outbound_enabled = 1)
+                        AND EXISTS (SELECT 1 FROM workspace_history_scopes target
+                                    WHERE target.project_id = s.project_id AND target.inbound_enabled = 1)
+                    ))",
+            )?;
+            let rows = stmt.query_map(params![short_id, reader_project], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut visible = Vec::new();
+            for row in rows {
+                visible.push(uuid::Uuid::parse_str(&row?)?);
+            }
+            Ok(visible)
+        })
+        .await
+    }
+
+    /// Confirm an already-fetched batch immediately before it is disclosed.
+    /// One read transaction snapshots every target and both consent rows.
+    pub async fn sessions_access_allowed(
+        &self,
+        reader_project: &str,
+        session_ids: &[uuid::Uuid],
+    ) -> Result<bool> {
+        validate_project_id(reader_project)?;
+        let reader_project = reader_project.to_string();
+        let session_ids = session_ids.to_vec();
+        self.transaction(move |conn| {
+            session_ids
+                .into_iter()
+                .try_fold(true, |allowed, session_id| {
+                    Ok(allowed && session_access_allowed_conn(conn, &reader_project, session_id)?)
+                })
+        })
+        .await
+    }
 }
 
 fn validate_project_id(project_id: &str) -> Result<()> {
@@ -102,6 +169,28 @@ fn workspace_history_scope_conn(
     .optional()
     .context("querying workspace history scope")
     .map(|scope| scope.unwrap_or(WorkspaceHistoryScope::CURRENT_WORKSPACE_ONLY))
+}
+
+pub(crate) fn session_access_allowed_conn(
+    conn: &Connection,
+    reader_project: &str,
+    session_id: uuid::Uuid,
+) -> Result<bool> {
+    let allowed: Option<i64> = conn
+        .query_row(
+            "SELECT s.project_id = ?1 OR (
+                EXISTS (SELECT 1 FROM workspace_history_scopes reader
+                        WHERE reader.project_id = ?1 AND reader.outbound_enabled = 1)
+                AND EXISTS (SELECT 1 FROM workspace_history_scopes target
+                            WHERE target.project_id = s.project_id AND target.inbound_enabled = 1)
+             )
+             FROM sessions s WHERE s.session_id = ?2",
+            params![reader_project, session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("querying session workspace for history scope")?;
+    Ok(allowed == Some(1))
 }
 
 #[cfg(test)]

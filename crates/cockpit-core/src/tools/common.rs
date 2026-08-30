@@ -421,10 +421,19 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             review_cage: None,
             context_usage: None,
             available_tools: Arc::new(
-                ["bash", "escalate", "read", "write", "edit"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+                [
+                    "bash",
+                    "escalate",
+                    "read",
+                    "write",
+                    "edit",
+                    "session_search",
+                    "session_read",
+                    "session_lineage_search",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             ),
             mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
                 Vec::new(),

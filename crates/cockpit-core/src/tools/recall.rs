@@ -58,6 +58,9 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             None => return Ok(not_found(path, target)),
         },
     };
+    // Revalidate at the output boundary. This is the disclosure
+    // linearization point with a concurrent consent revocation.
+    require_target_access(ctx, target).await?;
     // Scrub before selecting a page so a secret split across a page boundary
     // cannot leave a prefix or suffix in a later continuation.
     render_page(&ctx.redact.scrub(&content), path, args)
@@ -160,6 +163,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
         return Ok(None);
     }
     let target = parse(path, ctx).await?;
+    require_target_access(ctx, target).await?;
     if matches!(target, RecallPath::History) {
         // #134 owns the final history-search tool. Until then, discovery is
         // FTS-only; never fall back to recursively regex-scanning transcripts.
@@ -173,6 +177,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     let Some(content) = pseudofile_content(target, ctx).await? else {
         return Ok(Some(not_found(path, target)));
     };
+    require_target_access(ctx, target).await?;
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(
             args.get("case_insensitive")
@@ -207,6 +212,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
 
 async fn parse(path: &str, ctx: &ToolCtx) -> Result<RecallPath> {
     if path == "cockpit://history" || path == "cockpit://history/" {
+        crate::tools::history_scope::require_recall_permission(ctx)?;
         return Ok(RecallPath::History);
     }
     let parts: Vec<_> = path.trim_end_matches('/').split('/').collect();
@@ -243,25 +249,55 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
         return Ok(ctx.session.id);
     }
     if let Ok(id) = Uuid::parse_str(id) {
-        let row = ctx
+        if id == ctx.session.id {
+            return Ok(id);
+        }
+        crate::tools::history_scope::require_recall_permission(ctx)?;
+        if ctx
             .session
             .db
-            .get_session(id)
+            .session_access_allowed(&ctx.session.project_id, id)
             .await?
-            .ok_or_else(|| invalid_input("session does not exist"))?;
-        if row.project_id != ctx.session.project_id {
-            return Err(invalid_input(
-                "session is outside the current workspace and cannot be recalled",
-            ));
+        {
+            return Ok(id);
         }
-        return Ok(id);
+        return Err(invalid_input("no accessible session with that id"));
     }
-    ctx.session
+    let local = ctx
+        .session
         .db
         .get_session_by_short_id(&ctx.session.project_id, id)
         .await?
-        .map(|row| row.session_id)
-        .ok_or_else(|| invalid_input(format!("no session with short id `{id}`")))
+        .map(|row| row.session_id);
+    if let Some(id) = local {
+        crate::tools::history_scope::require_recall_permission(ctx)?;
+        return Ok(id);
+    }
+    crate::tools::history_scope::require_recall_permission(ctx)?;
+    let visible = ctx
+        .session
+        .db
+        .accessible_sessions_by_short_id(&ctx.session.project_id, id)
+        .await?;
+    match visible.as_slice() {
+        [session_id] => Ok(*session_id),
+        _ => Err(invalid_input("no accessible session with that short id")),
+    }
+}
+
+async fn require_target_access(ctx: &ToolCtx, target: RecallPath) -> Result<()> {
+    match target {
+        RecallPath::History => crate::tools::history_scope::require_recall_permission(ctx),
+        RecallPath::Transcript(session_id)
+        | RecallPath::Compaction(session_id, _)
+        | RecallPath::Plan(session_id)
+        | RecallPath::Artifact(session_id, _)
+            if session_id != ctx.session.id =>
+        {
+            crate::tools::history_scope::require_session_access(ctx, session_id).await
+        }
+        _ => Ok(()),
+    }
 }
 
 async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<String>> {
@@ -271,8 +307,13 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
             let turns = ctx
                 .session
                 .db
-                .thread_turns_for_trust(session_id, caller_history_trust(ctx))
-                .await?;
+                .thread_turns_for_access(
+                    &ctx.session.project_id,
+                    session_id,
+                    caller_history_trust(ctx),
+                )
+                .await?
+                .ok_or_else(|| invalid_input("session is no longer accessible"))?;
             Ok(Some(
                 turns
                     .iter()
@@ -522,6 +563,7 @@ fn utf8_prefix(value: &str, budget: usize) -> &str {
 }
 
 async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
+    crate::tools::history_scope::require_recall_permission(ctx)?;
     let mut entries = Vec::new();
     for session in ctx
         .session

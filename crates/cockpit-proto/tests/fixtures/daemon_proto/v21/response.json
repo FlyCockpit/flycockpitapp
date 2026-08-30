@@ -67,6 +67,13 @@
     },
     "response": "workspace_trust"
   },
+  "workspace_history_scope": {
+    "data": {
+      "inbound": true,
+      "outbound": true
+    },
+    "response": "workspace_history_scope"
+  },
   "flycockpit_stored": {
     "response": "flycockpit_stored"
   },

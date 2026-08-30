@@ -100,9 +100,14 @@ impl Tool for SessionReadTool {
         let turns = ctx
             .session
             .db
-            .thread_turns_for_trust(session_id, caller_history_trust(ctx))
+            .thread_turns_for_access(
+                &ctx.session.project_id,
+                session_id,
+                caller_history_trust(ctx),
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
+            .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?
+            .ok_or_else(|| invalid_input("session is no longer accessible"))?;
         if turns.is_empty() {
             return Ok(ToolOutput::text(format!(
                 "Session `{id_arg}` has no user/assistant turns."
@@ -143,6 +148,9 @@ impl Tool for SessionReadTool {
                 redaction.scrub(output.content.model_text()),
             );
         }
+        // This final authorization read is the disclosure linearization point:
+        // a revocation that commits before output is returned wins.
+        crate::tools::history_scope::require_session_access(ctx, session_id).await?;
         Ok(output)
     }
 }
@@ -158,14 +166,13 @@ async fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
         if ctx
             .session
             .db
-            .get_session(uuid)
+            .session_access_allowed(&ctx.session.project_id, uuid)
             .await
             .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?
-            .is_some()
         {
             return Ok(uuid);
         }
-        return Err(invalid_input(format!("no session with id `{id_arg}`")));
+        return Err(invalid_input("no accessible session with that id"));
     }
 
     // Project-scoped first — short ids are unique per project.
@@ -179,23 +186,20 @@ async fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
         return Ok(row.session_id);
     }
 
-    // Fall back to a global lookup so a thread from another repo is
-    // still reachable; report ambiguity explicitly.
+    // Resolve only authorized cross-workspace matches. Never disclose a
+    // protected match count or whether a protected session exists.
     let global = ctx
         .session
         .db
-        .find_sessions_by_short_id_global(id_arg)
+        .accessible_sessions_by_short_id(&ctx.session.project_id, id_arg)
         .await
         .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
     match global.len() {
-        0 => Err(invalid_input(format!(
-            "no session with short id `{id_arg}`"
-        ))),
-        1 => Ok(global[0].session_id),
-        n => Err(invalid_input(format!(
-            "short id `{id_arg}` is ambiguous ({n} matches across projects); \
-             pass the full session UUID instead"
-        ))),
+        0 => Err(invalid_input("no accessible session with that short id")),
+        1 => Ok(global[0]),
+        _ => Err(invalid_input(
+            "no accessible session with that short id; use a full session UUID",
+        )),
     }
 }
 

@@ -415,6 +415,8 @@ pub enum TrustCommand {
     Status(TrustStatusArgs),
     /// Store a workspace trust mode for the effective root.
     Set(TrustSetArgs),
+    /// View or set cross-workspace history recall consent for this workspace.
+    HistoryScope(HistoryScopeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -614,6 +616,18 @@ pub struct TrustSetArgs {
     /// Workspace trust mode to store.
     #[arg(long, value_enum)]
     pub mode: TrustModeArg,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct HistoryScopeArgs {
+    /// Directory whose effective workspace root should be updated.
+    pub path: Option<PathBuf>,
+    /// Allow agents in this workspace to read consenting workspaces.
+    #[arg(long, action = ArgAction::Set, required = true)]
+    pub outbound: bool,
+    /// Allow consenting workspaces to read this workspace's history.
+    #[arg(long, action = ArgAction::Set, required = true)]
+    pub inbound: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]

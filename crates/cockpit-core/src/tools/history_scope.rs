@@ -27,16 +27,10 @@ pub(crate) fn require_recall_permission(ctx: &ToolCtx) -> Result<()> {
 /// available by default. Neither check observes execution sandbox state.
 pub(crate) async fn require_session_access(ctx: &ToolCtx, target: Uuid) -> Result<()> {
     require_recall_permission(ctx)?;
-    let row = ctx
-        .session
-        .db
-        .get_session(target)
-        .await?
-        .ok_or_else(|| invalid_input("session does not exist"))?;
     if ctx
         .session
         .db
-        .history_scope_allows(&ctx.session.project_id, &row.project_id)
+        .session_access_allowed(&ctx.session.project_id, target)
         .await?
     {
         Ok(())

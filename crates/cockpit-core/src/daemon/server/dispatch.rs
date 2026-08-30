@@ -7826,6 +7826,39 @@ async fn handle_serialized_request_impl(
                 config_generation: inventory::current_config_generation(),
             })
         }
+        Request::SetWorkspaceHistoryScope {
+            project_root,
+            outbound,
+            inbound,
+        } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root);
+            ctx.db
+                .set_workspace_history_scope(
+                    &project_id,
+                    crate::db::history_scope::WorkspaceHistoryScope { outbound, inbound },
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope { outbound, inbound })
+        }
+        Request::GetWorkspaceHistoryScope { project_root } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root);
+            let scope = ctx
+                .db
+                .workspace_history_scope(&project_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope {
+                outbound: scope.outbound,
+                inbound: scope.inbound,
+            })
+        }
         Request::GetStartupDisclosures { project_root: _ } => {
             #[cfg(not(feature = "remote"))]
             return Ok(Response::StartupDisclosures {

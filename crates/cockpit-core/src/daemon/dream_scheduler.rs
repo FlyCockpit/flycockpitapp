@@ -649,19 +649,19 @@ mod tests {
     }
 
     fn test_dream_entry_with_id(id: &str, schedule: Option<&str>) -> KnowledgeBaseRegistryEntry {
-        KnowledgeBaseRegistryEntry {
-            id: id.into(),
-            name: format!("KB {id}"),
-            description: "test".into(),
-            source: KnowledgeBaseSource::Local {
+        KnowledgeBaseRegistryEntry::new(
+            id.into(),
+            format!("KB {id}"),
+            "test".into(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("kb"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: Some("p:dream".into()),
-            dream_schedule: schedule.map(str::to_owned),
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        }
+            KnowledgeBaseEmbeddingOwnership::Local,
+            Some("p:dream".into()),
+            schedule.map(str::to_owned),
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        )
     }
 
     fn test_dream_providers() -> ProvidersConfig {

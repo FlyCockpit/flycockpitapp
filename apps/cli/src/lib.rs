@@ -240,6 +240,7 @@ pub mod integration {
             let request = match session_id {
                 Some(session_id) => crate::daemon::proto::attach_existing_code_root_v1_request(
                     session_id,
+                    since_seq,
                     None,
                     false,
                     interactive,
@@ -259,7 +260,6 @@ pub mod integration {
                     crate::env_snapshot::EnvDriftPolicy::default(),
                 ),
             };
-            let _ = since_seq;
             match self
                 .inner
                 .request_ok(request)

@@ -2268,6 +2268,9 @@ pub enum SessionWork {
     ResolveAgentDecision {
         decision_request_id: Uuid,
         answer: crate::agent_tree::PublicDecisionAnswer,
+        /// Present only for the ACP Code-root first-wins route. The worker
+        /// writes it in the same SQLite transaction as a newly won decision.
+        code_root_receipt: Option<crate::db::agent_tree_decisions::CodeRootInterruptReceiptWrite>,
         respond_to:
             oneshot::Sender<std::result::Result<crate::agent_tree::DecisionSettlement, String>>,
     },

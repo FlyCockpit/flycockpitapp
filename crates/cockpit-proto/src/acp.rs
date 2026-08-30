@@ -235,6 +235,11 @@ pub struct AttachExistingCodeRootV1Request {
     pub client_request_id: OpaqueAsciiId128V1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_cursor: Option<CodeRootReplayCursorV1>,
+    /// Session-event cursor for bounded transcript rehydration. This is
+    /// independent of the ACP delivery cursor above: the latter resumes
+    /// root-state invalidations while this cursor resumes session history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<i64>,
     pub options: CodeRootAttachOptionsV1,
 }
 
@@ -452,6 +457,7 @@ pub fn create_code_root_v1_request(
 #[allow(clippy::too_many_arguments)]
 pub fn attach_existing_code_root_v1_request(
     session_id: Uuid,
+    since_seq: Option<i64>,
     initial_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     no_sandbox: bool,
     interactive: bool,
@@ -469,6 +475,7 @@ pub fn attach_existing_code_root_v1_request(
         client_request_id: OpaqueAsciiId128V1::new(Uuid::new_v4().to_string())
             .expect("generated request id is bounded ASCII"),
         replay_cursor: None,
+        since_seq,
         options: CodeRootAttachOptionsV1 {
             initial_model,
             model_override,

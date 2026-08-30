@@ -451,6 +451,7 @@ pub(crate) async fn attach_send_pump(
     let request = match requested_session {
         Some(session_id) => proto::attach_existing_code_root_v1_request(
             session_id,
+            None,
             model_override.clone(),
             no_sandbox,
             false,

@@ -302,7 +302,14 @@ fn send_session_event_with_agent(
     source: NoticeSource,
 ) {
     record_notice_event_with_agent(Some(session), agent, redact, &event, source);
-    record_code_root_state_transition(session, &event);
+    // A Code-root transition is observable to ordinary session clients only
+    // after its ACP replay invalidation is durable.  The event itself is
+    // already a committed worker transition, so there is no safe later read
+    // that can reconstruct a missed delivery for a reconnecting ACP client.
+    // Fail closed instead of publishing an unreplayable transition.
+    if !record_code_root_state_transition(session, &event) {
+        return;
+    }
     send_event(tx, redact, event);
 }
 
@@ -311,15 +318,15 @@ fn send_session_event_with_agent(
 /// broadcast and is never invoked by the delivery-read route: a short-lived
 /// attention row therefore leaves two durable transition deliveries even when
 /// no ACP client polls while it is open.
-fn record_code_root_state_transition(session: &Session, event: &proto::Event) {
+fn record_code_root_state_transition(session: &Session, event: &proto::Event) -> bool {
     if session.session_entry_mode() != proto::SessionEntryMode::Code {
-        return;
+        return true;
     }
     let payload = match serde_json::to_string(&proto::CodeRootDeliveryPayloadV1::RootStateChanged) {
         Ok(payload) => payload,
         Err(error) => {
-            tracing::warn!(%error, session_id = %session.id, "serializing Code-root state delivery failed");
-            return;
+            tracing::error!(%error, session_id = %session.id, "serializing Code-root state delivery failed; suppressing session broadcast");
+            return false;
         }
     };
     let source_key = code_root_transition_source_key(event);
@@ -336,10 +343,10 @@ fn record_code_root_state_transition(session: &Session, event: &proto::Event) {
         )
         .map(|_| ())
     }) {
-        // The event was already durably committed; failing to append the
-        // required projection must be visible rather than silently falling
-        // back to a later polling reconstruction.
-        tracing::error!(%error, session_id = %session.id, "recording Code-root state delivery failed");
+        tracing::error!(%error, session_id = %session.id, "recording Code-root state delivery failed; suppressing session broadcast");
+        false
+    } else {
+        true
     }
 }
 

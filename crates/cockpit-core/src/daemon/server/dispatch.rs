@@ -5677,6 +5677,10 @@ async fn handle_serialized_request_impl(
             let reservation = crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .reserve_new_attachment()
                 .map_err(code_root_contract_error)?;
+            let _reservation_guard = CodeRootAttachmentReservationGuard::new(
+                &ctx.code_root_authority,
+                reservation.clone(),
+            );
             let options = request.options.clone();
             let principal = state.principal.clone();
             let attached = match Box::pin(attach(
@@ -5772,7 +5776,7 @@ async fn handle_serialized_request_impl(
                         state,
                         ctx,
                         Some(result.attachment.root_id.0),
-                        None,
+                        request.since_seq,
                         None,
                         options.initial_model,
                         options.no_sandbox,
@@ -5811,13 +5815,17 @@ async fn handle_serialized_request_impl(
             let reservation = crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .reserve_new_attachment()
                 .map_err(code_root_contract_error)?;
+            let _reservation_guard = CodeRootAttachmentReservationGuard::new(
+                &ctx.code_root_authority,
+                reservation.clone(),
+            );
             let options = request.options.clone();
             let principal = state.principal.clone();
             let attached = match Box::pin(attach(
                 state,
                 ctx,
                 Some(request.root_id.0),
-                None,
+                request.since_seq,
                 None,
                 options.initial_model,
                 options.no_sandbox,
@@ -6146,12 +6154,26 @@ async fn handle_serialized_request_impl(
                     message: "Code-root interrupt resolution is already in progress; retry the same request".into(),
                 });
             }
+            let _resolution_guard = CodeRootInterruptResolutionGuard::new(
+                &ctx.code_root_authority,
+                record.logical_client_id.clone(),
+                request.client_request_id.clone(),
+            );
             attached
                 .handle
                 .send_work(SessionWork::ResolveAgentDecision {
                     decision_request_id,
                     answer: crate::agent_tree::PublicDecisionAnswer::option(
                         request.selected_choice.as_str().to_owned(),
+                    ),
+                    code_root_receipt: Some(
+                        crate::db::agent_tree_decisions::CodeRootInterruptReceiptWrite {
+                            logical_client_id: record.logical_client_id.as_str().to_owned(),
+                            client_request_id: request.client_request_id.as_str().to_owned(),
+                            fingerprint,
+                            outcome: "accepted".to_owned(),
+                            resolved_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                        },
                     ),
                     respond_to,
                 })
@@ -10865,6 +10887,7 @@ async fn handle_serialized_request_impl(
                 .send_work(SessionWork::ResolveAgentDecision {
                     decision_request_id,
                     answer: agent_decision_answer_from_wire(answer),
+                    code_root_receipt: None,
                     respond_to,
                 })
                 .await
@@ -18160,6 +18183,7 @@ async fn handle_concurrent_request_impl(
                 .send_work(SessionWork::ResolveAgentDecision {
                     decision_request_id,
                     answer: agent_decision_answer_from_wire(answer),
+                    code_root_receipt: None,
                     respond_to,
                 })
                 .await
@@ -26575,6 +26599,67 @@ pub(super) fn code_root_contract_error(error: anyhow::Error) -> ErrorPayload {
         ErrorCode::BadRequest
     };
     ErrorPayload { code, message }
+}
+
+/// Owns a capacity reservation across every await in a Code-root create or
+/// attach route. Dispatch tasks are aborted when their connection closes, so
+/// explicit error cleanup alone cannot release this boot-local permit.
+struct CodeRootAttachmentReservationGuard<'a> {
+    authority: &'a std::sync::Arc<std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
+    reservation: String,
+}
+
+impl<'a> CodeRootAttachmentReservationGuard<'a> {
+    fn new(
+        authority: &'a std::sync::Arc<
+            std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>,
+        >,
+        reservation: String,
+    ) -> Self {
+        Self {
+            authority,
+            reservation,
+        }
+    }
+}
+
+impl Drop for CodeRootAttachmentReservationGuard<'_> {
+    fn drop(&mut self) {
+        crate::sync::lock_or_recover(self.authority)
+            .release_attachment_reservation(&self.reservation);
+    }
+}
+
+/// Owns the in-flight first-wins fence until the dispatch future has either
+/// completed or been dropped. This makes connection cancellation equivalent
+/// to every explicit finish path.
+struct CodeRootInterruptResolutionGuard<'a> {
+    authority: &'a std::sync::Arc<std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
+    logical_client_id: proto::OpaqueAsciiId128V1,
+    client_request_id: proto::OpaqueAsciiId128V1,
+}
+
+impl<'a> CodeRootInterruptResolutionGuard<'a> {
+    fn new(
+        authority: &'a std::sync::Arc<
+            std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>,
+        >,
+        logical_client_id: proto::OpaqueAsciiId128V1,
+        client_request_id: proto::OpaqueAsciiId128V1,
+    ) -> Self {
+        Self {
+            authority,
+            logical_client_id,
+            client_request_id,
+        }
+    }
+}
+
+impl Drop for CodeRootInterruptResolutionGuard<'_> {
+    fn drop(&mut self) {
+        crate::sync::lock_or_recover(self.authority)
+            .finish_interrupt_resolution(&self.logical_client_id, &self.client_request_id);
+    }
 }
 
 fn code_root_interrupt_outcome_as_stored(

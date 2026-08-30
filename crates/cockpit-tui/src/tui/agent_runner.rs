@@ -2001,6 +2001,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn first_party_session_attach_request(
     session_id: Option<Uuid>,
+    since_seq: Option<i64>,
     project_root: String,
     initial_model: Option<cockpit_config::providers::ActiveModelRef>,
     no_sandbox: bool,
@@ -2013,6 +2014,7 @@ fn first_party_session_attach_request(
         return match session_id {
             Some(session_id) => proto::attach_existing_code_root_v1_request(
                 session_id,
+                since_seq,
                 initial_model,
                 no_sandbox,
                 true,
@@ -2035,7 +2037,7 @@ fn first_party_session_attach_request(
     }
     Request::Attach {
         session_id,
-        since_seq: None,
+        since_seq,
         project_root: Some(project_root),
         initial_model,
         no_sandbox,
@@ -2068,9 +2070,9 @@ where
             since_seq,
         } => (Some(session_id), since_seq),
     };
-    let _ = since_seq;
     let request = first_party_session_attach_request(
         target_session_id,
+        since_seq,
         ctx.project_root.clone(),
         None,
         ctx.no_sandbox,
@@ -2382,6 +2384,7 @@ async fn try_spawn_inner(
         let entry_mode = requested_session_entry_mode.unwrap_or(proto::SessionEntryMode::Code);
         let request = first_party_session_attach_request(
             session_id,
+            None,
             project_root,
             initial_model,
             no_sandbox,
@@ -3882,9 +3885,9 @@ where
     F: FnOnce(Request) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<std::result::Result<Response, ErrorPayload>>>,
 {
-    let _ = current_last_applied_seq(last_applied_seq);
     let response = send_request(first_party_session_attach_request(
         Some(session_id),
+        current_last_applied_seq(last_applied_seq),
         attach_context.project_root.clone(),
         None,
         attach_context.no_sandbox,
@@ -4004,8 +4007,13 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
         }
         let entries: Vec<_> = entries
             .into_iter()
-            .filter(|entry| {
-                history_entry_seq(entry).is_none_or(|seq| last.is_none_or(|last| seq > last))
+            .filter(|entry| match history_entry_seq(entry) {
+                Some(seq) => last.is_none_or(|last| seq > last),
+                // An incremental attach has no safe ordering proof for a
+                // sequence-less row. Never reapply it; first hydration still
+                // accepts the legacy sequence-less entries while `last` is
+                // absent.
+                None => last.is_none(),
             })
             .collect();
         if entries.is_empty() {

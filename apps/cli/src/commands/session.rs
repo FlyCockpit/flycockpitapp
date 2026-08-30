@@ -294,6 +294,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                 .request_ok(proto::attach_existing_code_root_v1_request(
                     session_id,
                     None,
+                    None,
                     false,
                     false,
                     None,

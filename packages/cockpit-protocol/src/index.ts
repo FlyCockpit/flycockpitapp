@@ -458,6 +458,7 @@ export const attachExistingCodeRootV1RequestSchema = z
     logical_client_id: opaqueAsciiId128V1Schema,
     client_request_id: opaqueAsciiId128V1Schema,
     replay_cursor: codeRootReplayCursorV1Schema.optional(),
+    since_seq: safeI64NumberSchema.optional(),
     options: codeRootAttachOptionsV1Schema,
   })
   .strict();

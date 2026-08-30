@@ -2186,7 +2186,11 @@ pub(crate) async fn run_turn(
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
     let media_available = active_tools.has_direct_native_media();
-    let mut tools = active_tools.definitions(agent.tool_steering);
+    // The provider sees the stable schema projection, while dispatch below
+    // keeps using `active_tools` and enforces transient availability at call
+    // time. This is the cache boundary for dynamic media, memory, and host
+    // capability probes.
+    let mut tools = active_tools.advertised_definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
@@ -2194,17 +2198,14 @@ pub(crate) async fn run_turn(
     // pre-classification stream deltas through the buffered delivery sink. The
     // SAME predicate drives both so schema advertisement and stream withholding
     // cannot drift. Computed on the pre-append tool set: a trusted or
-    // tool-disabled (empty `tools`) route is never eligible.
+    // tool-disabled (empty `tools`) route is never eligible. Its only inputs
+    // are the agent/model posture, so a change accompanies the intentional
+    // model failover or agent rebuild cache boundary, never live availability.
     let report_leak_eligible =
         crate::leak_report::route_advertises_report_leak(model.is_trusted(), &tools);
     if report_leak_eligible {
         tools.push(crate::leak_report::report_leak_tool_definition());
     }
-
-    inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history)
-        .await;
-    let active_tool_names = active_tools.names();
-    super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.
@@ -2221,29 +2222,21 @@ pub(crate) async fn run_turn(
     // prefix.
     session.note_send();
 
-    inject_initial_project_guidance(&agent.name, history, &cwd, &config, redact.clone(), tx).await;
-    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, &prompt);
-    crate::knowledge::inject_knowledge_for_turn(
-        history,
+    inject_volatile_context(
+        agent,
         &session,
+        &active_tools,
+        is_root,
+        context_usage,
+        history,
+        &prompt,
         &cwd,
         agent.definition.as_deref(),
         &config,
-        &knowledge_query,
         redact.clone(),
+        tx,
     )
     .await;
-
-    // Live instructions-file diff injection (prompt
-    // `instructions-file-live-diff.md`). Guidance now rides as user-role
-    // project notes rather than raw system text, so live in-place edits do the
-    // same. Gated to the session root: subagents inject their own current
-    // guidance once when their first model turn starts. The baseline advances
-    // on inject, so each distinct change is injected exactly once.
-    if is_root && let Some(message) = session.guidance_change_injection(&cwd).await {
-        inject_live_project_guidance_change(history, &cwd, &config, redact.clone(), tx, &message)
-            .await;
-    }
 
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
@@ -2358,6 +2351,7 @@ pub(crate) async fn run_turn(
                     })
                 },
             });
+    let endpoint_recovery_enabled = endpoint_recovery.is_some();
 
     // Dispatch-time recording (`inference-timeout-and-failure-
     // observability.md` #4): persist the attempt's captured body BEFORE the
@@ -2422,13 +2416,18 @@ pub(crate) async fn run_turn(
     )
     .await;
 
+    // Remove root-bound metadata work from the session-wide slot before any
+    // fallible request preparation. The work remains local until the actual
+    // provider handoff seam below, so preparation or audit failures discard it
+    // with this turn instead of letting a later inference reuse a stale prefix.
+    let scheduled_metadata_work = take_scheduled_metadata_work(&session, is_root);
+
     let mut prepared_request = model.prepare_completion_request(
-        &agent.system,
-        history,
+        crate::engine::model::AgentPromptParts::new(&agent.system, history),
         &prompt,
         &tools,
         &agent.params,
-        endpoint_recovery.is_some(),
+        endpoint_recovery_enabled,
         sealed_egress.as_deref(),
     )?;
     // The immutable post-render request body for this dispatched-target attempt.
@@ -2542,6 +2541,18 @@ pub(crate) async fn run_turn(
     let display_slot =
         Some(shared_display_slot.unwrap_or_else(|| new_display_attempt_slot(&session, &config)));
 
+    // Claim the locally held metadata work at the exact foreground dispatch
+    // seam. Earlier preparation failures have already dropped it; it cannot
+    // remain queued for a later inference.
+    let metadata_work =
+        scheduled_metadata_work.and_then(|work| match session.activate_metadata_fork(work) {
+            Ok(work) => Some(work),
+            Err(error) => {
+                tracing::warn!(%error, "metadata fork: activation failed; dropping work");
+                None
+            }
+        });
+
     let completion = model
         .complete_prepared_with_pre_drain(
             prepared_request,
@@ -2616,6 +2627,45 @@ pub(crate) async fn run_turn(
             return Err(provider_error_remains_primary(e, audit_settled));
         }
     };
+
+    if let Some(work) = metadata_work {
+        // This runs only after the foreground request completed successfully.
+        // `history`, `prompt`, `tools`, system, model, and parameters are the
+        // same values that prepared that request, after all pruning and live
+        // injections. The foreground request therefore owns cache warming
+        // before the detached trailing metadata instruction can dispatch.
+        let session = session.clone();
+        let model = model.clone();
+        let system = agent.system.clone();
+        let agent_name = agent.name.clone();
+        let params = agent.params.clone();
+        let history = history.clone();
+        let prompt = prompt.clone();
+        let tools = tools.clone();
+        let cwd = cwd.to_path_buf();
+        let config = config.clone();
+        let cancel = cancel.clone();
+        let sealed_egress = sealed_egress.clone();
+        tokio::spawn(async move {
+            crate::auto_title::generate_session_metadata_fork(
+                session,
+                model,
+                system,
+                agent_name,
+                params,
+                history,
+                prompt,
+                tools,
+                endpoint_recovery_enabled,
+                work,
+                cwd,
+                config,
+                cancel,
+                sealed_egress,
+            )
+            .await;
+        });
+    }
 
     // Settle the dispatch-time record to `completed`, filling the phase-timestamp
     // columns now known (`first_token_ms` / `completed_ms`) WITHOUT touching the
@@ -2747,7 +2797,7 @@ pub(crate) async fn run_turn(
         (false, false) => format!("{channel_reasoning}\n{inline_chip}"),
     };
     if let Some(u) = usage {
-        if let Err(e) = record_usage_blocking(session.clone(), call_id, u).await {
+        if let Err(e) = record_usage_blocking(session.clone(), call_id, u, model).await {
             tracing::warn!(error = %e, "session.record_usage failed");
         }
         // Feed the round into tokenizer calibration only after the cheap
@@ -3309,6 +3359,9 @@ pub(crate) async fn run_turn(
     // Tool dispatch.
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
+        caller_model: Some(crate::engine::tool::CallerModel::from_model(
+            agent.model.as_ref(),
+        )),
         agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
@@ -3368,12 +3421,7 @@ pub(crate) async fn run_turn(
             )
         },
         config: config.clone(),
-        mcp_resolver: {
-            agent
-                .mcp_resolver
-                .observe_config_generation(config.snapshot().generation);
-            agent.mcp_resolver.clone()
-        },
+        mcp_resolver: agent.mcp_resolver.clone(),
     };
 
     // ── Capability-aware turn scheduler (issue #57) ──────────────────────
@@ -3502,6 +3550,49 @@ pub(crate) async fn run_turn(
     })
 }
 
+/// Move work scheduled by the driver into the current root turn before request
+/// preparation begins. Once this returns, failure in any later preparation
+/// stage cannot leave the work in the session-global queue for another turn.
+fn take_scheduled_metadata_work(
+    session: &Session,
+    is_root: bool,
+) -> Option<crate::session::MetadataWork> {
+    is_root.then(|| session.take_metadata_fork()).flatten()
+}
+
+#[cfg(test)]
+mod metadata_fork_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn root_turn_removes_queued_metadata_before_request_preparation() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-preparation-failure"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let work = session
+            .note_user_content_for_metadata("schedule metadata before a failed request")
+            .expect("first user boundary schedules metadata");
+        session.queue_metadata_fork(work);
+
+        let held_for_this_turn = take_scheduled_metadata_work(&session, true);
+        assert!(held_for_this_turn.is_some());
+        assert!(
+            session.take_metadata_fork().is_none(),
+            "request preparation cannot leave this turn's metadata in the session queue"
+        );
+
+        // A request-preparation error drops this local work. A later root turn
+        // must not be able to claim it.
+        drop(held_for_this_turn);
+        assert!(session.take_metadata_fork().is_none());
+    }
+}
+
 #[cfg(test)]
 mod inference_audit_tests {
     use super::provider_error_remains_primary;
@@ -3570,6 +3661,48 @@ async fn inject_turn_start_system_messages(
             .any(|message| matches!(message, Message::System { content } if content == &nudge))
     {
         history.push(Message::System { content: nudge });
+    }
+}
+
+/// Inject every host-owned, per-turn prompt addition immediately before the
+/// provider request is assembled. The time prelude is already part of the
+/// inbound user message by this point; like every message appended here, it is
+/// deliberately volatile history rather than system-preamble text.
+async fn inject_volatile_context(
+    agent: &Agent,
+    session: &Session,
+    active_tools: &ToolBox,
+    is_root: bool,
+    context_usage: crate::engine::tool::ContextUsageSnapshot,
+    history: &mut Vec<Message>,
+    prompt: &Message,
+    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    redact: Arc<RedactionTable>,
+    tx: &mpsc::Sender<TurnEvent>,
+) {
+    inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history).await;
+    let active_tool_names = active_tools.names();
+    super::inject_available_skills_catalog(history, cwd, config, &active_tool_names);
+
+    inject_initial_project_guidance(&agent.name, history, cwd, config, redact.clone(), tx).await;
+    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, prompt);
+    crate::knowledge::inject_knowledge_for_turn(
+        history,
+        session,
+        cwd,
+        config,
+        &knowledge_query,
+        redact.clone(),
+    )
+    .await;
+
+    // Live instructions-file diffs and knowledge retrieval are fresh turn
+    // observations, so they stay in history. The same seam is reserved for
+    // knowledge-base freshness notices; their names/descriptions and frozen
+    // `last_dreamed_at` snapshot belong to the spawn-time stable prefix.
+    if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
+        inject_live_project_guidance_change(history, cwd, config, redact, tx, &message).await;
     }
 }
 
@@ -4077,6 +4210,9 @@ mod tests {
             active_tools: agent.tools.clone(),
             tool_ctx: crate::engine::tool::ToolCtx {
                 agent_id: agent.name.clone(),
+                caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                    agent.model.as_ref(),
+                )),
                 agent_instance_id: None,
                 lock_identity: agent.lock_identity.clone(),
                 write_scope: None,
@@ -4112,12 +4248,7 @@ mod tests {
                 media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
                 ),
                 config: config.clone(),
-                mcp_resolver: {
-                    agent
-                        .mcp_resolver
-                        .observe_config_generation(config.snapshot().generation);
-                    agent.mcp_resolver.clone()
-                },
+                mcp_resolver: agent.mcp_resolver.clone(),
             },
             session,
             config,

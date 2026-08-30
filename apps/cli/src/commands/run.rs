@@ -1,15 +1,8 @@
 //! `cockpit run` — one-shot non-interactive prompt through the daemon.
 //!
-//! Lifecycle (GOALS §8b + the user's refinement on the `--ephemeral`
-//! flag):
-//!
-//! - **Default:** attach to a long-running daemon if one is up;
-//!   otherwise spawn an ephemeral daemon that exits when the run
-//!   completes.
-//! - **`--ephemeral`:** spawn a private daemon that exits when the run
-//!   completes, unless a persistent daemon already holds the exclusive
-//!   ledger lock — then this run attaches to that owner and leaves it
-//!   running.
+//! Lifecycle: attach to a shareable daemon when one is already up; otherwise
+//! this command starts a shared ephemeral daemon for the duration of the run.
+//! That owner can be promoted in place when the user selects background work.
 //!
 //! Behavior:
 //!
@@ -19,11 +12,8 @@
 //! 4. Send the prompt and pump events until `TurnComplete`.
 //! 5. In `default` format we stream assistant text to stdout; in
 //!    `json` format we emit one envelope per line.
-//! 6. If we own the daemon (ephemeral path), shut it down. An
-//!    The owned-session RAII fallback (Layer A) guarantees this fires on every
-//!    exit — happy path, early `?` error, panic/unwind, or
-//!    SIGINT/SIGTERM — never on a run that attached to a pre-existing
-//!    persistent daemon.
+//! 6. On ordinary exit an ephemeral owner reaps after the final client; a run
+//!    attached to an existing daemon leaves that owner up.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -212,7 +202,7 @@ async fn resolve_requested_session_via_daemon(
         return Ok(None);
     }
     // For --continue, list sessions and find the most recent for this project.
-    let project_id = crate::session::project_id_for(root);
+    let project_id = crate::session::project_id_for(root)?;
     let response = client
         .request(crate::daemon::proto::Request::ListSessions {
             project_id: Some(project_id),
@@ -242,6 +232,9 @@ pub(crate) struct RunPumpOptions<'a> {
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) approve: &'a [GrantKind],
     pub(crate) image_data: &'a [Vec<u8>],
+    /// A generic session resume promoted its daemon before Attach established
+    /// the durable mode. Presentation remains deferred until that response.
+    pub(crate) assistant_promotion_notice: bool,
     /// When set, `cockpit run` marks the submission as a durable run
     /// invocation. `init`/`learn` leave this `None` (unbounded, no state).
     pub(crate) run_invocation_options: Option<proto::RunInvocationOptions>,
@@ -250,9 +243,6 @@ pub(crate) struct RunPumpOptions<'a> {
 pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) -> Result<()> {
     let format = args.output_format();
     let json_mode = matches!(format, OutputFormat::Json);
-    if let Err(error) = validate_ephemeral_continuation(&args) {
-        exit_run_error(format, 2, "invalid_arguments", &error.to_string());
-    }
     let cwd = match resolve_run_cwd(args.cwd.as_deref(), project_alias) {
         Ok(cwd) => cwd,
         Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
@@ -265,42 +255,48 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         exit_run_error(format, 2, "empty_prompt", &error.to_string());
     }
 
-    let mode = if args.ephemeral {
-        OwnedSessionMode::AlwaysEphemeral
-    } else {
-        OwnedSessionMode::AttachOrEphemeral
-    };
     let seed_unset_trust = args.cwd.is_none() && project_alias.is_none();
 
-    let result = crate::daemon::client::run_owned_daemon(mode, |client| {
-        Box::pin(async move {
-            // Preflight via daemon RPCs — the CLI never opens SQLite.
-            emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd, seed_unset_trust)
+    // A session id is mode-blind until Attach reads its durable row. Acquire
+    // a persistent-capable owner first so an Assistant resume cannot enter a
+    // private one-shot daemon; Code and Computer remain valid persistent
+    // sessions as well.
+    let result = if args.session.is_some() {
+        crate::daemon::client::run_assistant_daemon(move |client, promoted_from_ephemeral| {
+            Box::pin(async move {
+                run_with_daemon(
+                    client,
+                    &args,
+                    prompt,
+                    no_sandbox,
+                    &cwd,
+                    seed_unset_trust,
+                    promoted_from_ephemeral,
+                )
                 .await
-                .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
-            let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
-                .await
-                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-            let image_files = resolve_attachment_paths(&cwd, &args.file)
-                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-            let image_data = load_and_validate_images(&image_files).map_err(|error| {
-                RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
-            })?;
-
-            run_turn(
-                &client,
-                &args,
-                prompt,
-                no_sandbox,
-                &cwd,
-                requested_session,
-                &image_data,
-            )
-            .await
+            })
         })
-    })
-    .await;
+        .await
+    } else {
+        crate::daemon::client::run_owned_daemon(
+            OwnedSessionMode::AttachOrEphemeral,
+            move |client| {
+                Box::pin(async move {
+                    run_with_daemon(
+                        client,
+                        &args,
+                        prompt,
+                        no_sandbox,
+                        &cwd,
+                        seed_unset_trust,
+                        false,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    };
 
     let result = match result {
         Err(OwnedDaemonRunError::Connect(error)) => {
@@ -390,6 +386,41 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     Ok(())
 }
 
+async fn run_with_daemon(
+    client: ScopedDaemonClient<'_>,
+    args: &RunArgs,
+    prompt: String,
+    no_sandbox: bool,
+    cwd: &Path,
+    seed_unset_trust: bool,
+    promoted_from_ephemeral: bool,
+) -> Result<i32> {
+    // Preflight via daemon RPCs — the CLI never opens SQLite.
+    emit_org_logging_indicator_via_daemon(&client, cwd).await;
+    enforce_noninteractive_workspace_trust_via_daemon(&client, cwd, seed_unset_trust)
+        .await
+        .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+    let requested_session = resolve_requested_session_via_daemon(args, &client, cwd)
+        .await
+        .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+    let image_files = resolve_attachment_paths(cwd, &args.file)
+        .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+    let image_data = load_and_validate_images(&image_files)
+        .map_err(|error| RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}")))?;
+
+    run_turn(
+        &client,
+        args,
+        prompt,
+        no_sandbox,
+        cwd,
+        requested_session,
+        &image_data,
+        promoted_from_ephemeral,
+    )
+    .await
+}
+
 #[cfg(test)]
 fn finish_owned_run<T>(
     command: anyhow::Result<T>,
@@ -415,6 +446,7 @@ async fn run_turn(
     project_root: &Path,
     requested_session: Option<Uuid>,
     image_data: &[Vec<u8>],
+    promoted_from_ephemeral: bool,
 ) -> Result<i32> {
     attach_send_pump(
         client,
@@ -430,6 +462,7 @@ async fn run_turn(
             project_root: Some(project_root),
             approve: &args.approve,
             image_data,
+            assistant_promotion_notice: promoted_from_ephemeral,
             run_invocation_options: Some(args.run_invocation_options()),
         },
     )
@@ -440,7 +473,7 @@ async fn run_turn(
 /// completion, returning the run exit code. Shared by `cockpit run` and
 /// `cockpit init` so both drive the identical non-interactive turn over
 /// the daemon. The caller owns the daemon lifecycle (probe/spawn +
-/// ephemeral guard).
+/// one-shot owner guard).
 pub(crate) async fn attach_send_pump(
     client: &ScopedDaemonClient<'_>,
     prompt: String,
@@ -516,12 +549,17 @@ pub(crate) async fn attach_send_pump(
         }
         Err(error) => anyhow::bail!("daemon error: {error}"),
     };
-    let (session_id, repair_required) = match attached {
+    let (session_id, session_entry_mode, repair_required) = match attached {
         Response::Attached {
             session_id,
+            session_entry_mode,
             repair_required,
             ..
-        } => (session_id, repair_required.map(|repair| *repair)),
+        } => (
+            session_id,
+            session_entry_mode,
+            repair_required.map(|repair| *repair),
+        ),
         other => anyhow::bail!("unexpected attach response: {other:?}"),
     };
     let mut stdout = std::io::stdout().lock();
@@ -535,6 +573,14 @@ pub(crate) async fn attach_send_pump(
     )?;
     drop(stdout);
     drop(stderr);
+    if options.assistant_promotion_notice
+        && session_entry_mode == proto::SessionEntryMode::Assistant
+    {
+        eprintln!(
+            "{}",
+            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
+        );
+    }
     if requested_session.is_some()
         && let Some(repair) = repair_required
     {
@@ -917,15 +963,6 @@ fn validate_prompt(prompt: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_ephemeral_continuation(args: &RunArgs) -> Result<()> {
-    if args.ephemeral && (args.continue_session || args.session.is_some()) {
-        anyhow::bail!(
-            "--ephemeral sessions cannot be continued; drop --ephemeral or start a new session"
-        );
-    }
-    Ok(())
-}
-
 pub(crate) async fn pump_events(
     client: &ScopedDaemonClient<'_>,
     session_id: Uuid,
@@ -951,9 +988,49 @@ pub(crate) async fn pump_events(
                         writeln!(stderr, "{}", second_interrupt_unknown_guidance(id))?;
                         return Ok(130);
                     }
-                    // First SIGINT: stop ordinary waiting; cancel + reconcile.
-                    let code = reconcile_after_interrupt(client, id, format, &mut stderr).await?;
-                    return Ok(code);
+                    let proto::Response::ExitGuardStatus {
+                        ephemeral_owner,
+                        has_live_work,
+                    } = client
+                        .request_ok(Request::ExitGuardStatus)
+                        .await
+                        .context("reading authoritative daemon exit state")?
+                    else {
+                        anyhow::bail!("unexpected daemon exit-state response");
+                    };
+                    if has_live_work && ephemeral_owner {
+                        match prompt_run_exit_choice(&mut stderr)? {
+                            RunExitChoice::Background => {
+                                client
+                                    .request_ok(Request::PromoteToPersistent)
+                                    .await
+                                    .context("promoting daemon to persistent background owner")?;
+                                writeln!(
+                                    stderr,
+                                    "This session is still running in the background; reattach with cockpit run --session {session_id}"
+                                )?;
+                                return Ok(130);
+                            }
+                            RunExitChoice::StopAll => {
+                                // This is the only interactive path that broadens
+                                // cancellation beyond the current invocation.
+                                client
+                                    .request_ok(Request::CancelAllSessionWork)
+                                    .await
+                                    .context("cancelling all attached session work")?;
+                            }
+                        }
+                    } else if has_live_work {
+                        writeln!(
+                            stderr,
+                            "This session is still running in the background; reattach with cockpit run --session {session_id}"
+                        )?;
+                        return Ok(130);
+                    }
+                    // Either StopAll was explicitly selected, or the daemon
+                    // confirmed no live work at detach time. Normal Ctrl-C
+                    // cancellation remains invocation-scoped in this helper.
+                    return reconcile_after_interrupt(client, id, format, &mut stderr).await;
                 }
                 return Ok(130);
             }
@@ -1085,6 +1162,31 @@ pub(crate) async fn pump_events(
         stdout.flush()?;
     }
     Ok(code)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunExitChoice {
+    StopAll,
+    Background,
+}
+
+fn prompt_run_exit_choice(stderr: &mut impl Write) -> Result<RunExitChoice> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(RunExitChoice::StopAll);
+    }
+    writeln!(
+        stderr,
+        "This session is still working. What would you like to do? [s]top all / [b]ackground"
+    )?;
+    stderr.flush()?;
+    let mut choice = String::new();
+    std::io::stdin()
+        .read_line(&mut choice)
+        .context("reading exit choice")?;
+    Ok(match choice.trim().to_ascii_lowercase().as_str() {
+        "b" | "background" | "run in background" => RunExitChoice::Background,
+        _ => RunExitChoice::StopAll,
+    })
 }
 
 /// Map an authoritative terminal lifecycle state after interrupt reconciliation.
@@ -1931,7 +2033,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events (no session_id) — irrelevant to a headless
         // one-shot run, so they're filtered out by the session check.
-        CaffeinateState { .. } | DaemonDraining { .. }
+        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
@@ -2027,7 +2129,6 @@ mod tests {
             follow: false,
             file: Vec::new(),
             thinking: false,
-            ephemeral: false,
             max_turns: None,
             timeout: None,
             permission_mode: None,
@@ -2356,22 +2457,6 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_rejects_continuation() {
-        let mut args = run_args();
-        args.ephemeral = true;
-        args.continue_session = true;
-        assert_eq!(
-            validate_ephemeral_continuation(&args)
-                .unwrap_err()
-                .to_string(),
-            "--ephemeral sessions cannot be continued; drop --ephemeral or start a new session"
-        );
-
-        args.continue_session = false;
-        args.session = Some(Uuid::new_v4().to_string());
-        assert!(validate_ephemeral_continuation(&args).is_err());
-    }
-
     #[test]
     fn model_override_is_a_complete_new_session_selection() {
         let selection = parse_model_override(Some(" openai/gpt-5 "), false)
@@ -2454,7 +2539,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_flag_combinations_dispatch() {
+    fn attached_snapshot_does_not_finish_before_submission() {
         let session_id = Uuid::new_v4();
         let mut outcome = RunOutcome::new(true);
         // An attach snapshot may contain the daemon's pre-submission idle

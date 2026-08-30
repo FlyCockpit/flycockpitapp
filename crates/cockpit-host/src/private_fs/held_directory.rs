@@ -695,8 +695,8 @@ fn digest(parts: &[&[u8]]) -> String {
 #[cfg(unix)]
 mod imp {
     use std::ffi::{CString, OsStr};
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1630,7 +1630,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::mem::size_of;
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};

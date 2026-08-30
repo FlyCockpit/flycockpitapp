@@ -8061,6 +8061,7 @@ fn remote_state_with_grants(
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        pending_acp_catalog_composition: None,
     }
 }
 
@@ -8102,6 +8103,7 @@ fn owner_state() -> MutableClientState {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        pending_acp_catalog_composition: None,
     }
 }
 
@@ -15127,6 +15129,7 @@ async fn attached_state_with_worker_receiver(
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
+            pending_acp_catalog_composition: None,
         },
         session_row.session_id,
         work_rx,
@@ -33798,6 +33801,7 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        pending_acp_catalog_composition: None,
     };
     let parent_session_id = parent_row.session_id;
     let ctx_for_parent = ctx.clone();
@@ -33875,6 +33879,7 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        pending_acp_catalog_composition: None,
     };
     let btw_session_id = created.info.session_id;
     let ctx_for_btw = ctx.clone();

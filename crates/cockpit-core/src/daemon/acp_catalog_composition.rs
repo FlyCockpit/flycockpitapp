@@ -6,6 +6,21 @@
 
 use cockpit_proto as proto;
 
+/// Composition-only state carried while a public ACP route delegates to a
+/// base Code-root primitive. The base primitive consumes this immediately
+/// before it records its attachment/idempotency receipt, so neither the
+/// attachment capability nor the response is published without its catalog.
+pub(crate) struct PendingAcpCatalogCompositionV1 {
+    pub(crate) service: std::sync::Arc<dyn AcpCatalogCompositionServiceV1>,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) ingress: proto::AcpForwardedMcpIngressV1,
+    /// Set only after base root/attachment persistence has produced the
+    /// capability that the memory-only binding owns. The composed wrapper
+    /// uses these facts to roll back if binding or later publication fails.
+    pub(crate) root_id: Option<uuid::Uuid>,
+    pub(crate) attachment: Option<proto::CodeRootAttachmentCapabilityV1>,
+}
+
 pub(crate) trait AcpCatalogCompositionServiceV1: Send + Sync {
     fn validate_ingress(
         &self,

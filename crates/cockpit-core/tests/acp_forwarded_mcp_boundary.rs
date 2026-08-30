@@ -643,10 +643,80 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
             "forwarded approval must project a redacted server display, not {forbidden}"
         );
     }
+    let forwarded_prompt = forwarded_approval
+        .split("let prompt =")
+        .nth(1)
+        .and_then(|tail| tail.split("let question =").next())
+        .expect("forwarded durable prompt");
+    for forbidden in ["{tool}", "Some(tool)"] {
+        assert!(
+            !forwarded_prompt.contains(forbidden),
+            "forwarded durable approval prompt must not retain the remote tool name ({forbidden})"
+        );
+    }
     assert!(
         !forwarded_invoke.contains("\"tool\": tool") && !forwarded_invoke.contains("\"tool\":tool"),
         "forwarded external approval/effect payload must not carry a raw tool binding"
     );
+}
+
+#[test]
+fn acp_catalog_binding_precedes_base_code_root_publication() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dispatch = fs::read_to_string(manifest.join("src/daemon/server/dispatch.rs"))
+        .expect("read daemon dispatch source");
+
+    let composed_create = dispatch
+        .split("Request::CreateCodeRootWithAcpIngressV1(request) =>")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("Request::AttachExistingCodeRootWithAcpIngressV1(request) =>")
+                .next()
+        })
+        .expect("ACP create composition route");
+    let composed_attach = dispatch
+        .split("Request::AttachExistingCodeRootWithAcpIngressV1(request) =>")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("Request::CloseAcpCodeRootAttachmentV1(request) =>")
+                .next()
+        })
+        .expect("ACP attach composition route");
+    for route in [composed_create, composed_attach] {
+        assert!(route.contains("pending_acp_catalog_composition"));
+        assert!(
+            !route.contains("service.bind_catalog"),
+            "the composed wrapper must install a pre-publication gate, not bind after base publication"
+        );
+    }
+
+    for (base_route, receipt) in [
+        (
+            "Request::CreateCodeRootV1(request) =>",
+            ".record_create(&request",
+        ),
+        (
+            "Request::AttachExistingCodeRootV1(request) =>",
+            ".record_attach(&request",
+        ),
+    ] {
+        let base = dispatch
+            .split(base_route)
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("Request::CloseCodeRootAttachmentV1(request) =>")
+                    .next()
+            })
+            .expect("base Code-root route");
+        let binding = base
+            .find("bind_pending_acp_catalog_before_code_root_publication")
+            .expect("catalog composition gate");
+        let publication = base.find(receipt).expect("base publication receipt");
+        assert!(
+            binding < publication,
+            "catalog binding must complete before the base attachment receipt is published"
+        );
+    }
 }
 
 #[test]

@@ -24,8 +24,8 @@ impl Approver {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let prompt = match tool {
-            Some(tool) => format!(
-                "`{tool}` on `{display_name}` wants to run. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
+            Some(_) => format!(
+                "An editor-provided MCP tool on `{display_name}` wants to run. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."
             ),
             None => format!(
                 "`{display_name}` wants to connect. Transport: `{transport}`; identity: `{identity}`. Approval lasts no longer than the active editor forwarding epoch."

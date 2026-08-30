@@ -4731,6 +4731,8 @@ struct MutableClientState {
     upload_limits: AttachmentUploadLimits,
     terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
+    pending_acp_catalog_composition:
+        Option<crate::daemon::acp_catalog_composition::PendingAcpCatalogCompositionV1>,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -4835,6 +4837,7 @@ impl MutableClientState {
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host,
+            pending_acp_catalog_composition: None,
         }
     }
 

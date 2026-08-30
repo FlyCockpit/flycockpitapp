@@ -7,6 +7,7 @@ use super::sessions::*;
 #[cfg(feature = "remote")]
 use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
+use crate::daemon::acp_catalog_composition::PendingAcpCatalogCompositionV1;
 use crate::daemon::agent_management::{bad_config, conflict};
 use crate::daemon::code_roots::CodeRootProjectionWriterV1;
 
@@ -5513,6 +5514,103 @@ async fn dispatch_image_control_read(
     Ok(Response::ImageControlRead(response))
 }
 
+/// Bind the catalog after the base primitive has durably produced its root and
+/// attachment, but before that primitive records its idempotency receipt or
+/// returns the capability.  The receipt is the publication boundary: a
+/// concurrent retry/discovery consumer cannot obtain this attachment before
+/// the root worker has the matching effective catalog.
+fn bind_pending_acp_catalog_before_code_root_publication(
+    state: &mut MutableClientState,
+    root_id: uuid::Uuid,
+    attachment: &proto::CodeRootAttachmentCapabilityV1,
+) -> std::result::Result<(), ErrorPayload> {
+    let (service, cwd, ingress) = {
+        let Some(pending) = state.pending_acp_catalog_composition.as_mut() else {
+            return Ok(());
+        };
+        pending.root_id = Some(root_id);
+        pending.attachment = Some(attachment.clone());
+        (
+            pending.service.clone(),
+            pending.cwd.clone(),
+            pending.ingress.clone(),
+        )
+    };
+    let slot = state
+        .attached
+        .as_ref()
+        .ok_or_else(|| {
+            internal(anyhow::anyhow!(
+                "Code-root composition has no attached worker"
+            ))
+        })?
+        .handle
+        .forwarded_mcp_slot();
+    service.bind_catalog(root_id, attachment, &cwd, &ingress, slot)
+}
+
+/// Compensation is intentionally outside the base primitive: its binding
+/// failure is observed before the base receipt/response publication, while
+/// the normal close/archive funnels retain ownership of attachment and root
+/// cleanup.  The stored capability is only internal composition state and is
+/// never serialized to the ACP caller on this failure path.
+async fn rollback_acp_catalog_composition_failure(
+    error: ErrorPayload,
+    pending: PendingAcpCatalogCompositionV1,
+    archive_root: bool,
+    request_id: uuid::Uuid,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
+) -> ErrorPayload {
+    let Some(attachment) = pending.attachment else {
+        return error;
+    };
+    let close = Box::pin(handle_serialized_request_impl(
+        request_id,
+        Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
+            attachment_capability: attachment,
+            client_request_id: pending.ingress.ingress_request_id,
+        }),
+        state,
+        shared,
+        ctx,
+        effects,
+        #[cfg(feature = "remote")]
+        remote_operation,
+    ))
+    .await;
+    let root_rollback = if archive_root {
+        match pending.root_id {
+            Some(root_id) => super::sessions::archive_session(ctx, root_id, true).await,
+            None => Ok(()),
+        }
+    } else {
+        Ok(())
+    };
+    match (close, root_rollback) {
+        (Ok(_), Ok(_)) => error,
+        (Err(attachment_error), Ok(_)) => internal(anyhow::anyhow!(
+            "ACP catalog composition failed ({}) and attachment rollback failed ({})",
+            error.message,
+            attachment_error.message,
+        )),
+        (Ok(_), Err(root_error)) => internal(anyhow::anyhow!(
+            "ACP catalog create composition failed ({}) and root rollback failed ({})",
+            error.message,
+            root_error.message,
+        )),
+        (Err(attachment_error), Err(root_error)) => internal(anyhow::anyhow!(
+            "ACP catalog create composition failed ({}) and attachment rollback failed ({}) and root rollback failed ({})",
+            error.message,
+            attachment_error.message,
+            root_error.message,
+        )),
+    }
+}
+
 async fn handle_serialized_request_impl(
     request_id: Uuid,
     request: Request,
@@ -5643,6 +5741,18 @@ async fn handle_serialized_request_impl(
                 })?;
             let cwd = std::path::PathBuf::from(&request.base.workspace_selector.path);
             service.validate_ingress(&cwd, &request.ingress)?;
+            if state.pending_acp_catalog_composition.is_some() {
+                return Err(internal(anyhow::anyhow!(
+                    "nested ACP catalog composition is not permitted"
+                )));
+            }
+            state.pending_acp_catalog_composition = Some(PendingAcpCatalogCompositionV1 {
+                service: service.clone(),
+                cwd,
+                ingress: request.ingress.clone(),
+                root_id: None,
+                attachment: None,
+            });
             let base_response = Box::pin(handle_serialized_request_impl(
                 request_id,
                 Request::CreateCodeRootV1(request.base.clone()),
@@ -5653,69 +5763,34 @@ async fn handle_serialized_request_impl(
                 #[cfg(feature = "remote")]
                 remote_operation,
             ))
-            .await?;
+            .await;
+            let pending = state
+                .pending_acp_catalog_composition
+                .take()
+                .expect("ACP composition gate remains installed until base create completes");
+            let base_response = match base_response {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(rollback_acp_catalog_composition_failure(
+                        error,
+                        pending,
+                        true,
+                        request_id,
+                        state,
+                        shared,
+                        ctx,
+                        effects,
+                        #[cfg(feature = "remote")]
+                        remote_operation,
+                    )
+                    .await);
+                }
+            };
             let Response::CodeRootCreated(base) = base_response else {
                 return Err(internal(anyhow::anyhow!(
                     "base Code-root create returned an unexpected response"
                 )));
             };
-            let capability = base.attachment.attachment_capability.clone();
-            let slot = state
-                .attached
-                .as_ref()
-                .ok_or_else(|| internal(anyhow::anyhow!("created Code-root was not attached")))?
-                .handle
-                .forwarded_mcp_slot();
-            if let Err(error) = service.bind_catalog(
-                base.attachment.root_id.0,
-                &capability,
-                &cwd,
-                &request.ingress,
-                slot,
-            ) {
-                let rollback = Box::pin(handle_serialized_request_impl(
-                    request_id,
-                    Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
-                        attachment_capability: capability,
-                        client_request_id: request.ingress.ingress_request_id.clone(),
-                    }),
-                    state,
-                    shared,
-                    ctx,
-                    effects,
-                    #[cfg(feature = "remote")]
-                    remote_operation,
-                ))
-                .await;
-                // A create must not leave a durable runnable root behind when
-                // its catalog cannot be composed. Archiving revokes the root
-                // worker/catalog and makes the provisional root undiscoverable.
-                // This compensation is deliberately attempted even if closing
-                // the attachment failed.  The root itself is the durable,
-                // runnable resource; leaving it behind is worse than losing
-                // the more-specific attachment rollback diagnostic.
-                let root_rollback =
-                    super::sessions::archive_session(ctx, base.attachment.root_id.0, true).await;
-                return match (rollback, root_rollback) {
-                    (Ok(_), Ok(_)) => Err(error),
-                    (Err(attachment_error), Ok(_)) => Err(internal(anyhow::anyhow!(
-                        "ACP catalog create composition failed ({}) and attachment rollback failed ({})",
-                        error.message,
-                        attachment_error.message,
-                    ))),
-                    (Ok(_), Err(root_error)) => Err(internal(anyhow::anyhow!(
-                        "ACP catalog create composition failed ({}) and root rollback failed ({})",
-                        error.message,
-                        root_error.message,
-                    ))),
-                    (Err(attachment_error), Err(root_error)) => Err(internal(anyhow::anyhow!(
-                        "ACP catalog create composition failed ({}) and attachment rollback failed ({}) and root rollback failed ({})",
-                        error.message,
-                        attachment_error.message,
-                        root_error.message,
-                    ))),
-                };
-            }
             Ok(Response::CodeRootWithAcpIngressCreated(
                 proto::CreateCodeRootWithAcpIngressV1Result { base },
             ))
@@ -5741,6 +5816,18 @@ async fn handle_serialized_request_impl(
                     .project_root,
             );
             service.validate_ingress(&cwd, &request.ingress)?;
+            if state.pending_acp_catalog_composition.is_some() {
+                return Err(internal(anyhow::anyhow!(
+                    "nested ACP catalog composition is not permitted"
+                )));
+            }
+            state.pending_acp_catalog_composition = Some(PendingAcpCatalogCompositionV1 {
+                service: service.clone(),
+                cwd,
+                ingress: request.ingress.clone(),
+                root_id: None,
+                attachment: None,
+            });
             let base_response = Box::pin(handle_serialized_request_impl(
                 request_id,
                 Request::AttachExistingCodeRootV1(request.base.clone()),
@@ -5751,49 +5838,34 @@ async fn handle_serialized_request_impl(
                 #[cfg(feature = "remote")]
                 remote_operation,
             ))
-            .await?;
+            .await;
+            let pending = state
+                .pending_acp_catalog_composition
+                .take()
+                .expect("ACP composition gate remains installed until base attach completes");
+            let base_response = match base_response {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(rollback_acp_catalog_composition_failure(
+                        error,
+                        pending,
+                        false,
+                        request_id,
+                        state,
+                        shared,
+                        ctx,
+                        effects,
+                        #[cfg(feature = "remote")]
+                        remote_operation,
+                    )
+                    .await);
+                }
+            };
             let Response::CodeRootAttached(base) = base_response else {
                 return Err(internal(anyhow::anyhow!(
                     "base Code-root attach returned an unexpected response"
                 )));
             };
-            let capability = base.attachment.attachment_capability.clone();
-            let slot = state
-                .attached
-                .as_ref()
-                .ok_or_else(|| internal(anyhow::anyhow!("Code-root attach was not published")))?
-                .handle
-                .forwarded_mcp_slot();
-            if let Err(error) = service.bind_catalog(
-                base.attachment.root_id.0,
-                &capability,
-                &cwd,
-                &request.ingress,
-                slot,
-            ) {
-                let rollback = Box::pin(handle_serialized_request_impl(
-                    request_id,
-                    Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
-                        attachment_capability: capability,
-                        client_request_id: request.ingress.ingress_request_id.clone(),
-                    }),
-                    state,
-                    shared,
-                    ctx,
-                    effects,
-                    #[cfg(feature = "remote")]
-                    remote_operation,
-                ))
-                .await;
-                if let Err(rollback_error) = rollback {
-                    return Err(internal(anyhow::anyhow!(
-                        "ACP catalog attach composition failed ({}) and attachment rollback failed ({})",
-                        error.message,
-                        rollback_error.message,
-                    )));
-                }
-                return Err(error);
-            }
             Ok(Response::CodeRootWithAcpIngressAttached(
                 proto::AttachExistingCodeRootWithAcpIngressV1Result { base },
             ))
@@ -5872,6 +5944,11 @@ async fn handle_serialized_request_impl(
                         ))
                         .await?;
                     }
+                    bind_pending_acp_catalog_before_code_root_publication(
+                        state,
+                        result.attachment.root_id.0,
+                        &result.attachment.attachment_capability,
+                    )?;
                     if let Some(attached) = state.attached.as_mut() {
                         attached.code_root_capability =
                             Some(result.attachment.attachment_capability.clone());
@@ -5976,10 +6053,10 @@ async fn handle_serialized_request_impl(
                     return Err(internal(error));
                 }
             };
-            let result = {
+            let attachment = {
                 let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
                 let capture_generation = authority.capture_generation_for(root.root_id);
-                let attachment = authority
+                authority
                     .mint_attachment(
                         root.root_id,
                         request.logical_client_id.clone(),
@@ -5987,8 +6064,16 @@ async fn handle_serialized_request_impl(
                         initial.cursor,
                         &reservation,
                     )
-                    .map_err(code_root_contract_error)?;
+                    .map_err(code_root_contract_error)?
+            };
+            bind_pending_acp_catalog_before_code_root_publication(
+                state,
+                root.root_id.0,
+                &attachment.attachment_capability,
+            )?;
+            let result = {
                 let result = proto::CreateCodeRootV1Result { attachment, root };
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
                 authority
                     .record_create(&request, result.clone())
                     .map_err(code_root_contract_error)?;
@@ -6040,6 +6125,11 @@ async fn handle_serialized_request_impl(
                         ))
                         .await?;
                     }
+                    bind_pending_acp_catalog_before_code_root_publication(
+                        state,
+                        result.attachment.root_id.0,
+                        &result.attachment.attachment_capability,
+                    )?;
                     if let Some(attached) = state.attached.as_mut() {
                         attached.code_root_capability =
                             Some(result.attachment.attachment_capability.clone());
@@ -6167,10 +6257,10 @@ async fn handle_serialized_request_impl(
                     }
                 },
             };
-            let result = {
+            let attachment = {
                 let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
                 let capture_generation = authority.capture_generation_for(root.root_id);
-                let attachment = authority
+                authority
                     .mint_attachment(
                         root.root_id,
                         request.logical_client_id.clone(),
@@ -6178,8 +6268,16 @@ async fn handle_serialized_request_impl(
                         replay_cursor,
                         &reservation,
                     )
-                    .map_err(code_root_contract_error)?;
+                    .map_err(code_root_contract_error)?
+            };
+            bind_pending_acp_catalog_before_code_root_publication(
+                state,
+                root.root_id.0,
+                &attachment.attachment_capability,
+            )?;
+            let result = {
                 let result = proto::AttachExistingCodeRootV1Result { attachment, root };
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
                 authority
                     .record_attach(&request, result.clone())
                     .map_err(code_root_contract_error)?;

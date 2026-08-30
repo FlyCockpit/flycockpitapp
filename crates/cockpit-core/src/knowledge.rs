@@ -3748,7 +3748,7 @@ fn assistant_knowledge_registry_entry_for_session_start(
 }
 
 fn assistant_knowledge_registry_entry_from_row(
-    row: &cockpit_db::AssistantRow,
+    row: &cockpit_db::assistants::AssistantRow,
 ) -> Result<RegistryKnowledgeBase> {
     let root = crate::assistants::validate_row_home(row)?.join("knowledge");
     let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
@@ -3760,8 +3760,8 @@ fn assistant_knowledge_registry_entry_from_row(
     cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
     let entry = KnowledgeBaseRegistryEntry {
         id: format!("assistant-{}", config.installation_id),
-        name: format!("Assistant: {name}"),
-        description: format!("Knowledge installed with assistant `{name}`."),
+        name: format!("Assistant: {}", row.name),
+        description: format!("Knowledge installed with assistant `{}`.", row.name),
         source: KnowledgeBaseSource::Local { path: root.clone() },
         embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
         dream_model: None,

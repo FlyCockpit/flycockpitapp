@@ -6996,6 +6996,20 @@ fn log_response_send_failed(id: Uuid, envelope_kind: &'static str, error: &anyho
     );
 }
 
+/// Convert an unexpected server-side failure into the protocol's internal
+/// error shape. This is shared by every request handler module, so it lives at
+/// the daemon-server boundary rather than under a particular request domain.
+fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Internal,
+        // `{:#}` walks the full anyhow context chain (e.g. `resolving
+        // model: provider ...: ...`) rather than printing only the
+        // outermost context, so daemon-surfaced errors are legible
+        // instead of an opaque `internal: resolving model`.
+        message: format!("{err:#}"),
+    }
+}
+
 fn bad_request(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::BadRequest,

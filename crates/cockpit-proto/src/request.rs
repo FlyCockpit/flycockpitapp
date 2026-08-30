@@ -885,6 +885,17 @@ pub enum Request {
     GetStartupDisclosures {
         project_root: String,
     },
+    /// Read the installation-scoped state of a one-time disclosure.
+    GetAppFlag {
+        key: AppFlagKey,
+    },
+    /// Atomically acknowledge a one-time disclosure at its observed version.
+    /// A stale acknowledgement is rejected rather than overwriting a newer
+    /// state.
+    MarkAppFlagSeen {
+        key: AppFlagKey,
+        expected_version: u64,
+    },
     /// Read the daemon-owned, whole-installation storage footprint for the
     /// Settings → Storage page. This has no deletion side effect.
     GetStorageReport,

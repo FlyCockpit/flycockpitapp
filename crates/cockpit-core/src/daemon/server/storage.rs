@@ -193,7 +193,7 @@ pub(super) async fn execute(
 
     let mut database_delete_committed = false;
     let result: Result<u64, ErrorPayload> = async {
-        match plan {
+        Ok(match plan {
             CleanupPlan::ArchiveSessions {
                 candidates,
                 include_renamed_or_pinned,
@@ -313,7 +313,7 @@ pub(super) async fn execute(
                 verify_directory_snapshots(&directories).map_err(internal)?;
                 remove_previewed_directories(&directories).map_err(internal)?
             }
-        }
+        })
     }
     .await;
     let bytes_freed = match result {
@@ -419,7 +419,9 @@ async fn preview_target(
             age_days,
             include_renamed_or_pinned,
         } => {
-            ensure!(*age_days > 0, "storage archive age must be positive").map_err(internal)?;
+            if *age_days == 0 {
+                return Err(super::bad_request("storage archive age must be positive"));
+            }
             let cutoff = chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(i64::from(*age_days).saturating_mul(24 * 60 * 60 * 1_000));
@@ -456,11 +458,11 @@ async fn preview_target(
             age_days,
             include_renamed_or_pinned,
         } => {
-            ensure!(
-                *age_days > 0,
-                "storage permanent-delete age must be positive"
-            )
-            .map_err(internal)?;
+            if *age_days == 0 {
+                return Err(super::bad_request(
+                    "storage permanent-delete age must be positive",
+                ));
+            }
             let cutoff = chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(i64::from(*age_days).saturating_mul(24 * 60 * 60 * 1_000));
@@ -472,7 +474,7 @@ async fn preview_target(
             let session_ids = candidates
                 .iter()
                 .map(|candidate| candidate.session_id)
-                .collect();
+                .collect::<Vec<_>>();
             preview_permanent_session_deletion(ctx, &session_ids).await
         }
         cockpit_proto::StorageCleanupTarget::RemoveOrphanedWorkspaceStorage { project_ids } => {

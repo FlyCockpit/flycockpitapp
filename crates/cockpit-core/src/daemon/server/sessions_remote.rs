@@ -5,7 +5,7 @@
 //! mutation composition for sessions.
 
 use super::authz::ClientPrincipal;
-use super::sessions::{btw_info_to_proto, internal, stop_subtree};
+use super::sessions::{btw_info_to_proto, stop_subtree};
 use super::*;
 
 #[derive(Debug, thiserror::Error)]

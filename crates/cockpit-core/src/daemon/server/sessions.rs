@@ -476,12 +476,10 @@ pub(super) async fn delete_session(
                 )));
             }
             Err(error) => {
-                return Err(internal(error.with_context(|| {
-                    format!(
-                        "verifying result-blob removal at `{}`",
-                        result_blob_dir.display()
-                    )
-                })));
+                return Err(internal(anyhow::Error::from(error).context(format!(
+                    "verifying result-blob removal at `{}`",
+                    result_blob_dir.display()
+                ))));
             }
         }
     }
@@ -731,17 +729,6 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
         };
     }
     internal(error)
-}
-
-pub(super) fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
-    ErrorPayload {
-        code: ErrorCode::Internal,
-        // `{:#}` walks the full anyhow context chain (e.g. `resolving
-        // model: provider ...: ...`) rather than printing only the
-        // outermost context, so daemon-surfaced errors are legible
-        // instead of an opaque `internal: resolving model`.
-        message: format!("{err:#}"),
-    }
 }
 
 pub(super) fn require_scheduler(

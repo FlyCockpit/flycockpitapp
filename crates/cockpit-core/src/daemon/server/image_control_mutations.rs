@@ -45,9 +45,8 @@ use cockpit_proto::image_control::{
     ImageEndpointSafeV1, ImageTargetSafeV1, ImageWorkflowSafeV1,
 };
 
+use super::{DaemonContext, internal, inventory};
 use crate::daemon::proto::{ErrorCode, ErrorPayload, Request, Response};
-use crate::daemon::server::sessions::internal;
-use crate::daemon::server::{DaemonContext, inventory};
 
 fn bad_request(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {

@@ -760,14 +760,13 @@ pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
 pub(crate) fn text_artifact_capture_is_persistable(
     tool: &str,
     capture: Option<&crate::engine::tool::TextArtifactCapture>,
-    delivered_body: &str,
+    _delivered_body: &str,
     recheck_modified_output: bool,
 ) -> bool {
     text_artifact_capture_is_eligible(tool)
         && !recheck_modified_output
         && capture.is_some_and(|value| {
             !value.content.is_empty()
-                && value.content != delivered_body
                 && value.host_original_bytes >= value.host_captured_bytes
                 && value.host_dropped_bytes == value.host_original_bytes - value.host_captured_bytes
                 && value.stored_source_bytes == value.content.len()

@@ -8175,7 +8175,7 @@ impl Driver {
             "oversized source carries media attachments"
         );
         anyhow::ensure!(
-            canonical.request.text.len() > 64 * 1024
+            canonical.request.text.len() > 1024
                 && canonical.request.text.len()
                     <= crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES,
             "oversized source violates FCM2 bounds"
@@ -11200,6 +11200,49 @@ impl Driver {
                     return Ok(());
                 }
             }
+            let spill_bytes = self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.context_policy.as_ref())
+                .map(crate::agents::ContextPolicy::artifact_spill_bytes)
+                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
+            let source_blob_path = if oversized.source_text.len() > spill_bytes {
+                let path = crate::text_artifact_blob::new_path(self.session.id);
+                if let Err(error) = self
+                    .session
+                    .db
+                    .stage_text_artifact_blob_cleanup_intent(
+                        path.clone(),
+                        self.session.id,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "staging oversized user paste cleanup failed");
+                    let _ = self
+                        .reject_reserved_oversized_user_submission(
+                            oversized.reservation.clone(),
+                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            tx,
+                        )
+                        .await;
+                    return Ok(());
+                }
+                match crate::text_artifact_blob::write_at(&path, &oversized.source_text) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::error!(%error, "oversized user paste disk spill failed; refusing inline SQLite fallback");
+                        let _ = self.reject_reserved_oversized_user_submission(
+                            oversized.reservation.clone(),
+                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            tx,
+                        ).await;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
             let materialization = self
                 .session
                 .db
@@ -11236,33 +11279,7 @@ impl Driver {
                             &user_text,
                         ).expect("accepted oversized composition is constructed from closed host parts"),
                         source_text: oversized.source_text.clone(),
-                        source_blob_path: {
-                            let spill_bytes = self
-                                .stack
-                                .last()
-                                .and_then(|frame| frame.agent.context_policy.as_ref())
-                                .map(crate::agents::ContextPolicy::artifact_spill_bytes)
-                                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
-                            if oversized.source_text.len() > spill_bytes {
-                                match crate::text_artifact_blob::write(self.session.id, &oversized.source_text) {
-                                    Ok(path) => Some(path),
-                                    Err(error) => {
-                                        tracing::error!(%error, "oversized user paste disk spill failed; refusing inline SQLite fallback");
-                                        let _ = self.reject_reserved_oversized_user_submission(
-                                            oversized.reservation.clone(),
-                                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
-                                            tx,
-                                        ).await;
-                                        let _ = tx.send(TurnEvent::Notice {
-                                            text: "Saving oversized-message content failed; no provider was called.".to_owned(),
-                                        }).await;
-                                        return Ok(());
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        },
+                        source_blob_path,
                         source_preview_lines: self
                             .stack
                             .last()

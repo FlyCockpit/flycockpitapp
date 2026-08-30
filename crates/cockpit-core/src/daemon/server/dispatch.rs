@@ -2954,11 +2954,11 @@ fn require_terminal_binding(
 }
 
 /// Build the only durable ingress representation for a text-only source that
-/// crosses the artifact threshold. This happens before legacy queue admission
-/// and, critically, before an over-8MiB source can create a receipt/lease.
-/// Text-only submissions at or below this size retain the ordinary inline
-/// representation. Above it, the only admissible representation is the
-/// FCM2-backed source-artifact path.
+/// crosses the active agent's artifact threshold. This happens before legacy
+/// queue admission and, critically, before an over-8MiB source can create a
+/// receipt/lease. Text-only submissions at or below that configured limit
+/// retain the ordinary inline representation. Above it, the only admissible
+/// representation is the FCM2-backed source-artifact path.
 const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 
 pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
@@ -3000,7 +3000,12 @@ pub(super) fn oversized_text_artifact_admission(
         #[cfg(feature = "remote")]
         remote_operation,
     } = request;
-    if text.len() <= INLINE_USER_TEXT_BYTES {
+    let spill_bytes = crate::agents::resolve(&handle.project_root, &handle.live_active_agent())
+        .map_err(internal)?
+        .and_then(|agent| agent.context_policy)
+        .map(|policy| policy.artifact_spill_bytes())
+        .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
+    if text.len() <= spill_bytes {
         return Ok(None);
     }
     if text.len() > crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES {
@@ -3867,7 +3872,7 @@ async fn handle_send_user_message(
     // receipt/run-invocation acceptance, scheduler activity, or any provider
     // handoff.  Media/file submissions at the inline boundary retain their
     // existing typed attachment route unchanged.
-    if (!images.is_empty() || !media.is_empty()) && text.len() > INLINE_USER_TEXT_BYTES {
+    if (!images.is_empty() || !media.is_empty()) && text.len() > 64 * 1024 {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "media/file submissions cannot carry text over the 64 KiB artifact threshold"
@@ -8466,6 +8471,11 @@ async fn handle_serialized_request_impl(
             for id in &session_ids {
                 if let Ok(session_id) = Uuid::parse_str(id) {
                     ctx.db.delete_session(session_id).await.map_err(internal)?;
+                    if let Err(error) =
+                        crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await
+                    {
+                        tracing::warn!(%error, %session_id, "purged-session text artifact cleanup remains pending");
+                    }
                     purged = purged.saturating_add(1);
                 }
             }

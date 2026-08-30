@@ -2730,6 +2730,7 @@ async fn export_text_artifacts_writes_index_and_payload() {
                 .to_string(),
             created_at: 123,
         }],
+        staged_blob_paths: Vec::new(),
         unavailable_projection: None,
     })
     .await
@@ -2935,6 +2936,7 @@ async fn export_text_artifact_preserves_capture_accounting() {
                 .to_string(),
             created_at: 124,
         }],
+        staged_blob_paths: Vec::new(),
         unavailable_projection: None,
     })
     .await
@@ -2988,6 +2990,7 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
                 .to_string(),
                 created_at: 125,
             }],
+            staged_blob_paths: Vec::new(),
             unavailable_projection: None,
         })
         .await

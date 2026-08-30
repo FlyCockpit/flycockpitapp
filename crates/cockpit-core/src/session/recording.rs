@@ -1969,6 +1969,7 @@ impl Session {
                 ts_ms: chrono::Utc::now().timestamp_millis(),
                 data_json: serde_json::to_string(&data)?,
                 artifacts,
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await

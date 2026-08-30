@@ -181,6 +181,10 @@ pub struct TextArtifactEventInput {
     pub ts_ms: i64,
     pub data_json: String,
     pub artifacts: Vec<TextArtifactCandidate>,
+    /// Blob paths whose cleanup intents were committed before the filesystem
+    /// write. A path is claimed only if this transaction stores its owner;
+    /// rejected and cancelled admissions deliberately leave the intent live.
+    pub staged_blob_paths: Vec<String>,
     /// A closed, durable projection that deliberately owns no artifact body.
     /// Used when safety could not authorize retaining a capture.
     pub unavailable_projection: Option<TextArtifactUnavailableProjection>,
@@ -1478,6 +1482,7 @@ fn record_event_with_text_artifacts_conn(
     // checked again by `insert_artifact_conn` and any unexpected drift rolls
     // back the whole composition.
     validate_event_artifact_slots(input)?;
+    validate_staged_blob_paths(input)?;
     let plans = plan_event_artifact_admissions(conn, input)?;
     let mut states = input
         .artifacts
@@ -1531,6 +1536,7 @@ fn record_event_with_text_artifacts_conn(
         input.ts_ms,
         &serde_json::to_string(&data)?,
     )?;
+    let mut claimed_blob_paths = std::collections::BTreeSet::new();
     let slots = input
         .artifacts
         .iter()
@@ -1549,6 +1555,9 @@ fn record_event_with_text_artifacts_conn(
                     None,
                 )? {
                     TextArtifactAdmission::Stored(artifact) => {
+                        if let Some(path) = blob_path_from_provenance(&candidate.provenance_json)? {
+                            claimed_blob_paths.insert(path);
+                        }
                         TextArtifactAdmission::Stored(artifact)
                     }
                     TextArtifactAdmission::ArtifactLimit => {
@@ -1566,6 +1575,13 @@ fn record_event_with_text_artifacts_conn(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for path in claimed_blob_paths {
+        crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+            conn,
+            &path,
+            input.session_id,
+        )?;
+    }
     Ok(TextArtifactEventResult { event_seq, slots })
 }
 
@@ -1627,6 +1643,28 @@ fn validate_event_artifact_slots(input: &TextArtifactEventInput) -> Result<()> {
             "only tool_call and context_pruned events may use generic artifact composition"
         ),
     }
+    Ok(())
+}
+
+fn validate_staged_blob_paths(input: &TextArtifactEventInput) -> Result<()> {
+    let staged = input
+        .staged_blob_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        staged.len() == input.staged_blob_paths.len(),
+        "duplicate staged text artifact blob path"
+    );
+    let candidate_paths = input
+        .artifacts
+        .iter()
+        .filter_map(|candidate| blob_path_from_provenance(&candidate.provenance_json).transpose())
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    ensure!(
+        staged == candidate_paths,
+        "staged text artifact blobs must exactly match candidate blob paths"
+    );
     Ok(())
 }
 
@@ -2043,10 +2081,20 @@ fn only_provenance_keys_with_optional(
 }
 
 fn has_blob_path(provenance_json: &str) -> Result<bool> {
-    Ok(serde_json::from_str::<serde_json::Value>(provenance_json)
-        .context("parsing text artifact provenance")?
-        .get("blob_path")
-        .is_some())
+    Ok(blob_path_from_provenance(provenance_json)?.is_some())
+}
+
+fn blob_path_from_provenance(provenance_json: &str) -> Result<Option<String>> {
+    let provenance: serde_json::Value =
+        serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
+    match provenance.get("blob_path") {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| anyhow!("text artifact blob path is not a string")),
+    }
 }
 
 fn artifact_preview_lines(provenance_json: &str) -> Result<usize> {
@@ -3014,6 +3062,13 @@ fn materialize_reserved_user_artifacts_conn(
     } else {
         None
     };
+    if let Some(path) = input.source_blob_path.as_deref() {
+        crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+            conn,
+            path,
+            reservation.session_id,
+        )?;
+    }
     let safe_outcome = MessageSafeOutcome::Materialized {
         message_seq: event_seq as u64,
     }
@@ -3358,10 +3413,9 @@ pub(crate) fn fork_session_artifacts_conn(
         let child_event_seq = *event_map
             .get(&artifact.event_seq)
             .ok_or_else(|| anyhow!("fork artifact event was not copied"))?;
-        ensure!(
-            !has_blob_path(&artifact.provenance_json)?,
-            "forking blob-backed text artifacts is unavailable until child sessions receive their own daemon-owned blob copies"
-        );
+        // Blob bodies are immutable. Fork rows retain the same validated
+        // daemon-owned path; session deletion checks for surviving references
+        // before enqueuing unlink, so either fork can outlive the other.
         let mut provenance: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
             .context("stored text artifact provenance is invalid")?;
         match artifact.kind {
@@ -3996,6 +4050,7 @@ mod tests {
                 ts_ms: 10,
                 data_json: serde_json::json!({ "output": "visible" }).to_string(),
                 artifacts: vec![tool_candidate(content, 0, "call-0")],
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await
@@ -4028,6 +4083,7 @@ mod tests {
                 ts_ms: 11,
                 data_json: serde_json::json!({"output":"visible capped display"}).to_string(),
                 artifacts: Vec::new(),
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: Some(TextArtifactUnavailableProjection {
                     candidate,
                     reason: TextArtifactUnavailableReason::PersistenceUnavailable,
@@ -4524,6 +4580,7 @@ mod tests {
                     prune_candidate("first\n", 0, "call-prune-0"),
                     prune_candidate("second\n", 1, "call-prune-1"),
                 ],
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await

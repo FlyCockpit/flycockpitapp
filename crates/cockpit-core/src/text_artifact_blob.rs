@@ -4,7 +4,6 @@
 //! relative path is carried in validated artifact provenance so the database
 //! layer remains a storage leaf and never receives filesystem authority.
 
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -12,11 +11,20 @@ use uuid::Uuid;
 
 const ROOT: &str = "text-artifacts";
 
-pub fn write(session_id: Uuid, content: &str) -> Result<String> {
+/// Allocate a daemon-relative identity before writing. Callers journal this
+/// value first so cancellation can never lose cleanup ownership.
+pub fn new_path(session_id: Uuid) -> String {
     let relative = PathBuf::from(ROOT)
         .join(session_id.to_string())
-        .join(format!("{}.txt", Uuid::new_v4()));
-    let path = state_root()?.join(&relative);
+        .join(format!("{}.txt", Uuid::new_v4()))
+        .to_str()
+        .expect("UUID artifact paths are UTF-8")
+        .to_owned();
+    relative
+}
+
+pub fn write_at(relative: &str, content: &str) -> Result<String> {
+    let path = resolve(relative)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("artifact blob path has no parent"))?;
@@ -24,10 +32,7 @@ pub fn write(session_id: Uuid, content: &str) -> Result<String> {
         .with_context(|| format!("creating private artifact directory {}", parent.display()))?;
     cockpit_host::private_fs::write_private_file_exclusive(&path, content.as_bytes())
         .with_context(|| format!("creating private artifact blob {}", path.display()))?;
-    relative
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("artifact blob path is not UTF-8"))
+    Ok(relative.to_owned())
 }
 
 pub fn read(relative: &str) -> Result<String> {
@@ -77,47 +82,14 @@ pub fn remove_many(paths: &[String]) -> Result<()> {
 pub async fn reconcile_cleanup_intents(db: &crate::db::Db) -> Result<usize> {
     let paths = db.pending_text_artifact_blob_cleanup_intents().await?;
     let mut completed = 0usize;
-    let mut cleaned_sessions = std::collections::BTreeSet::new();
     for path in paths {
         if let Err(error) = remove(&path) {
             tracing::warn!(%error, %path, "text artifact blob cleanup remains pending");
             continue;
         }
-        if let Some(session) = Path::new(&path)
-            .components()
-            .nth(1)
-            .and_then(|component| match component {
-                Component::Normal(value) => value.to_str(),
-                _ => None,
-            })
-            .and_then(|value| Uuid::parse_str(value).ok())
-        {
-            cleaned_sessions.insert(session);
-        }
         completed += usize::from(db.complete_text_artifact_blob_cleanup_intent(path).await?);
     }
-    for session_id in cleaned_sessions {
-        remove_session(session_id)?;
-    }
     Ok(completed)
-}
-
-/// Best-effort session cleanup after the ledger's owning session transaction
-/// commits. A missing directory is already a successful cleanup outcome.
-pub fn remove_session(session_id: Uuid) -> Result<()> {
-    let path = state_root()?.join(ROOT).join(session_id.to_string());
-    // Verify the whole path before the recursive convenience operation.  The
-    // directory is daemon-private, so no untrusted writer can race a checked
-    // component into a symlink after this point.
-    if path.exists() {
-        cockpit_host::private_fs::ensure_private_dir(&path)
-            .with_context(|| format!("opening private artifact directory {}", path.display()))?;
-    }
-    match fs::remove_dir_all(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
-    }
 }
 
 pub fn path_from_provenance(provenance_json: &str) -> Result<Option<String>> {

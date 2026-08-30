@@ -1983,13 +1983,22 @@ async fn execute_ordinary_call_unscoped(
         .as_ref()
         .map(crate::agents::ContextPolicy::artifact_preview_lines)
         .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+    if artifact_capture.is_none()
+        && canonical_result_is_text_only
+        && output_str.len() > artifact_spill_bytes
+    {
+        artifact_capture = Some(crate::intel::budget::capture_text_artifact_body(
+            &output_str,
+        ));
+    }
+    let result_was_truncated = result.as_ref().is_ok_and(|output| output.truncated);
     let artifact_capture = artifact_capture.filter(|capture| {
         crate::engine::agent::text_artifact_capture_is_persistable(
             resolved_name,
             Some(capture),
             &output_str,
             recheck_modified_output,
-        ) && capture.content.len() > artifact_spill_bytes
+        ) && (capture.content.len() > artifact_spill_bytes || result_was_truncated)
     });
 
     let truncated = matches!(
@@ -2200,7 +2209,18 @@ async fn execute_ordinary_call_unscoped(
         // `artifact_capture` was filtered at the common boundary above.  A
         // configured spill is fail-closed: retaining it inline would put the
         // large secret-bearing body in SQLite after the disk invariant failed.
-        let blob_path = crate::text_artifact_blob::write(env.session.id, &capture.content)
+        let staged_at = chrono::Utc::now().timestamp_millis();
+        let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
+        env.session
+            .db
+            .stage_text_artifact_blob_cleanup_intent(
+                staged_blob_path.clone(),
+                env.session.id,
+                staged_at,
+            )
+            .await
+            .context("staging tool artifact blob cleanup")?;
+        let blob_path = crate::text_artifact_blob::write_at(&staged_blob_path, &capture.content)
             .with_context(|| format!("spilling tool result for {resolved_name}"))?;
         provenance["blob_path"] = serde_json::Value::String(blob_path.clone());
         let provenance_json = provenance.to_string();
@@ -2226,6 +2246,7 @@ async fn execute_ordinary_call_unscoped(
             ts_ms: chrono::Utc::now().timestamp_millis(),
             data_json: event_data.to_string(),
             artifacts: vec![candidate.clone()],
+            staged_blob_paths: vec![blob_path.clone()],
             unavailable_projection: None,
         };
         match env.session.db.record_event_with_text_artifacts(event).await {
@@ -3545,6 +3566,7 @@ mod tests {
                     .to_string(),
                     created_at: 1,
                 }],
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await

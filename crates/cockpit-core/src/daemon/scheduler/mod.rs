@@ -821,6 +821,14 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                         %session_id,
                         "failed to clean up refused scheduled session"
                     );
+                } else if let Err(cleanup_error) =
+                    crate::text_artifact_blob::reconcile_cleanup_intents(db).await
+                {
+                    tracing::warn!(
+                        error = %cleanup_error,
+                        %session_id,
+                        "text artifact cleanup remains pending for refused scheduled session"
+                    );
                 }
                 return Err(error).context("starting scheduled assistant session");
             }

@@ -895,6 +895,35 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 pub const SESSION_MEDIA_CLEANUP_BARRIER: &str =
     "session media cleanup must complete before session deletion";
 
+fn validate_text_artifact_blob_path(path: &str) -> Result<()> {
+    anyhow::ensure!(
+        path.starts_with("text-artifacts/")
+            && !path.contains("..")
+            && !path.bytes().any(|byte| byte.is_ascii_control()),
+        "text artifact cleanup path is invalid"
+    );
+    Ok(())
+}
+
+pub(crate) fn stage_text_artifact_blob_cleanup_intent_conn(
+    conn: &Connection,
+    blob_path: &str,
+    session_id: Uuid,
+    now_unix_ms: i64,
+) -> Result<()> {
+    anyhow::ensure!(
+        now_unix_ms >= 0,
+        "cleanup intent timestamp must be nonnegative"
+    );
+    validate_text_artifact_blob_path(blob_path)?;
+    conn.execute(
+        "INSERT INTO text_artifact_blob_cleanup_intents(blob_path,session_id,created_at_unix_ms)
+         VALUES(?1,?2,?3)",
+        params![blob_path, session_id.to_string(), now_unix_ms],
+    )?;
+    Ok(())
+}
+
 /// True when `delete_session_conn` refused because owned media is not yet at a
 /// deletion-evidenced terminal. Walks the anyhow chain so a wrapping context
 /// does not hide the barrier.
@@ -2060,19 +2089,31 @@ impl Db {
             now_unix_ms >= 0,
             "cleanup intent timestamp must be nonnegative"
         );
-        for member in collect_subtree(conn, session_id)? {
+        let deleting = collect_subtree(conn, session_id)?;
+        for member in &deleting {
             for artifact in crate::db::text_artifacts::list_text_artifacts_conn(conn, member)? {
                 let value: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
                     .context("parsing text artifact provenance for cleanup")?;
                 let Some(path) = value.get("blob_path").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
-                anyhow::ensure!(
-                    path.starts_with("text-artifacts/")
-                        && !path.contains("..")
-                        && !path.bytes().any(|byte| byte.is_ascii_control()),
-                    "text artifact cleanup path is invalid"
-                );
+                validate_text_artifact_blob_path(path)?;
+                // Forks share immutable daemon-owned blobs.  Do not retire a
+                // blob while a session outside this cascade still references
+                // it; the final owning delete will enqueue it instead.
+                let mut references = conn.prepare(
+                    "SELECT session_id FROM session_text_artifacts
+                      WHERE json_extract(provenance_json, '$.blob_path')=?1",
+                )?;
+                let has_survivor = references
+                    .query_map([path], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .filter_map(|value| Uuid::parse_str(&value).ok())
+                    .any(|owner| !deleting.contains(&owner));
+                if has_survivor {
+                    continue;
+                }
                 conn.execute(
                     "INSERT OR IGNORE INTO text_artifact_blob_cleanup_intents(blob_path,session_id,created_at_unix_ms)
                      VALUES(?1,?2,?3)",
@@ -2080,6 +2121,42 @@ impl Db {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Journal a blob before the filesystem creates it.  If the process is
+    /// cancelled before the owning event commits, this durable identity makes
+    /// the secret-bearing file reclaimable on the next reconciliation pass.
+    pub async fn stage_text_artifact_blob_cleanup_intent(
+        &self,
+        blob_path: String,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            stage_text_artifact_blob_cleanup_intent_conn(conn, &blob_path, session_id, now_unix_ms)
+        })
+        .await
+    }
+
+    /// Consume the pre-write cleanup intent from the same transaction which
+    /// creates an artifact owner.  This is crate-visible so text-artifact
+    /// compositions cannot accidentally claim a blob outside their commit.
+    pub(crate) fn claim_staged_text_artifact_blob_cleanup_intent_conn(
+        conn: &Connection,
+        blob_path: &str,
+        session_id: Uuid,
+    ) -> Result<()> {
+        validate_text_artifact_blob_path(blob_path)?;
+        let deleted = conn.execute(
+            "DELETE FROM text_artifact_blob_cleanup_intents
+              WHERE blob_path=?1 AND session_id=?2",
+            params![blob_path, session_id.to_string()],
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "text artifact blob is not protected by its staged cleanup intent"
+        );
         Ok(())
     }
 

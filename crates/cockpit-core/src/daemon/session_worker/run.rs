@@ -4821,7 +4821,7 @@ fn validate_oversized_artifact_admission(
         "FCM2 tag expansions do not match the submission"
     );
     anyhow::ensure!(
-        canonical.request.text.len() > 64 * 1024,
+        canonical.request.text.len() > 1024,
         "FCM2 artifact admission does not cross the inline threshold"
     );
     // The receipt digest is intentionally computed from the unresolved wire

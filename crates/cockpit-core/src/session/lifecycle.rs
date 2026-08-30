@@ -531,6 +531,7 @@ impl Session {
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
+            workspace_scratch_dir: Mutex::new(None),
             host_shim_dir: Mutex::new(None),
             sandbox_mode: AtomicU8::new(sandbox_mode_to_u8(
                 crate::tools::sandbox_mode::SandboxMode::Sandbox,
@@ -587,6 +588,38 @@ impl Session {
                 None
             }
         }
+    }
+
+    /// Durable, private-to-this-session scratch below the workspace's Cockpit
+    /// state directory. The containing workspace directory is keyed by the
+    /// existing `project_id` and carries a marker that lets maintenance code
+    /// recover the canonical project root without enumerating the filesystem.
+    ///
+    /// This is intentionally separate from [`Self::tmp_dir`]: ending or
+    /// dropping a session removes only the ephemeral system-temp directory.
+    pub fn workspace_scratch_dir(&self) -> Option<PathBuf> {
+        let mut slot = self.workspace_scratch_dir.lock().unwrap();
+        if let Some(dir) = slot.as_ref() {
+            return Some(dir.clone());
+        }
+        let dir = match workspace_scratch_dir_for_session(
+            &self.project_id,
+            &self.project_root,
+            self.id,
+        ) {
+            Ok(dir) => dir,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    project_id = %self.project_id,
+                    project_root = %self.project_root.display(),
+                    "creating durable workspace scratch dir failed"
+                );
+                return None;
+            }
+        };
+        *slot = Some(dir.clone());
+        Some(dir)
     }
 
     /// Per-session host shim directory under the Cockpit data dir. Used for

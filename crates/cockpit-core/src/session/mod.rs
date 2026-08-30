@@ -259,6 +259,10 @@ pub struct Session {
     /// [`Self::tmp_dir`] access; removed on [`Self::end`] and on drop.
     /// `Mutex<Option<…>>` so creation is one-shot and `end()` can take it.
     tmp_dir: Mutex<Option<PathBuf>>,
+    /// Durable per-workspace scratch, partitioned by session under the Cockpit
+    /// state directory. Unlike [`Self::tmp_dir`], this directory deliberately
+    /// survives session end and daemon restart.
+    workspace_scratch_dir: Mutex<Option<PathBuf>>,
     /// Per-session host executable shims under the Cockpit data dir. These
     /// are separate from [`Self::tmp_dir`] so shell PATH shims live in a
     /// stable user-data location, but they share the same end/drop cleanup.
@@ -1342,6 +1346,86 @@ pub fn project_id_for(root: &Path) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WorkspaceDirMarker {
+    project_id: String,
+    canonical_root: String,
+    created_at_unix_ms: i64,
+    last_used_at_unix_ms: i64,
+}
+
+/// Return the durable workspace root for a known `project_id`. This is a
+/// direct path calculation; it never scans project roots or re-hashes paths.
+pub fn workspace_dir_for_project_id(project_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !project_id.is_empty()
+            && project_id.len() <= 1024
+            && project_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid workspace project id"
+    );
+    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
+        .join("workspaces")
+        .join(project_id))
+}
+
+/// Recover the canonical workspace path recorded for `project_id`, without a
+/// filesystem scan or path re-hash. A missing marker means this workspace has
+/// not yet used durable scratch on this machine.
+pub fn workspace_root_for_project_id(project_id: &str) -> Result<Option<PathBuf>> {
+    let marker_path = workspace_dir_for_project_id(project_id)?.join(".workspace.json");
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
+    let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+    anyhow::ensure!(
+        marker.project_id == project_id,
+        "workspace marker project id does not match directory"
+    );
+    Ok(Some(PathBuf::from(marker.canonical_root)))
+}
+
+fn workspace_scratch_dir_for_session(
+    project_id: &str,
+    project_root: &Path,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    let workspace_dir = workspace_dir_for_project_id(project_id)?;
+    std::fs::create_dir_all(&workspace_dir)
+        .with_context(|| format!("creating `{}`", workspace_dir.display()))?;
+
+    let marker_path = workspace_dir.join(".workspace.json");
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let now = Utc::now().timestamp_millis();
+    let created_at_unix_ms = std::fs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WorkspaceDirMarker>(&bytes).ok())
+        .filter(|marker| {
+            marker.project_id == project_id
+                && marker.canonical_root == canonical_root.to_string_lossy()
+        })
+        .map(|marker| marker.created_at_unix_ms)
+        .unwrap_or(now);
+    let marker = WorkspaceDirMarker {
+        project_id: project_id.to_string(),
+        canonical_root: canonical_root.to_string_lossy().into_owned(),
+        created_at_unix_ms,
+        last_used_at_unix_ms: now,
+    };
+    std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker)?)
+        .with_context(|| format!("writing `{}`", marker_path.display()))?;
+
+    let session_dir = workspace_dir.join("sessions").join(session_id.to_string());
+    std::fs::create_dir_all(&session_dir)
+        .with_context(|| format!("creating `{}`", session_dir.display()))?;
+    Ok(session_dir)
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];

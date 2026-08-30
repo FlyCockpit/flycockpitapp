@@ -11,7 +11,16 @@ pub fn outside_session_boundary(
     root: &Path,
     tmp_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    crate::tools::sandbox::outside_session_boundary(path, root, tmp_dir)
+    outside_session_boundary_with_workspace_scratch(path, root, tmp_dir, None)
+}
+
+pub fn outside_session_boundary_with_workspace_scratch(
+    path: &Path,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    crate::tools::sandbox::outside_session_boundary(path, root, tmp_dir, workspace_scratch_dir)
 }
 
 pub fn command_directory_escape(
@@ -19,6 +28,16 @@ pub fn command_directory_escape(
     command_cwd: &Path,
     root: &Path,
     tmp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    command_directory_escape_with_workspace_scratch(command, command_cwd, root, tmp_dir, None)
+}
+
+pub fn command_directory_escape_with_workspace_scratch(
+    command: &str,
+    command_cwd: &Path,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     let tokens = shell_tokens(command);
     let mut i = 0;
@@ -59,7 +78,13 @@ pub fn command_directory_escape(
                     if kind == RedirectKind::TargetFile
                         && let Some(target) = operand
                         && let Some(outside) =
-                            redirect_target_escape(target, command_cwd, root, tmp_dir)
+                            redirect_target_escape(
+                                target,
+                                command_cwd,
+                                root,
+                                tmp_dir,
+                                workspace_scratch_dir,
+                            )
                     {
                         return Some(outside);
                     }
@@ -82,7 +107,12 @@ pub fn command_directory_escape(
                             directory_change_target(&tokens, i + 1, word == "pushd")
                     {
                         let resolved = crate::tools::common::resolve(&target, command_cwd);
-                        if let Some(outside) = outside_session_boundary(&resolved, root, tmp_dir) {
+                        if let Some(outside) = outside_session_boundary(
+                            &resolved,
+                            root,
+                            tmp_dir,
+                            workspace_scratch_dir,
+                        ) {
                             return Some(outside);
                         }
                     }
@@ -99,7 +129,13 @@ pub fn command_directory_escape(
                         && let Some(ShellToken::Word(prog)) = tokens.get(prog_i)
                         && Path::new(prog).is_absolute()
                         && let Some(outside) =
-                            literal_path_word_escape(prog, command_cwd, root, tmp_dir)
+                            literal_path_word_escape(
+                                prog,
+                                command_cwd,
+                                root,
+                                tmp_dir,
+                                workspace_scratch_dir,
+                            )
                     {
                         return Some(outside);
                     }
@@ -145,19 +181,37 @@ pub fn command_directory_escape(
                 if current_program.as_deref() == Some("dd")
                     && let Some(value) = dd_file_operand(word)
                     && let Some(outside) =
-                        literal_path_word_escape(value, command_cwd, root, tmp_dir)
+                        literal_path_word_escape(
+                            value,
+                            command_cwd,
+                            root,
+                            tmp_dir,
+                            workspace_scratch_dir,
+                        )
                 {
                     return Some(outside);
                 }
                 if literal_path_operand_command(current_program.as_deref())
                     && let Some(outside) =
-                        literal_path_word_escape(word, command_cwd, root, tmp_dir)
+                        literal_path_word_escape(
+                            word,
+                            command_cwd,
+                            root,
+                            tmp_dir,
+                            workspace_scratch_dir,
+                        )
                 {
                     return Some(outside);
                 }
                 if Path::new(word).is_absolute()
                     && let Some(outside) =
-                        literal_path_word_escape(word, command_cwd, root, tmp_dir)
+                        literal_path_word_escape(
+                            word,
+                            command_cwd,
+                            root,
+                            tmp_dir,
+                            workspace_scratch_dir,
+                        )
                 {
                     return Some(outside);
                 }
@@ -427,12 +481,13 @@ fn literal_path_word_escape(
     command_cwd: &Path,
     root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     // A command operand beginning with `-` is an option flag, not a path.
     if word.starts_with('-') {
         return None;
     }
-    path_word_escape(word, command_cwd, root, tmp_dir)
+    path_word_escape(word, command_cwd, root, tmp_dir, workspace_scratch_dir)
 }
 
 /// Boundary-check a redirection target. Unlike a command operand, a redirect
@@ -445,8 +500,9 @@ fn redirect_target_escape(
     command_cwd: &Path,
     root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    path_word_escape(word, command_cwd, root, tmp_dir)
+    path_word_escape(word, command_cwd, root, tmp_dir, workspace_scratch_dir)
 }
 
 fn path_word_escape(
@@ -454,6 +510,7 @@ fn path_word_escape(
     command_cwd: &Path,
     root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     if dynamic_shell_path(word) {
         return None;
@@ -468,7 +525,7 @@ fn path_word_escape(
         return None;
     }
     let resolved = crate::tools::common::resolve(word, command_cwd);
-    outside_session_boundary(&resolved, root, tmp_dir)
+    outside_session_boundary(&resolved, root, tmp_dir, workspace_scratch_dir)
 }
 
 fn directory_change_target(tokens: &[ShellToken], mut i: usize, pushd: bool) -> Option<String> {

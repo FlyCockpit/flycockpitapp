@@ -78,8 +78,9 @@ pub fn within_root(canonical_root: &Path, candidate: &Path) -> bool {
 ///
 /// `path` is the already-resolved absolute target the tool is about to
 /// touch (callers go through [`crate::tools::common::resolve`] first).
-/// The boundary is the session cwd plus the per-session tmp dir — both
-/// "inside." A path inside the boundary is allowed silently. A path
+/// The boundary is the session cwd plus both session scratch directories —
+/// ephemeral tmp and durable workspace scratch — all of which are "inside."
+/// A path inside the boundary is allowed silently. A path
 /// outside consults part 1's path-grant store via `ctx`; if not granted,
 /// it raises part 1's approval prompt **naming the exact path** and, on a
 /// non-`Once` grant, persists it. On deny it returns an invalid-input
@@ -453,34 +454,51 @@ fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
         }
         // Session scratch remains usable; sibling worktrees and the primary
         // repository are not implicit lease visibility.
-        return ctx
-            .session
-            .tmp_dir()
-            .as_deref()
-            .is_some_and(|tmp| cockpit_host::path_containment::contained_under(tmp, path));
+        return [ctx.session.tmp_dir(), ctx.session.workspace_scratch_dir()]
+            .iter()
+            .flatten()
+            .any(|scratch| cockpit_host::path_containment::contained_under(scratch, path));
     }
-    path_inside_boundary(path, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    let tmp_dir = ctx.session.tmp_dir();
+    let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+    path_inside_boundary(
+        path,
+        &ctx.cwd,
+        tmp_dir.as_deref(),
+        workspace_scratch_dir.as_deref(),
+    )
 }
 
 pub(crate) fn outside_session_boundary(
     path: &Path,
     root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     let effective = effective_native_path(path).unwrap_or_else(|_| path.to_path_buf());
-    if path_inside_boundary(&effective, root, tmp_dir) {
+    if path_inside_boundary(&effective, root, tmp_dir, workspace_scratch_dir) {
         None
     } else {
         Some(effective)
     }
 }
 
-fn path_inside_boundary(candidate: &Path, root: &Path, tmp_dir: Option<&Path>) -> bool {
+fn path_inside_boundary(
+    candidate: &Path,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
+) -> bool {
     if cockpit_host::path_containment::contained_under(root, candidate) {
         return true;
     }
     if let Some(tmp) = tmp_dir
         && cockpit_host::path_containment::contained_under(tmp, candidate)
+    {
+        return true;
+    }
+    if let Some(scratch) = workspace_scratch_dir
+        && cockpit_host::path_containment::contained_under(scratch, candidate)
     {
         return true;
     }

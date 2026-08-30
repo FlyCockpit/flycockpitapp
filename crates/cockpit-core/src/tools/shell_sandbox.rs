@@ -102,9 +102,28 @@ pub fn sandbox_policy(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> SandboxPolicy {
+    sandbox_policy_with_workspace_scratch(
+        cwd,
+        tmp_dir,
+        None,
+        session_env,
+        extra_paths,
+        write_scope,
+    )
+}
+
+pub fn sandbox_policy_with_workspace_scratch(
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+) -> SandboxPolicy {
     sandbox_policy_with_visibility_restriction(
         cwd,
         tmp_dir,
+        workspace_scratch_dir,
         session_env,
         extra_paths,
         write_scope,
@@ -126,6 +145,7 @@ pub fn sandbox_policy_for_workspace_lease(
     sandbox_policy_with_visibility_restriction(
         cwd,
         tmp_dir,
+        None,
         session_env,
         extra_paths,
         write_scope,
@@ -137,6 +157,7 @@ pub fn sandbox_policy_for_workspace_lease(
 fn sandbox_policy_with_visibility_restriction(
     cwd: &std::path::Path,
     tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
@@ -188,6 +209,13 @@ fn sandbox_policy_with_visibility_restriction(
         // hatch into another workspace's shared state.
         push_unique_path(&mut allow_read_roots, tmp.to_path_buf());
         push_unique_path(&mut allow_write_roots, tmp.to_path_buf());
+    }
+    if workspace_write_allowed
+        && !restrict_to_visibility
+        && let Some(scratch) = workspace_scratch_dir
+    {
+        push_unique_path(&mut allow_read_roots, scratch.to_path_buf());
+        push_unique_path(&mut allow_write_roots, scratch.to_path_buf());
     }
 
     SandboxPolicy {
@@ -289,11 +317,35 @@ pub async fn build_sandboxed_command(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> Result<tokio::process::Command> {
+    build_sandboxed_command_with_workspace_scratch(
+        command,
+        cwd,
+        tmp_dir,
+        None,
+        extra_env,
+        session_env,
+        extra_paths,
+        write_scope,
+    )
+    .await
+}
+
+pub async fn build_sandboxed_command_with_workspace_scratch(
+    command: &str,
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
+) -> Result<tokio::process::Command> {
     build_sandboxed_command_with_visibility_root(
         command,
         cwd,
         cwd,
         tmp_dir,
+        workspace_scratch_dir,
         extra_env,
         session_env,
         extra_paths,
@@ -314,6 +366,7 @@ pub async fn build_sandboxed_command_with_visibility_root(
     cwd: &std::path::Path,
     visibility_root: &std::path::Path,
     tmp_dir: Option<&std::path::Path>,
+    workspace_scratch_dir: Option<&std::path::Path>,
     extra_env: &[(String, String)],
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
@@ -343,6 +396,7 @@ pub async fn build_sandboxed_command_with_visibility_root(
     let policy = sandbox_policy_with_visibility_restriction(
         visibility_root,
         tmp_dir,
+        workspace_scratch_dir,
         session_env,
         extra_paths,
         if restrict_to_visibility && !workspace_write_allowed {

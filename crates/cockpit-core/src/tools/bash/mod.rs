@@ -364,6 +364,7 @@ async fn call_bash_inner(
     ctx: &ToolCtx,
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
+    let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
     {
@@ -399,13 +400,24 @@ async fn call_bash_inner(
             lease.visibility_root.display()
         )));
     } else if let Some(outside) =
-        outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+        crate::tools::bash::outside_session_boundary_with_workspace_scratch(
+            &cwd,
+            &ctx.cwd,
+            ctx.session.tmp_dir().as_deref(),
+            workspace_scratch_dir.as_deref(),
+        )
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
     if ctx.workspace_lease.is_none()
         && let Some(outside) =
-            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+            crate::tools::bash::command_directory_escape_with_workspace_scratch(
+                command,
+                &cwd,
+                &ctx.cwd,
+                ctx.session.tmp_dir().as_deref(),
+                workspace_scratch_dir.as_deref(),
+            )
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
@@ -682,9 +694,10 @@ async fn call_bash_inner(
             ctx.write_scope.as_deref(),
         )
     } else {
-        crate::tools::shell_sandbox::sandbox_policy(
+        crate::tools::shell_sandbox::sandbox_policy_with_workspace_scratch(
             sandbox_cwd,
             tmp_dir.as_deref(),
+            workspace_scratch_dir.as_deref(),
             &session_env,
             &extra_sandbox_paths,
             ctx.write_scope.as_deref(),
@@ -2631,6 +2644,7 @@ async fn run_shell(
     }
 
     let mut cmd = if confine {
+        let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
         let visibility_root = ctx
             .workspace_lease
             .as_ref()
@@ -2641,6 +2655,7 @@ async fn run_shell(
             cwd,
             visibility_root,
             tmp_dir,
+            workspace_scratch_dir.as_deref(),
             scrub,
             session_env,
             extra_sandbox_paths,

@@ -241,11 +241,13 @@ impl Tool for CustomBashTool {
             }
         }
 
+        let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
         let mut command = if confine {
-            crate::tools::shell_sandbox::build_sandboxed_command(
+            crate::tools::shell_sandbox::build_sandboxed_command_with_workspace_scratch(
                 &cmd,
                 &ctx.cwd,
                 ctx.session.tmp_dir().as_deref(),
+                workspace_scratch_dir.as_deref(),
                 &scrub,
                 &session_env,
                 &[],

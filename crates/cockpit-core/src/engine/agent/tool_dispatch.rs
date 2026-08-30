@@ -1966,24 +1966,14 @@ async fn execute_ordinary_call_unscoped(
     if wire_args.is_some() {
         args = wire_args.clone().unwrap();
     }
-    if let Some(canonical) =
+    let history_args =
         history_rewrite_args(wire_args.as_ref(), &args, repair_outcome.valid, &recovery)
-    {
-        rewrite_assistant_tool_call(
-            history,
-            &tc.id,
-            model_history_args(env, resolved_name, &canonical),
-        );
-    } else {
-        // Store-time projection must also rewrite the live assistant call.
-        // Otherwise a marked value would survive in the just-built history
-        // until restart even though the durable replay row correctly omits it.
-        rewrite_assistant_tool_call(
-            history,
-            &tc.id,
-            model_history_args(env, resolved_name, &args),
-        );
-    }
+            .unwrap_or(&args);
+    // Store-time projection must also rewrite the live assistant call.
+    // Otherwise a marked value would survive in the just-built history until
+    // restart even though the durable replay row correctly omits it.
+    let model_history_args = model_history_args(env, resolved_name, history_args);
+    rewrite_assistant_tool_call(history, &tc.id, &model_history_args);
     if let Some(signature) = repair_outcome
         .valid
         .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args))

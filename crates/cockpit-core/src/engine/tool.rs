@@ -231,23 +231,19 @@ fn project_model_value(
             let mut output = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let schema = prefix.and_then(|prefix| prefix.get(index)).or(item_schema);
+                let item_pointer = if prefix.is_some_and(|prefix| index < prefix.len()) {
+                    schema_pointer_child(
+                        &schema_pointer_child(schema_pointer, "prefixItems"),
+                        &index.to_string(),
+                    )
+                } else {
+                    schema_pointer_child(schema_pointer, "items")
+                };
                 let projected = match schema {
                     Some(Value::Bool(false)) => None,
-                    Some(schema) => project_model_value(
-                        item,
-                        schema,
-                        root,
-                        if prefix.is_some_and(|prefix| index < prefix.len()) {
-                            &schema_pointer_child(
-                                &schema_pointer_child(schema_pointer, "prefixItems"),
-                                &index.to_string(),
-                            )
-                        } else {
-                            &schema_pointer_child(schema_pointer, "items")
-                        },
-                        depth + 1,
-                        true,
-                    ),
+                    Some(schema) => {
+                        project_model_value(item, schema, root, &item_pointer, depth + 1, true)
+                    }
                     None => Some(item.clone()),
                 };
                 if let Some(projected) = projected {

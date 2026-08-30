@@ -1101,14 +1101,27 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             // A later include-sensitive export has no raw body to restore and
             // must retain both its exact safe bytes and its representation
             // rather than relabeling them as raw.
+            let raw_content =
+                match crate::text_artifact_blob::path_from_provenance(&entry.provenance_json)? {
+                    Some(blob_path) => {
+                        crate::text_artifact_blob::read(&blob_path).with_context(|| {
+                            format!("reading text artifact {} for export", entry.artifact_id)
+                        })?
+                    }
+                    None => entry.content.clone(),
+                };
+            anyhow::ensure!(
+                raw_content.len() == entry.content_bytes,
+                "text artifact blob accounting differs from its ledger row"
+            );
             let content = if entry.representation
                 == crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
             {
-                entry.content.clone()
+                raw_content
             } else if options.redacted {
-                redact_artifact_length_preserving(&entry.content, export_redactor)
+                redact_artifact_length_preserving(&raw_content, export_redactor)
             } else {
-                entry.content.clone()
+                raw_content
             };
             debug_assert_eq!(content.len(), entry.content_bytes);
             let representation_mode = if entry.representation

@@ -11244,20 +11244,30 @@ impl Driver {
                                 .map(crate::agents::ContextPolicy::artifact_spill_bytes)
                                 .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
                             if oversized.source_text.len() > spill_bytes {
-                                match crate::text_artifact_blob::write(
-                                    self.session.id,
-                                    &oversized.source_text,
-                                ) {
+                                match crate::text_artifact_blob::write(self.session.id, &oversized.source_text) {
                                     Ok(path) => Some(path),
                                     Err(error) => {
-                                        tracing::warn!(%error, "could not spill oversized user paste to disk; retaining inline artifact");
-                                        None
+                                        tracing::error!(%error, "oversized user paste disk spill failed; refusing inline SQLite fallback");
+                                        let _ = self.reject_reserved_oversized_user_submission(
+                                            oversized.reservation.clone(),
+                                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                            tx,
+                                        ).await;
+                                        let _ = tx.send(TurnEvent::Notice {
+                                            text: "Saving oversized-message content failed; no provider was called.".to_owned(),
+                                        }).await;
+                                        return Ok(());
                                     }
                                 }
                             } else {
                                 None
                             }
                         },
+                        source_preview_lines: self
+                            .stack
+                            .last()
+                            .and_then(|frame| frame.agent.context_policy.as_ref())
+                            .map(crate::agents::ContextPolicy::artifact_preview_lines),
                         model_projection: (user_text != oversized.source_text)
                             .then_some(user_text.clone()),
                         agent: Some(active_agent.clone()),
@@ -11338,10 +11348,8 @@ impl Driver {
                         .await;
                     }
                     let effective = projection_artifact.as_ref().unwrap_or(&source_artifact);
-                    let effective_content = match crate::text_artifact_blob::path_from_provenance(
-                        &effective.provenance_json,
-                    ) {
-                        Ok(Some(path)) => match crate::text_artifact_blob::read(&path) {
+                    let effective_content =
+                        match crate::text_artifact_blob::read_artifact_content(effective) {
                             Ok(content) => content,
                             Err(error) => {
                                 tracing::error!(%error, event_seq, "materialized user artifact blob is unavailable");
@@ -11353,17 +11361,18 @@ impl Driver {
                                     .await;
                                 return Ok(());
                             }
-                        },
-                        Ok(None) => effective.content.clone(),
-                        Err(error) => {
-                            tracing::error!(%error, event_seq, "materialized user artifact blob reference is invalid");
-                            return Ok(());
-                        }
-                    };
+                        };
                     let outbound_content = self.redact.scrub(&effective_content);
-                    match crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content(
+                    let preview_lines = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.context_policy.as_ref())
+                        .map(crate::agents::ContextPolicy::artifact_preview_lines)
+                        .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                    match crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content_and_preview_lines(
                         effective,
                         &outbound_content,
+                        preview_lines,
                     ) {
                         Ok(frame) => Some((event_seq, frame)),
                         Err(error) => {

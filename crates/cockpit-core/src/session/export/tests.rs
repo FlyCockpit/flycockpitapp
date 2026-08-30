@@ -2808,6 +2808,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
                     .to_owned(),
                 source_text: source.clone(),
                 source_blob_path: None,
+                source_preview_lines: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: Default::default(),

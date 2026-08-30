@@ -194,8 +194,10 @@ impl ContextPolicy {
     /// The default auto-compact percentage (80) used when the def does not
     /// declare one.
     pub const DEFAULT_AUTO_COMPACT_PCT: u8 = 80;
-    pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize = 8 * 1024;
-    pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize = 100;
+    pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize =
+        crate::db::text_artifacts::DEFAULT_ARTIFACT_SPILL_BYTES;
+    pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize =
+        crate::db::text_artifacts::DEFAULT_ARTIFACT_PREVIEW_LINES;
 
     pub fn artifact_spill_bytes(&self) -> usize {
         self.artifact_spill_bytes

@@ -326,6 +326,23 @@ pub fn utf8_preview_pair(value: &str) -> (&str, &str) {
     (head, &value[start..])
 }
 
+/// Build the ingress-selected line preview while retaining a strict byte cap.
+pub fn utf8_preview_lines(value: &str, lines: usize) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut preview = String::new();
+    for line in value.lines().take(lines.max(1)) {
+        if preview.len().saturating_add(line.len()).saturating_add(1) > MAX_BYTES {
+            break;
+        }
+        preview.push_str(line);
+        preview.push('\n');
+    }
+    if preview.is_empty() {
+        preview.push_str(bounded_utf8_prefix(value, MAX_BYTES));
+    }
+    preview
+}
+
 /// Render the model-only projection for one joined oversized-user owner. The
 /// source/projection relation is authoritative; callers pass the selected
 /// effective artifact and never parse a stored marker to recover identity.
@@ -343,6 +360,18 @@ pub fn render_user_input_artifact_frame_with_outbound_content(
     artifact: &crate::db::text_artifacts::TextArtifact,
     outbound_content: &str,
 ) -> anyhow::Result<String> {
+    render_user_input_artifact_frame_with_outbound_content_and_preview_lines(
+        artifact,
+        outbound_content,
+        crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES,
+    )
+}
+
+pub fn render_user_input_artifact_frame_with_outbound_content_and_preview_lines(
+    artifact: &crate::db::text_artifacts::TextArtifact,
+    outbound_content: &str,
+    preview_lines: usize,
+) -> anyhow::Result<String> {
     use crate::db::text_artifacts::{CaptureReason, TextArtifactKind, TextArtifactRelation};
 
     anyhow::ensure!(
@@ -358,7 +387,7 @@ pub fn render_user_input_artifact_frame_with_outbound_content(
         ) => {}
         _ => anyhow::bail!("user artifact has an invalid owner relation"),
     }
-    let (preview_head, preview_tail) = utf8_preview_pair(outbound_content);
+    let preview_head = utf8_preview_lines(outbound_content, preview_lines);
     // User-frame provenance is intentionally independent of the derived
     // artifact's source UUID. A model sees only the effective artifact id.
     let provenance = format!(
@@ -378,8 +407,8 @@ pub fn render_user_input_artifact_frame_with_outbound_content(
         stored_source_bytes: artifact.stored_source_bytes,
         content_bytes: artifact.content_bytes,
         line_count: outbound_content.lines().count(),
-        preview_head,
-        preview_tail,
+        preview_head: &preview_head,
+        preview_tail: "",
     }))
 }
 

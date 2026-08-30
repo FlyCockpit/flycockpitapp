@@ -693,7 +693,6 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                 || artifact.host_dropped_bytes != host_dropped_bytes
                 || artifact.stored_source_bytes != stored_source_bytes
                 || artifact.content_bytes != content_bytes
-                || artifact.content.lines().count() != line_count
             {
                 return Err(anyhow!("available tool artifact projection is malformed"));
             }
@@ -705,14 +704,21 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                     "available tool artifact provenance differs from durable projection state"
                 ));
             }
-            let artifact_content =
-                match crate::text_artifact_blob::path_from_provenance(&artifact.provenance_json)? {
-                    Some(path) => crate::text_artifact_blob::read(&path)?,
-                    None => artifact.content.clone(),
-                };
+            let artifact_content = crate::text_artifact_blob::read_artifact_content(artifact)?;
+            if artifact_content.lines().count() != line_count {
+                return Err(anyhow!("available tool artifact projection is malformed"));
+            }
             let outbound_content = redaction.scrub(&artifact_content);
-            let (preview_head, preview_tail) =
-                crate::engine::text_artifact_frame::utf8_preview_pair(&outbound_content);
+            let preview_lines = artifact_provenance
+                .get("preview_lines")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+            let preview_head = crate::engine::text_artifact_frame::utf8_preview_lines(
+                &outbound_content,
+                preview_lines,
+            );
+            let preview_tail = "";
             // Locally captured artifacts have already passed this boundary and
             // retain their durable previews. Imported (or newly matched)
             // content is rendered from the current safe view instead of
@@ -740,7 +746,7 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                         host_dropped_bytes: artifact.host_dropped_bytes,
                         stored_source_bytes: artifact.stored_source_bytes,
                         content_bytes: artifact.content_bytes,
-                        line_count: artifact.content.lines().count(),
+                        line_count: artifact_content.lines().count(),
                         preview_head,
                         preview_tail,
                     },
@@ -862,10 +868,12 @@ fn apply_text_artifact_user_projections(
             ));
         }
         let source = sources[0];
+        let source_content = crate::text_artifact_blob::read_artifact_content(source)
+            .context("reading blob-backed user source during rehydration")?;
         if source.kind != TextArtifactKind::UserInputSource
             || source.capture_reason != CaptureReason::OversizedUserInput
             || source.projection_slot.is_some()
-            || source.content != authored
+            || source_content != authored
         {
             return Err(anyhow!(
                 "user source artifact does not match its canonical event"
@@ -921,10 +929,18 @@ fn apply_text_artifact_user_projections(
         } else {
             source
         };
-        let outbound_content = redaction.scrub(&effective.content);
-        let frame = crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content(
+        let effective_content = crate::text_artifact_blob::read_artifact_content(effective)
+            .context("reading blob-backed user projection during rehydration")?;
+        let outbound_content = redaction.scrub(&effective_content);
+        let preview_lines = source_provenance
+            .get("preview_lines")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+        let frame = crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content_and_preview_lines(
             effective,
             &outbound_content,
+            preview_lines,
         )
         .context("rendering rehydrated user artifact frame")?;
         if frames.insert(event.seq, frame).is_some() {
@@ -3666,6 +3682,7 @@ mod tests {
                 model_envelope_json: envelope.to_string(),
                 source_text: source,
                 source_blob_path: None,
+                source_preview_lines: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
@@ -3775,6 +3792,7 @@ mod tests {
                 model_envelope_json: envelope.to_string(),
                 source_text: source,
                 source_blob_path: None,
+                source_preview_lines: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),

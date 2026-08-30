@@ -371,6 +371,15 @@ fn parse_text_artifacts(
         if !provenance.is_object() {
             bail!("text artifact provenance must be an object");
         }
+        // The archive member is the authoritative full body.  Its source
+        // machine's daemon-local pathname is neither portable nor valid in
+        // the destination, so preserve semantic provenance but never import a
+        // dangling disk reference.
+        let mut provenance = provenance.clone();
+        provenance
+            .as_object_mut()
+            .expect("object checked above")
+            .remove("blob_path");
         parsed.push(ImportedTextArtifact {
             source_artifact_id,
             source_session_id: parse_uuid(
@@ -632,7 +641,7 @@ fn validate_import_artifact_provenance(
         .ok_or_else(|| anyhow!("text artifact provenance must be an object"))?;
     match artifact.kind {
         TextArtifactKind::ToolResult => {
-            require_exact_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
+            require_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
             let agent = provenance
                 .get("agent_id")
                 .ok_or_else(|| anyhow!("tool artifact provenance lacks agent_id"))?;
@@ -651,7 +660,7 @@ fn validate_import_artifact_provenance(
             }
         }
         TextArtifactKind::UserInputSource => {
-            require_exact_provenance_keys(provenance, &["event_seq"])?;
+            require_provenance_keys(provenance, &["event_seq"])?;
             if provenance.get("event_seq").and_then(Value::as_i64)
                 != Some(artifact.source_event_seq)
             {
@@ -700,6 +709,30 @@ fn require_exact_provenance_keys(
         || !expected.iter().all(|key| provenance.contains_key(*key))
     {
         bail!("text artifact provenance has an invalid shape");
+    }
+    Ok(())
+}
+
+fn require_provenance_keys(
+    provenance: &serde_json::Map<String, Value>,
+    required: &[&str],
+) -> Result<()> {
+    if !required.iter().all(|key| provenance.contains_key(*key))
+        || !provenance.keys().all(|key| {
+            required.contains(&key.as_str()) || key == "source" || key == "preview_lines"
+        })
+    {
+        bail!("text artifact provenance has unexpected keys");
+    }
+    if let Some(source) = provenance.get("source") {
+        if !matches!(source.as_str(), Some("tool_result") | Some("user_paste")) {
+            bail!("text artifact provenance source is invalid");
+        }
+    }
+    if let Some(lines) = provenance.get("preview_lines") {
+        if !matches!(lines.as_u64(), Some(1..=10_000)) {
+            bail!("text artifact provenance preview line count is invalid");
+        }
     }
     Ok(())
 }
@@ -938,12 +971,19 @@ fn validate_tool_artifact_projection_state(
             if artifact_provenance != Value::Object(provenance.clone()) {
                 bail!("available tool artifact projection provenance differs from its sidecar");
             }
-            let (expected_head, expected_tail) =
-                crate::engine::text_artifact_frame::utf8_preview_pair(&artifact.content);
+            let preview_lines = provenance
+                .get("preview_lines")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+            let expected_head = crate::engine::text_artifact_frame::utf8_preview_lines(
+                &artifact.content,
+                preview_lines,
+            );
             if projection.get("line_count").and_then(Value::as_u64)
                 != Some(artifact.content.lines().count() as u64)
                 || preview_head != expected_head
-                || preview_tail != expected_tail
+                || !preview_tail.is_empty()
             {
                 bail!("available tool artifact projection previews differ from its sidecar");
             }

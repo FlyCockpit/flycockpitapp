@@ -23,6 +23,8 @@ pub const MAX_ARTIFACT_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SESSION_ARTIFACT_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 pub const ARTIFACT_RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
 pub const ARTIFACT_RESERVATION_RENEW_AT_REMAINING_MS: i64 = 5 * 60 * 1000;
+pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize = 8 * 1024;
+pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -396,6 +398,9 @@ pub struct ReservedUserArtifactMaterialization {
     /// Daemon-owned relative blob path for the immutable source body. The DB
     /// validates and persists only metadata and the inline preview.
     pub source_blob_path: Option<String>,
+    /// Ingress-selected model preview height.  Persisting it makes resume
+    /// cache-stable if the agent definition later changes.
+    pub source_preview_lines: Option<usize>,
     pub model_projection: Option<String>,
     pub agent: Option<String>,
     pub context: TextArtifactEventContext,
@@ -1744,7 +1749,10 @@ fn insert_artifact_conn(
 
     let artifact_id = Uuid::new_v4();
     let stored_content = if has_blob_path(&candidate.provenance_json)? {
-        artifact_inline_preview(&candidate.content)
+        artifact_inline_preview(
+            &candidate.content,
+            artifact_preview_lines(&candidate.provenance_json)?,
+        )
     } else {
         candidate.content.clone()
     };
@@ -1997,13 +2005,15 @@ fn only_provenance_keys_with_optional(
 ) -> Result<()> {
     let expected_len = expected.len()
         + usize::from(provenance.contains_key(optional))
-        + usize::from(provenance.contains_key("source"));
+        + usize::from(provenance.contains_key("source"))
+        + usize::from(provenance.contains_key("preview_lines"));
     ensure!(
         provenance.len() == expected_len
             && expected.iter().all(|key| provenance.contains_key(*key))
-            && provenance
-                .keys()
-                .all(|key| expected.contains(&key.as_str()) || key == optional || key == "source"),
+            && provenance.keys().all(|key| expected.contains(&key.as_str())
+                || key == optional
+                || key == "source"
+                || key == "preview_lines"),
         "text artifact provenance has an invalid shape"
     );
     if let Some(path) = provenance.get(optional) {
@@ -2023,6 +2033,12 @@ fn only_provenance_keys_with_optional(
             "text artifact source is invalid"
         );
     }
+    if let Some(lines) = provenance.get("preview_lines") {
+        ensure!(
+            matches!(lines.as_u64(), Some(1..=10_000)),
+            "text artifact preview line count is invalid"
+        );
+    }
     Ok(())
 }
 
@@ -2033,11 +2049,21 @@ fn has_blob_path(provenance_json: &str) -> Result<bool> {
         .is_some())
 }
 
-fn artifact_inline_preview(content: &str) -> String {
-    const MAX_LINES: usize = 100;
+fn artifact_preview_lines(provenance_json: &str) -> Result<usize> {
+    let value: serde_json::Value =
+        serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
+    Ok(value
+        .get("preview_lines")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0 && *value <= 10_000)
+        .unwrap_or(DEFAULT_ARTIFACT_PREVIEW_LINES))
+}
+
+fn artifact_inline_preview(content: &str, max_lines: usize) -> String {
     const MAX_BYTES: usize = 16 * 1024;
     let mut preview = String::new();
-    for line in content.lines().take(MAX_LINES) {
+    for line in content.lines().take(max_lines) {
         if preview.len().saturating_add(line.len()).saturating_add(1) > MAX_BYTES {
             break;
         }
@@ -2929,9 +2955,11 @@ fn materialize_reserved_user_artifacts_conn(
         host_original_bytes: input.source_text.len(),
         host_dropped_bytes: 0,
         stored_source_bytes: input.source_text.len(),
-        provenance_json: match &input.source_blob_path {
-            Some(path) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "blob_path": path}).to_string(),
-            None => serde_json::json!({"event_seq": event_seq, "source": "user_paste"}).to_string(),
+        provenance_json: match (&input.source_blob_path, input.source_preview_lines) {
+            (Some(path), Some(preview_lines)) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "blob_path": path, "preview_lines": preview_lines}).to_string(),
+            (Some(path), None) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "blob_path": path}).to_string(),
+            (None, Some(preview_lines)) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "preview_lines": preview_lines}).to_string(),
+            (None, None) => serde_json::json!({"event_seq": event_seq, "source": "user_paste"}).to_string(),
         },
         created_at: input.now_ms,
     };
@@ -3330,6 +3358,10 @@ pub(crate) fn fork_session_artifacts_conn(
         let child_event_seq = *event_map
             .get(&artifact.event_seq)
             .ok_or_else(|| anyhow!("fork artifact event was not copied"))?;
+        ensure!(
+            !has_blob_path(&artifact.provenance_json)?,
+            "forking blob-backed text artifacts is unavailable until child sessions receive their own daemon-owned blob copies"
+        );
         let mut provenance: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
             .context("stored text artifact provenance is invalid")?;
         match artifact.kind {
@@ -3895,6 +3927,7 @@ mod tests {
                     .to_owned(),
                 source_text: source,
                 source_blob_path: None,
+                source_preview_lines: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4373,6 +4406,7 @@ mod tests {
                     .to_owned(),
                 source_text: source,
                 source_blob_path: None,
+                source_preview_lines: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4427,6 +4461,7 @@ mod tests {
                     .to_owned(),
                 source_text: source,
                 source_blob_path: None,
+                source_preview_lines: None,
                 model_projection: Some("different model projection".to_owned()),
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -5133,6 +5168,7 @@ mod tests {
             model_envelope_json: r#"{"version":3,"prelude":[{"type":"forced_skill","call_id":"forced-fault","name":"review","args":{"name":"review"},"body":"FORCED","hard_fail":false}],"parts":[{"type":"text","text":"AUTO\nTAG\n"},{"type":"authored_text_slot"}]}"#.to_owned(),
             source_text: source,
             source_blob_path: None,
+            source_preview_lines: None,
             model_projection: Some("rewritten model body".to_owned()),
             agent: Some("Build".to_owned()),
             context: TextArtifactEventContext::default(),

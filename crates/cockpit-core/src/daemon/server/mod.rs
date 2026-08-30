@@ -4213,6 +4213,9 @@ fn terminal_temp_root(paths: &DaemonPaths) -> PathBuf {
 }
 
 async fn run_boot_housekeeping(db: &Db) {
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(db).await {
+        tracing::warn!(%error, "replaying text artifact blob cleanup intents on boot failed");
+    }
     // Drop autocomplete-tally rows that have aged out of the 30-day
     // window. Best-effort — a prune failure shouldn't block boot.
     let before = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;

@@ -955,6 +955,11 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
         session_id,
         crate::db::session_log::now_ms().max(0),
     )?;
+    Db::enqueue_text_artifact_blob_cleanup_conn(
+        conn,
+        session_id,
+        crate::db::session_log::now_ms().max(0),
+    )?;
     // The delete cascades to descendant forks and `/btw` rows, so every member
     // of the cascade set needs a tombstone — not just the requested root. A
     // descendant deleted without one loses the owner-visible marker for its
@@ -2042,6 +2047,63 @@ impl Db {
             )?;
         }
         Ok(())
+    }
+
+    /// Persist every daemon-owned artifact body that the pending cascade will
+    /// orphan.  The DB retains identities only; core owns all filesystem I/O.
+    pub fn enqueue_text_artifact_blob_cleanup_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            now_unix_ms >= 0,
+            "cleanup intent timestamp must be nonnegative"
+        );
+        for member in collect_subtree(conn, session_id)? {
+            for artifact in crate::db::text_artifacts::list_text_artifacts_conn(conn, member)? {
+                let value: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
+                    .context("parsing text artifact provenance for cleanup")?;
+                let Some(path) = value.get("blob_path").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    path.starts_with("text-artifacts/")
+                        && !path.contains("..")
+                        && !path.bytes().any(|byte| byte.is_ascii_control()),
+                    "text artifact cleanup path is invalid"
+                );
+                conn.execute(
+                    "INSERT OR IGNORE INTO text_artifact_blob_cleanup_intents(blob_path,session_id,created_at_unix_ms)
+                     VALUES(?1,?2,?3)",
+                    params![path, member.to_string(), now_unix_ms],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn pending_text_artifact_blob_cleanup_intents(&self) -> Result<Vec<String>> {
+        self.read(|conn| {
+            Ok(conn
+                .prepare("SELECT blob_path FROM text_artifact_blob_cleanup_intents ORDER BY created_at_unix_ms,blob_path")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    pub async fn complete_text_artifact_blob_cleanup_intent(
+        &self,
+        blob_path: String,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM text_artifact_blob_cleanup_intents WHERE blob_path=?1",
+                [blob_path],
+            )? == 1)
+        })
+        .await
     }
 
     /// Replay durable filesystem cleanup. The intent is removed only after a

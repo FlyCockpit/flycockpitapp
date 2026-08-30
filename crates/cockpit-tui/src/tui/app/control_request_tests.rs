@@ -16,7 +16,6 @@ use cockpit_proto::{Request, Response};
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app
 }

@@ -15,9 +15,12 @@ const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
     match intent {
-        cockpit_client::LifecycleIntent::AttachOrPersistent
-        | cockpit_client::LifecycleIntent::EnsurePersistent => LifecycleMode::AttachOrPersistent,
-        cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+        cockpit_client::LifecycleIntent::AttachOrPersistent => {
+            LifecycleMode::from_background_agents(true)
+        }
+        cockpit_client::LifecycleIntent::AttachOrEphemeral => {
+            LifecycleMode::from_background_agents(false)
+        }
     }
 }
 
@@ -30,6 +33,19 @@ pub enum LifecycleMode {
     AttachOrPersistent,
     /// Attach to any current owner, otherwise start an ephemeral owner.
     AttachOrEphemeral,
+}
+
+impl LifecycleMode {
+    /// Select the lifetime used only when acquisition must spawn an owner.
+    /// Existing owners are always discovered and attached before this policy
+    /// is consulted.
+    pub fn from_background_agents(background_agents: bool) -> Self {
+        if background_agents {
+            Self::AttachOrPersistent
+        } else {
+            Self::AttachOrEphemeral
+        }
+    }
 }
 
 /// Connect-or-spawn result: a ready-to-use client and the lifetime selected
@@ -300,26 +316,19 @@ pub async fn serve_lifecycle_requests(
 ) -> Result<()> {
     while let Some(request) = requests.recv().await {
         // A queued request may be cancelled before the lifecycle actor sees
-        // it. Never spawn a daemon for a receiver that is already gone.
-        if request.reply.is_closed() {
+        // it. Never spawn a daemon for a cancelled request.
+        if request.is_cancelled() || request.reply.is_closed() {
             continue;
         }
         let mode = mode_for_intent(request.intent);
-        let resolved = probe_or_spawn(mode).await.and_then(|mut connected| {
-            if matches!(
-                request.intent,
-                cockpit_client::LifecycleIntent::EnsurePersistent
-            ) && connected.owns_daemon
-            {
-                anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
-            }
-            Ok(cockpit_client::LifecycleResolution {
+        let resolved = probe_or_spawn_with_spawn_authorization(mode, Some(&request))
+            .await
+            .map(|connected| cockpit_client::LifecycleResolution {
                 endpoint: connected.endpoint,
                 owns_daemon: connected.owns_daemon,
                 socket: connected.socket,
                 startup_notice: connected.startup_notice,
-            })
-        });
+            });
         match resolved {
             Ok(resolution) => {
                 let _ = request.reply.send(Ok(resolution));
@@ -384,6 +393,16 @@ fn after_restart_wait(error: SharedWaitError) -> RestartWaitPlan {
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
+    probe_or_spawn_with_spawn_authorization(mode, None).await
+}
+
+/// Resolve a daemon under optional request-scoped spawn authority. The permit
+/// runs through the only owner-creation path, after every discovery or restart
+/// wait, so cancellation and creation have a single linearization point.
+async fn probe_or_spawn_with_spawn_authorization(
+    mode: LifecycleMode,
+    lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+) -> Result<ConnectedDaemon> {
     use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
 
     match mode {
@@ -477,7 +496,14 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         }
     }
 
-    // No reachable daemon to attach to — spawn one.
+    // No reachable daemon to attach to — claim the request's spawn permit.
+    // The permit is retained until the exact creation call returns, making
+    // cancellation and owner creation mutually exclusive.
+    let mut spawn_permit = lifecycle_request
+        .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+
     //
     // Both lifetimes use the canonical socket. A client preference decides
     // only the first owner's lifetime; an existing owner always wins.
@@ -505,6 +531,9 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         #[cfg(any(test, feature = "test-support"))]
         if crate::daemon::in_process_auto_promote_enabled() {
             let pid = crate::daemon::auto_promote_in_process_persistent().await?;
+            if let Some(permit) = spawn_permit.as_mut() {
+                permit.owner_created();
+            }
             tracing::info!(
                 pid,
                 ephemeral = false,
@@ -529,6 +558,9 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         let pid = spawn_detached(false)?;
         (canonical, pid, None)
     };
+    if let Some(permit) = spawn_permit.as_mut() {
+        permit.owner_created();
+    }
     tracing::info!(pid = pid, ephemeral = ephemeral, "daemon spawned");
 
     // Wait for the socket + a successful handshake. In-process auto-promote

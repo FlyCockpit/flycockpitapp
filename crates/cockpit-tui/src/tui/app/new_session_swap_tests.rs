@@ -74,7 +74,6 @@ fn app_with_only_session_switch_pending(started_at: Instant) -> App {
     app.pane = None;
     app.dialog = Dialog::None;
     app.question_dialog = None;
-    app.daemon_prompt = None;
     let kind = AsyncActionKind::Internal("session.switch");
     app.async_actions.start(
         kind.clone(),

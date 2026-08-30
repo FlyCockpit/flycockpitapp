@@ -3298,7 +3298,7 @@ fn daemon_request_blocking(
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
                 let resolved = lifecycle
-                    .resolve(LifecycleIntent::EnsurePersistent)
+                    .resolve_default()
                     .await
                     .map_err(|error| format!("daemon lifecycle: {error}"))?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)

@@ -671,14 +671,7 @@ export const pendingGuidanceProposalSchema = z
 export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
 
 const requestParamSchemas = {
-  get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
   get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
-  mark_app_flag_seen: z
-    .object({
-      key: z.literal("daemon_autostart_notice"),
-      expected_version: safeU64NumberSchema,
-    })
-    .strict(),
   resolve_assistant_session: z
     .object({
       assistant_id: z.string().min(1),
@@ -1070,9 +1063,7 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // array directly so it stays in sync with `clientRequestSchema` by
 // construction.
 const clientRequestVariants = [
-  requestVariant("get_app_flag", requestParamSchemas.get_app_flag),
   requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
-  requestVariant("mark_app_flag_seen", requestParamSchemas.mark_app_flag_seen),
   requestVariant("resolve_assistant_session", requestParamSchemas.resolve_assistant_session),
   requestVariant("set_workspace_trust", requestParamSchemas.set_workspace_trust),
   requestVariant("archive_session", requestParamSchemas.archive_session),
@@ -1222,8 +1213,6 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
-  "app_flag",
-  "app_flag_seen",
   "assistant_session_resolved",
   "config_refreshed",
   "attached",
@@ -1567,26 +1556,6 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
-  responseVariant(
-    "app_flag",
-    z
-      .object({
-        key: z.literal("daemon_autostart_notice"),
-        seen: z.boolean(),
-        version: safeU64NumberSchema,
-      })
-      .strict(),
-  ),
-  responseVariant(
-    "app_flag_seen",
-    z
-      .object({
-        key: z.literal("daemon_autostart_notice"),
-        version: safeU64NumberSchema,
-        changed: z.boolean(),
-      })
-      .strict(),
-  ),
   responseVariant(
     "assistant_session_resolved",
     z.object({ session: sessionSummaryWireSchema, created: z.boolean() }).strict(),

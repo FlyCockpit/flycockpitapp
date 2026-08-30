@@ -519,7 +519,6 @@ impl App {
             && !self.dialog.is_active()
             && matches!(self.overlay, Overlay::None)
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
         {
             match key.code {
                 KeyCode::Char('m') if self.auth_failure_notice.is_some() => {
@@ -733,41 +732,6 @@ impl App {
             return false;
         }
 
-        if self.startup_modal_on_top() == Some(StartupModal::Daemon)
-            && let Some(prompt) = self.daemon_prompt.as_mut()
-        {
-            let should_close = prompt.handle_key(key);
-            if !should_close {
-                return false;
-            }
-            let choice = prompt.take_choice();
-            match choice {
-                Some(crate::tui::daemon_prompt::DaemonChoice::StartAndConnect) => {
-                    // Resolution and any required spawn occur asynchronously
-                    // in the CLI-owned lifecycle composition task.
-                    self.daemon_connected = true;
-                    self.daemon_prompt = None;
-                    self.reset_display_attach_backoff();
-                    self.maybe_open_add_provider_wizard();
-                }
-                Some(crate::tui::daemon_prompt::DaemonChoice::StartEphemeral) => {
-                    // The next lifecycle resolution prefers an ephemeral,
-                    // reference-counted owner. It remains attachable through
-                    // the canonical socket, so normal RPC UI stays enabled.
-                    self.ephemeral_preference = true;
-                    self.daemon_connected = true;
-                    self.push_plain("daemon: starting an ephemeral daemon — it shuts down after the last client exits"
-                                .to_string());
-                    self.daemon_prompt = None;
-                    self.maybe_open_add_provider_wizard();
-                }
-                Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
-                    return self.request_guarded_exit();
-                }
-            }
-            return false;
-        }
-
         // Answering dialog (GOALS §3b) — same modal rule. It replaces the
         // composer, so it routes before the settings dialog / picker. On
         // close, send the resolution back to the daemon as
@@ -872,7 +836,6 @@ impl App {
         if matches!(self.overlay, Overlay::None)
             && self.session_setup_inline_visible()
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
             && !self.dialog.is_active()
         {
             let captures_all_input = self
@@ -1209,7 +1172,6 @@ impl App {
             && !self.dialog.is_active()
             && !self.overlay.is_open()
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
             && self.pane.is_none()
         {
             self.open_transcript_find();
@@ -1227,7 +1189,6 @@ impl App {
             && !self.dialog.is_active()
             && !self.overlay.is_open()
             && self.question_dialog.is_none()
-            && self.daemon_prompt.is_none()
             && self.pane.is_none()
         {
             self.open_scratchpad_pane();
@@ -1465,7 +1426,6 @@ impl App {
             && self.active_schedules.is_empty()
             && matches!(self.dialog, Dialog::None)
             && !self.overlay.is_open()
-            && self.daemon_prompt.is_none()
             && self.question_dialog.is_none()
             && self.pending_local_choice.is_none()
             && !self.pending_prune_confirm
@@ -3659,26 +3619,24 @@ impl App {
             }
             return;
         }
-        if self.daemon_prompt.is_some()
-            || matches!(
-                self.overlay,
-                Overlay::Stats(_)
-                    | Overlay::Usage(_)
-                    | Overlay::Sessions(_)
-                    | Overlay::Skills(_)
-                    | Overlay::Tools(_)
-                    | Overlay::GoalSettings(_)
-                    | Overlay::Permissions(_)
-                    | Overlay::Resources(_)
-                    | Overlay::Quick(_)
-                    | Overlay::Context(_)
-                    | Overlay::Leaks(_)
-                    | Overlay::Sealed(_)
-                    | Overlay::Diff(_)
-                    | Overlay::GuidanceReview(_)
-                    | Overlay::Help(_)
-            )
-            || self.context_menu.is_some()
+        if matches!(
+            self.overlay,
+            Overlay::Stats(_)
+                | Overlay::Usage(_)
+                | Overlay::Sessions(_)
+                | Overlay::Skills(_)
+                | Overlay::Tools(_)
+                | Overlay::GoalSettings(_)
+                | Overlay::Permissions(_)
+                | Overlay::Resources(_)
+                | Overlay::Quick(_)
+                | Overlay::Context(_)
+                | Overlay::Leaks(_)
+                | Overlay::Sealed(_)
+                | Overlay::Diff(_)
+                | Overlay::GuidanceReview(_)
+                | Overlay::Help(_)
+        ) || self.context_menu.is_some()
             || self.pin_pick.is_some()
             || self.fork_pick.is_some()
             || self.copy_pick.is_some()
@@ -3912,7 +3870,6 @@ impl App {
     pub(super) fn structured_paste_composer_eligible(&self) -> bool {
         !(self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
             || (self.pane_focused && self.pane.is_some()))
-            && self.daemon_prompt.is_none()
             && !matches!(
                 self.overlay,
                 Overlay::Stats(_)
@@ -5174,7 +5131,6 @@ mod paste_routing_tests {
 
     fn input_ready_app(tmp: &tempfile::TempDir) -> App {
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         crate::tui::app::seed_ready_model_for_tests(&mut app);
         app
@@ -6118,7 +6074,6 @@ mod chat_scrollback_key_tests {
     fn scrollable_app() -> App {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.chat_total_lines = 20;
         app.chat_visible_lines = 6;
@@ -6335,7 +6290,6 @@ mod shift_enter_keyboard_protocol_tests {
 
     fn app(tmp: &tempfile::TempDir) -> App {
         let mut app = App::new(Some(tmp.path()), false);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.composer.set_vim_enabled(false);
         crate::tui::app::seed_ready_model_for_tests(&mut app);

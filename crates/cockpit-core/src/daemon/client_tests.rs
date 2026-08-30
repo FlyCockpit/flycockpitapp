@@ -392,11 +392,19 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
         LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
+        mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
+        LifecycleMode::AttachOrEphemeral
+    );
+}
+
+#[test]
+fn background_agents_setting_selects_new_owner_lifetime() {
+    assert_eq!(
+        LifecycleMode::from_background_agents(true),
         LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
+        LifecycleMode::from_background_agents(false),
         LifecycleMode::AttachOrEphemeral
     );
 }

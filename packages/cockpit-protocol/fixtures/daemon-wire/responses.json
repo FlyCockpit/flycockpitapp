@@ -5,28 +5,6 @@
     "response": "ack",
     "v": 21
   },
-  "app_flag": {
-    "data": {
-      "key": "daemon_autostart_notice",
-      "seen": false,
-      "version": 7
-    },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "res",
-    "response": "app_flag",
-    "v": 21
-  },
-  "app_flag_seen": {
-    "data": {
-      "changed": true,
-      "key": "daemon_autostart_notice",
-      "version": 8
-    },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "res",
-    "response": "app_flag_seen",
-    "v": 21
-  },
   "assistant_session_resolved": {
     "data": {
       "created": true,

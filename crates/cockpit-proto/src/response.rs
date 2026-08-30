@@ -632,16 +632,6 @@ pub enum Response {
         connector: Option<ConnectorDisclosure>,
         config_generation: u64,
     },
-    AppFlag {
-        key: AppFlagKey,
-        seen: bool,
-        version: u64,
-    },
-    AppFlagSeen {
-        key: AppFlagKey,
-        version: u64,
-        changed: bool,
-    },
     AssistantSessionResolved {
         session: SessionSummary,
         created: bool,
@@ -1516,8 +1506,6 @@ macro_rules! response_variants {
             (Response::SubscriptionAckCommitted { .. }, "subscription_ack_committed");
             (Response::CopilotAuthCommitted { .. }, "copilot_auth_committed");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
-            (Response::AppFlag { .. }, "app_flag");
-            (Response::AppFlagSeen { .. }, "app_flag_seen");
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");

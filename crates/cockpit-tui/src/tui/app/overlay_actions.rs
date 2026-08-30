@@ -4,7 +4,7 @@ async fn resolve_notes_endpoint(
     lifecycle: cockpit_client::LifecycleClient,
 ) -> Result<cockpit_client::ClientEndpoint, String> {
     lifecycle
-        .resolve(cockpit_client::LifecycleIntent::EnsurePersistent)
+        .resolve_default()
         .await
         .map(|resolution| resolution.endpoint)
         .map_err(|error| format!("notes daemon lifecycle failed: {error}"))
@@ -343,13 +343,14 @@ mod notes_lifecycle_tests {
     use super::resolve_notes_endpoint;
 
     #[tokio::test]
-    async fn endpoint_resolution_requests_persistent_attach_exactly_once() {
+    async fn endpoint_resolution_requests_configured_default_exactly_once() {
         let (client, mut requests) = cockpit_client::LifecycleClient::channel(2);
+        let client = client.with_default_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral);
         let resolve = tokio::spawn(resolve_notes_endpoint(client));
         let request = requests.recv().await.expect("one lifecycle request");
         assert_eq!(
             request.intent,
-            cockpit_client::LifecycleIntent::EnsurePersistent
+            cockpit_client::LifecycleIntent::AttachOrEphemeral
         );
         let (connections, _connection_requests) = tokio::sync::mpsc::channel(1);
         let (sensitive, _sensitive_requests) = tokio::sync::mpsc::channel(1);

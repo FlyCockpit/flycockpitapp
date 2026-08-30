@@ -1412,8 +1412,6 @@ fn tui_db_inventory_converted() {
     for rpc in [
         "SetWorkspaceTrust",
         "GetStartupDisclosures",
-        "GetAppFlag",
-        "MarkAppFlagSeen",
         "ResolveAssistantSession",
         "ReadSubagentHistoryPage",
         "StatsRollup",
@@ -2700,7 +2698,7 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     let tui = tui_production_sources();
     for required in [
         "LifecycleIntent::AttachOrEphemeral",
-        "LifecycleIntent::EnsurePersistent",
+        "resolve_default()",
         "connect_endpoint",
         "ClientEndpoint",
     ] {

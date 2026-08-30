@@ -248,7 +248,6 @@ fn idle_empty_ctrl_d_exits_immediately() {
     use crate::tui::settings::Dialog;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = Dialog::None;
 
     let exit = app.handle_key(ctrl('d'));
@@ -335,7 +334,6 @@ fn durable_control_receipt_fences_every_guarded_exit() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     let request_id = cockpit_client::presentation::ControlRequestId(41);
     app.pending_control_requests.insert(
@@ -376,9 +374,6 @@ fn exit_routes_share_the_app_wide_authority_gate() {
     );
     assert!(input.contains(
         "self.ctrl_d_can_exit_immediately() {\n                self.request_guarded_exit()"
-    ));
-    assert!(input.contains(
-        "DaemonChoice::Exit) | None => {\n                    return self.request_guarded_exit();"
     ));
     assert!(
         slash.contains(

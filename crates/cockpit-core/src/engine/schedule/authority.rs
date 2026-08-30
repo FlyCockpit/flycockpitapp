@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
@@ -92,6 +92,9 @@ pub enum ScheduleEvent {
     /// main history. After the turn the driver posts
     /// [`ScheduleCommand::IterationFinished`].
     LoopIterationDue { job_id: String, prompt: String },
+    /// An idle wake finished in its fork without a visible action. The driver
+    /// releases the live slot without recording a transcript turn.
+    EphemeralCompleted { job_id: String },
     /// A genuine recursive-`Swarm` child subagent (`bee` / `scout`) has just
     /// STARTED its background task. Emitted by the runner ([`super::swarm::run_swarm`])
     /// as its FIRST action — on the SAME authority→driver channel and by the
@@ -381,6 +384,9 @@ pub struct ScheduleAuthority {
     /// Recursive `Swarm` spawns that arrived while at the concurrency cap
     /// (GOALS §24). Drained FIFO as running jobs complete and slots free.
     swarm_queue: std::collections::VecDeque<SpawnSpec>,
+    /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
+    /// user message resets their countdown without polling.
+    idle_activity_tx: watch::Sender<u64>,
 }
 
 impl ScheduleAuthority {
@@ -409,6 +415,7 @@ impl ScheduleAuthority {
         ctx: ScheduleContext,
         max_concurrent: usize,
     ) -> Self {
+        let (idle_activity_tx, _) = watch::channel(0_u64);
         Self {
             registry: BTreeMap::new(),
             max_concurrent: max_concurrent.max(1),
@@ -419,6 +426,7 @@ impl ScheduleAuthority {
             swarm_max_concurrency: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
+            idle_activity_tx,
         }
     }
 
@@ -705,6 +713,7 @@ impl ScheduleAuthority {
             ctx: self.ctx.clone(),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
+            idle_activity_rx: args.idle.then(|| self.idle_activity_tx.subscribe()),
         };
         let handle = tokio::spawn(loop_runner::run_forked_loop(run_ctx));
         let entry = ScheduleEntry {
@@ -719,6 +728,13 @@ impl ScheduleAuthority {
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
+    }
+
+    /// Reset this thread's idle schedules after an accepted external user
+    /// message. Scheduled work and rejected input never call this method.
+    pub fn record_user_activity(&self) {
+        let next = (*self.idle_activity_tx.borrow()).saturating_add(1);
+        let _ = self.idle_activity_tx.send(next);
     }
 
     /// Start a background shell job. Returns the job id.
@@ -1438,6 +1454,7 @@ mod tests {
                             "goal-supervision worker {worker:?} must not emit SwarmChildStopGateCompleted"
                         )
                     }
+                    ScheduleEvent::EphemeralCompleted { .. } => {}
                     ScheduleEvent::Completed { .. } => break,
                     ScheduleEvent::LoopIterationDue { .. } => {}
                 }

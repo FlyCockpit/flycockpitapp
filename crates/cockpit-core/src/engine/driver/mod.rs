@@ -7924,6 +7924,7 @@ impl Driver {
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
         if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
             self.keep_warm_armed_for_idle_window = false;
+            self.schedule.record_user_activity();
         }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
@@ -11787,6 +11788,7 @@ impl Driver {
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity().await;
                         }
+                        self.schedule.record_user_activity();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {

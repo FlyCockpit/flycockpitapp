@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::engine::agent::{Agent, TurnEvent, TurnOutcome, turn};
 use crate::engine::message::{Message, extract_text};
@@ -43,6 +43,9 @@ pub struct LoopRunCtx {
     pub turn_tx: mpsc::Sender<TurnEvent>,
     /// Authority→driver channel — the terminal completion.
     pub event_tx: mpsc::Sender<ScheduleEvent>,
+    /// An accepted parent-thread user message advances this receiver and
+    /// restarts an idle timer's countdown.
+    pub idle_activity_rx: Option<watch::Receiver<u64>>,
 }
 
 /// Max turns one fork iteration may take before we cut it off (bounds a
@@ -61,6 +64,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         ctx,
         turn_tx,
         event_tx,
+        mut idle_activity_rx,
     } = run;
 
     // Branch a fork from main as of registration (tail snapshot). The fork
@@ -108,6 +112,8 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
 
     let limit = args.limit.unwrap_or(u64::MAX);
     let mut delay = args.interval_secs;
+    let mut watch_digest =
+        (!args.watch_paths.is_empty()).then(|| local_change_digest(&ctx.cwd, &args.watch_paths));
 
     // Accumulated history for `independent = false`. Reset each iteration
     // for `independent = true`.
@@ -115,12 +121,18 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     let mut last_result = String::new();
     let mut iteration: u64 = 0;
     let mut errored = false;
+    let wake_prompt = args.idle.then(|| {
+        format!(
+            "[idle wake] Do not invent work. Inspect only what is needed to determine whether a real change requires action. If nothing changed, take no action and send no message.\n\n{}",
+            args.prompt
+        )
+    });
 
     while iteration < limit {
         // Wait the interval before each iteration (a timer with limit=1
         // therefore fires after one interval — matching "one-shot delayed
         // prompt").
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        wait_for_next_wake(delay, idle_activity_rx.as_mut()).await;
 
         if state.is_cancelled() {
             break;
@@ -130,10 +142,24 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             fork_history.clear();
         }
 
+        if let Some(previous_digest) = watch_digest.as_mut() {
+            let current_digest = local_change_digest(&ctx.cwd, &args.watch_paths);
+            if current_digest == *previous_digest {
+                iteration += 1;
+                if args.backoff {
+                    delay = (delay.saturating_mul(2)).min(super::spec::BACKOFF_CEILING_SECS);
+                }
+                continue;
+            }
+            *previous_digest = current_digest;
+            delay = args.interval_secs;
+        }
+
+        let before_workspace = args.idle.then(|| git_status_digest(&ctx.cwd));
         match run_iteration(
             &fork_agent,
             &mut fork_history,
-            &args.prompt,
+            wake_prompt.as_deref().unwrap_or(&args.prompt),
             fork_session.clone(),
             &ctx,
             &turn_tx,
@@ -148,6 +174,15 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             }
         }
 
+        if let Some(before_workspace) = before_workspace
+            && git_status_digest(&ctx.cwd) != before_workspace
+        {
+            // File mutation is a persistent action even when the model chose
+            // not to narrate it. The eventual parent delivery must not be
+            // discarded as a no-op.
+            state.mark_persistent_action();
+        }
+
         cap_fork_history(&mut fork_history);
         iteration += 1;
 
@@ -159,6 +194,15 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         if args.backoff {
             delay = (delay.saturating_mul(2)).min(super::spec::BACKOFF_CEILING_SECS);
         }
+    }
+
+    // Pure read-only idle checks leave no durable main-thread turn. The fork
+    // still reports completion so the bounded registry slot is released.
+    if args.idle && !state.has_persistent_action() {
+        let _ = event_tx
+            .send(ScheduleEvent::EphemeralCompleted { job_id })
+            .await;
+        return;
     }
 
     // Promote the terminal iteration's result + accumulated notes to main.
@@ -176,6 +220,62 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             requests,
         })
         .await;
+}
+
+async fn wait_for_next_wake(delay_secs: u64, activity_rx: Option<&mut watch::Receiver<u64>>) {
+    let sleep = tokio::time::sleep(std::time::Duration::from_secs(delay_secs));
+    tokio::pin!(sleep);
+    let Some(activity_rx) = activity_rx else {
+        sleep.await;
+        return;
+    };
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return,
+            changed = activity_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Cheap local mtime/length/type digest. A file appearing, disappearing, or
+/// changing metadata counts as a change without an inference request.
+fn local_change_digest(root: &std::path::Path, paths: &[String]) -> String {
+    let mut entries = paths
+        .iter()
+        .map(|path| match std::fs::metadata(root.join(path)) {
+            Ok(metadata) => {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                format!("{path}:{}:{}:{modified}", metadata.len(), metadata.is_dir())
+            }
+            Err(error) => format!("{path}:missing:{}", error.kind()),
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join("|")
+}
+
+/// A best-effort mutation probe for no-op classification. `git status` is
+/// local, bounded output (paths only), and never invokes the model. A
+/// non-repository or unavailable Git executable returns a stable empty digest;
+/// `note` and fork spawn requests remain explicit action signals there.
+fn git_status_digest(root: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// Run one iteration's turn loop in the fork. Returns the iteration's

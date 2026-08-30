@@ -23,6 +23,11 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         match event {
+            ScheduleEvent::EphemeralCompleted { job_id } => {
+                // No-op idle wakes intentionally have neither a transcript
+                // turn nor an inbox item; only their live registry row ends.
+                self.schedule.mark_completed(&job_id);
+            }
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
                 if self.persist_on_reentry_owns_started_unsettled_siblings() {
                     // Do not run the tick or call `iteration_finished`: keep-park
@@ -251,7 +256,7 @@ impl Driver {
                 if limit.is_none() {
                     self.ensure_unbounded_loop_allowed().await?;
                 }
-                let job_id = if parsed.keep_in_context {
+                let job_id = if parsed.keep_in_context && !parsed.idle {
                     self.schedule.start_loop_in_context(parsed)
                 } else {
                     self.schedule.start_loop_forked(parsed)

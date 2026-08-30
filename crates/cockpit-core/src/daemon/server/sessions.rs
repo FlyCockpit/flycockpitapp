@@ -417,7 +417,6 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
-    negotiated_protocol_version: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let session = match ctx.db.get_session(session_id).await {
         Ok(Some(session)) => session,
@@ -429,17 +428,7 @@ pub(super) async fn delete_session(
         }
         Err(e) => return Err(internal(e)),
     };
-    // v10-only: reject deleting an active session. The CLI's existing
-    // behavior bails with "session is active; end it before deleting";
-    // the daemon must match — it must NOT stop-and-delete the active
-    // session. The session row remains intact.
-    //
-    // v9 clients retain the frozen behavior: stop-and-delete proceeds
-    // regardless of the active state. The negotiated protocol version
-    // gates this so a v9 envelope carrying the unchanged DeleteSession
-    // tag does not get the new rejection behavior.
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
-    {
+    if session.ended_at_unix_ms.is_none() {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),

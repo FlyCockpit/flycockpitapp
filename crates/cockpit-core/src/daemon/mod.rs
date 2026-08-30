@@ -2064,21 +2064,17 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
 /// handshake.
 #[cfg(any(unix, test))]
 async fn ephemeral_last_client_reaper(
-    mut presence: tokio::sync::watch::Receiver<usize>,
+    mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
     mut on_reap: impl FnMut(),
 ) {
-    while *presence.borrow() == 0 {
-        if presence.changed().await.is_err() {
-            return;
-        }
-    }
     loop {
-        if presence.changed().await.is_err() {
-            return;
-        }
-        if *presence.borrow() == 0 {
+        let observed = *presence.borrow_and_update();
+        if observed.has_attached && observed.count == 0 {
             tracing::info!("ephemeral daemon lost its final client; beginning teardown");
             on_reap();
+            return;
+        }
+        if presence.changed().await.is_err() {
             return;
         }
     }
@@ -2770,23 +2766,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_reaps_immediately_after_the_last_client_detaches() {
-        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0usize);
+    async fn ephemeral_reaps_when_first_attach_and_disconnect_precede_reaper() {
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let reaped_c = reaped.clone();
         let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
             reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
-        presence_tx.send(1).unwrap();
-        tokio::task::yield_now().await;
-        assert!(
-            !reaped.load(std::sync::atomic::Ordering::SeqCst),
-            "an attached client must retain the ephemeral owner"
-        );
-        presence_tx.send(0).unwrap();
-        let _ = task.await;
+        presence_tx.send_modify(|presence| {
+            presence.count = 1;
+            presence.has_attached = true;
+        });
+        presence_tx.send_modify(|presence| presence.count = 0);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the durable first-attach marker must survive a coalesced disconnect")
+            .expect("reaper task joins");
         assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_socket_owner_waits_for_its_last_attached_client() {
+        let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let project = tempfile::tempdir().expect("project directory");
+        harness
+            .db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .await
+            .expect("trust project");
+
+        let paths = harness.ephemeral_paths("two-socket-clients");
+        let daemon_paths = paths.clone();
+        let daemon_db = harness.db.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_foreground_inner_with_boot_db(
+                daemon_paths,
+                Duration::from_millis(300),
+                false,
+                crate::daemon::terminal::test_host_factory(),
+                Some(daemon_db),
+            )
+            .await
+        });
+        wait_until(|| paths.socket.exists(), Duration::from_secs(2)).await;
+
+        let client_a = cockpit_client::DaemonClient::connect(&paths.socket)
+            .await
+            .expect("connect first socket client");
+        let first = client_a
+            .request_ok(proto::Request::Attach {
+                session_id: None,
+                since_seq: None,
+                project_root: Some(project.path().to_string_lossy().into_owned()),
+                initial_model: None,
+                no_sandbox: false,
+                interactive: true,
+                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            })
+            .await
+            .expect("first socket client attaches");
+        let proto::Response::Attached { session_id, .. } = first else {
+            panic!("first socket client must receive Attached");
+        };
+
+        let client_b = cockpit_client::DaemonClient::connect(&paths.socket)
+            .await
+            .expect("connect second socket client");
+        client_b
+            .request_ok(proto::Request::Attach {
+                session_id: Some(session_id),
+                since_seq: None,
+                project_root: None,
+                initial_model: None,
+                no_sandbox: false,
+                interactive: true,
+                session_entry_mode: None,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            })
+            .await
+            .expect("second socket client attaches");
+
+        drop(client_a);
+        client_b
+            .request_ok(proto::Request::DaemonStatus)
+            .await
+            .expect("second attached socket client retains the owner");
+        assert!(
+            paths.socket.exists(),
+            "owner remains published for client B"
+        );
+
+        drop(client_b);
+        tokio::time::timeout(Duration::from_secs(3), daemon_task)
+            .await
+            .expect("last socket client must drain and reap the ephemeral owner")
+            .expect("daemon task joins")
+            .expect("daemon drain cancels attached session work cleanly");
+        assert!(!paths.socket.exists(), "last client removes the socket");
+        assert!(
+            !paths.pid_file.exists(),
+            "last client removes the pid record"
+        );
     }
 
     /// A persisted session must not, by itself, keep an

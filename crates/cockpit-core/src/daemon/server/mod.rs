@@ -2350,11 +2350,12 @@ pub struct DaemonContext {
     /// on the first broadcast after construction.
     redaction_generation: std::sync::atomic::AtomicU64,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
-    /// Live count of connected clients. Each [`handle_client`] task
-    /// increments on accept and decrements on exit. Ephemeral owners watch
-    /// the receiver side for their final-client transition; persistent
-    /// owners ignore it.
-    client_count: tokio::sync::watch::Sender<usize>,
+    /// Live client state. Each successfully attached client increments the
+    /// count and permanently records that this owner has served a client.
+    /// Ephemeral owners need both facts: a watch receiver may coalesce a
+    /// fast `0 -> 1 -> 0`, but it must still reap after that first client
+    /// leaves.
+    client_presence: tokio::sync::watch::Sender<ClientPresence>,
     /// Daemon-wide graceful-shutdown gate
     /// (`daemon-graceful-drain-shutdown.md`). Shared with the registry
     /// (installed into worker models). New `SendUserMessage` requests are
@@ -2564,7 +2565,7 @@ impl DaemonContext {
         let redaction_key_resolver: Option<
             Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
         > = None;
-        let (client_count, _) = tokio::sync::watch::channel(0usize);
+        let (client_presence, _) = tokio::sync::watch::channel(ClientPresence::default());
         #[cfg(feature = "remote")]
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
@@ -2722,7 +2723,7 @@ impl DaemonContext {
             global_redaction,
             redaction_generation: std::sync::atomic::AtomicU64::new(0),
             terminal_host,
-            client_count,
+            client_presence,
             shutdown,
             restart_decision: StdMutex::new(()),
             shutdown_grace_override: StdMutex::new(None),
@@ -3499,19 +3500,31 @@ impl DaemonContext {
         });
     }
 
-    /// Subscribe to the live connected-client count. Used by ephemeral
-    /// lifetime ownership.
-    pub fn client_presence(&self) -> tokio::sync::watch::Receiver<usize> {
-        self.client_count.subscribe()
+    /// Subscribe to the live client state used by ephemeral lifetime
+    /// ownership.
+    pub(crate) fn client_presence(&self) -> tokio::sync::watch::Receiver<ClientPresence> {
+        self.client_presence.subscribe()
     }
 
     /// RAII guard: bumps the connected-client count on construction and
     /// decrements it on drop, so the count stays correct on every exit
     /// path of a client task (clean EOF, decode error, send failure).
     fn track_client(self: &Arc<Self>) -> ClientGuard {
-        self.client_count.send_modify(|n| *n += 1);
+        self.client_presence.send_modify(|presence| {
+            presence.count += 1;
+            presence.has_attached = true;
+        });
         ClientGuard { ctx: self.clone() }
     }
+}
+
+/// The observed client state of one daemon owner. `has_attached` is monotonic
+/// for the owner's lifetime, so the first complete attach cannot be erased by
+/// a later disconnect before the lifecycle reaper observes the watch channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClientPresence {
+    pub(crate) count: usize,
+    pub(crate) has_attached: bool,
 }
 
 /// Decrements the daemon's connected-client count when a client task
@@ -3523,8 +3536,8 @@ struct ClientGuard {
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.ctx
-            .client_count
-            .send_modify(|n| *n = n.saturating_sub(1));
+            .client_presence
+            .send_modify(|presence| presence.count = presence.count.saturating_sub(1));
     }
 }
 
@@ -4627,11 +4640,6 @@ struct MutableClientState {
     upload_limits: AttachmentUploadLimits,
     terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
-    /// Negotiated protocol version for this connection, updated from each
-    /// inbound envelope's `v`. v10-only semantic changes (e.g. active-session
-    /// rejection in DeleteSession) are gated on this so a v9 client retains
-    /// its frozen behavior.
-    negotiated_protocol_version: u32,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -4736,7 +4744,6 @@ impl MutableClientState {
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host,
-            negotiated_protocol_version: proto::PROTOCOL_VERSION,
         }
     }
 
@@ -4749,26 +4756,6 @@ impl MutableClientState {
             Uuid::new_v4(),
             next_terminal_connection_epoch(),
         )
-    }
-
-    /// Update the negotiated protocol version from an inbound envelope. The
-    /// envelope version is the min(client, daemon) negotiated value, so this
-    /// is the authoritative per-connection version for semantic gates.
-    fn update_negotiated_protocol_version(&mut self, v: u32) {
-        self.negotiated_protocol_version = v;
-    }
-
-    /// The negotiated protocol version for this connection. v10-only
-    /// semantic changes gate on this so v9 clients keep frozen behavior.
-    fn negotiated_protocol_version(&self) -> u32 {
-        self.negotiated_protocol_version
-    }
-
-    #[cfg(test)]
-    fn detached_for_test_with_protocol_version(version: u32) -> Self {
-        let mut state = Self::detached_for_test();
-        state.negotiated_protocol_version = version;
-        state
     }
 
     fn shared_snapshot(&self) -> Arc<SharedClientState> {
@@ -5753,17 +5740,32 @@ async fn handle_client_frame(
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<bool> {
     match frame {
-        RecvFrame::Envelope(env) => handle_envelope(
-            *env,
-            state,
-            shared,
-            ctx,
-            event_cmd_tx,
-            writer_tx,
-            concurrent,
-        )
-        .await
-        .map(|()| true),
+        RecvFrame::Envelope(env) => {
+            let is_attach = matches!(
+                &env.body,
+                Body::Request {
+                    request: Request::Attach { .. },
+                    ..
+                }
+            );
+            let was_attached = state.attached.is_some();
+            handle_envelope(
+                *env,
+                state,
+                shared,
+                ctx,
+                event_cmd_tx,
+                writer_tx,
+                concurrent,
+            )
+            .await
+            .map(|()| {
+                if is_attach && !was_attached && state.attached.is_some() {
+                    client_guard.get_or_insert_with(|| ctx.track_client());
+                }
+                true
+            })
+        }
         RecvFrame::VersionMismatch { v, kind, id } => {
             if kind == "req"
                 && let Some(id) = id
@@ -5818,10 +5820,6 @@ async fn handle_envelope(
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<()> {
-    // Track the negotiated protocol version for this connection so v10-only
-    // semantic changes can gate on it. The envelope version is the
-    // min(client, daemon) negotiated value.
-    state.update_negotiated_protocol_version(env.v);
     match env.body {
         Body::Request {
             id,
@@ -5902,9 +5900,6 @@ async fn handle_envelope(
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
-            }
-            if is_attach && attached {
-                client_guard.get_or_insert_with(|| ctx.track_client());
             }
             let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);

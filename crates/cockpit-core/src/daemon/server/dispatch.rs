@@ -10514,15 +10514,9 @@ async fn handle_serialized_request_impl(
                     &Request::DeleteSession { session_id },
                     operation,
                 )?;
-                return sessions_remote::delete_session(
-                    ctx,
-                    session_id,
-                    state.negotiated_protocol_version(),
-                    &ledger,
-                )
-                .await;
+                return sessions_remote::delete_session(ctx, session_id, &ledger).await;
             }
-            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
+            delete_session(ctx, session_id).await
         }
 
         Request::GetInventoryBundle {

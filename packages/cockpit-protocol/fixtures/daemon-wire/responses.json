@@ -3,7 +3,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 21
+    "v": 22
   },
   "app_flag": {
     "data": {
@@ -14,7 +14,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag",
-    "v": 21
+    "v": 22
   },
   "app_flag_seen": {
     "data": {
@@ -25,7 +25,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag_seen",
-    "v": 21
+    "v": 22
   },
   "assistant_session_resolved": {
     "data": {
@@ -36,6 +36,8 @@
         "created_by_principal": "flycockpit:user",
         "descendant_count": 0,
         "fork_count": 0,
+        "fork_point_turn_id": null,
+        "is_assistant_thread": false,
         "last_active_at_unix_ms": 1700000001000,
         "latest_activity_at": 1700000001,
         "open_interrupts": 0,
@@ -53,7 +55,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "assistant_session_resolved",
-    "v": 21
+    "v": 22
   },
   "attached": {
     "data": {
@@ -166,7 +168,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 21
+    "v": 22
   },
   "bulk_transfer_chunk": {
     "data": {
@@ -177,7 +179,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk",
-    "v": 21
+    "v": 22
   },
   "bulk_transfer_chunk_accepted": {
     "data": {
@@ -189,7 +191,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk_accepted",
-    "v": 21
+    "v": 22
   },
   "config_refreshed": {
     "data": {
@@ -199,7 +201,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "config_refreshed",
-    "v": 21
+    "v": 22
   },
   "export_session_data": {
     "data": {
@@ -221,7 +223,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "export_session_data",
-    "v": 21
+    "v": 22
   },
   "forked": {
     "data": {
@@ -233,7 +235,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 21
+    "v": 22
   },
   "fs_list": {
     "data": {
@@ -254,7 +256,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 21
+    "v": 22
   },
   "fs_read": {
     "data": {
@@ -266,7 +268,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 21
+    "v": 22
   },
   "fs_stat": {
     "data": {
@@ -284,7 +286,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 21
+    "v": 22
   },
   "fs_write": {
     "data": {
@@ -293,7 +295,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 21
+    "v": 22
   },
   "git_diff_file": {
     "data": {
@@ -303,7 +305,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 21
+    "v": 22
   },
   "git_status": {
     "data": {
@@ -316,7 +318,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 21
+    "v": 22
   },
   "history_page": {
     "data": {
@@ -335,7 +337,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 21
+    "v": 22
   },
   "inventory_bundle": {
     "data": {
@@ -384,7 +386,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "inventory_bundle",
-    "v": 21
+    "v": 22
   },
   "restart_decision": {
     "data": {
@@ -394,7 +396,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "restart_decision",
-    "v": 21
+    "v": 22
   },
   "run_invocation_cancel_result": {
     "data": {
@@ -409,7 +411,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_cancel_result",
-    "v": 21
+    "v": 22
   },
   "run_invocation_status": {
     "data": {
@@ -428,7 +430,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_status",
-    "v": 21
+    "v": 22
   },
   "session_messages": {
     "data": {
@@ -446,7 +448,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 21
+    "v": 22
   },
   "sessions": {
     "data": {
@@ -458,6 +460,8 @@
           "created_by_principal": "flycockpit:user",
           "descendant_count": 2,
           "fork_count": 1,
+          "fork_point_turn_id": "42",
+          "is_assistant_thread": true,
           "last_active_at_unix_ms": 1700000001000,
           "last_viewed_at": 1700000002,
           "latest_activity_at": 1700000003,
@@ -479,7 +483,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 21
+    "v": 22
   },
   "startup_disclosures": {
     "data": {
@@ -496,7 +500,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "startup_disclosures",
-    "v": 21
+    "v": 22
   },
   "stats_rollup": {
     "data": {
@@ -590,7 +594,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 21
+    "v": 22
   },
   "subagent_history_page": {
     "data": {
@@ -611,7 +615,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "subagent_history_page",
-    "v": 21
+    "v": 22
   },
   "user_message_queued": {
     "data": {
@@ -649,7 +653,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "user_message_queued",
-    "v": 21
+    "v": 22
   },
   "workspace_trust_set": {
     "data": {
@@ -658,7 +662,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_trust_set",
-    "v": 21
+    "v": 22
   },
   "workspace_history_scope": {
     "data": {
@@ -668,7 +672,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_history_scope",
-    "v": 21
+    "v": 22
   },
   "agent_tree_page": {
     "data": {
@@ -689,7 +693,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_tree_page",
-    "v": 21
+    "v": 22
   },
   "agent_attention_page": {
     "data": {
@@ -718,7 +722,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_attention_page",
-    "v": 21
+    "v": 22
   },
   "agent_decision_steered": {
     "data": {
@@ -730,7 +734,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_decision_steered",
-    "v": 21
+    "v": 22
   },
   "session_setup_snapshot": {
     "data": {
@@ -832,7 +836,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_setup_snapshot",
-    "v": 21
+    "v": 22
   },
   "guidance_proposals": {
     "data": {
@@ -849,7 +853,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposals",
-    "v": 21
+    "v": 22
   },
   "guidance_enablement_trace": {
     "data": {
@@ -864,7 +868,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_enablement_trace",
-    "v": 21
+    "v": 22
   },
   "storage_report": {
     "data": {
@@ -881,7 +885,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_report",
-    "v": 21
+    "v": 22
   },
   "storage_cleanup_preview": {
     "data": {
@@ -898,14 +902,14 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_cleanup_preview",
-    "v": 21
+    "v": 22
   },
   "storage_cleanup_completed": {
     "data": { "bytes_freed": 0 },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_cleanup_completed",
-    "v": 21
+    "v": 22
   },
   "guidance_proposal_reviewed": {
     "data": {
@@ -914,10 +918,10 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposal_reviewed",
-    "v": 21
+    "v": 22
   },
   "code_root_created": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_created",
@@ -1032,7 +1036,7 @@
     }
   },
   "code_root_attached": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_attached",
@@ -1147,14 +1151,14 @@
     }
   },
   "code_root_attachment_closed": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_attachment_closed",
     "data": "closed"
   },
   "code_roots_discovered": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_roots_discovered",
@@ -1163,7 +1167,7 @@
     }
   },
   "code_root_read": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_read",
@@ -1272,7 +1276,7 @@
     }
   },
   "code_root_deliveries": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_deliveries",
@@ -1282,7 +1286,7 @@
     }
   },
   "code_root_deliveries_acked": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_deliveries_acked",
@@ -1291,7 +1295,7 @@
     }
   },
   "code_root_interrupt_resolved": {
-    "v": 21,
+    "v": 22,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_interrupt_resolved",

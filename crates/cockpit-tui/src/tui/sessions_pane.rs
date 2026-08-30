@@ -2245,6 +2245,8 @@ mod tests {
             title: None,
             description: None,
             parent_session_id: None,
+            fork_point_turn_id: None,
+            is_assistant_thread: false,
             fork_count: 0,
             descendant_count: 0,
             last_viewed_at_unix_ms: None,

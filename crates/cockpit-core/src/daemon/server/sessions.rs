@@ -783,6 +783,8 @@ mod sessions_activity_tests {
             title: None,
             description: None,
             parent_session_id: None,
+            fork_point_turn_id: None,
+            is_assistant_thread: false,
             created_by_principal: None,
             shared_with_collaborators: false,
             fork_count: 0,

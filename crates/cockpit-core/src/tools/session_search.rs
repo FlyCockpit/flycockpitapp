@@ -195,17 +195,10 @@ impl Tool for HistorySearchTool {
                     let threads = ctx
                         .session
                         .db
-                        .list_sessions_for_assistant(&assistant_name, false, limit)
+                        .list_threads_for_assistant(&assistant_name, &ctx.session.project_id, limit)
                         .await
-                        .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?
-                        .into_iter()
-                        .filter(|thread| {
-                            thread.project_id == ctx.session.project_id
-                                && thread.parent_session_id.is_some()
-                                && thread.archived_at_unix_ms.is_none()
-                        })
-                        .collect::<Vec<_>>();
-                    render_thread_list(threads, ctx).await
+                        .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                    render_thread_list(threads, trust, ctx).await
                 }
             }
             HistorySearchScope::CurrentArtifacts => {
@@ -400,6 +393,7 @@ async fn render_session_hits(
 /// than applying relevance ranking when the user only asked to browse.
 async fn render_thread_list(
     threads: Vec<crate::db::sessions::SessionRow>,
+    caller_trust: HistoryCallerTrust,
     ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
     if threads.is_empty() {
@@ -431,9 +425,19 @@ async fn render_thread_list(
             thread.title.as_deref().unwrap_or("(untitled)"),
         )
         .await?;
-        let description = match thread.description.as_deref() {
-            Some(description) => redact_target_text(ctx, thread.session_id, description).await?,
-            None => String::new(),
+        let description = match (
+            caller_trust.can_read_trusted(),
+            thread.description_model_trust.as_deref(),
+            thread.description.as_deref(),
+        ) {
+            (_, _, None) => String::new(),
+            (true, _, Some(description)) => {
+                redact_target_text(ctx, thread.session_id, description).await?
+            }
+            (false, Some("untrusted"), Some(description)) => {
+                redact_target_text(ctx, thread.session_id, description).await?
+            }
+            (false, _, Some(_)) => String::new(),
         };
         out.push_str(&format!(
             "cockpit://session/{id}/transcript  {}  {}\n",

@@ -184,6 +184,9 @@ pub struct SessionRow {
     /// root sessions; also NULL for tail-forks until the daemon resolves
     /// the parent's last turn.
     pub fork_point_turn_id: Option<String>,
+    /// `true` only for a first-class persistent assistant thread. Ordinary
+    /// forks and `/btw` children retain their lineage but are not threads.
+    pub is_assistant_thread: bool,
     /// Auto-generated or user-set title (GOALS §17d).
     pub title: Option<String>,
     /// Generated old-session context and immutable identity of the model that
@@ -314,6 +317,7 @@ impl SessionRow {
             short_id: row.get("short_id")?,
             parent_session_id,
             fork_point_turn_id: row.get("fork_point_turn_id")?,
+            is_assistant_thread: row.get::<_, i64>("is_assistant_thread")? != 0,
             title: row.get("title")?,
             description: row.get("description")?,
             description_provider_id: row.get("description_provider_id")?,
@@ -516,8 +520,9 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
-          assistant_name, created_by_principal, shared_with_collaborators, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+          assistant_name, created_by_principal, shared_with_collaborators, is_dream_session,
+          is_assistant_thread)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -544,6 +549,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.created_by_principal,
             row.shared_with_collaborators as i64,
             row.is_dream_session as i64,
+            row.is_assistant_thread as i64,
         ],
     )?;
     Ok(())
@@ -578,7 +584,7 @@ fn execute_fork_insert(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms,
           last_active_at_unix_ms, active_agent, pending_remote_agent_selection, short_id,
-          parent_session_id, fork_point_turn_id,
+          parent_session_id, fork_point_turn_id, is_assistant_thread,
           provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           title_recovery_nudge_state,
@@ -587,7 +593,7 @@ fn execute_fork_insert(
           model_system_prompt_snapshot_json, knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, active_model_revision, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -599,6 +605,7 @@ fn execute_fork_insert(
             row.short_id,
             row.parent_session_id.map(|id| id.to_string()),
             fork_point_turn_id,
+            row.is_assistant_thread as i64,
             row.provider,
             row.model,
             row.session_entry_mode,
@@ -733,6 +740,7 @@ fn build_session_row(
         short_id,
         parent_session_id: None,
         fork_point_turn_id: None,
+        is_assistant_thread: false,
         title: None,
         description: None,
         description_provider_id: None,
@@ -1877,6 +1885,7 @@ impl Db {
             short_id: Some(short_id),
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: None,
+            is_assistant_thread: false,
             title: None,
             description: None,
             description_provider_id: None,
@@ -2028,6 +2037,14 @@ impl Db {
             !fresh_thread || fork_point_turn_id.is_some(),
             "a thread must be anchored to a parent message"
         );
+        ensure!(
+            !fresh_thread || parent.assistant_name.is_some(),
+            "a thread must belong to an assistant session"
+        );
+        ensure!(
+            !fresh_thread || !parent.is_dream_session,
+            "a thread cannot be created from a knowledge dream session"
+        );
         let short_id = generate_unique_short_id(conn, &parent.project_id)
             .context("generating fork short_id")?;
         let row = SessionRow {
@@ -2050,6 +2067,7 @@ impl Db {
             short_id: Some(short_id),
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: fork_point_turn_id.clone(),
+            is_assistant_thread: fresh_thread,
             title: None,
             description: None,
             description_provider_id: None,
@@ -3476,6 +3494,56 @@ impl Db {
         Ok(out)
     }
 
+    /// First-class assistant threads in one workspace. Every eligibility
+    /// predicate is in SQL before the bounded limit, so unrelated roots,
+    /// ordinary forks, archived rows, and disposable side conversations
+    /// cannot starve this recency-ordered surface.
+    pub async fn list_threads_for_assistant(
+        &self,
+        assistant_name: &str,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionRow>> {
+        let assistant_name = assistant_name.to_string();
+        let project_id = project_id.to_string();
+        self.read(move |conn| {
+            Self::list_threads_for_assistant_conn(conn, &assistant_name, &project_id, limit)
+        })
+        .await
+    }
+
+    pub fn list_threads_for_assistant_conn(
+        conn: &Connection,
+        assistant_name: &str,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM sessions
+                   WHERE assistant_name = ?1
+                     AND project_id = ?2
+                     AND is_assistant_thread = 1
+                     AND ephemeral = 0
+                     AND archived_at_unix_ms IS NULL
+                     AND is_dream_session = 0
+                   ORDER BY last_active_at_unix_ms DESC, session_id DESC
+                   LIMIT ?3",
+            )
+            .context("preparing list_threads_for_assistant")?;
+        let rows = stmt
+            .query_map(
+                params![assistant_name, project_id, limit],
+                SessionRow::from_row,
+            )
+            .context("querying assistant threads")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding assistant thread row")?);
+        }
+        Ok(out)
+    }
+
     pub async fn most_recent_session_for_assistant(
         &self,
         assistant_name: &str,
@@ -3630,6 +3698,8 @@ impl Db {
                 title: row.title,
                 description: row.description,
                 parent_session_id: row.parent_session_id,
+                fork_point_turn_id: row.fork_point_turn_id,
+                is_assistant_thread: row.is_assistant_thread,
                 fork_count,
                 descendant_count,
                 last_viewed_at_unix_ms: row.last_viewed_at_unix_ms,

@@ -1371,7 +1371,6 @@ pub enum Request {
         fork_point_turn_id: Option<String>,
         #[serde(default)]
         ephemeral: bool,
-        #[serde(default)]
         fresh_thread: bool,
     },
 

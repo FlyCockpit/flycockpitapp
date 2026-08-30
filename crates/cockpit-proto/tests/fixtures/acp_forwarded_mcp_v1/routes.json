@@ -10,7 +10,7 @@
           "options": {
             "no_sandbox": false,
             "interactive": false,
-            "client_protocol_version": 21,
+            "client_protocol_version": 22,
             "env_policy": "daemon"
           }
         },
@@ -33,7 +33,7 @@
           "options": {
             "no_sandbox": false,
             "interactive": false,
-            "client_protocol_version": 21,
+            "client_protocol_version": 22,
             "env_policy": "daemon"
           }
         },

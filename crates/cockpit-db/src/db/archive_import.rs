@@ -38,6 +38,8 @@ pub struct ImportedArchiveSession {
     pub parent_source_id: Option<Uuid>,
     pub short_id: Option<String>,
     pub fork_point_turn_id: Option<String>,
+    pub assistant_name: Option<String>,
+    pub is_assistant_thread: bool,
     pub active_model: Option<ImportedArchiveActiveModel>,
     pub session_entry_mode: String,
     pub active_agent: String,
@@ -327,6 +329,7 @@ fn import_session_archive_graph_conn(
             )?;
             row.session_id = id_map[&source_id];
             row.parent_session_id = session.parent_source_id.map(|parent| id_map[&parent]);
+            row.assistant_name = session.assistant_name.clone();
             if let Some(short_id) = session.short_id.filter(|id| is_crockford_short_id(id)) {
                 let exists: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sessions WHERE project_id = ?1 AND short_id = ?2",
@@ -340,9 +343,18 @@ fn import_session_archive_graph_conn(
             if let (Some(parent_source_id), Some(fork_point_turn_id)) =
                 (session.parent_source_id, session.fork_point_turn_id.clone())
             {
-                pending_forks.push((row.session_id, parent_source_id, fork_point_turn_id));
+                pending_forks.push((
+                    row.session_id,
+                    parent_source_id,
+                    fork_point_turn_id,
+                    session.is_assistant_thread,
+                ));
             }
             row.fork_point_turn_id = None;
+            // The parent/event FK is restored after its event-sequence map is
+            // known. Keep the type marker false until that same UPDATE makes
+            // the complete thread invariant true.
+            row.is_assistant_thread = false;
             row.session_entry_mode = session.session_entry_mode;
             if let Some(active_model) = session.active_model {
                 row.provider = Some(active_model.provider);
@@ -525,7 +537,7 @@ fn restore_events_and_artifacts(
     task_call_id_map: BTreeMap<String, String>,
     inference_call_id_map: BTreeMap<String, String>,
     imported: Vec<Uuid>,
-    pending_forks: Vec<(Uuid, Uuid, String)>,
+    pending_forks: Vec<(Uuid, Uuid, String, bool)>,
 ) -> Result<ArchiveImportResult> {
     let provenance_ts = graph
         .events
@@ -721,7 +733,7 @@ fn restore_events_and_artifacts(
         )?;
     }
 
-    for (dest_session_id, parent_source_id, source_seq) in pending_forks {
+    for (dest_session_id, parent_source_id, source_seq, is_assistant_thread) in pending_forks {
         let parsed: i64 = source_seq.parse().with_context(|| {
             format!("import fork_point_turn_id `{source_seq}` is not an integer")
         })?;
@@ -733,8 +745,14 @@ fn restore_events_and_artifacts(
                 )
             })?;
         conn.execute(
-            "UPDATE sessions SET fork_point_turn_id = ?1 WHERE session_id = ?2",
-            params![dest_seq.to_string(), dest_session_id.to_string()],
+            "UPDATE sessions
+                SET fork_point_turn_id = ?1, is_assistant_thread = ?2
+              WHERE session_id = ?3",
+            params![
+                dest_seq.to_string(),
+                is_assistant_thread as i64,
+                dest_session_id.to_string(),
+            ],
         )?;
     }
 

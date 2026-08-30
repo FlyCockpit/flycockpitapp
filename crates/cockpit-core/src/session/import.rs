@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,7 +43,116 @@ const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 pub async fn import_archive(db: &Db, archive: ImportArchive) -> Result<ImportResult> {
+    let mut archive = archive;
+    stage_blob_backed_import_artifacts(db, &mut archive).await?;
     db.import_session_archive_graph(archive).await
+}
+
+/// Archive members contain the complete portable body, while the source
+/// daemon's pathname is intentionally discarded during parsing.  Recreate a
+/// daemon-owned blob before the one database import transaction starts; its
+/// cleanup intent remains durable until that transaction claims it alongside
+/// the destination artifact row.
+async fn stage_blob_backed_import_artifacts(db: &Db, archive: &mut ImportArchive) -> Result<()> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("reading import blob staging clock")?
+        .as_millis()
+        .try_into()
+        .context("import blob staging clock exceeds i64")?;
+    for artifact_index in 0..archive.text_artifacts.len() {
+        let artifact = &archive.text_artifacts[artifact_index];
+        let source_session_id = artifact.source_session_id;
+        let source_event_seq = artifact.source_event_seq;
+        let projection_slot = artifact.projection_slot;
+        let kind = artifact.kind;
+        let content = artifact.content.clone();
+        let mut provenance: Value = serde_json::from_str(&artifact.provenance_json)
+            .context("parsing imported text artifact provenance for blob staging")?;
+        // `preview_lines` is the durable ingress-pseudofile contract.  It is
+        // carried by tool results, user sources, and rewritten user
+        // projections, including the latter which deliberately has no
+        // `source` tag of its own.
+        let needs_blob = provenance
+            .as_object()
+            .is_some_and(|object| object.contains_key("preview_lines"));
+        if !needs_blob {
+            archive.text_artifacts[artifact_index].staged_blob_session_id = None;
+            continue;
+        }
+        let path = crate::text_artifact_blob::new_path(source_session_id);
+        db.stage_text_artifact_blob_cleanup_intent(path.clone(), source_session_id, now_ms)
+            .await
+            .context("staging imported text artifact blob cleanup")?;
+        crate::text_artifact_blob::write_at(&path, &content)
+            .context("writing imported text artifact blob")?;
+        let original_provenance = provenance.clone();
+        provenance
+            .as_object_mut()
+            .expect("object checked above")
+            .insert("blob_path".to_owned(), Value::String(path.clone()));
+        if kind == TextArtifactKind::ToolResult {
+            update_imported_tool_projection_blob_path(
+                archive,
+                source_session_id,
+                source_event_seq,
+                projection_slot,
+                &original_provenance,
+                &path,
+            )?;
+        }
+        archive.text_artifacts[artifact_index].provenance_json =
+            serde_json::to_string(&provenance)?;
+        archive.text_artifacts[artifact_index].staged_blob_session_id = Some(source_session_id);
+    }
+    Ok(())
+}
+
+/// Tool events duplicate their immutable artifact provenance in the durable
+/// projection state.  When import substitutes the portable archive body with
+/// a destination daemon blob, update that paired state in lockstep; leaving
+/// the source-machine path out of either side would make rehydration fail
+/// closed on the mismatch.
+fn update_imported_tool_projection_blob_path(
+    archive: &mut ImportArchive,
+    source_session_id: Uuid,
+    source_event_seq: i64,
+    projection_slot: Option<i64>,
+    original_provenance: &Value,
+    blob_path: &str,
+) -> Result<()> {
+    let event = archive
+        .events
+        .iter_mut()
+        .find(|event| event.source_session_id == source_session_id && event.seq == source_event_seq)
+        .ok_or_else(|| anyhow!("imported tool artifact lacks its owner event"))?;
+    let mut data: Value =
+        serde_json::from_str(&event.data_json).context("parsing imported tool owner event")?;
+    let projection = match event.kind {
+        SessionEventKind::ToolCall => data
+            .get_mut("artifact_projection")
+            .ok_or_else(|| anyhow!("imported tool artifact owner lacks its projection"))?,
+        SessionEventKind::ContextPruned => data
+            .get_mut("artifact_projections")
+            .and_then(Value::as_array_mut)
+            .and_then(|projections| {
+                projections.iter_mut().find(|projection| {
+                    projection.get("projection_slot").and_then(Value::as_i64) == projection_slot
+                })
+            })
+            .ok_or_else(|| anyhow!("imported pruned tool artifact lacks its projection"))?,
+        _ => bail!("imported tool artifact has a non-tool owner event"),
+    };
+    let provenance = projection
+        .get_mut("provenance")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("imported tool projection lacks object provenance"))?;
+    if Value::Object(provenance.clone()) != *original_provenance {
+        bail!("imported tool projection provenance differs from its artifact");
+    }
+    provenance.insert("blob_path".to_owned(), Value::String(blob_path.to_owned()));
+    event.data_json = serde_json::to_string(&data)?;
+    Ok(())
 }
 
 pub fn read_archive(path: &Path) -> Result<ImportArchive> {
@@ -414,6 +524,7 @@ fn parse_text_artifacts(
             representation,
             created_at: required_i64(object, "created_at", "text artifact index")?,
             content,
+            staged_blob_session_id: None,
             model_envelope_json: match object.get("model_envelope") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(value)) if value.len() <= 131_072 => Some(value.clone()),

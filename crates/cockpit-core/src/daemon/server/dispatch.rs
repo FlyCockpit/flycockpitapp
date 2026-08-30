@@ -65,26 +65,6 @@ macro_rules! finish_nonrepeatable_response {
 
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static SECRET_OWNER_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn local_knowledge_dream_head(
-    knowledge_base: &crate::config::extended::KnowledgeBaseRegistryEntry,
-    workspace_root: &std::path::Path,
-) -> Option<String> {
-    let crate::config::extended::KnowledgeBaseSource::Local { path } = &knowledge_base.source
-    else {
-        return None;
-    };
-    let root = if path.is_absolute() {
-        path.clone()
-    } else {
-        workspace_root.join(path)
-    };
-    crate::git::run_git(&root, &["rev-parse", "--verify", "HEAD"])
-        .ok()
-        .filter(|outcome| outcome.success)
-        .map(|outcome| outcome.stdout.trim().to_owned())
-        .filter(|commit| !commit.is_empty())
-}
 /// Credential clear must never wait indefinitely on a best-effort remote
 /// instance revoke. Local vault ownership is cleared independently below.
 #[cfg(feature = "remote")]
@@ -5854,11 +5834,6 @@ async fn handle_serialized_request_impl(
                     })?],
                 None => extended.knowledge_bases.clone(),
             };
-            let consumer = ctx
-                .db
-                .ensure_installation_identity()
-                .await
-                .map_err(internal)?;
             let mut results = Vec::with_capacity(knowledge_bases.len());
             for knowledge_base in knowledge_bases {
                 if !matches!(
@@ -5883,20 +5858,6 @@ async fn handle_serialized_request_impl(
                 .map_err(daemon_config_error)?;
                 let caller_trust =
                     crate::knowledge::dream::history_caller_trust(&model, &providers);
-                let session_ids = ctx
-                    .db
-                    .undreamed_sessions_for_knowledge_base(
-                        &knowledge_base.id,
-                        project_root.as_str(),
-                        consumer.as_hex(),
-                        caller_trust,
-                    )
-                    .await
-                    .map_err(internal)?
-                    .into_iter()
-                    .map(|source| source.session_id)
-                    .collect();
-                let commit_before = local_knowledge_dream_head(&knowledge_base, cwd);
                 let model = crate::config::providers::ActiveModelRef {
                     provider: model.provider,
                     model: model.model,
@@ -5904,7 +5865,7 @@ async fn handle_serialized_request_impl(
                     thinking_mode: None,
                     prompt_cache_retention: None,
                 };
-                let disposition = crate::daemon::dream_scheduler::run_knowledge_dream(
+                let run = crate::daemon::dream_scheduler::run_knowledge_dream(
                     &ctx.db,
                     &ctx.registry,
                     cwd,
@@ -5916,38 +5877,19 @@ async fn handle_serialized_request_impl(
                 )
                 .await
                 .map_err(internal)?;
-                let (outcome, commit) = match disposition {
+                let outcome = match run.disposition {
                     crate::daemon::dream_scheduler::DreamRunDisposition::Empty => {
-                        ctx.db
-                            .record_knowledge_dream_manual_empty_check(
-                                &knowledge_base.id,
-                                project_root.as_str(),
-                                consumer.as_hex(),
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                            .await
-                            .map_err(internal)?;
-                        (
-                            crate::daemon::proto::KnowledgeDreamRunOutcome::NothingToDream,
-                            None,
-                        )
+                        crate::daemon::proto::KnowledgeDreamRunOutcome::NothingToDream
                     }
                     crate::daemon::dream_scheduler::DreamRunDisposition::Completed => {
-                        let commit_after = local_knowledge_dream_head(&knowledge_base, cwd);
-                        let commit = (commit_after != commit_before)
-                            .then_some(commit_after)
-                            .flatten();
-                        (
-                            crate::daemon::proto::KnowledgeDreamRunOutcome::Dreamed,
-                            commit,
-                        )
+                        crate::daemon::proto::KnowledgeDreamRunOutcome::Dreamed
                     }
                 };
                 results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
                     knowledge_base_id: knowledge_base.id,
                     outcome,
-                    session_ids,
-                    commit,
+                    session_ids: run.session_ids,
+                    commit: run.commit,
                 });
             }
             Ok(Response::KnowledgeDreamRuns { results })

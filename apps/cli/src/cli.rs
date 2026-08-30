@@ -1732,6 +1732,30 @@ mod tests {
     }
 
     #[test]
+    fn dream_requires_one_knowledge_base_or_all_and_preserves_the_selection() {
+        let single = Cli::try_parse_from(["cockpit", "dream", "research"]).unwrap();
+        match single.command {
+            Some(Command::Dream(args)) => {
+                assert_eq!(args.knowledge_base_id.as_deref(), Some("research"));
+                assert!(!args.all);
+            }
+            other => panic!("expected dream command, got {other:?}"),
+        }
+
+        let all = Cli::try_parse_from(["cockpit", "dream", "--all"]).unwrap();
+        match all.command {
+            Some(Command::Dream(args)) => {
+                assert!(args.knowledge_base_id.is_none());
+                assert!(args.all);
+            }
+            other => panic!("expected dream command, got {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["cockpit", "dream"]).is_err());
+        assert!(Cli::try_parse_from(["cockpit", "dream", "research", "--all"]).is_err());
+    }
+
+    #[test]
     fn modes_session_setup_mode_entries_and_legacy_assistant_management_parse_distinctly() {
         assert!(matches!(
             Cli::try_parse_from(["cockpit", "code"]).unwrap().command,

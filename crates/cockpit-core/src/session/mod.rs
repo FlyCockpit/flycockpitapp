@@ -476,18 +476,50 @@ impl Session {
         self.dream_read_scope.clone()
     }
 
-    /// Starts a root turn with no inherited dream attachment consent or
-    /// execution fence. The returned guard owns cleanup for every exit path,
+    /// Starts a root turn with no inherited dream attachment consent. A
+    /// daemon-installed run fence is promoted for this one internal Dream
+    /// turn. The returned guard owns cleanup for every exit path,
     /// including a source lookup that returns empty, errors while redacting,
     /// times out, or never reaches `knowledge_dream_apply`.
     pub(crate) fn begin_dream_read_scope_turn(&self) -> DreamReadScopeTurn {
         let scope = self.dream_read_scope();
         *scope.write().expect("dream read scope lock poisoned") = None;
         let run_fence = self.dream_run_fence.clone();
-        *run_fence
+        let mut current = run_fence
             .lock()
-            .expect("knowledge dream run fence state poisoned") = DreamRunFenceState::Vacant;
+            .expect("knowledge dream run fence state poisoned");
+        *current = match std::mem::replace(&mut *current, DreamRunFenceState::Vacant) {
+            DreamRunFenceState::Pending(fence) => DreamRunFenceState::Held(fence),
+            _ => DreamRunFenceState::Vacant,
+        };
         DreamReadScopeTurn(scope, run_fence)
+    }
+
+    /// Install the daemon-owned fence before its internal Dream turn enters
+    /// the driver. A later normal root turn cannot inherit this pending state.
+    pub(crate) fn install_dream_run_fence(&self, fence: DreamRunFence) -> Result<()> {
+        let mut current = self
+            .dream_run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if !matches!(&*current, DreamRunFenceState::Vacant) {
+            anyhow::bail!("knowledge dream execution fence was already installed for this session");
+        }
+        *current = DreamRunFenceState::Pending(fence);
+        Ok(())
+    }
+
+    /// Undo a not-yet-started daemon Dream turn. Once the driver promotes the
+    /// fence to `Held`, its root-turn guard or detached apply owner is solely
+    /// responsible for release.
+    pub(crate) fn clear_pending_dream_run_fence(&self) {
+        let mut current = self
+            .dream_run_fence
+            .lock()
+            .expect("knowledge dream run fence state poisoned");
+        if matches!(&*current, DreamRunFenceState::Pending(_)) {
+            *current = DreamRunFenceState::Vacant;
+        }
     }
 
     /// Acquire the one per-root/per-KB boundary before selecting dream
@@ -508,6 +540,11 @@ impl Session {
             match &*current {
                 DreamRunFenceState::Vacant => {
                     *current = DreamRunFenceState::Acquiring(key.clone());
+                }
+                DreamRunFenceState::Pending(_) => {
+                    anyhow::bail!(
+                        "knowledge dream source selection started before the daemon-owned execution fence entered its root turn"
+                    );
                 }
                 DreamRunFenceState::Acquiring(existing) => {
                     anyhow::bail!(
@@ -541,7 +578,7 @@ impl Session {
                 "knowledge dream execution fence lifecycle ended before source selection"
             );
         }
-        *current = DreamRunFenceState::Held(DreamRunFence { key, _guard: guard });
+        *current = DreamRunFenceState::Held(DreamRunFence::new(key, guard));
         acquisition.commit();
         Ok(())
     }
@@ -560,6 +597,12 @@ impl Session {
             .lock()
             .expect("knowledge dream run fence state poisoned");
         match std::mem::replace(&mut *current, DreamRunFenceState::Vacant) {
+            DreamRunFenceState::Pending(fence) => {
+                *current = DreamRunFenceState::Pending(fence);
+                anyhow::bail!(
+                    "knowledge dream apply started before its root turn accepted the execution fence"
+                );
+            }
             DreamRunFenceState::Held(fence) if fence.key == key => Ok(fence),
             DreamRunFenceState::Held(fence) => {
                 let selected_knowledge_base_id = fence.key.knowledge_base_id.clone();
@@ -621,13 +664,38 @@ impl DreamRunFenceKey {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DreamRunFence {
     key: DreamRunFenceKey,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl DreamRunFence {
+    pub(crate) async fn acquire(
+        project_root: &crate::knowledge::dream::CanonicalDreamProjectRoot,
+        knowledge_base_id: &str,
+    ) -> Self {
+        let key = DreamRunFenceKey::new(project_root, knowledge_base_id);
+        let guard = crate::knowledge::dream::knowledge_dream_run_lock_for_root(
+            project_root,
+            knowledge_base_id,
+        )
+        .lock_owned()
+        .await;
+        Self::new(key, guard)
+    }
+
+    fn new(key: DreamRunFenceKey, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self {
+            key,
+            _guard: Arc::new(guard),
+        }
+    }
 }
 
 enum DreamRunFenceState {
     Vacant,
+    Pending(DreamRunFence),
     Acquiring(DreamRunFenceKey),
     Held(DreamRunFence),
 }

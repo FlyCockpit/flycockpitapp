@@ -40,6 +40,34 @@ fn compiled_product_domain_gate_rejects_extended_surface_centrally() {
         .expect("base-profile RPC must remain available");
 }
 
+#[tokio::test]
+async fn run_knowledge_dream_all_returns_an_empty_daemon_receipt_list_when_none_are_configured() {
+    let ctx = test_ctx();
+    let workspace = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            workspace.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    let response = handle_request(
+        Request::RunKnowledgeDream {
+            project_root: workspace.path().to_string_lossy().into_owned(),
+            knowledge_base_id: None,
+            no_sandbox: false,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(response, Response::KnowledgeDreamRuns { results } if results.is_empty()));
+}
+
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
     let value = serde_json::to_value(config).unwrap();
     let operations = value

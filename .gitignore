@@ -48,6 +48,11 @@ lerna-debug.log*
 # Database backups
 backups/
 
+# Generated local knowledge-base projections. OKF markdown and referenced
+# structured data are the committed source of truth.
+embeddings.sqlite
+index.sqlite
+
 # Turbo
 .turbo
 .nx

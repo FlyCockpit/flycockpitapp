@@ -11,6 +11,7 @@ use std::ffi::c_char;
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -39,6 +40,23 @@ use crate::session::Session;
 pub(crate) const EMBEDDINGS_FILE: &str = "embeddings.sqlite";
 /// Disposable local projection of a KB's OKF markdown and sibling resources.
 pub(crate) const INDEX_FILE: &str = "index.sqlite";
+/// Per-machine artifacts which must never enter a KB's Git history. Keeping
+/// the complete list here makes a newly initialized KB safe before any dream
+/// state service starts.
+const KB_MACHINE_STATE_GITIGNORE: &[&str] = &[
+    EMBEDDINGS_FILE,
+    INDEX_FILE,
+    "dreamed-ledger",
+    "dreamed-ledger.sqlite",
+    "dreamed-ledger/",
+    "watermarks",
+    "watermarks.sqlite",
+    "watermarks/",
+    "schedule-state",
+    "schedule-state.sqlite",
+    "schedule-state/",
+    "sealed-material/",
+];
 pub(crate) const INDEX_LOGIC_VERSION: i64 = 2;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
@@ -461,42 +479,27 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     if sidecar_paths.is_empty() {
         return Ok(());
     }
-    let prefix = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--show-prefix"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8(output.stdout).context("reading knowledge repository Git prefix")?
-        }
+    let prefix = match crate::git::run_git(root, &["rev-parse", "--show-prefix"]) {
+        Ok(output) if output.success => output.stdout,
         Ok(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
         Ok(output) => bail!(
             "checking Git ignore rules for local knowledge base {} failed: {}",
             root.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.stderr.trim()
         ),
         Err(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
         Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
     };
-    let exclude = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--git-path", "info/exclude"])
-        .output()
+    let exclude = crate::git::run_git(root, &["rev-parse", "--git-path", "info/exclude"])
         .context("locating local knowledge repository exclusion file")?;
-    if !exclude.status.success() {
+    if !exclude.success {
         bail!(
             "locating Git exclusion file for local knowledge base {} failed: {}",
             root.display(),
-            String::from_utf8_lossy(&exclude.stderr).trim()
+            exclude.stderr.trim()
         );
     }
-    let exclude_path = PathBuf::from(
-        String::from_utf8(exclude.stdout)
-            .context("reading local knowledge repository exclusion path")?
-            .trim(),
-    );
+    let exclude_path = PathBuf::from(exclude.stdout.trim());
     let exclude_path = if exclude_path.is_absolute() {
         exclude_path
     } else {
@@ -515,33 +518,45 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
         rules.push_str(&rel_string(path));
         rules.push('\n');
     }
+    for path in KB_MACHINE_STATE_GITIGNORE {
+        // The index and embeddings paths above can be relocated for assistant
+        // snapshots, while these are always per-KB-root state names.  Keep
+        // both forms: duplicate ignore patterns are harmless and make the
+        // generated exclusion file self-contained for ordinary local KBs.
+        rules.push('/');
+        rules.push_str(&root_prefix);
+        rules.push_str(path);
+        rules.push('\n');
+    }
 
     // Ignore rules do not apply retroactively to an index entry. Refuse before
     // SQLite can mutate a committed derived artifact; removing it from Git is
     // an explicit repository-owner action, never an implicit side effect.
-    for path in &sidecar_paths {
-        let repository_path = format!("{root_prefix}{}", rel_string(path));
-        let repository_pathspec = format!(":/{repository_path}");
-        let tracked = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["ls-files", "--error-unmatch", "--", &repository_pathspec])
-            .output()
+    let mut protected_paths: Vec<String> =
+        sidecar_paths.iter().map(|path| rel_string(path)).collect();
+    protected_paths.extend(
+        KB_MACHINE_STATE_GITIGNORE
+            .iter()
+            .map(|path| path.trim_end_matches('/').to_string()),
+    );
+    protected_paths.sort();
+    protected_paths.dedup();
+    for path in protected_paths {
+        let repository_path = format!("{root_prefix}{path}");
+        let repository_pathspec = format!(":(top){repository_path}");
+        let tracked = crate::git::run_git(root, &["ls-files", "--", &repository_pathspec])
             .context("checking whether knowledge sidecar is tracked by Git")?;
-        if tracked.status.success() {
-            bail!(
-                "knowledge sidecar {} is tracked by Git; remove it from the repository before using this knowledge base",
-                repository_path
-            );
-        }
-        // `--error-unmatch` uses exit status 1 for the one expected negative
-        // result: this pathname is not tracked. Any other status means Git
-        // could not authoritatively answer the mutation-safety question.
-        if tracked.status.code() != Some(1) {
+        if !tracked.success {
             bail!(
                 "checking whether knowledge sidecar {} is tracked by Git failed: {}",
                 repository_path,
-                String::from_utf8_lossy(&tracked.stderr).trim()
+                tracked.stderr.trim()
+            );
+        }
+        if !tracked.stdout.trim().is_empty() {
+            bail!(
+                "knowledge sidecar {} is tracked by Git; remove it from the repository before using this knowledge base",
+                repository_path
             );
         }
     }
@@ -568,6 +583,528 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Metadata for one durable dream projection.  The dream executor supplies
+/// this after it has written OKF files; this layer deliberately does not know
+/// how a model produced those files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeDreamCommit {
+    pub knowledge_base_id: String,
+    pub model: String,
+    pub sessions_dreamed: usize,
+    pub concepts_written: usize,
+    pub data_files_written: usize,
+}
+
+/// Git is an optional durability enhancement for a local KB.  A deferred
+/// result never rolls back already-written OKF files: dream is re-runnable
+/// from its durable ledger and the local repository retains any local commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnowledgeDreamGitOutcome {
+    Skipped {
+        reason: String,
+    },
+    NoChanges {
+        branch: String,
+    },
+    Committed {
+        commit: String,
+        branch: String,
+        pushed: bool,
+    },
+    Deferred {
+        branch: Option<String>,
+        commit: Option<String>,
+        reason: String,
+    },
+}
+
+enum PreparedKnowledgeGit {
+    Active {
+        branch: String,
+        remote: Option<String>,
+    },
+    Skipped(String),
+    Deferred(String),
+}
+
+/// Serialize write runs in this daemon.  Git's own index lock protects each
+/// individual subprocess, but it cannot cover the fetch -> apply -> commit
+/// sequence.  The per-KB advisory lock does, while leaving different KBs
+/// independent.
+fn knowledge_write_lock(root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let identity = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut locks = locks
+        .lock()
+        .expect("knowledge write lock registry poisoned");
+    if let Some(lock) = locks.get(&identity).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(identity, Arc::downgrade(&lock));
+    lock
+}
+
+/// Apply a dream's OKF mutation inside the KB's Git transaction boundary.
+///
+/// Git is intentionally best-effort.  If it is absent or a remote cannot be
+/// synchronized safely, `apply` still runs and the caller receives a status
+/// explaining why history was skipped or deferred.  We never force-push.
+pub fn apply_knowledge_dream<F>(
+    root: &Path,
+    merge_policy: KnowledgeBaseMergePolicy,
+    dream: &KnowledgeDreamCommit,
+    apply: F,
+) -> Result<KnowledgeDreamGitOutcome>
+where
+    F: FnOnce() -> Result<()>,
+{
+    fs::create_dir_all(root)
+        .with_context(|| format!("creating local knowledge base {}", root.display()))?;
+    let lock = knowledge_write_lock(root);
+    let _guard = lock.lock().expect("knowledge write lock poisoned");
+    let prepared = prepare_knowledge_git(root, merge_policy, &dream.knowledge_base_id);
+
+    // The model write is the authority.  Git setup/synchronization failures
+    // must not turn an otherwise usable local KB into a read-only feature.
+    apply()?;
+
+    match prepared {
+        PreparedKnowledgeGit::Skipped(reason) => Ok(KnowledgeDreamGitOutcome::Skipped { reason }),
+        PreparedKnowledgeGit::Deferred(reason) => Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: None,
+            commit: None,
+            reason,
+        }),
+        PreparedKnowledgeGit::Active { branch, remote } => {
+            match commit_knowledge_dream(root, &branch, remote.as_deref(), dream) {
+                Ok(outcome) => Ok(outcome),
+                Err(error) => Ok(KnowledgeDreamGitOutcome::Deferred {
+                    branch: Some(branch),
+                    commit: None,
+                    reason: format!("recording dream history failed: {error}"),
+                }),
+            }
+        }
+    }
+}
+
+fn prepare_knowledge_git(
+    root: &Path,
+    merge_policy: KnowledgeBaseMergePolicy,
+    knowledge_base_id: &str,
+) -> PreparedKnowledgeGit {
+    let probe = match crate::git::run_git(root, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(probe) => probe,
+        Err(error) => return PreparedKnowledgeGit::Skipped(format!("Git is unavailable: {error}")),
+    };
+    if !probe.success {
+        let initialized = match crate::git::run_git(root, &["init", "-q"]) {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                return PreparedKnowledgeGit::Skipped(format!("Git is unavailable: {error}"));
+            }
+        };
+        if !initialized.success {
+            return PreparedKnowledgeGit::Deferred(format!(
+                "initializing the knowledge Git repository failed: {}",
+                initialized.stderr.trim()
+            ));
+        }
+        let main = match crate::git::run_git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]) {
+            Ok(main) => main,
+            Err(error) => {
+                return PreparedKnowledgeGit::Deferred(format!(
+                    "setting the knowledge repository default branch failed: {error}"
+                ));
+            }
+        };
+        if !main.success {
+            return PreparedKnowledgeGit::Deferred(format!(
+                "setting the knowledge repository default branch failed: {}",
+                main.stderr.trim()
+            ));
+        }
+    }
+
+    let sidecars = match KbSidecars::in_root(root).canonicalized() {
+        Ok(sidecars) => sidecars,
+        Err(error) => {
+            return PreparedKnowledgeGit::Deferred(format!(
+                "resolving knowledge machine-state paths failed: {error}"
+            ));
+        }
+    };
+    if let Err(error) = ensure_sidecars_gitignored(root, &sidecars) {
+        return PreparedKnowledgeGit::Deferred(format!(
+            "protecting knowledge machine state from Git failed: {error}"
+        ));
+    }
+
+    let branch = match knowledge_git_branch(root) {
+        Ok(branch) => branch,
+        Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+    };
+    let remote = match knowledge_git_remote(root) {
+        Ok(remote) => remote,
+        Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+    };
+    let has_head = match knowledge_git_has_head(root) {
+        Ok(has_head) => has_head,
+        Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+    };
+
+    if remote.is_some() {
+        // Rebase and checkout are only safe before the model writes, and only
+        // when no existing user changes could be displaced.
+        if has_head {
+            let clean = match knowledge_git_worktree_clean(root) {
+                Ok(clean) => clean,
+                Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+            };
+            if !clean {
+                return PreparedKnowledgeGit::Deferred(
+                    "knowledge repository has local changes; deferring remote dream sync"
+                        .to_string(),
+                );
+            }
+        }
+        let remote_name = remote.as_deref().expect("checked above");
+        if let Err(error) = knowledge_git_fetch(root, remote_name) {
+            return PreparedKnowledgeGit::Deferred(error.to_string());
+        }
+    }
+
+    let branch = match merge_policy {
+        KnowledgeBaseMergePolicy::Auto => {
+            if let Some(remote_name) = remote.as_deref()
+                && let Err(error) =
+                    knowledge_git_rebase_remote_branch(root, remote_name, &branch, has_head)
+            {
+                return PreparedKnowledgeGit::Deferred(error.to_string());
+            }
+            branch
+        }
+        KnowledgeBaseMergePolicy::Review => {
+            let review_branch = format!(
+                "cockpit/dream/{}/{}",
+                git_branch_component(knowledge_base_id),
+                uuid::Uuid::new_v4().simple()
+            );
+            let base = remote
+                .as_deref()
+                .and_then(|remote_name| knowledge_git_remote_ref(root, remote_name, &branch).ok())
+                .flatten();
+            let checkout = if let Some(base) = base.as_deref() {
+                knowledge_git(root, &["checkout", "-q", "-b", &review_branch, base])
+            } else {
+                knowledge_git(root, &["checkout", "-q", "-b", &review_branch])
+            };
+            match checkout {
+                Ok(checkout) if checkout.success => review_branch,
+                Ok(checkout) => {
+                    return PreparedKnowledgeGit::Deferred(format!(
+                        "creating knowledge review branch failed: {}",
+                        checkout.stderr.trim()
+                    ));
+                }
+                Err(error) => return PreparedKnowledgeGit::Deferred(error.to_string()),
+            }
+        }
+    };
+
+    PreparedKnowledgeGit::Active { branch, remote }
+}
+
+fn commit_knowledge_dream(
+    root: &Path,
+    branch: &str,
+    remote: Option<&str>,
+    dream: &KnowledgeDreamCommit,
+) -> Result<KnowledgeDreamGitOutcome> {
+    let paths = match versioned_knowledge_paths(root) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return Ok(KnowledgeDreamGitOutcome::Deferred {
+                branch: Some(branch.to_string()),
+                commit: None,
+                reason: format!("validating dream output for Git failed: {error}"),
+            });
+        }
+    };
+    if paths.is_empty() {
+        return Ok(KnowledgeDreamGitOutcome::NoChanges {
+            branch: branch.to_string(),
+        });
+    }
+
+    let mut add_args = vec!["add".to_string(), "--".to_string()];
+    add_args.extend(paths.iter().map(|path| rel_string(path)));
+    let add_refs: Vec<_> = add_args.iter().map(String::as_str).collect();
+    let add = knowledge_git(root, &add_refs)?;
+    if !add.success {
+        return Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: None,
+            reason: format!("staging dream output failed: {}", add.stderr.trim()),
+        });
+    }
+
+    let mut cached_args = vec![
+        "diff".to_string(),
+        "--cached".to_string(),
+        "--name-only".to_string(),
+        "--".to_string(),
+    ];
+    cached_args.extend(paths.iter().map(|path| rel_string(path)));
+    let cached_refs: Vec<_> = cached_args.iter().map(String::as_str).collect();
+    let changed = knowledge_git(root, &cached_refs)?;
+    if !changed.success {
+        return Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: None,
+            reason: format!(
+                "checking staged dream output failed: {}",
+                changed.stderr.trim()
+            ),
+        });
+    }
+    if changed.stdout.trim().is_empty() {
+        return Ok(KnowledgeDreamGitOutcome::NoChanges {
+            branch: branch.to_string(),
+        });
+    }
+
+    let message = structured_dream_commit_message(dream);
+    let mut commit_args = vec![
+        "commit".to_string(),
+        "--only".to_string(),
+        "-m".to_string(),
+        message,
+    ];
+    commit_args.push("--".to_string());
+    commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
+    let committed = knowledge_git(root, &commit_refs)?;
+    if !committed.success {
+        return Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: None,
+            reason: format!(
+                "committing dream output failed: {}",
+                committed.stderr.trim()
+            ),
+        });
+    }
+    let commit = crate::git::head_sha(root)?;
+
+    let Some(remote) = remote else {
+        return Ok(KnowledgeDreamGitOutcome::Committed {
+            commit,
+            branch: branch.to_string(),
+            pushed: false,
+        });
+    };
+    if knowledge_git_push(root, remote, branch)?.success {
+        return Ok(KnowledgeDreamGitOutcome::Committed {
+            commit,
+            branch: branch.to_string(),
+            pushed: true,
+        });
+    }
+
+    // A rejected push is the normal concurrent-writer case. Fetch, rebase,
+    // and try once more. A conflict is aborted so the next ledger-driven dream
+    // run starts from a clean repository; no force-push is ever attempted.
+    if let Err(error) = knowledge_git_fetch(root, remote) {
+        return Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: Some(commit),
+            reason: error.to_string(),
+        });
+    }
+    if let Err(error) = knowledge_git_rebase_remote_branch(root, remote, branch, true) {
+        return Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: Some(commit),
+            reason: error.to_string(),
+        });
+    }
+    let pushed = knowledge_git_push(root, remote, branch)?;
+    if pushed.success {
+        Ok(KnowledgeDreamGitOutcome::Committed {
+            commit: crate::git::head_sha(root)?,
+            branch: branch.to_string(),
+            pushed: true,
+        })
+    } else {
+        Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: Some(commit),
+            reason: format!(
+                "pushing dream output was rejected after rebase retry: {}",
+                pushed.stderr.trim()
+            ),
+        })
+    }
+}
+
+fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let bundle = parse_bundle(root)?;
+    let mut paths = BTreeSet::new();
+    if bundle.index_md.is_some() {
+        paths.insert(PathBuf::from("index.md"));
+    }
+    if bundle.log_md.is_some() {
+        paths.insert(PathBuf::from("log.md"));
+    }
+    paths.extend(bundle.concepts.into_iter().map(|concept| concept.path));
+    paths.extend(bundle.resources.into_iter().map(|resource| resource.path));
+    Ok(paths)
+}
+
+fn structured_dream_commit_message(dream: &KnowledgeDreamCommit) -> String {
+    fn field(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    format!(
+        "dream(kb={}): sessions={} model={} concepts={} data_files={}",
+        field(&dream.knowledge_base_id),
+        dream.sessions_dreamed,
+        field(&dream.model),
+        dream.concepts_written,
+        dream.data_files_written,
+    )
+}
+
+fn knowledge_git(root: &Path, args: &[&str]) -> Result<crate::git::GitOutcome> {
+    crate::git::run_git(root, args)
+        .with_context(|| format!("running knowledge Git command `git {}`", args.join(" ")))
+}
+
+fn knowledge_git_branch(root: &Path) -> Result<String> {
+    let branch = knowledge_git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    if !branch.success {
+        bail!("knowledge repository has no writable branch");
+    }
+    let branch = branch.stdout.trim();
+    if branch.is_empty() || branch.starts_with('-') {
+        bail!("knowledge repository reported an invalid branch name");
+    }
+    Ok(branch.to_string())
+}
+
+fn knowledge_git_remote(root: &Path) -> Result<Option<String>> {
+    let remote = knowledge_git(root, &["remote", "get-url", "origin"])?;
+    if !remote.success {
+        return Ok(None);
+    }
+    Ok(Some("origin".to_string()))
+}
+
+fn knowledge_git_has_head(root: &Path) -> Result<bool> {
+    Ok(knowledge_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?.success)
+}
+
+fn knowledge_git_worktree_clean(root: &Path) -> Result<bool> {
+    let status = knowledge_git(root, &["status", "--porcelain=v1"])?;
+    if !status.success {
+        bail!(
+            "checking knowledge repository status failed: {}",
+            status.stderr.trim()
+        );
+    }
+    Ok(status.stdout.trim().is_empty())
+}
+
+fn knowledge_git_fetch(root: &Path, remote: &str) -> Result<()> {
+    let fetched = knowledge_git(root, &["fetch", "--prune", remote])?;
+    if !fetched.success {
+        bail!(
+            "fetching knowledge remote failed: {}",
+            fetched.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn knowledge_git_remote_ref(root: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/remotes/{remote}/{branch}");
+    let found = knowledge_git(root, &["rev-parse", "--verify", "--quiet", &reference])?;
+    if found.success {
+        Ok(Some(reference))
+    } else {
+        Ok(None)
+    }
+}
+
+fn knowledge_git_rebase_remote_branch(
+    root: &Path,
+    remote: &str,
+    branch: &str,
+    has_head: bool,
+) -> Result<()> {
+    let Some(reference) = knowledge_git_remote_ref(root, remote, branch)? else {
+        return Ok(());
+    };
+    if !has_head {
+        let checkout = knowledge_git(root, &["checkout", "-q", "-B", branch, &reference])?;
+        if !checkout.success {
+            bail!(
+                "checking out remote knowledge branch failed: {}",
+                checkout.stderr.trim()
+            );
+        }
+        return Ok(());
+    }
+    let rebase = knowledge_git(root, &["rebase", &reference])?;
+    if rebase.success {
+        return Ok(());
+    }
+    let abort = knowledge_git(root, &["rebase", "--abort"])?;
+    if !abort.success {
+        bail!(
+            "rebasing knowledge output failed and Git could not abort safely: {}",
+            abort.stderr.trim()
+        );
+    }
+    bail!(
+        "rebasing knowledge output deferred: {}",
+        rebase.stderr.trim()
+    )
+}
+
+fn knowledge_git_push(root: &Path, remote: &str, branch: &str) -> Result<crate::git::GitOutcome> {
+    let destination = format!("HEAD:refs/heads/{branch}");
+    knowledge_git(root, &["push", remote, &destination])
+}
+
+fn git_branch_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if component.is_empty() {
+        "knowledge".to_string()
+    } else {
+        component
+    }
 }
 
 struct RemoteKb {
@@ -3778,6 +4315,199 @@ timestamp: 2026-08-29T12:00:00Z
         })
         .await
         .unwrap();
+    }
+
+    fn test_dream(knowledge_base_id: &str) -> KnowledgeDreamCommit {
+        KnowledgeDreamCommit {
+            knowledge_base_id: knowledge_base_id.to_string(),
+            model: "openai:gpt-5".to_string(),
+            sessions_dreamed: 2,
+            concepts_written: 1,
+            data_files_written: 0,
+        }
+    }
+
+    fn configure_knowledge_git(root: &Path) {
+        crate::git::run_git_checked(root, &["config", "user.email", "dream@test.invalid"]).unwrap();
+        crate::git::run_git_checked(root, &["config", "user.name", "Dream test"]).unwrap();
+        crate::git::run_git_checked(root, &["config", "commit.gpgsign", "false"]).unwrap();
+    }
+
+    fn write_dream_concept(root: &Path, name: &str, body: &str) {
+        fs::write(
+            root.join(format!("{name}.md")),
+            format!("---\ntype: memory\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn local_knowledge_dreams_commit_structured_history_by_concept_file() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let first = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                configure_knowledge_git(tmp.path());
+                write_dream_concept(tmp.path(), "first-concept", "First dream output.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            KnowledgeDreamGitOutcome::Committed { pushed: false, .. }
+        ));
+
+        let second = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                write_dream_concept(tmp.path(), "second-concept", "Second dream output.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            second,
+            KnowledgeDreamGitOutcome::Committed { pushed: false, .. }
+        ));
+        let log = crate::git::run_git_checked(tmp.path(), &["log", "--format=%s", "-2"]).unwrap();
+        assert!(
+            log.contains(
+                "dream(kb=personal): sessions=2 model=openai:gpt-5 concepts=1 data_files=0"
+            )
+        );
+        assert!(tmp.path().join("first-concept.md").is_file());
+        assert!(tmp.path().join("second-concept.md").is_file());
+    }
+
+    #[test]
+    fn advanced_remote_rebases_and_retries_a_nonconflicting_dream_push() {
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("knowledge-remote.git");
+        let remote_arg = remote.to_string_lossy().into_owned();
+        crate::git::run_git_checked(tmp.path(), &["init", "-q", "--bare", &remote_arg]).unwrap();
+
+        let seed = tmp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        write_bundle(&seed);
+        crate::git::run_git_checked(&seed, &["init", "-q"]).unwrap();
+        configure_knowledge_git(&seed);
+        crate::git::run_git_checked(&seed, &["add", "--all"]).unwrap();
+        crate::git::run_git_checked(&seed, &["commit", "-q", "-m", "seed"]).unwrap();
+        crate::git::run_git_checked(&seed, &["branch", "-M", "main"]).unwrap();
+        crate::git::run_git_checked(&seed, &["remote", "add", "origin", &remote_arg]).unwrap();
+        crate::git::run_git_checked(&seed, &["push", "-q", "origin", "main"]).unwrap();
+
+        let root = tmp.path().join("writer");
+        let root_arg = root.to_string_lossy().into_owned();
+        crate::git::run_git_checked(
+            tmp.path(),
+            &["clone", "-q", "--branch", "main", &remote_arg, &root_arg],
+        )
+        .unwrap();
+        configure_knowledge_git(&root);
+
+        let outcome = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            || {
+                write_dream_concept(&root, "local-concept", "Local dream output.");
+
+                // This commit lands after the writer's pre-apply fetch, so
+                // the first push is rejected. The Git transaction must fetch,
+                // rebase this distinct concept file, and retry without force.
+                let other = tmp.path().join("other-writer");
+                let other_arg = other.to_string_lossy().into_owned();
+                crate::git::run_git_checked(
+                    tmp.path(),
+                    &["clone", "-q", "--branch", "main", &remote_arg, &other_arg],
+                )
+                .unwrap();
+                configure_knowledge_git(&other);
+                write_dream_concept(&other, "remote-concept", "Remote writer output.");
+                crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
+                crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote advance"])
+                    .unwrap();
+                crate::git::run_git_checked(&other, &["push", "-q", "origin", "main"]).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Committed { pushed: true, .. }
+        ));
+        crate::git::run_git_checked(&root, &["fetch", "-q", "origin"]).unwrap();
+        let remote_tree =
+            crate::git::run_git_checked(&root, &["ls-tree", "-r", "--name-only", "origin/main"])
+                .unwrap();
+        assert!(remote_tree.contains("local-concept.md"));
+        assert!(remote_tree.contains("remote-concept.md"));
+    }
+
+    #[test]
+    fn review_knowledge_dream_commits_on_a_dedicated_branch() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let outcome = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Review,
+            &test_dream("team"),
+            || {
+                configure_knowledge_git(tmp.path());
+                write_dream_concept(tmp.path(), "review-concept", "Needs human review.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        let KnowledgeDreamGitOutcome::Committed { branch, pushed, .. } = outcome else {
+            panic!("review dream must commit on its review branch");
+        };
+        assert!(!pushed);
+        assert!(branch.starts_with("cockpit/dream/team/"));
+        assert_ne!(
+            crate::git::current_branch(tmp.path()).unwrap().as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn knowledge_machine_state_is_ignored_when_history_is_initialized() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            || {
+                configure_knowledge_git(tmp.path());
+                for name in KB_MACHINE_STATE_GITIGNORE {
+                    let path = tmp.path().join(name.trim_end_matches('/'));
+                    if name.ends_with('/') {
+                        fs::create_dir_all(path).unwrap();
+                    } else {
+                        fs::write(path, "local only").unwrap();
+                    }
+                }
+                write_dream_concept(tmp.path(), "ignored-state", "State is private.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        for name in KB_MACHINE_STATE_GITIGNORE {
+            let ignored = crate::git::run_git(
+                tmp.path(),
+                &["check-ignore", "-q", name.trim_end_matches('/')],
+            )
+            .unwrap();
+            assert!(ignored.success, "{name} must be ignored in a KB repository");
+        }
     }
 
     fn ids(results: &[SearchResult]) -> Vec<String> {

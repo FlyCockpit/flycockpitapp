@@ -638,6 +638,7 @@ local	assistant_inbox_items	assistant_name	foreign
 local	assistant_inbox_items	created_at_unix_ms	non_relationship
 local	assistant_inbox_items	delivered_at_unix_ms	non_relationship
 local	assistant_inbox_items	delivery	non_relationship
+local	assistant_inbox_items	human_read_at_unix_ms	non_relationship
 local	assistant_inbox_items	inbox_item_id	primary
 local	assistant_inbox_items	main_session_id	foreign
 local	assistant_inbox_items	operation_id	local_identity

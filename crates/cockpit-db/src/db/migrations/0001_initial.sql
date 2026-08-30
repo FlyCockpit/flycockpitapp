@@ -59,12 +59,18 @@ CREATE TABLE assistant_inbox_items (
     delivery           TEXT NOT NULL CHECK (delivery IN ('immediate', 'defer', 'notify')),
     created_at_unix_ms INTEGER NOT NULL,
     delivered_at_unix_ms INTEGER CHECK (delivered_at_unix_ms IS NULL OR delivered_at_unix_ms >= created_at_unix_ms),
+    -- Human visibility is independent of agent delivery. A delivery can be
+    -- consumed at a main-turn boundary while the item remains unread in the
+    -- user's inbox; notify entries have no agent delivery at all.
+    human_read_at_unix_ms INTEGER CHECK (human_read_at_unix_ms IS NULL OR human_read_at_unix_ms >= created_at_unix_ms),
     CHECK (main_session_id <> raising_session_id)
 );
 CREATE UNIQUE INDEX assistant_inbox_items_raise_operation_idx
     ON assistant_inbox_items(raising_session_id, operation_scope, operation_id);
 CREATE INDEX assistant_inbox_items_main_pending_idx
     ON assistant_inbox_items(main_session_id, delivered_at_unix_ms, created_at_unix_ms);
+CREATE INDEX assistant_inbox_items_main_unread_idx
+    ON assistant_inbox_items(main_session_id, human_read_at_unix_ms, created_at_unix_ms);
 CREATE INDEX assistant_inbox_items_assistant_rate_idx
     ON assistant_inbox_items(assistant_name, created_at_unix_ms);
 

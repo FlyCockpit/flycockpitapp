@@ -2889,6 +2889,7 @@ mod tests {
                 delivery: "notify".into(),
                 created_at_unix_ms: 1,
                 delivered_at_unix_ms: None,
+                human_read_at_unix_ms: None,
             }]),
         );
         let notice = pane.notice.as_deref().unwrap();

@@ -4658,6 +4658,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "list_sessions",
         "read_history_page",
         "read_assistant_inbox",
+        "acknowledge_assistant_inbox_human_read",
         "read_session_messages",
         "read_subagent_history_page",
         "read_agent_attention",

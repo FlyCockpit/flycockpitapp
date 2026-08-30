@@ -1095,6 +1095,12 @@ const requestParamSchemas = {
       limit: z.number().int().positive(),
     })
     .strict(),
+  acknowledge_assistant_inbox_human_read: z
+    .object({
+      main_session_id: uuidSchema,
+      inbox_item_ids: z.array(uuidSchema).min(1).max(100),
+    })
+    .strict(),
   read_subagent_history_page: z
     .object({
       session_id: uuidSchema,
@@ -1440,6 +1446,10 @@ const clientRequestVariants = [
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_assistant_inbox", requestParamSchemas.read_assistant_inbox),
+  requestVariant(
+    "acknowledge_assistant_inbox_human_read",
+    requestParamSchemas.acknowledge_assistant_inbox_human_read,
+  ),
   requestVariant("read_agent_tree", requestParamSchemas.read_agent_tree),
   requestVariant("read_agent_attention", requestParamSchemas.read_agent_attention),
   requestVariant("read_session_messages", requestParamSchemas.read_session_messages),
@@ -1650,6 +1660,7 @@ export const assistantInboxItemWireSchema = z
     delivery: z.enum(["immediate", "defer", "notify"]),
     createdAtUnixMs: safeI64NumberSchema,
     deliveredAtUnixMs: safeI64NumberSchema.nullable(),
+    humanReadAtUnixMs: safeI64NumberSchema.nullable(),
   })
   .strict();
 export type AssistantInboxItemWire = z.infer<typeof assistantInboxItemWireSchema>;

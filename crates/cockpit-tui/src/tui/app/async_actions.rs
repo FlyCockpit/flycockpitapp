@@ -1088,12 +1088,19 @@ impl App {
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.inbox") => {
+                let mut reload_sessions = false;
                 if let Overlay::Sessions(pane) = &mut self.overlay {
                     match result.payload {
                         Ok(AsyncActionPayload::AssistantInbox {
                             main_session_id,
                             items,
-                        }) => pane.apply_inbox_result(main_session_id, Ok(items)),
+                        }) => {
+                            pane.apply_inbox_result(main_session_id, Ok(items));
+                            // The inbox action durably acknowledges the items
+                            // the human opened. Reload daemon-owned summaries
+                            // so the visible badge reflects that immediately.
+                            reload_sessions = true;
+                        }
                         Err(error) => {
                             if let Some(main_session_id) = pane.selected_session_id_for_action() {
                                 pane.apply_inbox_result(main_session_id, Err(error));
@@ -1101,6 +1108,9 @@ impl App {
                         }
                         Ok(_) => {}
                     }
+                }
+                if reload_sessions {
+                    self.start_sessions_list_action();
                 }
             }
             AsyncActionKind::DaemonRpc("skills.list") => {

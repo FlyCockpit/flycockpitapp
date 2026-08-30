@@ -12,6 +12,7 @@ pub struct AssistantInboxItemWire {
     pub delivery: String,
     pub created_at_unix_ms: i64,
     pub delivered_at_unix_ms: Option<i64>,
+    pub human_read_at_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

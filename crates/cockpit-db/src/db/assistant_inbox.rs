@@ -64,6 +64,7 @@ pub struct AssistantInboxItem {
     pub delivery: AssistantInboxDelivery,
     pub created_at_unix_ms: i64,
     pub delivered_at_unix_ms: Option<i64>,
+    pub human_read_at_unix_ms: Option<i64>,
 }
 
 impl AssistantInboxItem {
@@ -101,6 +102,7 @@ impl AssistantInboxItem {
             delivery: AssistantInboxDelivery::parse(&delivery)?,
             created_at_unix_ms: row.get("created_at_unix_ms")?,
             delivered_at_unix_ms: row.get("delivered_at_unix_ms")?,
+            human_read_at_unix_ms: row.get("human_read_at_unix_ms")?,
         })
     }
 }
@@ -225,9 +227,9 @@ impl Db {
         .await
     }
 
-    /// User-visible inbox entries for one main assistant session.  Delivered
-    /// items stay visible as history; callers select the unread badge by
-    /// filtering `delivered_at_unix_ms IS NULL` in the same durable query.
+    /// User-visible inbox entries for one main assistant session. Delivered
+    /// items stay visible as history; human-read state is deliberately
+    /// independent of agent delivery.
     pub async fn assistant_inbox_for_main(
         &self,
         main_session_id: Uuid,
@@ -316,6 +318,39 @@ impl Db {
                 ensure!(
                     matched == 1,
                     "assistant inbox acknowledgement target missing"
+                );
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Mark exactly the inbox items the human opened as read. This does not
+    /// change agent-delivery state, so immediate/deferred work remains safely
+    /// retryable and notify-only entries can clear the human-visible badge.
+    /// The operation is idempotent and rejects a cross-session identity rather
+    /// than silently acknowledging an item the caller was not authorized to
+    /// view.
+    pub async fn acknowledge_assistant_inbox_human_read(
+        &self,
+        main_session_id: Uuid,
+        inbox_item_ids: Vec<Uuid>,
+    ) -> Result<()> {
+        if inbox_item_ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        self.transaction(move |conn| {
+            for inbox_item_id in inbox_item_ids {
+                let matched = conn.execute(
+                    "UPDATE assistant_inbox_items
+                       SET human_read_at_unix_ms = COALESCE(human_read_at_unix_ms, ?1)
+                     WHERE inbox_item_id = ?2 AND main_session_id = ?3",
+                    params![now, inbox_item_id.to_string(), main_session_id.to_string()],
+                )?;
+                ensure!(
+                    matched == 1,
+                    "assistant inbox human-read acknowledgement target missing"
                 );
             }
             Ok(())
@@ -526,8 +561,85 @@ mod tests {
         assert!(visible.iter().any(|item| {
             item.delivery == AssistantInboxDelivery::Notify
                 && item.delivered_at_unix_ms.is_none()
+                && item.human_read_at_unix_ms.is_none()
                 && item.raising_session_id == thread.session_id
         }));
+    }
+
+    #[tokio::test]
+    async fn human_read_acknowledgement_is_independent_of_agent_delivery() {
+        let db = Db::open_in_memory().unwrap();
+        let (main, thread) = assistant_with_thread(&db).await;
+        let immediate = db
+            .raise_assistant_inbox_item(
+                thread.session_id,
+                "turn-1".into(),
+                "immediate".into(),
+                "agent delivery must not clear the human badge".into(),
+                AssistantInboxDelivery::Immediate,
+            )
+            .await
+            .unwrap();
+        let notify = db
+            .raise_assistant_inbox_item(
+                thread.session_id,
+                "turn-1".into(),
+                "notify".into(),
+                "notify must clear when the human opens the inbox".into(),
+                AssistantInboxDelivery::Notify,
+            )
+            .await
+            .unwrap();
+
+        db.acknowledge_assistant_inbox_delivery(main.session_id, vec![immediate.inbox_item_id])
+            .await
+            .unwrap();
+        let after_delivery = db
+            .assistant_inbox_for_main(main.session_id, true, 10)
+            .await
+            .unwrap();
+        assert!(
+            after_delivery
+                .iter()
+                .all(|item| item.human_read_at_unix_ms.is_none())
+        );
+        let unread_after_delivery = db
+            .list_session_summaries(Some("project"), None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.session_id == main.session_id)
+            .unwrap()
+            .assistant_inbox_unread;
+        assert_eq!(unread_after_delivery, 2);
+
+        db.acknowledge_assistant_inbox_human_read(
+            main.session_id,
+            vec![immediate.inbox_item_id, notify.inbox_item_id],
+        )
+        .await
+        .unwrap();
+        let after_human_read = db
+            .assistant_inbox_for_main(main.session_id, true, 10)
+            .await
+            .unwrap();
+        assert!(
+            after_human_read
+                .iter()
+                .all(|item| item.human_read_at_unix_ms.is_some())
+        );
+        assert!(after_human_read.iter().any(|item| {
+            item.inbox_item_id == notify.inbox_item_id && item.delivered_at_unix_ms.is_none()
+        }));
+        let unread_after_human_read = db
+            .list_session_summaries(Some("project"), None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.session_id == main.session_id)
+            .unwrap()
+            .assistant_inbox_unread;
+        assert_eq!(unread_after_human_read, 0);
     }
 
     #[tokio::test]

@@ -3690,11 +3690,11 @@ impl Db {
                     "SELECT COUNT(*),
                             (SELECT raising_session_id FROM assistant_inbox_items newest
                               WHERE newest.main_session_id = ?1
-                                AND newest.delivered_at_unix_ms IS NULL
+                                AND newest.human_read_at_unix_ms IS NULL
                               ORDER BY newest.created_at_unix_ms DESC,
                                        newest.inbox_item_id DESC LIMIT 1)
                        FROM assistant_inbox_items
-                      WHERE main_session_id = ?1 AND delivered_at_unix_ms IS NULL",
+                      WHERE main_session_id = ?1 AND human_read_at_unix_ms IS NULL",
                     [row.session_id.to_string()],
                     |record| {
                         let count: i64 = record.get(0)?;

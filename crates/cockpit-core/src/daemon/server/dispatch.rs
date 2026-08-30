@@ -11327,6 +11327,17 @@ async fn handle_serialized_request_impl(
             })
         }
 
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id,
+            inbox_item_ids,
+        } => {
+            ctx.db
+                .acknowledge_assistant_inbox_human_read(main_session_id, inbox_item_ids)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::ReadClientSubmissionReceipt {
             session_id,
             client_submission_id,
@@ -18646,6 +18657,16 @@ async fn handle_concurrent_request_impl(
                 main_session_id,
                 items,
             })
+        }
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id,
+            inbox_item_ids,
+        } => {
+            ctx.db
+                .acknowledge_assistant_inbox_human_read(main_session_id, inbox_item_ids)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
         }
         Request::ReadClientSubmissionReceipt {
             session_id,
@@ -29893,5 +29914,6 @@ fn assistant_inbox_item_wire(
         delivery: item.delivery.as_str().to_string(),
         created_at_unix_ms: item.created_at_unix_ms,
         delivered_at_unix_ms: item.delivered_at_unix_ms,
+        human_read_at_unix_ms: item.human_read_at_unix_ms,
     }
 }

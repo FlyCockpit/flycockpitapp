@@ -1106,6 +1106,18 @@ CREATE TABLE knowledge_dreamed_sessions (
 CREATE INDEX idx_knowledge_dreamed_sessions_last
     ON knowledge_dreamed_sessions(kb_id, project_root, consumer_id, dreamed_at_unix_ms DESC);
 
+-- Monotonic identity for successful dream completions. Wall-clock time is
+-- presentation only: completion_revision advances even when the clock repeats
+-- or moves backwards, so a live session can never miss a later completion.
+CREATE TABLE knowledge_dream_completion_state (
+    kb_id                 TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    project_root          TEXT NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
+    consumer_id           TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
+    completion_revision   INTEGER NOT NULL CHECK (completion_revision > 0),
+    completed_at_unix_ms  INTEGER NOT NULL,
+    PRIMARY KEY (kb_id, project_root, consumer_id)
+);
+
 -- Per-machine daemon dream scheduler state.  The completion ledger above is
 -- immutable evidence about individual source sessions; this row records the
 -- daemon's schedule cursor and also makes an empty scheduled fire visible to

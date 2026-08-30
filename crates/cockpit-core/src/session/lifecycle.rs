@@ -149,11 +149,13 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
 
 fn capture_knowledge_base_prompt_snapshot_json(
     db: &Db,
+    config: &crate::config::extended::ExtendedConfig,
     project_root: &std::path::Path,
     assistant_name: Option<&str>,
     allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
+    trust_mode: crate::db::workspace_trust::WorkspaceTrustMode,
 ) -> Result<String> {
-    let config = crate::config::extended::load_for_cwd(project_root);
+    let config = config.clone();
     let project_root = project_root.to_string_lossy().into_owned();
     let assistant_name = assistant_name.map(str::to_owned);
     let allowed_knowledge_bases = allowed_knowledge_bases.cloned();
@@ -164,6 +166,7 @@ fn capture_knowledge_base_prompt_snapshot_json(
             &project_root,
             assistant_name.as_deref(),
             allowed_knowledge_bases.as_ref(),
+            trust_mode,
         )
         .map(|snapshot| snapshot.to_json_string())
     })
@@ -177,6 +180,7 @@ impl Session {
         db: Db,
         project_root: PathBuf,
         active_agent: &str,
+        config: &crate::config::extended::ExtendedConfig,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
@@ -199,9 +203,14 @@ impl Session {
             .and_then(|definition| definition.allowed_knowledge_bases().cloned());
         row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
             &db,
+            config,
             &project_root,
             None,
             allowed_knowledge_bases.as_ref(),
+            crate::config::trust::runtime_policy().map_or(
+                crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+                |policy| policy.mode,
+            ),
         )?;
         let row_for_db = row.clone();
         let row = db
@@ -222,7 +231,6 @@ impl Session {
         db: Db,
         project_root: PathBuf,
         active_agent: &str,
-        allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
@@ -243,12 +251,6 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
-            &db,
-            &project_root,
-            None,
-            allowed_knowledge_bases,
-        )?;
         let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -291,6 +293,37 @@ impl Session {
         Ok(())
     }
 
+    /// Freeze the KB prompt only after the daemon's final durable trust
+    /// observation, using the retained, trust-filtered config projection that
+    /// is about to be published to this worker.
+    pub(crate) fn set_deferred_knowledge_base_prompt_snapshot(
+        &mut self,
+        config: &crate::config::extended::ExtendedConfig,
+        assistant_name: Option<&str>,
+        allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
+        trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_row.lock().unwrap().is_some(),
+            "knowledge-base prompt snapshot may only be set before persistence"
+        );
+        let snapshot = capture_knowledge_base_prompt_snapshot_json(
+            &self.db,
+            config,
+            &self.project_root,
+            assistant_name,
+            allowed_knowledge_bases,
+            trust_policy.mode,
+        )?;
+        self.knowledge_base_prompt_snapshot =
+            Arc::new(crate::knowledge::KnowledgeBasePromptSnapshot::from_json_str(&snapshot));
+        anyhow::ensure!(
+            self.stage_pending_row(|row| row.knowledge_base_prompt_snapshot_json = snapshot),
+            "deferred session row disappeared while capturing knowledge-base prompt snapshot"
+        );
+        Ok(())
+    }
+
     pub fn session_entry_mode(&self) -> crate::daemon::proto::SessionEntryMode {
         self.session_entry_mode
     }
@@ -304,7 +337,6 @@ impl Session {
         project_root: PathBuf,
         active_agent: &str,
         assistant_name: &str,
-        allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
@@ -327,12 +359,6 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
-            &db,
-            &project_root,
-            Some(assistant_name),
-            allowed_knowledge_bases,
-        )?;
         let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)

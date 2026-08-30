@@ -27281,8 +27281,15 @@ async fn run_docs_ask_pipeline(
     package: Option<String>,
     question: String,
 ) -> std::result::Result<String, String> {
-    let session = crate::session::Session::create(db.clone(), cwd.clone(), "docs", resolver, vault)
-        .map_err(|error| format!("creating docs ask session: {error:#}"))?;
+    let session = crate::session::Session::create(
+        db.clone(),
+        cwd.clone(),
+        "docs",
+        &extended,
+        resolver,
+        vault,
+    )
+    .map_err(|error| format!("creating docs ask session: {error:#}"))?;
     // Install the daemon command-secret cache so this session's sync redaction
     // and model builds inject the (already pre-resolved) command outputs.
     session.set_command_secret_cache(Some(command_secret_cache));

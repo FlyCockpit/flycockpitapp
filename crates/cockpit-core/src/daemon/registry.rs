@@ -1461,6 +1461,10 @@ impl SessionRegistry {
             crate::agents::resolve_with_assistant_db(&project_root, &initial_agent, &self.inner.db)
                 .await
                 .context("resolving active agent before capturing knowledge attachments")?;
+        let allowed_knowledge_bases = initial_agent_definition
+            .as_ref()
+            .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+            .cloned();
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
@@ -1470,9 +1474,6 @@ impl SessionRegistry {
             self.inner.db.clone(),
             project_root,
             &initial_agent,
-            initial_agent_definition
-                .as_ref()
-                .and_then(crate::agents::AgentDef::allowed_knowledge_bases),
             self.redaction_key_resolver()?,
             self.secret_vault()?,
         )
@@ -1531,6 +1532,12 @@ impl SessionRegistry {
             }
         }
         debug_assert!(trust_revision > 0);
+        session.set_deferred_knowledge_base_prompt_snapshot(
+            &extended_cfg,
+            None,
+            allowed_knowledge_bases.as_ref(),
+            &trust_policy,
+        )?;
         self.start_worker(
             worker_publication,
             session,
@@ -1611,7 +1618,6 @@ impl SessionRegistry {
             project_root,
             assistant_name,
             assistant_name,
-            assistant_definition.agent.allowed_knowledge_bases(),
             self.redaction_key_resolver()?,
             self.secret_vault()?,
         )
@@ -1659,6 +1665,12 @@ impl SessionRegistry {
             }
         }
         debug_assert!(trust_revision > 0);
+        session.set_deferred_knowledge_base_prompt_snapshot(
+            &extended_cfg,
+            Some(assistant_name),
+            assistant_definition.agent.allowed_knowledge_bases(),
+            &trust_policy,
+        )?;
         self.start_worker(
             &worker_publication,
             session,

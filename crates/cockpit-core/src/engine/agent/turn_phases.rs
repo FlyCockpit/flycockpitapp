@@ -3652,6 +3652,137 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn next_root_turn_injects_later_dream_without_changing_cached_kb_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let project_root = root.path().to_string_lossy().into_owned();
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+
+        // Exercise the non-empty production completion writer: the source must
+        // remain attached until the consumed snapshot is committed.
+        db.attach_session_to_knowledge_base("team", &project_root, session.id)
+            .await
+            .unwrap();
+        db.record_knowledge_dream_completion(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            &[session.id],
+        )
+        .await
+        .unwrap();
+        let mut history = Vec::new();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await;
+
+        assert!(history.iter().any(|message| {
+            matches!(message, Message::System { content }
+                if content.contains("KB Team Notes finished a new dream at")
+                    && content.contains("newer knowledge is now available"))
+        }));
+        assert_eq!(
+            session.knowledge_base_system_prompt(),
+            prefix_before,
+            "turn-start freshness delivery must leave the cached KB prefix byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_freshness_uses_revision_when_completion_clock_does_not_advance() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let project_root = root.path().to_string_lossy().into_owned();
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+        let mut history = Vec::new();
+
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await;
+        assert!(history.iter().any(|message| {
+            matches!(message, Message::System { content }
+                if content.contains("completion revision 2"))
+        }));
+
+        db.record_knowledge_dream_manual_empty_check("team", &project_root, consumer.as_hex(), 999)
+            .await
+            .unwrap();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| matches!(message, Message::System { content } if content.contains("KB Team Notes finished a new dream at")))
+                .count(),
+            2,
+            "a backwards clock must not collapse a later completion into an earlier notice"
+        );
+        assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
+    }
+
     fn tool_call(name: &str, args: Value) -> ToolCall {
         ToolCall {
             id: rig::message::ToolCallId::new_or_mint("call-1".to_string()),

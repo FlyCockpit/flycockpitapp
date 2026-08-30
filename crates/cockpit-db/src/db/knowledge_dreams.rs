@@ -19,6 +19,31 @@ pub struct DreamSessionSource {
     pub last_active_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnowledgeDreamCompletion {
+    pub revision: i64,
+    pub completed_at_unix_ms: i64,
+}
+
+fn record_completion_conn(
+    conn: &rusqlite::Connection,
+    kb_id: &str,
+    project_root: &str,
+    consumer_id: &str,
+    completed_at_unix_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO knowledge_dream_completion_state
+             (kb_id, project_root, consumer_id, completion_revision, completed_at_unix_ms)
+         VALUES (?1, ?2, ?3, 1, ?4)
+         ON CONFLICT(kb_id, project_root, consumer_id) DO UPDATE SET
+             completion_revision = knowledge_dream_completion_state.completion_revision + 1,
+             completed_at_unix_ms = excluded.completed_at_unix_ms",
+        params![kb_id, project_root, consumer_id, completed_at_unix_ms],
+    )?;
+    Ok(())
+}
+
 impl Db {
     pub async fn attach_session_to_knowledge_base(
         &self,
@@ -177,6 +202,7 @@ impl Db {
                     params![&kb_id, &project_root, &consumer_id, &session_id, dreamed_at],
                 )?;
             }
+            record_completion_conn(conn, &kb_id, &project_root, &consumer_id, dreamed_at)?;
             Ok(())
         })
         .await
@@ -200,6 +226,24 @@ impl Db {
         .await
     }
 
+    pub async fn knowledge_dream_completion(
+        &self,
+        kb_id: &str,
+        project_root: &str,
+        consumer_id: &str,
+    ) -> Result<Option<KnowledgeDreamCompletion>> {
+        validate_kb_id(kb_id)?;
+        validate_project_root(project_root)?;
+        validate_consumer_id(consumer_id)?;
+        let kb_id = kb_id.to_owned();
+        let project_root = project_root.to_owned();
+        let consumer_id = consumer_id.to_owned();
+        self.read(move |conn| {
+            knowledge_dream_completion_conn(conn, &kb_id, &project_root, &consumer_id)
+        })
+        .await
+    }
+
     /// The daemon's successful schedule cursor. `checked_at_unix_ms` is
     /// always advanced after a fire, while `last_dreamed_at_unix_ms` advances
     /// only for the no-new-sessions fast path; non-empty runs publish their
@@ -218,7 +262,7 @@ impl Db {
         let kb_id = kb_id.to_owned();
         let project_root = project_root.to_owned();
         let consumer_id = consumer_id.to_owned();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             conn.execute(
                 "INSERT INTO knowledge_dream_schedule_state
                     (kb_id, project_root, consumer_id, last_scheduled_at_unix_ms, last_dreamed_at_unix_ms)
@@ -237,6 +281,9 @@ impl Db {
                     last_dreamed_at_unix_ms,
                 ],
             )?;
+            if let Some(completed_at) = last_dreamed_at_unix_ms {
+                record_completion_conn(conn, &kb_id, &project_root, &consumer_id, completed_at)?;
+            }
             Ok(())
         })
         .await
@@ -258,7 +305,7 @@ impl Db {
         let kb_id = kb_id.to_owned();
         let project_root = project_root.to_owned();
         let consumer_id = consumer_id.to_owned();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             conn.execute(
                 "INSERT INTO knowledge_dream_schedule_state
                     (kb_id, project_root, consumer_id, last_scheduled_at_unix_ms, last_dreamed_at_unix_ms)
@@ -267,6 +314,7 @@ impl Db {
                     last_dreamed_at_unix_ms = excluded.last_dreamed_at_unix_ms",
                 params![kb_id, project_root, consumer_id, checked_at_unix_ms],
             )?;
+            record_completion_conn(conn, &kb_id, &project_root, &consumer_id, checked_at_unix_ms)?;
             Ok(())
         })
         .await
@@ -335,19 +383,38 @@ pub fn knowledge_base_last_dreamed_at_conn(
     validate_project_root(project_root)?;
     validate_consumer_id(consumer_id)?;
     conn.query_row(
-        "SELECT MAX(last_dreamed_at_unix_ms) FROM (
-            SELECT MAX(dreamed_at_unix_ms) AS last_dreamed_at_unix_ms
-              FROM knowledge_dreamed_sessions
-             WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3
-            UNION ALL
-            SELECT last_dreamed_at_unix_ms
-              FROM knowledge_dream_schedule_state
-             WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3
-         )",
+        "SELECT completed_at_unix_ms FROM knowledge_dream_completion_state
+          WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3",
         params![kb_id, project_root, consumer_id],
         |row| row.get(0),
     )
+    .optional()
     .context("loading knowledge-base last dreamed time")
+}
+
+pub fn knowledge_dream_completion_conn(
+    conn: &rusqlite::Connection,
+    kb_id: &str,
+    project_root: &str,
+    consumer_id: &str,
+) -> Result<Option<KnowledgeDreamCompletion>> {
+    validate_kb_id(kb_id)?;
+    validate_project_root(project_root)?;
+    validate_consumer_id(consumer_id)?;
+    conn.query_row(
+        "SELECT completion_revision, completed_at_unix_ms
+           FROM knowledge_dream_completion_state
+          WHERE kb_id = ?1 AND project_root = ?2 AND consumer_id = ?3",
+        params![kb_id, project_root, consumer_id],
+        |row| {
+            Ok(KnowledgeDreamCompletion {
+                revision: row.get(0)?,
+                completed_at_unix_ms: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .context("loading knowledge-base dream completion")
 }
 
 fn validate_kb_id(value: &str) -> Result<()> {

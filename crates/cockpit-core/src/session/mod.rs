@@ -1193,6 +1193,12 @@ impl Session {
         self.knowledge_base_prompt_snapshot.render_system_block()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_knowledge_base_prompt_snapshot_for_test(&mut self, raw: &str) {
+        self.knowledge_base_prompt_snapshot =
+            Arc::new(KnowledgeBasePromptSnapshot::from_json_str(raw));
+    }
+
     /// Return one-line, per-turn freshness facts for dreams that completed
     /// after this session began. This does not update the cached system prompt.
     ///
@@ -1218,7 +1224,7 @@ impl Session {
         for entry in snapshot.entries() {
             let current = match self
                 .db
-                .knowledge_base_last_dreamed_at(&entry.id, &project_root, consumer.as_hex())
+                .knowledge_dream_completion(&entry.id, &project_root, consumer.as_hex())
                 .await
             {
                 Ok(current) => current,
@@ -1230,18 +1236,20 @@ impl Session {
             let Some(current) = current else {
                 continue;
             };
-            if entry
-                .last_dreamed_at_unix_ms
-                .map_or(true, |snapshot| current > snapshot)
-            {
-                fresh.push((entry.id.clone(), entry.name.clone(), current));
+            if current.revision > entry.dream_completion_revision {
+                fresh.push((
+                    entry.id.clone(),
+                    entry.name.clone(),
+                    current.revision,
+                    current.completed_at_unix_ms,
+                ));
             }
         }
         fresh
             .into_iter()
-            .map(|(_id, name, timestamp)| {
+            .map(|(_id, name, revision, timestamp)| {
                 format!(
-                    "KB {name} finished a new dream at {}; newer knowledge is now available.",
+                    "KB {name} finished a new dream at {} (completion revision {revision}); newer knowledge is now available.",
                     crate::knowledge::format_dream_timestamp(timestamp)
                 )
             })

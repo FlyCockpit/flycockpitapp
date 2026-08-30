@@ -54,6 +54,8 @@ pub(crate) struct KnowledgeBasePromptSnapshotEntry {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) last_dreamed_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) dream_completion_revision: i64,
 }
 
 impl KnowledgeBasePromptSnapshot {
@@ -63,6 +65,7 @@ impl KnowledgeBasePromptSnapshot {
         project_root: &str,
         assistant_name: Option<&str>,
         allowed_knowledge_bases: Option<&BTreeSet<String>>,
+        trust_mode: WorkspaceTrustMode,
     ) -> Result<Self> {
         let consumer = crate::db::installation_identity::ensure_installation_identity_conn(conn)?;
         let attached = attached_bundles_from_registry(
@@ -70,22 +73,26 @@ impl KnowledgeBasePromptSnapshot {
             config,
             Path::new(project_root),
             allowed_knowledge_bases,
+            trust_mode,
         )?;
         let entries = attached
             .into_iter()
             .map(|knowledge_base| {
                 let entry = knowledge_base.entry;
+                let completion = crate::db::knowledge_dreams::knowledge_dream_completion_conn(
+                    conn,
+                    &entry.id,
+                    project_root,
+                    consumer.as_hex(),
+                )?;
                 Ok(KnowledgeBasePromptSnapshotEntry {
                     id: entry.id.clone(),
                     name: entry.name,
                     description: entry.description,
-                    last_dreamed_at_unix_ms:
-                        crate::db::knowledge_dreams::knowledge_base_last_dreamed_at_conn(
-                            conn,
-                            &entry.id,
-                            project_root,
-                            consumer.as_hex(),
-                        )?,
+                    last_dreamed_at_unix_ms: completion
+                        .map(|completion| completion.completed_at_unix_ms),
+                    dream_completion_revision: completion
+                        .map_or(0, |completion| completion.revision),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3572,11 +3579,14 @@ pub(crate) async fn attached_bundles(
     allowed_knowledge_bases: Option<&BTreeSet<String>>,
     extended: &ExtendedConfig,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
+    let trust_mode = crate::config::trust::runtime_policy()
+        .map_or(WorkspaceTrustMode::Untrusted, |policy| policy.mode);
     attached_bundles_from_registry(
         assistant_knowledge_registry_entry(session).await?,
         extended,
         cwd,
         allowed_knowledge_bases,
+        trust_mode,
     )
 }
 
@@ -3589,6 +3599,7 @@ fn attached_bundles_from_registry(
     extended: &ExtendedConfig,
     cwd: &Path,
     allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    trust_mode: WorkspaceTrustMode,
 ) -> Result<Vec<AttachedKnowledgeBase>> {
     let mut seen = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
@@ -3614,10 +3625,7 @@ fn attached_bundles_from_registry(
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
-        if entry.trust_required
-            && !crate::config::trust::runtime_policy()
-                .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
-        {
+        if entry.trust_required && trust_mode != WorkspaceTrustMode::Trust {
             continue;
         }
         let local = local.map(|local| {
@@ -5324,7 +5332,7 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[test]
-    fn prompt_snapshot_uses_the_same_attachment_filter_as_retrieval() {
+    fn prompt_snapshot_uses_its_carried_trust_authority_for_attachments() {
         let tmp = TempDir::new().unwrap();
         write_bundle(&tmp.path().join("available"));
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -5338,21 +5346,30 @@ timestamp: 2026-08-29T12:00:00Z
         let mut restricted = available.clone();
         restricted.id = "restricted".to_string();
         restricted.name = "Restricted".to_string();
+        restricted.trust_required = true;
         let config = ExtendedConfig {
             knowledge_bases: vec![available, restricted],
             ..Default::default()
         };
-        let allowed = BTreeSet::from(["available".to_string()]);
+        let allowed = BTreeSet::from(["available".to_string(), "restricted".to_string()]);
         let root = tmp.path().to_string_lossy().into_owned();
 
         let snapshot = db
             .blocking_write_for_sync_maintenance(move |conn| {
-                KnowledgeBasePromptSnapshot::capture(&config, conn, &root, None, Some(&allowed))
+                KnowledgeBasePromptSnapshot::capture(
+                    &config,
+                    conn,
+                    &root,
+                    None,
+                    Some(&allowed),
+                    WorkspaceTrustMode::Trust,
+                )
             })
             .unwrap();
 
-        assert_eq!(snapshot.entries().len(), 1);
+        assert_eq!(snapshot.entries().len(), 2);
         assert_eq!(snapshot.entries()[0].id, "available");
+        assert_eq!(snapshot.entries()[1].id, "restricted");
     }
 
     #[tokio::test]

@@ -26058,6 +26058,15 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
+    // A durable Assistant owns background work. Frontends resolve its owner
+    // through PromoteToPersistent before Attach; keep this server boundary as
+    // the final fail-closed fence for any future generic resume path.
+    if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.paths.ephemeral {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "Assistant sessions require a persistent daemon owner".into(),
+        });
+    }
     // Terminal results for transactions this attach converged. Delivered
     // through the worker below, once a handle exists to stamp the generation.
     let recovered_default_transactions;

@@ -382,6 +382,10 @@ pub struct AgentRunner {
     /// Capability used for every fresh connection to this exact daemon,
     /// including session switches and reconnects.
     pub(crate) endpoint: ClientEndpoint,
+    /// Lifecycle capability retained for an existing-session switch. A
+    /// durable Assistant can be selected after the runner was first attached,
+    /// so that switch must re-resolve the owner as persistent before Attach.
+    lifecycle: LifecycleClient,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -580,6 +584,7 @@ impl AgentRunner {
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
             ),
+            lifecycle: LifecycleClient::disconnected(),
             socket: socket.unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
             history: Vec::new(),
             paused_work: Vec::new(),
@@ -839,6 +844,7 @@ impl AgentRunner {
         let session_id_state = self.session_id_state.clone();
         let last_applied_seq = self.last_applied_seq.clone();
         let endpoint = self.endpoint.clone();
+        let lifecycle = self.lifecycle.clone();
         let input_tx = self.input_tx.clone();
         async move {
             #[cfg(test)]
@@ -857,6 +863,7 @@ impl AgentRunner {
                     session_id_state,
                     last_applied_seq,
                     endpoint,
+                    lifecycle,
                     input_tx,
                 );
                 return Ok(outcome);
@@ -886,6 +893,7 @@ impl AgentRunner {
                 attach_context,
                 session_id_state,
                 endpoint,
+                lifecycle,
                 target,
                 cancel_outgoing_turn_after_attach,
             )
@@ -1930,6 +1938,7 @@ async fn switch_session_inner(
     attach_context: Arc<RwLock<AttachRequestContext>>,
     session_id_state: Arc<Mutex<Uuid>>,
     endpoint: ClientEndpoint,
+    lifecycle: LifecycleClient,
     target: SessionTarget,
     cancel_outgoing_turn_after_attach: bool,
 ) -> Result<SessionSwitchOutcome, String> {
@@ -1937,6 +1946,16 @@ async fn switch_session_inner(
     // same session id. Adopt a fresh client so the old connection cannot feed
     // pre-Attach events into the new epoch.
     let outgoing_client = current_client.read().await.clone();
+    let endpoint = match target {
+        SessionTarget::Resume { .. } => {
+            lifecycle
+                .resolve(LifecycleIntent::PromoteToPersistent)
+                .await
+                .map_err(|error| format!("daemon lifecycle: {error}"))?
+                .endpoint
+        }
+        SessionTarget::New => endpoint,
+    };
     let replacement_client = DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| format!("connect replacement session client: {error:#}"))?;
@@ -2320,7 +2339,16 @@ async fn try_spawn_inner(
     let root_model_override = root_model_override_for_attach(session_id, &initial_model);
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-        let daemon = lifecycle.resolve(intent).await?;
+        // A session id is durable but mode-blind at this boundary. Resolve all
+        // generic resumes through the persistent policy; Code and Computer
+        // remain valid there, while Assistant cannot attach to an ephemeral
+        // owner before its durable mode is loaded by the daemon.
+        let lifecycle_intent = if session_id.is_some() {
+            LifecycleIntent::PromoteToPersistent
+        } else {
+            intent
+        };
+        let daemon = lifecycle.resolve(lifecycle_intent).await?;
         timer.phase("resolve_lifecycle");
         let owns_daemon = daemon.owns_daemon;
         let socket = daemon.socket.clone();
@@ -2457,6 +2485,7 @@ async fn try_spawn_inner(
         Ok::<_, String>((
             client,
             endpoint,
+            lifecycle,
             session_id,
             short_id,
             active_agent_name,
@@ -2481,6 +2510,7 @@ async fn try_spawn_inner(
     let (
         client,
         endpoint,
+        lifecycle,
         session_id,
         short_id,
         initial_active_agent,
@@ -3064,6 +3094,7 @@ async fn try_spawn_inner(
         usage,
         owns_daemon,
         endpoint,
+        lifecycle,
         socket,
         history,
         paused_work,

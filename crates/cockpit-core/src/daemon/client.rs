@@ -303,6 +303,34 @@ where
         .map_err(OwnedDaemonRunError::OperationOrCleanup)
 }
 
+/// Run one foreground operation through the persistent Assistant owner.
+///
+/// This has the same callback boundary as [`run_one_shot_daemon`], but never
+/// returns a client backed by the one-shot ephemeral owner: a resumed session
+/// may be an Assistant, whose daemon-owned work must survive this command.
+pub async fn run_assistant_daemon<T, F>(operation: F) -> std::result::Result<T, OwnedDaemonRunError>
+where
+    F: for<'client> std::ops::FnOnce(
+            ScopedDaemonClient<'client>,
+        ) -> std::pin::Pin<
+            std::boxed::Box<dyn std::future::Future<Output = anyhow::Result<T>> + 'client>,
+        >,
+{
+    let connected = probe_or_spawn(LifecycleMode::PromoteToPersistent)
+        .await
+        .map_err(OwnedDaemonRunError::Connect)?;
+    if connected.owns_daemon {
+        return Err(OwnedDaemonRunError::OperationOrCleanup(anyhow!(
+            "persistent daemon attach produced an ephemeral instance; refusing resumed session"
+        )));
+    }
+    operation(ScopedDaemonClient {
+        client: &connected.client,
+    })
+    .await
+    .map_err(OwnedDaemonRunError::OperationOrCleanup)
+}
+
 /// Persistent-only daemon connection. It contains no process-ownership guard,
 /// so exposing the client cannot detach an ephemeral child.
 pub struct PersistentDaemonSession {
@@ -530,7 +558,14 @@ async fn promote_ephemeral_owner_with_recovery_policy(
                 .map_err(anyhow::Error::msg)?;
         }
 
-        let old_pid = crate::daemon::daemon_pid(&current_paths);
+        // The canonical socket is reusable. Bind this destructive request to
+        // the exact ephemeral generation observed by discovery; otherwise a
+        // competing promotion can replace the owner before this connection is
+        // made and make us restart its persistent successor.
+        let expected_predecessor = ephemeral_owner_identity(&current_paths).ok_or_else(|| {
+            anyhow!("ephemeral daemon owner identity is unavailable for promotion")
+        })?;
+        let old_pid = Some(expected_predecessor.1.pid);
         let client = match connect_local_daemon(&current_paths.socket).await {
             Ok(client) => client,
             Err(error) if replacement_required => {
@@ -549,6 +584,34 @@ async fn promote_ephemeral_owner_with_recovery_policy(
                     .context("connecting to ephemeral daemon for persistent promotion");
             }
         };
+        if ephemeral_owner_identity(&current_paths) != Some(expected_predecessor.clone()) {
+            // Do not issue RestartIfIdle to a socket whose published owner
+            // changed while connecting. Return to discovery; the next loop
+            // either observes the persistent successor or binds a new
+            // ephemeral predecessor before making another destructive call.
+            drop(client);
+            let discovered = crate::daemon::discover().await;
+            match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
+                DiscoverAttachPlan::AttachRunning if !discovered.paths.ephemeral => {
+                    let mut connected =
+                        attach_running_with_skew_check(discovered.paths, None).await?;
+                    connected.promoted_from_ephemeral = true;
+                    return Ok(connected);
+                }
+                DiscoverAttachPlan::AttachRunning => {
+                    current_paths = discovered.paths;
+                    continue;
+                }
+                DiscoverAttachPlan::WaitForRestart
+                | DiscoverAttachPlan::Spawn
+                | DiscoverAttachPlan::FailIncompatible
+                | DiscoverAttachPlan::FailUnreachable => {
+                    anyhow::bail!(
+                        "ephemeral daemon owner changed while preparing Assistant promotion"
+                    );
+                }
+            }
+        }
         let response = match client.request_ok(Request::RestartIfIdle).await {
             Ok(response) => response,
             Err(error) if replacement_required => {
@@ -910,6 +973,30 @@ fn persistent_owner_identity(
     let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
     let endpoint = crate::daemon::read_endpoint_record(&canonical)?;
     if endpoint.kind != crate::daemon::DaemonEndpointKind::Persistent
+        || endpoint.socket != paths.socket
+    {
+        return None;
+    }
+    let cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt) =
+        cockpit_host::daemon_lifecycle::read_daemon_pid_record(&canonical.pid_file)?
+    else {
+        return None;
+    };
+    (receipt == endpoint.receipt).then_some((endpoint.socket, receipt))
+}
+
+/// Bind an ephemeral endpoint to the PID receipt published for that exact
+/// generation. Unlike a numeric PID or canonical socket path, this identity
+/// cannot be reused by a successor daemon.
+fn ephemeral_owner_identity(
+    paths: &crate::daemon::DaemonPaths,
+) -> Option<(PathBuf, cockpit_host::daemon_lifecycle::DaemonPidReceipt)> {
+    if !paths.ephemeral {
+        return None;
+    }
+    let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
+    let endpoint = crate::daemon::read_endpoint_record(&canonical)?;
+    if endpoint.kind != crate::daemon::DaemonEndpointKind::Ephemeral
         || endpoint.socket != paths.socket
     {
         return None;

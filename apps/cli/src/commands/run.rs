@@ -254,7 +254,16 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
 
     let seed_unset_trust = args.cwd.is_none() && project_alias.is_none();
 
-    let result = crate::daemon::client::run_one_shot_daemon(|client| {
+    // A session id is mode-blind until Attach reads its durable row. Acquire
+    // a persistent-capable owner first so an Assistant resume cannot enter a
+    // private one-shot daemon; Code and Computer remain valid persistent
+    // sessions as well.
+    let run_daemon = if args.session.is_some() {
+        crate::daemon::client::run_assistant_daemon
+    } else {
+        crate::daemon::client::run_one_shot_daemon
+    };
+    let result = run_daemon(|client| {
         Box::pin(async move {
             // Preflight via daemon RPCs — the CLI never opens SQLite.
             emit_org_logging_indicator_via_daemon(&client, &cwd).await;

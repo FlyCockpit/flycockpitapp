@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
-use crate::daemon::client::{OwnedSessionMode, ensure_persistent_daemon};
+use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, ResolveResponse, Response};
 
 pub async fn run(cmd: SessionCommand) -> Result<()> {
@@ -285,7 +285,10 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let json = args.json;
     let follow = args.follow;
 
-    crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
+    // Session ids do not carry lifecycle mode at the CLI boundary. Resolve a
+    // persistent-capable owner before generic Attach so a durable Assistant
+    // never runs under the command's short-lived ephemeral daemon.
+    crate::daemon::client::run_assistant_daemon(|client| {
         Box::pin(async move {
             let env_snapshot = crate::env_snapshot::EnvSnapshot::from_process(
                 crate::env_snapshot::EnvSnapshotSource::ExplicitCli,

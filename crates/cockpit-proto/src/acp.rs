@@ -974,6 +974,134 @@ mod forwarded_mcp_tests {
     }
 
     #[test]
+    fn every_bounded_forwarded_string_has_exact_scalar_and_utf8_byte_edges() {
+        struct FieldCase {
+            label: &'static str,
+            pointer: &'static str,
+            max_scalars: usize,
+            max_bytes: usize,
+            http: bool,
+        }
+
+        fn candidate(case: &FieldCase, value: String) -> serde_json::Value {
+            let mut declaration = if case.http {
+                json!({
+                    "name": "server",
+                    "transport": {
+                        "type": "http",
+                        "url": "https://example.invalid/mcp",
+                        "headers": [{"name": "x-route", "value": "blue"}]
+                    }
+                })
+            } else {
+                json!({
+                    "name": "server",
+                    "transport": {
+                        "type": "stdio",
+                        "command": "mcp",
+                        "args": ["--stdio"],
+                        "env": [{"name": "ROUTING_HINT", "value": "blue"}]
+                    }
+                })
+            };
+            *declaration.pointer_mut(case.pointer).unwrap() = json!(value);
+            declaration
+        }
+
+        let cases = [
+            FieldCase {
+                label: "declaration name",
+                pointer: "/name",
+                max_scalars: 64,
+                max_bytes: 256,
+                http: false,
+            },
+            FieldCase {
+                label: "stdio command",
+                pointer: "/transport/command",
+                max_scalars: 4_096,
+                max_bytes: 4_096,
+                http: false,
+            },
+            FieldCase {
+                label: "stdio argument",
+                pointer: "/transport/args/0",
+                max_scalars: 8_192,
+                max_bytes: 8_192,
+                http: false,
+            },
+            FieldCase {
+                label: "environment name",
+                pointer: "/transport/env/0/name",
+                max_scalars: 8_192,
+                max_bytes: 8_192,
+                http: false,
+            },
+            FieldCase {
+                label: "environment value",
+                pointer: "/transport/env/0/value",
+                max_scalars: 8_192,
+                max_bytes: 8_192,
+                http: false,
+            },
+            FieldCase {
+                label: "URL",
+                pointer: "/transport/url",
+                max_scalars: 4_096,
+                max_bytes: 4_096,
+                http: true,
+            },
+            FieldCase {
+                label: "header name",
+                pointer: "/transport/headers/0/name",
+                max_scalars: 8_192,
+                max_bytes: 8_192,
+                http: true,
+            },
+            FieldCase {
+                label: "header value",
+                pointer: "/transport/headers/0/value",
+                max_scalars: 8_192,
+                max_bytes: 8_192,
+                http: true,
+            },
+        ];
+        for case in &cases {
+            for (kind, value, accepted) in [
+                ("ASCII scalar max", "a".repeat(case.max_scalars), true),
+                (
+                    "ASCII scalar max+1",
+                    "a".repeat(case.max_scalars + 1),
+                    false,
+                ),
+                (
+                    "multibyte scalar max",
+                    "é".repeat(case.max_scalars),
+                    case.max_scalars * 2 <= case.max_bytes,
+                ),
+                (
+                    "multibyte scalar max+1",
+                    "é".repeat(case.max_scalars + 1),
+                    false,
+                ),
+                ("UTF-8 byte max", "🦀".repeat(case.max_bytes / 4), true),
+                (
+                    "UTF-8 byte max+1",
+                    format!("{}a", "🦀".repeat(case.max_bytes / 4)),
+                    false,
+                ),
+            ] {
+                assert_eq!(
+                    decode_declaration(candidate(case, value)).is_ok(),
+                    accepted,
+                    "{}: {kind}",
+                    case.label
+                );
+            }
+        }
+    }
+
+    #[test]
     fn decoder_rejects_unknowns_duplicates_counts_and_raw_json_escape_hatches() {
         let unknown_variant = json!({
             "name": "server", "transport": {"type": "websocket", "url": "wss://x"}
@@ -992,6 +1120,14 @@ mod forwarded_mcp_tests {
             ]}
         });
         assert!(decode_declaration(duplicate_headers).is_err());
+        let unicode_distinct_headers = json!({
+            "name": "server",
+            "transport": {"type": "http", "url": "https://x", "headers": [
+                {"name": "Ä-Route", "value": "one"},
+                {"name": "ä-route", "value": "two"}
+            ]}
+        });
+        assert!(decode_declaration(unicode_distinct_headers).is_ok());
         let too_many_args = vec!["x"; 65];
         assert!(
             decode_declaration(json!({

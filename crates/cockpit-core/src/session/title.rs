@@ -3,6 +3,39 @@
 use super::*;
 
 impl Session {
+    /// Apply the combined output of the cache-reusing self-metadata fork.
+    /// The durable update is atomic: a manual title or ephemeral session wins
+    /// the race and leaves both generated fields untouched.
+    pub fn set_auto_metadata(
+        &self,
+        title: &str,
+        description: &str,
+        expected_user_content_tokens: usize,
+        expected_metadata_fork_generation: i64,
+    ) -> Result<bool> {
+        let session_id = self.id;
+        let title_for_db = title.to_string();
+        let description_for_db = description.to_string();
+        let updated = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::set_auto_session_metadata_conn(
+                    conn,
+                    session_id,
+                    &title_for_db,
+                    &description_for_db,
+                    expected_user_content_tokens as i64,
+                    expected_metadata_fork_generation,
+                )
+            })
+            .context("setting auto session metadata")?;
+        if updated {
+            *self.title.lock().unwrap() = Some(title.to_string());
+            *self.description.lock().unwrap() = Some(description.to_string());
+        }
+        Ok(updated)
+    }
+
     /// Apply an auto-generated title. No-ops (and returns false) if the
     /// user has manually renamed this session.
     pub fn set_auto_title(&self, title: &str) -> Result<bool> {
@@ -234,6 +267,83 @@ impl Session {
         TitleAction::None
     }
 
+    /// Fold one raw user turn into the same-model metadata-fork cadence. This
+    /// is deliberately keyed to `user_content_turns`, not inference/tool
+    /// rounds: a tool-call storm must not continuously rename or re-describe a
+    /// session. It is the mutually exclusive alternative to
+    /// [`Self::note_user_content`], so it consumes the shared durable slot
+    /// itself rather than racing the utility-title path.
+    pub fn note_user_content_for_metadata(&self, text: &str) -> Option<MetadataWork> {
+        let increment = crate::auto_title::estimate_tokens(text);
+        if increment == 0 {
+            return None;
+        }
+        let user_content_tokens = self
+            .user_content_tokens
+            .fetch_add(increment, Ordering::Relaxed)
+            + increment;
+        let user_turns = self.user_content_turns.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.user_renamed() {
+            self.persist_title_progress();
+            return None;
+        }
+        let last_slot = self.title_stage.load(Ordering::Relaxed);
+        let Some(slot) = scheduled_metadata_slot(user_turns, last_slot) else {
+            self.persist_title_progress();
+            return None;
+        };
+        self.title_stage.store(slot, Ordering::Relaxed);
+        if slot >= 8 && slot <= 16 {
+            self.title_nudge_slot_pending.store(slot, Ordering::Relaxed);
+        }
+        self.persist_title_progress();
+        Some(MetadataWork {
+            action: if slot <= 16 {
+                MetadataAction::TitleAndDescribe
+            } else {
+                MetadataAction::Describe
+            },
+            expected_user_content_tokens: user_content_tokens,
+            expected_metadata_fork_generation: 0,
+        })
+    }
+
+    /// Claim the metadata fork's durable generation immediately before the
+    /// foreground request whose prefix it will reuse. A newer claim or a
+    /// cancellation/drain revocation invalidates this exact work item.
+    pub(crate) fn activate_metadata_fork(&self, mut work: MetadataWork) -> Result<MetadataWork> {
+        let session_id = self.id;
+        work.expected_metadata_fork_generation = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::activate_metadata_fork_conn(conn, session_id)
+            })
+            .context("activating metadata fork")?;
+        Ok(work)
+    }
+
+    /// Revoke only the currently owning generation. The conditional update is
+    /// safe when a newer foreground request has already claimed its own fork.
+    pub(crate) fn revoke_metadata_fork(&self, expected_generation: i64) -> Result<bool> {
+        let session_id = self.id;
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::revoke_metadata_fork_conn(conn, session_id, expected_generation)
+            })
+            .context("revoking metadata fork")
+    }
+
+    /// Queue metadata work only for the imminent root inference.  The turn
+    /// phase consumes it before the provider call and drops it on cancellation
+    /// or error, preventing a stale slot from leaking into a later turn.
+    pub(crate) fn queue_metadata_fork(&self, work: MetadataWork) {
+        *self.pending_metadata_fork.lock().unwrap() = Some(work);
+    }
+
+    pub(crate) fn take_metadata_fork(&self) -> Option<MetadataWork> {
+        self.pending_metadata_fork.lock().unwrap().take()
+    }
+
     fn title_nudge_threshold_reached(&self) -> bool {
         let slot = self.title_stage.load(Ordering::Relaxed);
         TITLE_SCHEDULE_SLOTS.contains(&slot) && slot >= 8
@@ -371,5 +481,129 @@ impl Session {
         }
         *last = Some(now);
         Some(format!("[time: {}]", now.to_rfc3339()))
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn metadata_cadence_uses_user_boundaries_and_describes_at_higher_slots() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-cadence"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        for expected in [
+            MetadataAction::TitleAndDescribe,
+            MetadataAction::TitleAndDescribe,
+            MetadataAction::None,
+            MetadataAction::TitleAndDescribe,
+        ] {
+            assert_eq!(
+                session
+                    .note_user_content_for_metadata("user content")
+                    .map(|work| work.action)
+                    .unwrap_or(MetadataAction::None),
+                expected,
+            );
+        }
+        for _ in 5..=16 {
+            let action = session
+                .note_user_content_for_metadata("user content")
+                .map(|work| work.action)
+                .unwrap_or(MetadataAction::None);
+            if session.user_content_turns() == 8 || session.user_content_turns() == 16 {
+                assert_eq!(action, MetadataAction::TitleAndDescribe);
+            } else {
+                assert_eq!(action, MetadataAction::None);
+            }
+        }
+        for _ in 17..=31 {
+            assert_eq!(
+                session.note_user_content_for_metadata("later user boundary"),
+                None
+            );
+        }
+        assert_eq!(
+            session.note_user_content_for_metadata("next user boundary"),
+            Some(MetadataWork {
+                action: MetadataAction::Describe,
+                expected_user_content_tokens: session.user_content_tokens(),
+                expected_metadata_fork_generation: 0,
+            })
+        );
+        assert_eq!(session.title_stage(), 32);
+    }
+
+    #[test]
+    fn metadata_write_is_fenced_to_its_user_boundary_and_accepts_unicode_contract() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-write-fence"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let first = session
+            .activate_metadata_fork(
+                session
+                    .note_user_content_for_metadata("first boundary")
+                    .expect("first boundary schedules metadata"),
+            )
+            .expect("activating first metadata fork");
+        let second = session
+            .activate_metadata_fork(
+                session
+                    .note_user_content_for_metadata("newer boundary")
+                    .expect("second boundary schedules metadata"),
+            )
+            .expect("activating second metadata fork");
+
+        assert!(
+            !session
+                .set_auto_metadata(
+                    "stale-title",
+                    "stale description",
+                    first.expected_user_content_tokens,
+                    first.expected_metadata_fork_generation,
+                )
+                .unwrap(),
+            "an older fork must not publish over newer user content"
+        );
+        assert!(
+            session
+                .set_auto_metadata(
+                    "fresh-title",
+                    &"😀".repeat(1000),
+                    second.expected_user_content_tokens,
+                    second.expected_metadata_fork_generation,
+                )
+                .unwrap()
+        );
+
+        assert!(
+            session
+                .revoke_metadata_fork(second.expected_metadata_fork_generation)
+                .unwrap(),
+            "the active generation is revocable on cancellation or drain"
+        );
+        assert!(
+            !session
+                .set_auto_metadata(
+                    "revoked-title",
+                    "a cancelled fork must not publish metadata",
+                    second.expected_user_content_tokens,
+                    second.expected_metadata_fork_generation,
+                )
+                .unwrap(),
+            "the durable lifecycle generation fences a write after revocation"
+        );
     }
 }

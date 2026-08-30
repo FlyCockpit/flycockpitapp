@@ -2748,6 +2748,10 @@ impl std::error::Error for GoalMutationRejected {}
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
         proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
+        // This is an independent owner acknowledgement for the storage page;
+        // do not reuse the autostart flag or clients will suppress the wrong
+        // contextual guidance.
+        proto::AppFlagKey::StorageManagementHint => "storage-management-hint",
     }
 }
 
@@ -5733,6 +5737,93 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::AttachKnowledgeBaseSession {
+            knowledge_base_id,
+            session_id,
+        } => {
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let root = crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                &session.project_root,
+            )?;
+            let lock =
+                crate::knowledge::dream::knowledge_dream_lock_for_root(&root, &knowledge_base_id);
+            let _guard = lock.lock().await;
+            ctx.db
+                .attach_session_to_knowledge_base(&knowledge_base_id, root.as_str(), session_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+        Request::DetachKnowledgeBaseSession {
+            knowledge_base_id,
+            session_id,
+        } => {
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_persisted_canonical_root(
+                    &session.project_root,
+                )
+                .map_err(internal)?;
+            let lock =
+                crate::knowledge::dream::knowledge_dream_lock_for_root(&root, &knowledge_base_id);
+            let _guard = lock.lock().await;
+            ctx.db
+                .detach_session_from_knowledge_base(&knowledge_base_id, root.as_str(), session_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+        Request::RunKnowledgeDream { .. } | Request::KnowledgeDreamStatus { .. } => {
+            Err(ErrorPayload {
+                code: ErrorCode::Unavailable,
+                message: "knowledge dream execution is not available in this daemon build".into(),
+            })
+        }
+        Request::CancelAllSessionWork => {
+            let attached = require_attached(state)?;
+            attached
+                .handle
+                .send_work(SessionWork::CancelAll)
+                .await
+                .map_err(session_work_error)?;
+            Ok(Response::Ack)
+        }
+        Request::PromoteToPersistent => Err(ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message: "in-place daemon promotion is not available in this daemon build".into(),
+        }),
+        Request::ExitGuardStatus => {
+            let (has_schedules, processing, tool_running) =
+                require_attached(state)?.handle.live_status();
+            Ok(Response::ExitGuardStatus {
+                ephemeral_owner: ctx.paths.ephemeral,
+                has_live_work: has_schedules || processing || tool_running,
+            })
+        }
+        Request::ReleaseExitGuard => {
+            require_attached(state)?;
+            Ok(Response::Ack)
+        }
+        Request::ResumeFromCompaction => Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "resume compaction requires an offered interactive away-resume choice".into(),
+        }),
         Request::CreateCodeRootWithAcpIngressV1(request) => {
             let service = ctx
                 .acp_catalog_composition
@@ -8866,6 +8957,39 @@ async fn handle_serialized_request_impl(
                 config_generation: inventory::current_config_generation(),
             })
         }
+        Request::SetWorkspaceHistoryScope {
+            project_root,
+            outbound,
+            inbound,
+        } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root).map_err(internal)?;
+            ctx.db
+                .set_workspace_history_scope(
+                    &project_id,
+                    crate::db::history_scope::WorkspaceHistoryScope { outbound, inbound },
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope { outbound, inbound })
+        }
+        Request::GetWorkspaceHistoryScope { project_root } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root).map_err(internal)?;
+            let scope = ctx
+                .db
+                .workspace_history_scope(&project_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope {
+                outbound: scope.outbound,
+                inbound: scope.inbound,
+            })
+        }
         Request::GetStartupDisclosures { project_root: _ } => {
             #[cfg(not(feature = "remote"))]
             return Ok(Response::StartupDisclosures {
@@ -8944,6 +9068,11 @@ async fn handle_serialized_request_impl(
                 changed,
             })
         }
+        Request::GetStorageReport => super::storage::report(ctx).await,
+        Request::PreviewStorageCleanup { target } => super::storage::preview(ctx, target).await,
+        Request::ExecuteStorageCleanup { preview_id } => {
+            super::storage::execute(ctx, preview_id).await
+        }
         Request::ResolveAssistantSession {
             assistant_id,
             project_root,
@@ -8984,8 +9113,9 @@ async fn handle_serialized_request_impl(
                         )? {
                             Some(row) => (row, false),
                             None => {
-                                let project_id =
-                                    crate::session::project_id_for(Path::new(&project_root_for_db));
+                                let project_id = crate::session::project_id_for(
+                                    Path::new(&project_root_for_db),
+                                )?;
                                 let row = crate::db::Db::build_new_assistant_session_row_conn(
                                     conn,
                                     &project_id,
@@ -15185,16 +15315,16 @@ async fn handle_serialized_request_impl(
                         .map_err(bad_config)?
                         .ok_or_else(|| bad_request(format!("agent `{agent}` was not found")))?;
                     let catalog = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
-                        &cwd, 0, &def,
+                        &cwd, &def,
                     )
                     .catalog();
-                    let entry = catalog.servers.get(&server).ok_or_else(|| {
+                    let entry = catalog.get(&server).ok_or_else(|| {
                         bad_request(format!("MCP server `{server}` is not available to agent `{agent}`"))
                     })?;
                     if !entry.agent_bound {
                         return Err(bad_request(format!(
                             "MCP OAuth agent selector requires an agent-package server; `{server}` comes from {} scope",
-                            entry.source.as_str()
+                            entry.source().as_str()
                         )));
                     }
                     if entry.profile != profile {
@@ -15203,7 +15333,11 @@ async fn handle_serialized_request_impl(
                             entry.profile
                         )));
                     }
-                    entry.server.clone()
+                    entry.persistent_server().cloned().ok_or_else(|| {
+                        bad_request(format!(
+                            "agent `{agent}` selected built-in MCP server `{server}`, which has no OAuth configuration"
+                        ))
+                    })?
                 } else {
                     let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
                     let config = mcp_config_from_paths(&paths)?;
@@ -21214,13 +21348,12 @@ fn redacted_mcp_config_snapshot(
         crate::mcp::resolver::discover_effective_catalog(cwd)
     });
     let mut shadowed = catalog
-        .shadowed
-        .iter()
+        .shadowed_entries()
         .filter_map(|entry| {
             entry.shadowed_by.map(|shadowed_by| {
                 serde_json::json!({
-                    "server": entry.name,
-                    "source": entry.source.as_str(),
+                    "server": entry.name(),
+                    "source": entry.source().as_str(),
                     "shadowed_by": shadowed_by.as_str(),
                 })
             })
@@ -21231,18 +21364,18 @@ fn redacted_mcp_config_snapshot(
             continue;
         };
         let agent_catalog =
-            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, 0, &def).catalog();
-        shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
+            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, &def).catalog();
+        shadowed.extend(agent_catalog.shadowed_entries().filter_map(|entry| {
             let shadowed_by = entry.shadowed_by?;
-            if entry.source != crate::mcp::resolver::McpScope::Agent
+            if entry.source() != crate::mcp::resolver::McpScope::Agent
                 && shadowed_by != crate::mcp::resolver::McpScope::Agent
             {
                 return None;
             }
             Some(serde_json::json!({
                 "agent": listing.name,
-                "server": entry.name,
-                "source": entry.source.as_str(),
+                "server": entry.name(),
+                "source": entry.source().as_str(),
                 "shadowed_by": shadowed_by.as_str(),
             }))
         }));
@@ -26329,7 +26462,9 @@ async fn finish_session_setup_snapshot(
 ) -> std::result::Result<cockpit_proto::SessionSetupSnapshotV1, ErrorPayload> {
     let last_used = ctx
         .db
-        .last_used_root_agent_for_project(&crate::session::project_id_for(project_root))
+        .last_used_root_agent_for_project(
+            &crate::session::project_id_for(project_root).map_err(internal)?,
+        )
         .await
         .ok()
         .flatten();
@@ -27196,6 +27331,10 @@ async fn code_root_read_from_attached_response(
         history,
         paused_work,
         repair_required,
+        // The ACP Code-root projection deliberately does not transfer this
+        // interactive, one-shot capability. It may only be consumed by the
+        // attach response that issued it.
+        resume_compaction_offer: _,
         daemon_version,
         compatible,
         env_baseline,
@@ -27830,6 +27969,11 @@ pub(super) async fn attach(
             .as_ref()
             .and_then(|att| att.handle.repair_required())
             .map(Box::new),
+        // An away-resume offer is minted and consumed through the driver work
+        // protocol, not reconstructed during an ordinary attach. In
+        // particular, an ACP Code-root attach must never acquire that
+        // one-shot interactive authority by replaying this response.
+        resume_compaction_offer: None,
         daemon_version: proto::DAEMON_VERSION.to_string(),
         compatible: proto::is_protocol_compatible(client_protocol_version),
         env_baseline: Some(env_baseline_meta),
@@ -28395,8 +28539,15 @@ async fn run_docs_ask_pipeline(
     package: Option<String>,
     question: String,
 ) -> std::result::Result<String, String> {
-    let session = crate::session::Session::create(db.clone(), cwd.clone(), "docs", resolver, vault)
-        .map_err(|error| format!("creating docs ask session: {error:#}"))?;
+    let session = crate::session::Session::create(
+        db.clone(),
+        cwd.clone(),
+        "docs",
+        &extended,
+        resolver,
+        vault,
+    )
+    .map_err(|error| format!("creating docs ask session: {error:#}"))?;
     // Install the daemon command-secret cache so this session's sync redaction
     // and model builds inject the (already pre-resolved) command outputs.
     session.set_command_secret_cache(Some(command_secret_cache));
@@ -28471,10 +28622,14 @@ async fn run_docs_ask_pipeline(
         cwd: cwd.clone(),
         config: config.clone(),
         session_short_id: session.short_id(),
+        workspace_scratch_dir: session.workspace_scratch_dir(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+        knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
         interactive: false,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd.clone())
+            .catalog(),
         model_override: None,
         delegation_model: None,
         delegated: true,
@@ -28490,6 +28645,7 @@ async fn run_docs_ask_pipeline(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        dream_read_scope: session.dream_read_scope(),
         workspace_lease: None,
         credential_store: Some(store),
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
@@ -28570,8 +28726,11 @@ fn parse_sealed_owner_scope_kind(
         "session" => Ok(crate::db::sealed_scope::SealedScopeKind::Session),
         "project" => Ok(crate::db::sealed_scope::SealedScopeKind::Project),
         "global" => Ok(crate::db::sealed_scope::SealedScopeKind::Global),
+        "knowledge_base" => Ok(crate::db::sealed_scope::SealedScopeKind::KnowledgeBase),
         other => {
-            anyhow::bail!("scope kind must be `session`, `project`, or `global`, got `{other}`")
+            anyhow::bail!(
+                "scope kind must be `session`, `project`, `global`, or `knowledge_base`, got `{other}`"
+            )
         }
     }
 }
@@ -28680,6 +28839,12 @@ fn build_sealed_scope_ref(
             SealedProjectKey::from_canonical(key),
         )),
         crate::db::sealed_scope::SealedScopeKind::Global => Ok(SealedScopeRef::Global),
+        crate::db::sealed_scope::SealedScopeKind::KnowledgeBase => {
+            Ok(SealedScopeRef::KnowledgeBase(
+                crate::sealed::SealedKnowledgeBaseId::parse(&key)
+                    .context("knowledge-base scope key must be a knowledge-base id")?,
+            ))
+        }
     }
 }
 
@@ -28732,6 +28897,12 @@ fn sealed_record_row_to_inventory_item(
         crate::db::sealed_scope::SealedScopeKind::Session => proto::SealedOwnerScopeKind::Session,
         crate::db::sealed_scope::SealedScopeKind::Project => proto::SealedOwnerScopeKind::Project,
         crate::db::sealed_scope::SealedScopeKind::Global => proto::SealedOwnerScopeKind::Global,
+        // KB entries are owner-readable metadata, but their literal lifecycle
+        // remains in KnowledgeBaseSealedStore rather than the generic owner
+        // recovery flow.
+        crate::db::sealed_scope::SealedScopeKind::KnowledgeBase => {
+            proto::SealedOwnerScopeKind::KnowledgeBase
+        }
     };
     proto::SealedOwnerInventoryItem {
         record_id: row.record_id,

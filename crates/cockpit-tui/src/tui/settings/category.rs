@@ -353,6 +353,7 @@ pub(super) enum SettingId {
 
     // ── Behavior ─────────────────────────────────────────────────────
     DefaultPrimaryAgent,
+    BackgroundAgents,
     ApprovalMode,
     SandboxEscalationEnabled,
     PredictNextMessage,
@@ -454,6 +455,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::AttentionDesktop,
     SettingId::ExitTailLines,
     SettingId::DefaultPrimaryAgent,
+    SettingId::BackgroundAgents,
     SettingId::ApprovalMode,
     SettingId::SandboxEscalationEnabled,
     SettingId::PredictNextMessage,
@@ -557,6 +559,7 @@ impl SettingId {
             SettingId::AttentionDesktop => "attention desktop",
             SettingId::ExitTailLines => "exit tail lines",
             SettingId::DefaultPrimaryAgent => "default agent",
+            SettingId::BackgroundAgents => "background agents",
             SettingId::ApprovalMode => "approval mode",
             SettingId::SandboxEscalationEnabled => "sandbox escalation",
             SettingId::PredictNextMessage => "predict next message",
@@ -752,6 +755,13 @@ impl SettingId {
                 "Which agent a brand-new session starts on. `build` starts on the \
                  coding agent; `plan` starts on the planning agent. You can still \
                  switch any time with /build or /plan."
+            }
+            SettingId::BackgroundAgents => {
+                "Keep agents running in the background after I close all windows. \
+                 On (default) starts a persistent ledger owner when one is needed; \
+                 off starts a reference-counted owner that stops agents and owned \
+                 processes after the last client closes. A running persistent owner \
+                 is always reused."
             }
             SettingId::ApprovalMode => {
                 "When a command needs approval to leave the sandbox. `manual` \
@@ -1839,6 +1849,7 @@ fn category_rows(category: Category) -> Vec<Row> {
         ],
         Category::Behavior => vec![
             Setting(S::DefaultPrimaryAgent),
+            Setting(S::BackgroundAgents),
             Setting(S::ApprovalMode),
             Setting(S::SandboxEscalationEnabled),
             Setting(S::PredictNextMessage),
@@ -2077,6 +2088,11 @@ impl SettingsCx {
             S::DefaultPrimaryAgent => {
                 default_primary_agent_label(e.default_primary_agent).to_string()
             }
+            S::BackgroundAgents => on_off(
+                e.daemon.background_agents,
+                "on (default — keep agents running after all windows close)",
+                "off (stop agents after the last window closes)",
+            ),
             S::ApprovalMode => approval_mode_label(e.default_approval_mode).to_string(),
             S::SandboxEscalationEnabled => on_off(
                 e.sandbox_escalation_enabled,
@@ -3009,6 +3025,7 @@ impl SettingsCx {
             S::DefaultPrimaryAgent => {
                 e.default_primary_agent = e.default_primary_agent.cycled();
             }
+            S::BackgroundAgents => e.daemon.background_agents = !e.daemon.background_agents,
             S::ApprovalMode => e.default_approval_mode = e.default_approval_mode.cycled(),
             S::SandboxEscalationEnabled => {
                 e.sandbox_escalation_enabled = !e.sandbox_escalation_enabled
@@ -3542,6 +3559,7 @@ impl SettingsCx {
                 let d = cockpit_config::extended::ExtendedConfig::default();
                 let e = &mut self.extended;
                 e.default_primary_agent = d.default_primary_agent;
+                e.daemon.background_agents = d.daemon.background_agents;
                 e.default_approval_mode = d.default_approval_mode;
                 e.sandbox_escalation_enabled = d.sandbox_escalation_enabled;
                 e.predict_next_message = d.predict_next_message;
@@ -3790,6 +3808,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::SandboxDefaultMode => &["sandbox", "defaultMode"],
         S::SandboxDockerfile => &["sandbox", "dockerfile"],
         S::DefaultPrimaryAgent => &["defaultPrimaryAgent"],
+        S::BackgroundAgents => &["daemon", "background_agents"],
         S::PredictNextMessage => &["predictNextMessage"],
         S::QueuedMessagesAsSteering => &["queuedMessagesAsSteering"],
         S::ShellCompression => &["shellCompression"],
@@ -4796,6 +4815,25 @@ mod descriptor_tests {
         assert_eq!(
             SettingId::ApprovalMode.descriptor().help,
             "When a command needs approval to leave the sandbox. `manual` (default) asks you — you are the gate; `auto` lets the utility-model safety gate approve when possible and asks when unsafe or unavailable; `yolo` runs without approval prompts. Distinct from the `auto` *agent*."
+        );
+    }
+
+    #[test]
+    fn background_agents_is_a_persisted_behavior_toggle() {
+        assert_eq!(SettingId::BackgroundAgents.label(), "background agents");
+        assert!(
+            SettingId::BackgroundAgents
+                .help_text()
+                .contains("Keep agents running in the background after I close all windows.")
+        );
+        assert_eq!(
+            setting_json_path(SettingId::BackgroundAgents),
+            Some(&["daemon", "background_agents"] as &[&str])
+        );
+        assert!(
+            category_rows(Category::Behavior)
+                .iter()
+                .any(|row| matches!(row, Row::Setting(SettingId::BackgroundAgents)))
         );
     }
 }

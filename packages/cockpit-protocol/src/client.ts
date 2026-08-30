@@ -19,6 +19,9 @@ import {
   parseListSessionsResult,
   parseSessionLiveStatusResult,
   parseSessionMessagesResult,
+  parseStorageCleanupCompletedResult,
+  parseStorageCleanupPreviewResult,
+  parseStorageReportResult,
   parseUserMessageQueuedResult,
   type ResolveResponse,
   serverMessageSchema,
@@ -377,6 +380,29 @@ export class RemoteSessionClient {
     );
   }
 
+  async getStorageReport() {
+    return parseStorageReportResult(await this.send({ request: "get_storage_report" }));
+  }
+
+  async dismissStorageManagementHint(expected_version: number) {
+    await this.send({
+      request: "mark_app_flag_seen",
+      params: { key: "storage_management_hint", expected_version },
+    });
+  }
+
+  async previewStorageCleanup(params: ParamsOf<"preview_storage_cleanup">) {
+    return parseStorageCleanupPreviewResult(
+      await this.send({ request: "preview_storage_cleanup", params }),
+    );
+  }
+
+  async executeStorageCleanup(preview_id: string) {
+    return parseStorageCleanupCompletedResult(
+      await this.send({ request: "execute_storage_cleanup", params: { preview_id } }),
+    );
+  }
+
   async archiveSession(session_id: string, cascade = false) {
     return parseAckResult(
       await this.send({ request: "archive_session", params: { session_id, cascade } }),
@@ -403,10 +429,6 @@ export class RemoteSessionClient {
     return parseAckResult(
       await this.send({ request: "share_session", params: { session_id, shared } }),
     );
-  }
-
-  async deleteSession(session_id: string) {
-    return parseAckResult(await this.send({ request: "delete_session", params: { session_id } }));
   }
 
   async setActiveModel(params: ParamsOf<"set_active_model">) {

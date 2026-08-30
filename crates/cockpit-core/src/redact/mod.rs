@@ -929,6 +929,7 @@ impl PersistedEntry {
 /// A built lookup of `value → origin-name` pairs the next outbound
 /// request must be scrubbed against. Hold one per session (cheap to
 /// rebuild; small in-memory footprint).
+#[derive(Clone)]
 pub struct RedactionTable {
     /// Aho-Corasick search structure; `None` when there's nothing to
     /// scrub or redaction is disabled. Keeping it `Option` lets
@@ -2636,9 +2637,8 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/session/recording.rs",
         "crates/cockpit-core/src/skills/auto_select/mod.rs",
-        "crates/cockpit-core/src/tools/artifact_read.rs",
-        "crates/cockpit-core/src/tools/artifact_search.rs",
         "crates/cockpit-core/src/tools/read.rs",
+        "crates/cockpit-core/src/tools/recall.rs",
         "crates/cockpit-core/src/tools/skill.rs",
     ];
 

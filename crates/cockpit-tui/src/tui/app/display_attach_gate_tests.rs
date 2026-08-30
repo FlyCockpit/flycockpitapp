@@ -1,11 +1,10 @@
 use super::should_attempt_display_attach;
 use std::cell::Cell;
 
-/// The happy path: no runner, prompt closed, believed
-/// connected, and the daemon answers → attach.
+/// The happy path: no runner, believed connected, and the daemon answers → attach.
 #[test]
 fn attaches_when_daemon_reachable() {
-    assert!(should_attempt_display_attach(false, false, true, || true));
+    assert!(should_attempt_display_attach(false, true, || true));
 }
 
 /// A runner already exists → no attach, and the probe is never run
@@ -13,7 +12,7 @@ fn attaches_when_daemon_reachable() {
 #[test]
 fn skips_when_runner_exists_without_probing() {
     let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(true, false, true, || {
+    let attach = should_attempt_display_attach(true, true, || {
         probed.set(true);
         true
     });
@@ -21,24 +20,11 @@ fn skips_when_runner_exists_without_probing() {
     assert!(!probed.get(), "must not probe once a runner exists");
 }
 
-/// The "daemon not running" prompt is still open → don't spawn a daemon
-/// out from under the user's choice; probe is skipped.
-#[test]
-fn skips_while_prompt_open() {
-    let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(false, true, true, || {
-        probed.set(true);
-        true
-    });
-    assert!(!attach);
-    assert!(!probed.get());
-}
-
 /// `daemon_connected` is false → no attach, no probe.
 #[test]
 fn skips_when_not_connected() {
     let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(false, false, false, || {
+    let attach = should_attempt_display_attach(false, false, || {
         probed.set(true);
         true
     });
@@ -51,5 +37,5 @@ fn skips_when_not_connected() {
 /// is the "Start and connect" startup gap that previously double-spawned.
 #[test]
 fn waits_when_socket_not_yet_bound() {
-    assert!(!should_attempt_display_attach(false, false, true, || false));
+    assert!(!should_attempt_display_attach(false, true, || false));
 }

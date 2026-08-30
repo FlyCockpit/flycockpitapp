@@ -10,6 +10,9 @@ import type {
   HistoryPageResult,
   InterruptQuestion,
   ResumeRepairState,
+  StorageCleanupCompletedResult,
+  StorageCleanupPreviewResult,
+  StorageReportResult,
   HistoryEntry as WireHistoryEntry,
   SessionSummary as WireSessionSummary,
 } from "@flycockpit/cockpit-protocol";
@@ -49,6 +52,7 @@ export type WebSessionSummary = {
   projectId: string;
   projectRoot: string;
   title: string;
+  description?: string;
   shortId?: string;
   status: string;
   archived: boolean;
@@ -215,6 +219,16 @@ type RemoteSessionState = {
   loadProjects: (instanceId: string) => Promise<void>;
   loadSessions: (instanceId: string, projectRoot: string) => Promise<void>;
   loadStatsRollup: (instanceId: string, projectId: string) => Promise<void>;
+  getStorageReport: (instanceId: string) => Promise<StorageReportResult>;
+  dismissStorageManagementHint: (instanceId: string, expectedVersion: number) => Promise<void>;
+  previewStorageCleanup: (
+    instanceId: string,
+    target: Parameters<RemoteSessionClient["previewStorageCleanup"]>[0]["target"],
+  ) => Promise<StorageCleanupPreviewResult>;
+  executeStorageCleanup: (
+    instanceId: string,
+    previewId: string,
+  ) => Promise<StorageCleanupCompletedResult>;
   attach: (instanceId: string, sessionId: string) => Promise<void>;
   loadOlderHistory: (instanceId: string, sessionId: string) => Promise<void>;
   createSession: (
@@ -707,6 +721,7 @@ export function toWebSessionSummary(session: WireSessionSummary): WebSessionSumm
     projectId: session.project_id,
     projectRoot: session.project_root,
     title: session.title ?? session.short_id ?? session.session_id,
+    description: session.description ?? undefined,
     shortId: session.short_id,
     status: stringField(raw, "activity_state") ?? "idle",
     archived: booleanField(raw, "archived") ?? false,
@@ -1940,6 +1955,26 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
         statsRollupByProject: { ...current.statsRollupByProject, [projectId]: rollup },
       })),
     }));
+  },
+  getStorageReport: async (instanceId) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    return client.getStorageReport();
+  },
+  dismissStorageManagementHint: async (instanceId, expectedVersion) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    await client.dismissStorageManagementHint(expectedVersion);
+  },
+  previewStorageCleanup: async (instanceId, target) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    return client.previewStorageCleanup({ target });
+  },
+  executeStorageCleanup: async (instanceId, previewId) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    return client.executeStorageCleanup(previewId);
   },
   attach: async (instanceId, sessionId) => {
     const initial = get();

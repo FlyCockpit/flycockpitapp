@@ -1362,6 +1362,41 @@ async fn read_image_tool_call_media_reference() {
     drop(setup);
 }
 
+#[tokio::test]
+async fn read_image_path_cannot_admit_a_trust_required_knowledge_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge = tmp.path().join(".cockpit/knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        r#"{"knowledgeBases":[{"id":"private","name":"Private","description":"Private local knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(knowledge.join("protected.png"), test_image_4x4()).unwrap();
+
+    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let authority = Arc::new(test_authority_with_attachment(
+        *ctx.session.id.as_bytes(),
+        [0x44; 16],
+        test_image_4x4(),
+    ));
+    let ctx = ctx.with_media_authority(authority);
+
+    let error = ReadImageTool
+        .call(
+            json!({"source": {"path": ".cockpit/knowledge/protected.png"}}),
+            &ctx,
+        )
+        .await
+        .expect_err("an untrusted model must not admit a protected KB image");
+    assert!(
+        error
+            .to_string()
+            .contains("local knowledge base that requires a trusted model"),
+        "unexpected error: {error:#}"
+    );
+}
+
 #[test]
 fn read_image_tool_source_swap() {
     let original = test_image_4x4();

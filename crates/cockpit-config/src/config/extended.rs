@@ -30,7 +30,7 @@ mod resource_scheduler;
 pub mod tui;
 
 #[allow(unused_imports)]
-pub use daemon::{DaemonAutostart, DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
+pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
 #[allow(unused_imports)]
 pub use data_syntax::DataSyntaxConfig;
 #[allow(unused_imports)]
@@ -72,6 +72,197 @@ pub use tui::{
     ToolCommandTemplate, TuiConfig, VimModeSetting, WebConfig, WebCustomConfig, WebProvider,
     validate_web_custom_placeholders,
 };
+
+/// A named knowledge base available to a workspace.  The source stays an
+/// explicit provider-neutral reference so callers do not need to care whether
+/// retrieval is local today or hosted in a future deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeBaseRegistryEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub source: KnowledgeBaseSource,
+    #[serde(rename = "embeddingOwnership")]
+    pub embedding_ownership: KnowledgeBaseEmbeddingOwnership,
+    #[serde(
+        rename = "dreamModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dream_model: Option<String>,
+    #[serde(
+        rename = "dreamSchedule",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dream_schedule: Option<String>,
+    /// Local-KB access policy. When enabled, only a provider/model explicitly
+    /// configured as trusted may read or write this KB, including through its
+    /// dream model. It does not disable content redaction. Remote KBs cannot
+    /// enforce client-side model trust and are rejected when this is enabled.
+    #[serde(rename = "trustRequired", default)]
+    pub trust_required: bool,
+    #[serde(rename = "mergePolicy")]
+    pub merge_policy: KnowledgeBaseMergePolicy,
+
+    // Workspace configuration does not get to assert a durable attachment
+    // identity. For configured KBs the identity is derived from `source`, so
+    // replacing a source cannot retain its predecessor's dream watermark.
+    // Installed assistants are host-owned attachments whose installation ID is
+    // assigned outside the workspace configuration document.
+    #[serde(skip)]
+    attachment_identity: Option<uuid::Uuid>,
+}
+
+impl KnowledgeBaseRegistryEntry {
+    pub fn new(
+        id: String,
+        name: String,
+        description: String,
+        source: KnowledgeBaseSource,
+        embedding_ownership: KnowledgeBaseEmbeddingOwnership,
+        dream_model: Option<String>,
+        dream_schedule: Option<String>,
+        trust_required: bool,
+        merge_policy: KnowledgeBaseMergePolicy,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            source,
+            embedding_ownership,
+            dream_model,
+            dream_schedule,
+            trust_required,
+            merge_policy,
+            attachment_identity: None,
+        }
+    }
+
+    /// Return the identity used to scope durable dream state.
+    ///
+    /// A host-owned installer, or the local attachment resolver, may bind a
+    /// concrete identity. Unbound workspace entries use a deterministic
+    /// provisional source identity so configuration validation can identify
+    /// duplicates before a local source is resolved. Durable consumers must
+    /// resolve local sources before using that provisional identity.
+    pub fn attachment_id(&self) -> uuid::Uuid {
+        self.attachment_identity
+            .unwrap_or_else(|| source_attachment_identity(&self.source))
+    }
+
+    /// Bind a concrete attachment identity assigned by its owning resolver.
+    ///
+    /// This is deliberately not serializable: a workspace configuration cannot
+    /// retain or assert this identity.
+    pub fn with_bound_attachment_identity(mut self, attachment_id: uuid::Uuid) -> Self {
+        self.attachment_identity = Some(attachment_id);
+        self
+    }
+
+    /// Whether an installer or source resolver has bound a concrete identity.
+    pub fn has_bound_attachment_identity(&self) -> bool {
+        self.attachment_identity.is_some()
+    }
+}
+
+/// Validate the KB policy that does not depend on the provider catalog.
+/// Remote KBs are served to arbitrary third-party agents, so a local-model
+/// trust promise is unenforceable and must be rejected at config load time.
+pub fn validate_knowledge_base_local_policy(entries: &[KnowledgeBaseRegistryEntry]) -> Result<()> {
+    for entry in entries {
+        if matches!(&entry.source, KnowledgeBaseSource::Remote { .. }) && entry.trust_required {
+            anyhow::bail!(
+                "knowledge base `{}` is remote and cannot set trustRequired; trustRequired is only enforceable for local knowledge bases",
+                entry.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate trust-required KBs against the effective provider catalog. This is
+/// intentionally a configuration boundary: a dream model that cannot access
+/// its KB must never be selected or persisted and only fail later at runtime.
+pub fn validate_knowledge_base_registry(
+    entries: &[KnowledgeBaseRegistryEntry],
+    providers: &crate::config::providers::ProvidersConfig,
+) -> Result<()> {
+    validate_knowledge_base_local_policy(entries)?;
+    for entry in entries {
+        if !entry.trust_required {
+            continue;
+        }
+        let Some(selector) = entry
+            .dream_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+        else {
+            continue;
+        };
+        let (provider, model) = selector
+            .split_once(':')
+            .or_else(|| selector.split_once('/'))
+            .filter(|(provider, model)| !provider.trim().is_empty() && !model.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge base `{}` dreamModel `{selector}` must use provider:model or provider/model",
+                    entry.id
+                )
+            })?;
+        if !providers
+            .resolve_trust(provider.trim(), model.trim())
+            .is_trusted()
+        {
+            anyhow::bail!(
+                "knowledge base `{}` requires a trusted dreamModel; `{selector}` is untrusted",
+                entry.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn source_attachment_identity(source: &KnowledgeBaseSource) -> uuid::Uuid {
+    let mut name = b"flycockpit/knowledge-attachment/v1\0".to_vec();
+    match source {
+        KnowledgeBaseSource::Local { path } => {
+            name.extend_from_slice(b"local\0");
+            name.extend_from_slice(path.to_string_lossy().as_bytes());
+        }
+        KnowledgeBaseSource::Remote { url } => {
+            name.extend_from_slice(b"remote\0");
+            name.extend_from_slice(url.as_bytes());
+        }
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum KnowledgeBaseSource {
+    Local { path: PathBuf },
+    Remote { url: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum KnowledgeBaseEmbeddingOwnership {
+    #[default]
+    Local,
+    RemoteOwned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KnowledgeBaseMergePolicy {
+    #[default]
+    Auto,
+    Review,
+}
 
 #[cfg(test)]
 use guards::{resolve_injection_guard_from_paths, resolve_preflight_from_paths};
@@ -189,10 +380,15 @@ pub struct ExtendedConfig {
     /// prompt-injection guard when enabled, and similar small tasks.
     /// Identifier format mirrors the primary model selector
     /// (`"<provider>:<model-id>"`). Unset disables every
-    /// utility-model-dependent feature — auto-titling is skipped and
-    /// sessions display their short id as the label.
+    /// utility-model-dependent feature. Session titling falls back to the
+    /// cache-reusing active-model metadata fork when this is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utility_model: Option<String>,
+
+    /// Default model for knowledge-base dream orchestration. A KB-specific
+    /// `dreamModel` wins; this value then falls back to `utility_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream_model: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation_model: Option<String>,
@@ -211,6 +407,12 @@ pub struct ExtendedConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
+
+    /// Prefer the active session model for the cache-reusing, ephemeral
+    /// title-and-description fork. When no utility title model is configured,
+    /// Cockpit also takes this path automatically.
+    #[serde(default)]
+    pub auto_title_with_session_model: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_injection: Option<String>,
@@ -243,11 +445,10 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
 
-    /// Enable the trust-gated `.cockpit/knowledge/` project OKF bundle.
-    /// Assistant-owned bundles are discovered independently from assistant
-    /// home directories; this flag only controls the project attach point.
-    #[serde(default)]
-    pub project_knowledge: bool,
+    /// Named knowledge bases available to this workspace. Agent definitions
+    /// may narrow this registry through `allowedKnowledgeBases`.
+    #[serde(default, rename = "knowledgeBases")]
+    pub knowledge_bases: Vec<KnowledgeBaseRegistryEntry>,
 
     /// Maximum model-context budget for automatic cited knowledge injection.
     #[serde(default = "default_knowledge_inject_max_tokens")]
@@ -1474,6 +1675,21 @@ impl ExtendedConfig {
             .or(self.utility_model.as_deref())
     }
 
+    /// Resolve the workspace-level half of the dream-model cascade. The
+    /// per-KB override is applied by the knowledge engine.
+    pub fn dream_model_ref(&self) -> Option<&str> {
+        self.dream_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                self.utility_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+            })
+    }
+
     /// The model ref for drafting the `/compact` handoff brief: the
     /// dedicated `compact_model` when set and non-empty (after trimming),
     /// else the shared `utility_model`. An unset/empty result means "use
@@ -1530,19 +1746,21 @@ impl Default for ExtendedConfig {
             allow_computer_guidance_proposals: None,
             allow_remote_config: false,
             utility_model: None,
+            dream_model: None,
             translation_model: None,
             cheap_code: None,
             smart_code: None,
             reasoning: None,
             agent_chooses_subagent_model: false,
             auto_title: None,
+            auto_title_with_session_model: false,
             skill_injection: None,
             predict_next_message_model: None,
             harness_report_summarization: None,
             compact_model: None,
             btw_model: None,
             embedding_model: None,
-            project_knowledge: false,
+            knowledge_bases: Vec::new(),
             knowledge_inject_max_tokens: default_knowledge_inject_max_tokens(),
             compact_prompt: None,
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
@@ -1876,9 +2094,12 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
         }
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
+    let config = resolve_loaded_docs(&docs);
+    validate_knowledge_base_registry(&config.knowledge_bases, &providers)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
-        config: resolve_loaded_docs(&docs),
+        config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
     })
@@ -1928,6 +2149,8 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
     let config = resolve_loaded_docs(&docs);
+    validate_knowledge_base_registry(&config.knowledge_bases, &providers)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
         config,
@@ -2514,13 +2737,32 @@ impl ExtendedConfigDoc {
         parse_field!("reasoning", reasoning);
         parse_field!("agent_chooses_subagent_model", agent_chooses_subagent_model);
         parse_field!("auto_title", auto_title);
+        parse_field!(
+            "auto_title_with_session_model",
+            auto_title_with_session_model
+        );
         parse_field!("skill_injection", skill_injection);
         parse_field!("predict_next_message_model", predict_next_message_model);
         parse_field!("harness_report_summarization", harness_report_summarization);
         parse_field!("compact_model", compact_model);
         parse_field!("btw_model", btw_model);
         parse_field!("embedding_model", embedding_model);
-        parse_field!("project_knowledge", project_knowledge);
+        if let Some(value) = raw.get("knowledgeBases") {
+            match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
+                Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {
+                    cfg.knowledge_bases = entries;
+                }
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                    );
+                    warnings.push(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         parse_field!("knowledge_inject_max_tokens", knowledge_inject_max_tokens);
         parse_field!("compact_prompt", compact_prompt);
         parse_field!("prompt_injection_guard", prompt_injection_guard);
@@ -2672,7 +2914,22 @@ impl ExtendedConfigDoc {
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
-        remove_malformed!("project_knowledge", bool);
+        if let Some(value) = obj.get("knowledgeBases") {
+            match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
+                Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {}
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                    );
+                    warnings.push(
+                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
+                            .to_string(),
+                    );
+                    // An invalid upper registry must not reveal a lower one.
+                    obj.insert("knowledgeBases".into(), serde_json::json!([]));
+                }
+            }
+        }
         remove_malformed!("queuedMessagesAsSteering", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);

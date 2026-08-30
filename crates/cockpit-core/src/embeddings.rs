@@ -11,6 +11,11 @@ use crate::redact::RedactionTable;
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// Durable identity of the model whose vector space this embedder returns.
+    /// Knowledge sidecars use it to reject vectors from a different model even
+    /// when the two models happen to share a dimension.
+    fn identity(&self) -> String;
 }
 
 #[derive(Clone)]
@@ -229,6 +234,10 @@ impl Embedder for OpenAiCompatEmbedder {
                 embedding.ok_or_else(|| anyhow!("missing embedding response index {index}"))
             })
             .collect()
+    }
+
+    fn identity(&self) -> String {
+        format!("openai-compatible:{}:{}", self.base_url, self.model)
     }
 }
 

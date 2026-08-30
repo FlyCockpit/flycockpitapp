@@ -225,7 +225,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::EndedSessionsPurged { .. }
         | proto::Response::AssistantDeleted { .. }
         | proto::Response::MediaReservationDiagnosis { .. }
-        | proto::Response::MediaReservationRepaired { .. } => {}
+        | proto::Response::MediaReservationRepaired { .. }
+        | proto::Response::KnowledgeDreamStatus { .. }
+        | proto::Response::KnowledgeDreamRuns { .. }
+        | proto::Response::ExitGuardStatus { .. } => {}
         #[cfg(feature = "remote")]
         proto::Response::ConnectorState { .. } | proto::Response::OrgSyncStatus { .. } => {}
         // Free-text-bearing owner-remoted reads: the vaulted-secret redaction
@@ -397,6 +400,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             history,
             paused_work,
             repair_required,
+            resume_compaction_offer: _,
             daemon_version: _,
             compatible: _,
             env_baseline: _,
@@ -777,6 +781,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             live_application_pending: _,
         }
         | proto::Response::WorkspaceTrust { .. }
+        | proto::Response::WorkspaceHistoryScope { .. }
         | proto::Response::SecretInventory { .. }
         | proto::Response::ProviderCatalogSnapshot { .. }
         | proto::Response::ProviderModelsFetched { .. }
@@ -785,7 +790,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderMutationCommitted { .. }
         | proto::Response::SubscriptionAckCommitted { .. }
         | proto::Response::AppFlag { .. }
-        | proto::Response::AppFlagSeen { .. } => {}
+        | proto::Response::AppFlagSeen { .. }
+        | proto::Response::StorageReport { .. }
+        | proto::Response::StorageCleanupPreview { .. }
+        | proto::Response::StorageCleanupCompleted { .. } => {}
         proto::Response::LocalOperationSettlement {
             response,
             terminal_error,
@@ -1059,7 +1067,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             dropped: _,
         }
-        | proto::Event::DaemonDraining { forced: _ } => {}
+        | proto::Event::DaemonDraining { forced: _ }
+        | proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: _,
+        } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
             agent: _,
@@ -1729,6 +1740,7 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         turns: _,
         active_agent: _,
         title,
+        description,
         parent_session_id: _,
         created_by_principal: _,
         shared_with_collaborators: _,
@@ -1743,6 +1755,7 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
     } = summary;
     scrub_string(project_root, redact);
     scrub_option_string(title, redact);
+    scrub_option_string(description, redact);
 }
 
 fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
@@ -2365,6 +2378,15 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
     }
 }
 
+/// The last-client reaper distinguishes completed shutdown from a persistent
+/// promotion and from work that must settle before teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EphemeralReapDecision {
+    Shutdown,
+    Persistent,
+    WaitingForLiveWork,
+}
+
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
 pub struct DaemonContext {
@@ -2560,6 +2582,30 @@ pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
 impl DaemonContext {
     pub(crate) fn current_global_redaction(&self) -> Arc<RedactionTable> {
         current_redaction(&self.global_redaction)
+    }
+
+    /// Ephemeral daemons have no durable media root. Attachment paths must
+    /// therefore use storage only while this owner is persistent.
+    pub(crate) fn active_media_storage_recovery(
+        &self,
+    ) -> Option<Arc<crate::media_storage::MediaStorageRecovery>> {
+        (!self.paths.ephemeral)
+            .then(|| self.media_storage_recovery.clone())
+            .flatten()
+    }
+
+    /// Begin last-client teardown only after every worker is idle. Persistent
+    /// owners deliberately survive transport disconnects.
+    pub(crate) fn reap_ephemeral_last_client(self: &Arc<Self>) -> EphemeralReapDecision {
+        let _decision = crate::sync::lock_or_recover(&self.restart_decision);
+        if !self.paths.ephemeral {
+            return EphemeralReapDecision::Persistent;
+        }
+        if self.registry.any_agent_running() {
+            return EphemeralReapDecision::WaitingForLiveWork;
+        }
+        request_shutdown(self);
+        EphemeralReapDecision::Shutdown
     }
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
@@ -4733,6 +4779,7 @@ struct MutableClientState {
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
     pending_acp_catalog_composition:
         Option<crate::daemon::acp_catalog_composition::PendingAcpCatalogCompositionV1>,
+    exit_guard_reservation: Option<Arc<()>>,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -4838,6 +4885,7 @@ impl MutableClientState {
             terminal_views: HashMap::new(),
             terminal_host,
             pending_acp_catalog_composition: None,
+            exit_guard_reservation: None,
         }
     }
 
@@ -6744,15 +6792,23 @@ mod leaks_tests;
 mod secret_store_boot_tests;
 #[cfg(test)]
 mod secret_store_local_tests;
-mod sessions;
+pub(crate) mod sessions;
 #[cfg(feature = "remote")]
 mod sessions_remote;
+pub(crate) mod storage;
 #[cfg(test)]
 mod tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub(crate) use dispatch::CONFIG_PUBLICATION_RPC_LOCK;
 pub use dispatch::request_shutdown;
+/// Convert unexpected request-domain failures into the wire's internal error.
+fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Internal,
+        message: format!("{err:#}"),
+    }
+}
 pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
     dispatch::spawn_lock_sweeper(ctx)
 }

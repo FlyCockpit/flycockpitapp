@@ -82,16 +82,18 @@ pub async fn list_tools_cached_identified(
 }
 
 async fn list_tools_for_entry(
+    name: &str,
     entry: &CatalogEntry,
     context: McpConnectContext,
 ) -> Result<Vec<ToolDescriptor>> {
     let cfg = entry
-        .server
-        .with_selected_profile(&entry.name, &entry.profile)?;
+        .persistent_server()
+        .expect("external catalog entries always have persistent server configuration")
+        .with_selected_profile(name, &entry.profile)?;
     list_tools_cached_identified(
-        &entry.name,
+        name,
         &cfg,
-        entry.source,
+        entry.source(),
         &entry.profile,
         entry.agent_bound,
         context
@@ -146,7 +148,7 @@ pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<Sea
     let mut hits = builtin::search(host, query);
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
-        let tools = match list_tools_for_entry(entry, connect_context(host)).await {
+        let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -202,7 +204,7 @@ pub async fn grep_tool_names(
     }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
-        let tools = match list_tools_for_entry(entry, connect_context(host)).await {
+        let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -251,7 +253,7 @@ pub async fn grep_tool_definitions(
     }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
-        let tools = match list_tools_for_entry(entry, connect_context(host)).await {
+        let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -299,10 +301,13 @@ pub async fn describe(
     let Some(entry) = catalog.get(server) else {
         bail!("unknown MCP server `{server}`");
     };
-    if !entry.server.enabled {
+    if !entry
+        .persistent_server()
+        .is_some_and(|server| server.enabled)
+    {
         bail!("MCP server `{server}` is disabled");
     }
-    let tools = list_tools_for_entry(entry, connect_context(host)).await?;
+    let tools = list_tools_for_entry(server, entry, connect_context(host)).await?;
     let Some(desc) = tools.into_iter().find(|desc| desc.name == tool) else {
         bail!("unknown MCP tool `{server}.{tool}`");
     };
@@ -418,7 +423,10 @@ pub async fn invoke(
         }
         bail!("unknown MCP server `{server}`");
     };
-    let server_cfg = entry.server.with_selected_profile(server, &entry.profile)?;
+    let server_cfg = entry
+        .persistent_server()
+        .expect("external catalog entries always have persistent server configuration")
+        .with_selected_profile(server, &entry.profile)?;
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }
@@ -456,7 +464,7 @@ pub async fn invoke(
     if let Some(result) = host.test_external_invoke(server, tool, args.clone()) {
         return result;
     }
-    let tools = list_tools_for_entry(entry, connect_context(host)).await?;
+    let tools = list_tools_for_entry(server, entry, connect_context(host)).await?;
     if !tools.iter().any(|desc| desc.name == tool) {
         if let Some(suggestion) = crate::mcp::suggest::closest_tool(
             tool,

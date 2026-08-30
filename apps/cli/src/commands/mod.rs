@@ -75,6 +75,7 @@ pub mod connect;
 pub mod daemon;
 pub mod debug;
 pub mod doctor;
+pub mod dream;
 pub mod export;
 pub mod fetch_models;
 #[cfg(feature = "remote")]
@@ -84,6 +85,7 @@ pub mod init;
 pub mod invocation;
 pub mod jq;
 pub mod kcl;
+pub mod knowledge;
 pub mod learn;
 pub mod mcp;
 pub mod models;

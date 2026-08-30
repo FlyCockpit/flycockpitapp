@@ -312,6 +312,35 @@ fn pushed_config_snapshot_replaces_held_snapshot() {
     assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 9999);
 }
 
+#[test]
+fn pushed_config_snapshot_updates_background_agent_acquisition_preference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_fixture_tree(tmp.path());
+    let mut app = app_for_tree(tmp.path());
+
+    assert_eq!(
+        app.lifecycle_intent(),
+        cockpit_client::LifecycleIntent::AttachOrPersistent
+    );
+
+    let mut ephemeral = snapshot_from_tree(tmp.path(), 1);
+    ephemeral.extended.daemon.background_agents = false;
+    app.apply_config_snapshot(ephemeral);
+    assert_eq!(
+        app.lifecycle_intent(),
+        cockpit_client::LifecycleIntent::AttachOrEphemeral
+    );
+
+    let mut persistent = snapshot_from_tree(tmp.path(), 2);
+    persistent.extended.daemon.background_agents = true;
+    app.apply_config_snapshot(persistent);
+    assert_eq!(
+        app.lifecycle_intent(),
+        cockpit_client::LifecycleIntent::AttachOrPersistent
+    );
+}
+
 // ---- Criterion 5: stale pushes are dropped ---------------------------------
 
 #[test]

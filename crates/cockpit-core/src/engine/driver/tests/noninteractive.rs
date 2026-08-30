@@ -1084,6 +1084,7 @@ fn scoped_child_holds_no_delegation_tools() {
         DelegationConfinement {
             lock_identity: Some("builder#scoped".to_string()),
             write_scope: Some(scope),
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
         },
     );
@@ -4944,6 +4945,7 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
             DelegationConfinement {
                 lock_identity: None,
                 write_scope: Some(scope.clone()),
+                dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 workspace_lease: None,
             },
         );
@@ -5001,6 +5003,7 @@ async fn resolved_child_execution_surface_preflight_is_side_effect_free() {
         DelegationConfinement {
             lock_identity: None,
             write_scope: Some(scope.clone()),
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
         },
     );

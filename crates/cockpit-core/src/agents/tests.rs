@@ -691,6 +691,25 @@ fn to_markdown_round_trips_through_parse() {
 }
 
 #[test]
+fn vnext_allowed_knowledge_bases_round_trip_through_markdown() {
+    let mut def = embedded_default("builder").unwrap();
+    def.vnext.as_mut().unwrap().allowed_knowledge_bases = Some(std::collections::BTreeSet::from([
+        "project".to_string(),
+        "shared-notes".to_string(),
+    ]));
+    let markdown = def.to_markdown().unwrap();
+    assert!(markdown.contains("allowedKnowledgeBases:"));
+    let parsed = parse_agent_with_scope(
+        &markdown,
+        "builder",
+        "builder.md".into(),
+        DefinitionScope::BuiltinOverride,
+    )
+    .unwrap();
+    assert_eq!(parsed.vnext, def.vnext);
+}
+
+#[test]
 fn agent_vnext_every_editable_builtin_ejects_closed_schema_v2() {
     for &name in crate::agents::BUILTIN_AGENT_NAMES {
         let embedded = embedded_default(name).unwrap();
@@ -1817,10 +1836,10 @@ fn apply_tool_surface_override_replaces_tools_and_tiers() {
         tools: vec![
             "read".to_string(),
             "mcp".to_string(),
-            "session_search".to_string(),
+            "history_search".to_string(),
         ],
         tool_tiers: std::collections::BTreeMap::from([(
-            "session_search".to_string(),
+            "history_search".to_string(),
             ToolTier::Discoverable,
         )]),
     };
@@ -1837,7 +1856,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
     let selection = ToolSurfaceSelection {
         tools: vec!["read".to_string()],
         tool_tiers: std::collections::BTreeMap::from([(
-            "session_search".to_string(),
+            "history_search".to_string(),
             ToolTier::Discoverable,
         )]),
     };
@@ -1845,7 +1864,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
     let err = apply_tool_surface_override(&mut def, &selection).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("does not grant"), "{msg}");
-    assert!(msg.contains("session_search"), "{msg}");
+    assert!(msg.contains("history_search"), "{msg}");
     assert_eq!(def.tools.as_deref(), Some(&["read".to_string()][..]));
     assert!(def.tool_tiers.is_empty());
 }
@@ -2029,12 +2048,16 @@ fn agent_def_context_policy_bounds() {
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(10),
         inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     validate_invariants(&def).expect("10 is in range");
 
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(95),
         inline_caps: Some(crate::agents::InlineCapsProfile::Large),
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     validate_invariants(&def).expect("95 is in range");
 
@@ -2042,6 +2065,8 @@ fn agent_def_context_policy_bounds() {
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(9),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     let err = validate_invariants(&def).unwrap_err().to_string();
     assert!(err.contains("autoCompactPct"), "{err}");
@@ -2051,6 +2076,8 @@ fn agent_def_context_policy_bounds() {
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(96),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     let err = validate_invariants(&def).unwrap_err().to_string();
     assert!(err.contains("96"), "{err}");
@@ -2094,6 +2121,8 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
     with_policy.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(60),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     let digest_policy = with_policy.vnext_digest_bytes().expect("digest policy");
     assert_ne!(

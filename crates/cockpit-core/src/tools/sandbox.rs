@@ -78,8 +78,9 @@ pub fn within_root(canonical_root: &Path, candidate: &Path) -> bool {
 ///
 /// `path` is the already-resolved absolute target the tool is about to
 /// touch (callers go through [`crate::tools::common::resolve`] first).
-/// The boundary is the session cwd plus the per-session tmp dir — both
-/// "inside." A path inside the boundary is allowed silently. A path
+/// The boundary is the session cwd plus both session scratch directories —
+/// ephemeral tmp and durable workspace scratch — all of which are "inside."
+/// A path inside the boundary is allowed silently. A path
 /// outside consults part 1's path-grant store via `ctx`; if not granted,
 /// it raises part 1's approval prompt **naming the exact path** and, on a
 /// non-`Once` grant, persists it. On deny it returns an invalid-input
@@ -102,9 +103,11 @@ pub async fn check_native_access(
     required: SandboxPathAccess,
 ) -> Result<PathBuf> {
     // A workspace lease is a hard filesystem boundary, not an additional
-    // source of approval.  In particular, a stale lease, a read-only lease
-    // used for a write, or a path outside its visibility root must never fall
-    // through to the ambient `approve_path` flow.
+    // source of approval. In particular, a stale lease or a workspace path
+    // outside its visibility root must never fall through to the ambient
+    // `approve_path` flow. The session's own durable scratch is the explicit
+    // capability exception: it remains read/write for the leased agent even
+    // when the workspace lease is read-only.
     if let Some(lease) = ctx.workspace_lease.as_deref() {
         if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
             crate::workspace_lease::expire_active_workspace_lease_if_due(&ctx.session.db, lease)
@@ -122,17 +125,6 @@ pub async fn check_native_access(
                 lease.id
             )));
         }
-        let permitted = match required {
-            SandboxPathAccess::Read => lease.allows_read(),
-            SandboxPathAccess::ReadWrite => lease.allows_write(),
-        };
-        if !permitted {
-            return Err(invalid_input(format!(
-                "`{}` is denied by workspace lease `{}` operation authority",
-                path.display(),
-                lease.id
-            )));
-        }
         let effective = effective_native_path(path).map_err(|err| {
             invalid_input(format!(
                 "`{}` cannot be proven inside workspace lease `{}`: {err}",
@@ -140,13 +132,33 @@ pub async fn check_native_access(
                 lease.id
             ))
         })?;
-        if !lease.covers_path(&effective) {
+        let session_scratch = ctx.session.workspace_scratch_dir();
+        let is_session_scratch =
+            cockpit_host::path_containment::contained_under(&session_scratch, &effective);
+        let permitted = match required {
+            SandboxPathAccess::Read => lease.allows_read(),
+            SandboxPathAccess::ReadWrite => lease.allows_write(),
+        };
+        if !permitted && !is_session_scratch {
+            return Err(invalid_input(format!(
+                "`{}` is denied by workspace lease `{}` operation authority",
+                path.display(),
+                lease.id
+            )));
+        }
+        if !lease.covers_path(&effective) && !is_session_scratch {
             return Err(invalid_input(format!(
                 "`{}` is outside workspace lease visibility `{}`",
                 effective.display(),
                 lease.visibility_root.display()
             )));
         }
+        // A workspace lease limits where a delegated agent may operate; it
+        // does not override the model-trust boundary for a local KB. Keep
+        // this check on the lease path as well as the ambient path below so
+        // every native filesystem consumer of this choke point is fenced.
+        crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
+            .map_err(|error| invalid_input(error.to_string()))?;
         return Ok(effective);
     }
 
@@ -172,6 +184,12 @@ pub async fn check_native_access(
             )));
         }
     };
+
+    // Trust-required local KBs are a hard filesystem boundary. This common
+    // native-path choke point covers read, write, edit, LSP, skills, and every
+    // future native tool that obtains host-path authority through this helper.
+    crate::knowledge::ensure_local_knowledge_path_access(ctx, &effective)
+        .map_err(|error| invalid_input(error.to_string()))?;
 
     if within_boundary(ctx, &effective) {
         return Ok(effective);
@@ -453,34 +471,53 @@ fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
         }
         // Session scratch remains usable; sibling worktrees and the primary
         // repository are not implicit lease visibility.
-        return ctx
-            .session
-            .tmp_dir()
-            .as_deref()
-            .is_some_and(|tmp| cockpit_host::path_containment::contained_under(tmp, path));
+        let tmp_dir = ctx.session.tmp_dir();
+        let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+        return tmp_dir
+            .iter()
+            .chain(std::iter::once(&workspace_scratch_dir))
+            .any(|scratch| cockpit_host::path_containment::contained_under(scratch, path));
     }
-    path_inside_boundary(path, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    let tmp_dir = ctx.session.tmp_dir();
+    let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+    path_inside_boundary(
+        path,
+        &ctx.cwd,
+        tmp_dir.as_deref(),
+        Some(&workspace_scratch_dir),
+    )
 }
 
 pub(crate) fn outside_session_boundary(
     path: &Path,
     root: &Path,
     tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     let effective = effective_native_path(path).unwrap_or_else(|_| path.to_path_buf());
-    if path_inside_boundary(&effective, root, tmp_dir) {
+    if path_inside_boundary(&effective, root, tmp_dir, workspace_scratch_dir) {
         None
     } else {
         Some(effective)
     }
 }
 
-fn path_inside_boundary(candidate: &Path, root: &Path, tmp_dir: Option<&Path>) -> bool {
+fn path_inside_boundary(
+    candidate: &Path,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+    workspace_scratch_dir: Option<&Path>,
+) -> bool {
     if cockpit_host::path_containment::contained_under(root, candidate) {
         return true;
     }
     if let Some(tmp) = tmp_dir
         && cockpit_host::path_containment::contained_under(tmp, candidate)
+    {
+        return true;
+    }
+    if let Some(scratch) = workspace_scratch_dir
+        && cockpit_host::path_containment::contained_under(scratch, candidate)
     {
         return true;
     }
@@ -697,9 +734,13 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,
@@ -760,6 +801,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leased_native_access_allows_durable_workspace_scratch() {
+        let lease_root = tempfile::tempdir().unwrap();
+        let mut ctx = sandboxed_ctx(lease_root.path());
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            lease_root.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::none(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        )));
+        let scratch_file = ctx.session.workspace_scratch_dir().join("scratch.txt");
+
+        check_native_access(&ctx, &scratch_file, SandboxPathAccess::ReadWrite)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn native_parent_traversal_stays_inside() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = sandboxed_ctx(tmp.path());
@@ -780,6 +838,55 @@ mod tests {
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_lease_does_not_bypass_trust_required_local_knowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let knowledge_root = tmp.path().join("knowledge");
+        std::fs::create_dir(&knowledge_root).unwrap();
+        let target = knowledge_root.join("notes.md");
+
+        let mut ctx = sandboxed_ctx(tmp.path());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended
+            .knowledge_bases
+            .push(crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                "private".to_string(),
+                "Private".to_string(),
+                "Trusted local knowledge".to_string(),
+                crate::config::extended::KnowledgeBaseSource::Local {
+                    path: std::path::PathBuf::from("knowledge"),
+                },
+                crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                None,
+                None,
+                true,
+                crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+            ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            tmp.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        )));
+
+        let error = check_native_access(&ctx, &target, SandboxPathAccess::ReadWrite)
+            .await
+            .expect_err("an untrusted leased agent must not access a protected local KB");
+        assert!(
+            error
+                .to_string()
+                .contains("local knowledge base that requires a trusted model"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]

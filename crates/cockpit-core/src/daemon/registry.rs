@@ -53,6 +53,16 @@ use crate::{
     session::Session,
 };
 
+/// Ties the scheduler callback future's lifetime to the delivered refresh.
+/// Dropping a timed-out callback must cancel the driver-owned provider call.
+struct KeepWarmCallbackGuard(tokio_util::sync::CancellationToken);
+
+impl Drop for KeepWarmCallbackGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("session entry mode conflict: session is {actual}, attach requested {requested}")]
 pub(crate) struct SessionEntryModeConflict {
@@ -190,7 +200,10 @@ struct Inner {
         Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
-    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Serializes the all-or-nothing persistent-service snapshot copied into
+    /// a newly created session with an in-place lifetime promotion.
+    persistent_service_transition: Mutex<()>,
+    resource_scheduler: Mutex<Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>>,
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
@@ -669,6 +682,7 @@ impl SessionRegistry {
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
+                persistent_service_transition: Mutex::new(()),
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
                 message_media_authority: Arc::new(Mutex::new(None)),
@@ -679,7 +693,7 @@ impl SessionRegistry {
                 command_secret_cache: Mutex::new(
                     crate::secret_command::CommandSecretCache::with_subprocess_executor(),
                 ),
-                resource_scheduler,
+                resource_scheduler: Mutex::new(resource_scheduler),
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
@@ -723,7 +737,14 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
     }
 
-    pub(crate) fn set_media_storage_recovery(
+    /// Fence a promotion's service installation against the synchronous
+    /// session-worker construction snapshot. The guard is never held across
+    /// an await by either side.
+    pub(crate) fn lock_persistent_service_transition(&self) -> std::sync::MutexGuard<'_, ()> {
+        crate::sync::lock_or_recover(&self.inner.persistent_service_transition)
+    }
+
+    pub fn set_media_storage_recovery(
         &self,
         recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     ) {
@@ -792,7 +813,14 @@ impl SessionRegistry {
     pub fn resource_scheduler(
         &self,
     ) -> Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>> {
-        self.inner.resource_scheduler.clone()
+        crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone()
+    }
+
+    pub fn set_resource_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.resource_scheduler) = scheduler;
     }
 
     pub fn set_global_bus(&self, tx: EventSender) {
@@ -801,6 +829,10 @@ impl SessionRegistry {
 
     pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
+    }
+
+    pub fn clear_scheduler(&self) {
+        *crate::sync::lock_or_recover(&self.inner.scheduler) = None;
     }
 
     pub fn set_write_scope(
@@ -831,6 +863,10 @@ impl SessionRegistry {
             Some((storage, ledger));
     }
 
+    pub(crate) fn clear_message_media_authority(&self) {
+        *crate::sync::lock_or_recover(&self.inner.message_media_authority) = None;
+    }
+
     fn message_media_authority(
         &self,
     ) -> Option<(
@@ -845,6 +881,10 @@ impl SessionRegistry {
         runtime: Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>,
     ) {
         *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
+    }
+
+    pub(crate) fn clear_tool_media_runtime(&self) {
+        *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = None;
     }
 
     pub(crate) fn tool_media_runtime(
@@ -1014,6 +1054,53 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.scheduler).clone()
     }
 
+    /// Run a daemon-owned keep-warm callback against its original session.
+    /// The callback payload is locally minted by the driver; malformed or
+    /// stale jobs fail closed and cannot be mistaken for a user submission.
+    pub async fn run_keep_warm_job(
+        &self,
+        job: crate::daemon::scheduler::ScheduledJob,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            job.owner == "system:keep_warm"
+                && matches!(&job.payload, crate::daemon::proto::ScheduledJobPayload::Callback { subsystem } if subsystem == "keep_warm"),
+            "keep-warm callback has invalid daemon ownership"
+        );
+        let keep_warm_job = crate::keep_warm::parse_job_id(&job.id)?;
+
+        let handle = self
+            .attach_existing(
+                keep_warm_job.session_id,
+                None,
+                false,
+                None,
+                crate::env_snapshot::EnvSnapshot::from_process(
+                    crate::daemon::proto::EnvSnapshotSource::DaemonStart,
+                ),
+            )
+            .await?;
+        // `ProductionJobExecutor` cancels this future when its callback
+        // deadline expires. The guard propagates that cancellation into the
+        // delivered driver control so no paid refresh outlives the callback.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_callback_drop = KeepWarmCallbackGuard(cancel.clone());
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(crate::daemon::session_worker::SessionWork::KeepWarm {
+                cache_send_at_unix_millis: keep_warm_job.cache_send_identity.unix_millis,
+                cache_send_id: keep_warm_job.cache_send_identity.send_id,
+                after_secs: keep_warm_job.after_secs,
+                idle_window_secs: keep_warm_job.idle_window_secs,
+                cancel,
+                respond_to,
+            })
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("keep-warm worker stopped before replying"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     fn scheduler_source(
         &self,
     ) -> Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>> {
@@ -1036,6 +1123,55 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
     ) -> Result<SessionWorkerHandle> {
+        self.attach_with_creation_flags(
+            session_id,
+            project_root,
+            initial_model,
+            client_no_sandbox,
+            model_override,
+            env_snapshot,
+            session_entry_mode,
+            false,
+        )
+        .await
+    }
+
+    /// Start the one durable session that records a knowledge-dream run. Its
+    /// transcript remains available by explicit session address for audit,
+    /// while the creation-only flag excludes it from ordinary recall and all
+    /// future dream source scans.
+    pub(crate) async fn attach_dream_session(
+        &self,
+        project_root: PathBuf,
+        model: ActiveModelRef,
+        client_no_sandbox: bool,
+        env_snapshot: EnvSnapshot,
+    ) -> Result<SessionWorkerHandle> {
+        self.attach_with_creation_flags(
+            None,
+            Some(project_root),
+            Some(model.clone()),
+            client_no_sandbox,
+            Some(&model),
+            env_snapshot,
+            crate::daemon::proto::SessionEntryMode::Code,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_with_creation_flags(
+        &self,
+        session_id: Option<Uuid>,
+        project_root: Option<PathBuf>,
+        initial_model: Option<ActiveModelRef>,
+        client_no_sandbox: bool,
+        model_override: Option<&ActiveModelRef>,
+        env_snapshot: EnvSnapshot,
+        session_entry_mode: crate::daemon::proto::SessionEntryMode,
+        is_dream_session: bool,
+    ) -> Result<SessionWorkerHandle> {
         // This is deliberately daemon-wide rather than keyed by session id:
         // trust transitions select workers by durable workspace root, while a
         // cold attach does not know that root until it has resolved authority.
@@ -1047,6 +1183,10 @@ impl SessionRegistry {
         };
         // Resume path.
         if let Some(id) = session_id {
+            anyhow::ensure!(
+                !self.inner.db.is_session_deleting(id).await?,
+                "session {id} is being deleted and cannot be resumed"
+            );
             // Resolve the handle for whichever claim path this attach takes.
             // The reconciliation gate below is applied UNIFORMLY afterwards
             // (finding 3) so no claim path can slip a pre-reconciliation handle
@@ -1160,6 +1300,7 @@ impl SessionRegistry {
             model_override,
             env_snapshot,
             session_entry_mode,
+            is_dream_session,
             &worker_publication_permit,
         ))
         .await
@@ -1191,6 +1332,10 @@ impl SessionRegistry {
             .get_session(session_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
+        anyhow::ensure!(
+            row.lifecycle == "active",
+            "session {session_id} is being deleted and cannot be resumed"
+        );
         let mode = match row.session_entry_mode.as_str() {
             "code" => crate::daemon::proto::SessionEntryMode::Code,
             "assistant" => crate::daemon::proto::SessionEntryMode::Assistant,
@@ -1340,6 +1485,7 @@ impl SessionRegistry {
         model_override: Option<&ActiveModelRef>,
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
+        is_dream_session: bool,
         worker_publication: &WorkerPublicationPermit<'_>,
     ) -> Result<SessionWorkerHandle> {
         // Linearize the full preflight/start handoff with trust decisions and
@@ -1392,7 +1538,7 @@ impl SessionRegistry {
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
-        let project_id = crate::session::project_id_for(&project_root);
+        let project_id = crate::session::project_id_for(&project_root)?;
         let last_used = self
             .inner
             .db
@@ -1420,6 +1566,9 @@ impl SessionRegistry {
         )
         .context("creating session")?;
         session.set_deferred_entry_mode(session_entry_mode)?;
+        if is_dream_session {
+            session.set_deferred_dream_session()?;
+        }
         session
             .set_active_model_ref(active)
             .context("setting active model on new session")?;
@@ -1891,7 +2040,8 @@ impl SessionRegistry {
         // Recovery of a pre-selection session is a two-phase operation. The
         // full selection is visible in memory while the worker is validated.
         // The deferred sessions row is flushed after that commit and immediately
-        // precedes `session_worker::spawn`, which is synchronous and infallible;
+        // precedes `session_worker::spawn`, which persists the initial
+        // redaction boundary before starting the worker;
         // attach always writes a durable parent row before agent-tree dependents.
         // Existing selections are never overwritten by Attach; intentional
         // changes go through SetActiveModel.
@@ -1926,6 +2076,10 @@ impl SessionRegistry {
             &session.credential_store()?,
         )
         .context("building redaction table")?;
+        let redact = session
+            .with_machine_scoped_sealed_redactions(&redact)
+            .await
+            .context("adding machine-scoped sealed values to redaction table")?;
         let redact = Arc::new(redact);
 
         // Build the model from providers config. Errors out loud if
@@ -1974,6 +2128,10 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        // A concurrent promotion either finishes its complete service bundle
+        // before this snapshot, or this new session keeps the coherent
+        // pre-promotion bundle. It can never retain an intermediate mix.
+        let _persistent_service_transition = self.lock_persistent_service_transition();
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
         self.copy_tool_media_runtime_to_session(&session);
@@ -2015,7 +2173,7 @@ impl SessionRegistry {
             daemon_no_sandbox,
             &extended_cfg,
             self.inner.lsp.clone(),
-            self.inner.resource_scheduler.clone(),
+            crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone(),
             self.scheduler_source(),
             self.write_scope_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
@@ -2054,7 +2212,8 @@ impl SessionRegistry {
                     None => snapshot,
                 }
             },
-        );
+        )
+        .context("starting session worker")?;
 
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
@@ -2464,8 +2623,8 @@ impl SessionRegistry {
             .live
             .values()
             .any(|entry| {
-                let (has_schedules, processing, _tool_running) = entry.handle.live_status();
-                has_schedules || processing
+                let (has_schedules, processing, tool_running) = entry.handle.live_status();
+                has_schedules || processing || tool_running
             })
     }
 
@@ -2944,6 +3103,7 @@ mod tests {
         scheduler.start_with_sleeper(
             ShutdownSignal::new(),
             Arc::new(PendingSchedulerSleeper),
+            None,
             None,
         )
     }

@@ -135,7 +135,7 @@ fn project_mcps(project_root: &std::path::Path, def: &AgentDef) -> Vec<SessionSe
             scope: entry.source().as_str().to_string(),
             enabled: entry.is_enabled(),
             shadowed_by: entry.shadowed_by.map(|scope| scope.as_str().to_string()),
-            profile: Some(entry.profile).filter(|profile| !profile.is_empty()),
+            profile: Some(entry.profile.clone()).filter(|profile| !profile.is_empty()),
         })
         .collect()
 }

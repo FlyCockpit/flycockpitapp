@@ -742,16 +742,6 @@ async fn toolbox_with_retrieval_if_needed(
     }
     if session
         .db
-        .session_has_text_artifacts(session.id)
-        .await
-        .unwrap_or(false)
-    {
-        tools = tools
-            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
-            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
-    }
-    if session
-        .db
         .session_has_task_delegation_payloads(session.id)
         .await
         .unwrap_or(false)
@@ -767,13 +757,7 @@ pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
     // Read/search pages are bounded responses, not new durable captures.
     !matches!(
         tool,
-        "read"
-            | "write"
-            | "edit"
-            | "unlock"
-            | "artifact_read"
-            | "artifact_search"
-            | "delegation_payload_retrieve"
+        "read" | "write" | "edit" | "unlock" | "delegation_payload_retrieve"
     )
 }
 

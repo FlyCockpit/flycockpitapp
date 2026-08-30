@@ -7819,6 +7819,39 @@ async fn handle_serialized_request_impl(
                 config_generation: inventory::current_config_generation(),
             })
         }
+        Request::SetWorkspaceHistoryScope {
+            project_root,
+            outbound,
+            inbound,
+        } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root).map_err(internal)?;
+            ctx.db
+                .set_workspace_history_scope(
+                    &project_id,
+                    crate::db::history_scope::WorkspaceHistoryScope { outbound, inbound },
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope { outbound, inbound })
+        }
+        Request::GetWorkspaceHistoryScope { project_root } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root).map_err(internal)?;
+            let scope = ctx
+                .db
+                .workspace_history_scope(&project_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope {
+                outbound: scope.outbound,
+                inbound: scope.inbound,
+            })
+        }
         Request::GetStartupDisclosures { project_root: _ } => {
             #[cfg(not(feature = "remote"))]
             return Ok(Response::StartupDisclosures {
@@ -7880,6 +7913,9 @@ async fn handle_serialized_request_impl(
             }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
+            let project_id_for_new_session =
+                crate::session::project_id_for(Path::new(&project_root_for_db))
+                    .map_err(internal)?;
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
@@ -7897,11 +7933,9 @@ async fn handle_serialized_request_impl(
                         )? {
                             Some(row) => (row, false),
                             None => {
-                                let project_id =
-                                    crate::session::project_id_for(Path::new(&project_root_for_db));
                                 let row = crate::db::Db::build_new_assistant_session_row_conn(
                                     conn,
-                                    &project_id,
+                                    &project_id_for_new_session,
                                     &project_root_for_db,
                                     &assistant_for_db,
                                     &assistant_for_db,
@@ -25350,9 +25384,10 @@ async fn finish_session_setup_snapshot(
     session_id: Uuid,
     snapshot: cockpit_proto::SessionSetupSnapshotV1,
 ) -> std::result::Result<cockpit_proto::SessionSetupSnapshotV1, ErrorPayload> {
+    let project_id = crate::session::project_id_for(project_root).map_err(internal)?;
     let last_used = ctx
         .db
-        .last_used_root_agent_for_project(&crate::session::project_id_for(project_root))
+        .last_used_root_agent_for_project(&project_id)
         .await
         .ok()
         .flatten();

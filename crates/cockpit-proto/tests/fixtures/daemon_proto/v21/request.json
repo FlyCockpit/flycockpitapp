@@ -11,6 +11,12 @@
     },
     "request": "get_workspace_trust"
   },
+  "get_workspace_history_scope": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_workspace_history_scope"
+  },
   "resolve_assistant_session": {
     "params": {
       "assistant_id": "helper-bot",
@@ -26,6 +32,14 @@
       "project_root": "/tmp/project"
     },
     "request": "set_workspace_trust"
+  },
+  "set_workspace_history_scope": {
+    "params": {
+      "inbound": true,
+      "outbound": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_history_scope"
   },
   "archive_session": {
     "params": {

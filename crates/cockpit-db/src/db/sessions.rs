@@ -1667,6 +1667,29 @@ impl Db {
             .await
     }
 
+    /// Lightweight workspace-scoped directory listing for the recall
+    /// pseudonamespace. Bodies remain behind their individual trust-filtered
+    /// readers; this only exposes stable session identities.
+    pub async fn list_active_sessions_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SessionRow>> {
+        let project_id = project_id.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM sessions
+                      WHERE project_id=?1 AND archived_at_unix_ms IS NULL
+                      ORDER BY last_active_at_unix_ms DESC",
+                )
+                .context("preparing workspace session listing")?;
+            stmt.query_map([project_id], SessionRow::from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("decoding workspace session listing")
+        })
+        .await
+    }
+
     pub fn find_sessions_by_short_id_global_conn(
         conn: &Connection,
         short_id: &str,

@@ -126,7 +126,7 @@ pub struct SpawnArgs {
     /// interactive session (the daemon root, or an interactive handoff
     /// such as `builder`) versus a one-shot leaf delegation
     /// (`run_noninteractive`) or the `docs` pipeline. Gates the
-    /// cross-session recall tools (`session_search` / `session_read`):
+    /// cross-session recall discovery tools:
     /// they're registered only when `true`, so non-interactive contexts
     /// don't pay their description tokens (token economy, GOALS §10).
     /// This is the spawn-time analog of the runtime
@@ -440,8 +440,7 @@ fn with_write_tools(tb: ToolBox) -> ToolBox {
         .with(Arc::new(crate::tools::unlock::UnlockTool))
 }
 
-/// Append the cross-session recall tools (`session_search` /
-/// `session_read`, prompt `search-old-sessions.md`) to `tb` when this
+/// Append recall discovery tools to `tb` when this
 /// spawn is interactive. Centralized so every user-facing agent shares
 /// one gate rather than each re-spelling the pair + the `interactive`
 /// check.
@@ -450,7 +449,6 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
         return tb;
     }
     tb.with(Arc::new(crate::tools::session_search::SessionSearchTool))
-        .with(Arc::new(crate::tools::session_read::SessionReadTool))
         .with(Arc::new(crate::tools::todo::TodoTool))
 }
 
@@ -465,12 +463,7 @@ fn with_tiered_recall_tools(
         return Ok(tb);
     }
     let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
-    for name in [
-        "session_search",
-        "session_read",
-        "session_lineage_search",
-        "todo",
-    ] {
+    for name in ["session_search", "session_lineage_search", "todo"] {
         if is_assistant
             && !grant_has_mcp
             && !grant.iter().any(|tool| tool == name)
@@ -541,16 +534,12 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "webfetch",
         "websearch",
         "lsp",
-        "plan_read",
-        "plan_write",
-        "plan_edit",
         "start_build",
         "defer_to_orchestrator",
         "return",
         "harness_list",
         "harness_invoke",
         "session_search",
-        "session_read",
         "session_lineage_search",
         "todo",
         "write",
@@ -684,24 +673,6 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Planning",
-            name: "plan_read",
-            summary: "Read the shared plan document.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
-            name: "plan_write",
-            summary: "Replace the shared plan document.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
-            name: "plan_edit",
-            summary: "Patch the shared plan document.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
             name: "start_build",
             summary: "Start a build from the current plan.",
             condition: None,
@@ -720,27 +691,9 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Session",
-            name: "session_read",
-            summary: "Read a prior persisted session.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Session",
             name: "session_lineage_search",
             summary: "Search the current session's compaction lineage.",
             condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Session",
-            name: "artifact_read",
-            summary: "Read an immutable session text artifact.",
-            condition: Some("when the session has artifacts"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Session",
-            name: "artifact_search",
-            summary: "Search an immutable session text artifact.",
-            condition: Some("when the session has artifacts"),
         },
         BuiltinToolInventoryItem {
             family: "Session",
@@ -906,8 +859,6 @@ fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
         "seed",
         "list-packages",
         "add-package",
-        "artifact_read",
-        "artifact_search",
         "delegation_payload_retrieve",
     ]
 }
@@ -969,16 +920,10 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::mcp_tool::McpTool),
         Arc::new(tools::lsp::LspTool),
         Arc::new(tools::return_tool::ReturnTool),
-        Arc::new(tools::plan_doc::PlanReadTool),
-        Arc::new(tools::plan_doc::PlanWriteTool),
-        Arc::new(tools::plan_doc::PlanEditTool),
         Arc::new(tools::plan_doc::StartBuildTool),
         Arc::new(tools::session_search::SessionSearchTool),
-        Arc::new(tools::session_read::SessionReadTool),
         Arc::new(tools::session_search::SessionLineageSearchTool),
         Arc::new(tools::todo::TodoTool),
-        Arc::new(tools::artifact_read::ArtifactReadTool),
-        Arc::new(tools::artifact_search::ArtifactSearchTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
         Arc::new(tools::worktree_orchestrate::WorktreeOrchestrateTool),
@@ -1100,16 +1045,12 @@ pub(crate) fn materialize_tool_by_name(
         )?),
         "lsp" => tb.with(Arc::new(tools::lsp::LspTool)),
         "return" => tb.with(Arc::new(tools::return_tool::ReturnTool)),
-        "plan_read" => tb.with(Arc::new(tools::plan_doc::PlanReadTool)),
-        "plan_write" => tb.with(Arc::new(tools::plan_doc::PlanWriteTool)),
-        "plan_edit" => tb.with(Arc::new(tools::plan_doc::PlanEditTool)),
         "start_build" => tb.with(Arc::new(tools::plan_doc::StartBuildTool)),
         "todo" => tb.with(Arc::new(tools::todo::TodoTool)),
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
         "session_search" => tb.with(Arc::new(tools::session_search::SessionSearchTool)),
-        "session_read" => tb.with(Arc::new(tools::session_read::SessionReadTool)),
         "session_lineage_search" => {
             tb.with(Arc::new(tools::session_search::SessionLineageSearchTool))
         }
@@ -1496,7 +1437,6 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_list",
             "harness_invoke",
             "session_search",
-            "session_read",
             "session_lineage_search",
             "lsp",
         ],
@@ -1510,7 +1450,6 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_list",
             "harness_invoke",
             "session_search",
-            "session_read",
             "session_lineage_search",
             "todo",
             "webfetch",
@@ -1520,7 +1459,6 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_list",
             "harness_invoke",
             "session_search",
-            "session_read",
             "session_lineage_search",
             "lsp",
         ],
@@ -1538,7 +1476,7 @@ pub(crate) fn default_disabled_tools_for(name: &str) -> &'static [&'static str] 
 }
 
 fn default_assistant_discoverable_tools() -> &'static [&'static str] {
-    &["session_search", "session_read", "session_lineage_search"]
+    &["session_search", "session_lineage_search"]
 }
 
 fn documented_av_tool_tier(def_name: &str, tool: &str) -> Option<crate::agents::ToolTier> {
@@ -2736,7 +2674,6 @@ fn default_assistant_tools() -> Vec<String> {
         [
             "mcp",
             "session_search",
-            "session_read",
             "session_lineage_search",
             "skill_manage",
         ]
@@ -3753,20 +3690,18 @@ pub fn goal_control(
     }
 }
 
-/// `Plan` — the user-facing read-only planning agent. It investigates the
+/// `Plan` — the user-facing planning agent. It investigates the
 /// project, keeps a session-scoped virtual plan document, and hands the final
-/// standalone plan to a fresh `Build` session when the user agrees. It holds no
-/// filesystem write or lock tools.
+/// standalone plan to a fresh `Build` session when the user agrees. Its sole
+/// intended mutation is the plan pseudofile through the generic `write` tool.
 pub fn plan(args: &SpawnArgs) -> Agent {
     let def = crate::agents::embedded_default("Plan").expect("Plan has an embedded definition");
     let base_tools = with_lsp_nav(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::write::WriteTool))
             .with(Arc::new(crate::tools::bash::BashTool::new())),
     ))
-    .with(Arc::new(crate::tools::plan_doc::PlanReadTool))
-    .with(Arc::new(crate::tools::plan_doc::PlanWriteTool))
-    .with(Arc::new(crate::tools::plan_doc::PlanEditTool))
     .with(Arc::new(crate::tools::plan_doc::StartBuildTool))
     .with(Arc::new(crate::tools::question::QuestionTool))
     .with(Arc::new(crate::tools::skill::SkillTool))
@@ -4376,12 +4311,7 @@ pub(crate) mod tests {
         assert_eq!(def.mode, AgentMode::Subagent);
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in [
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ] {
+        for tool in ["read", "session_search", "session_lineage_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in [
@@ -4392,7 +4322,7 @@ pub(crate) mod tests {
                 "{forbidden} must not be on history"
             );
         }
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
         crate::agents::validate_invariants(&def).expect("history def is invariant-valid");
@@ -4405,7 +4335,7 @@ pub(crate) mod tests {
         let agent = load("history", &args).unwrap();
         let names = agent.tools.names();
 
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert!(
                 names.contains(&tool),
                 "{tool} should be a first-class history tool: {names:?}"
@@ -4830,7 +4760,6 @@ pub(crate) mod tests {
             "harness_list",
             "harness_invoke",
             "session_search",
-            "session_read",
             "session_lineage_search",
         ] {
             assert!(
@@ -4982,7 +4911,7 @@ pub(crate) mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -5030,7 +4959,7 @@ pub(crate) mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -5288,7 +5217,6 @@ pub(crate) mod tests {
         );
         for non_direct in [
             "session_search",
-            "session_read",
             "session_lineage_search",
             "todo",
             "webfetch",

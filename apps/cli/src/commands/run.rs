@@ -202,7 +202,7 @@ async fn resolve_requested_session_via_daemon(
         return Ok(None);
     }
     // For --continue, list sessions and find the most recent for this project.
-    let project_id = crate::session::project_id_for(root);
+    let project_id = crate::session::project_id_for(root)?;
     let response = client
         .request(crate::daemon::proto::Request::ListSessions {
             project_id: Some(project_id),

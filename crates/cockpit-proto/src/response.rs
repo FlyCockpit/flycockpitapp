@@ -434,6 +434,10 @@ pub enum Response {
         mode: Option<WorkspaceTrustMode>,
         config_generation: u64,
     },
+    WorkspaceHistoryScope {
+        outbound: bool,
+        inbound: bool,
+    },
     #[cfg(feature = "remote")]
     FlycockpitStored,
     #[cfg(feature = "remote")]
@@ -1518,6 +1522,7 @@ macro_rules! response_variants {
             (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
             (Response::WorkspaceTrustSet { .. }, "workspace_trust_set");
             (Response::WorkspaceTrust { .. }, "workspace_trust");
+            (Response::WorkspaceHistoryScope { .. }, "workspace_history_scope");
             #[cfg(feature = "remote")]
             (Response::FlycockpitStored, "flycockpit_stored");
             #[cfg(feature = "remote")]

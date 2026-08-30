@@ -157,7 +157,7 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -194,7 +194,7 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
@@ -253,7 +253,7 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root)?;
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();

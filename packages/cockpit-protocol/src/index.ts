@@ -686,6 +686,14 @@ const requestParamSchemas = {
       expected_config_generation: safeU64NumberSchema,
     })
     .strict(),
+  set_workspace_history_scope: z
+    .object({
+      project_root: projectRootSchema,
+      outbound: z.boolean(),
+      inbound: z.boolean(),
+    })
+    .strict(),
+  get_workspace_history_scope: z.object({ project_root: projectRootSchema }).strict(),
   archive_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
   attach: z.union([
     // A fresh session has no durable session identity yet, so it must name
@@ -1071,6 +1079,14 @@ const clientRequestVariants = [
   requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
   requestVariant("resolve_assistant_session", requestParamSchemas.resolve_assistant_session),
   requestVariant("set_workspace_trust", requestParamSchemas.set_workspace_trust),
+  requestVariant(
+    "set_workspace_history_scope",
+    requestParamSchemas.set_workspace_history_scope,
+  ),
+  requestVariant(
+    "get_workspace_history_scope",
+    requestParamSchemas.get_workspace_history_scope,
+  ),
   requestVariant("archive_session", requestParamSchemas.archive_session),
   requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
   requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
@@ -1259,6 +1275,7 @@ export const responseNameSchema = z.enum([
   "bulk_transfer_chunk_accepted",
   "bulk_transfer_chunk",
   "workspace_trust_set",
+  "workspace_history_scope",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -1619,6 +1636,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         live_application_pending: z.array(uuidSchema).optional(),
       })
       .strict(),
+  ),
+  responseVariant(
+    "workspace_history_scope",
+    z.object({ outbound: z.boolean(), inbound: z.boolean() }).strict(),
   ),
   responseVariant(
     "config_refreshed",

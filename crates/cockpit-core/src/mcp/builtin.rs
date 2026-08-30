@@ -1041,7 +1041,6 @@ fn default_functions() -> Vec<BuiltinFunction> {
     let mut funcs = control_functions();
     for tool in [
         Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>,
-        Arc::new(crate::tools::session_read::SessionReadTool),
         Arc::new(crate::tools::session_search::SessionLineageSearchTool),
         // The sole sealed-value mechanism. Monty and the native registry share
         // one implementation, so the two surfaces cannot drift.

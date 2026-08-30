@@ -38,7 +38,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Regex content search confined to the current root; use `search` for indexed repo-wide regex and `code` for identifiers/definitions"
+        "Regex content search confined to the current root or one `cockpit://` pseudofile; `cockpit://history/` uses bounded FTS discovery"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -83,6 +83,9 @@ impl Tool for GrepTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        if let Some(output) = crate::tools::recall::grep(&args, ctx).await? {
+            return Ok(output);
+        }
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)

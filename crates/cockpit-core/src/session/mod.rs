@@ -1432,17 +1432,29 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-/// Hash the project root into a 12-char hex id. Stable across symlink
-/// shifts because the input is the realpath when available.
-pub fn project_id_for(root: &Path) -> String {
+/// Derive a workspace key from the held root directory object, not a path or
+/// workspace metadata. This is a read-only observation: resolving a workspace
+/// must work on read-only and metadata-limited filesystems, and no user-owned
+/// workspace state can change the key while that directory object is live.
+pub fn project_id_for(root: &Path) -> Result<String> {
+    let canonical = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    let authority =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            &canonical,
+        )
+        .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
+    Ok(project_id_from_workspace_object(authority.identity()))
+}
+
+fn project_id_from_workspace_object(object_identity: &str) -> String {
     use sha2::{Digest, Sha256};
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let s = canon.to_string_lossy();
     let mut h = Sha256::new();
-    h.update(s.as_bytes());
+    h.update(b"cockpit-workspace-object-identity-v1\0");
+    h.update(object_identity.as_bytes());
     let out = h.finalize();
-    let mut hex = String::with_capacity(12);
-    for byte in out.iter().take(6) {
+    let mut hex = String::with_capacity(64);
+    for byte in out {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
@@ -3266,5 +3278,35 @@ mod tests {
         // Editing to v3 injects, diffed from v2.
         std::fs::write(&path, "v3\n").unwrap();
         assert!(s.guidance_change_injection(tmp.path()).await.is_some());
+    }
+
+    #[test]
+    fn replacement_workspace_at_the_same_path_gets_a_new_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        std::fs::rename(&workspace, temp.path().join("retired-workspace")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let replacement = project_id_for(&workspace).unwrap();
+
+        assert_ne!(original, replacement);
+    }
+
+    #[test]
+    fn workspace_contents_cannot_change_a_live_workspace_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        // Workspace contents are not identity input. Their modification and
+        // cleanup must not detach a live workspace from its consent state.
+        let untracked = workspace.join("repository-artifact");
+        std::fs::write(&untracked, "edited by repository tooling").unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
+        std::fs::remove_file(untracked).unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
     }
 }

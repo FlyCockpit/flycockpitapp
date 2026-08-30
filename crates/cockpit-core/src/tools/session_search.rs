@@ -5,7 +5,7 @@
 //! tiebreaker (migration 0013 / [`crate::db::session_search`]). Defaults
 //! to the current project, excludes archived + the live session, and
 //! returns one highlighted ~150-char snippet per thread. The companion
-//! [`crate::tools::session_read`] reads a chosen thread back.
+//! `read cockpit://session/<short_id>/transcript` reads a chosen thread back.
 //!
 //! Stored history is raw, and trusted-model rows may contain secrets because
 //! trusted outbound redaction is a no-op. The DB trust filter remains the first
@@ -49,7 +49,7 @@ impl Tool for SessionSearchTool {
             "Search your earlier conversations (past sessions) by keyword and get back the most \
              relevant threads, each with its short id and a matching snippet. Use this when the \
              user refers to prior work — \"like we did before\", \"the bug from last week\" — to \
-             find which session it was; then read it in full with `session_read`. Searches the \
+             find which session it was; then read it in full through its `cockpit://` transcript. Searches the \
              current project by default; set `all_projects` to widen it. Narrow large result \
              sets with `since` (only sessions active after a date). This is recall of past \
              conversations, not a code or web search."
@@ -84,6 +84,8 @@ impl Tool for SessionSearchTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        crate::tools::history_scope::require_recall_permission(ctx)?;
+        crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
         ctx.session
             .db
             .fts5_available()
@@ -125,8 +127,9 @@ impl Tool for SessionSearchTool {
         let hits = ctx
             .session
             .db
-            .search_candidates_for_trust(
+            .search_accessible_candidates_for_trust(
                 query,
+                &ctx.session.project_id,
                 project_id,
                 Some(ctx.session.id),
                 since,
@@ -160,8 +163,8 @@ impl Tool for SessionSearchTool {
         let mut out = String::new();
         for hit in hits.iter().take(limit as usize) {
             // A pre-§17 row may lack a short_id; fall back to the full
-            // UUID, which session_read also accepts, so the thread stays
-            // reachable.
+            // UUID, which the cockpit pseudofile path also accepts, so the
+            // thread stays reachable.
             let id = hit
                 .short_id
                 .clone()
@@ -186,7 +189,26 @@ impl Tool for SessionSearchTool {
                 .map_or_else(|| snippet.to_string(), |table| table.scrub(snippet));
             out.push_str(&format!("{short}  {date}  {title}\n    {snippet}\n"));
         }
-        out.push_str("\nUse session_read with a short id (and the topic as `query`) to read a thread back.\n");
+        let displayed: Vec<_> = hits
+            .iter()
+            .take(limit as usize)
+            .map(|hit| hit.session_id)
+            .collect();
+        // Keep the disclosure permit until this call returns. A consent write
+        // cannot commit between the final batch check and its output.
+        let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
+        if !ctx
+            .session
+            .db
+            .sessions_access_allowed(&ctx.session.project_id, &displayed)
+            .await
+            .map_err(|e| anyhow::anyhow!("session_search history scope: {e:#}"))?
+        {
+            return Err(invalid_input(
+                "history access changed before results could be returned",
+            ));
+        }
+        out.push_str("\nUse `read` on `cockpit://session/<short_id>/transcript` for a thread.\n");
         Ok(ToolOutput::text(out))
     }
 }
@@ -209,7 +231,7 @@ impl Tool for SessionLineageSearchTool {
              predecessor sessions and the current session, for a keyword or phrase. Use this \
              when a detail may have been summarized away by compaction. It returns bounded \
              snippets and can also scan bounded tool-call event JSON; follow up with \
-             `session_read` only for a specific session/topic you need. This is recall of \
+             `read` on a cockpit transcript only for a specific session/topic you need. This is recall of \
              stored conversation history, not a code search."
                 .to_string(),
         )
@@ -232,6 +254,8 @@ impl Tool for SessionLineageSearchTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        crate::tools::history_scope::require_recall_permission(ctx)?;
+        crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
         ctx.session
             .db
             .fts5_available()

@@ -1749,6 +1749,18 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "set_workspace_history_scope"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_workspace_history_scope"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "get_startup_disclosures"
       },
       {
@@ -2544,6 +2556,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "workspace_trust"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "workspace_history_scope"
       },
       {
         "class": "bounded_request_response",

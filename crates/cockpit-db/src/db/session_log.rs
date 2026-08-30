@@ -24,6 +24,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::Db;
+use crate::db::session_search::HistoryCallerTrust;
 
 const READ_SESSION_MESSAGES_MAX_LIMIT: u32 = 200;
 const LIST_SESSION_EVENTS_MAX_LIMIT: u32 = 500;
@@ -860,6 +861,67 @@ impl Db {
         let handoff_id = handoff_id.to_string();
         self.read(move |conn| Self::compaction_payload_conn(conn, session_id, &handoff_id))
             .await
+    }
+
+    /// Return the Nth persisted compaction payload for one session. The
+    /// recall facade uses this rather than touching the database directly.
+    pub async fn compaction_text_for_trust(
+        &self,
+        session_id: Uuid,
+        number: usize,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<String>> {
+        if number == 0 {
+            return Ok(None);
+        }
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            conn.query_row(
+                "SELECT COALESCE(
+                            json_extract(e.data_json, '$.handoff_text'),
+                            json_extract(h.payload_json, '$.handoff_text'),
+                            json_extract(e.data_json, '$.brief_text'),
+                            json_extract(h.payload_json, '$.brief_text')
+                        )
+                   FROM session_events e
+              LEFT JOIN compaction_handoffs h
+                     ON h.handoff_id=json_extract(e.data_json, '$.handoff_ref')
+                    AND h.session_id=e.session_id
+                  WHERE e.session_id=?1 AND e.type='session_compacted'
+                    AND (?2 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                  ORDER BY e.seq ASC
+                  LIMIT 1 OFFSET ?3",
+                params![
+                    session_id.to_string(),
+                    permitted,
+                    i64::try_from(number - 1)?
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading compaction recall payload")
+        })
+        .await
+    }
+
+    /// Count visible compaction points for pseudodirectory discovery.
+    pub async fn compaction_count_for_trust(
+        &self,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<usize> {
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_events
+                  WHERE session_id=?1 AND type='session_compacted'
+                    AND (?2 OR model_trust IS NULL OR model_trust <> 'trusted')",
+                params![session_id.to_string(), permitted],
+                |row| row.get(0),
+            )?;
+            usize::try_from(count).context("negative compaction count")
+        })
+        .await
     }
 
     /// Read one inference attempt keyed `(call_id, ordinal)`.
@@ -3948,6 +4010,37 @@ mod tests {
         assert_eq!(page.events[0].seq, compacted);
         assert_eq!(page.events[0].data, payload);
         assert_session_event_rows_eq(&page.events, &full);
+    }
+
+    #[tokio::test]
+    async fn compaction_recall_returns_canonical_text_not_payload_json() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let handoff_id = Uuid::new_v4();
+        db.store_compaction_payload(
+            handoff_id,
+            session.session_id,
+            &json!({ "handoff_text": "stored handoff" }).to_string(),
+        )
+        .await
+        .unwrap();
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::SessionCompacted,
+            Some("builder"),
+            None,
+            &json!({ "handoff_ref": handoff_id.to_string(), "brief_text": "inline brief" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.compaction_text_for_trust(session.session_id, 1, HistoryCallerTrust::Trusted,)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("stored handoff")
+        );
     }
 
     #[tokio::test]

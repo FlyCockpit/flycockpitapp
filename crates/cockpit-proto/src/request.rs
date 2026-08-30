@@ -874,6 +874,14 @@ pub enum Request {
     GetWorkspaceTrust {
         project_root: String,
     },
+    SetWorkspaceHistoryScope {
+        project_root: String,
+        outbound: bool,
+        inbound: bool,
+    },
+    GetWorkspaceHistoryScope {
+        project_root: String,
+    },
     GetStartupDisclosures {
         project_root: String,
     },
@@ -4114,6 +4122,8 @@ macro_rules! request_variants {
             (Request::DeleteProjectNote { .. }, "delete_project_note");
             (Request::SetWorkspaceTrust { .. }, "set_workspace_trust");
             (Request::GetWorkspaceTrust { .. }, "get_workspace_trust");
+            (Request::SetWorkspaceHistoryScope { .. }, "set_workspace_history_scope");
+            (Request::GetWorkspaceHistoryScope { .. }, "get_workspace_history_scope");
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
@@ -4427,6 +4437,8 @@ macro_rules! command {
             (Request::DeleteProjectNote { project_root, id }, "delete_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid", [project_root: String => project_root, id: Uuid => param]);
             (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
             (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::SetWorkspaceHistoryScope { project_root, outbound, inbound }, "set_workspace_history_scope", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|outbound:bool|inbound:bool", [project_root: String => project_root, outbound: bool => param, inbound: bool => param]);
+            (Request::GetWorkspaceHistoryScope { project_root }, "get_workspace_history_scope", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
@@ -5838,6 +5850,8 @@ mod tests {
                         | "complete_mcp_oauth"
                         | "set_workspace_trust"
                         | "get_workspace_trust"
+                        | "set_workspace_history_scope"
+                        | "get_workspace_history_scope"
                         | "resolve_assistant_session"
                         | "list_assistants"
                         | "upsert_assistant"

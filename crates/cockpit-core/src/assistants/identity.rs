@@ -490,7 +490,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let project_id = crate::session::project_id_for(project);
+        let project_id = crate::session::project_id_for(project).unwrap();
         let project_root = project.display().to_string();
         let session_row = db
             .blocking_write_for_sync_maintenance(move |conn| {

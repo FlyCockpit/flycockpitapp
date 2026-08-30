@@ -3690,7 +3690,7 @@ pub fn read_assistant_inbox_blocking(
             main_session_id: got,
             items,
         } if got == main_session_id => {
-            let inbox_item_ids = items.iter().map(|item| item.inbox_item_id).collect();
+            let inbox_item_ids: Vec<Uuid> = items.iter().map(|item| item.inbox_item_id).collect();
             if !inbox_item_ids.is_empty() {
                 match daemon_request_at_blocking(
                     endpoint,

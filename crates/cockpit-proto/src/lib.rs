@@ -1996,10 +1996,11 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
-    KnowledgeDreamRunOutcome, KnowledgeDreamRunReceipt, Response, ResumeCompactionDefault,
-    ResumeCompactionOffer, RunInvocationCancelOutcome, RunInvocationCancelResultV1,
-    RunInvocationLifecycleState, RunInvocationStatusV1, RunInvocationTerminalReason,
+    ActiveModelState, AssistantInboxItemWire, BtwForkInfo, ClientSubmissionReceiptStatus,
+    ImageIngressAdmissionReceiptV1, KnowledgeDreamRunOutcome, KnowledgeDreamRunReceipt, Response,
+    ResumeCompactionDefault, ResumeCompactionOffer, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};

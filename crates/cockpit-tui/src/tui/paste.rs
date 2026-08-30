@@ -1329,7 +1329,7 @@ impl PasteRegistry {
                 let original_nonce = nonce.to_string();
                 let (nonce, number) = match retained_text_numbers.remove(&original_nonce) {
                     Some(number) => (original_nonce, number),
-                    None => (Self::text_nonce(&full), registry.next_text_number()),
+                    None => (original_nonce, registry.next_text_number()),
                 };
                 let (_id, placeholder) = registry.register_text_with_number_and_nonce(
                     at,

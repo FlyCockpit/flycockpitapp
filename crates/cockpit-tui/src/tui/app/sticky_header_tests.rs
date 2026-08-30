@@ -450,18 +450,21 @@ fn anchor_round_trip_is_stable_across_header_appear_and_disappear() {
         top_after_push, top_with_header,
         "scroll-anchor round-trip must keep the same history top while the header stays up"
     );
+    let offset_after_push = app.chat_scroll_offset;
 
     app.sticky_user_message = false;
     render_sticky(&mut app, 40, 10);
     assert!(app.sticky_header_area.is_none());
     // Offset-from-bottom is preserved across the flip so the round-trip
     // cannot oscillate (header decision uses the uncarved pane height).
-    assert_eq!(app.chat_scroll_offset, offset_with_header);
+    // Compare against the post-push offset: appending a bottom row may grow
+    // offset-from-bottom to keep the same history top.
+    assert_eq!(app.chat_scroll_offset, offset_after_push);
 
     app.sticky_user_message = true;
     render_sticky(&mut app, 40, 10);
     assert!(app.sticky_header_area.is_some());
-    assert_eq!(app.chat_scroll_offset, offset_with_header);
+    assert_eq!(app.chat_scroll_offset, offset_after_push);
 }
 
 #[test]

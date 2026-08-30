@@ -2691,7 +2691,7 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     assert!(settings.contains("cockpit_core::daemon::client::test_lifecycle_client()"));
     let tui = tui_production_sources();
     for required in [
-        "LifecycleIntent::AlwaysEphemeral",
+        "LifecycleIntent::AttachOwnEphemeral",
         "LifecycleIntent::EnsurePersistent",
         "connect_endpoint",
         "ClientEndpoint",

@@ -795,6 +795,7 @@ pub(super) fn open_fixture_dialog(path: &std::path::Path) -> SettingsDialog {
         dialog.active_project_root = Some(parent.to_path_buf());
     }
     dialog.cx.queue_extended_load();
+    dialog.cx.queue_provider_catalog(None);
     dialog
 }
 

@@ -40,19 +40,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            #[cfg(test)]
-            {
-                // `#[tokio::test]` defaults to a current-thread runtime. Spawned
-                // export/RPC work then cannot run while the test awaits the
-                // request channel. Drive those tasks on the dedicated worker
-                // pool so they make progress independently of the event loop.
-                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                    return test_async_runtime().spawn(future);
-                }
-            }
-            handle.spawn(future)
-        }
+        Ok(handle) => handle.spawn(future),
         Err(_) => {
             #[cfg(test)]
             {
@@ -72,15 +60,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            #[cfg(test)]
-            {
-                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                    return test_async_runtime().spawn_blocking(work);
-                }
-            }
-            handle.spawn_blocking(work)
-        }
+        Ok(handle) => handle.spawn_blocking(work),
         Err(_) => {
             #[cfg(test)]
             {
@@ -2286,7 +2266,7 @@ mod tests {
             )
             .id();
 
-        first_tx.send(()).unwrap();
+        let _ = first_tx.send(());
         second_tx.send(()).unwrap();
         let results = wait_for_results(&mut runner).await;
 

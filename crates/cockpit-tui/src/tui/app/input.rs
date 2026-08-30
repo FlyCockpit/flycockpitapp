@@ -411,6 +411,13 @@ impl App {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Home
+            && self.composer.is_empty()
+            && self.sticky_header_area.is_some()
+        {
+            self.jump_to_sticky_user_header();
+            return false;
+        }
         if self.handle_queue_key(key) {
             return false;
         }
@@ -1681,6 +1688,10 @@ impl App {
                 false
             }
             KeyCode::Home => {
+                if self.composer.is_empty() && self.sticky_header_area.is_some() {
+                    self.jump_to_sticky_user_header();
+                    return false;
+                }
                 self.composer.move_line_start();
                 false
             }

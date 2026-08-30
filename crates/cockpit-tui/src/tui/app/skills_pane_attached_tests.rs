@@ -76,8 +76,19 @@ async fn drain_until_idle(app: &mut App) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let notify = app.async_actions.notifier();
+        let notified = notify.notified();
+        app.drain_async_actions();
+        if app.async_actions.pending_count() == 0 {
+            app.drain_async_actions();
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(20), notified).await;
     }
-    panic!("async action did not complete");
+    panic!(
+        "async action did not complete; pending={:?}",
+        app.async_actions.pending_kinds()
+    );
 }
 
 #[tokio::test]

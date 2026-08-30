@@ -188,11 +188,11 @@ impl ResourcesPane {
         frame.render_stateful_widget(
             List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-                .scroll_padding(1),
+                .scroll_padding(0),
             body,
             &mut viewport,
         );
-        let mut offset = viewport.offset().min(max_offset);
+        let mut offset = self.list.offset().min(max_offset);
         if self.follow_selection
             && let Some(row) = selected_row
         {
@@ -312,7 +312,6 @@ impl ResourcesPane {
             }
         }
 
-        lines.push(Line::default());
         lines.push(section("Running"));
         if snapshot.running.is_empty() {
             lines.push(muted("  none"));
@@ -322,7 +321,6 @@ impl ResourcesPane {
             }
         }
 
-        lines.push(Line::default());
         lines.push(section("Queued"));
         if snapshot.queued.is_empty() {
             lines.push(muted("  none"));

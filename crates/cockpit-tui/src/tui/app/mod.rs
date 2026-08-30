@@ -3424,6 +3424,10 @@ impl App {
         app.session_setup_collapsed = true;
         app.session_setup_focused = false;
         app.daemon_prompt = None;
+        // First-run Add-Provider is a production launch convenience. Opening it
+        // here queues leftover settings.effect work (guidance-trace) that later
+        // steals a fixture attached-request channel when a test drains.
+        app.dialog = Dialog::None;
         app
     }
 

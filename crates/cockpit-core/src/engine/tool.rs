@@ -1252,6 +1252,7 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            executing_model_trusted: self.executing_model_trusted,
             agent_instance_id: self.agent_instance_id,
             lock_identity: self.lock_identity.clone(),
             write_scope: self.write_scope.clone(),

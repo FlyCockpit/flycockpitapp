@@ -561,6 +561,7 @@ mod safety_gate_tests {
         };
         ToolCtx {
             agent_id: "builder".to_string(),
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,

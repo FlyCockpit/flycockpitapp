@@ -363,14 +363,13 @@ impl Tool for SessionLineageSearchTool {
 }
 
 pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
-    let (Some(provider), Some(model)) = (ctx.session.active_provider(), ctx.session.active_model())
-    else {
+    let Some(caller_model) = ctx.caller_model.as_ref() else {
         return HistoryCallerTrust::Untrusted;
     };
     if ctx
         .config
         .providers()
-        .resolve_trust(&provider, &model)
+        .resolve_trust(caller_model.provider_id(), caller_model.model_id())
         .is_trusted()
     {
         HistoryCallerTrust::Trusted
@@ -421,10 +420,10 @@ mod tests {
             providers.join("local.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{
-                    "id": "local-model",
-                    "trust": "untrusted",
-                }]
+                "models": [
+                    { "id": "trusted-model", "trust": "trusted" },
+                    { "id": "local-model", "trust": "untrusted" }
+                ]
             })
             .to_string(),
         )
@@ -478,14 +477,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_search_scrubs_target_session_only_secret_from_snippet() {
+    async fn untrusted_calling_model_scrubs_snippet_despite_trusted_session_active_model() {
         const TARGET_ONLY_SECRET: &str = "workspace-b-only-search-secret-130";
         let tmp = tempfile::tempdir().unwrap();
         write_untrusted_provider(tmp.path());
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
         ctx.session
-            .set_active_model("local", "local-model")
+            .set_active_model("local", "trusted-model")
             .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
         let other = ctx
             .session
             .db
@@ -539,13 +542,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_search_fails_closed_without_target_redaction_table() {
+    async fn untrusted_calling_model_fails_closed_despite_trusted_session_active_model() {
         let tmp = tempfile::tempdir().unwrap();
         write_untrusted_provider(tmp.path());
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
         ctx.session
-            .set_active_model("local", "local-model")
+            .set_active_model("local", "trusted-model")
             .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
         let other = ctx
             .session
             .db
@@ -618,10 +625,14 @@ mod tests {
     {
         let tmp = tempfile::tempdir().unwrap();
         write_untrusted_provider(tmp.path());
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
         ctx.session
-            .set_active_model("local", "local-model")
+            .set_active_model("local", "trusted-model")
             .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
         ctx.session.persist_redaction_table(&ctx.redact).unwrap();
         ctx.session
             .db

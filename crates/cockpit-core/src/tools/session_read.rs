@@ -277,7 +277,10 @@ mod tests {
             providers.join("local.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{ "id": "local-model", "trust": "untrusted" }]
+                "models": [
+                    { "id": "trusted-model", "trust": "trusted" },
+                    { "id": "local-model", "trust": "untrusted" }
+                ]
             })
             .to_string(),
         )
@@ -452,14 +455,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_cross_session_read_uses_target_persisted_redaction_table() {
+    async fn untrusted_calling_model_scrubs_read_despite_trusted_session_active_model() {
         const TARGET_ONLY_SECRET: &str = "workspace-b-only-dotenv-secret-130";
         let tmp = tempfile::tempdir().unwrap();
         write_untrusted_provider(tmp.path());
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
         ctx.session
-            .set_active_model("local", "local-model")
+            .set_active_model("local", "trusted-model")
             .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
         let (short, target) = seed_thread(
             &ctx,
             &[("workspace B used workspace-b-only-dotenv-secret-130", false)],
@@ -481,14 +488,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_cross_session_read_fails_closed_without_target_redaction_table() {
+    async fn untrusted_calling_model_read_fails_closed_despite_trusted_session_active_model() {
         const TARGET_ONLY_SECRET: &str = "workspace-b-unpersisted-dotenv-secret-130";
         let tmp = tempfile::tempdir().unwrap();
         write_untrusted_provider(tmp.path());
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
         ctx.session
-            .set_active_model("local", "local-model")
+            .set_active_model("local", "trusted-model")
             .unwrap();
+        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
+            "local",
+            "local-model",
+        ));
         let (short, target) = seed_thread(
             &ctx,
             &[(

@@ -1201,6 +1201,10 @@ const ALLOWED_LINES: &[(&str, &str)] = &[
         "std::fs::create_dir_all(&dir)?;",
     ),
     (
+        "crates/cockpit-tui/src/tui/settings/mod.rs",
+        "match std::fs::create_dir_all(directory) {",
+    ),
+    (
         "crates/cockpit-tui/src/tui/async_action.rs",
         "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;",
     ),
@@ -1928,6 +1932,10 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
             "std::fs::create_dir_all(&dir)?;",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/settings/mod.rs",
+            "match std::fs::create_dir_all(directory) {",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",

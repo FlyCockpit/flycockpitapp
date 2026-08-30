@@ -442,10 +442,11 @@ impl StatsPane {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )
-                .scroll_padding(0),
+                .scroll_padding(1),
             body,
             &mut viewport,
         );
+        *self.list.offset_mut() = viewport.offset();
         render_scrollbar(
             frame,
             body,

@@ -1690,18 +1690,30 @@ mod tests {
                 (!symbol.is_empty()).then_some(symbol)
             })
             .collect::<String>();
+        compact_wide_glyph_continuations(&rendered)
+    }
+
+    fn compact_wide_glyph_continuations(rendered: &str) -> String {
         // Wide CJK glyphs occupy two TestBackend cells; the continuation
-        // cell is sometimes a space. Drop those so unicode identity asserts
-        // see "模型" rather than "模 型".
+        // cell is sometimes a space. Drop a space only when it sits between
+        // two wide glyphs so "模型" does not become "模 型". Keep a space
+        // after a wide glyph when the next character is narrow — that is
+        // the filter caret ("中 a").
+        let chars: Vec<char> = rendered.chars().collect();
         let mut compact = String::new();
-        for ch in rendered.chars() {
-            if ch == ' '
-                && compact
+        for (index, &ch) in chars.iter().enumerate() {
+            if ch == ' ' {
+                let prev_wide = compact
                     .chars()
                     .last()
-                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2))
-            {
-                continue;
+                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2));
+                let next_wide = chars
+                    .get(index + 1)
+                    .copied()
+                    .is_some_and(|next| unicode_width::UnicodeWidthChar::width(next) == Some(2));
+                if prev_wide && next_wide {
+                    continue;
+                }
             }
             compact.push(ch);
         }

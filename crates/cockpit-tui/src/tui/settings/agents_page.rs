@@ -104,6 +104,10 @@ pub(super) struct AgentsPage {
     /// ambiguity. The page cannot close until the daemon replays a matching
     /// terminal receipt.
     uncertain_agent_operation: Option<Box<PendingAgentOperation>>,
+    /// Mutation-success copy restored after the follow-up inventory load.
+    retained_status: Option<String>,
+    /// Confirmed reset-all waits for an inventory revision, then submits.
+    reset_all_after_load: bool,
 }
 
 struct StagedInventoryLoad {
@@ -455,6 +459,8 @@ impl AgentsPage {
             staged_assistants: None,
             pending_daemon: HashMap::new(),
             uncertain_agent_operation: None,
+            retained_status: None,
+            reset_all_after_load: false,
         }
     }
 
@@ -768,6 +774,33 @@ impl AgentsPage {
         self.rebuild_rows();
     }
 
+    fn take_reset_all_after_load(&mut self, cx: &mut SettingsCx) {
+        if !self.reset_all_after_load {
+            return;
+        }
+        let Some(revision) = self.inventory_revision.clone() else {
+            return;
+        };
+        if self.pending_daemon.values().any(|pending| {
+            matches!(
+                pending,
+                PendingAgentOperation::Inventory { .. } | PendingAgentOperation::Assistants { .. }
+            )
+        }) {
+            return;
+        }
+        self.reset_all_after_load = false;
+        let cwd = cx.agents_cwd();
+        self.stage_mutation(
+            cx,
+            cwd,
+            cockpit_proto::AgentMutation::ResetAllBuiltins,
+            revision,
+            MutationPurpose::ResetAll,
+        );
+        self.status = Some("resetting all built-in overrides…".into());
+    }
+
     fn refresh_paired_load_status(&mut self, generation: uuid::Uuid) {
         if generation != self.load_generation {
             return;
@@ -796,7 +829,7 @@ impl AgentsPage {
         } else if waiting {
             Some("loading daemon-owned agent inventory…".into())
         } else {
-            None
+            self.retained_status.take()
         };
     }
 
@@ -955,6 +988,7 @@ impl AgentsPage {
                     }
                 }
                 self.refresh_paired_load_status(generation);
+                self.take_reset_all_after_load(cx);
             }
             PendingAgentOperation::Assistants { generation } => {
                 if generation != self.load_generation {
@@ -977,6 +1011,7 @@ impl AgentsPage {
                     }
                 }
                 self.refresh_paired_load_status(generation);
+                self.take_reset_all_after_load(cx);
             }
             other => self.apply_operation_completion(cx, other, completion.response),
         }
@@ -1410,7 +1445,8 @@ impl AgentsPage {
                                 &snapshot.revision,
                             );
                             self.editing = None;
-                            self.status = Some(format!("saved `{}`", snapshot.name));
+                            self.retained_status = Some(format!("saved `{}`", snapshot.name));
+                            self.status = self.retained_status.clone();
                             self.queue_load(cx);
                             self.restore_cursor_after_load(&id);
                             let _ = markdown;
@@ -1449,7 +1485,7 @@ impl AgentsPage {
                     }
                     MutationPurpose::ResetAll => {
                         self.expected_inventory_after_commit = result.inventory_revision.clone();
-                        self.status = Some(match result.outcome {
+                        self.retained_status = Some(match result.outcome {
                             cockpit_proto::AgentMutationOutcome::Reconciled => {
                                 "reset all built-in agent overrides".into()
                             }
@@ -1457,6 +1493,7 @@ impl AgentsPage {
                                 warning,
                             } => warning,
                         });
+                        self.status = self.retained_status.clone();
                         self.queue_load(cx);
                     }
                 }
@@ -3311,10 +3348,9 @@ impl SettingsCx {
                         );
                         p.status = Some("resetting all built-in overrides…".into());
                     } else {
+                        p.reset_all_after_load = true;
                         p.queue_load(self);
-                        p.status = Some(
-                            "refreshing reset-all authority; confirm again when loaded".into(),
-                        );
+                        p.status = Some("refreshing reset-all authority…".into());
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {

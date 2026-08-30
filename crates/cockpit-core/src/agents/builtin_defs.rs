@@ -327,7 +327,6 @@ fn careful_def() -> AgentDef {
             "harness_list",
             "harness_invoke",
             "session_search",
-            "session_read",
             "session_lineage_search",
             "todo",
             "webfetch",
@@ -521,16 +520,11 @@ fn history_def() -> AgentDef {
         "history",
         "Read-only recall worker; searches prior sessions and compaction lineage, then reports relevant excerpts.",
         AgentMode::Subagent,
-        &[
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ],
+        &["read", "session_search", "session_lineage_search"],
         crate::engine::builtin::HISTORY_PROMPT,
         None,
     );
-    for tool in ["session_search", "session_read", "session_lineage_search"] {
+    for tool in ["session_search", "session_lineage_search"] {
         def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
     }
     def
@@ -590,9 +584,7 @@ fn plan_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
-            "plan_read",
-            "plan_write",
-            "plan_edit",
+            "write",
             "start_build",
             "question",
             "skill",
@@ -954,12 +946,7 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"history"));
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in [
-            "read",
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-        ] {
+        for tool in ["read", "session_search", "session_lineage_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in ["task", "spawn", "handoff", "write", "edit", "unlock"] {
@@ -968,7 +955,7 @@ mod tests {
                 "{forbidden} must not be granted"
             );
         }
-        for tool in ["session_search", "session_read", "session_lineage_search"] {
+        for tool in ["session_search", "session_lineage_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
     }

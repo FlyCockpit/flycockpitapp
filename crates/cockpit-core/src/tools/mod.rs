@@ -38,6 +38,7 @@ pub mod plan_doc;
 pub mod question;
 pub mod read;
 pub mod read_image;
+pub mod recall;
 pub mod return_tool;
 pub mod sandbox;
 pub mod sandbox_mode;

@@ -729,28 +729,12 @@ async fn toolbox_with_retrieval_if_needed(
     session: &Session,
     posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
-    // These two tools are registered with the built-in inventory so their
-    // schemas are available once a capture exists, but they must never be
-    // offered speculatively.  Start by removing any static registration so a
-    // rebuilt/restarted session gets the same artifact-dependent surface as a
-    // newly-created one.
-    tools = tools.without("artifact_read").without("artifact_search");
     if session.sandbox_escalation_enabled()
         && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {
         tools = tools.without("escalate");
-    }
-    if session
-        .db
-        .session_has_text_artifacts(session.id)
-        .await
-        .unwrap_or(false)
-    {
-        tools = tools
-            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
-            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
     }
     if session
         .db
@@ -769,13 +753,7 @@ pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
     // Read/search pages are bounded responses, not new durable captures.
     !matches!(
         tool,
-        "read"
-            | "write"
-            | "edit"
-            | "unlock"
-            | "artifact_read"
-            | "artifact_search"
-            | "delegation_payload_retrieve"
+        "read" | "write" | "edit" | "unlock" | "delegation_payload_retrieve"
     )
 }
 

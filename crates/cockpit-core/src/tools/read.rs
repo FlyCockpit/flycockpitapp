@@ -25,7 +25,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Snapshot-read a file with no lock; use `read` before `write`/`edit` when you intend to edit"
+        "Snapshot-read a file or `cockpit://` recall pseudofile with no lock; use `read` before `write`/`edit` when you intend to edit"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -84,6 +84,15 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // `cockpit://` is a database-backed recall provider, never a host
+        // path. Dispatch before resolve/sandbox/gitignore can inspect it.
+        if args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(crate::tools::recall::is_recall_path)
+        {
+            return crate::tools::recall::read(&args, ctx).await;
+        }
         // Native-tool boundary check (sandboxing part 2): a path outside
         // cwd + session tmp escalates via the approval prompt (naming the
         // exact path) before any read happens.

@@ -32,7 +32,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read; prefer `edit` for small changes"
+        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
     }
 
     fn verbose_description(&self) -> Option<String> {
@@ -79,6 +79,11 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // The recall provider owns its sole writable pseudofile (plan) and
+        // must run before every host-path guard.
+        if let Some(output) = crate::tools::recall::write(&args, ctx).await? {
+            return Ok(output);
+        }
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)

@@ -773,9 +773,7 @@ pub enum Request {
     ListSealedActions,
     /// Create a sealed action instance. The three ids (`kind_id`, `origin_id`,
     /// `projection_id`) are closed server-side lookups the daemon resolves to a
-    /// compiled action kind; an unknown id is rejected before any persist. For
-    /// `knowledge_base_copy`, `origin_id` is the configured KB registry label,
-    /// resolved and pinned by the daemon rather than a caller-supplied UUID. The
+    /// compiled action kind; an unknown id is rejected before any persist. The
     /// wire carries no origin URL, path template, or projection blob. The daemon
     /// mints the `action_id`.
     CreateSealedAction {
@@ -876,24 +874,25 @@ pub enum Request {
     GetWorkspaceTrust {
         project_root: String,
     },
+    /// Read or change this workspace's independent cross-workspace history
+    /// recall consents. The caller must configure outbound access in the
+    /// querying workspace and inbound access in every workspace it permits.
     SetWorkspaceHistoryScope {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         outbound: bool,
         inbound: bool,
     },
     GetWorkspaceHistoryScope {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
     },
     GetStartupDisclosures {
         project_root: String,
     },
-    /// Read the installation-scoped state of a one-time disclosure.
     GetAppFlag {
         key: AppFlagKey,
     },
-    /// Atomically acknowledge a one-time disclosure at its observed version.
-    /// A stale acknowledgement is rejected rather than overwriting a newer
-    /// state.
     MarkAppFlagSeen {
         key: AppFlagKey,
         expected_version: u64,
@@ -1044,23 +1043,16 @@ pub enum Request {
     CancelTurn,
 
     /// Cancel every live unit of work in the attached session: the foreground
-    /// turn and all loop, timer, background, and swarm jobs. This is the
-    /// explicit "Stop all" exit decision; `CancelTurn` remains the narrower
-    /// ctrl+c interrupt.
+    /// turn and all loop, timer, background, and swarm jobs.
     CancelAllSessionWork,
-
     /// Convert the current reference-counted daemon owner into a persistent
-    /// owner without interrupting its live session workers. This is the
-    /// explicit user choice behind "Run in background" during detach.
+    /// owner without interrupting its live session workers.
     PromoteToPersistent,
-
     /// Authoritative attached-session snapshot used immediately before a
-    /// client detaches. The daemon, not a UI projection, decides whether live
-    /// work exists and reports the lifetime of this exact owner.
+    /// client detaches.
     ExitGuardStatus,
-
     /// Release this attached client's pending exit-guard decision without
-    /// changing daemon lifetime. Used when the client dismisses the prompt.
+    /// changing daemon lifetime.
     ReleaseExitGuard,
 
     FsList {
@@ -1454,9 +1446,8 @@ pub enum Request {
         job: ScheduledJobCreate,
     },
 
-    /// List client-visible durable scheduler jobs. Owner filtering is exact
-    /// for assistant owners; daemon-owned `system:*` callback jobs are never
-    /// exposed through this request.
+    /// List durable scheduler jobs. Owner filtering is exact, e.g.
+    /// `assistant:alice` or `system:dreamer`.
     ListScheduledJobs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
@@ -1690,11 +1681,8 @@ pub enum Request {
     /// immediately; the in-place boundary arrives as a `CompactReady` event.
     Compact,
 
-    /// Accept the compacted branch of a prior interactive attach's
-    /// [`crate::ResumeCompactionOffer`]. The daemon revalidates the exact
-    /// rolling snapshot at the safe boundary and applies its deterministic
-    /// handoff without model inference. Not sending this request retains the
-    /// full conversation and leaves the snapshot banked.
+    /// Accept the compacted branch of a prior interactive attach's rolling
+    /// snapshot at the daemon's safe boundary.
     ResumeFromCompaction,
 
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
@@ -4472,7 +4460,7 @@ macro_rules! command {
             (Request::GetWorkspaceHistoryScope { project_root }, "get_workspace_history_scope", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
-            (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
+            (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::GetStorageReport, "get_storage_report", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::PreviewStorageCleanup { target }, "preview_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "target:StorageCleanupTarget", [target: StorageCleanupTarget => param]);
             (Request::ExecuteStorageCleanup { preview_id }, "execute_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "preview_id:Uuid", [preview_id: Uuid => param]);
@@ -5857,10 +5845,6 @@ mod tests {
                         | "sync_flycockpit_org_policy"
                         | "enroll_flycockpit_org_sync"
                         | "get_startup_disclosures"
-                        | "mark_app_flag_seen"
-                        | "get_storage_report"
-                        | "preview_storage_cleanup"
-                        | "execute_storage_cleanup"
                         | "list_secret_inventory"
                         | "put_named_secret"
                         | "delete_named_secret"
@@ -5892,8 +5876,6 @@ mod tests {
                         | "complete_mcp_oauth"
                         | "set_workspace_trust"
                         | "get_workspace_trust"
-                        | "set_workspace_history_scope"
-                        | "get_workspace_history_scope"
                         | "resolve_assistant_session"
                         | "list_assistants"
                         | "upsert_assistant"

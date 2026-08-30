@@ -119,6 +119,25 @@ CREATE TABLE sessions (
     description        TEXT CHECK (
         description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
     ),                                            -- generated old-session context (§17d)
+    -- A generated description is model-authored durable content. Preserve its
+    -- exact source identity so history search can apply the same trust fence
+    -- as it does to event-owned FTS rows. All provenance is absent together
+    -- for sessions without a description; a description may never fail open
+    -- through NULL trust.
+    description_provider_id TEXT,
+    description_model_id    TEXT,
+    description_model_trust TEXT,
+    CHECK (
+        (description IS NULL
+         AND description_provider_id IS NULL
+         AND description_model_id IS NULL
+         AND description_model_trust IS NULL)
+        OR
+        (description IS NOT NULL
+         AND description_provider_id IS NOT NULL
+         AND description_model_id IS NOT NULL
+         AND description_model_trust IN ('trusted', 'untrusted'))
+    ),
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -185,10 +204,10 @@ CREATE TABLE sessions (
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
-    -- title/metadata slot (0, 1, 2, 4, 8, 16, 32, 64, or 128) so a resumed
-    -- session never repeats the same automatic metadata opportunity.
+    -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
+    -- the same automatic title opportunity.
     user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
-    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16, 32, 64, 128)),
+    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
     -- Monotonic ownership fence for an in-flight same-model metadata fork.
     metadata_fork_generation INTEGER NOT NULL DEFAULT 0 CHECK (metadata_fork_generation >= 0),
 
@@ -1097,7 +1116,7 @@ CREATE TABLE app_flags (
 );
 
 -- Durable daemon-owned work left after a session's relational deletion has
--- committed but its fenced directory could not yet be unlinked.  The path is
+-- committed but its fenced directory could not yet be unlinked. The path is
 -- an opaque staging pathname produced by the storage daemon, never UI input.
 CREATE TABLE storage_directory_cleanup_intents (
     staged_path TEXT PRIMARY KEY,
@@ -3204,8 +3223,6 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
--- ---- session full-text search (`session_search` / `cockpit://` recall) -------------
-
 -- ---- scheduled jobs --------------------------------------------------------
 -- The immutable insertion identity fences stale asynchronous actions when a
 -- user-chosen job id is deleted and later reused.
@@ -3238,22 +3255,20 @@ CREATE TABLE scheduled_jobs (
     disabled_notice   TEXT
 );
 
-CREATE INDEX idx_scheduled_jobs_next_run
-    ON scheduled_jobs(enabled, next_run_at);
-
-CREATE INDEX idx_scheduled_jobs_owner
-    ON scheduled_jobs(owner);
+CREATE INDEX idx_scheduled_jobs_next_run ON scheduled_jobs(enabled, next_run_at);
+CREATE INDEX idx_scheduled_jobs_owner ON scheduled_jobs(owner);
 
 CREATE TRIGGER scheduled_jobs_row_identity_immutable
 BEFORE UPDATE OF row_identity ON scheduled_jobs
 BEGIN
     SELECT RAISE(ABORT, 'scheduled job row identity is immutable');
 END;
+
+-- ---- session full-text search (`history_search` / `cockpit://` recall) ------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
--- session: the session TITLE plus the text of `user_message` /
--- `assistant_message` events and model-written compaction briefs/handoffs.
--- Tool outputs, tool-call args, and raw inference payloads are deliberately
--- NOT indexed — they're noise for recall and a token/privacy hazard.
+-- session: the session title/description, the text of `user_message` /
+-- `assistant_message` events, model-written compaction briefs/handoffs, and
+-- session-owned text artifacts. Raw inference payloads remain unindexed.
 --
 -- Layout choice: a contentless FTS5 table (`content=''`) with one indexed
 -- text column, because the searchable text is spread across two base
@@ -3263,8 +3278,8 @@ END;
 -- thread (`session_id`) and, for message rows, an in-thread location
 -- (`seq`); it stores identifiers only, never a second copy of text.
 --
---   row_kind   — 'title' | 'message' | 'compaction', so readers can window
---                messages separately from compaction summary matches.
+--   row_kind   — 'title' | 'description' | 'message' | 'compaction' |
+--                'artifact', preserving the canonical recall target.
 --   seq        — session_events.seq for a message row; NULL for a title.
 
 CREATE VIRTUAL TABLE session_fts USING fts5(
@@ -3274,44 +3289,33 @@ CREATE VIRTUAL TABLE session_fts USING fts5(
 
 CREATE TABLE session_fts_docs (
     rowid      INTEGER PRIMARY KEY,
-    row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message', 'compaction')),
+    row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'description', 'message', 'compaction', 'artifact')),
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     seq        INTEGER,
+    artifact_id TEXT,
     FOREIGN KEY (session_id, seq)
         REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
-    UNIQUE(row_kind, session_id, seq)
+    FOREIGN KEY (session_id, artifact_id)
+        REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    UNIQUE(row_kind, session_id, artifact_id)
 );
 
 CREATE UNIQUE INDEX session_fts_docs_one_title
     ON session_fts_docs(session_id)
     WHERE row_kind = 'title';
 
+CREATE UNIQUE INDEX session_fts_docs_one_description
+    ON session_fts_docs(session_id)
+    WHERE row_kind = 'description';
+
+-- An event has at most one message or compaction document of a given kind,
+-- but it may own several separately-addressable artifact documents.
+CREATE UNIQUE INDEX session_fts_docs_one_non_artifact_event_kind
+    ON session_fts_docs(row_kind, session_id, seq)
+    WHERE row_kind <> 'artifact';
+
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
-
--- ---- knowledge dream ledger -------------------------------------------------
--- Dream snapshots the project's global `session_events.seq` before it reads
--- input, then advances this per-concrete-KB-attachment boundary only after it
--- has durably folded every event through that sequence into the attachment.
--- Retrieval never writes this table: it uses the exact ordering boundary to
--- find sessions with a later event that may not have been dreamed yet.
--- `knowledge_base_attachment_id` is a source-derived UUID (or a
--- host-installer UUID), deliberately distinct from the user-configured,
--- workspace-local registry `id`.
-CREATE TABLE knowledge_dream_ledger (
-    project_uuid BLOB NOT NULL CHECK (
-        typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
-        AND project_uuid <> zeroblob(16)
-    ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,
-    knowledge_base_attachment_id BLOB NOT NULL CHECK (
-        typeof(knowledge_base_attachment_id) = 'blob'
-        AND length(knowledge_base_attachment_id) = 16
-        AND knowledge_base_attachment_id <> zeroblob(16)
-    ),
-    last_dreamed_session_event_seq INTEGER NOT NULL CHECK (last_dreamed_session_event_seq >= 0),
-    updated_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY (project_uuid, knowledge_base_attachment_id)
-);
 
 -- Event sync: `user_message` / `assistant_message` rows carry conversational
 -- text at data_json.'$.text'. `session_compacted` rows carry model-written
@@ -3385,9 +3389,11 @@ BEGIN
              )
            ELSE json_extract(old.data_json, '$.text') END
     FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
     DELETE FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
 END;
 
 CREATE TRIGGER session_fts_events_au AFTER UPDATE ON session_events
@@ -3414,9 +3420,11 @@ BEGIN
              )
            ELSE json_extract(old.data_json, '$.text') END
     FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
     DELETE FROM session_fts_docs
-    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction')
+      AND session_id = old.session_id AND seq = old.seq;
     INSERT INTO session_fts_docs (row_kind, session_id, seq)
     SELECT CASE WHEN new.type = 'session_compacted' THEN 'compaction' ELSE 'message' END,
            new.session_id,
@@ -3474,28 +3482,50 @@ END;
 -- NULL→text, text→text, and text→NULL transitions.
 
 CREATE TRIGGER session_fts_title_ai AFTER INSERT ON sessions
-WHEN new.title IS NOT NULL AND new.title <> ''
+WHEN (new.title IS NOT NULL AND new.title <> '')
+  OR (new.description IS NOT NULL AND new.description <> '')
 BEGIN
-    INSERT INTO session_fts_docs (row_kind, session_id, seq)
-    VALUES ('title', new.session_id, NULL);
-    INSERT INTO session_fts (rowid, body)
-    VALUES (last_insert_rowid(), new.title);
-END;
-
-CREATE TRIGGER session_fts_title_au AFTER UPDATE OF title ON sessions
-BEGIN
-    INSERT INTO session_fts (session_fts, rowid, body)
-    SELECT 'delete', rowid, old.title
-    FROM session_fts_docs
-    WHERE row_kind = 'title' AND session_id = old.session_id;
-    DELETE FROM session_fts_docs
-    WHERE row_kind = 'title' AND session_id = old.session_id;
     INSERT INTO session_fts_docs (row_kind, session_id, seq)
     SELECT 'title', new.session_id, NULL
     WHERE new.title IS NOT NULL AND new.title <> '';
+    INSERT INTO session_fts_docs (row_kind, session_id, seq)
+    SELECT 'description', new.session_id, NULL
+    WHERE new.description IS NOT NULL AND new.description <> '';
     INSERT INTO session_fts (rowid, body)
-    SELECT last_insert_rowid(), new.title
+    SELECT rowid, CASE row_kind
+      WHEN 'title' THEN new.title
+      ELSE new.description
+    END
+    FROM session_fts_docs
+    WHERE session_id = new.session_id
+      AND row_kind IN ('title', 'description');
+END;
+
+CREATE TRIGGER session_fts_title_au AFTER UPDATE OF title, description ON sessions
+BEGIN
+    INSERT INTO session_fts (session_fts, rowid, body)
+    SELECT 'delete', rowid, CASE row_kind
+      WHEN 'title' THEN old.title
+      ELSE old.description
+    END
+    FROM session_fts_docs
+    WHERE row_kind IN ('title', 'description') AND session_id = old.session_id;
+    DELETE FROM session_fts_docs
+    WHERE row_kind IN ('title', 'description') AND session_id = old.session_id;
+    INSERT INTO session_fts_docs (row_kind, session_id, seq)
+    SELECT 'title', new.session_id, NULL
     WHERE new.title IS NOT NULL AND new.title <> '';
+    INSERT INTO session_fts_docs (row_kind, session_id, seq)
+    SELECT 'description', new.session_id, NULL
+    WHERE new.description IS NOT NULL AND new.description <> '';
+    INSERT INTO session_fts (rowid, body)
+    SELECT rowid, CASE row_kind
+      WHEN 'title' THEN new.title
+      ELSE new.description
+    END
+    FROM session_fts_docs
+    WHERE session_id = new.session_id
+      AND row_kind IN ('title', 'description');
 END;
 
 CREATE TRIGGER session_fts_sessions_ad AFTER DELETE ON sessions
@@ -3504,10 +3534,15 @@ BEGIN
     SELECT 'delete', d.rowid,
            CASE d.row_kind
              WHEN 'title' THEN old.title
+             WHEN 'description' THEN old.description
+             WHEN 'artifact' THEN a.content
              ELSE json_extract(e.data_json, '$.text')
            END
     FROM session_fts_docs AS d
-    LEFT JOIN session_events AS e ON e.seq = d.seq
+    LEFT JOIN session_events AS e
+           ON e.session_id = d.session_id AND e.seq = d.seq
+    LEFT JOIN session_text_artifacts AS a
+           ON a.session_id = d.session_id AND a.artifact_id = d.artifact_id
     WHERE d.session_id = old.session_id;
     DELETE FROM session_fts_docs WHERE session_id = old.session_id;
 END;
@@ -3841,6 +3876,32 @@ CREATE TABLE session_text_artifacts (
 
 CREATE INDEX idx_session_text_artifacts_session_created
     ON session_text_artifacts(session_id, created_at, artifact_id);
+
+-- Artifact bodies are immutable and have a canonical cockpit pseudofile, so
+-- they may participate in `history_search` discovery without exposing the
+-- whole body in the tool result. The owner event sequence carries the same
+-- model-trust filter as message and compaction rows.
+CREATE TRIGGER session_fts_artifacts_ai AFTER INSERT ON session_text_artifacts
+BEGIN
+    INSERT INTO session_fts_docs (row_kind, session_id, seq, artifact_id)
+    VALUES ('artifact', new.session_id, new.owner_event_seq, new.artifact_id);
+    INSERT INTO session_fts (rowid, body)
+    VALUES (last_insert_rowid(), new.content);
+END;
+
+CREATE TRIGGER session_fts_artifacts_ad BEFORE DELETE ON session_text_artifacts
+BEGIN
+    INSERT INTO session_fts (session_fts, rowid, body)
+    SELECT 'delete', rowid, old.content
+    FROM session_fts_docs
+    WHERE row_kind = 'artifact'
+      AND session_id = old.session_id
+      AND artifact_id = old.artifact_id;
+    DELETE FROM session_fts_docs
+    WHERE row_kind = 'artifact'
+      AND session_id = old.session_id
+      AND artifact_id = old.artifact_id;
+END;
 
 -- The accepted model-facing composition for an artifact-backed user turn.
 -- Authored bytes are never duplicated here: the sole `authored_text` slot is
@@ -4462,10 +4523,9 @@ CREATE TABLE workspace_trust (
 CREATE INDEX idx_workspace_trust_updated_at
     ON workspace_trust(updated_at_unix_ms DESC);
 
--- ---- workspace history recall scope --------------------------------------------------------
--- Independent from execution sandbox and workspace trust. Missing workspace
--- rows are fail-closed (current workspace only). The machine default table is
--- reserved for onboarding; no flow reads or writes it in v0.1 yet.
+-- ---- workspace history recall scope ----------------------------------------
+-- Independent from execution sandbox and workspace trust. Missing rows are
+-- fail-closed, keeping recall in the current workspace only.
 CREATE TABLE workspace_history_scopes (
     project_id TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 4096),
     outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (outbound_enabled IN (0, 1)),
@@ -4473,6 +4533,8 @@ CREATE TABLE workspace_history_scopes (
     updated_at_unix_ms INTEGER NOT NULL
 );
 
+-- Reserved onboarding default. Recall uses explicit per-workspace decisions;
+-- a missing row remains fail-closed.
 CREATE TABLE machine_history_scope_default (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     cross_workspace_recall_enabled INTEGER NOT NULL DEFAULT 0
@@ -6031,9 +6093,7 @@ BEGIN
 END;
 
 -- ---- scoped sealed values --------------------------------------------------
--- Owner-managed sealed values across Session, Project, Global, and Knowledge
--- Base scope. KB references use the daemon vault directly; their markdown
--- contains only resolver-agnostic symbolic tokens.
+-- Owner-managed sealed values across Session, Project, and Global scope.
 --
 -- Only Session literals live in SQLite (the pre-existing `sealed_values`
 -- table above). Project and Global literals live in a dedicated sealed-value
@@ -6049,10 +6109,9 @@ END;
 -- half-live.
 CREATE TABLE sealed_value_records (
     record_id       TEXT    PRIMARY KEY,
-    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global', 'knowledge_base')),
+    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
     -- session_id for session scope, canonical project key for project scope,
-    -- the KB id for knowledge-base scope, and the empty string for global
-    -- scope (global names are unique globally).
+    -- and the empty string for global scope (global names are unique globally).
     scope_key       TEXT    NOT NULL,
     name            TEXT    NOT NULL,
     description     TEXT    NOT NULL,
@@ -6062,9 +6121,9 @@ CREATE TABLE sealed_value_records (
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL,
     deleted_at_ms   INTEGER,
-    -- Session and knowledge-base literals use vault items directly, so neither
-    -- record kind carries a compartment locator.
-    CHECK (scope NOT IN ('session', 'knowledge_base') OR compartment_key IS NULL),
+    -- Session literals never leave SQLite, so a session record never carries a
+    -- compartment locator.
+    CHECK (scope <> 'session' OR compartment_key IS NULL),
     -- Global records are unique globally; their scope key is always empty.
     CHECK ((scope = 'global') = (scope_key = '')),
     UNIQUE (scope, scope_key, name)
@@ -6083,7 +6142,7 @@ END;
 -- Deleted names are never reused. The tombstone outlives the record row so a
 -- later create of the same canonical name in the same scope is refused.
 CREATE TABLE sealed_value_name_tombstones (
-    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global', 'knowledge_base')),
+    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
     scope_key     TEXT    NOT NULL,
     name          TEXT    NOT NULL,
     retired_at_ms INTEGER NOT NULL,
@@ -6441,7 +6500,6 @@ CREATE TABLE secret_vault_items (
         'subscription_ack',
         'sealed_compartment',
         'session_sealed_value',
-        'knowledge_base_sealed_value',
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,

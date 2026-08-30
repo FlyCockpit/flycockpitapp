@@ -1040,8 +1040,7 @@ fn control_functions() -> Vec<BuiltinFunction> {
 fn default_functions() -> Vec<BuiltinFunction> {
     let mut funcs = control_functions();
     for tool in [
-        Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>,
-        Arc::new(crate::tools::session_search::SessionLineageSearchTool),
+        Arc::new(crate::tools::session_search::HistorySearchTool) as Arc<dyn Tool>,
         // The sole sealed-value mechanism. Monty and the native registry share
         // one implementation, so the two surfaces cannot drift.
         Arc::new(crate::tools::use_sealed_value::UseSealedValueTool::new()),
@@ -2241,21 +2240,15 @@ mod tests {
     #[test]
     fn history_agent_tools_are_default_cockpit_mcp_functions() {
         let registry = default_registry();
-        for name in ["session_search", "session_lineage_search"] {
+        for name in ["history_search"] {
             let func = registry
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} should be a cockpit builtin function"));
             assert_eq!(func.name, name);
             assert!(
-                ToolOutputBuiltinAdapter::new(match name {
-                    "session_search" => {
-                        Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>
-                    }
-                    "session_lineage_search" => {
-                        Arc::new(crate::tools::session_search::SessionLineageSearchTool)
-                    }
-                    _ => unreachable!(),
-                })
+                ToolOutputBuiltinAdapter::new(Arc::new(
+                    crate::tools::session_search::HistorySearchTool
+                ) as Arc<dyn Tool>)
                 .into_function()
                 .is_ok(),
                 "{name} must register without an approval seam"
@@ -2504,15 +2497,15 @@ mod tests {
         let denied_registry = crate::engine::tool::ToolBox::new().mcp_builtin_registry();
         let denied = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()))
             .with_builtin_registry(denied_registry);
-        assert!(describe(&denied, "session_search").is_err());
-        assert!(search(&denied, "session_search").is_empty());
+        assert!(describe(&denied, "history_search").is_err());
+        assert!(search(&denied, "history_search").is_empty());
 
         let allowed_registry = crate::engine::tool::ToolBox::new()
-            .with(Arc::new(crate::tools::session_search::SessionSearchTool))
+            .with(Arc::new(crate::tools::session_search::HistorySearchTool))
             .mcp_builtin_registry();
         let allowed = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()))
             .with_builtin_registry(allowed_registry);
-        assert!(describe(&allowed, "session_search").is_ok());
+        assert!(describe(&allowed, "history_search").is_ok());
     }
 
     #[tokio::test]

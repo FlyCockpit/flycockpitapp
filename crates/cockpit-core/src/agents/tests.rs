@@ -1836,10 +1836,10 @@ fn apply_tool_surface_override_replaces_tools_and_tiers() {
         tools: vec![
             "read".to_string(),
             "mcp".to_string(),
-            "session_search".to_string(),
+            "history_search".to_string(),
         ],
         tool_tiers: std::collections::BTreeMap::from([(
-            "session_search".to_string(),
+            "history_search".to_string(),
             ToolTier::Discoverable,
         )]),
     };
@@ -1856,7 +1856,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
     let selection = ToolSurfaceSelection {
         tools: vec!["read".to_string()],
         tool_tiers: std::collections::BTreeMap::from([(
-            "session_search".to_string(),
+            "history_search".to_string(),
             ToolTier::Discoverable,
         )]),
     };
@@ -1864,7 +1864,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
     let err = apply_tool_surface_override(&mut def, &selection).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("does not grant"), "{msg}");
-    assert!(msg.contains("session_search"), "{msg}");
+    assert!(msg.contains("history_search"), "{msg}");
     assert_eq!(def.tools.as_deref(), Some(&["read".to_string()][..]));
     assert!(def.tool_tiers.is_empty());
 }

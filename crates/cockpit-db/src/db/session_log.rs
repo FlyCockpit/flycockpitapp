@@ -908,6 +908,63 @@ impl Db {
         .await
     }
 
+    /// Recall-provider compaction lookup with workspace consent evaluated in
+    /// the statement that reads the compaction text.
+    pub async fn compaction_text_for_reader_project_and_trust(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+        number: usize,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<String>> {
+        if number == 0 {
+            return Ok(None);
+        }
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT text
+                       FROM (
+                            SELECT e.model_trust, s.project_id, COALESCE(
+                                    json_extract(e.data_json, '$.handoff_text'),
+                                    json_extract(h.payload_json, '$.handoff_text'),
+                                    json_extract(e.data_json, '$.brief_text'),
+                                    json_extract(h.payload_json, '$.brief_text')
+                                ) AS text
+                               FROM session_events AS e
+                          LEFT JOIN compaction_handoffs AS h
+                                 ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
+                                AND h.session_id = e.session_id
+                               JOIN sessions AS s ON s.session_id = e.session_id
+                              WHERE e.session_id = ?1 AND e.type = 'session_compacted'
+                              ORDER BY e.seq ASC
+                              LIMIT 1 OFFSET ?4
+                       ) AS compaction
+                      WHERE (?2 OR compaction.model_trust IS NULL OR compaction.model_trust <> 'trusted')
+                        AND (compaction.project_id = ?3
+                             OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                         WHERE reader.project_id = ?3
+                                           AND reader.outbound_enabled = 1)
+                                 AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                             WHERE target.project_id = compaction.project_id
+                                               AND target.inbound_enabled = 1)))",
+                    params![
+                        session_id.to_string(),
+                        permitted,
+                        reader_project,
+                        i64::try_from(number - 1)?,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading consent-scoped compaction recall payload")?;
+            Ok(row)
+        })
+        .await
+    }
+
     /// Return visible chronological compaction ordinals for pseudodirectory
     /// discovery. Hidden rows leave gaps rather than recycling their URI.
     pub async fn compaction_numbers_for_trust(

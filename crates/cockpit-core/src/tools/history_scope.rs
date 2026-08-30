@@ -10,7 +10,7 @@ use crate::engine::tool::{ToolCtx, invalid_input};
 /// The allowlist preserves the pre-#129 posture: only recall-capable agent
 /// surfaces (including Monty) may inspect durable session history.
 pub(crate) fn require_recall_permission(ctx: &ToolCtx) -> Result<()> {
-    let granted_by_surface = ctx.available_tools.contains("session_search")
+    let granted_by_surface = ctx.available_tools.contains("history_search")
         || matches!(ctx.agent_id.as_str(), "history" | "Monty" | "monty");
     if granted_by_surface {
         Ok(())
@@ -63,7 +63,7 @@ mod tests {
     async fn session_access_requires_two_workspace_consents_and_ignores_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.available_tools = Arc::new(HashSet::from(["session_search".to_string()]));
+        ctx.available_tools = Arc::new(HashSet::from(["history_search".to_string()]));
         let target = ctx
             .session
             .db

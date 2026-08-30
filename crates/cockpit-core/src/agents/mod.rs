@@ -695,7 +695,7 @@ fn tool_family(name: &str) -> &'static str {
         | "defer_to_orchestrator"
         | "schedule"
         | "start_build" => "coordination",
-        "session_search" | "session_lineage_search" | "knowledge_retrieve" | "todo" => "memory",
+        "history_search" | "knowledge_retrieve" | "todo" => "memory",
         "skill" | "skill_manage" | "mcp" => "extensions",
         "grep" | "glob" => "sandbox",
         _ => "other",
@@ -984,10 +984,8 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 
 impl AgentDef {
     /// The knowledge-base restriction authored in this exact definition.
-    ///
-    /// Running agents retain an [`AgentDef`] snapshot, so callers that govern
-    /// knowledge access must take this value from that snapshot rather than
-    /// resolve a same-named definition again.
+    /// Running agents retain an `AgentDef` snapshot, so knowledge access is
+    /// governed by that snapshot rather than a same-named reloaded definition.
     pub(crate) fn allowed_knowledge_bases(&self) -> Option<&BTreeSet<String>> {
         self.vnext
             .as_ref()

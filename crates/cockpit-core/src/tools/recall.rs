@@ -45,17 +45,34 @@ pub fn is_recall_path(path: &str) -> bool {
     path.starts_with(PREFIX)
 }
 
+/// `history_search` is the recall capability. The ordinary file tools may
+/// route `cockpit://` requests here, but that routing must not turn their
+/// ambient filesystem authority into history authority.
+fn require_recall_authority(ctx: &ToolCtx) -> Result<()> {
+    if ctx.available_tools.contains("history_search") {
+        return Ok(());
+    }
+    Err(invalid_input(
+        "`cockpit://` recall is unavailable to this agent; use an agent granted `history_search`",
+    ))
+}
+
 pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_input("`path` is required"))?;
+    if is_recall_path(path) {
+        require_recall_authority(ctx)?;
+    }
     let target = parse(path, ctx).await?;
-    // Hold the fence before any target-specific lookup. That includes a
-    // not-found result, which must not become an observable probe after a
-    // consent revocation has committed.
+    // Hold the disclosure fence across target resolution, redaction, loading,
+    // and rendering so a completed consent revocation cannot race a response.
     let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
     require_target_access(ctx, target).await?;
+    // Rehydrate and union the target's durable redaction knowledge before
+    // loading any target-owned bytes for the recall response.
+    let redactor = redactor_for_target(ctx, target).await?;
     let content = match target {
         RecallPath::History => history_directory(ctx).await?,
         target => match pseudofile_content(target, ctx).await? {
@@ -63,13 +80,10 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             None => return Ok(not_found(path, target)),
         },
     };
-    // Revalidate while retaining the shared disclosure permit through page
-    // rendering and return. Consent writes take the exclusive side before
-    // committing, so revocation cannot race a prepared response.
     require_target_access(ctx, target).await?;
     // Scrub before selecting a page so a secret split across a page boundary
     // cannot leave a prefix or suffix in a later continuation.
-    render_page(&ctx.redact.scrub(&content), path, args)
+    render_page(&redactor.scrub(&content), path, args)
 }
 
 pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
@@ -136,14 +150,11 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
     if !is_recall_path(requested) && !pattern.starts_with(PREFIX) {
         return Ok(None);
     }
+    require_recall_authority(ctx)?;
     let resolved_pattern = history_glob_pattern(pattern, path)?;
     let matcher = globset::Glob::new(&resolved_pattern)
         .map_err(|err| invalid_input(format!("invalid glob `{resolved_pattern}`: {err}")))?
         .compile_matcher();
-    // Discovery returns durable history identifiers. Keep it within the same
-    // disclosure fence as transcript and search output.
-    let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
-    crate::tools::history_scope::require_recall_permission(ctx)?;
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     for entry in history_entries(ctx).await? {
         if matcher.is_match(&entry) {
@@ -179,26 +190,24 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     if !is_recall_path(path) {
         return Ok(None);
     }
+    require_recall_authority(ctx)?;
     let target = parse(path, ctx).await?;
-    // As with `read`, retain the fence before any target-specific lookup or
-    // not-found response and through construction of the matching output.
+    // Retain this through output construction, including a not-found result.
     let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
     require_target_access(ctx, target).await?;
     if matches!(target, RecallPath::History) {
-        // #134 owns the final history-search tool. Until then, discovery is
-        // FTS-only; never fall back to recursively regex-scanning transcripts.
-        if args.get("mode").is_some() {
-            return Err(invalid_input(
-                "`mode` is only available when grepping one cockpit pseudofile; `cockpit://history/` uses FTS discovery",
-            ));
-        }
-        return Ok(Some(history_fts_search(args, ctx).await?));
+        return Err(invalid_input(
+            "use `history_search` for cockpit history discovery; grep only searches one returned pseudofile",
+        ));
     }
     let pattern = args
         .get("pattern")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_input("`pattern` is required"))?;
+    // Construct the union before loading target-owned bytes so every recall
+    // path has the same target-redaction ordering as `read`.
+    let redactor = redactor_for_target(ctx, target).await?;
     let Some(content) = pseudofile_content(target, ctx).await? else {
         return Ok(Some(not_found(path, target)));
     };
@@ -219,7 +228,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
 
     // Search the complete redacted pseudofile, rather than `read`'s first
     // byte-capped result. The result itself has an independent byte cap.
-    let content = ctx.redact.scrub(&content);
+    let content = redactor.scrub(&content);
     let mut out = String::new();
     let mut matches = 0usize;
     for (line, text) in content.lines().enumerate() {
@@ -233,6 +242,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             return Ok(Some(truncated_search_output(out)));
         }
     }
+    require_target_access(ctx, target).await?;
     Ok(Some(ToolOutput::text(if out.is_empty() {
         "No matches.".to_string()
     } else {
@@ -242,13 +252,12 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
 
 async fn parse(path: &str, ctx: &ToolCtx) -> Result<RecallPath> {
     if path == "cockpit://history" || path == "cockpit://history/" {
-        crate::tools::history_scope::require_recall_permission(ctx)?;
         return Ok(RecallPath::History);
     }
     let parts: Vec<_> = path.trim_end_matches('/').split('/').collect();
     if parts.len() < 5 || parts[0] != "cockpit:" || parts[2] != "session" {
         return Err(invalid_input(
-            "invalid cockpit path; use `cockpit://session/<short_id>/transcript`, `/compactions/<n>`, `/artifacts/<uuid>`, or `/plan`",
+            "invalid cockpit path; use `cockpit://session/<short_id-or-uuid>/transcript`, `/compactions/<n>`, `/artifacts/<uuid>`, or `/plan`",
         ));
     }
     let session_id = resolve_session(ctx, parts[3]).await?;
@@ -279,54 +288,39 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
         return Ok(ctx.session.id);
     }
     if let Ok(id) = Uuid::parse_str(id) {
-        if id == ctx.session.id {
-            return Ok(id);
-        }
-        crate::tools::history_scope::require_recall_permission(ctx)?;
-        if ctx
-            .session
-            .db
-            .session_access_allowed(&ctx.session.project_id, id)
-            .await?
-        {
-            return Ok(id);
-        }
-        return Err(invalid_input("no accessible session with that id"));
-    }
-    let local = ctx
-        .session
-        .db
-        .get_session_by_short_id(&ctx.session.project_id, id)
-        .await?
-        .map(|row| row.session_id);
-    if let Some(id) = local {
-        crate::tools::history_scope::require_recall_permission(ctx)?;
+        // UUIDs intentionally do not perform a preliminary access read. The
+        // content accessor below carries the consent predicate in its own
+        // data query, so revocation cannot race an authorization preflight.
         return Ok(id);
     }
-    crate::tools::history_scope::require_recall_permission(ctx)?;
-    let visible = ctx
+    let mut sessions = ctx
         .session
         .db
         .accessible_sessions_by_short_id(&ctx.session.project_id, id)
-        .await?;
-    match visible.as_slice() {
-        [session_id] => Ok(*session_id),
-        _ => Err(invalid_input("no accessible session with that short id")),
+        .await?
+        .into_iter();
+    let Some(session_id) = sessions.next() else {
+        return Err(invalid_input(format!(
+            "no accessible session with short id `{id}`"
+        )));
+    };
+    if sessions.next().is_some() {
+        return Err(invalid_input(format!(
+            "short id `{id}` is ambiguous; use the session UUID"
+        )));
     }
+    Ok(session_id)
 }
 
 async fn require_target_access(ctx: &ToolCtx, target: RecallPath) -> Result<()> {
     match target {
-        RecallPath::History => crate::tools::history_scope::require_recall_permission(ctx),
+        RecallPath::History => Ok(()),
         RecallPath::Transcript(session_id)
         | RecallPath::Compaction(session_id, _)
         | RecallPath::Plan(session_id)
-        | RecallPath::Artifact(session_id, _)
-            if session_id != ctx.session.id =>
-        {
+        | RecallPath::Artifact(session_id, _) => {
             crate::tools::history_scope::require_session_access(ctx, session_id).await
         }
-        _ => Ok(()),
     }
 }
 
@@ -337,13 +331,12 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
             let turns = ctx
                 .session
                 .db
-                .thread_turns_for_access(
+                .thread_turns_for_reader_project_and_trust(
                     &ctx.session.project_id,
                     session_id,
                     caller_history_trust(ctx),
                 )
-                .await?
-                .ok_or_else(|| invalid_input("session is no longer accessible"))?;
+                .await?;
             Ok(Some(
                 turns
                     .iter()
@@ -366,13 +359,22 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
         RecallPath::Compaction(session_id, n) => {
             ctx.session
                 .db
-                .compaction_text_for_trust(session_id, n, caller_history_trust(ctx))
+                .compaction_text_for_reader_project_and_trust(
+                    &ctx.session.project_id,
+                    session_id,
+                    n,
+                    caller_history_trust(ctx),
+                )
                 .await
         }
         RecallPath::Plan(session_id) => Ok(Some(
             ctx.session
                 .db
-                .get_session_plan_doc_for_trust(session_id, caller_history_trust(ctx))
+                .get_session_plan_doc_for_reader_project_and_trust(
+                    &ctx.session.project_id,
+                    session_id,
+                    caller_history_trust(ctx),
+                )
                 .await?
                 .map(|doc| format!("[revision={}]\n{}", doc.revision, doc.content))
                 .unwrap_or_else(|| "[revision=0]\n".to_string()),
@@ -380,11 +382,40 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
         RecallPath::Artifact(session_id, artifact_id) => Ok(ctx
             .session
             .db
-            .text_artifact_for_trust(session_id, artifact_id, caller_history_trust(ctx))
+            .text_artifact_for_reader_project_and_trust(
+                &ctx.session.project_id,
+                session_id,
+                artifact_id,
+                caller_history_trust(ctx),
+            )
             .await?
             .map(|artifact| crate::text_artifact_blob::read_artifact_content(&artifact))
             .transpose()?),
     }
+}
+
+async fn redactor_for_target(
+    ctx: &ToolCtx,
+    target: RecallPath,
+) -> Result<std::sync::Arc<crate::redact::RedactionTable>> {
+    let session_id = match target {
+        RecallPath::History => return Ok(ctx.redact.clone()),
+        RecallPath::Transcript(session_id)
+        | RecallPath::Compaction(session_id, _)
+        | RecallPath::Plan(session_id)
+        | RecallPath::Artifact(session_id, _) => session_id,
+    };
+    let Some(target_table) = ctx
+        .session
+        .persisted_redaction_table_for_session(&ctx.session.project_id, session_id)
+        .await?
+    else {
+        return Ok(ctx.redact.clone());
+    };
+    ctx.redact
+        .union(&target_table)
+        .map(std::sync::Arc::new)
+        .map_err(|error| anyhow::anyhow!("unioning target-session redaction table: {error:#}"))
 }
 
 fn not_found(path: &str, target: RecallPath) -> ToolOutput {
@@ -594,7 +625,6 @@ fn utf8_prefix(value: &str, budget: usize) -> &str {
 }
 
 async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
-    crate::tools::history_scope::require_recall_permission(ctx)?;
     let mut entries = Vec::new();
     for session in ctx
         .session
@@ -663,42 +693,6 @@ async fn history_directory(ctx: &ToolCtx) -> Result<String> {
     Ok(history_entries(ctx).await?.join("\n"))
 }
 
-async fn history_fts_search(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-    let query = args
-        .get("pattern")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    ctx.session.db.fts5_available().await?;
-    let hits = ctx
-        .session
-        .db
-        .search_candidates_for_trust(
-            query,
-            Some(&ctx.session.project_id),
-            None,
-            None,
-            20,
-            caller_history_trust(ctx),
-        )
-        .await?;
-    let mut out = String::new();
-    for hit in hits {
-        let row = format!(
-            "cockpit://session/{}/transcript: {}\n",
-            hit.short_id.unwrap_or_else(|| hit.session_id.to_string()),
-            ctx.redact.scrub(hit.snippet.trim())
-        );
-        if !append_capped_record(&mut out, &row) {
-            return Ok(truncated_search_output(out));
-        }
-    }
-    Ok(ToolOutput::text(if out.is_empty() {
-        "No matches.".to_string()
-    } else {
-        out
-    }))
-}
-
 fn append_capped_record(out: &mut String, row: &str) -> bool {
     const MARKER: &str = "... [truncated; narrow the search]\n";
     if out.len() + row.len() + MARKER.len() <= OUTPUT_BYTE_CAP {
@@ -727,6 +721,8 @@ fn truncated_search_output(mut out: String) -> ToolOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -807,6 +803,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("expected_revision"));
     }
+
     #[tokio::test]
     async fn single_pseudofile_grep_supports_literal_and_regex_modes() {
         let tmp = TempDir::new().unwrap();
@@ -841,5 +838,29 @@ mod tests {
         .unwrap();
         assert!(regex.content.model_text().contains("a+b"));
         assert!(regex.content.model_text().contains("axb"));
+    }
+
+    #[tokio::test]
+    async fn recall_provider_rejects_callers_without_history_search() {
+        let tmp = TempDir::new().unwrap();
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        ctx.available_tools = Arc::new(HashSet::from(["read".to_string(), "grep".to_string()]));
+        let path = format!("cockpit://session/{}/transcript", ctx.session.short_id());
+
+        for result in [
+            read(&json!({ "path": path.clone() }), &ctx)
+                .await
+                .map(|_| ()),
+            grep(
+                &json!({ "path": path.clone(), "pattern": "anything", "mode": "literal" }),
+                &ctx,
+            )
+            .await
+            .map(|_| ()),
+            glob("cockpit://history/**", None, &ctx).await.map(|_| ()),
+        ] {
+            assert!(result.is_err());
+            assert!(format!("{:#}", result.unwrap_err()).contains("history_search"));
+        }
     }
 }

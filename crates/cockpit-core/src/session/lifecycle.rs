@@ -931,6 +931,39 @@ impl Session {
         }
     }
 
+    /// Load a session's durable redaction table through this daemon-owned
+    /// session's vault handle. Cross-session readers must fold this table into
+    /// their own redactor before returning any target-owned history.
+    ///
+    /// The database column remains a legacy import projection; production
+    /// persistence keeps the table in the vault. A malformed persisted table
+    /// is an error rather than a reason to return target content unredacted.
+    pub(crate) async fn persisted_redaction_table_for_session(
+        &self,
+        reader_project: &str,
+        session_id: uuid::Uuid,
+    ) -> Result<Option<crate::redact::RedactionTable>> {
+        if session_id == self.id {
+            return self.persisted_redaction_table();
+        }
+        let Some(redaction_table_json) = self
+            .db
+            .session_redaction_table_json_for_reader_project(reader_project, session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let json = match redaction_table_json.filter(|json| !json.is_empty()) {
+            Some(json) => Some(json),
+            None => load_redaction_table_from_vault(&self.secret_vault, session_id)?,
+        };
+        json.map(|json| {
+            crate::redact::RedactionTable::from_persisted_json(&json)
+                .context("loading persisted target-session redaction table")
+        })
+        .transpose()
+    }
+
     /// Legacy file-origin markers are used only to warn when a resumed
     /// session cannot rebuild coverage. They never reveal a secret value.
     pub fn persisted_disk_redaction_origins(&self) -> Result<Vec<String>> {

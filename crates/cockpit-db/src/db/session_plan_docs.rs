@@ -89,6 +89,55 @@ impl Db {
         .await
     }
 
+    /// Recall-provider plan lookup with workspace consent evaluated in the
+    /// statement that reads the plan body.
+    pub async fn get_session_plan_doc_for_reader_project_and_trust(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<SessionPlanDoc>> {
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            conn.query_row(
+                "SELECT d.session_id, d.content, d.revision, d.updated_at, d.model_trust
+                   FROM session_plan_docs AS d
+                   JOIN sessions AS s ON s.session_id = d.session_id
+                  WHERE d.session_id = ?1
+                    AND (?2 OR d.model_trust IS NULL OR d.model_trust <> 'trusted')
+                    AND (s.project_id = ?3
+                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                     WHERE reader.project_id = ?3
+                                       AND reader.outbound_enabled = 1)
+                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                         WHERE target.project_id = s.project_id
+                                           AND target.inbound_enabled = 1)))",
+                params![session_id.to_string(), permitted, reader_project],
+                |row| {
+                    let session_id_s: String = row.get(0)?;
+                    let session_id = Uuid::parse_str(&session_id_s).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(SessionPlanDoc {
+                        session_id,
+                        content: row.get(1)?,
+                        revision: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        model_trust: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .context("reading consent-scoped session plan document")
+        })
+        .await
+    }
+
     /// Replace a plan document only when its current revision is exactly the
     /// caller-observed revision and is visible to that caller. `None` means
     /// the document changed, is hidden by model trust, or was created after

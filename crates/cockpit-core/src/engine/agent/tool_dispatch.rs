@@ -3689,7 +3689,9 @@ mod tests {
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             review_cage: None,
             context_usage: None,
-            available_tools: Arc::new(std::collections::HashSet::new()),
+            available_tools: Arc::new(std::collections::HashSet::from([
+                "history_search".to_string()
+            ])),
             mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
                 Vec::new(),
             )),

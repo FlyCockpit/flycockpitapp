@@ -118,8 +118,7 @@ pub struct SpawnArgs {
     /// test paths where a session id isn't yet resolved.
     pub session_short_id: String,
     /// Durable per-workspace, per-session scratch made available to native and
-    /// shell tools. It is injected into the system prompt so every agent knows
-    /// the exact path it may use across session restarts.
+    /// shell tools across session restarts.
     pub workspace_scratch_dir: std::path::PathBuf,
     /// Assistant-owned sessions prepend SOUL.md and USER.md before the
     /// assistant definition body. Preloaded by the session worker so prompt
@@ -138,13 +137,10 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// Parent-admitted MCP server identities. Child catalogs intersect
-    /// agent-bound servers with these complete source-tagged entries;
-    /// scope-level servers stay visible.
+    /// Parent-admitted MCP identities constrain descendant catalogs.
     pub mcp_parent_reachable: Option<crate::mcp::resolver::ParentReachableCatalog>,
-    /// Immutable catalog admitted by the daemon root worker. Factories may
-    /// project an agent package onto it, but must never rediscover persistent
-    /// MCP files for a descendant or a turn refresh.
+    /// Immutable catalog admitted by the daemon root worker. Descendants must
+    /// project it rather than rediscovering persistent MCP configuration.
     pub mcp_root_catalog: std::sync::Arc<crate::mcp::resolver::EffectiveCatalog>,
     /// Root selection (explicit fresh choice, persisted installed-root resume,
     /// or legacy plan-level override). A delegated vNext child never inherits
@@ -453,7 +449,7 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
     if !args.interactive {
         return tb;
     }
-    tb.with(Arc::new(crate::tools::session_search::SessionSearchTool))
+    tb.with(Arc::new(crate::tools::session_search::HistorySearchTool))
         .with(Arc::new(crate::tools::todo::TodoTool))
 }
 
@@ -468,7 +464,7 @@ fn with_tiered_recall_tools(
         return Ok(tb);
     }
     let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
-    for name in ["session_search", "session_lineage_search", "todo"] {
+    for name in ["history_search", "todo"] {
         if is_assistant
             && !grant_has_mcp
             && !grant.iter().any(|tool| tool == name)
@@ -544,8 +540,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "return",
         "harness_list",
         "harness_invoke",
-        "session_search",
-        "session_lineage_search",
+        "history_search",
         "knowledge_retrieve",
         "todo",
         "write",
@@ -554,8 +549,6 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "grep",
         "glob",
         "use_sealed_value",
-        "knowledge_sealed_create",
-        "knowledge_sealed_copy",
         "inspect_audio",
         "inspect_video",
         "extract_video_clip",
@@ -693,14 +686,8 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Session",
-            name: "session_search",
-            summary: "Search prior persisted sessions.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Session",
-            name: "session_lineage_search",
-            summary: "Search the current session's compaction lineage.",
+            name: "history_search",
+            summary: "Search persisted history by scope.",
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
@@ -786,18 +773,6 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             name: "use_sealed_value",
             summary: "Use a granted sealed value by reference through a granted action.",
             condition: Some("Requires an Owner-issued sealed-value action grant."),
-        },
-        BuiltinToolInventoryItem {
-            family: "Knowledge",
-            name: "knowledge_sealed_create",
-            summary: "Create a vault-backed symbolic sealed reference for an attached KB.",
-            condition: Some("The KB must be attached and accessible to this model."),
-        },
-        BuiltinToolInventoryItem {
-            family: "Knowledge",
-            name: "knowledge_sealed_copy",
-            summary: "Copy an Owner-granted sealed value into an attached KB.",
-            condition: Some("Requires an exact Owner-issued sealed-value action grant."),
         },
         BuiltinToolInventoryItem {
             family: "Media",
@@ -947,8 +922,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::lsp::LspTool),
         Arc::new(tools::return_tool::ReturnTool),
         Arc::new(tools::plan_doc::StartBuildTool),
-        Arc::new(tools::session_search::SessionSearchTool),
-        Arc::new(tools::session_search::SessionLineageSearchTool),
+        Arc::new(tools::session_search::HistorySearchTool),
         Arc::new(tools::todo::TodoTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
@@ -956,8 +930,6 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
-        Arc::new(tools::knowledge_sealed::CreateKnowledgeBaseSealedValueTool),
-        Arc::new(tools::knowledge_sealed::CopyKnowledgeBaseSealedValueTool),
         Arc::new(tools::audio_video::InspectAudioTool::new()),
         Arc::new(tools::audio_video::InspectVideoTool::new()),
         Arc::new(tools::audio_video::ExtractVideoClipTool::new()),
@@ -1007,12 +979,6 @@ pub(crate) fn materialize_tool_by_name(
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
-        "knowledge_sealed_create" => tb.with(Arc::new(
-            tools::knowledge_sealed::CreateKnowledgeBaseSealedValueTool,
-        )),
-        "knowledge_sealed_copy" => tb.with(Arc::new(
-            tools::knowledge_sealed::CopyKnowledgeBaseSealedValueTool,
-        )),
         "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
         | "extract_audio" | "transcribe_audio"
             if media_forbidden =>
@@ -1084,10 +1050,7 @@ pub(crate) fn materialize_tool_by_name(
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
-        "session_search" => tb.with(Arc::new(tools::session_search::SessionSearchTool)),
-        "session_lineage_search" => {
-            tb.with(Arc::new(tools::session_search::SessionLineageSearchTool))
-        }
+        "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
         "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                 .cloned(),
@@ -1172,7 +1135,7 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
     if let Some(model_prompt) = model_prompt {
-        let role_system = compose_system_prompt_for_spawn(&role_prompt, args);
+        let role_system = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
         out.push_str(model_prompt);
         if !out.ends_with('\n') {
@@ -1186,18 +1149,10 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     } else {
-        let mut out = compose_system_prompt_for_spawn(&role_prompt, args);
+        let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     }
-}
-
-fn compose_system_prompt_for_spawn(role_prompt: &str, args: &SpawnArgs) -> String {
-    let mut out = compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd);
-    out.push_str("Durable workspace scratch: ");
-    out.push_str(&args.workspace_scratch_dir.display().to_string());
-    out.push('\n');
-    out
 }
 
 fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
@@ -1274,7 +1229,7 @@ fn compose_system_prompt_with(
 /// line. Project guidance is injected as user-role history, not system text.
 /// Used by the fresh-chat context
 /// indicator to size the actual baseline sent to the model, in both
-/// daemon (calibrated) and isolated (raw cl100k) modes. Pass the empty
+/// daemon (calibrated) and daemonless (raw cl100k) modes. Pass the empty
 /// string for `session_short_id` when no session exists yet — it simply
 /// omits the `Session:` line, matching what the engine sends.
 pub fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> String {
@@ -1482,8 +1437,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "change_impact",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
             "lsp",
         ],
         "Careful" => &[
@@ -1495,19 +1449,12 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "skill",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
             "todo",
             "webfetch",
             "websearch",
         ],
-        "Multireview" => &[
-            "harness_list",
-            "harness_invoke",
-            "session_search",
-            "session_lineage_search",
-            "lsp",
-        ],
+        "Multireview" => &["harness_list", "harness_invoke", "history_search", "lsp"],
         _ => &[],
     }
 }
@@ -1522,7 +1469,7 @@ pub(crate) fn default_disabled_tools_for(name: &str) -> &'static [&'static str] 
 }
 
 fn default_assistant_discoverable_tools() -> &'static [&'static str] {
-    &["session_search", "session_lineage_search"]
+    &["history_search"]
 }
 
 fn documented_av_tool_tier(def_name: &str, tool: &str) -> Option<crate::agents::ToolTier> {
@@ -1649,17 +1596,17 @@ fn with_audio_video_tools(
             crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
         };
     }
-    // Materialize the transcriber even when the spawn snapshot cannot expose
-    // it. `materialize_tool_by_name` retains it as dormant in that case, and
-    // the stable advertised projection keeps its schema in `tools[]`; the
-    // root-scoped authority remains enforced at call time.
-    tb = match effective_tool_tier(def, "transcribe_audio", false) {
-        crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "transcribe_audio", def, args)?,
-        crate::agents::ToolTier::Discoverable => {
-            add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
-        }
-        crate::agents::ToolTier::Disabled => tb,
-    };
+    if args.media_availability.is_available() {
+        tb = match effective_tool_tier(def, "transcribe_audio", false) {
+            crate::agents::ToolTier::Enabled => {
+                add_tool_by_name(tb, "transcribe_audio", def, args)?
+            }
+            crate::agents::ToolTier::Discoverable => {
+                add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
+            }
+            crate::agents::ToolTier::Disabled => tb,
+        };
+    }
     Ok(tb)
 }
 
@@ -1799,11 +1746,15 @@ pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) ->
     })?;
     let mut definition = (**definition).clone();
     let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
-    // Tool-surface refreshes are config-driven, not a new MCP admission. Keep
-    // this agent's exact catalog projection so the turn cannot observe edited
-    // mcp.json files or acquire newly added persistent servers.
+    // A foreground child may already carry the parent's no-widening
+    // intersection. Rebuilding from its governing definition must not restore
+    // grants removed at admission. `load_resolved_def` only intersects when
+    // `args.mcp_parent_reachable` is Some; copy the live admission ceiling
+    // so a root-shaped rebuild (`None`) cannot widen the catalog.
     rebuilt.posture = agent.posture.clone();
-    rebuilt.mcp_resolver = agent.mcp_resolver.clone();
+    if let Some(parent) = agent.mcp_resolver.parent_reachable() {
+        rebuilt.mcp_resolver = rebuilt.mcp_resolver.with_parent_reachable(parent);
+    }
     Ok(rebuilt)
 }
 
@@ -2717,14 +2668,9 @@ fn test_host_tool_surface(cwd: &Path, name: &str) -> Option<Vec<String>> {
 fn default_assistant_tools() -> Vec<String> {
     let mut tools = default_custom_tools();
     tools.extend(
-        [
-            "mcp",
-            "session_search",
-            "session_lineage_search",
-            "skill_manage",
-        ]
-        .into_iter()
-        .map(str::to_string),
+        ["mcp", "history_search", "skill_manage"]
+            .into_iter()
+            .map(str::to_string),
     );
     tools
 }
@@ -2810,11 +2756,7 @@ pub(crate) async fn unknown_agent_rejection(
 /// The bundled reachable subagent set for `Plan` plus any user-authored
 /// custom subagent (`mode` `subagent`/`all`).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
-    let mut out: Vec<String> = vec![
-        "explore".to_string(),
-        "history".to_string(),
-        "knowledge".to_string(),
-    ];
+    let mut out: Vec<String> = vec!["explore".to_string(), "history".to_string()];
     append_custom_subagents(&mut out, cwd);
     out
 }
@@ -2834,7 +2776,6 @@ fn build_subagents(
         "builder".to_string(),
         "explore".to_string(),
         "history".to_string(),
-        "knowledge".to_string(),
         "docs".to_string(),
     ];
     if computer_subagent_reachable(config, cwd) {
@@ -3404,13 +3345,13 @@ pub fn build(args: &SpawnArgs) -> Agent {
         "task",
         crate::engine::tool::ToolDescOverride {
             text: Some(
-                "Delegate substantive feature work to a subagent (builder writes, explore investigates, knowledge retrieves cited KB context); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
             verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
-                 well-scoped piece to `builder` to write/edit files, `explore` for \
-                 read-only investigation, or `knowledge` for cited KB retrieval, with a complete standalone brief (goal, constraints, \
+                 well-scoped piece to `builder` to write/edit files, or to `explore` for \
+                 read-only investigation, with a complete standalone brief (goal, constraints, \
                  exact files, what \"done\" looks like). Each `builder` task is one \
                  implementation slice, not a bundle of unrelated asks. If the user asks for a \
                  follow-up implementation iteration after `builder` returns, start a fresh \
@@ -3493,13 +3434,6 @@ pub fn explore(args: &SpawnArgs) -> Agent {
 /// compaction lineage in its own context, then returns a short report.
 pub fn history(args: &SpawnArgs) -> Agent {
     embedded_agent("history", args)
-}
-
-/// `knowledge` — read-only KB retrieval specialist. Its only explicit tool
-/// aggregates provider-backed KB citations with the dream-bounded fresh
-/// session subset; it cannot write either source.
-pub fn knowledge(args: &SpawnArgs) -> Agent {
-    embedded_agent("knowledge", args)
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It is intentionally a
@@ -4371,7 +4305,7 @@ pub(crate) mod tests {
         assert_eq!(def.mode, AgentMode::Subagent);
 
         let tools = def.tools.as_ref().expect("history has explicit tools");
-        for tool in ["read", "session_search", "session_lineage_search"] {
+        for tool in ["read", "history_search"] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in [
@@ -4382,7 +4316,7 @@ pub(crate) mod tests {
                 "{forbidden} must not be on history"
             );
         }
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
         crate::agents::validate_invariants(&def).expect("history def is invariant-valid");
@@ -4395,7 +4329,7 @@ pub(crate) mod tests {
         let agent = load("history", &args).unwrap();
         let names = agent.tools.names();
 
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert!(
                 names.contains(&tool),
                 "{tool} should be a first-class history tool: {names:?}"
@@ -4411,43 +4345,6 @@ pub(crate) mod tests {
             agent.role_prompt.contains("Do not paste raw transcripts")
                 || agent.role_prompt.contains("avoid dumping transcripts"),
             "history prompt must forbid raw transcript dumps"
-        );
-    }
-
-    #[test]
-    fn knowledge_agent_has_only_cited_read_only_retrieval() {
-        let tmp = tempfile::tempdir().unwrap();
-        let args = test_spawn_args(tmp.path());
-        let agent = load("knowledge", &args).unwrap();
-        let names = agent.tools.names();
-
-        assert!(names.contains(&"knowledge_retrieve"));
-        for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
-            assert!(
-                !names.contains(&forbidden),
-                "knowledge must not receive `{forbidden}`: {names:?}"
-            );
-        }
-        assert!(agent.role_prompt.contains("cited synthesis"));
-        assert!(agent.role_prompt.contains("staleness"));
-    }
-
-    #[test]
-    fn knowledge_is_reachable_from_builtin_task_surfaces() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config =
-            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
-        assert!(
-            build_subagents(&config, tmp.path())
-                .iter()
-                .any(|agent| agent == "knowledge"),
-            "Build-family task surfaces must expose knowledge retrieval"
-        );
-        assert!(
-            plan_subagents(tmp.path())
-                .iter()
-                .any(|agent| agent == "knowledge"),
-            "Plan task surfaces must expose knowledge retrieval"
         );
     }
 
@@ -4496,7 +4393,6 @@ pub(crate) mod tests {
             ("builder", builder as fn(&SpawnArgs) -> Agent),
             ("explore", explore as fn(&SpawnArgs) -> Agent),
             ("history", history as fn(&SpawnArgs) -> Agent),
-            ("knowledge", knowledge as fn(&SpawnArgs) -> Agent),
         ] {
             let loaded = load(name, &args).unwrap();
             let factory_agent = factory(&args);
@@ -4667,16 +4563,6 @@ pub(crate) mod tests {
         assert!(
             !rebuilt.mcp_resolver.catalog().contains("new-persistent"),
             "edited persistent configuration is visible only to a new root worker"
-        );
-        let descendant_args = SpawnArgs {
-            mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
-            mcp_root_catalog: agent.mcp_resolver.root_catalog(),
-            ..rebuild_args
-        };
-        let descendant = agent_from_def(&def, &descendant_args).expect("descendant constructs");
-        assert!(
-            !descendant.mcp_resolver.catalog().contains("new-persistent"),
-            "a descendant projects its parent root snapshot, not the current disk catalog"
         );
     }
 
@@ -4857,8 +4743,7 @@ pub(crate) mod tests {
             "change_impact",
             "harness_list",
             "harness_invoke",
-            "session_search",
-            "session_lineage_search",
+            "history_search",
         ] {
             assert!(
                 !names.contains(&tool),
@@ -5009,7 +4894,7 @@ pub(crate) mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -5057,7 +4942,7 @@ pub(crate) mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in ["session_search", "session_lineage_search"] {
+        for tool in ["history_search"] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -5081,7 +4966,7 @@ pub(crate) mod tests {
             mode: AgentMode::Primary,
             model: None,
             temperature: None,
-            tools: Some(vec!["session_search".to_string(), "read".to_string()]),
+            tools: Some(vec!["history_search".to_string(), "read".to_string()]),
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
@@ -5104,7 +4989,7 @@ pub(crate) mod tests {
             Err(err) => err,
         };
         let msg = format!("{err}");
-        assert!(msg.contains("session_search"), "{msg}");
+        assert!(msg.contains("history_search"), "{msg}");
         assert!(msg.contains("mcp"), "{msg}");
 
         def.tools = Some(vec!["read".to_string()]);
@@ -5117,7 +5002,7 @@ pub(crate) mod tests {
         );
 
         def.tools = Some(vec![
-            "session_search".to_string(),
+            "history_search".to_string(),
             "read".to_string(),
             "mcp".to_string(),
         ]);
@@ -5313,13 +5198,7 @@ pub(crate) mod tests {
             names.len() <= 10,
             "Careful direct tools should stay within the small-surface budget: {names:?}"
         );
-        for non_direct in [
-            "session_search",
-            "session_lineage_search",
-            "todo",
-            "webfetch",
-            "websearch",
-        ] {
+        for non_direct in ["history_search", "todo", "webfetch", "websearch"] {
             assert!(
                 !names.contains(&non_direct),
                 "{non_direct} must not be injected into Careful's direct tool surface"
@@ -6453,7 +6332,7 @@ pub(crate) mod tests {
         let args = test_spawn_args(tmp.path());
         let names = known_agent_tool_names();
         assert!(names.contains(&"todo"));
-        assert!(names.contains(&"session_lineage_search"));
+        assert!(names.contains(&"history_search"));
         // `goal` is deliberately not a grantable/runtime tool: the session goal
         // is host/driver-owned durable state, not a tool an agent may mention in
         // `tools:` (see `worker_cannot_create_or_mutate_goal`). Its retired
@@ -6470,7 +6349,7 @@ pub(crate) mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "session_lineage_search"] {
+        for name in ["todo", "history_search"] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }
@@ -7683,20 +7562,6 @@ pub(crate) mod tests {
         assert_eq!(with_snapshot, existing);
     }
 
-    #[test]
-    fn compose_system_prompt_for_model_includes_durable_workspace_scratch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        let scratch = tmp.path().join("state/workspaces/project/sessions/session");
-        args.workspace_scratch_dir = scratch.clone();
-
-        let out = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
-        assert!(
-            out.contains(&format!("Durable workspace scratch: {}", scratch.display())),
-            "block was: {out}"
-        );
-    }
-
     /// Config with a name set, used by the deterministic name-present case.
     fn cfg_with_name(name: &str) -> ExtendedConfig {
         ExtendedConfig {
@@ -7842,12 +7707,6 @@ pub(crate) mod tests {
         let out = compose_system_prompt("ROLE", "abc", tmp.path());
         assert!(!out.contains("Project guidance"));
         assert!(!out.contains("RULES"));
-        // Every changing turn addition stays in the history half of
-        // `AgentPromptParts`, never in the cache-stable system prefix.
-        assert!(!out.contains("[time:"));
-        assert!(!out.contains("[knowledge]"));
-        assert!(!out.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
-        assert!(!out.contains("[project guidance notice]"));
     }
 
     /// Contract test: when multiple configured filenames exist in the

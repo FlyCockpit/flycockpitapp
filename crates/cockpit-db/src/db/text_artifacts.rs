@@ -502,7 +502,8 @@ impl Db {
                    FROM session_text_artifacts a
                    JOIN session_text_artifact_event_refs r
                      ON r.session_id=a.session_id AND r.artifact_id=a.artifact_id
-                   JOIN session_events e ON e.seq=r.event_seq
+                   JOIN session_events e
+                     ON e.session_id = r.session_id AND e.seq = r.event_seq
                   WHERE a.session_id=?1 AND a.artifact_id=?2
                     AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')",
                 params![session_id.to_string(), artifact_id.to_string(), permitted],
@@ -510,6 +511,51 @@ impl Db {
             )
             .optional()
             .context("looking up trusted text artifact")
+        })
+        .await
+    }
+
+    /// Recall-provider artifact lookup with the workspace-consent predicate
+    /// attached to the artifact metadata/body read.
+    pub async fn text_artifact_for_reader_project_and_trust(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+        artifact_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<TextArtifact>> {
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            conn.query_row(
+                "SELECT a.session_id,a.artifact_id,r.event_seq,r.relation,r.projection_slot,a.kind,a.capture_reason,
+                        a.content_representation,a.content,a.host_captured_bytes,a.host_original_bytes,a.host_dropped_bytes,
+                        a.stored_source_bytes,a.content_bytes,a.provenance_json,a.created_at,a.archive_import_id
+                   FROM session_text_artifacts AS a
+                   JOIN session_text_artifact_event_refs AS r
+                     ON r.session_id = a.session_id AND r.artifact_id = a.artifact_id
+                   JOIN session_events AS e
+                     ON e.session_id = r.session_id AND e.seq = r.event_seq
+                   JOIN sessions AS s ON s.session_id = a.session_id
+                  WHERE a.session_id = ?1 AND a.artifact_id = ?2
+                    AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                    AND (s.project_id = ?4
+                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                     WHERE reader.project_id = ?4
+                                       AND reader.outbound_enabled = 1)
+                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                         WHERE target.project_id = s.project_id
+                                           AND target.inbound_enabled = 1)))",
+                params![
+                    session_id.to_string(),
+                    artifact_id.to_string(),
+                    permitted,
+                    reader_project,
+                ],
+                decode_artifact,
+            )
+            .optional()
+            .context("looking up consent-scoped text artifact")
         })
         .await
     }
@@ -564,7 +610,8 @@ impl Db {
                    FROM session_text_artifacts a
                    JOIN session_text_artifact_event_refs r
                      ON r.session_id=a.session_id AND r.artifact_id=a.artifact_id
-                   JOIN session_events e ON e.seq=r.event_seq
+                   JOIN session_events e
+                     ON e.session_id = r.session_id AND e.seq = r.event_seq
                   WHERE a.session_id=?1
                     AND (?2 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
                   ORDER BY a.created_at,a.artifact_id",
@@ -4898,6 +4945,24 @@ mod tests {
             })
             .await
             .unwrap();
+        let prune_session_id = session.session_id;
+        let prune_event_seq = prune.event_seq;
+        let artifact_fts_docs = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM session_fts_docs
+                      WHERE row_kind = 'artifact' AND session_id = ?1 AND seq = ?2",
+                    params![prune_session_id.to_string(), prune_event_seq],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_fts_docs, 2,
+            "every artifact from one owning event needs its own FTS document"
+        );
         let projections = db
             .text_artifact_projection_call_ids(session.session_id)
             .await

@@ -1,17 +1,17 @@
-//! `session_search` — BM25 recall across past threads.
+//! `history_search` — scope-selected FTS recall.
 //!
 //! Finds prior conversations whose title or message text matches a
 //! query, ranked by FTS5 BM25 with `last_active_at_unix_ms` recency as the
 //! tiebreaker (migration 0013 / [`crate::db::session_search`]). Defaults
 //! to the current project, excludes archived + the live session, and
-//! returns one highlighted ~150-char snippet per thread. The companion
-//! `read cockpit://session/<short_id>/transcript` reads a chosen thread back.
+//! returns one highlighted ~150-char snippet per recall target. The companion
+//! `read cockpit://session/<short_id-or-uuid>/transcript` reads a chosen thread back.
 //!
-//! Stored history is raw, and trusted-model rows may contain secrets because
-//! trusted outbound redaction is a no-op. The DB trust filter remains the first
-//! gate; untrusted recall snippets are additionally scrubbed before return with
-//! the reader/target/machine redaction union, with the ordinary outbound
-//! chokepoint remaining as defense in depth.
+//! Output is plain tool text; it passes back through the redaction
+//! chokepoint on the next outbound prompt like any other tool result —
+//! no bypass, no second pre-redaction (prompt decision). Stored history is raw,
+//! and trusted-model rows may contain secrets because trusted outbound redaction
+//! is a no-op; history text must only reach models as ordinary tool output.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,16 +28,38 @@ const MAX_LIMIT: u32 = 50;
 const TOOL_SCAN_MAX_SESSIONS: u32 = 16;
 const TOOL_SCAN_MAX_ROWS_PER_SESSION: u32 = 20;
 
-pub struct SessionSearchTool;
+pub struct HistorySearchTool;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistorySearchScope {
+    Past,
+    Lineage,
+    CurrentArtifacts,
+    AllProjects,
+}
+
+impl HistorySearchScope {
+    fn parse(args: &Value) -> Result<Self> {
+        match args.get("scope").and_then(Value::as_str).unwrap_or("past") {
+            "past" => Ok(Self::Past),
+            "lineage" => Ok(Self::Lineage),
+            "current-artifacts" => Ok(Self::CurrentArtifacts),
+            "all-projects" => Ok(Self::AllProjects),
+            _ => Err(invalid_input(
+                "`scope` must be `past`, `lineage`, `current-artifacts`, or `all-projects`",
+            )),
+        }
+    }
+}
 
 #[async_trait]
-impl Tool for SessionSearchTool {
+impl Tool for HistorySearchTool {
     fn name(&self) -> &str {
-        "session_search"
+        "history_search"
     }
 
     fn description(&self) -> &str {
-        "Search past sessions' titles and messages by relevance; returns ranked threads with snippets"
+        "Search persisted history by scope with FTS; returns bounded ranked snippets and cockpit pseudofile targets"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -47,12 +69,12 @@ impl Tool for SessionSearchTool {
     fn verbose_description(&self) -> Option<String> {
         Some(
             "Search your earlier conversations (past sessions) by keyword and get back the most \
-             relevant threads, each with its short id and a matching snippet. Use this when the \
-             user refers to prior work — \"like we did before\", \"the bug from last week\" — to \
-             find which session it was; then read it in full through its `cockpit://` transcript. Searches the \
-             current project by default; set `all_projects` to widen it. Narrow large result \
-             sets with `since` (only sessions active after a date). This is recall of past \
-             conversations, not a code or web search."
+             relevant history, each with a bounded FTS snippet and a `cockpit://` target. Choose \
+             `past` for earlier sessions in this workspace, `lineage` for compaction predecessors \
+             plus the current session, `current-artifacts` for the current session's text artifacts, \
+             or `all-projects` for consent-permitted cross-workspace recall. Read one returned \
+             pseudofile for details; this tool never recursively scans transcripts. Narrow large \
+             result sets with `since` (only sessions active after a date)."
                 .to_string(),
         )
     }
@@ -61,10 +83,11 @@ impl Tool for SessionSearchTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query":      { "type": "string", "description": "Keyword search text" },
-                "all_projects": { "type": "boolean", "description": "All-project recall (default current project)" },
+                "query":      { "type": "string", "description": "FTS keyword search text" },
+                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects"], "description": "Recall area (default `past`)" },
                 "limit":      { "type": "integer", "description": "Max threads (default 10, max 50)" },
-                "since":      { "type": "string", "description": "RFC3339/`YYYY-MM-DD` lower bound on last activity" }
+                "since":      { "type": "string", "description": "RFC3339/`YYYY-MM-DD` lower bound on last activity; applies to past scopes" },
+                "include_tool_events": { "type": "boolean", "description": "For `lineage`, also scan bounded tool-event JSON" }
             },
             "required": ["query"]
         })
@@ -74,20 +97,22 @@ impl Tool for SessionSearchTool {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "query":      { "type": "string", "description": "Literal keywords to search past sessions for; matches titles and message text" },
-                "all_projects": { "type": "boolean", "description": "When true, search sessions across all projects; defaults to the current project only" },
-                "limit":      { "type": "integer", "description": "Maximum number of matching threads to return; defaults to 10, maximum 50" },
-                "since":      { "type": "string", "description": "Optional lower bound on last activity (RFC3339 timestamp or `YYYY-MM-DD`); only sessions active after this are returned" }
+                "query":      { "type": "string", "description": "Literal keywords to search indexed titles, descriptions, messages, compactions, or artifacts" },
+                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects"], "description": "`past` excludes the current session; `lineage` includes it; `current-artifacts` returns artifact pseudofiles; `all-projects` requires two-way workspace consent" },
+                "limit":      { "type": "integer", "description": "Maximum number of matching targets to return; defaults to 10, maximum 50" },
+                "since":      { "type": "string", "description": "Optional lower bound on last activity for past scopes" },
+                "include_tool_events": { "type": "boolean", "description": "For `lineage`, scan a bounded set of tool-event JSON rows (default true)" }
             },
             "required": ["query"]
         }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let scope = HistorySearchScope::parse(&args)?;
         crate::tools::history_scope::require_recall_permission(ctx)?;
         crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
-        // Hold the disclosure fence across discovery, redaction, and rendering.
-        // A consent revocation takes the exclusive side before committing.
+        // Keep consent stable across discovery, target-redaction union, and
+        // output construction. Revocations acquire the exclusive side first.
         let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
         ctx.session
             .db
@@ -102,16 +127,6 @@ impl Tool for SessionSearchTool {
             .filter(|q| !q.is_empty())
             .ok_or_else(|| invalid_input("`query` is required"))?;
 
-        let all_projects = args
-            .get("all_projects")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let project_id = if all_projects {
-            None
-        } else {
-            Some(ctx.session.project_id.as_str())
-        };
-
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -123,277 +138,258 @@ impl Tool for SessionSearchTool {
             _ => None,
         };
 
-        // Fetch a candidate pool larger than the display budget so the
-        // ranking seam has room to reorder before we truncate (future
-        // embedding re-ranker; identity today).
-        let pool = (limit.saturating_mul(3)).clamp(limit, MAX_LIMIT * 3);
-        let hits = ctx
-            .session
-            .db
-            .search_accessible_candidates_for_trust(
-                query,
-                &ctx.session.project_id,
-                project_id,
-                Some(ctx.session.id),
-                since,
-                pool,
-                caller_history_trust(ctx),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
-
-        if hits.is_empty() {
-            let scope = if all_projects {
-                "any project".to_string()
-            } else {
-                format!("project `{}`", ctx.session.project_id)
-            };
-            return Ok(ToolOutput::text(format!(
-                "No past sessions in {scope} match `{query}`."
-            )));
-        }
-
-        let recall_base = if caller_history_trust(ctx) == HistoryCallerTrust::Untrusted {
-            Some(
-                ctx.session
-                    .with_machine_scoped_sealed_redactions(&ctx.redact)
+        let trust = caller_history_trust(ctx);
+        match scope {
+            HistorySearchScope::CurrentArtifacts => {
+                let hits = ctx
+                    .session
+                    .db
+                    .search_current_artifact_candidates_for_trust(
+                        query,
+                        ctx.session.id,
+                        limit,
+                        trust,
+                    )
                     .await
-                    .map_err(|e| anyhow::anyhow!("session_search redaction: {e:#}"))?,
-            )
-        } else {
-            None
-        };
-        let mut out = String::new();
-        for hit in hits.iter().take(limit as usize) {
-            // A pre-§17 row may lack a short_id; fall back to the full
-            // UUID, which the cockpit pseudofile path also accepts, so the
-            // thread stays reachable.
-            let id = hit
-                .short_id
-                .clone()
-                .unwrap_or_else(|| hit.session_id.to_string());
-            let short = id.as_str();
-            let title = hit.title.as_deref().unwrap_or("(untitled)");
-            let date = human_date(hit.last_active_at_unix_ms);
-            let snippet = hit.snippet.trim();
-            let redaction = recall_base
-                .as_ref()
-                .map(|base| {
+                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                if hits.is_empty() {
+                    return Ok(ToolOutput::text(format!(
+                        "No accessible current-session artifacts match `{query}`."
+                    )));
+                }
+                let mut out = format!("Current artifact matches for `{query}`:\n");
+                for hit in hits {
+                    let snippet =
+                        redact_target_text(ctx, ctx.session.id, hit.snippet.trim()).await?;
+                    out.push_str(&format!(
+                        "cockpit://session/{}/artifacts/{}\n    {}\n",
+                        ctx.session.short_id(),
+                        hit.artifact_id,
+                        snippet.trim()
+                    ));
+                }
+                Ok(ToolOutput::text(out))
+            }
+            HistorySearchScope::Lineage => {
+                let lineage = ctx
+                    .session
+                    .db
+                    .compaction_lineage_sessions(ctx.session.id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                let hits = ctx
+                    .session
+                    .db
+                    .search_lineage_candidates_in_sessions(
+                        query,
+                        &ctx.session.project_id,
+                        &lineage,
+                        trust,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                let include_tool_events = args
+                    .get("include_tool_events")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let scan = if include_tool_events {
+                    Some(
+                        ctx.session
+                            .db
+                            .scan_tool_events_in_sessions(
+                                query,
+                                &ctx.session.project_id,
+                                &lineage,
+                                trust,
+                                TOOL_SCAN_MAX_SESSIONS,
+                                TOOL_SCAN_MAX_ROWS_PER_SESSION,
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?,
+                    )
+                } else {
+                    None
+                };
+                render_lineage(query, hits, scan, limit, ctx).await
+            }
+            HistorySearchScope::Past | HistorySearchScope::AllProjects => {
+                let all_projects = scope == HistorySearchScope::AllProjects;
+                let project_id = (!all_projects).then_some(ctx.session.project_id.as_str());
+                let hits = if all_projects {
                     ctx.session
-                        .recall_redaction_table_from_base(base, hit.session_id)
-                })
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("session_search redaction: {e:#}"))?;
-            let title = redaction
-                .as_ref()
-                .map_or_else(|| title.to_string(), |table| table.scrub(title));
-            let snippet = redaction
-                .as_ref()
-                .map_or_else(|| snippet.to_string(), |table| table.scrub(snippet));
-            out.push_str(&format!("{short}  {date}  {title}\n    {snippet}\n"));
+                        .db
+                        .search_permitted_candidates_for_trust(
+                            query,
+                            &ctx.session.project_id,
+                            Some(ctx.session.id),
+                            since,
+                            limit,
+                            trust,
+                        )
+                        .await
+                } else {
+                    ctx.session
+                        .db
+                        .search_candidates_for_trust(
+                            query,
+                            project_id,
+                            Some(ctx.session.id),
+                            since,
+                            limit,
+                            trust,
+                        )
+                        .await
+                }
+                .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
+                render_session_hits(query, &hits, limit, all_projects, ctx).await
+            }
         }
-        let displayed: Vec<_> = hits
-            .iter()
-            .take(limit as usize)
-            .map(|hit| hit.session_id)
-            .collect();
-        if !ctx
-            .session
-            .db
-            .sessions_access_allowed(&ctx.session.project_id, &displayed)
-            .await
-            .map_err(|e| anyhow::anyhow!("session_search history scope: {e:#}"))?
-        {
-            return Err(invalid_input(
-                "history access changed before results could be returned",
-            ));
-        }
-        out.push_str("\nUse `read` on `cockpit://session/<short_id>/transcript` for a thread.\n");
-        Ok(ToolOutput::text(out))
     }
 }
 
-pub struct SessionLineageSearchTool;
-
-#[async_trait]
-impl Tool for SessionLineageSearchTool {
-    fn name(&self) -> &str {
-        "session_lineage_search"
-    }
-
-    fn description(&self) -> &str {
-        "Search the current session's compaction lineage, including compacted predecessors and the current session"
-    }
-
-    fn verbose_description(&self) -> Option<String> {
-        Some(
-            "Search the current session's persisted history lineage, including compacted \
-             predecessor sessions and the current session, for a keyword or phrase. Use this \
-             when a detail may have been summarized away by compaction. It returns bounded \
-             snippets and can also scan bounded tool-call event JSON; follow up with \
-             `read` on a cockpit transcript only for a specific session/topic you need. This is recall of \
-             stored conversation history, not a code search."
-                .to_string(),
-        )
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Keyword search text" },
-                "limit": { "type": "integer", "description": "Max FTS hits (default 10, max 50)" },
-                "include_tool_events": { "type": "boolean", "description": "Also scan bounded tool-call event JSON inside the lineage" }
-            },
-            "required": ["query"]
-        })
-    }
-
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        crate::tools::history_scope::require_recall_permission(ctx)?;
-        crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
-        ctx.session
-            .db
-            .fts5_available()
-            .await
-            .map_err(|e| invalid_input(format!("{e:#}")))?;
-
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-            .ok_or_else(|| invalid_input("`query` is required"))?;
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|l| (l as u32).clamp(1, MAX_LIMIT))
-            .unwrap_or(DEFAULT_LIMIT);
-        let include_tool_events = args
-            .get("include_tool_events")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let trust = caller_history_trust(ctx);
-
-        let lineage = ctx
-            .session
-            .db
-            .compaction_lineage_sessions(ctx.session.id)
-            .await
-            .map_err(|e| anyhow::anyhow!("session_lineage_search: {e:#}"))?;
-        let hits = ctx
-            .session
-            .db
-            .search_lineage_candidates(query, ctx.session.id, limit, trust)
-            .await
-            .map_err(|e| anyhow::anyhow!("session_lineage_search: {e:#}"))?;
-        let scan = if include_tool_events {
-            Some(
-                ctx.session
-                    .db
-                    .scan_tool_events_in_sessions(
-                        query,
-                        &lineage,
-                        trust,
-                        TOOL_SCAN_MAX_SESSIONS,
-                        TOOL_SCAN_MAX_ROWS_PER_SESSION,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("session_lineage_search: {e:#}"))?,
-            )
+async fn render_session_hits(
+    query: &str,
+    hits: &[crate::db::session_search::SearchHit],
+    limit: u32,
+    all_projects: bool,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    if hits.is_empty() {
+        let scope = if all_projects {
+            "permitted projects"
         } else {
-            None
+            "this project"
         };
-
-        if hits.is_empty() && scan.as_ref().is_none_or(|scan| scan.hits.is_empty()) {
-            return Ok(ToolOutput::text(format!(
-                "No accessible lineage history matches `{query}`."
-            )));
-        }
-
-        let mut out = format!("Lineage history matches for `{query}`:\n");
-        let recall_base = if trust == HistoryCallerTrust::Untrusted {
-            Some(
-                ctx.session
-                    .with_machine_scoped_sealed_redactions(&ctx.redact)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("session_lineage_search redaction: {e:#}"))?,
-            )
-        } else {
-            None
-        };
-        for hit in &hits {
-            let id = hit
-                .short_id
+        return Ok(ToolOutput::text(format!(
+            "No past sessions in {scope} match `{query}`."
+        )));
+    }
+    let mut out = String::new();
+    for hit in hits.iter().take(limit as usize) {
+        let id = if hit.project_id == ctx.session.project_id {
+            hit.short_id
                 .clone()
-                .unwrap_or_else(|| hit.session_id.to_string());
-            let title = hit.title.as_deref().unwrap_or("(untitled)");
-            let redaction = recall_base
-                .as_ref()
-                .map(|base| {
-                    ctx.session
-                        .recall_redaction_table_from_base(base, hit.session_id)
-                })
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("session_lineage_search redaction: {e:#}"))?;
-            let title = redaction
-                .as_ref()
-                .map_or_else(|| title.to_string(), |table| table.scrub(title));
-            let snippet = redaction.as_ref().map_or_else(
-                || hit.snippet.trim().to_string(),
-                |table| table.scrub(hit.snippet.trim()),
-            );
-            out.push_str(&format!(
-                "{}  {}  {}\n    {}\n",
-                id,
-                human_date(hit.last_active_at_unix_ms),
-                title,
-                snippet
-            ));
-        }
-        if let Some(scan) = scan {
-            if !scan.hits.is_empty() {
-                out.push_str("\nBounded tool-event matches:\n");
-                for hit in scan.hits {
-                    let snippet = recall_base
-                        .as_ref()
-                        .map(|base| {
-                            ctx.session
-                                .recall_redaction_table_from_base(base, hit.session_id)
-                                .map(|table| table.scrub(hit.snippet.trim()))
-                        })
-                        .transpose()
-                        .map_err(|e| anyhow::anyhow!("session_lineage_search redaction: {e:#}"))?
-                        .unwrap_or_else(|| hit.snippet.trim().to_string());
-                    out.push_str(&format!(
-                        "{} [{}] {}: {}\n",
-                        hit.session_id, hit.seq, hit.event_type, snippet
-                    ));
-                }
-            }
-            if scan.truncated {
-                out.push_str(
-                    "\nTool-event scan hit its bounded cap; narrow the query for more detail.\n",
-                );
-                return Ok(ToolOutput::truncated_text(out));
-            }
-        }
-        Ok(ToolOutput::text(out))
+                .unwrap_or_else(|| hit.session_id.to_string())
+        } else {
+            hit.session_id.to_string()
+        };
+        let title = redact_target_text(
+            ctx,
+            hit.session_id,
+            hit.title.as_deref().unwrap_or("(untitled)"),
+        )
+        .await?;
+        let snippet = redact_target_text(ctx, hit.session_id, hit.snippet.trim()).await?;
+        out.push_str(&format!(
+            "cockpit://session/{id}/transcript  {}  {title}\n    {}\n",
+            human_date(hit.last_active_at_unix_ms),
+            snippet.trim()
+        ));
     }
+    let displayed: Vec<_> = hits
+        .iter()
+        .take(limit as usize)
+        .map(|hit| hit.session_id)
+        .collect();
+    if !ctx
+        .session
+        .db
+        .sessions_access_allowed(&ctx.session.project_id, &displayed)
+        .await?
+    {
+        return Err(invalid_input(
+            "history access changed before results could be returned",
+        ));
+    }
+    Ok(ToolOutput::text(out))
+}
+
+async fn render_lineage(
+    query: &str,
+    hits: Vec<crate::db::session_search::SearchHit>,
+    scan: Option<crate::db::session_search::ToolEventScan>,
+    limit: u32,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    if hits.is_empty() && scan.as_ref().is_none_or(|scan| scan.hits.is_empty()) {
+        return Ok(ToolOutput::text(format!(
+            "No accessible lineage history matches `{query}`."
+        )));
+    }
+    let mut out = format!("Lineage history matches for `{query}`:\n");
+    for hit in hits.into_iter().take(limit as usize) {
+        let id = if hit.project_id == ctx.session.project_id {
+            hit.short_id.unwrap_or_else(|| hit.session_id.to_string())
+        } else {
+            hit.session_id.to_string()
+        };
+        let title = redact_target_text(
+            ctx,
+            hit.session_id,
+            hit.title.as_deref().unwrap_or("(untitled)"),
+        )
+        .await?;
+        let snippet = redact_target_text(ctx, hit.session_id, hit.snippet.trim()).await?;
+        out.push_str(&format!(
+            "cockpit://session/{id}/transcript  {}  {}\n    {}\n",
+            human_date(hit.last_active_at_unix_ms),
+            title.trim(),
+            snippet.trim()
+        ));
+    }
+    if let Some(scan) = scan {
+        if !scan.hits.is_empty() {
+            out.push_str("\nBounded tool-event matches:\n");
+            for hit in scan.hits {
+                let event_type = redact_target_text(ctx, hit.session_id, &hit.event_type).await?;
+                let snippet = redact_target_text(ctx, hit.session_id, hit.snippet.trim()).await?;
+                out.push_str(&format!(
+                    "{} [{}] {}: {}\n",
+                    hit.session_id,
+                    hit.seq,
+                    event_type.trim(),
+                    snippet.trim()
+                ));
+            }
+        }
+        if scan.truncated {
+            out.push_str(
+                "\nTool-event scan hit its bounded cap; narrow the query for more detail.\n",
+            );
+            return Ok(ToolOutput::truncated_text(out));
+        }
+    }
+    Ok(ToolOutput::text(out))
+}
+
+/// Build the model-visible redactor for one history target. A target session's
+/// persisted table is durable knowledge of secrets it observed, so it must be
+/// unioned with the caller's table even for same-workspace recall. Parse and
+/// union errors fail the search rather than exposing an unredacted snippet.
+async fn redact_target_text(ctx: &ToolCtx, session_id: uuid::Uuid, text: &str) -> Result<String> {
+    let Some(target_table) = ctx
+        .session
+        .persisted_redaction_table_for_session(&ctx.session.project_id, session_id)
+        .await?
+    else {
+        return Ok(ctx.redact.scrub(text));
+    };
+    let redactor = ctx
+        .redact
+        .union(&target_table)
+        .map_err(|error| anyhow::anyhow!("history_search target redaction union: {error:#}"))?;
+    Ok(redactor.scrub(text))
 }
 
 pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
-    let Some(caller_model) = ctx.caller_model.as_ref() else {
+    let (Some(provider), Some(model)) = (ctx.session.active_provider(), ctx.session.active_model())
+    else {
         return HistoryCallerTrust::Untrusted;
     };
     if ctx
         .config
         .providers()
-        .resolve_trust(caller_model.provider_id(), caller_model.model_id())
+        .resolve_trust(&provider, &model)
         .is_trusted()
     {
         HistoryCallerTrust::Trusted
@@ -444,63 +440,14 @@ mod tests {
             providers.join("local.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [
-                    { "id": "trusted-model", "trust": "trusted" },
-                    { "id": "local-model", "trust": "untrusted" }
-                ]
-            })
-            .to_string(),
-        )
-        .unwrap();
-    }
-
-    fn write_trusted_provider(root: &std::path::Path) {
-        let providers = root.join(".cockpit/providers");
-        std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(root.join(".cockpit/config.json"), r#"{}"#).unwrap();
-        std::fs::write(
-            providers.join("local.json"),
-            serde_json::json!({
-                "url": "https://example.test/v1",
                 "models": [{
                     "id": "local-model",
-                    "trust": "trusted",
+                    "trust": "untrusted",
                 }]
             })
             .to_string(),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn history_trust_follows_the_executing_context_not_session_selection() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_trusted_provider(tmp.path());
-        let mut ctx = test_ctx(tmp.path());
-        ctx.session
-            .set_active_model("local", "local-model")
-            .unwrap();
-
-        assert_eq!(caller_history_trust(&ctx), HistoryCallerTrust::Untrusted);
-        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
-            "local",
-            "local-model",
-        ));
-        assert_eq!(caller_history_trust(&ctx), HistoryCallerTrust::Trusted);
-    }
-
-    fn persist_empty_target_table(ctx: &ToolCtx, target: uuid::Uuid) {
-        ctx.session
-            .secret_vault()
-            .put_item(
-                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-                &crate::secure_key::redaction_table_item_id(&target.to_string()),
-                crate::redact::RedactionTable::empty()
-                    .to_persisted_json()
-                    .unwrap()
-                    .as_bytes(),
-            )
-            .unwrap();
     }
 
     #[tokio::test]
@@ -525,9 +472,8 @@ mod tests {
             )
             .await
             .unwrap();
-        persist_empty_target_table(&ctx, other.session_id);
 
-        let out = SessionSearchTool
+        let out = HistorySearchTool
             .call(json!({ "query": "peregrine" }), &ctx)
             .await
             .unwrap();
@@ -536,116 +482,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_calling_model_scrubs_snippet_despite_trusted_session_active_model() {
-        const TARGET_ONLY_SECRET: &str = "workspace-b-only-search-secret-130";
-        let tmp = tempfile::tempdir().unwrap();
-        write_untrusted_provider(tmp.path());
-        let mut ctx = test_ctx(tmp.path());
-        ctx.session
-            .set_active_model("local", "trusted-model")
-            .unwrap();
-        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
-            "local",
-            "local-model",
-        ));
-        let other = ctx
-            .session
-            .db
-            .create_session(&ctx.session.project_id, "/workspace-b", "Build")
-            .await
-            .unwrap();
-        ctx.session
-            .db
-            .insert_session_event(
-                other.session_id,
-                SessionEventKind::UserMessage,
-                None,
-                None,
-                &json!({ "text": format!("deployment note contains {TARGET_ONLY_SECRET}") }),
-            )
-            .await
-            .unwrap();
-        let target_root = tmp.path().join("workspace-b");
-        std::fs::create_dir_all(&target_root).unwrap();
-        std::fs::write(
-            target_root.join(".env"),
-            format!("TARGET_ONLY_TOKEN={TARGET_ONLY_SECRET}\n"),
-        )
-        .unwrap();
-        let table = crate::redact::RedactionTable::build_with_env(
-            &ctx.config.extended().redact,
-            &target_root,
-            &std::collections::HashMap::new(),
-        )
-        .unwrap();
-        ctx.session
-            .secret_vault()
-            .put_item(
-                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-                &crate::secure_key::redaction_table_item_id(&other.session_id.to_string()),
-                table.to_persisted_json().unwrap().as_bytes(),
-            )
-            .unwrap();
-
-        let out = SessionSearchTool
-            .call(json!({ "query": "deployment" }), &ctx)
-            .await
-            .unwrap();
-
-        assert!(!out.content.contains(TARGET_ONLY_SECRET), "{}", out.content);
-        assert!(
-            out.content.contains(ctx.redact.placeholder()),
-            "{}",
-            out.content
-        );
-    }
-
-    #[tokio::test]
-    async fn untrusted_calling_model_fails_closed_despite_trusted_session_active_model() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_untrusted_provider(tmp.path());
-        let mut ctx = test_ctx(tmp.path());
-        ctx.session
-            .set_active_model("local", "trusted-model")
-            .unwrap();
-        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
-            "local",
-            "local-model",
-        ));
-        let other = ctx
-            .session
-            .db
-            .create_session(&ctx.session.project_id, "/workspace-b", "Build")
-            .await
-            .unwrap();
-        ctx.session
-            .db
-            .insert_session_event(
-                other.session_id,
-                SessionEventKind::UserMessage,
-                None,
-                None,
-                &json!({ "text": "deployment note contains an unpersisted target secret" }),
-            )
-            .await
-            .unwrap();
-
-        let err = SessionSearchTool
-            .call(json!({ "query": "deployment" }), &ctx)
-            .await
-            .unwrap_err();
-
-        assert!(
-            format!("{err:#}").contains("target session redaction table is unavailable"),
-            "{err:#}"
-        );
-    }
-
-    #[tokio::test]
     async fn search_empty_match_is_clean_message_not_error() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let out = SessionSearchTool
+        let out = HistorySearchTool
             .call(json!({ "query": "nothingmatchesthis" }), &ctx)
             .await
             .unwrap();
@@ -668,7 +508,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let out = SessionSearchTool
+        let out = HistorySearchTool
             .call(json!({ "query": "wombat" }), &ctx)
             .await
             .unwrap();
@@ -680,19 +520,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_trust_lineage_search_includes_current_session_without_relaxing_session_search()
-    {
+    async fn target_session_redaction_covers_search_snippets_and_recall_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let secret = "target-session-history-secret";
+        let other = ctx
+            .session
+            .db
+            .create_session(&ctx.session.project_id, "/x", "Build")
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .insert_session_event(
+                other.session_id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": format!("stored {secret}") }),
+            )
+            .await
+            .unwrap();
+        let target_redaction = crate::redact::RedactionTable::empty()
+            .with_forced_literal(secret.to_string(), "test".to_string())
+            .unwrap();
+        ctx.session
+            .db
+            .set_session_redaction_table_json(
+                other.session_id,
+                Some(target_redaction.to_persisted_json().unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let found = HistorySearchTool
+            .call(json!({ "query": secret }), &ctx)
+            .await
+            .unwrap();
+        assert!(!found.content.contains(secret), "{}", found.content);
+
+        let path = format!("cockpit://session/{}/transcript", other.short_id.unwrap());
+        let read = crate::tools::recall::read(&json!({ "path": path.clone() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!read.content.contains(secret), "{}", read.content);
+        let grep = crate::tools::recall::grep(
+            &json!({ "path": path, "pattern": secret, "mode": "literal" }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(grep.content, "No matches.");
+    }
+
+    #[tokio::test]
+    async fn history_search_lineage_includes_current_session_without_relaxing_past_scope() {
         let tmp = tempfile::tempdir().unwrap();
         write_untrusted_provider(tmp.path());
-        let mut ctx = test_ctx(tmp.path());
+        let ctx = test_ctx(tmp.path());
         ctx.session
-            .set_active_model("local", "trusted-model")
+            .set_active_model("local", "local-model")
             .unwrap();
-        ctx.caller_model = Some(crate::engine::tool::CallerModel::new(
-            "local",
-            "local-model",
-        ));
-        ctx.session.persist_redaction_table(&ctx.redact).unwrap();
         ctx.session
             .db
             .insert_session_event(
@@ -705,16 +594,16 @@ mod tests {
             .await
             .unwrap();
 
-        let lineage = SessionLineageSearchTool
+        let lineage = HistorySearchTool
             .call(
-                json!({ "query": "moonstone", "include_tool_events": false }),
+                json!({ "query": "moonstone", "scope": "lineage", "include_tool_events": false }),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(lineage.content.contains("moonstone"), "{}", lineage.content);
 
-        let cross_thread = SessionSearchTool
+        let cross_thread = HistorySearchTool
             .call(json!({ "query": "moonstone" }), &ctx)
             .await
             .unwrap();
@@ -723,6 +612,106 @@ mod tests {
             "{}",
             cross_thread.content
         );
+    }
+
+    #[tokio::test]
+    async fn all_projects_scope_requires_two_directional_workspace_consent() {
+        use crate::db::history_scope::WorkspaceHistoryScope;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let other = ctx
+            .session
+            .db
+            .create_session("other-workspace", "/other", "Elsewhere")
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .insert_session_event(
+                other.session_id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "cross workspace lodestone" }),
+            )
+            .await
+            .unwrap();
+
+        let denied = HistorySearchTool
+            .call(
+                json!({ "query": "lodestone", "scope": "all-projects" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            denied.content.contains("No past sessions"),
+            "{}",
+            denied.content
+        );
+
+        ctx.session
+            .db
+            .set_workspace_history_scope(
+                &ctx.session.project_id,
+                WorkspaceHistoryScope {
+                    outbound: true,
+                    inbound: false,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .set_workspace_history_scope(
+                "other-workspace",
+                WorkspaceHistoryScope {
+                    outbound: false,
+                    inbound: true,
+                },
+            )
+            .await
+            .unwrap();
+        let permitted = HistorySearchTool
+            .call(
+                json!({ "query": "lodestone", "scope": "all-projects" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            permitted.content.contains(&other.session_id.to_string()),
+            "{}",
+            permitted.content
+        );
+
+        let recalled = crate::tools::recall::read(
+            &json!({
+                "path": format!("cockpit://session/{}/transcript", other.session_id),
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            recalled.content.contains("cross workspace lodestone"),
+            "{}",
+            recalled.content
+        );
+    }
+
+    #[test]
+    fn scope_rejects_retired_tool_shapes() {
+        assert_eq!(
+            HistorySearchScope::parse(&json!({ "scope": "past" })).unwrap(),
+            HistorySearchScope::Past
+        );
+        assert_eq!(
+            HistorySearchScope::parse(&json!({})).unwrap(),
+            HistorySearchScope::Past
+        );
+        assert!(HistorySearchScope::parse(&json!({ "scope": "invalid" })).is_err());
     }
 
     #[test]

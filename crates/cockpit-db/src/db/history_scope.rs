@@ -1,12 +1,13 @@
-//! Per-workspace history-recall consent (issue #131).
+//! Per-workspace history-recall consent.
 //!
-//! This is deliberately separate from workspace trust and execution sandbox
-//! state. A cross-workspace recall is allowed only when the reader opted in
-//! and the target opted in; missing decisions fail closed.
+//! Cross-workspace discovery is an explicit two-directional capability: the
+//! workspace issuing the query enables outbound recall and the workspace that
+//! owns a result enables inbound recall. Missing decisions fail closed.
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::db::Db;
 
@@ -41,12 +42,12 @@ impl Db {
         let now = Utc::now().timestamp_millis();
         self.write(move |conn| {
             conn.execute(
-                "INSERT INTO workspace_history_scopes \
-                    (project_id, outbound_enabled, inbound_enabled, updated_at_unix_ms) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(project_id) DO UPDATE SET \
-                    outbound_enabled = excluded.outbound_enabled, \
-                    inbound_enabled = excluded.inbound_enabled, \
+                "INSERT INTO workspace_history_scopes \\
+                    (project_id, outbound_enabled, inbound_enabled, updated_at_unix_ms) \\
+                 VALUES (?1, ?2, ?3, ?4) \\
+                 ON CONFLICT(project_id) DO UPDATE SET \\
+                    outbound_enabled = excluded.outbound_enabled, \\
+                    inbound_enabled = excluded.inbound_enabled, \\
                     updated_at_unix_ms = excluded.updated_at_unix_ms",
                 params![project_id, scope.outbound, scope.inbound, now],
             )
@@ -56,6 +57,8 @@ impl Db {
         .await
     }
 
+    /// Return this workspace's explicit consent state. Missing rows are the
+    /// safe default so callers can render an actionable disabled status.
     pub async fn workspace_history_scope(&self, project_id: &str) -> Result<WorkspaceHistoryScope> {
         validate_project_id(project_id)?;
         let project_id = project_id.to_string();
@@ -63,9 +66,9 @@ impl Db {
             .await
     }
 
-    /// Same-workspace history is always available.  Cross-workspace access
-    /// requires both the reader workspace's outbound consent and the target
-    /// workspace's inbound consent.  This is not coupled to any sandbox flag.
+    /// Same-workspace history is always visible. Cross-workspace history
+    /// requires the querying workspace's outbound consent and the target
+    /// workspace's inbound consent in one database snapshot.
     pub async fn history_scope_allows(
         &self,
         reader_project: &str,
@@ -86,13 +89,45 @@ impl Db {
         .await
     }
 
-    /// Resolve a session only when it is visible to `reader_project`.  The
-    /// lookup and both consent rows share one SQLite snapshot, so callers do
-    /// not turn an existence probe into a cross-workspace disclosure.
+    /// Fetch a target session's legacy redaction projection only when the
+    /// reader can access that session in this statement's consent snapshot.
+    /// The outer option distinguishes an inaccessible/nonexistent session
+    /// from an accessible session whose legacy projection is absent.
+    pub async fn session_redaction_table_json_for_reader_project(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+    ) -> Result<Option<Option<String>>> {
+        validate_project_id(reader_project)?;
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT s.redaction_table_json
+                   FROM sessions AS s
+                  WHERE s.session_id = ?1
+                    AND (s.project_id = ?2
+                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                     WHERE reader.project_id = ?2
+                                       AND reader.outbound_enabled = 1)
+                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                         WHERE target.project_id = s.project_id
+                                           AND target.inbound_enabled = 1)))",
+                params![session_id.to_string(), reader_project],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading consent-scoped session redaction projection")
+        })
+        .await
+    }
+
+    /// Resolve a session only when it is visible to `reader_project`. The
+    /// lookup and both consent rows share one SQLite snapshot, preventing a
+    /// cross-workspace existence probe from becoming a disclosure.
     pub async fn session_access_allowed(
         &self,
         reader_project: &str,
-        session_id: uuid::Uuid,
+        session_id: Uuid,
     ) -> Result<bool> {
         validate_project_id(reader_project)?;
         let reader_project = reader_project.to_string();
@@ -100,13 +135,13 @@ impl Db {
             .await
     }
 
-    /// Same as [`Self::session_access_allowed`], but resolves a short id
-    /// without revealing how many inaccessible workspaces use that prefix.
+    /// Resolve a short id without revealing inaccessible workspaces that use
+    /// the same prefix.
     pub async fn accessible_sessions_by_short_id(
         &self,
         reader_project: &str,
         short_id: &str,
-    ) -> Result<Vec<uuid::Uuid>> {
+    ) -> Result<Vec<Uuid>> {
         validate_project_id(reader_project)?;
         let reader_project = reader_project.to_string();
         let short_id = short_id.to_string();
@@ -124,21 +159,17 @@ impl Db {
             let rows = stmt.query_map(params![short_id, reader_project], |row| {
                 row.get::<_, String>(0)
             })?;
-            let mut visible = Vec::new();
-            for row in rows {
-                visible.push(uuid::Uuid::parse_str(&row?)?);
-            }
-            Ok(visible)
+            rows.map(|row| Ok(Uuid::parse_str(&row?)?)).collect()
         })
         .await
     }
 
-    /// Confirm an already-fetched batch immediately before it is disclosed.
-    /// One read transaction snapshots every target and both consent rows.
+    /// Confirm an already-fetched batch immediately before disclosure. One
+    /// transaction snapshots every target and both consent rows.
     pub async fn sessions_access_allowed(
         &self,
         reader_project: &str,
-        session_ids: &[uuid::Uuid],
+        session_ids: &[Uuid],
     ) -> Result<bool> {
         validate_project_id(reader_project)?;
         let reader_project = reader_project.to_string();
@@ -166,9 +197,16 @@ fn workspace_history_scope_conn(
     project_id: &str,
 ) -> Result<WorkspaceHistoryScope> {
     conn.query_row(
-        "SELECT outbound_enabled, inbound_enabled FROM workspace_history_scopes WHERE project_id = ?1",
+        "SELECT outbound_enabled, inbound_enabled
+           FROM workspace_history_scopes
+          WHERE project_id = ?1",
         [project_id],
-        |row| Ok(WorkspaceHistoryScope { outbound: row.get(0)?, inbound: row.get(1)? }),
+        |row| {
+            Ok(WorkspaceHistoryScope {
+                outbound: row.get(0)?,
+                inbound: row.get(1)?,
+            })
+        },
     )
     .optional()
     .context("querying workspace history scope")
@@ -178,7 +216,7 @@ fn workspace_history_scope_conn(
 pub(crate) fn session_access_allowed_conn(
     conn: &Connection,
     reader_project: &str,
-    session_id: uuid::Uuid,
+    session_id: Uuid,
 ) -> Result<bool> {
     let allowed: Option<i64> = conn
         .query_row(

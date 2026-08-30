@@ -12332,7 +12332,30 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ResumeFromCompaction => {
-            let att = require_attached(state)?;
+            // Exactness is rechecked by the worker, but only an interactive
+            // away-resume that was actually offered this branch may request
+            // it. Keep the authorization connection-local so a headless
+            // attach, reattach, or a second request cannot borrow an offer.
+            let handle = {
+                let att = state.attached.as_mut().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::NotAttached,
+                    message: "client has not attached to a session".into(),
+                })?;
+                if !att.resume_compaction_offer_issued {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message:
+                            "resume compaction requires an offered interactive away-resume choice"
+                                .into(),
+                    });
+                }
+                // Consume before sending work. If the worker is unavailable
+                // or the exact snapshot has changed, a new eligible attach
+                // must obtain a fresh offer rather than replaying stale
+                // authority.
+                att.resume_compaction_offer_issued = false;
+                att.handle.clone()
+            };
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
@@ -12346,7 +12369,7 @@ async fn handle_serialized_request_impl(
                 return Ok(response);
             }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
-            att.handle
+            handle
                 .send_work(SessionWork::ResumeFromCompaction { respond_to })
                 .await
                 .map_err(session_work_error)?;
@@ -26363,9 +26386,10 @@ pub(super) async fn attach(
     drain_client_attachment_ownership(state, ctx, "reattach").await?;
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
-        handle,
+        handle: handle.clone(),
         workspace_identity: Some(workspace_identity),
         _interactive_guard: interactive_guard,
+        resume_compaction_offer_issued: false,
     });
 
     // An interactive away-resume gets its policy from the live driver's
@@ -26528,6 +26552,15 @@ pub(super) async fn attach(
         .await
         .map_err(internal)?
         .map(btw_info_to_proto);
+
+    if resume_compaction_offer.is_some()
+        && let Some(att) = state.attached.as_mut()
+    {
+        // All remaining attach work is complete, so this client is about to
+        // receive the explicit `ask` choice. Automatic compacted defaults do
+        // not authorize the public accept request.
+        att.resume_compaction_offer_issued = true;
+    }
 
     Ok(Response::Attached {
         session_id,

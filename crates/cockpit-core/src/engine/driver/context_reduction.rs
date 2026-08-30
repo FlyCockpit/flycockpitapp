@@ -1089,8 +1089,10 @@ impl Driver {
         // A rolling precompaction is deliberately not a cache-timing feature:
         // every completed root turn gets folded into the durable brief. The
         // delta is small whether the provider cache is hot, cold, or absent.
-        // A full rebuild limits compounded-summary drift; a reported cache hit
-        // makes that rebuild opportunistically cheap, but never required.
+        // A full rebuild limits compounded-summary drift on the configured
+        // cadence. A hot cache can still make a scheduled rebuild cheap, but
+        // cache state never promotes an ordinary delta boundary to a full
+        // history rebuild.
         if ctx_cfg.rolling_precompaction {
             let mut ready = match &self.shadow_brief {
                 Some(ShadowBriefState::Ready(ready)) => Some(ready.clone()),
@@ -1126,10 +1128,6 @@ impl Driver {
                 .as_ref()
                 .map(|ready| snapshot_turns.saturating_sub(ready.snapshot_turns))
                 .unwrap_or(snapshot_turns);
-            let warm = self
-                .session
-                .last_usage()
-                .is_some_and(|usage| usage.cached_input_tokens > 0);
             // Never delta-revise a fitted source. Its omitted prefix is not
             // represented by the old brief, so a later fitted delta cannot
             // make the combined snapshot full. Rebuild from the entire
@@ -1143,8 +1141,7 @@ impl Driver {
                     && ready.as_ref().is_some_and(|ready| {
                         ready.turns_since_rebuild.saturating_add(delta_turns)
                             >= ctx_cfg.rolling_precompaction_rebuild_turns
-                    }))
-                || warm;
+                    }));
             let turns_since_rebuild = match ready.as_ref() {
                 Some(ready) if !rebuild => ready.turns_since_rebuild.saturating_add(delta_turns),
                 _ => 0,

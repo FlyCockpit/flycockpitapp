@@ -4942,6 +4942,12 @@ struct AttachedSession {
     /// count so the loop guard reverts to headless behavior. `None` for a
     /// non-interactive attach (e.g. `cockpit run`'s event pump).
     _interactive_guard: Option<crate::daemon::session_worker::InteractiveClientGuard>,
+    /// Set only when this exact attachment received an interactive
+    /// away-resume `ask` offer. It is consumed before the corresponding
+    /// `ResumeFromCompaction` work is enqueued, so an attached headless
+    /// client, a fresh attachment, or a replay cannot bypass the resume
+    /// choice boundary.
+    resume_compaction_offer_issued: bool,
 }
 
 #[derive(Default)]

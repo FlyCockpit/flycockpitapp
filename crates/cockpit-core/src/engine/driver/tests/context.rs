@@ -486,6 +486,43 @@ async fn rolling_precompaction_survives_legacy_shadow_killswitch_and_rebuilds_on
 }
 
 #[tokio::test]
+async fn rolling_precompaction_keeps_warm_turns_incremental_until_cadence() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        rolling_precompaction_rebuild_turns: 24,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    driver
+        .session
+        .set_last_usage_estimate(crate::tokens::TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 100,
+            cached_input_tokens: 1_900,
+            cache_creation_input_tokens: 0,
+        });
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+
+    assert_eq!(
+        compact_inference_purposes(&driver).await,
+        ["rolling_compaction_rebuild", "rolling_compaction_delta"],
+        "a warm cache report must not turn each completed turn into a full-history rebuild"
+    );
+}
+
+#[tokio::test]
 async fn rolling_partial_snapshot_is_rebuilt_not_delta_promoted() {
     use crate::config::providers::{CacheMode, ContextConfig};
     use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};

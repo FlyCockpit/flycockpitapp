@@ -722,8 +722,7 @@ pub struct ContextConfig {
     #[serde(default = "default_rolling_precompaction")]
     pub rolling_precompaction: bool,
     /// Rebuild the rolling brief from the complete history after this many
-    /// summarized turns. `0` disables cadence rebuilds; warm cache observations
-    /// may still request one. Default 24.
+    /// summarized turns. `0` disables cadence rebuilds. Default 24.
     #[serde(default = "default_rolling_precompaction_rebuild_turns")]
     pub rolling_precompaction_rebuild_turns: usize,
     /// Time without activity after which an attach is considered a resume from

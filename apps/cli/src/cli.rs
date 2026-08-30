@@ -224,6 +224,10 @@ pub enum Command {
     #[command(subcommand)]
     Session(SessionCommand),
 
+    /// Run governed knowledge-base synthesis.
+    #[command(subcommand)]
+    Knowledge(KnowledgeCommand),
+
     /// Manage durable daemon scheduler jobs.
     #[cfg(feature = "extended")]
     #[command(subcommand)]
@@ -407,6 +411,15 @@ pub struct LearnArgs {
     /// holds the exclusive ledger lock, attach to it instead.
     #[arg(long)]
     pub ephemeral: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KnowledgeCommand {
+    /// Dream all currently attached, undreamed sessions into a KB.
+    Dream {
+        #[arg(value_name = "KB_ID")]
+        knowledge_base_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -185,3 +185,65 @@ fn validate_consumer_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn attachment_minus_ledger_is_exact_and_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_session("p", "/p", "Build").await.unwrap();
+        let second = db.create_session("p", "/p", "Build").await.unwrap();
+        db.attach_session_to_knowledge_base("kb", first.session_id)
+            .await
+            .unwrap();
+
+        let initial = db
+            .undreamed_sessions_for_knowledge_base("kb", "consumer")
+            .await
+            .unwrap();
+        assert_eq!(
+            initial.iter().map(|row| row.session_id).collect::<Vec<_>>(),
+            vec![first.session_id]
+        );
+
+        db.record_knowledge_dream_completion("kb", "consumer", &[first.session_id])
+            .await
+            .unwrap();
+        assert!(
+            db.undreamed_sessions_for_knowledge_base("kb", "consumer")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        db.attach_session_to_knowledge_base("kb", second.session_id)
+            .await
+            .unwrap();
+        let next = db
+            .undreamed_sessions_for_knowledge_base("kb", "consumer")
+            .await
+            .unwrap();
+        assert_eq!(
+            next.iter().map(|row| row.session_id).collect::<Vec<_>>(),
+            vec![second.session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_fails_closed_after_consent_is_revoked() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/p", "Build").await.unwrap();
+        db.attach_session_to_knowledge_base("kb", session.session_id)
+            .await
+            .unwrap();
+        db.detach_session_from_knowledge_base("kb", session.session_id)
+            .await
+            .unwrap();
+        assert!(
+            db.record_knowledge_dream_completion("kb", "consumer", &[session.session_id])
+                .await
+                .is_err()
+        );
+    }
+}

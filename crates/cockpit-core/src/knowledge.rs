@@ -6,6 +6,10 @@
 //! replace the local implementation without caller churn. Embeddings and
 //! vector tables never enter `cockpit.db`.
 
+pub(crate) mod dream;
+
+pub use dream::build_dream_prompt;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 use std::fs;
@@ -15,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -63,6 +67,7 @@ const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const KNOWLEDGE_DREAM_SOURCES_TOOL_NAME: &str = "knowledge_dream_sources";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
 const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
@@ -72,7 +77,11 @@ const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
-    &[MEMORY_SEARCH_TOOL_NAME, KNOWLEDGE_DREAM_APPLY_TOOL_NAME]
+    &[
+        MEMORY_SEARCH_TOOL_NAME,
+        KNOWLEDGE_DREAM_SOURCES_TOOL_NAME,
+        KNOWLEDGE_DREAM_APPLY_TOOL_NAME,
+    ]
 }
 
 unsafe extern "C" {
@@ -3705,12 +3714,14 @@ pub(crate) async fn with_memory_search_if_attached(
             toolbox.without(MEMORY_SEARCH_TOOL_NAME)
         };
     let extended = config.extended();
+    let providers = config.providers();
     let dream_writes_enabled =
         attached_bundles(session, cwd, allowed_knowledge_bases.as_ref(), &extended)
             .await
             .is_ok_and(|bundles| {
                 bundles.iter().any(|knowledge_base| {
-                    knowledge_base.entry.dream_model.as_deref() == Some(executing_model)
+                    dream::resolve_dream_model(&knowledge_base.entry, &extended, &providers)
+                        .is_ok_and(|model| model.reference() == executing_model)
                         && matches!(
                             &knowledge_base.entry.source,
                             KnowledgeBaseSource::Local { .. }
@@ -3718,12 +3729,19 @@ pub(crate) async fn with_memory_search_if_attached(
                 })
             });
     if dream_writes_enabled {
-        toolbox.with(Arc::new(KnowledgeDreamApplyTool {
+        toolbox
+            .with(Arc::new(KnowledgeDreamSourcesTool {
+                allowed_knowledge_bases: allowed_knowledge_bases.clone(),
+                executing_model: executing_model.to_string(),
+            }))
+            .with(Arc::new(KnowledgeDreamApplyTool {
             allowed_knowledge_bases,
             executing_model: executing_model.to_string(),
         }))
     } else {
-        toolbox.without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
+        toolbox
+            .without(KNOWLEDGE_DREAM_SOURCES_TOOL_NAME)
+            .without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
     }
 }
 
@@ -3744,18 +3762,111 @@ pub(crate) struct KnowledgeDreamApplyTool {
     executing_model: String,
 }
 
+pub(crate) struct KnowledgeDreamSourcesTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+    executing_model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeDreamSourcesArgs {
+    knowledge_base_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeDreamApplyArgs {
     knowledge_base_id: String,
-    sessions_dreamed: usize,
-    writes: Vec<KnowledgeDreamWrite>,
+    source_session_ids: Vec<uuid::Uuid>,
+    upserts: Vec<dream::ConceptUpsert>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct KnowledgeDreamWrite {
-    path: String,
-    content: String,
+#[derive(Debug, Clone)]
+pub(super) struct KnowledgeDreamWrite {
+    pub(super) path: String,
+    pub(super) content: String,
+}
+
+#[async_trait]
+impl Tool for KnowledgeDreamSourcesTool {
+    fn name(&self) -> &str {
+        KNOWLEDGE_DREAM_SOURCES_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "List exactly the attached sessions not yet dreamed into a knowledge base"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "knowledgeBaseId": { "type": "string" }
+            },
+            "required": ["knowledgeBaseId"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let args: KnowledgeDreamSourcesArgs = typed_args(args)?;
+        let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+        )
+        .await?;
+        let knowledge_base = bundles
+            .iter()
+            .find(|knowledge_base| knowledge_base.entry.id == args.knowledge_base_id)
+            .context("dream target knowledge base is not attached")?;
+        let model = dream::resolve_dream_model(&knowledge_base.entry, &extended, &providers)?;
+        ensure!(
+            model.reference() == self.executing_model,
+            "knowledge base `{}` must dream with `{}`",
+            knowledge_base.entry.id,
+            model.reference()
+        );
+        let consumer = ctx.session.db.ensure_installation_identity().await?;
+        let mut sources = ctx
+            .session
+            .db
+            .undreamed_sessions_for_knowledge_base(
+                &knowledge_base.entry.id,
+                consumer.as_hex(),
+            )
+            .await?;
+        let redaction_base = ctx
+            .session
+            .with_machine_scoped_sealed_redactions(&ctx.redact)
+            .await?;
+        for source in &mut sources {
+            let target_union = ctx
+                .session
+                .recall_redaction_table_from_base(&redaction_base, source.session_id)?;
+            source.title = source.title.take().map(|title| target_union.scrub(&title));
+            source.description = target_union.scrub(&source.description);
+        }
+        let presentation = sources
+            .into_iter()
+            .map(|source| {
+                json!({
+                    "sessionId": source.session_id,
+                    "title": source.title,
+                    "description": source.description,
+                    "lastActiveAtUnixMs": source.last_active_at_unix_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(ToolOutput::text(serde_json::to_string_pretty(&presentation)?))
+    }
 }
 
 #[async_trait]
@@ -3765,16 +3876,16 @@ impl Tool for KnowledgeDreamApplyTool {
     }
 
     fn description(&self) -> &str {
-        "Commit validated dream-produced OKF files to an attached knowledge base"
+        "Apply a redacted, provenance-tagged knowledge dream change set"
     }
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Write the complete changed OKF concept/resource files from a completed knowledge dream. \
-             The named KB must be attached and configured with a dream model. Paths are single files \
-             at the KB root; submit the full contents for every file changed by this dream. The daemon \
-             validates the resulting OKF bundle, records a structured Git commit when available, and \
-             safely defers remote publication rather than force-pushing."
+            "Final step for the dream orchestrator after one layer of read-only subagents proposes \
+             concepts. Submit exactly the sourceSessionIds returned by knowledge_dream_sources and \
+             the orchestrator's merged concept upserts. The daemon rechecks the ledger/model/trust, \
+             applies the target-union redaction table, protects human concepts, writes through the \
+             configured sink, then records completion."
                 .to_string(),
         )
     }
@@ -3791,32 +3902,40 @@ impl Tool for KnowledgeDreamApplyTool {
                     "type": "string",
                     "description": "Attached local knowledge base ID"
                 },
-                "sessionsDreamed": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Number of source sessions included in this dream"
-                },
-                "writes": {
+                "sourceSessionIds": {
                     "type": "array",
-                    "minItems": 1,
+                    "items": { "type": "string", "format": "uuid" },
+                    "description": "Exact attached, undreamed source IDs returned by knowledge_dream_sources"
+                },
+                "upserts": {
+                    "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Single root-level OKF .md or referenced .csv/.jsonl/.ndjson file"
+                            "id": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+                            "type": { "type": "string" },
+                            "title": { "type": ["string", "null"] },
+                            "body": { "type": "string" },
+                            "citations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "target": { "type": "string" }
+                                    },
+                                    "required": ["label", "target"],
+                                    "additionalProperties": false
+                                }
                             },
-                            "content": {
-                                "type": "string",
-                                "description": "Complete replacement contents for this file"
-                            }
+                            "provenance": { "const": "dream" }
                         },
-                        "required": ["path", "content"],
+                        "required": ["id", "type", "body", "provenance"],
                         "additionalProperties": false
                     }
                 }
             },
-            "required": ["knowledgeBaseId", "sessionsDreamed", "writes"],
+            "required": ["knowledgeBaseId", "sourceSessionIds", "upserts"],
             "additionalProperties": false
         })
     }
@@ -3828,13 +3947,8 @@ impl Tool for KnowledgeDreamApplyTool {
                 "knowledgeDreamApply knowledgeBaseId must not be empty",
             ));
         }
-        if args.sessions_dreamed == 0 {
-            return Err(invalid_input(
-                "knowledgeDreamApply sessionsDreamed must be at least 1",
-            ));
-        }
-        let writes = validate_knowledge_dream_writes(args.writes)?;
         let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
         let bundles = attached_bundles(
             &ctx.session,
             &ctx.cwd,
@@ -3851,58 +3965,33 @@ impl Tool for KnowledgeDreamApplyTool {
                     args.knowledge_base_id
                 )
             })?;
-        if !matches!(
-            &knowledge_base.entry.source,
-            KnowledgeBaseSource::Local { .. }
-        ) {
-            bail!(
-                "remote knowledge-base dream writes are hosted and not implemented for `{}`",
-                knowledge_base.entry.id
-            );
-        }
-        let configured_model = knowledge_base
-            .entry
-            .dream_model
-            .as_deref()
-            .with_context(|| {
-                format!(
-                    "knowledge base `{}` has no configured dream model",
-                    knowledge_base.entry.id
-                )
-            })?;
-        if configured_model != self.executing_model {
-            bail!(
-                "knowledge base `{}` is configured to dream with `{configured_model}`, not the executing model `{}`",
-                knowledge_base.entry.id,
-                self.executing_model
-            );
-        }
-        let concepts_written = writes
-            .iter()
-            .filter(|write| is_knowledge_dream_concept_path(&write.path))
-            .count();
-        let data_files_written = writes.len().saturating_sub(concepts_written);
-        let dream = KnowledgeDreamCommit {
+        let entry = knowledge_base.entry.clone();
+        let change_set = dream::DreamChangeSet {
             knowledge_base_id: args.knowledge_base_id,
-            model: self.executing_model.clone(),
-            sessions_dreamed: args.sessions_dreamed,
-            concepts_written,
-            data_files_written,
+            source_session_ids: args.source_session_ids,
+            upserts: args.upserts,
         };
         let cancel = dream_write_cancellation(ctx);
-        let session = ctx.session.clone();
-        let cwd = ctx.cwd.clone();
-        let outcome = apply_registered_knowledge_dream(
-            &session,
-            &cwd,
-            self.allowed_knowledge_bases.as_ref(),
+        let sink = dream::LocalGitSink::new(
+            ctx.session.clone(),
+            ctx.cwd.clone(),
+            self.allowed_knowledge_bases.clone(),
+            extended.clone(),
+        );
+        let engine = dream::DreamEngine::new(ctx.session.clone());
+        let outcome = engine
+            .apply_orchestrated_change_set(
+            &entry,
             &extended,
-            &dream,
+            &providers,
+            &self.executing_model,
+            &ctx.redact,
+            change_set,
+            &sink,
             cancel.cancel.clone(),
-            move |root| apply_knowledge_dream_writes(root, &writes),
         )
-        .await;
-        Ok(render_knowledge_dream_outcome(outcome?))
+        .await?;
+        Ok(render_dream_run_outcome(outcome))
     }
 }
 
@@ -3940,81 +4029,7 @@ fn dream_write_cancellation(ctx: &ToolCtx) -> DreamWriteCancellation {
     }
 }
 
-fn validate_knowledge_dream_writes(
-    writes: Vec<KnowledgeDreamWrite>,
-) -> Result<Vec<KnowledgeDreamWrite>> {
-    if writes.is_empty() {
-        return Err(invalid_input(
-            "knowledgeDreamApply writes must not be empty",
-        ));
-    }
-    let mut paths = BTreeSet::new();
-    let mut total_bytes = 0_usize;
-    for write in &writes {
-        let path = Path::new(&write.path);
-        let mut components = path.components();
-        let Some(std::path::Component::Normal(leaf)) = components.next() else {
-            return Err(invalid_input(format!(
-                "knowledgeDreamApply path `{}` must be a single file at the knowledge-base root",
-                write.path
-            )));
-        };
-        if components.next().is_some() || leaf != std::ffi::OsStr::new(&write.path) {
-            return Err(invalid_input(format!(
-                "knowledgeDreamApply path `{}` must be a single file at the knowledge-base root",
-                write.path
-            )));
-        }
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(extension.as_str(), "md" | "csv" | "jsonl" | "ndjson") {
-            return Err(invalid_input(format!(
-                "knowledgeDreamApply path `{}` must end in .md, .csv, .jsonl, or .ndjson",
-                write.path
-            )));
-        }
-        if KB_MACHINE_STATE_GITIGNORE.contains(&write.path.as_str()) {
-            return Err(invalid_input(format!(
-                "knowledgeDreamApply path `{}` is reserved for machine-local state",
-                write.path
-            )));
-        }
-        if !paths.insert(write.path.clone()) {
-            return Err(invalid_input(format!(
-                "knowledgeDreamApply contains duplicate path `{}`",
-                write.path
-            )));
-        }
-        if write.content.len() > MAX_KNOWLEDGE_FILE_BYTES {
-            return Err(invalid_input(format!(
-                "knowledgeDreamApply file `{}` exceeds the knowledge file size limit",
-                write.path
-            )));
-        }
-        total_bytes = total_bytes
-            .checked_add(write.content.len())
-            .ok_or_else(|| {
-                invalid_input(
-                    "knowledgeDreamApply content length overflowed the knowledge size limit",
-                )
-            })?;
-        if total_bytes > MAX_KNOWLEDGE_TOTAL_BYTES {
-            return Err(invalid_input(
-                "knowledgeDreamApply writes exceed the aggregate knowledge size limit",
-            ));
-        }
-    }
-    Ok(writes)
-}
-
-fn is_knowledge_dream_concept_path(path: &str) -> bool {
-    path.ends_with(".md") && !matches!(path, "index.md" | "log.md")
-}
-
-fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<()> {
+pub(super) fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<()> {
     // Git provides the rollback boundary for a tracked KB.  Git is optional,
     // though, so preserve the exact pre-write file set here as well: a later
     // write failure or a failed OKF validation must not leave a Git-absent KB
@@ -4099,39 +4114,25 @@ impl KnowledgeDreamWriteRollback {
     }
 }
 
-fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutput {
-    let text = match outcome {
-        KnowledgeDreamGitOutcome::Skipped { reason } => {
-            format!("Knowledge dream applied; Git history was skipped: {reason}")
+fn render_dream_run_outcome(outcome: dream::DreamRunOutcome) -> ToolOutput {
+    match outcome {
+        dream::DreamRunOutcome::NothingToDream => {
+            ToolOutput::text("Knowledge base has no attached, undreamed sessions.")
         }
-        KnowledgeDreamGitOutcome::NoChanges { branch } => {
-            format!("Knowledge dream produced no versioned changes on `{branch}`.")
-        }
-        KnowledgeDreamGitOutcome::Committed {
-            commit,
-            branch,
-            pushed,
-        } => format!(
-            "Knowledge dream committed `{commit}` on `{branch}`{}.",
-            if pushed { " and pushed it" } else { "" }
-        ),
-        KnowledgeDreamGitOutcome::Deferred {
-            branch,
-            commit,
-            reason,
-        } => format!(
-            "Knowledge dream output was retained{}{}; synchronization deferred: {reason}",
-            branch
-                .as_deref()
-                .map(|branch| format!(" on `{branch}`"))
-                .unwrap_or_default(),
-            commit
-                .as_deref()
-                .map(|commit| format!(" at `{commit}`"))
-                .unwrap_or_default(),
-        ),
-    };
-    ToolOutput::text(text)
+        dream::DreamRunOutcome::Applied {
+            sessions_dreamed,
+            concepts_written,
+            sink,
+        } => ToolOutput::text(format!(
+            "Knowledge dream completed: {sessions_dreamed} session(s), {concepts_written} concept upsert(s); sink outcome: {sink:?}."
+        )),
+        dream::DreamRunOutcome::Deferred {
+            sessions_pending,
+            sink,
+        } => ToolOutput::text(format!(
+            "Knowledge dream sink deferred; {sessions_pending} session(s) remain undreamed for retry: {sink:?}."
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]

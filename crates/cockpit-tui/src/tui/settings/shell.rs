@@ -169,6 +169,10 @@ pub(super) struct PointerOperationGate {
 }
 
 impl PointerOperationGate {
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(super) fn begin(&mut self) -> PointerOperationId {
         self.next = self.next.saturating_add(1).max(1);
         let id = PointerOperationId(self.next);

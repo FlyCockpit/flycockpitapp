@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 #[cfg(test)]
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,6 +45,13 @@ const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
 const MAX_KNOWLEDGE_DEPTH: usize = 32;
 const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// A host-owned, non-secret generation marker for local KB sealed values.
+///
+/// This intentionally lives beside the KB markdown rather than in daemon
+/// state: a filesystem object can be deleted and later reuse every observable
+/// platform identity (including an inode). A fresh directory has no marker,
+/// so it is assigned a fresh namespace before it can receive a sealed value.
+const SEALED_KNOWLEDGE_BASE_ID_FILE: &str = ".flycockpit-sealed-kb-id";
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
@@ -1570,16 +1578,52 @@ pub(crate) async fn sealed_knowledge_base_id_for_tool(
         .bundles
         .iter()
         .find(|bundle| bundle.entry.id == registry_id)
-        .map(|bundle| &bundle.sealed_id)
+        .map(|bundle| &bundle.entry)
         .context("knowledge base is unavailable or not attached")?;
-    Ok(entry.clone())
+    ensure_sealed_knowledge_base_identity(entry)
 }
 
-/// Stable sealed-value identity for one KB source object. Unlike the broader
-/// attachment identity used for dream ordering, this intentionally excludes
-/// markdown content: authoring a new symbolic token changes the source text
-/// but must not strand the token it just created. Replacing the directory or a
-/// symlink target changes the object identity and therefore fails old tokens.
+/// Resolve the Owner's registry label to the exact immutable namespace bound
+/// into a KB-copy action. Unlike a normal KB read, this may create the empty
+/// non-secret marker: the Owner is explicitly authorizing a future custody
+/// transfer, and this makes the first copy possible without creating a dummy
+/// vault value merely to learn an ID.
+pub(crate) fn sealed_knowledge_base_id_for_owner(
+    cwd: &Path,
+    extended: &ExtendedConfig,
+    registry_id: &str,
+) -> Result<crate::sealed::SealedKnowledgeBaseId> {
+    let mut matches = extended
+        .knowledge_bases
+        .iter()
+        .filter(|entry| entry.id == registry_id);
+    let mut entry = matches
+        .next()
+        .cloned()
+        .context("knowledge base is not configured")?;
+    if matches.next().is_some() {
+        bail!("knowledge base registry contains duplicate ID `{registry_id}`");
+    }
+    if let KnowledgeBaseSource::Local { path } = &entry.source {
+        entry.source = KnowledgeBaseSource::Local {
+            path: if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            },
+        };
+    }
+    ensure_sealed_knowledge_base_identity(&entry)
+}
+
+/// Stable sealed-value identity for one KB source object.
+///
+/// Local KBs use a durable, random generation marker, never filesystem
+/// metadata. Filesystem identities are recyclable, so deriving a capability
+/// namespace from a path/inode (or Windows creation tuple) could transfer old
+/// vault entries to a replacement directory. A read-only attachment lacking a
+/// marker receives an invocation-local ID; any committed token then fails
+/// closed. The marker is created only by the sealed authoring path below.
 fn sealed_knowledge_base_identity(
     entry: &KnowledgeBaseRegistryEntry,
 ) -> Result<crate::sealed::SealedKnowledgeBaseId> {
@@ -1596,44 +1640,101 @@ fn sealed_knowledge_base_identity(
                 .with_context(|| format!("resolving knowledge base source {}", path.display()));
         }
     };
-    let metadata = std::fs::metadata(&root)
-        .with_context(|| format!("reading knowledge base source {}", root.display()))?;
-    if !metadata.is_dir() {
+    if !std::fs::metadata(&root)
+        .with_context(|| format!("reading knowledge base source {}", root.display()))?
+        .is_dir()
+    {
         bail!(
             "knowledge base source {} is not a directory",
             root.display()
         );
     }
-    let mut name = b"flycockpit/knowledge-sealed-attachment/v1\0".to_vec();
-    append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
+    read_sealed_knowledge_base_marker(&root)?.map_or_else(
+        || crate::sealed::SealedKnowledgeBaseId::from_attachment_id(uuid::Uuid::new_v4()),
+        crate::sealed::SealedKnowledgeBaseId::from_attachment_id,
+    )
+}
 
-        name.extend_from_slice(&metadata.dev().to_le_bytes());
-        name.extend_from_slice(&metadata.ino().to_le_bytes());
-    }
-    #[cfg(windows)]
+/// Return the KB namespace after durably assigning one when the Owner/model
+/// first authors a sealed value. This is the only mutation of the marker: KB
+/// reads never create state and therefore cannot bless a replacement object.
+fn ensure_sealed_knowledge_base_identity(
+    entry: &KnowledgeBaseRegistryEntry,
+) -> Result<crate::sealed::SealedKnowledgeBaseId> {
+    let KnowledgeBaseSource::Local { path } = &entry.source else {
+        return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(entry.attachment_id());
+    };
+    let root = std::fs::canonicalize(path)
+        .with_context(|| format!("resolving knowledge base source {}", path.display()))?;
+    if !std::fs::metadata(&root)
+        .with_context(|| format!("reading knowledge base source {}", root.display()))?
+        .is_dir()
     {
-        use std::os::windows::fs::MetadataExt as _;
+        bail!(
+            "knowledge base source {} is not a directory",
+            root.display()
+        );
+    }
+    if let Some(id) = read_sealed_knowledge_base_marker(&root)? {
+        return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(id);
+    }
 
-        name.extend_from_slice(&metadata.creation_time().to_le_bytes());
-        name.extend_from_slice(&metadata.file_attributes().to_le_bytes());
-    }
-    #[cfg(not(any(unix, windows)))]
+    let marker = sealed_knowledge_base_marker_path(&root);
+    let generated = uuid::Uuid::new_v4();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
     {
-        let created = metadata
-            .created()
-            .context("reading knowledge base source creation time")?
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("knowledge base source creation time predates Unix epoch")?;
-        name.extend_from_slice(&created.as_secs().to_le_bytes());
-        name.extend_from_slice(&created.subsec_nanos().to_le_bytes());
+        Ok(mut file) => {
+            file.write_all(generated.to_string().as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            crate::sealed::SealedKnowledgeBaseId::from_attachment_id(generated)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = read_sealed_knowledge_base_marker(&root)?.context(
+                "knowledge-base sealed identity marker appeared but is not a regular marker file",
+            )?;
+            crate::sealed::SealedKnowledgeBaseId::from_attachment_id(existing)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "creating knowledge-base sealed identity marker {}",
+                marker.display()
+            )
+        }),
     }
-    crate::sealed::SealedKnowledgeBaseId::from_attachment_id(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        &name,
-    ))
+}
+
+fn sealed_knowledge_base_marker_path(root: &Path) -> PathBuf {
+    root.join(SEALED_KNOWLEDGE_BASE_ID_FILE)
+}
+
+fn read_sealed_knowledge_base_marker(root: &Path) -> Result<Option<uuid::Uuid>> {
+    let marker = sealed_knowledge_base_marker_path(root);
+    let metadata = match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", marker.display())),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "knowledge-base sealed identity marker {} must be a regular file",
+            marker.display()
+        );
+    }
+    let raw = std::fs::read_to_string(&marker)
+        .with_context(|| format!("reading {}", marker.display()))?;
+    let value = raw
+        .strip_suffix('\n')
+        .context("knowledge-base sealed identity marker must end with a newline")?;
+    if value.contains('\n') || value.contains('\r') {
+        bail!("knowledge-base sealed identity marker has invalid content");
+    }
+    uuid::Uuid::parse_str(value)
+        .context("knowledge-base sealed identity marker must contain a UUID")
+        .map(Some)
 }
 
 fn validate_dream_models(
@@ -2769,6 +2870,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn replacement_kb_directory_at_the_same_path_gets_a_fresh_sealed_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "project".to_string(),
+            "Project".to_string(),
+            "Workspace project knowledge".to_string(),
+            KnowledgeBaseSource::Local { path: root.clone() },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+
+        let original = ensure_sealed_knowledge_base_identity(&entry).unwrap();
+        assert_eq!(sealed_knowledge_base_identity(&entry).unwrap(), original);
+
+        fs::remove_dir_all(&root).unwrap();
+        write_bundle(&root);
+        let replacement = ensure_sealed_knowledge_base_identity(&entry).unwrap();
+
+        assert_ne!(original, replacement);
+        assert_eq!(sealed_knowledge_base_identity(&entry).unwrap(), replacement);
+    }
+
+    #[test]
+    fn owner_can_pin_a_configured_kb_label_before_the_first_sealed_copy() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![KnowledgeBaseRegistryEntry::new(
+                "project".to_string(),
+                "Project".to_string(),
+                "Workspace project knowledge".to_string(),
+                KnowledgeBaseSource::Local {
+                    path: PathBuf::from("knowledge"),
+                },
+                KnowledgeBaseEmbeddingOwnership::Local,
+                None,
+                None,
+                false,
+                KnowledgeBaseMergePolicy::Auto,
+            )],
+            ..Default::default()
+        };
+
+        let pinned = sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project").unwrap();
+
+        assert_eq!(
+            sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project").unwrap(),
+            pinned
+        );
+        assert!(sealed_knowledge_base_marker_path(&root).is_file());
     }
 
     #[cfg(unix)]

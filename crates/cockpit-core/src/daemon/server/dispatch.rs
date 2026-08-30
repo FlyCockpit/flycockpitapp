@@ -7174,7 +7174,34 @@ async fn handle_serialized_request_impl(
             // Resolve the three closed-lookup ids to a compiled action kind and
             // parse the safe fields FIRST. An unknown id / unsafe field is
             // rejected here, before any persist.
-            let kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
+            // KB-copy actions deliberately take the configured registry label
+            // as their closed `origin_id`, not an implementation UUID. The
+            // daemon resolves and pins the label's current immutable namespace
+            // while the Owner creates the action. This makes the first copy
+            // operable without manufacturing a dummy sealed value to discover
+            // its destination identity.
+            let resolved_origin_id = if kind_id == "knowledge_base_copy" {
+                let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
+                    &ctx.db,
+                    &ctx.canonical_cwd,
+                )
+                .await
+                .map_err(internal)?;
+                let (_, extended) = ctx
+                    .config_source()
+                    .load_effective_for_daemon(&ctx.canonical_cwd, &trust_policy)
+                    .map_err(daemon_config_error)?;
+                crate::knowledge::sealed_knowledge_base_id_for_owner(
+                    &ctx.canonical_cwd,
+                    &extended,
+                    &origin_id,
+                )
+                .map_err(|error| bad_request(error.to_string()))?
+                .to_string()
+            } else {
+                origin_id
+            };
+            let kind = resolve_sealed_action_kind(&kind_id, &resolved_origin_id, &projection_id)
                 .map_err(|error| bad_request(error.to_string()))?;
             let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
@@ -27381,7 +27408,9 @@ fn sealed_record_row_to_inventory_item(
 }
 
 /// The closed server-side catalog that resolves the three `CreateSealedAction`
-/// ids to a compiled [`SealedActionKind`].
+/// ids to a compiled [`SealedActionKind`]. For `knowledge_base_copy`, callers
+/// first resolve the Owner-visible registry label to the immutable attachment
+/// identity and pass that result as `origin_id`.
 ///
 /// The ids are closed lookups, never free-form payloads: `kind_id` selects a
 /// builtin kind template (a fixed origin allowlist, credential placement, path

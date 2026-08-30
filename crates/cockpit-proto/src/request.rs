@@ -773,7 +773,9 @@ pub enum Request {
     ListSealedActions,
     /// Create a sealed action instance. The three ids (`kind_id`, `origin_id`,
     /// `projection_id`) are closed server-side lookups the daemon resolves to a
-    /// compiled action kind; an unknown id is rejected before any persist. The
+    /// compiled action kind; an unknown id is rejected before any persist. For
+    /// `knowledge_base_copy`, `origin_id` is the configured KB registry label,
+    /// resolved and pinned by the daemon rather than a caller-supplied UUID. The
     /// wire carries no origin URL, path template, or projection blob. The daemon
     /// mints the `action_id`.
     CreateSealedAction {

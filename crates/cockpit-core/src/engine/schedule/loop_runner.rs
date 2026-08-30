@@ -98,10 +98,6 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     // A fork persists across wakes exactly as before, but a handoff replaces
     // it so no later wake remains rooted in the retired context.
     let mut fork_session: Option<(u64, Arc<crate::session::Session>)> = None;
-    // A handoff while a fork is executing re-runs the already-due wake against
-    // the successor. It does not sleep again, so a bounded idle timer retains
-    // its activity-derived deadline rather than gaining a fresh one.
-    let mut wake_ready = false;
 
     // Accumulated history for `independent = false`. Reset each iteration
     // for `independent = true`.
@@ -121,31 +117,28 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     });
 
     while iteration < limit {
-        if !wake_ready {
-            // Wait the interval before each iteration (a timer with limit=1
-            // therefore fires after one interval — matching "one-shot delayed
-            // prompt").
-            match wait_for_next_wake(delay, args.interval_secs, idle_activity_rx.as_mut()).await {
-                WakeWait::Elapsed { activity_seen } => {
-                    // Activity restarts both this countdown and any backoff. The
-                    // next wake therefore fires after the configured interval from
-                    // the last accepted user message, never an old deadline.
-                    if activity_seen {
-                        delay = args.interval_secs;
-                    }
-                }
-                WakeWait::ActivityChannelClosed => {
-                    // An idle timer without its authority must never degrade into
-                    // an immediate loop. It cannot observe a future reset, so end
-                    // visibly and let the driver's normal failed-completion path
-                    // reconcile the bounded registry entry.
-                    last_result = "idle activity authority closed".to_string();
-                    errored = true;
-                    break;
+        // Wait the interval before each iteration (a timer with limit=1
+        // therefore fires after one interval — matching "one-shot delayed
+        // prompt").
+        match wait_for_next_wake(delay, args.interval_secs, idle_activity_rx.as_mut()).await {
+            WakeWait::Elapsed { activity_seen } => {
+                // Activity restarts both this countdown and any backoff. The
+                // next wake therefore fires after the configured interval from
+                // the last accepted user message, never an old deadline.
+                if activity_seen {
+                    delay = args.interval_secs;
                 }
             }
+            WakeWait::ActivityChannelClosed => {
+                // An idle timer without its authority must never degrade into
+                // an immediate loop. It cannot observe a future reset, so end
+                // visibly and let the driver's normal failed-completion path
+                // reconcile the bounded registry entry.
+                last_result = "idle activity authority closed".to_string();
+                errored = true;
+                break;
+            }
         }
-        wake_ready = false;
 
         if cancelled {
             break;
@@ -155,8 +148,11 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         // thread compacted or moved to a successor. Snapshot only after the
         // wait so this iteration cannot fork from the retired context.
         // Mark all migrations observed before this execution boundary as
-        // incorporated, then snapshot. A replacement racing the snapshot is
-        // still observed by the select around `run_iteration` below.
+        // incorporated, then snapshot. Once this wake starts, it must run to
+        // its normal completion: a tool may already have crossed an external
+        // effect boundary, so retrying the wake after a handoff could duplicate
+        // that effect. A replacement racing this snapshot is adopted at the
+        // following wake instead.
         let live_generation = *migration_rx.borrow_and_update();
         let live_ctx = ctx.snapshot();
 
@@ -230,43 +226,25 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             args.idle,
         ));
 
-        let iteration_result = tokio::select! {
-            biased;
-            changed = migration_rx.changed() => Err(changed.is_ok()),
-            result = run_iteration(
-                &fork_agent,
-                &mut fork_history,
-                wake_prompt.as_deref().unwrap_or(&args.prompt),
-                fork_session
-                    .as_ref()
-                    .expect("a fork is created before every iteration")
-                    .1
-                    .clone(),
-                &live_ctx,
-                &turn_tx,
-            ) => Ok(result),
-        };
-        let iteration_result = match iteration_result {
-            Ok(result) => result,
-            Err(true) => {
-                // Discard predecessor-only deferred output before rerunning
-                // this wake in the successor context. Effects that already
-                // crossed their native boundary cannot be undone, but no
-                // predecessor fork result may be published after migration.
-                let _ = state.take_notes();
-                let _ = state.take_requests();
-                let _ = state.take_actions();
-                fork_session = None;
-                fork_history.clear();
-                wake_ready = true;
-                continue;
-            }
-            Err(false) => {
-                last_result = "live schedule context authority closed".to_string();
-                errored = true;
-                break;
-            }
-        };
+        // A handoff is deliberately not selected against a running wake. The
+        // running fork owns one concrete iteration and its active-idle-wake
+        // state until it publishes or releases that wake. Cancelling it here
+        // would both leave that state in `Running` and make any external tool
+        // effect indeterminate; replaying the same due wake could execute the
+        // effect twice while consuming only one bounded iteration.
+        let iteration_result = run_iteration(
+            &fork_agent,
+            &mut fork_history,
+            wake_prompt.as_deref().unwrap_or(&args.prompt),
+            fork_session
+                .as_ref()
+                .expect("a fork is created before every iteration")
+                .1
+                .clone(),
+            &live_ctx,
+            &turn_tx,
+        )
+        .await;
 
         match iteration_result {
             Ok(text) => last_result = text,

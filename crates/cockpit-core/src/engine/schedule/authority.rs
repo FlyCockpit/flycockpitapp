@@ -282,8 +282,10 @@ impl ScheduleContext {
 pub struct LiveScheduleContext {
     ctx: Arc<RwLock<ScheduleContext>>,
     /// Only successor/compaction replacement publishes here. Ordinary context
-    /// refreshes are adopted at the next wake; a live handoff must also stop a
-    /// currently executing predecessor fork before it can publish.
+    /// refreshes are adopted at the next wake. A migration that arrives during
+    /// an executing wake is likewise adopted at its following boundary: an
+    /// in-flight wake must not be replayed because its external effects may
+    /// already be committed.
     migration_tx: watch::Sender<u64>,
 }
 
@@ -556,7 +558,8 @@ impl ScheduleAuthority {
 
     /// Refresh the redaction table used by newly spawned scheduled work and by
     /// the next wake of every live loop. An iteration already executing keeps
-    /// its snapshot until it completes or a successor migration aborts it.
+    /// its snapshot until it completes; a successor migration is adopted at
+    /// the next wake boundary rather than aborting that iteration.
     pub fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
         self.ctx.update(|ctx| ctx.redact = table);
     }

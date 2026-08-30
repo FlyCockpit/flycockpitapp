@@ -459,6 +459,7 @@ async fn scheduler_delegate_probe_is_side_effect_free_until_attempt_admission() 
         workspace_lease: None,
         context: crate::engine::agent::TaskContext::Fresh,
         granted_tools: Vec::new(),
+        seed_reads: Vec::new(),
         todo_ids: Vec::new(),
         repair_notes: Vec::new(),
         task_call_id: "probe-no-consume".to_string(),

@@ -154,6 +154,42 @@ impl HostContext {
         }
     }
 
+    /// Isolated catalog for the explore seed-selection fork. The captured
+    /// slot is owned by the caller; this host has no native-tool context, so
+    /// the fork can select calls but cannot execute them or reach foreground
+    /// capabilities.
+    pub fn seed_reads_fork(
+        session: Arc<Session>,
+        cwd: PathBuf,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+        slot: Arc<std::sync::Mutex<Option<Vec<crate::engine::seed_reads::SeedRead>>>>,
+    ) -> Self {
+        Self {
+            db: Some(session.db.clone()),
+            session_id: Some(session.id),
+            cwd,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            config,
+            session: Some(session),
+            root_agent_frame: false,
+            context_usage: None,
+            child_events: None,
+            builtin_registry: Arc::new(BuiltinRegistry::seed_reads_fork(slot)),
+            native_tool_ctx: None,
+            scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
+            #[cfg(test)]
+            test_builtin_gate: None,
+            #[cfg(test)]
+            test_external_invoke: None,
+            #[cfg(test)]
+            test_external_approval_entered: None,
+        }
+    }
+
     /// Prefer the ToolCtx-threaded resolver, then overlay any caller-built
     /// servers the resolver does not already know. Hand-built `McpConfig`
     /// fixtures (and production `catalog.to_mcp_config()`) stay visible even
@@ -877,6 +913,35 @@ impl BuiltinRegistry {
         )])
     }
 
+    /// Monty-only capability provisioned after explore finishes. It is absent
+    /// from every agent's base native `tools[]`, including explore's, so the
+    /// fork reuses the warm prompt prefix.
+    pub fn seed_reads_fork(
+        slot: Arc<std::sync::Mutex<Option<Vec<crate::engine::seed_reads::SeedRead>>>>,
+    ) -> Self {
+        Self::new(vec![BuiltinFunction::new(
+            "seed_reads",
+            "Return read-only tool calls for the implementation child to execute fresh",
+            BuiltinPresentation {
+                glyph: "🌱",
+                label: "seed_reads".to_string(),
+            },
+            Arc::new(seed_reads_schema),
+            Arc::new(|_| Availability::available()),
+            true,
+            Arc::new(move |_ctx, args| {
+                let slot = slot.clone();
+                Box::pin(async move {
+                    let calls = crate::engine::seed_reads::parse_seed_reads(args.get("calls"))
+                        .map_err(anyhow::Error::msg)?;
+                    *slot.lock().map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
+                        Some(calls.clone());
+                    Ok(serde_json::json!({"accepted": true, "count": calls.len()}))
+                })
+            }),
+        )])
+    }
+
     fn iter(&self) -> impl Iterator<Item = &BuiltinFunction> {
         self.funcs.values()
     }
@@ -884,6 +949,29 @@ impl BuiltinRegistry {
     fn get(&self, name: &str) -> Option<&BuiltinFunction> {
         self.funcs.get(name)
     }
+}
+
+fn seed_reads_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "calls": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "enum": crate::engine::seed_reads::ALLOWED_SEED_READ_TOOLS},
+                        "args": {"type": "object"}
+                    },
+                    "required": ["tool", "args"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["calls"],
+        "additionalProperties": false
+    })
 }
 
 pub fn builtin_presentations() -> Vec<(String, BuiltinPresentation)> {
@@ -1673,6 +1761,23 @@ mod tests {
                 .get("set_session_metadata")
                 .is_some(),
             "the ephemeral fork catalog owns the metadata function"
+        );
+    }
+
+    #[test]
+    fn seed_reads_function_exists_only_on_ephemeral_fork_catalog() {
+        assert!(
+            BuiltinRegistry::default_with(Vec::new())
+                .get("seed_reads")
+                .is_none(),
+            "the foreground Monty catalog must not discover seed_reads"
+        );
+        let slot = Arc::new(Mutex::new(None));
+        assert!(
+            BuiltinRegistry::seed_reads_fork(slot)
+                .get("seed_reads")
+                .is_some(),
+            "the explore ephemeral fork catalog owns seed_reads"
         );
     }
 

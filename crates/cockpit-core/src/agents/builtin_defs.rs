@@ -464,6 +464,7 @@ fn builder_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
+            "grep",
             "write",
             "unlock",
             "edit",
@@ -526,6 +527,7 @@ fn explore_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
+            "mcp",
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,

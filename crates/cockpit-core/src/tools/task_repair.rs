@@ -106,6 +106,7 @@ const DELEGATE_KEYS: &[&str] = &[
     "cwd",
     "write_scope",
     "grant_tools",
+    "seed_reads",
     "todo_ids",
 ];
 

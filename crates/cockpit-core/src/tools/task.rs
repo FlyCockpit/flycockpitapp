@@ -98,7 +98,7 @@ impl TaskTool {
              - models: {{ \"intent\": \"models\" }} \
              - query: {{ \"intent\": \"query\", \"payload\": {{ \"task_call_id\": \"...\", \"message\": \"...\" }} }} \
              If a noninteractive task returns a backgrounded task_delegation JSON envelope, the original tool call is closed and the child is still running detached with result_pending=true. Do not treat it as the report or redelegate solely because it backgrounded; continue the current conversation and use the async task_delegation result or task status/query/list with task_call_id. Read each child status and optional error; backgrounded children can later complete, fail, be cancelled, or be lost. task steer applies at the next child turn boundary only if still running/actionable. resume_handle is not a universal background-task control channel. \
-             Multiple independent delegate calls may be emitted separately; each keeps its own call/task lifecycle and the host may run proven read-only children concurrently. Use batch only for one grouped result or explicit depends_on edges. Do not add legacy delegate/batch/control siblings. Query/steer require message."
+             When explore returns a host-authored seed_reads array, copy it unchanged to the promptly-following builder delegate payload; the builder executes those read-only calls before its first inference. Multiple independent delegate calls may be emitted separately; each keeps its own call/task lifecycle and the host may run proven read-only children concurrently. Use batch only for one grouped result or explicit depends_on edges. Do not add legacy delegate/batch/control siblings. Query/steer require message."
         );
         let model_selector_schema = serde_json::json!({
             "type": "object",
@@ -175,6 +175,20 @@ impl TaskTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Extra tools"
+                },
+                "seed_reads": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "description": "Fresh read-only calls selected by explore; implementation child executes them before its first inference",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": { "type": "string", "enum": ["read", "grep", "code", "graph", "search"] },
+                            "args": { "type": "object" }
+                        },
+                        "required": ["tool", "args"],
+                        "additionalProperties": false
+                    }
                 },
                 "todo_ids": {
                     "type": "array",
@@ -271,6 +285,7 @@ impl TaskTool {
                 "write_scope": delegate_payload["properties"]["write_scope"].clone(),
                 "workspace_lease": delegate_payload["properties"]["workspace_lease"].clone(),
                 "grant_tools": delegate_payload["properties"]["grant_tools"].clone(),
+                "seed_reads": delegate_payload["properties"]["seed_reads"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
                 "task_call_id": control_payload["properties"]["task_call_id"].clone(),
@@ -482,6 +497,15 @@ mod tests {
             assert_eq!(
                 payload_props["grant_tools"]["type"], "array",
                 "grant_tools is an array: {schema}"
+            );
+            assert_eq!(
+                payload_props["seed_reads"]["type"], "array",
+                "seed_reads is an array: {schema}"
+            );
+            assert_eq!(
+                payload_props["seed_reads"]["items"]["properties"]["tool"]["enum"],
+                serde_json::json!(["read", "grep", "code", "graph", "search"]),
+                "seed_reads exposes the closed read-only allowlist: {schema}"
             );
             assert!(
                 !payload_props.contains_key("seed"),

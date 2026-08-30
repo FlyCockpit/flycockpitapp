@@ -4577,6 +4577,89 @@ impl Driver {
         .await
     }
 
+    async fn execute_interactive_seed_reads(
+        &mut self,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+        brief: Message,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        if seed_reads.is_empty() {
+            return Ok(brief);
+        }
+        let agent = self
+            .stack
+            .last()
+            .context("driver stack is empty")?
+            .agent
+            .clone();
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
+                .await;
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
+            agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
+            lock_identity: agent.lock_identity.clone(),
+            write_scope: agent.write_scope.clone(),
+            dream_read_scope: self.dream_read_scope.clone(),
+            workspace_lease: agent.workspace_lease.clone(),
+            current_tool_call_id: None,
+            tool_steering: agent.tool_steering,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel,
+            shutdown_gate: agent.model.shutdown_gate(),
+            approver: self.approver.clone(),
+            image_generation_dispatch: self.session.image_generation_dispatch(),
+            transcription_dispatch: None,
+            deferred_log: self.stack.last().context("driver stack is empty")?.deferred_log.clone(),
+            root_agent_frame: false,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                active_tools.names().into_iter().map(str::to_string).collect(),
+            ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            has_tree: active_tools.get("code").is_some(),
+            has_bash: active_tools.get("bash").is_some(),
+            events: Some(tx.clone()),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            env_overlay: agent.env_overlay.clone(),
+            config: self.config.clone(),
+            mcp_resolver: agent.mcp_resolver.clone(),
+        };
+        let frame = self.stack.last_mut().context("driver stack is empty")?;
+        frame.history.push(brief);
+        crate::engine::seed_reads::execute_before_first_inference(
+            &agent,
+            &active_tools,
+            &ctx,
+            tx,
+            &mut frame.history,
+            seed_reads,
+            &self.session,
+            &self.config,
+            &self.cwd,
+            self.loop_guard_threshold,
+        )
+        .await?;
+        Ok(Message::user(
+            "The host executed the explore-selected read-only seed calls above. Use their fresh results and continue with the delegated implementation brief without rediscovering them.",
+        ))
+    }
+
     async fn continue_after_parked_interrupt_replay(
         &mut self,
         input_rx: &crate::engine::message::UserSubmissionQueue,
@@ -13207,6 +13290,7 @@ impl Driver {
                     model,
                     remaining_depth,
                     granted_tools,
+                    seed_reads,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13303,6 +13387,7 @@ impl Driver {
                         "model": model_selector_json(&model),
                         "remaining_depth": remaining_depth,
                         "granted_tools": &granted_tools,
+                        "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,
                         "provider_item_id": &task_provider_item_id,
                         "function_call_id": &task_function_call_id,
@@ -13634,7 +13719,14 @@ impl Driver {
                             &brief,
                         )
                     };
-                    next_prompt = Message::user(brief);
+                    next_prompt = self
+                        .execute_interactive_seed_reads(
+                            &seed_reads,
+                            Message::user(brief),
+                            tx,
+                            cancel.clone(),
+                        )
+                        .await?;
                     continue;
                 }
                 TurnOutcome::SpawnNoninteractive {
@@ -13649,6 +13741,7 @@ impl Driver {
                     workspace_lease,
                     context,
                     granted_tools,
+                    seed_reads,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13917,6 +14010,7 @@ impl Driver {
                             .as_ref()
                             .map(|lease| lease.id.to_string()),
                         granted_tools,
+                        seed_reads,
                         todo_ids,
                         child_recursion,
                         repair_notes,

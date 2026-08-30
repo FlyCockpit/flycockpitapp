@@ -1328,16 +1328,16 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-const WORKSPACE_BIRTH_TOKEN_FILE: &str = ".cockpit-workspace-birth-token";
 const WORKSPACE_BIRTH_TOKEN_MAX_BYTES: usize = 64;
 
 /// Derive a workspace key from both the live root directory object and a
-/// random birth token held inside that object. Object IDs alone are not a
-/// lifetime identity: Unix inodes and Windows file IDs can be recycled after
-/// deletion. A replacement repository consequently creates a fresh token and
-/// cannot inherit the predecessor's sessions or history-scope consent even if
-/// its platform object ID is recycled. The held authority anchors both the
-/// token read and its exclusive creation beneath the verified root.
+/// birth token held in that directory object's metadata. Object IDs alone are
+/// not a lifetime identity: Unix inodes and Windows file IDs can be recycled
+/// after deletion. Object metadata is deliberately not a repository entry, so
+/// ordinary cleanup or edits of untracked files cannot detach a live workspace
+/// from its sessions or history-scope consent. A replacement directory creates
+/// a fresh token and cannot inherit the predecessor's sessions or consent even
+/// if its platform object ID is recycled.
 pub fn project_id_for(root: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
@@ -1346,50 +1346,22 @@ pub fn project_id_for(root: &Path) -> Result<String> {
             &canonical,
         )
         .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
-    let birth_token = workspace_birth_token(&authority)?;
+    let birth_token = authority
+        .workspace_birth_token()
+        .context("reading workspace birth token from directory metadata")?;
+    validate_workspace_birth_token(&birth_token)?;
     Ok(project_id_from_workspace_evidence(
         authority.identity(),
         &birth_token,
     ))
 }
 
-fn workspace_birth_token(
-    authority: &cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority,
-) -> Result<Vec<u8>> {
-    match authority.read_regular_file_relative_bounded(
-        &[WORKSPACE_BIRTH_TOKEN_FILE],
-        WORKSPACE_BIRTH_TOKEN_MAX_BYTES,
-    ) {
-        Ok(token) => validate_workspace_birth_token(token),
-        Err(read_error)
-            if read_error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let generated = Uuid::new_v4().to_string().into_bytes();
-            authority
-                .create_regular_file_relative_if_absent(WORKSPACE_BIRTH_TOKEN_FILE, &generated)
-                .context("creating workspace birth token")?;
-            authority
-                .read_regular_file_relative_bounded(
-                    &[WORKSPACE_BIRTH_TOKEN_FILE],
-                    WORKSPACE_BIRTH_TOKEN_MAX_BYTES,
-                )
-                .context("reopening workspace birth token after creation")
-                .and_then(validate_workspace_birth_token)
-        }
-        Err(error) => Err(error).context("reading workspace birth token"),
-    }
-}
-
-fn validate_workspace_birth_token(token: Vec<u8>) -> Result<Vec<u8>> {
-    let text = std::str::from_utf8(&token).context("workspace birth token is not UTF-8")?;
-    let parsed = Uuid::parse_str(text).context("workspace birth token is not a UUID")?;
+fn validate_workspace_birth_token(token: &[u8]) -> Result<()> {
     anyhow::ensure!(
-        parsed.to_string() == text,
-        "workspace birth token is not canonical"
+        !token.is_empty() && token.len() <= WORKSPACE_BIRTH_TOKEN_MAX_BYTES,
+        "workspace birth token has an invalid length"
     );
-    Ok(token)
+    Ok(())
 }
 
 fn project_id_from_workspace_evidence(object_identity: &str, birth_token: &[u8]) -> String {
@@ -3220,17 +3192,53 @@ mod tests {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let original = project_id_for(&workspace).unwrap();
-        let original_birth_token =
-            std::fs::read(workspace.join(WORKSPACE_BIRTH_TOKEN_FILE)).unwrap();
 
         std::fs::rename(&workspace, temp.path().join("retired-workspace")).unwrap();
         std::fs::create_dir(&workspace).unwrap();
         let replacement = project_id_for(&workspace).unwrap();
-        let replacement_birth_token =
-            std::fs::read(workspace.join(WORKSPACE_BIRTH_TOKEN_FILE)).unwrap();
 
         assert_ne!(original, replacement);
-        assert_ne!(original_birth_token, replacement_birth_token);
+    }
+
+    #[test]
+    fn untracked_file_cleanup_cannot_change_a_live_workspace_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        // The historical file name is intentionally ordinary untracked
+        // repository content now. Its modification and cleanup must not
+        // affect the directory-object metadata that owns workspace identity.
+        let untracked = workspace.join(".cockpit-workspace-birth-token");
+        std::fs::write(&untracked, "edited by repository tooling").unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
+        std::fs::remove_file(untracked).unwrap();
+        assert_eq!(project_id_for(&workspace).unwrap(), original);
+    }
+
+    #[test]
+    fn concurrent_workspace_identity_initialization_observes_one_complete_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let start = std::sync::Arc::clone(&start);
+                let workspace = workspace.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    project_id_for(&workspace)
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 1, "all callers must observe the same project ID");
     }
 
     #[test]

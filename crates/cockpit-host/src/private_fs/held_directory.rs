@@ -10,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest as _, Sha256};
+#[cfg(unix)]
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryIdentity {
@@ -249,23 +251,18 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.read_regular_file(components)
     }
 
-    /// Atomically create a small, root-relative regular file if it is absent.
+    /// Return the opaque, directory-object-bound lifetime discriminator for a
+    /// workspace, creating it if this directory has never had one.  This is
+    /// deliberately stored in object metadata rather than a repository entry:
+    /// deleting or editing untracked workspace files must not change history
+    /// ownership for a still-live directory object.
     ///
-    /// The create is anchored in the retained workspace handle and refuses
-    /// symlinks/reparse points. `false` means another actor already created
-    /// the name; callers must reopen and validate its contents through this
-    /// authority rather than treating that outcome as success by itself.
-    pub fn create_regular_file_relative_if_absent(
-        &self,
-        name: &str,
-        contents: &[u8],
-    ) -> Result<bool> {
-        validate_component(name)?;
-        ensure!(
-            contents.len() <= 4096,
-            "held workspace bootstrap file exceeds 4096 bytes"
-        );
-        self.imp.create_regular_file_if_absent(name, contents)
+    /// Creation is compare-and-create at the metadata layer.  A competing
+    /// creator therefore either installs a complete value atomically or reads
+    /// the complete value installed by the winner; no caller can observe a
+    /// partially-written discriminator.
+    pub fn workspace_birth_token(&self) -> Result<Vec<u8>> {
+        self.imp.workspace_birth_token()
     }
 
     /// Open a regular descendant through the retained workspace directory.
@@ -722,6 +719,71 @@ mod imp {
     use super::*;
     use crate::private_fs::held_fd;
 
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "fgetxattr"]
+        fn macos_fgetxattr(
+            fd: std::os::fd::RawFd,
+            name: *const libc::c_char,
+            value: *mut libc::c_void,
+            size: libc::size_t,
+            position: u32,
+            options: i32,
+        ) -> libc::ssize_t;
+        #[link_name = "fsetxattr"]
+        fn macos_fsetxattr(
+            fd: std::os::fd::RawFd,
+            name: *const libc::c_char,
+            value: *const libc::c_void,
+            size: libc::size_t,
+            position: u32,
+            options: i32,
+        ) -> i32;
+    }
+
+    unsafe fn get_workspace_birth_token_xattr(
+        fd: std::os::fd::RawFd,
+        name: *const libc::c_char,
+        value: *mut libc::c_void,
+        size: libc::size_t,
+    ) -> libc::ssize_t {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { macos_fgetxattr(fd, name, value, size, 0, 0) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unsafe { libc::fgetxattr(fd, name, value, size) }
+        }
+    }
+
+    unsafe fn set_workspace_birth_token_xattr_if_absent(
+        fd: std::os::fd::RawFd,
+        name: *const libc::c_char,
+        value: *const libc::c_void,
+        size: libc::size_t,
+    ) -> i32 {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { macos_fsetxattr(fd, name, value, size, 0, 1) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unsafe { libc::fsetxattr(fd, name, value, size, libc::XATTR_CREATE) }
+        }
+    }
+
+    fn workspace_birth_token_missing(error: &std::io::Error) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            error.raw_os_error() == Some(libc::ENOATTR)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            error.raw_os_error() == Some(libc::ENODATA)
+        }
+    }
+
     pub(super) fn regular_file_authorization_identity(path: &Path) -> Result<String> {
         let metadata = std::fs::symlink_metadata(path)?;
         ensure!(
@@ -841,40 +903,79 @@ mod imp {
             Ok(self.dir.try_clone()?)
         }
 
-        pub(super) fn create_regular_file_if_absent(
-            &self,
-            name: &str,
-            contents: &[u8],
-        ) -> Result<bool> {
-            let name = CString::new(name).context("workspace bootstrap file has NUL")?;
-            let raw = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    // This random lifetime discriminator is not a secret.
-                    // Keep it readable to every user who can attach the
-                    // shared workspace, so they derive the same project ID.
-                    0o644,
-                )
-            };
-            if raw < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    return Ok(false);
+        pub(super) fn workspace_birth_token(&self) -> Result<Vec<u8>> {
+            const ATTRIBUTE: &[u8] = b"user.cockpit.workspace-birth-token\0";
+            const MAX_BYTES: usize = 64;
+
+            fn read(fd: std::os::fd::RawFd) -> std::io::Result<Option<Vec<u8>>> {
+                let name = ATTRIBUTE.as_ptr().cast();
+                let size =
+                    unsafe { get_workspace_birth_token_xattr(fd, name, std::ptr::null_mut(), 0) };
+                if size < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return if workspace_birth_token_missing(&error) {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    };
                 }
-                return Err(error).context("creating held workspace bootstrap file");
+                let size = usize::try_from(size).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "xattr size overflow")
+                })?;
+                if size == 0 || size > MAX_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "workspace birth-token xattr has an invalid length",
+                    ));
+                }
+                let mut token = vec![0_u8; size];
+                let read = unsafe {
+                    get_workspace_birth_token_xattr(
+                        fd,
+                        name,
+                        token.as_mut_ptr().cast(),
+                        token.len(),
+                    )
+                };
+                if read < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let read = usize::try_from(read).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "xattr read overflow")
+                })?;
+                if read != token.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "workspace birth-token xattr changed while reading",
+                    ));
+                }
+                Ok(Some(token))
             }
-            let mut file = unsafe { File::from_raw_fd(raw) };
-            file.write_all(contents)
-                .context("writing held workspace bootstrap file")?;
-            file.sync_all()
-                .context("syncing held workspace bootstrap file")?;
-            Ok(true)
+
+            match read(self.dir.as_raw_fd()).context("reading workspace birth-token xattr")? {
+                Some(token) => Ok(token),
+                None => {
+                    let generated = Uuid::new_v4().to_string();
+                    let status = unsafe {
+                        set_workspace_birth_token_xattr_if_absent(
+                            self.dir.as_raw_fd(),
+                            ATTRIBUTE.as_ptr().cast(),
+                            generated.as_ptr().cast(),
+                            generated.len(),
+                        )
+                    };
+                    if status == 0 {
+                        return Ok(generated.into_bytes());
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EEXIST) {
+                        return read(self.dir.as_raw_fd())
+                            .context("reading concurrently-created workspace birth-token xattr")?
+                            .context("concurrent workspace birth-token xattr disappeared");
+                    }
+                    Err(error).context("creating workspace birth-token xattr")
+                }
+            }
         }
 
         pub(super) fn read_regular_file(&self, components: &[&str]) -> Result<Vec<u8>> {
@@ -1761,6 +1862,10 @@ mod imp {
     const OPEN_EXISTING: u32 = 3;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    // FSCTL_CREATE_OR_GET_OBJECT_ID associates a durable 16-byte NTFS object
+    // identifier with this directory.  Unlike a directory entry, it survives
+    // repository cleanup and is never published in a partially-written form.
+    const FSCTL_CREATE_OR_GET_OBJECT_ID: u32 = 0x0009_00c0;
 
     #[repr(C)]
     struct UnicodeString {
@@ -1874,6 +1979,16 @@ mod imp {
             information: *mut ByHandleFileInformation,
         ) -> i32;
         fn FlushFileBuffers(file: Handle) -> i32;
+        fn DeviceIoControl(
+            device: Handle,
+            control_code: u32,
+            input: *const c_void,
+            input_len: u32,
+            output: *mut c_void,
+            output_len: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
     }
 
     #[derive(Debug)]
@@ -1992,61 +2107,31 @@ mod imp {
         pub(super) fn directory_handle_clone(&self) -> Result<File> {
             Ok(self.dir.try_clone()?)
         }
-        pub(super) fn create_regular_file_if_absent(
-            &self,
-            name: &str,
-            contents: &[u8],
-        ) -> Result<bool> {
-            let mut owned = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
-            let unicode = UnicodeString {
-                length: (owned.len() * 2) as u16,
-                maximum_length: (owned.len() * 2) as u16,
-                buffer: owned.as_mut_ptr(),
-            };
-            let attributes = ObjectAttributes {
-                length: size_of::<ObjectAttributes>() as u32,
-                root_directory: self.dir.as_raw_handle(),
-                object_name: &unicode,
-                attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
-                security_descriptor: ptr::null_mut(),
-                security_quality_of_service: ptr::null_mut(),
-            };
-            let mut io = IoStatusBlock {
-                status: 0,
-                information: 0,
-            };
-            let mut raw = ptr::null_mut();
-            let status = unsafe {
-                NtCreateFile(
-                    &mut raw,
-                    GENERIC_WRITE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-                    &attributes,
-                    &mut io,
-                    ptr::null(),
-                    FILE_ATTRIBUTE_NORMAL,
-                    FILE_SHARE_ALL,
-                    FILE_CREATE,
-                    FILE_NON_DIRECTORY_FILE
-                        | FILE_OPEN_REPARSE_POINT
-                        | FILE_SYNCHRONOUS_IO_NONALERT,
+        pub(super) fn workspace_birth_token(&self) -> Result<Vec<u8>> {
+            // OBJECT_ID_BUFFER begins with the 16-byte object id; the
+            // remaining birth/domain fields are irrelevant here.  The FSCTL
+            // is atomic: if another caller creates the id first, both callers
+            // receive that same fully initialized directory property.
+            let mut object_id = [0_u8; 64];
+            let mut returned = 0_u32;
+            let ok = unsafe {
+                DeviceIoControl(
+                    self.dir.as_raw_handle(),
+                    FSCTL_CREATE_OR_GET_OBJECT_ID,
                     ptr::null(),
                     0,
+                    object_id.as_mut_ptr().cast(),
+                    object_id.len() as u32,
+                    &mut returned,
+                    ptr::null_mut(),
                 )
             };
-            if status == STATUS_OBJECT_NAME_COLLISION {
-                return Ok(false);
-            }
             ensure!(
-                status >= STATUS_SUCCESS_MIN && !raw.is_null(),
-                "creating held Windows workspace bootstrap file failed with NTSTATUS {status:#x}"
+                ok != 0 && returned >= 16,
+                "creating or reading Windows workspace object ID failed: {}",
+                std::io::Error::last_os_error()
             );
-            let mut file = unsafe { File::from_raw_handle(raw) };
-            verify_regular_handle(&file)?;
-            file.write_all(contents)
-                .context("writing held Windows workspace bootstrap file")?;
-            file.sync_all()
-                .context("syncing held Windows workspace bootstrap file")?;
-            Ok(true)
+            Ok(object_id[..16].to_vec())
         }
         pub(super) fn read_regular_file(&self, components: &[&str]) -> Result<Vec<u8>> {
             let (leaf, parents) = components
@@ -3295,7 +3380,7 @@ mod imp {
         pub(super) fn directory_handle_clone(&self) -> Result<File> {
             anyhow::bail!("held workspace directory authority is unavailable")
         }
-        pub(super) fn create_regular_file_if_absent(&self, _: &str, _: &[u8]) -> Result<bool> {
+        pub(super) fn workspace_birth_token(&self) -> Result<Vec<u8>> {
             anyhow::bail!("held workspace directory authority is unavailable")
         }
         pub(super) fn read_regular_file(&self, _: &[&str]) -> Result<Vec<u8>> {

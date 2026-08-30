@@ -148,6 +148,9 @@ pub(crate) fn resolve_root_agent_conn(
     let Ok(Some(row)) = crate::db::Db::get_session_conn(conn, session_id) else {
         return default_primary();
     };
+    if row.session_entry_mode == "computer" {
+        return "Computer".to_string();
+    }
     if let Some(assistant_name) = row.assistant_name.as_deref() {
         if conn
             .query_row(

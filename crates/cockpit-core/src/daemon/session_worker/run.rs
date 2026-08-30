@@ -6167,13 +6167,17 @@ pub(super) async fn run_worker(
         prepared_root_launch.is_some(),
         session.is_freshly_created(),
     );
-    // Root primary: the session's stored active agent (so a resume restarts
+    // Root primary: Computer entry-mode owns a dedicated root; other sessions
+    // use the stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
     // force the release default (`Build`). Issue #75: the mode axis no longer
     // selects the primary — `defaultPrimaryAgent` governs.
     let root_agent_name = match session.assistant_name.clone() {
         Some(name) => name,
+        None if session.session_entry_mode() == proto::SessionEntryMode::Computer => {
+            "Computer".to_string()
+        }
         None => match prepared_root_launch.as_ref() {
             Some(prepared) => prepared.root_agent_name.clone(),
             None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
@@ -6444,7 +6448,9 @@ pub(super) async fn run_worker(
             .await
             {
                 Ok(agent) => agent,
-                Err(error) if prepared_root_launch.is_none() => {
+                Err(error)
+                    if prepared_root_launch.is_none() && root_agent_name != "Computer" =>
+                {
                     tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
                     builtin::default_build(&spawn_args)
                 }
@@ -6466,7 +6472,7 @@ pub(super) async fn run_worker(
                 }
             }
         }
-        Err(error) if prepared_root_launch.is_none() => {
+        Err(error) if prepared_root_launch.is_none() && root_agent_name != "Computer" => {
             tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
             builtin::default_build(&spawn_args)
         }

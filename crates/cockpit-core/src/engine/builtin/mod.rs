@@ -93,6 +93,7 @@ pub(crate) const DREAM_PROMPT: &str = include_str!("dream.md");
 pub(crate) const DREAM_WORKER_PROMPT: &str = include_str!("dream_worker.md");
 // `bee` — `Swarm`'s recursive parallel worker (GOALS §24/§26).
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
+pub(crate) const COMPUTER_PRIMARY_PROMPT: &str = include_str!("computer.md");
 pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
@@ -335,6 +336,14 @@ pub(crate) fn computer_use_custody_route(
 pub(crate) fn computer_use_criteria(
     selector: &str,
 ) -> crate::config::providers::ModelPolicyCriteria<'_> {
+    computer_use_criteria_for_role(selector, true, "computer")
+}
+
+fn computer_use_criteria_for_role<'a>(
+    selector: &'a str,
+    require_subagent_invokable: bool,
+    agent: &'a str,
+) -> crate::config::providers::ModelPolicyCriteria<'a> {
     use crate::config::providers::{
         AvailabilityScope, ModelOptimization, ModelPolicyCriteria, ModelPolicySelector,
         RequiredModelCapability,
@@ -343,18 +352,34 @@ pub(crate) fn computer_use_criteria(
         selector: ModelPolicySelector::Exact(selector),
         required_capabilities: vec![RequiredModelCapability::ImageInput],
         min_context_tokens: None,
-        require_subagent_invokable: true,
+        require_subagent_invokable,
         optimize: ModelOptimization::Balanced,
         role: Some("computer"),
-        agent: Some("computer"),
+        agent: Some(agent),
         // The host enabled `computer_use` on this exact model.
         availability: AvailabilityScope::HostNamedTarget,
     }
 }
 
+fn computer_primary_candidate(
+    providers: &crate::config::providers::ProvidersConfig,
+    cwd: &Path,
+) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
+    computer_candidate(providers, cwd, false, "Computer")
+}
+
 fn computer_subagent_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
+) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
+    computer_candidate(providers, cwd, true, "computer")
+}
+
+fn computer_candidate(
+    providers: &crate::config::providers::ProvidersConfig,
+    cwd: &Path,
+    require_subagent_invokable: bool,
+    agent: &str,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
@@ -364,7 +389,9 @@ fn computer_subagent_candidate(
             if tier == crate::config::extended::ComputerUseMode::Disabled {
                 continue;
             }
-            if !providers.resolve_subagent_invokable(provider_id, &model.id) {
+            if require_subagent_invokable
+                && !providers.resolve_subagent_invokable(provider_id, &model.id)
+            {
                 continue;
             }
             let caps = providers.resolve_effective_model_capabilities(
@@ -384,7 +411,21 @@ fn computer_subagent_candidate(
             // The custody class is the configured computer-use model's own
             // trust class: the host authorized this model for computer use, a
             // model never picks it.
-            if computer_use_custody_route(providers, provider_id, &model.id).is_err() {
+            let selector = format!("{provider_id}:{}", model.id);
+            let custody = crate::engine::model_roles::custody_for_trust(
+                providers.resolve_trust(provider_id, &model.id),
+            );
+            if providers
+                .resolve_sensitive_model_policy_eligibility(
+                    &computer_use_criteria_for_role(
+                        &selector,
+                        require_subagent_invokable,
+                        agent,
+                    ),
+                    custody,
+                )
+                .is_err()
+            {
                 continue;
             }
             return Some((
@@ -1757,6 +1798,9 @@ pub fn load_with_tool_surface_override(
             "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
         );
     }
+    if name == "Computer" {
+        return computer_primary(args);
+    }
     if name == "computer" {
         return computer(args);
     }
@@ -1814,6 +1858,9 @@ pub async fn load_with_assistant_db_and_tool_surface_override(
         bail!(
             "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
         );
+    }
+    if name == "Computer" {
+        return computer_primary(args);
     }
     if name == "computer" {
         return computer(args);
@@ -3546,17 +3593,37 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
+    computer_agent(args, "computer", true)
+}
+
+/// `Computer` — the dedicated interactive computer-use primary. Unlike the
+/// lowercase delegation worker, its eligible model need not be marked
+/// subagent-invokable; it is the root model for this session.
+pub fn computer_primary(args: &SpawnArgs) -> Result<Agent> {
+    computer_agent(args, "Computer", false)
+}
+
+fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool) -> Result<Agent> {
     if args.workspace_lease.as_ref().is_some_and(|lease| {
         !lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_computer()
     }) {
         bail!("workspace lease does not permit computer use");
     }
     let (_extended, providers) = args.config.configs();
-    let Some((provider_id, model_id, native_computer)) =
+    let candidate = if require_subagent_invokable {
         computer_subagent_candidate(&providers, &args.cwd)
+    } else {
+        computer_primary_candidate(&providers, &args.cwd)
+    };
+    let Some((provider_id, model_id, native_computer)) = candidate
     else {
         bail!(
-            "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
+            "{name} requires a configured vision-capable model with a native computer_use contract and computer_use enabled{}",
+            if require_subagent_invokable {
+                " that is subagent-invokable"
+            } else {
+                ""
+            }
         );
     };
     // The worker route is a *sensitive* route — computer use ships screenshots
@@ -3570,7 +3637,11 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     );
     let worker_selector = format!("{provider_id}:{model_id}");
     let request = crate::config::providers::SensitiveModelPolicyRequest::new(
-        computer_use_criteria(&worker_selector),
+        computer_use_criteria_for_role(
+            &worker_selector,
+            require_subagent_invokable,
+            name,
+        ),
         custody,
         crate::engine::model_roles::custody_payload_for(custody, &session_redact),
     )
@@ -3582,7 +3653,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
         custody = resolved.custody.as_str(),
         granted = resolved.trusted_custody_grant().is_some(),
         routing = %serde_json::to_string(&resolved.policy.routing_diagnostics()).unwrap_or_default(),
-        "computer-use subagent custody"
+        "computer-use agent custody"
     );
     let model = Arc::new(crate::engine::model::Model::for_provider_optional_store(
         &providers,
@@ -3598,7 +3669,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     );
     if !caps.supports_image_input() {
         bail!(
-            "computer-use subagent requires a vision-capable model; `{}`:`{}` is not vision-capable",
+            "{name} requires a vision-capable model; `{}`:`{}` is not vision-capable",
             model.provider_id(),
             model.model_id_ref()
         );
@@ -3606,8 +3677,8 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     let mut child_args = args.clone();
     child_args.model = model;
     child_args.params.native_computer = Some(native_computer);
-    let def = crate::agents::embedded_internal_default("computer")
-        .expect("computer has an internal agent definition");
+    let def = crate::agents::embedded_internal_default(name)
+        .expect("computer agent has an internal definition");
     let mut agent = agent_from_def(&def, &child_args)?;
     agent.delegation_recursion = DelegationRecursionContext {
         enabled: args.delegation_recursion.enabled,

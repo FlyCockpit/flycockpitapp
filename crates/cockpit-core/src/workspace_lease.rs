@@ -2096,6 +2096,7 @@ mod tests {
             },
             questions: None,
             verification: None,
+            allowed_knowledge_bases: None,
         };
         def.resolve_grant(&host()).unwrap()
     }
@@ -2525,6 +2526,7 @@ mod tests {
             delegation: DelegationPolicy::default(),
             questions: None,
             verification: None,
+            allowed_knowledge_bases: None,
         };
         let leaf_grant = leaf.resolve_grant(&host()).unwrap();
         assert!(

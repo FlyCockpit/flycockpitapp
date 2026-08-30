@@ -73,6 +73,58 @@ pub use tui::{
     validate_web_custom_placeholders,
 };
 
+/// A named knowledge base available to a workspace.  The source stays an
+/// explicit provider-neutral reference so callers do not need to care whether
+/// retrieval is local today or hosted in a future deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeBaseRegistryEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub source: KnowledgeBaseSource,
+    #[serde(rename = "embeddingOwnership")]
+    pub embedding_ownership: KnowledgeBaseEmbeddingOwnership,
+    #[serde(
+        rename = "dreamModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dream_model: Option<String>,
+    #[serde(
+        rename = "dreamSchedule",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dream_schedule: Option<String>,
+    #[serde(rename = "trustRequired", default)]
+    pub trust_required: bool,
+    #[serde(rename = "mergePolicy")]
+    pub merge_policy: KnowledgeBaseMergePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum KnowledgeBaseSource {
+    Local { path: PathBuf },
+    Remote { url: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum KnowledgeBaseEmbeddingOwnership {
+    #[default]
+    Local,
+    RemoteOwned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KnowledgeBaseMergePolicy {
+    #[default]
+    Auto,
+    Review,
+}
+
 #[cfg(test)]
 use guards::{resolve_injection_guard_from_paths, resolve_preflight_from_paths};
 #[cfg(test)]
@@ -243,11 +295,10 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
 
-    /// Enable the trust-gated `.cockpit/knowledge/` project OKF bundle.
-    /// Assistant-owned bundles are discovered independently from assistant
-    /// home directories; this flag only controls the project attach point.
-    #[serde(default)]
-    pub project_knowledge: bool,
+    /// Named knowledge bases available to this workspace. Agent definitions
+    /// may narrow this registry through `allowedKnowledgeBases`.
+    #[serde(default, rename = "knowledgeBases")]
+    pub knowledge_bases: Vec<KnowledgeBaseRegistryEntry>,
 
     /// Maximum model-context budget for automatic cited knowledge injection.
     #[serde(default = "default_knowledge_inject_max_tokens")]
@@ -1542,7 +1593,7 @@ impl Default for ExtendedConfig {
             compact_model: None,
             btw_model: None,
             embedding_model: None,
-            project_knowledge: false,
+            knowledge_bases: Vec::new(),
             knowledge_inject_max_tokens: default_knowledge_inject_max_tokens(),
             compact_prompt: None,
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
@@ -2520,7 +2571,7 @@ impl ExtendedConfigDoc {
         parse_field!("compact_model", compact_model);
         parse_field!("btw_model", btw_model);
         parse_field!("embedding_model", embedding_model);
-        parse_field!("project_knowledge", project_knowledge);
+        parse_field!("knowledgeBases", knowledge_bases);
         parse_field!("knowledge_inject_max_tokens", knowledge_inject_max_tokens);
         parse_field!("compact_prompt", compact_prompt);
         parse_field!("prompt_injection_guard", prompt_injection_guard);
@@ -2672,7 +2723,7 @@ impl ExtendedConfigDoc {
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
-        remove_malformed!("project_knowledge", bool);
+        remove_malformed!("knowledgeBases", Vec<KnowledgeBaseRegistryEntry>);
         remove_malformed!("queuedMessagesAsSteering", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);

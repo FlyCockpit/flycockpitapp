@@ -1350,6 +1350,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         definition.resolve_grant(&host()).expect("grant resolves")
     }
@@ -1616,6 +1617,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         let grant = definition.resolve_grant(&host()).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1694,6 +1696,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         definition.resolve_grant(&host()).unwrap()
     }
@@ -1727,6 +1730,7 @@ mod tests {
                     ..Default::default()
                 }],
             }),
+            allowed_knowledge_bases: None,
         };
         definition.resolve_grant(&host()).unwrap()
     }

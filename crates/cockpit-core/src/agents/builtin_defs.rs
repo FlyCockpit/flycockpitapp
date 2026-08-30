@@ -296,6 +296,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
         delegation,
         questions: None,
         verification: None,
+        allowed_knowledge_bases: None,
     }
 }
 

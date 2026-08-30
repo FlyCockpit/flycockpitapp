@@ -1230,6 +1230,12 @@ impl AgentDef {
         if let Some(verification) = &vnext.verification {
             fm.insert("verification".into(), serde_yaml::to_value(verification)?);
         }
+        if let Some(knowledge_bases) = &vnext.allowed_knowledge_bases {
+            fm.insert(
+                "allowedKnowledgeBases".into(),
+                serde_yaml::to_value(knowledge_bases)?,
+            );
+        }
         if let Some(capabilities) = &self.capabilities {
             fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
         }
@@ -1362,6 +1368,8 @@ fn parse_agent_with_scope(
         questions: Option<QuestionPolicy>,
         #[serde(default)]
         verification: Option<VerificationPolicy>,
+        #[serde(rename = "allowedKnowledgeBases", default)]
+        allowed_knowledge_bases: Option<BTreeSet<String>>,
         #[serde(default)]
         description: String,
         #[serde(default)]
@@ -1506,6 +1514,7 @@ fn parse_agent_with_scope(
                 delegation: fm.delegation.unwrap_or_default(),
                 questions: fm.questions,
                 verification: fm.verification,
+                allowed_knowledge_bases: fm.allowed_knowledge_bases,
             };
             definition.validate_for_scope(scope).map_err(|error| {
                 anyhow::anyhow!(

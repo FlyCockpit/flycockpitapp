@@ -280,51 +280,68 @@ impl ScheduleContext {
 /// survived compaction forks from the successor rather than its predecessor.
 #[derive(Clone)]
 pub struct LiveScheduleContext {
-    ctx: Arc<RwLock<ScheduleContext>>,
-    /// Only successor/compaction replacement publishes here. Ordinary context
-    /// refreshes are adopted at the next wake. A migration that arrives during
-    /// an executing wake is likewise adopted at its following boundary: an
-    /// in-flight wake must not be replayed because its external effects may
-    /// already be committed.
-    migration_tx: watch::Sender<u64>,
+    state: Arc<RwLock<LiveScheduleState>>,
+}
+
+/// The complete execution-boundary snapshot for a live scheduled runner.
+///
+/// `migration_generation` identifies the root session from which an
+/// ephemeral fork was created. It must be read with `ctx`: reading either
+/// independently could pair a successor context with its predecessor's
+/// generation and leave one wake on the retired fork.
+struct LiveScheduleState {
+    ctx: ScheduleContext,
+    migration_generation: u64,
 }
 
 impl LiveScheduleContext {
     fn new(ctx: ScheduleContext) -> Self {
-        let (migration_tx, _) = watch::channel(0);
         Self {
-            ctx: Arc::new(RwLock::new(ctx)),
-            migration_tx,
+            state: Arc::new(RwLock::new(LiveScheduleState {
+                ctx,
+                migration_generation: 0,
+            })),
         }
     }
 
     pub fn snapshot(&self) -> ScheduleContext {
-        self.ctx
+        self.state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ctx
             .clone()
     }
 
+    /// Atomically capture the live context and the identity generation of its
+    /// root session for one runner wake boundary.
+    pub(crate) fn snapshot_at_wake(&self) -> (u64, ScheduleContext) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.migration_generation, state.ctx.clone())
+    }
+
     fn replace(&self, ctx: ScheduleContext) {
-        *self
-            .ctx
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ctx;
-        self.migration_tx
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // An in-place compaction refreshes this same root session. Its fork is
+        // still valid, including accumulated non-independent loop history.
+        // Only a different root session retires that fork.
+        if !Arc::ptr_eq(&state.ctx.session, &ctx.session) {
+            state.migration_generation = state.migration_generation.wrapping_add(1);
+        }
+        state.ctx = ctx;
     }
 
     fn update(&self, update: impl FnOnce(&mut ScheduleContext)) {
-        update(
-            &mut *self
-                .ctx
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-    }
-
-    pub fn subscribe_migrations(&self) -> watch::Receiver<u64> {
-        self.migration_tx.subscribe()
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut state.ctx);
     }
 }
 
@@ -1431,6 +1448,22 @@ mod tests {
         assert!(!auth.has_loop());
     }
 
+    #[test]
+    fn in_place_context_refresh_does_not_retire_the_fork_generation() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let (before_generation, before_ctx) = auth.ctx.snapshot_at_wake();
+
+        // `apply_prepared_compaction` rebuilds the complete schedule context
+        // while retaining the same root session. That refresh must leave an
+        // existing non-independent fork and its accumulated history live.
+        let refreshed_context = auth.ctx.snapshot();
+        auth.migrate_to_live_context(refreshed_context);
+
+        let (after_generation, after_ctx) = auth.ctx.snapshot_at_wake();
+        assert_eq!(after_generation, before_generation);
+        assert!(Arc::ptr_eq(&after_ctx.session, &before_ctx.session));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn migration_keeps_a_bounded_timer_armed_once() {
         let (mut auth, mut events, _ui, tmp) = test_authority(8);
@@ -1439,6 +1472,7 @@ mod tests {
         }))
         .unwrap();
         let job_id = auth.start_loop_in_context(args);
+        let (predecessor_generation, _) = auth.ctx.snapshot_at_wake();
         let db = auth.ctx.snapshot().session.db.clone();
         let successor = Arc::new(
             crate::session::Session::create_for_test(
@@ -1453,7 +1487,9 @@ mod tests {
         let mut successor_context = auth.ctx.snapshot();
         successor_context.session = successor.clone();
         auth.migrate_to_live_context(successor_context);
-        assert_eq!(auth.ctx.snapshot().session.id, successor.id);
+        let (successor_generation, live_ctx) = auth.ctx.snapshot_at_wake();
+        assert_eq!(successor_generation, predecessor_generation.wrapping_add(1));
+        assert_eq!(live_ctx.session.id, successor.id);
         assert_eq!(
             auth.snapshot().len(),
             1,

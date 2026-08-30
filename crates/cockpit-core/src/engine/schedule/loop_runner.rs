@@ -86,9 +86,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     let persistent_state = (!args.idle).then(|| Arc::new(ForkScheduleState::new(job_id.clone())));
     let limit = args.limit.unwrap_or(u64::MAX);
     let mut delay = args.interval_secs;
-    let mut migration_rx = ctx.subscribe_migrations();
-    let initial_generation = *migration_rx.borrow();
-    let initial_ctx = ctx.snapshot();
+    let (initial_generation, initial_ctx) = ctx.snapshot_at_wake();
     let mut watch_digest = (!args.watch_paths.is_empty()).then(|| {
         (
             initial_generation,
@@ -147,14 +145,13 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         // A timer may have spent its whole countdown while the foreground
         // thread compacted or moved to a successor. Snapshot only after the
         // wait so this iteration cannot fork from the retired context.
-        // Mark all migrations observed before this execution boundary as
-        // incorporated, then snapshot. Once this wake starts, it must run to
-        // its normal completion: a tool may already have crossed an external
-        // effect boundary, so retrying the wake after a handoff could duplicate
-        // that effect. A replacement racing this snapshot is adopted at the
+        // Context and root-session generation are captured by one lock
+        // acquisition. Once this wake starts, it must run to its normal
+        // completion: a tool may already have crossed an external effect
+        // boundary, so retrying the wake after a handoff could duplicate that
+        // effect. A replacement racing this snapshot is adopted at the
         // following wake instead.
-        let live_generation = *migration_rx.borrow_and_update();
-        let live_ctx = ctx.snapshot();
+        let (live_generation, live_ctx) = ctx.snapshot_at_wake();
 
         if args.independent {
             fork_history.clear();

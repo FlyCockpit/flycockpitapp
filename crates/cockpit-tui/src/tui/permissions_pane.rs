@@ -341,11 +341,10 @@ impl PermissionsPane {
         frame.render_stateful_widget(
             List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-                .scroll_padding(1),
+                .scroll_padding(0),
             body,
             &mut viewport,
         );
-        *self.list.offset_mut() = viewport.offset();
         render_scrollbar(
             frame,
             body,

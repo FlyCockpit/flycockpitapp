@@ -396,9 +396,12 @@ fn request_from_settings_daemon_work(
     work: SettingsDaemonEffectWork,
 ) -> Result<Request, SettingsDaemonEffectWork> {
     match work {
-        SettingsDaemonEffectWork::Request(rpc)
-        | SettingsDaemonEffectWork::AttachedRequest(rpc)
-        | SettingsDaemonEffectWork::SettlementQuery(rpc) => Ok(rpc),
+        SettingsDaemonEffectWork::Request(rpc) | SettingsDaemonEffectWork::SettlementQuery(rpc) => {
+            Ok(rpc)
+        }
+        SettingsDaemonEffectWork::AttachedRequest(rpc) => {
+            Err(SettingsDaemonEffectWork::AttachedRequest(rpc))
+        }
         SettingsDaemonEffectWork::McpConfigSave {
             client_operation_id,
             project_root,
@@ -432,8 +435,113 @@ fn request_from_settings_daemon_work(
             provider_id,
             record: cockpit_proto::SensitiveWirePayload::new(record.take()),
         }),
+        SettingsDaemonEffectWork::ProviderMutation(plan) => provider_mutation_request(plan),
+        SettingsDaemonEffectWork::TypedDocumentEdit(plan) => typed_document_edit_request(plan),
         other => Err(other),
     }
+}
+
+#[cfg(test)]
+fn provider_mutation_request(
+    plan: ProviderMutationPlan,
+) -> Result<Request, SettingsDaemonEffectWork> {
+    let mutation = cockpit_proto::ProviderMutationBatch {
+        upserts: plan
+            .saves
+            .into_iter()
+            .map(|save| cockpit_proto::ProviderMutationUpsert {
+                provider_id: save.provider_id,
+                entry: save.entry,
+                header_secrets: save
+                    .header_secrets
+                    .into_iter()
+                    .map(|secret| {
+                        secret.map(|mut value| {
+                            cockpit_proto::ProviderSecretValue::new(std::mem::take(&mut *value))
+                        })
+                    })
+                    .collect(),
+            })
+            .collect(),
+        deletes: plan
+            .deletes
+            .into_iter()
+            .map(
+                |(provider_id, delete_stored_secrets)| cockpit_proto::ProviderMutationDelete {
+                    provider_id,
+                    delete_stored_secrets,
+                },
+            )
+            .collect(),
+        metadata: plan
+            .metadata
+            .map(|(category_defaults, on_unlisted_models_fetch)| {
+                cockpit_proto::ProviderLayerMetadataPatch {
+                    category_defaults,
+                    on_unlisted_models_fetch,
+                    active_model: None,
+                }
+            }),
+    };
+    Ok(Request::ApplyProviderMutation {
+        snapshot_session_id: plan.snapshot_session_id,
+        layer_id: plan.layer_id,
+        expected_revision: plan.expected_revision,
+        client_operation_id: plan.client_operation_id,
+        mutation_intent_hash: plan.mutation_intent_hash,
+        mutation,
+    })
+}
+
+#[cfg(test)]
+fn typed_document_edit_request(
+    plan: TypedDocumentEditPlan,
+) -> Result<Request, SettingsDaemonEffectWork> {
+    let snapshot = settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root: plan.project_root.clone(),
+        snapshot_session_id: plan.snapshot_session_id.clone(),
+    });
+    let Ok(Response::ExtendedConfigSnapshot { layers, .. }) = snapshot else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let Some(layer) = layers
+        .into_iter()
+        .find(|layer| layer.display_path == plan.requested_path)
+    else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let mut document = match serde_json::to_value(&layer.config) {
+        Ok(value) => value,
+        Err(_) => return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan)),
+    };
+    apply_json_merge_patch_local(&mut document, plan.patch.clone());
+    let desired: ExtendedConfig = match serde_json::from_value(document) {
+        Ok(value) => value,
+        Err(_) => return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan)),
+    };
+    let (Ok(base), Ok(desired_value)) = (
+        serde_json::to_value(&layer.config),
+        serde_json::to_value(&desired),
+    ) else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let Ok(operations) = changed_extended_paths(&base, &desired_value) else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let patch = cockpit_proto::ExtendedConfigPatch {
+        operations,
+        materialize: true,
+        denylist: Vec::new(),
+        redacted_mutations: Vec::new(),
+    };
+    Ok(Request::ApplyExtendedConfigPatch {
+        client_operation_id: plan.client_operation_id,
+        project_root: plan.project_root,
+        layer_id: layer.layer_id,
+        patch,
+        expected_revision: layer.revision,
+        snapshot_session_id: plan.snapshot_session_id,
+    })
 }
 
 pub(crate) enum SettingsDaemonEffectWork {
@@ -3494,6 +3602,8 @@ impl SettingsCx {
                 action,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
     }
 
     fn queue_project_shadow_snapshot(&mut self, prompt: category::ShadowedGlobalPrompt) {
@@ -3638,8 +3748,6 @@ impl SettingsCx {
         );
         self.extended_revision = None;
         self.extended_warnings = vec!["loading daemon-owned settings…".into()];
-        #[cfg(test)]
-        self.flush_request_daemon_effects();
     }
 
     fn queue_provider_catalog(&mut self, provider_id: Option<String>) {
@@ -3687,6 +3795,8 @@ impl SettingsCx {
                 navigation,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
     }
 
     fn queue_extended_save(&mut self) -> Result<SettingsSaveOutcome, String> {
@@ -5818,6 +5928,13 @@ impl Dialog {
 
     /// Re-open the picker after scaffolding a new scoped config, so the
     /// fresh row shows up and lands as the cursor target.
+    fn scaffold_directory_error(directory: &std::path::Path) -> Option<String> {
+        match std::fs::create_dir_all(directory) {
+            Ok(()) => None,
+            Err(error) => Some(format!("failed to create {}: {error}", directory.display())),
+        }
+    }
+
     fn reopen_picker(cwd: &std::path::Path, status: Option<String>) -> Self {
         let dirs = discover_config_dirs(cwd);
         if dirs.is_empty() {
@@ -5976,8 +6093,12 @@ impl Dialog {
                 }
                 ListAction::Close => true,
                 ListAction::Select(idx) => {
-                    let settings =
-                        SettingsDialog::open_for_scaffold(choices[idx].path.clone(), cwd.clone());
+                    let target = choices[idx].path.clone();
+                    if let Some(error) = Self::scaffold_directory_error(&target) {
+                        *status = Some(error);
+                        return false;
+                    }
+                    let settings = SettingsDialog::open_for_scaffold(target, cwd.clone());
                     *self = Dialog::Settings(Box::new(settings));
                     false
                 }
@@ -5994,9 +6115,12 @@ impl Dialog {
                 }
                 ListAction::Stay => false,
                 ListAction::Select(idx) => {
-                    let target = &choices[idx];
-                    let settings =
-                        SettingsDialog::open_for_scaffold(target.path.clone(), cwd.clone());
+                    let target = choices[idx].path.clone();
+                    if let Some(error) = Self::scaffold_directory_error(&target) {
+                        *self = Dialog::reopen_picker(cwd, Some(error));
+                        return false;
+                    }
+                    let settings = SettingsDialog::open_for_scaffold(target, cwd.clone());
                     *self = Dialog::Settings(Box::new(settings));
                     false
                 }
@@ -6430,6 +6554,29 @@ impl SettingsDialog {
             self.apply_daemon_completion(completion);
         }
         self.cx.daemon_effects.extend(skipped);
+    }
+
+    #[cfg(test)]
+    fn settle_test_effects(&mut self) {
+        for _ in 0..16 {
+            let pending_daemon = !self.cx.daemon_effects.is_empty();
+            self.flush_request_daemon_effects_for_test();
+            if let Some(page) = self.page.downcast_mut::<CategoryPage>()
+                && let Some(work) = page.take_path_suggestion_work()
+            {
+                let target = SettingsEffectTarget {
+                    surface: "settings.path-suggestions",
+                    owner: "category-path-editor".into(),
+                    revision: None,
+                };
+                self.cx.enqueue_blocking_work(target, work);
+            }
+            let pending_blocking = !self.cx.blocking_effects.is_empty();
+            self.drive_category_blocking_effects_for_test();
+            if !pending_daemon && !pending_blocking && self.cx.daemon_effects.is_empty() {
+                break;
+            }
+        }
     }
 
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
@@ -7548,6 +7695,8 @@ impl SettingsDialog {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        #[cfg(test)]
+        self.settle_test_effects();
         self.cx.retry_unknown_settlement();
         if self.authority_operation_pending() {
             // OAuth is the sole authority operation with an interactive
@@ -7588,10 +7737,15 @@ impl SettingsDialog {
             }
         };
         let nav = self.page.handle_key(&mut self.cx, key);
-        self.apply_nav(nav)
+        let close = self.apply_nav(nav);
+        #[cfg(test)]
+        self.settle_test_effects();
+        close
     }
 
     fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
+        #[cfg(test)]
+        self.settle_test_effects();
         if self.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
@@ -7736,6 +7890,8 @@ impl SettingsDialog {
                     let close = self.apply_nav(nav);
                     #[cfg(test)]
                     pointer_acceptance_tests::record_dispatched_action(&action);
+                    #[cfg(test)]
+                    self.settle_test_effects();
                     if close {
                         return SettingsPointerOutcome::Close;
                     }
@@ -7752,6 +7908,8 @@ impl SettingsDialog {
         column: u16,
         row: u16,
     ) -> SettingsPointerOutcome {
+        #[cfg(test)]
+        self.settle_test_effects();
         if self.authority_operation_pending() {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
@@ -7787,6 +7945,8 @@ impl SettingsDialog {
                 let close = self.apply_nav(nav);
                 #[cfg(test)]
                 pointer_acceptance_tests::record_dispatched_action(&action);
+                #[cfg(test)]
+                self.settle_test_effects();
                 if close {
                     SettingsPointerOutcome::Close
                 } else {
@@ -7943,7 +8103,9 @@ impl SettingsDialog {
             frame.set_cursor_position(cursor);
         }
         let help = if self.pointer_surface.enabled.get() {
-            format!("{}  click: activate  wheel: scroll", self.help_text())
+            // Pointer hints stay leftmost so an 80-column pane still shows
+            // both phrases when the page help string is the longer picker form.
+            format!("click: activate  wheel: scroll  {}", self.help_text())
         } else {
             self.help_text().to_string()
         };
@@ -8661,6 +8823,8 @@ impl SettingsCx {
             },
         );
         self.extended_warnings = vec!["saving provider settings…".into()];
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
         Ok(())
     }
 
@@ -8716,6 +8880,8 @@ impl SettingsCx {
                 notice: None,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
         Ok(())
     }
 

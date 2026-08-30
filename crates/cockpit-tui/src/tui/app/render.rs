@@ -2470,12 +2470,27 @@ impl App {
         area_h: usize,
         banner_rows: usize,
         message_rows: usize,
+        previous_visible: usize,
     ) {
         let total = banner_rows + message_rows;
         let visible = area_h.max(1);
         if total <= visible {
             self.pin_chat_to_tail();
             return;
+        }
+        if previous_visible > 0 {
+            let delta = previous_visible as isize - visible as isize;
+            if delta.unsigned_abs() == super::sticky_header::STICKY_USER_HEADER_HEIGHT as usize
+                && self.chat_scroll_offset > 0
+            {
+                // Offset-from-bottom is preserved across a sticky-header carve
+                // flip. The header decision uses the uncarved pane height, so
+                // compensating the two carved rows would make appear/disappear
+                // oscillate.
+                self.chat_scroll_offset =
+                    self.chat_scroll_offset.min(total.saturating_sub(visible));
+                return;
+            }
         }
         if self.chat_pinned_to_tail && self.chat_scroll_offset > 0 {
             self.chat_pinned_to_tail = false;
@@ -2896,6 +2911,7 @@ impl App {
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
+        let previous_visible = self.chat_visible_lines;
         // Publish the carved (or full) height before scroll-anchor
         // recapture so a header appear/disappear keeps offset-from-bottom
         // stable instead of compensating with a stale last-frame height.
@@ -3152,7 +3168,7 @@ impl App {
             self.chat_find_lines_query = None;
         }
 
-        self.derive_chat_scroll_offset(area_h, b, m);
+        self.derive_chat_scroll_offset(area_h, b, m, previous_visible);
 
         let (visible, visible_meta): VisibleRows = if b > 0 && b + m <= area_h {
             // Fits with room to spare: messages stay bottom-aligned and
@@ -5330,9 +5346,10 @@ pub(super) fn extract_selection_semantic(
         };
         if meta.copy_target.is_some() {
             if !meta.copy_provenance_present {
-                // Legacy/caller-supplied message rows have substantive
-                // visible plaintext but no authoritative semantic map.
-                return None;
+                // Header chrome such as the narrow-width `↔` indicator is
+                // tagged as part of the message but has no semantic map.
+                // Skip it rather than failing the whole selection.
+                continue;
             }
             saw_semantic_row = true;
         } else if meta.selectable {
@@ -5384,7 +5401,7 @@ pub(super) fn extract_selection_semantic(
             row_table_cell = fragment.table_cell.or(row_table_cell);
         }
         if meta.copy_fallback_if_unmapped {
-            return None;
+            continue;
         }
     }
     // An all-chrome selection inside a Markdown message is still a

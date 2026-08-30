@@ -1390,7 +1390,16 @@ impl AgentsPage {
                 }
                 match purpose {
                     MutationPurpose::EjectForEdit { external } => match result.snapshot {
-                        Some(snapshot) => self.open_workspace_editor(cx, cwd, snapshot, external),
+                        Some(snapshot) => {
+                            let id = super::pointer_actions::AgentId::workspace_occurrence(
+                                &snapshot.name,
+                                &snapshot.source_identity,
+                                &snapshot.revision,
+                            );
+                            self.queue_load(cx);
+                            self.restore_cursor_after_load(&id);
+                            self.open_workspace_editor(cx, cwd, snapshot, external);
+                        }
                         None => self.status = Some("daemon omitted ejected agent snapshot".into()),
                     },
                     MutationPurpose::SaveEditor { markdown } => match result.snapshot {

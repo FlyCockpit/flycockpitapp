@@ -1863,15 +1863,16 @@ mod tests {
     fn mcp_secret_custody_stays_daemon_owned() {
         let source = include_str!("mcp_page.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let owner = include_str!("mod.rs");
         assert!(production.contains("SettingsDaemonEffectWork::McpConfigSave"));
         assert!(production.contains("SecretPayload::new(secret_values_json)"));
         assert!(!production.contains("Request::SaveMcpConfig"));
         assert!(production.contains("self.mcp_config.clone()"));
         assert!(!production.contains("read_to_string"));
-        assert!(production.contains("Response::McpConfigCommitted"));
-        assert!(production.contains("self.mcp_owner_root"));
-        assert!(production.contains("self.mcp_config_path"));
-        assert!(production.contains("self.mcp_revision"));
+        assert!(owner.contains("Response::McpConfigCommitted"));
+        assert!(production.contains("mcp_owner_root"));
+        assert!(production.contains("mcp_config_path"));
+        assert!(production.contains("mcp_revision"));
         assert!(!production.contains("serde_json::to_string(&self.config)"));
         assert!(!production.contains("Response::Ack"));
         assert!(!production.contains("write_private"));

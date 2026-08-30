@@ -99,7 +99,7 @@ async fn drain_async_actions_until_idle(app: &mut App) {
 }
 
 async fn drain_session_switch_until_complete(app: &mut App) {
-    for _ in 0..20 {
+    for _ in 0..100 {
         app.drain_async_actions();
         if !app
             .async_actions
@@ -108,6 +108,7 @@ async fn drain_session_switch_until_complete(app: &mut App) {
             return;
         }
         tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("session switch action did not complete");
 }

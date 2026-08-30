@@ -256,6 +256,36 @@ impl OAuthKeyOutcome {
         }
     }
 
+    fn stay_present(
+        state: &mut OAuthFlowState,
+        action: Option<OAuthFlowRequest>,
+        effects: OAuthEffects,
+    ) -> Self {
+        let Some(request) = action else {
+            return Self::stay(None);
+        };
+        let OAuthFlowOp::Present {
+            authorize_url,
+            user_code,
+            open_browser,
+            advance_flow,
+        } = request.op
+        else {
+            return Self::stay(Some(request));
+        };
+        let value = user_code.as_deref().unwrap_or(&authorize_url);
+        let copy = (effects.copy)(value);
+        let presentation = OAuthPresentationResult {
+            copied: copy.is_ok(),
+            copy_unverified: copy
+                .as_ref()
+                .is_ok_and(|result| crate::clipboard::feedback::classify(result).is_unverified()),
+            opened: open_browser && (effects.open)(&authorize_url).is_ok(),
+            advance_flow,
+        };
+        Self::stay(state.apply_present(Ok(presentation)))
+    }
+
     fn back(action: Option<OAuthFlowRequest>) -> Self {
         Self {
             nav: OAuthNav::Back,
@@ -1032,7 +1062,7 @@ pub(super) fn handle_oauth_flow_key_with(
     key: KeyEvent,
     s: &mut OAuthFlowState,
     host: OAuthHost,
-    _effects: OAuthEffects,
+    effects: OAuthEffects,
 ) -> OAuthKeyOutcome {
     // A provider flow owns this settings surface until its exact terminal
     // completion (including cancellation) is applied.  In particular, do not
@@ -1095,7 +1125,7 @@ pub(super) fn handle_oauth_flow_key_with(
                     advance_flow: false,
                 })
             });
-            return OAuthKeyOutcome::stay(action);
+            return OAuthKeyOutcome::stay_present(s, action, effects);
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
             let login = s
@@ -1109,7 +1139,7 @@ pub(super) fn handle_oauth_flow_key_with(
                     advance_flow: false,
                 })
             });
-            return OAuthKeyOutcome::stay(action);
+            return OAuthKeyOutcome::stay_present(s, action, effects);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
             let login = s
@@ -1123,7 +1153,7 @@ pub(super) fn handle_oauth_flow_key_with(
                     advance_flow: false,
                 })
             });
-            return OAuthKeyOutcome::stay(action);
+            return OAuthKeyOutcome::stay_present(s, action, effects);
         }
         _ => {}
     }

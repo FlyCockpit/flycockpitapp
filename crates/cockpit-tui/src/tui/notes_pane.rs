@@ -910,10 +910,24 @@ impl NotesPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Sidebar (left, fixed width) | main pane (right).
-        let cols = Layout::horizontal([Constraint::Length(28), Constraint::Min(20)]).split(inner);
-        self.render_sidebar(frame, cols[0]);
-        self.render_main(frame, cols[1]);
+        // Sidebar is a 28-column strip; the remainder is the main pane. Use
+        // explicit rects so a narrow frame still keeps the 28-column sidebar
+        // instead of letting Constraint::Min steal width from Length.
+        let sidebar_w = inner.width.min(28);
+        let sidebar = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: sidebar_w,
+            height: inner.height,
+        };
+        let main = Rect {
+            x: inner.x.saturating_add(sidebar_w),
+            y: inner.y,
+            width: inner.width.saturating_sub(sidebar_w),
+            height: inner.height,
+        };
+        self.render_sidebar(frame, sidebar);
+        self.render_main(frame, main);
     }
 
     fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
@@ -963,7 +977,9 @@ impl NotesPane {
         let (list_content, scrollbar_area) =
             scrollbar_areas(list_area, row_count > list_area.height as usize);
         frame.render_stateful_widget(
-            List::new(items).highlight_style(highlight),
+            List::new(items)
+                .highlight_style(highlight)
+                .highlight_symbol(""),
             list_content,
             &mut self.sidebar,
         );
@@ -1113,7 +1129,10 @@ impl NotesPane {
                 };
                 let full_width = area.width.max(1) as usize;
                 let initial_lines = render_lines(full_width);
-                let overflow = initial_lines.len() > self.last_view_height;
+                let overflow = initial_lines.len() > self.last_view_height
+                    || note_content.as_deref().is_some_and(|content| {
+                        content.len() > full_width.saturating_mul(self.last_view_height.max(1))
+                    });
                 let (content_area, scrollbar_area) = scrollbar_areas(area, overflow);
                 let width = content_area.width.max(1) as usize;
                 let lines = if width == full_width {
@@ -1122,7 +1141,12 @@ impl NotesPane {
                     render_lines(width)
                 };
                 self.last_view_width = width;
-                self.last_view_rows = lines.len();
+                self.last_view_rows = lines.len().max(
+                    note_content
+                        .as_deref()
+                        .map(|content| content.len().div_ceil(width.max(1)))
+                        .unwrap_or(0),
+                );
                 let max_scroll = self.last_view_rows.saturating_sub(self.last_view_height);
                 if self.view_scroll > max_scroll {
                     self.view_scroll = max_scroll;
@@ -1223,8 +1247,19 @@ fn scrollbar_areas(area: Rect, overflow: bool) -> (Rect, Option<Rect>) {
     if !overflow || area.width < 2 {
         return (area, None);
     }
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    (cols[0], Some(cols[1]))
+    let content = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(1),
+        height: area.height,
+    };
+    let bar = Rect {
+        x: area.x.saturating_add(content.width),
+        y: area.y,
+        width: 1,
+        height: area.height,
+    };
+    (content, Some(bar))
 }
 
 #[cfg(test)]
@@ -1370,13 +1405,29 @@ mod tests {
         terminal
             .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
             .expect("draw notes");
-        terminal
+        let rendered = terminal
             .backend()
             .buffer()
             .content()
             .iter()
-            .map(|cell| cell.symbol())
-            .collect()
+            .filter_map(|cell| {
+                let symbol = cell.symbol();
+                (!symbol.is_empty()).then_some(symbol)
+            })
+            .collect::<String>();
+        let mut compact = String::new();
+        for ch in rendered.chars() {
+            if ch == ' '
+                && compact
+                    .chars()
+                    .last()
+                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2))
+            {
+                continue;
+            }
+            compact.push(ch);
+        }
+        compact
     }
 
     fn rendered_editor(pane: &mut NotesPane, width: u16, height: u16) -> (String, (u16, u16)) {

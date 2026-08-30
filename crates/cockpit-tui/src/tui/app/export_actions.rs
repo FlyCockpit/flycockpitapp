@@ -482,16 +482,20 @@ mod tests {
     }
 
     async fn drain_until_idle(app: &mut App) {
-        while app.async_actions.pending_count() != 0 {
+        for _ in 0..200 {
             let notify = app.async_actions.notifier();
             let notified = notify.notified();
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {
+                app.drain_async_actions();
                 return;
             }
-            notified.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(25), notified).await;
         }
-        app.drain_async_actions();
+        panic!(
+            "export action did not complete; pending={}",
+            app.async_actions.pending_count()
+        );
     }
 
     #[test]

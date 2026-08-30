@@ -5,7 +5,7 @@
 //! admitted once by the root worker, then each agent projects its package
 //! layer onto that immutable snapshot without further filesystem discovery.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -169,6 +169,19 @@ pub struct EffectiveCatalog {
     shadowed: Vec<CatalogEntry>,
     /// A layer tried to define the reserved `cockpit` server.
     pub reserved_builtin_rejected: bool,
+}
+
+/// Immutable server identities a parent admitted for a descendant.
+///
+/// The catalog key is retained together with the complete source-tagged
+/// [`CatalogEntry`], rather than reducing admission to a recyclable server
+/// name/profile pair. A child may project its package layer onto the root
+/// snapshot, but an agent-bound entry can cross this boundary only when its
+/// persistent configuration, provenance, profile, and binding state exactly
+/// match the entry the parent admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentReachableCatalog {
+    entries: BTreeMap<String, CatalogEntry>,
 }
 
 impl Default for EffectiveCatalog {
@@ -342,22 +355,24 @@ impl EffectiveCatalog {
     }
 
     /// Child catalogs keep scope-level servers and intersect agent-bound
-    /// servers with the parent's reachable set.
-    pub fn intersect_parent_reachable(&mut self, parent_reachable: &BTreeSet<(String, String)>) {
+    /// servers with the parent's admitted entry identities.
+    pub fn intersect_parent_reachable(&mut self, parent_reachable: &ParentReachableCatalog) {
         self.servers.retain(|name, entry| {
             if entry.agent_bound {
-                parent_reachable.contains(&(name.clone(), entry.profile.clone()))
+                parent_reachable.entries.get(name) == Some(entry)
             } else {
                 true
             }
         });
     }
 
-    pub fn reachable_bindings(&self) -> BTreeSet<(String, String)> {
-        self.servers
-            .iter()
-            .map(|(name, entry)| (name.clone(), entry.profile.clone()))
-            .collect()
+    /// Snapshot the complete identities a child may inherit from this
+    /// catalog. This is deliberately opaque so callers cannot weaken the
+    /// boundary by rebuilding it from catalog keys.
+    pub fn admitted_entries(&self) -> ParentReachableCatalog {
+        ParentReachableCatalog {
+            entries: self.servers.clone(),
+        }
     }
 }
 
@@ -371,7 +386,7 @@ pub struct EffectiveCatalogResolver {
     /// rediscover persistent files.
     root_catalog: Arc<EffectiveCatalog>,
     catalog: Arc<EffectiveCatalog>,
-    parent_reachable: Option<BTreeSet<(String, String)>>,
+    parent_reachable: Option<ParentReachableCatalog>,
 }
 
 impl EffectiveCatalogResolver {
@@ -393,7 +408,7 @@ impl EffectiveCatalogResolver {
     pub fn for_agent_from_root_catalog(
         root_catalog: Arc<EffectiveCatalog>,
         def: &crate::agents::AgentDef,
-        parent_reachable: Option<BTreeSet<(String, String)>>,
+        parent_reachable: Option<ParentReachableCatalog>,
     ) -> Arc<Self> {
         let (layer, reserved) = parse_agent_package_mcp(def);
         Self::project_root_catalog(
@@ -405,16 +420,13 @@ impl EffectiveCatalogResolver {
         )
     }
 
-    /// Admission-time parent-reachable MCP bindings. `None` for a root
-    /// catalog that is not intersected with a parent.
-    pub fn parent_reachable(&self) -> Option<BTreeSet<(String, String)>> {
+    /// Admission-time parent-reachable MCP catalog identities. `None` for a
+    /// root catalog that is not intersected with a parent.
+    pub fn parent_reachable(&self) -> Option<ParentReachableCatalog> {
         self.parent_reachable.clone()
     }
 
-    pub fn with_parent_reachable(
-        self: &Arc<Self>,
-        parent: BTreeSet<(String, String)>,
-    ) -> Arc<Self> {
+    pub fn with_parent_reachable(self: &Arc<Self>, parent: ParentReachableCatalog) -> Arc<Self> {
         let mut catalog = (*self.catalog).clone();
         catalog.intersect_parent_reachable(&parent);
         Arc::new(Self {
@@ -429,7 +441,7 @@ impl EffectiveCatalogResolver {
         agent_layer: Option<McpConfig>,
         agent_reserved_rejected: bool,
         bindings: Vec<crate::agents::McpBinding>,
-        parent_reachable: Option<BTreeSet<(String, String)>>,
+        parent_reachable: Option<ParentReachableCatalog>,
     ) -> Arc<Self> {
         let mut catalog = (*root_catalog).clone();
         if let Some(agent_layer) = agent_layer {
@@ -937,12 +949,46 @@ mod tests {
             PersistentMcpScope::Agent,
         );
         catalog.servers.get_mut("bound").unwrap().agent_bound = true;
-        let parent = BTreeSet::from([("global".to_string(), DEFAULT_PROFILE.to_string())]);
+        let mut parent_catalog = EffectiveCatalog::default();
+        parent_catalog.merge_layer(
+            named_cfg("global", "https://g/mcp"),
+            PersistentMcpScope::Global,
+        );
+        let parent = parent_catalog.admitted_entries();
         catalog.intersect_parent_reachable(&parent);
         assert!(catalog.servers.contains_key("global"));
         assert!(
             !catalog.servers.contains_key("bound"),
             "agent-bound servers not reachable to the parent must drop"
+        );
+    }
+
+    #[test]
+    fn child_intersection_rejects_recycled_binding_with_different_server_configuration() {
+        let mut parent = EffectiveCatalog::default();
+        parent.merge_layer(
+            named_cfg("bound", "https://parent.example/mcp"),
+            PersistentMcpScope::Agent,
+        );
+        parent.servers.get_mut("bound").unwrap().agent_bound = true;
+        let parent_reachable = parent.admitted_entries();
+
+        let mut child = EffectiveCatalog::default();
+        child.merge_layer(
+            named_cfg("bound", "https://child.example/mcp"),
+            PersistentMcpScope::Agent,
+        );
+        child.servers.get_mut("bound").unwrap().agent_bound = true;
+        assert_eq!(
+            child.servers["bound"].profile, parent.servers["bound"].profile,
+            "the defect requires the child to recycle the parent's profile"
+        );
+
+        child.intersect_parent_reachable(&parent_reachable);
+
+        assert!(
+            !child.servers.contains_key("bound"),
+            "an agent-bound child must not replace the parent-admitted server configuration"
         );
     }
 

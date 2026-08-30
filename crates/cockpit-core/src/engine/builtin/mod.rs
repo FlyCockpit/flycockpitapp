@@ -133,10 +133,10 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// Parent-reachable MCP bindings `(server, profile)`. Child catalogs
-    /// intersect agent-bound servers with this set; scope-level servers stay
-    /// visible.
-    pub mcp_parent_reachable: Option<std::collections::BTreeSet<(String, String)>>,
+    /// Parent-admitted MCP server identities. Child catalogs intersect
+    /// agent-bound servers with these complete source-tagged entries;
+    /// scope-level servers stay visible.
+    pub mcp_parent_reachable: Option<crate::mcp::resolver::ParentReachableCatalog>,
     /// Immutable catalog admitted by the daemon root worker. Factories may
     /// project an agent package onto it, but must never rediscover persistent
     /// MCP files for a descendant or a turn refresh.
@@ -4559,10 +4559,6 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let profile = crate::mcp::config::DEFAULT_PROFILE;
         let mut args = test_spawn_args(&project);
-        args.mcp_parent_reachable = Some(std::collections::BTreeSet::from([(
-            "reachable".to_string(),
-            profile.to_string(),
-        )]));
         let def = crate::agents::AgentDef {
             name: "child-mcp".to_string(),
             description: "custom".to_string(),
@@ -4598,6 +4594,13 @@ pub(crate) mod tests {
             private_subagents: std::collections::BTreeMap::new(),
             source: project.join("child-mcp.md"),
         };
+        let mut parent_def = def.clone();
+        parent_def.mcp_bindings.truncate(1);
+        args.mcp_parent_reachable = Some(
+            mcp_resolver_for(&args, &parent_def)
+                .catalog()
+                .admitted_entries(),
+        );
 
         let agent = agent_from_def(&def, &args).expect("child constructs");
         assert!(
@@ -4638,7 +4641,7 @@ pub(crate) mod tests {
             "edited persistent configuration is visible only to a new root worker"
         );
         let descendant_args = SpawnArgs {
-            mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
+            mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
             mcp_root_catalog: agent.mcp_resolver.root_catalog(),
             ..rebuild_args
         };

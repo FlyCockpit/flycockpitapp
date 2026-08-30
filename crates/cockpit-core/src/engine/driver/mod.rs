@@ -14124,7 +14124,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             ..self.spawn_args(interactive)
         }
     }
@@ -14199,7 +14199,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
             ..self.spawn_args(interactive)
         }

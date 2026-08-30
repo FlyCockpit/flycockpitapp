@@ -25,7 +25,8 @@ use crate::db::Db;
 use crate::db::session_search::HistoryCallerTrust;
 use crate::env_snapshot::EnvSnapshot;
 use crate::knowledge::dream::{
-    history_caller_trust, knowledge_dream_run_lock, resolve_dream_model,
+    CanonicalDreamProjectRoot, history_caller_trust, knowledge_dream_run_lock_for_root,
+    resolve_dream_model,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -37,7 +38,6 @@ pub(crate) struct DreamScheduler {
     db: Db,
     registry: SessionRegistry,
     config_source: ConfigSource,
-    workspace_root: PathBuf,
     in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -46,14 +46,13 @@ impl DreamScheduler {
         db: Db,
         registry: SessionRegistry,
         config_source: ConfigSource,
-        workspace_root: PathBuf,
+        _workspace_root: PathBuf,
         shutdown: crate::daemon::shutdown::ShutdownSignal,
     ) -> tokio::task::JoinHandle<()> {
         let scheduler = Self {
             db,
             registry,
             config_source,
-            workspace_root,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
         };
         tokio::spawn(async move { scheduler.run(shutdown).await })
@@ -80,14 +79,6 @@ impl DreamScheduler {
     }
 
     async fn run_due_once(&self) -> Result<()> {
-        let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
-            &self.db,
-            &self.workspace_root,
-        )
-        .await?;
-        let (providers, extended) = self
-            .config_source
-            .load_effective_for_daemon(&self.workspace_root, &trust_policy)?;
         let consumer_id = self
             .db
             .ensure_installation_identity()
@@ -95,103 +86,161 @@ impl DreamScheduler {
             .as_hex()
             .to_owned();
         let now = Utc::now().timestamp_millis();
+        let workspace_roots = self.db.list_knowledge_dream_workspace_roots().await?;
 
-        for knowledge_base in &extended.knowledge_bases {
-            if !matches!(&knowledge_base.source, KnowledgeBaseSource::Local { .. }) {
-                // TODO(hosted dream service): dispatch configured remote KB
-                // schedules through the hosted sink once it owns remote writes.
-                continue;
-            }
-            let last_scheduled = self
-                .db
-                .knowledge_base_last_scheduled_at(&knowledge_base.id, &consumer_id)
-                .await?;
-            let due = match is_due(
-                knowledge_base.dream_schedule.as_deref(),
-                last_scheduled,
-                now,
-                &knowledge_base.id,
-                &consumer_id,
-            ) {
-                Ok(due) => due,
+        let mut observed_roots = HashSet::new();
+        for workspace_root in workspace_roots {
+            let project_root = match CanonicalDreamProjectRoot::from_request_root(&workspace_root) {
+                Ok(project_root) => project_root,
                 Err(error) => {
-                    tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "knowledge dream schedule is invalid; skipping this knowledge base");
+                    tracing::warn!(workspace_root, error = %error.message, "knowledge dream scheduler skipped workspace with non-canonical root identity");
                     continue;
                 }
             };
-            if !due {
+            if !observed_roots.insert(project_root.clone()) {
                 continue;
             }
-            if !self.claim_in_flight(&knowledge_base.id).await {
-                continue;
-            }
-
-            let model = match resolve_dream_model(knowledge_base, &extended, &providers) {
-                Ok(model) => model,
+            let workspace_root = project_root.as_path().to_path_buf();
+            let trust_policy = match crate::config::trust::resolve_workspace_trust_policy_from_db(
+                &self.db,
+                &workspace_root,
+            )
+            .await
+            {
+                Ok(policy) => policy,
                 Err(error) => {
-                    self.release_in_flight(&knowledge_base.id).await;
-                    tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "knowledge dream schedule has no usable model");
+                    tracing::warn!(workspace_root = %workspace_root.display(), error = %error, "knowledge dream scheduler skipped workspace with unavailable trust policy");
                     continue;
                 }
             };
-            let caller_trust = history_caller_trust(&model, &providers);
-            let scheduler = self.clone();
-            let knowledge_base = knowledge_base.clone();
-            let consumer_id = consumer_id.clone();
-            let model = ActiveModelRef {
-                provider: model.provider,
-                model: model.model,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
+            let (providers, extended) = match self
+                .config_source
+                .load_effective_for_daemon(&workspace_root, &trust_policy)
+                .with_context(|| {
+                    format!(
+                        "loading daemon config for knowledge dream workspace {}",
+                        workspace_root.display()
+                    )
+                }) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!(workspace_root = %workspace_root.display(), error = %error, "knowledge dream scheduler skipped workspace with unreadable config");
+                    continue;
+                }
             };
-            tokio::spawn(async move {
-                match run_knowledge_dream(
-                    &scheduler.db,
-                    &scheduler.registry,
-                    &scheduler.workspace_root,
-                    &knowledge_base,
-                    model,
-                    caller_trust,
-                    false,
-                    true,
-                )
-                .await
-                {
-                    Ok(DreamRunDisposition::Empty) => {
-                        if let Err(error) = scheduler
-                            .db
-                            .record_knowledge_dream_schedule_fire(
-                                &knowledge_base.id,
-                                &consumer_id,
-                                now,
-                                Some(now),
-                            )
-                            .await
-                        {
-                            tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled empty knowledge dream fire failed");
-                        }
-                    }
-                    Ok(DreamRunDisposition::Completed) => {
-                        if let Err(error) = scheduler
-                            .db
-                            .record_knowledge_dream_schedule_fire(
-                                &knowledge_base.id,
-                                &consumer_id,
-                                now,
-                                None,
-                            )
-                            .await
-                        {
-                            tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled knowledge dream fire failed");
-                        }
-                    }
+            for knowledge_base in &extended.knowledge_bases {
+                if !matches!(&knowledge_base.source, KnowledgeBaseSource::Local { .. }) {
+                    // TODO(hosted dream service): dispatch configured remote KB
+                    // schedules through the hosted sink once it owns remote writes.
+                    continue;
+                }
+                let last_scheduled = self
+                    .db
+                    .knowledge_base_last_scheduled_at(
+                        &knowledge_base.id,
+                        project_root.as_str(),
+                        &consumer_id,
+                    )
+                    .await?;
+                let due = match is_due(
+                    knowledge_base.dream_schedule.as_deref(),
+                    last_scheduled,
+                    now,
+                    &knowledge_base.id,
+                    &consumer_id,
+                ) {
+                    Ok(due) => due,
                     Err(error) => {
-                        tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "scheduled knowledge dream failed");
+                        tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "knowledge dream schedule is invalid; skipping this knowledge base");
+                        continue;
                     }
+                };
+                if !due {
+                    continue;
                 }
-                scheduler.release_in_flight(&knowledge_base.id).await;
-            });
+                if !self
+                    .claim_in_flight(&project_root, &knowledge_base.id)
+                    .await
+                {
+                    continue;
+                }
+
+                let model = match resolve_dream_model(knowledge_base, &extended, &providers) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        self.release_in_flight(&project_root, &knowledge_base.id)
+                            .await;
+                        tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "knowledge dream schedule has no usable model");
+                        continue;
+                    }
+                };
+                let caller_trust = history_caller_trust(&model, &providers);
+                let scheduler = self.clone();
+                let knowledge_base = knowledge_base.clone();
+                let consumer_id = consumer_id.clone();
+                let workspace_root = workspace_root.clone();
+                let project_root = project_root.clone();
+                let model = ActiveModelRef {
+                    provider: model.provider,
+                    model: model.model,
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                };
+                tokio::spawn(async move {
+                    match run_knowledge_dream(
+                        &scheduler.db,
+                        &scheduler.registry,
+                        &workspace_root,
+                        &knowledge_base,
+                        model,
+                        caller_trust,
+                        false,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(DreamRunDisposition::Empty) => {
+                            let checked_at_unix_ms = Utc::now().timestamp_millis();
+                            if let Err(error) = scheduler
+                                .db
+                                .record_knowledge_dream_schedule_fire(
+                                    &knowledge_base.id,
+                                    project_root.as_str(),
+                                    &consumer_id,
+                                    checked_at_unix_ms,
+                                    Some(checked_at_unix_ms),
+                                )
+                                .await
+                            {
+                                tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled empty knowledge dream fire failed");
+                            }
+                        }
+                        Ok(DreamRunDisposition::Completed) => {
+                            let checked_at_unix_ms = Utc::now().timestamp_millis();
+                            if let Err(error) = scheduler
+                                .db
+                                .record_knowledge_dream_schedule_fire(
+                                    &knowledge_base.id,
+                                    project_root.as_str(),
+                                    &consumer_id,
+                                    checked_at_unix_ms,
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled knowledge dream fire failed");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "scheduled knowledge dream failed");
+                        }
+                    }
+                    scheduler
+                        .release_in_flight(&project_root, &knowledge_base.id)
+                        .await;
+                });
+            }
         }
         Ok(())
     }
@@ -216,12 +265,18 @@ pub(crate) async fn run_knowledge_dream(
     no_sandbox: bool,
     scheduled: bool,
 ) -> Result<DreamRunDisposition> {
-    let _run_guard = knowledge_dream_run_lock(&knowledge_base.id)
+    let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
+    let _run_guard = knowledge_dream_run_lock_for_root(&project_root, &knowledge_base.id)
         .lock_owned()
         .await;
     let consumer = db.ensure_installation_identity().await?;
     let sources = db
-        .undreamed_sessions_for_knowledge_base(&knowledge_base.id, consumer.as_hex(), caller_trust)
+        .undreamed_sessions_for_knowledge_base(
+            &knowledge_base.id,
+            project_root.as_str(),
+            consumer.as_hex(),
+            caller_trust,
+        )
         .await?;
     if sources.is_empty() {
         return Ok(DreamRunDisposition::Empty);
@@ -294,27 +349,15 @@ pub(crate) async fn run_knowledge_dream(
         .context("Dream session dropped queue acknowledgement")?
         .map_err(|error| anyhow::anyhow!(error.message))?;
     let turn_id = queued_item.id.to_string();
-    match tokio::time::timeout(DREAM_TURN_TIMEOUT, handle.watch_turn(&turn_id)).await {
-        Ok(Ok(TurnOutcome::Completed { .. })) => {}
-        Ok(Ok(TurnOutcome::Failed { error })) => {
-            anyhow::bail!("Dream session driver failed: {error}")
-        }
-        Ok(Err(_)) => anyhow::bail!("Dream session ended before its turn completed"),
-        Err(_) => {
-            handle
-                .send_work(SessionWork::Cancel)
-                .await
-                .context("cancelling timed-out Dream turn")?;
-            match handle.watch_turn(&turn_id).await {
-                Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Failed { .. }) | Err(_) => {
-                    anyhow::bail!("Dream turn timed out and was cancelled");
-                }
-            }
-        }
-    }
+    await_dream_turn_terminal(&handle, &turn_id, DREAM_TURN_TIMEOUT).await?;
 
     let remaining = db
-        .undreamed_sessions_for_knowledge_base(&knowledge_base.id, consumer.as_hex(), caller_trust)
+        .undreamed_sessions_for_knowledge_base(
+            &knowledge_base.id,
+            project_root.as_str(),
+            consumer.as_hex(),
+            caller_trust,
+        )
         .await?;
     ensure!(
         remaining.is_empty(),
@@ -324,12 +367,18 @@ pub(crate) async fn run_knowledge_dream(
 }
 
 impl DreamScheduler {
-    async fn claim_in_flight(&self, kb_id: &str) -> bool {
-        self.in_flight.lock().await.insert(kb_id.to_owned())
+    async fn claim_in_flight(&self, project_root: &CanonicalDreamProjectRoot, kb_id: &str) -> bool {
+        self.in_flight
+            .lock()
+            .await
+            .insert(format!("{}\u{0}{kb_id}", project_root.as_str()))
     }
 
-    async fn release_in_flight(&self, kb_id: &str) {
-        self.in_flight.lock().await.remove(kb_id);
+    async fn release_in_flight(&self, project_root: &CanonicalDreamProjectRoot, kb_id: &str) {
+        self.in_flight
+            .lock()
+            .await
+            .remove(&format!("{}\u{0}{kb_id}", project_root.as_str()));
     }
 }
 
@@ -425,9 +474,57 @@ fn default_jitter_seconds(kb_id: &str, consumer_id: &str) -> i64 {
     i64::from(value % u32::try_from(DEFAULT_JITTER_SECONDS).expect("constant fits u32"))
 }
 
+async fn await_dream_turn_terminal(
+    handle: &crate::daemon::session_worker::SessionWorkerHandle,
+    turn_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, handle.watch_turn(turn_id)).await {
+        Ok(outcome) => classify_dream_turn_terminal(turn_id, outcome)
+            .context("observing Dream turn terminal outcome"),
+        Err(_) => {
+            handle
+                .send_work(SessionWork::Cancel)
+                .await
+                .context("cancelling timed-out Dream turn")?;
+            classify_dream_turn_terminal(turn_id, handle.watch_turn(turn_id).await)
+                .context("Dream turn timed out and was cancelled")?;
+            Ok(())
+        }
+    }
+}
+
+fn classify_dream_turn_terminal(
+    turn_id: &str,
+    outcome: std::result::Result<TurnOutcome, tokio::sync::oneshot::error::RecvError>,
+) -> Result<()> {
+    match outcome {
+        Ok(TurnOutcome::Completed {
+            reason: crate::engine::IdleReason::Completed | crate::engine::IdleReason::GoalComplete,
+        }) => Ok(()),
+        Ok(TurnOutcome::Completed { reason }) => anyhow::bail!(
+            "Dream turn `{turn_id}` ended without completing successfully: {reason:?}"
+        ),
+        Ok(TurnOutcome::Failed { error }) => anyhow::bail!("Dream session driver failed: {error}"),
+        Err(_) => anyhow::bail!("Dream session ended before its turn completed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::config::extended::{
+        ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
+        KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
+    };
+    use crate::config::providers::{ModelTrust, ProviderEntry, ProvidersConfig};
+    use crate::daemon::session_worker::SessionWorkerHandle;
+    use crate::daemon::shutdown::ShutdownSignal;
+    use crate::db::workspace_trust::WorkspaceTrustMode;
+    use crate::locks::LockManager;
+    use crate::session::Session;
 
     #[test]
     fn per_machine_default_jitter_is_stable_and_kb_specific() {
@@ -442,5 +539,181 @@ mod tests {
     fn empty_custom_schedule_is_the_local_midnight_default() {
         assert!(is_due(None, None, 1, "kb", "machine").unwrap());
         assert!(is_due(Some("   "), None, 1, "kb", "machine").unwrap());
+    }
+
+    #[test]
+    fn custom_cron_skip_uses_cursor_and_does_not_replay_stale_elapsed_fires() {
+        let last_scheduled_at_unix_ms = 1_704_067_230_000;
+        assert!(
+            !is_due(
+                Some("@hourly"),
+                Some(last_scheduled_at_unix_ms),
+                1_704_069_000_000,
+                "kb",
+                "machine",
+            )
+            .unwrap()
+        );
+        assert!(
+            is_due(
+                Some("@hourly"),
+                Some(last_scheduled_at_unix_ms),
+                1_704_071_000_000,
+                "kb",
+                "machine",
+            )
+            .unwrap()
+        );
+    }
+
+    fn test_dream_entry(schedule: Option<&str>) -> KnowledgeBaseRegistryEntry {
+        KnowledgeBaseRegistryEntry {
+            id: "kb".into(),
+            name: "KB".into(),
+            description: "test".into(),
+            source: KnowledgeBaseSource::Local {
+                path: PathBuf::from("kb"),
+            },
+            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
+            dream_model: Some("p:dream".into()),
+            dream_schedule: schedule.map(str::to_owned),
+            trust_required: false,
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        }
+    }
+
+    fn test_dream_providers() -> ProvidersConfig {
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                trust: Some(ModelTrust::Trusted),
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "dream".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        providers.active_model = Some(ActiveModelRef {
+            provider: "p".into(),
+            model: "dream".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        providers
+    }
+
+    #[tokio::test]
+    async fn run_due_once_records_empty_fire_for_trusted_configured_workspace_without_attachments()
+    {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        db.set_workspace_trust(root.path(), WorkspaceTrustMode::Trust)
+            .await
+            .unwrap();
+
+        let registry = SessionRegistry::new(
+            db.clone(),
+            Arc::new(LockManager::in_memory(db.clone())),
+            ShutdownSignal::new(),
+            None,
+            ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
+        );
+        registry.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
+        registry.set_secret_vault(crate::secure_key::vault_for_db(&db).unwrap());
+
+        let scheduler = DreamScheduler {
+            db: db.clone(),
+            registry,
+            config_source: ConfigSource::fixed(
+                test_dream_providers(),
+                ExtendedConfig {
+                    knowledge_bases: vec![test_dream_entry(Some("@hourly"))],
+                    ..Default::default()
+                },
+            ),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        let consumer_id = db
+            .ensure_installation_identity()
+            .await
+            .unwrap()
+            .as_hex()
+            .to_owned();
+        let project_root = root.path().canonicalize().unwrap().display().to_string();
+        scheduler.run_due_once().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let scheduled = db
+                    .knowledge_base_last_scheduled_at("kb", &project_root, &consumer_id)
+                    .await
+                    .unwrap();
+                let dreamed = db
+                    .knowledge_base_last_dreamed_at("kb", &project_root, &consumer_id)
+                    .await
+                    .unwrap();
+                if scheduled.is_some() && dreamed.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached empty-fire task should persist its cursor");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_cancel_keeps_exact_completed_turn_as_success() {
+        let db = Db::open_in_memory().unwrap();
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
+        let session = Arc::new(
+            Session::create_deferred_for_test(
+                db,
+                PathBuf::from("/dream-timeout"),
+                "Dream",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let (handle, mut work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
+        let observed = tokio::spawn({
+            let handle = handle.clone();
+            async move { await_dream_turn_terminal(&handle, "turn-1", Duration::from_secs(60)).await }
+        });
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(matches!(work_rx.recv().await, Some(SessionWork::Cancel)));
+        handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
+            session_id: handle.session_id,
+            turn_id: Some("turn-1".to_string()),
+            reason: crate::engine::IdleReason::Completed,
+        });
+
+        observed.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn dream_turn_terminal_classifier_accepts_completed_and_goal_complete() {
+        assert!(
+            classify_dream_turn_terminal(
+                "turn-1",
+                Ok(TurnOutcome::Completed {
+                    reason: crate::engine::IdleReason::Completed,
+                }),
+            )
+            .is_ok()
+        );
+        assert!(
+            classify_dream_turn_terminal(
+                "turn-1",
+                Ok(TurnOutcome::Completed {
+                    reason: crate::engine::IdleReason::GoalComplete,
+                }),
+            )
+            .is_ok()
+        );
     }
 }

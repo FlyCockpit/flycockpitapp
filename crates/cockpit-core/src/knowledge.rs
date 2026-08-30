@@ -3857,11 +3857,13 @@ impl Tool for KnowledgeDreamSourcesTool {
             model.reference()
         );
         let consumer = ctx.session.db.ensure_installation_identity().await?;
+        let project_root = dream::CanonicalDreamProjectRoot::from_session_path(&ctx.cwd)?;
         let mut sources = ctx
             .session
             .db
             .undreamed_sessions_for_knowledge_base(
                 &knowledge_base.entry.id,
+                project_root.as_str(),
                 consumer.as_hex(),
                 dream::history_caller_trust(&model, &providers),
             )

@@ -5739,10 +5739,30 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             session_id,
         } => {
-            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &session.project_root,
+                )?;
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock_for_root(
+                &project_root,
+                &knowledge_base_id,
+            );
             let _guard = dream_lock.lock().await;
             ctx.db
-                .attach_session_to_knowledge_base(&knowledge_base_id, session_id)
+                .attach_session_to_knowledge_base(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    session_id,
+                )
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
@@ -5752,10 +5772,31 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             session_id,
         } => {
-            let dream_lock = crate::knowledge::dream::knowledge_dream_lock(&knowledge_base_id);
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_persisted_canonical_root(
+                    &session.project_root,
+                )
+                .map_err(internal)?;
+            let dream_lock = crate::knowledge::dream::knowledge_dream_lock_for_root(
+                &project_root,
+                &knowledge_base_id,
+            );
             let _guard = dream_lock.lock().await;
             ctx.db
-                .detach_session_from_knowledge_base(&knowledge_base_id, session_id)
+                .detach_session_from_knowledge_base(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    session_id,
+                )
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
@@ -5766,17 +5807,18 @@ async fn handle_serialized_request_impl(
             knowledge_base_id,
             no_sandbox,
         } => {
-            let cwd = std::fs::canonicalize(&project_root).map_err(|_| ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: "project_root must identify an existing canonical workspace".to_string(),
-            })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &project_root,
+                )?;
+            let cwd = project_root.as_path();
             let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd)
                     .await
                     .map_err(internal)?;
             let (providers, extended) = ctx
                 .config_source()
-                .load_effective_for_daemon(&cwd, &trust_policy)
+                .load_effective_for_daemon(cwd, &trust_policy)
                 .map_err(daemon_config_error)?;
             let knowledge_base = extended
                 .knowledge_bases
@@ -5812,7 +5854,7 @@ async fn handle_serialized_request_impl(
             crate::daemon::dream_scheduler::run_knowledge_dream(
                 &ctx.db,
                 &ctx.registry,
-                &cwd,
+                cwd,
                 knowledge_base,
                 model,
                 caller_trust,
@@ -5828,17 +5870,18 @@ async fn handle_serialized_request_impl(
             project_root,
             knowledge_base_id,
         } => {
-            let cwd = std::fs::canonicalize(&project_root).map_err(|_| ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: "project_root must identify an existing canonical workspace".to_string(),
-            })?;
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &project_root,
+                )?;
+            let cwd = project_root.as_path();
             let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd)
                     .await
                     .map_err(internal)?;
             let (providers, extended) = ctx
                 .config_source()
-                .load_effective_for_daemon(&cwd, &trust_policy)
+                .load_effective_for_daemon(cwd, &trust_policy)
                 .map_err(daemon_config_error)?;
             let knowledge_base = extended
                 .knowledge_bases
@@ -5872,6 +5915,7 @@ async fn handle_serialized_request_impl(
                 .db
                 .undreamed_sessions_for_knowledge_base(
                     &knowledge_base_id,
+                    project_root.as_str(),
                     consumer.as_hex(),
                     crate::knowledge::dream::history_caller_trust(&model, &providers),
                 )
@@ -5882,7 +5926,11 @@ async fn handle_serialized_request_impl(
                 .collect();
             let last_dreamed_at_unix_ms = ctx
                 .db
-                .knowledge_base_last_dreamed_at(&knowledge_base_id, consumer.as_hex())
+                .knowledge_base_last_dreamed_at(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    consumer.as_hex(),
+                )
                 .await
                 .map_err(internal)?;
             Ok(Response::KnowledgeDreamStatus {

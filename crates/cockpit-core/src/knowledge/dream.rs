@@ -289,6 +289,71 @@ pub struct DreamEngine {
     session: Arc<Session>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CanonicalDreamProjectRoot(String);
+
+impl CanonicalDreamProjectRoot {
+    pub(crate) fn from_request_root(
+        requested_root: &str,
+    ) -> std::result::Result<Self, crate::daemon::server::ErrorPayload> {
+        let canonical = crate::daemon::fs_api::canonical_project_root(requested_root)?;
+        Self::from_canonical_path(&canonical).map_err(|error| crate::daemon::server::ErrorPayload {
+            code: crate::daemon::server::ErrorCode::RootMissing,
+            message: error.to_string(),
+        })
+    }
+
+    pub(crate) fn from_session_path(path: &Path) -> Result<Self> {
+        let canonical = std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "canonicalizing knowledge dream project root {}",
+                path.display()
+            )
+        })?;
+        Self::from_canonical_path(&canonical)
+    }
+
+    /// Reuse a persisted root identity that was canonicalized earlier when the
+    /// session row was created. This preserves the exact DB/lock key even if
+    /// the directory has since been deleted.
+    pub(crate) fn from_persisted_canonical_root(project_root: &str) -> Result<Self> {
+        let path = Path::new(project_root);
+        ensure!(
+            path.is_absolute(),
+            "knowledge dream project root must be absolute"
+        );
+        ensure!(
+            path.to_str().is_some(),
+            "knowledge dream project root is not valid UTF-8"
+        );
+        Ok(Self(project_root.to_owned()))
+    }
+
+    pub(crate) fn from_canonical_path(path: &Path) -> Result<Self> {
+        ensure!(
+            path.is_absolute(),
+            "knowledge dream project root must be absolute"
+        );
+        ensure!(
+            path.is_dir(),
+            "knowledge dream project root must be a directory"
+        );
+        Ok(Self(
+            path.to_str()
+                .context("knowledge dream project root is not valid UTF-8")?
+                .to_owned(),
+        ))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
 impl DreamEngine {
     pub fn new(session: Arc<Session>) -> Self {
         Self { session }
@@ -310,7 +375,9 @@ impl DreamEngine {
         // Daemon advisory serialization covers selection through ledger
         // commit. LocalGitSink additionally holds #138's cross-process/root
         // fence around the filesystem transaction.
-        let dream_lock = knowledge_dream_lock(&knowledge_base.id);
+        let project_root =
+            CanonicalDreamProjectRoot::from_session_path(&self.session.project_root)?;
+        let dream_lock = knowledge_dream_lock_for_root(&project_root, &knowledge_base.id);
         let _dream_guard = tokio::select! {
             guard = dream_lock.lock() => guard,
             () = cancel.cancelled() => bail!("knowledge dream cancelled while waiting for the KB lock"),
@@ -337,6 +404,7 @@ impl DreamEngine {
             .db
             .undreamed_sessions_for_knowledge_base(
                 &knowledge_base.id,
+                project_root.as_str(),
                 consumer.as_hex(),
                 history_caller_trust(&model, providers),
             )
@@ -377,7 +445,12 @@ impl DreamEngine {
             .collect::<Vec<_>>();
         self.session
             .db
-            .record_knowledge_dream_completion(&knowledge_base.id, consumer.as_hex(), &source_ids)
+            .record_knowledge_dream_completion(
+                &knowledge_base.id,
+                project_root.as_str(),
+                consumer.as_hex(),
+                &source_ids,
+            )
             .await?;
         Ok(DreamRunOutcome::Applied {
             sessions_dreamed: source_ids.len(),
@@ -387,36 +460,44 @@ impl DreamEngine {
     }
 }
 
-pub(crate) fn knowledge_dream_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn knowledge_dream_lock_for_root(
+    project_root: &CanonicalDreamProjectRoot,
+    kb_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let key = knowledge_dream_lock_key(project_root, kb_id);
     let mut locks = LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("knowledge dream lock registry poisoned");
-    if let Some(lock) = locks.get(kb_id).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
     let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(kb_id.to_owned(), Arc::downgrade(&lock));
+    locks.insert(key, Arc::downgrade(&lock));
     lock
 }
 
-/// Full-run fence used by the daemon's manual and scheduled execution entry
-/// points. Keep this distinct from `knowledge_dream_lock`: the latter is the
-/// narrower apply/attachment transaction fence and is intentionally acquired
-/// by the Dream tool itself.
-pub(crate) fn knowledge_dream_run_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn knowledge_dream_run_lock_for_root(
+    project_root: &CanonicalDreamProjectRoot,
+    kb_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let key = knowledge_dream_lock_key(project_root, kb_id);
     let mut locks = LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("knowledge dream run-lock registry poisoned");
-    if let Some(lock) = locks.get(kb_id).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
     let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(kb_id.to_owned(), Arc::downgrade(&lock));
+    locks.insert(key, Arc::downgrade(&lock));
     lock
+}
+
+fn knowledge_dream_lock_key(project_root: &CanonicalDreamProjectRoot, kb_id: &str) -> String {
+    format!("{}\u{0}{kb_id}", project_root.as_str())
 }
 
 /// Deterministic instruction for the custom dream orchestrator turn. Native
@@ -620,5 +701,48 @@ mod tests {
                 .unwrap()
                 .contains("Keep this")
         );
+    }
+
+    #[test]
+    fn knowledge_dream_locks_are_root_scoped() {
+        let first = CanonicalDreamProjectRoot("/workspace-a".into());
+        let first_alias = CanonicalDreamProjectRoot("/workspace-a".into());
+        let second_root_id = CanonicalDreamProjectRoot("/workspace-b".into());
+        let first_lock = knowledge_dream_lock_for_root(&first, "kb");
+        let first_again = knowledge_dream_lock_for_root(&first_alias, "kb");
+        let second_root = knowledge_dream_lock_for_root(&second_root_id, "kb");
+        let second_kb = knowledge_dream_lock_for_root(&first, "other");
+        assert!(Arc::ptr_eq(&first_lock, &first_again));
+        assert!(!Arc::ptr_eq(&first_lock, &second_root));
+        assert!(!Arc::ptr_eq(&first_lock, &second_kb));
+
+        let run_first = knowledge_dream_run_lock_for_root(&first, "kb");
+        let run_first_again = knowledge_dream_run_lock_for_root(&first_alias, "kb");
+        let run_second = knowledge_dream_run_lock_for_root(&second_root_id, "kb");
+        assert!(Arc::ptr_eq(&run_first, &run_first_again));
+        assert!(!Arc::ptr_eq(&run_first, &run_second));
+    }
+
+    #[test]
+    fn canonical_dream_project_root_collapses_lexical_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let alias =
+            CanonicalDreamProjectRoot::from_request_root(root.path().join(".").to_str().unwrap())
+                .unwrap();
+        assert_eq!(canonical, alias);
+    }
+
+    #[test]
+    fn persisted_canonical_root_survives_deleted_workspace_for_detach_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let persisted = canonical.as_str().to_owned();
+        std::fs::remove_dir_all(root.path()).unwrap();
+
+        let restored =
+            CanonicalDreamProjectRoot::from_persisted_canonical_root(&persisted).unwrap();
+        assert_eq!(restored.as_str(), persisted);
+        assert!(CanonicalDreamProjectRoot::from_request_root(&persisted).is_err());
     }
 }

@@ -967,6 +967,12 @@ async fn execute_ordinary_call_unscoped(
         })
         .await;
 
+    // The provider was told an advertised-but-unavailable tool exists, so its
+    // call must produce that availability result directly. In particular, do
+    // not let a stale repeated-call signature turn an unavailable capability
+    // into an approval prompt or loop-guard refusal.
+    let unavailable_call = env.active_tools.unavailable_call_message(resolved_name);
+
     // Loop guard (GOALS §1/§12): block a back-to-back identical tool
     // call (same name + canonical post-repair `wire_input`) pending
     // approval. Only schema-valid calls are guarded — a malformed call
@@ -987,7 +993,7 @@ async fn execute_ordinary_call_unscoped(
         env,
         resolved_name,
         &args,
-        repair_outcome.valid && !placeholder_blocked,
+        repair_outcome.valid && !placeholder_blocked && unavailable_call.is_none(),
     )
     .await?;
     let repeated_recoverable_tool_call = match &repeat_authorization {
@@ -1038,7 +1044,6 @@ async fn execute_ordinary_call_unscoped(
         gate: replay_gate_memo,
         verification: None,
     };
-    let unavailable_call = env.active_tools.unavailable_call_message(resolved_name);
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
     let mut gate_block_status = "blocked_safety_gate";
@@ -5201,7 +5206,7 @@ mod tests {
         let session = test_session(tmp.path());
         let model = test_model();
         let (tx, mut rx) = mpsc::channel(8);
-        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
         let env = DispatchEnv {
             agent: &agent,
             session: &session,
@@ -5210,7 +5215,7 @@ mod tests {
             ctx: &ctx,
             tx: &tx,
             hint_corrections: false,
-            loop_guard_threshold: 10,
+            loop_guard_threshold: 1,
             hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
@@ -5229,8 +5234,31 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(history.len(), 2, "the model receives one tool result");
-        assert!(last_tool_result_text(&history).contains("currently unavailable"));
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "capability_unavailable_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            history.len(),
+            4,
+            "each unavailable call receives its own result"
+        );
+        assert!(
+            last_tool_result_text(&history).contains("currently unavailable"),
+            "a repeated unavailable call returns availability, not a loop refusal"
+        );
+        assert!(
+            !last_tool_result_text(&history).contains("Loop blocked"),
+            "unavailable calls must not enter the loop-guard approval path"
+        );
         assert!(
             matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "capability_unavailable_tool")
         );
@@ -5245,6 +5273,19 @@ mod tests {
             "unavailability is a call-time execution result"
         );
         assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "capability_unavailable_tool")
+        );
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(TurnEvent::ToolError { tool, error, kind, .. })
+                    if tool == "capability_unavailable_tool"
+                        && kind == crate::engine::tool::ToolFailKind::Execution
+                        && error.contains("currently unavailable")
+            ),
+            "a repeated unavailable call remains a call-time execution result"
+        );
+        assert!(
             !called.load(Ordering::SeqCst),
             "an unavailable tool must not reach its backend"
         );
@@ -5254,8 +5295,8 @@ mod tests {
             .list_tool_calls_for_session(session.id)
             .await
             .expect("tool audit rows load");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].hard_fail);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.hard_fail));
         assert!(
             session
                 .db

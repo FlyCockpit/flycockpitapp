@@ -69,7 +69,8 @@ mod tests {
     #[tokio::test]
     async fn session_access_requires_two_workspace_consents_and_ignores_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.available_tools = Arc::new(HashSet::from(["session_search".to_string()]));
         let target = ctx
             .session
             .db

@@ -6073,9 +6073,9 @@ mod render_history_spacing_tests {
     }
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
-        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
-        ToolCallState, render_entry, render_entry_call_count, render_pending,
-        render_pending_incremental, reset_render_entry_call_count,
+        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentOutcome,
+        SubagentRoutingChips, ToolCall, ToolCallState, render_entry, render_entry_call_count,
+        render_pending, render_pending_incremental, reset_render_entry_call_count,
     };
     use crate::tui::markdown::{
         render_byte_count as markdown_render_byte_count,
@@ -6280,6 +6280,25 @@ mod render_history_spacing_tests {
             spawned_at: std::time::Instant::now(),
             outcome: None,
             expanded: false,
+        }
+    }
+
+    fn completed_subagent(report: &str) -> HistoryEntry {
+        HistoryEntry::Subagent {
+            parent: "Build".to_string(),
+            child: "reporter".to_string(),
+            task_call_id: "completed-call".to_string(),
+            label: "default".to_string(),
+            model_trusted: true,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: std::time::Instant::now(),
+            outcome: Some(SubagentOutcome {
+                report: report.to_string(),
+                failed: false,
+                duration: std::time::Duration::from_secs(1),
+                status: None,
+            }),
+            expanded: true,
         }
     }
 
@@ -9826,14 +9845,22 @@ mod render_history_spacing_tests {
                 state: ToolCallState::Success,
             },
             diff_entry("tool-diff-marker.rs"),
+            running_subagent(),
+            completed_subagent("completed-subagent-report-marker"),
             agent("visible assistant message"),
         ]
         .into();
         let history_ids = app.history.ids().to_vec();
         let history_before = format!("{:?}", &*app.history);
 
-        let shown = buffer_text(&render_history_buffer(&mut app, 100, 24));
-        for marker in ["tool-box-marker", "tool-line-marker", "tool-diff-marker.rs"] {
+        let shown = buffer_text(&render_history_buffer(&mut app, 100, 40));
+        for marker in [
+            "tool-box-marker",
+            "tool-line-marker",
+            "tool-diff-marker.rs",
+            "delegated to explore",
+            "completed-subagent-report-marker",
+        ] {
             assert!(
                 shown.contains(marker),
                 "fixture must render {marker}:\n{shown}"
@@ -9841,10 +9868,16 @@ mod render_history_spacing_tests {
         }
 
         app.handle_tool_calls_command("hide");
-        let hidden = buffer_text(&render_history_buffer(&mut app, 100, 24));
+        let hidden = buffer_text(&render_history_buffer(&mut app, 100, 40));
         assert!(hidden.contains("visible user message"), "{hidden}");
         assert!(hidden.contains("visible assistant message"), "{hidden}");
-        for marker in ["tool-box-marker", "tool-line-marker", "tool-diff-marker.rs"] {
+        for marker in [
+            "tool-box-marker",
+            "tool-line-marker",
+            "tool-diff-marker.rs",
+            "delegated to explore",
+            "completed-subagent-report-marker",
+        ] {
             assert!(
                 !hidden.contains(marker),
                 "hidden tool row {marker}:\n{hidden}"
@@ -9862,8 +9895,14 @@ mod render_history_spacing_tests {
         );
 
         app.handle_tool_calls_command("show");
-        let restored = buffer_text(&render_history_buffer(&mut app, 100, 24));
-        for marker in ["tool-box-marker", "tool-line-marker", "tool-diff-marker.rs"] {
+        let restored = buffer_text(&render_history_buffer(&mut app, 100, 40));
+        for marker in [
+            "tool-box-marker",
+            "tool-line-marker",
+            "tool-diff-marker.rs",
+            "delegated to explore",
+            "completed-subagent-report-marker",
+        ] {
             assert!(
                 restored.contains(marker),
                 "shown tool row {marker}:\n{restored}"

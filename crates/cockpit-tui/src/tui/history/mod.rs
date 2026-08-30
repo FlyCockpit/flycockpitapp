@@ -328,7 +328,10 @@ impl HistoryEntry {
     pub(crate) fn is_tool_call_entry(&self) -> bool {
         matches!(
             self,
-            Self::Diff { .. } | Self::ToolBox { .. } | Self::ToolLine { .. }
+            Self::Diff { .. }
+                | Self::ToolBox { .. }
+                | Self::ToolLine { .. }
+                | Self::Subagent { .. }
         )
     }
 }

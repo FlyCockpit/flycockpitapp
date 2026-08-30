@@ -69,6 +69,7 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         turns: 1,
         active_agent: "Build".to_string(),
         title: Some("summary".to_string()),
+        description: None,
         parent_session_id: None,
         created_by_principal: None,
         shared_with_collaborators: false,

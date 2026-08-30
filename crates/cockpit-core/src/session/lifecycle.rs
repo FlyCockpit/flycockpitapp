@@ -509,6 +509,7 @@ impl Session {
             btw_parent_session_id: row.btw_parent_session_id,
             btw_tangent: row.btw_tangent,
             title: Mutex::new(row.title),
+            description: Mutex::new(row.description),
             user_renamed: Mutex::new(row.user_renamed),
             active_agent: Mutex::new(row.active_agent),
             model_selection: Mutex::new(model_selection),

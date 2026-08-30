@@ -186,6 +186,8 @@ pub struct SessionRow {
     pub fork_point_turn_id: Option<String>,
     /// Auto-generated or user-set title (GOALS §17d).
     pub title: Option<String>,
+    /// Cache-reusing metadata fork's one-sentence session context.
+    pub description: Option<String>,
     /// `true` when the user has manually set [`title`]. Locks out the
     /// utility-model auto-titling pass.
     pub user_renamed: bool,
@@ -288,6 +290,7 @@ impl SessionRow {
             parent_session_id,
             fork_point_turn_id: row.get("fork_point_turn_id")?,
             title: row.get("title")?,
+            description: row.get("description")?,
             user_renamed: user_renamed != 0,
             last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
             archived_at_unix_ms: row.get("archived_at_unix_ms")?,
@@ -448,8 +451,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
-          assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+          assistant_name, created_by_principal, shared_with_collaborators, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -473,6 +476,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.assistant_name,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
+            row.description,
         ],
     )?;
     Ok(())
@@ -513,8 +517,8 @@ fn execute_fork_insert(
           title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
-          model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+          model_system_prompt_snapshot_json, assistant_name, active_model_revision, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -546,6 +550,7 @@ fn execute_fork_insert(
             row.model_system_prompt_snapshot_json,
             row.assistant_name,
             row.active_model_revision,
+            row.description,
         ],
     )?;
     Ok(())
@@ -658,6 +663,7 @@ fn build_session_row(
         parent_session_id: None,
         fork_point_turn_id: None,
         title: None,
+        description: None,
         user_renamed: false,
         last_viewed_at_unix_ms: None,
         archived_at_unix_ms: None,
@@ -1343,6 +1349,7 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: None,
             title: None,
+            description: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1500,6 +1507,7 @@ impl Db {
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: fork_point_turn_id.clone(),
             title: None,
+            description: None,
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
@@ -1734,6 +1742,26 @@ impl Db {
                 params![title, session_id.to_string()],
             )
             .context("setting auto title")?;
+        Ok(affected > 0)
+    }
+
+    /// Atomically set generated session metadata. Only the ephemeral
+    /// self-metadata fork calls this; it cannot overwrite a manual title or
+    /// mutate a throwaway session.
+    pub fn set_auto_session_metadata_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        title: &str,
+        description: &str,
+    ) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions
+                 SET title = ?1, description = ?2, title_recovery_nudge_state = 0
+                 WHERE session_id = ?3 AND user_renamed = 0 AND ephemeral = 0",
+                params![title, description, session_id.to_string()],
+            )
+            .context("setting auto session metadata")?;
         Ok(affected > 0)
     }
 
@@ -2801,6 +2829,7 @@ impl Db {
                 turns: 0, // wire up when we track turn count
                 active_agent: row.active_agent,
                 title: row.title,
+                description: row.description,
                 parent_session_id: row.parent_session_id,
                 fork_count,
                 descendant_count,

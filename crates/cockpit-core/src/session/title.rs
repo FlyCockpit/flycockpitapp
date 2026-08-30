@@ -3,6 +3,31 @@
 use super::*;
 
 impl Session {
+    /// Apply the combined output of the cache-reusing self-metadata fork.
+    /// The durable update is atomic: a manual title or ephemeral session wins
+    /// the race and leaves both generated fields untouched.
+    pub fn set_auto_metadata(&self, title: &str, description: &str) -> Result<bool> {
+        let session_id = self.id;
+        let title_for_db = title.to_string();
+        let description_for_db = description.to_string();
+        let updated = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::set_auto_session_metadata_conn(
+                    conn,
+                    session_id,
+                    &title_for_db,
+                    &description_for_db,
+                )
+            })
+            .context("setting auto session metadata")?;
+        if updated {
+            *self.title.lock().unwrap() = Some(title.to_string());
+            *self.description.lock().unwrap() = Some(description.to_string());
+        }
+        Ok(updated)
+    }
+
     /// Apply an auto-generated title. No-ops (and returns false) if the
     /// user has manually renamed this session.
     pub fn set_auto_title(&self, title: &str) -> Result<bool> {
@@ -232,6 +257,48 @@ impl Session {
             self.persist_title_progress();
         }
         TitleAction::None
+    }
+
+    /// Fold one raw user turn into the same-model metadata-fork cadence. This
+    /// is deliberately keyed to `user_content_turns`, not inference/tool
+    /// rounds: a tool-call storm must not continuously rename or re-describe a
+    /// session. It is the mutually exclusive alternative to
+    /// [`Self::note_user_content`], so it consumes the shared durable slot
+    /// itself rather than racing the utility-title path.
+    pub fn note_user_content_for_metadata(&self, text: &str) -> MetadataAction {
+        let increment = crate::auto_title::estimate_tokens(text);
+        if increment != 0 {
+            self.user_content_tokens
+                .fetch_add(increment, Ordering::Relaxed);
+        }
+        let user_turns = if increment == 0 {
+            self.user_content_turns.load(Ordering::Relaxed)
+        } else {
+            self.user_content_turns.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        if self.user_renamed() {
+            if increment != 0 {
+                self.persist_title_progress();
+            }
+            return MetadataAction::None;
+        }
+        let last_slot = self.title_stage.load(Ordering::Relaxed);
+        let Some(slot) = scheduled_metadata_slot(user_turns, last_slot) else {
+            if increment != 0 {
+                self.persist_title_progress();
+            }
+            return MetadataAction::None;
+        };
+        self.title_stage.store(slot, Ordering::Relaxed);
+        if slot >= 8 && slot <= 16 {
+            self.title_nudge_slot_pending.store(slot, Ordering::Relaxed);
+        }
+        self.persist_title_progress();
+        if slot <= 16 {
+            MetadataAction::TitleAndDescribe
+        } else {
+            MetadataAction::Describe
+        }
     }
 
     fn title_nudge_threshold_reached(&self) -> bool {

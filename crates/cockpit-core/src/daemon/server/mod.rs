@@ -1676,6 +1676,7 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         turns: _,
         active_agent: _,
         title,
+        description,
         parent_session_id: _,
         created_by_principal: _,
         shared_with_collaborators: _,
@@ -1690,6 +1691,7 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
     } = summary;
     scrub_string(project_root, redact);
     scrub_option_string(title, redact);
+    scrub_option_string(description, redact);
 }
 
 fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {

@@ -102,6 +102,37 @@ impl HostContext {
         }
     }
 
+    /// Build the isolated host catalog used by the cache-reusing session
+    /// metadata fork. It intentionally has no native-tool context: the fork
+    /// can reach exactly one host function, through Monty's normal discovery
+    /// path, and cannot make a foreground tool call by accident.
+    pub fn metadata_fork(
+        session: Arc<Session>,
+        cwd: PathBuf,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+    ) -> Self {
+        Self {
+            db: Some(session.db.clone()),
+            session_id: Some(session.id),
+            cwd,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            config,
+            session: Some(session),
+            root_agent_frame: false,
+            context_usage: None,
+            child_events: None,
+            builtin_registry: Arc::new(BuiltinRegistry::metadata_fork()),
+            native_tool_ctx: None,
+            scan_tool_results: false,
+            #[cfg(test)]
+            test_builtin_gate: None,
+            #[cfg(test)]
+            test_external_invoke: None,
+            #[cfg(test)]
+            test_external_approval_entered: None,
+        }
+    }
+
     /// Prefer the ToolCtx-threaded resolver, then overlay any caller-built
     /// servers the resolver does not already know. Hand-built `McpConfig`
     /// fixtures (and production `catalog.to_mcp_config()`) stay visible even
@@ -795,6 +826,25 @@ impl BuiltinRegistry {
         Self::new(funcs)
     }
 
+    /// The source-tagged effective catalog for an ephemeral metadata fork.
+    /// This is deliberately separate from both the global default registry and
+    /// every agent registry, so `mcp.search` in the foreground can never
+    /// discover `set_session_metadata`.
+    pub fn metadata_fork() -> Self {
+        Self::new(vec![BuiltinFunction::new(
+            "set_session_metadata",
+            "Set this session's generated title and one-sentence description",
+            BuiltinPresentation {
+                glyph: "🏷️",
+                label: "set_session_metadata".to_string(),
+            },
+            Arc::new(set_session_metadata_schema),
+            Arc::new(set_session_metadata_availability),
+            true,
+            Arc::new(set_session_metadata),
+        )])
+    }
+
     fn iter(&self) -> impl Iterator<Item = &BuiltinFunction> {
         self.funcs.values()
     }
@@ -1234,6 +1284,79 @@ fn rename_session_schema() -> Value {
         },
         "required": ["name"],
         "additionalProperties": false
+    })
+}
+
+fn set_session_metadata_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Short kebab-case session title, 1 to 60 characters"
+            },
+            "description": {
+                "type": "string",
+                "description": "One concise sentence of session context, 1 to 1000 characters"
+            }
+        },
+        "required": ["title", "description"],
+        "additionalProperties": false
+    })
+}
+
+fn set_session_metadata_availability(ctx: &HostContext) -> Availability {
+    let Some(session) = ctx.session.as_ref() else {
+        return Availability::unavailable("set_session_metadata requires a live session");
+    };
+    let Ok(Some(row)) = session.db.blocking_write_for_sync_maintenance({
+        let session_id = session.id;
+        move |conn| crate::db::Db::get_session_conn(conn, session_id)
+    }) else {
+        return Availability::unavailable("session metadata is unavailable");
+    };
+    if row.user_renamed || row.ephemeral {
+        return Availability::unavailable("session metadata is no longer eligible");
+    }
+    Availability::available()
+}
+
+fn set_session_metadata<'a>(
+    ctx: &'a HostContext,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .context("`cockpit.set_session_metadata` requires title as a string")?;
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .context("`cockpit.set_session_metadata` requires description as a string")?;
+        if title.is_empty() || title.chars().count() > crate::auto_title::TITLE_MAX_CHARS {
+            bail!("`cockpit.set_session_metadata` title must be 1 to 60 characters");
+        }
+        if crate::auto_title::slugify_title(title).as_deref() != Some(title) {
+            bail!("`cockpit.set_session_metadata` title must be lowercase kebab-case");
+        }
+        if description.is_empty() || description.chars().count() > 1000 {
+            bail!("`cockpit.set_session_metadata` description must be 1 to 1000 characters");
+        }
+        let session = ctx
+            .session
+            .as_ref()
+            .context("`cockpit.set_session_metadata` requires a live session")?;
+        if !session.set_auto_metadata(title, description)? {
+            bail!("`cockpit.set_session_metadata` did not update session metadata");
+        }
+        Ok(serde_json::json!({
+            "updated": true,
+            "title": title,
+            "description": description,
+        }))
     })
 }
 

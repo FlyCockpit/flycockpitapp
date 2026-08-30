@@ -30,7 +30,8 @@ use std::path::Path;
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
 use crate::engine::agent::TurnEvent;
-use crate::session::{Session, TitleAction};
+use crate::engine::message::{Message, collect_tool_calls, tool_result_message};
+use crate::session::{MetadataAction, Session, TitleAction};
 
 static UTILITY_MODEL_UNSET_LOGGED: OnceLock<()> = OnceLock::new();
 
@@ -406,6 +407,121 @@ fn build_title_prompt(content_prefix: &str) -> String {
          the title — no quotes, no explanation, no trailing punctuation.\n\n\
          <content>\n{content_prefix}\n</content>\n"
     )
+}
+
+/// Run the optional same-model metadata pass on an ephemeral in-memory fork.
+/// Its request reuses the foreground agent's exact system prompt and native
+/// tool definitions; only the trailing user instruction is new. The metadata
+/// function lives solely behind the fork's Monty host catalog, so it never
+/// changes the native tool block or becomes discoverable to the main agent.
+///
+/// This intentionally bypasses the normal turn loop: fork messages, model
+/// output, and Monty results remain in this local vector and cannot enter the
+/// foreground transcript. At most two model turns are allowed, and every
+/// error is best-effort / silent to the user.
+pub async fn generate_session_metadata_fork(
+    session: Arc<Session>,
+    agent: Arc<crate::engine::agent::Agent>,
+    mut history: Vec<Message>,
+    source_prompt: Message,
+    action: MetadataAction,
+    cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+) {
+    if matches!(action, MetadataAction::None) {
+        return;
+    }
+
+    // The foreground prompt is part of the reused prefix. The only new data
+    // is this final fork instruction and its one-shot call skeleton.
+    history.push(source_prompt);
+    let mut prompt = Message::user(metadata_fork_instruction(action));
+    let active_tools = crate::engine::agent::turn_toolbox(&agent, &session, &cwd, &config).await;
+    let mut tools = active_tools.definitions(agent.tool_steering);
+    if crate::leak_report::route_advertises_report_leak(agent.model.is_trusted(), &tools) {
+        tools.push(crate::leak_report::report_leak_tool_definition());
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    for _ in 0..2 {
+        let completion = agent
+            .model
+            .complete_captured(
+                &agent.system,
+                &history,
+                prompt,
+                &tools,
+                agent.params.clone(),
+                &agent.name,
+                None,
+                &cancel,
+                None,
+            )
+            .await;
+        let Ok(((_, content, _), _, _)) = completion else {
+            return;
+        };
+        let calls = collect_tool_calls(&content);
+        let Some(call) = calls.iter().find(|call| call.function.name == "mcp") else {
+            // The fork is not allowed to act on ordinary assistant prose or a
+            // non-Monty tool call. A single recovery turn may still use the
+            // injected skeleton, then it stops.
+            prompt = Message::user(metadata_fork_retry_instruction());
+            continue;
+        };
+        let Some(script) = call
+            .function
+            .arguments
+            .get("script")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let host = crate::mcp::builtin::HostContext::metadata_fork(
+            session.clone(),
+            cwd.clone(),
+            config.clone(),
+        );
+        let cfg = agent.mcp_resolver.catalog().to_mcp_config();
+        let Ok(result) = crate::mcp::sandbox::run_with_host(script, &cfg, &host).await else {
+            return;
+        };
+        let updated = serde_json::from_str::<serde_json::Value>(&result)
+            .ok()
+            .and_then(|value| value.get("updated").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        // The successful metadata function has already performed its atomic
+        // update. The assistant/tool messages are retained only in this
+        // ephemeral fork for the one permitted recovery turn.
+        history.push(Message::Assistant { id: None, content });
+        history.push(tool_result_message(call, result));
+        if updated {
+            return;
+        }
+        prompt = Message::user(metadata_fork_retry_instruction());
+    }
+}
+
+fn metadata_fork_instruction(action: MetadataAction) -> String {
+    let cadence = match action {
+        MetadataAction::TitleAndDescribe => {
+            "Produce a fresh concise kebab-case title and a one-sentence description."
+        }
+        MetadataAction::Describe => {
+            "Refresh the one-sentence description and keep or refine the concise kebab-case title."
+        }
+        MetadataAction::None => unreachable!("metadata fork is never started without work"),
+    };
+    format!(
+        "{cadence} Do this now through Monty, with no explanation and no other tool calls. \
+         Use exactly this call skeleton and replace only the two placeholder strings:\n\n\
+         mcp.invoke(\"cockpit\", \"set_session_metadata\", {{\"title\": \"short-kebab-title\", \
+         \"description\": \"One concise sentence describing the work and context.\"}})"
+    )
+}
+
+fn metadata_fork_retry_instruction() -> String {
+    "Finish now with the exact Monty set_session_metadata call shown previously. Do not explain or call any other tool.".to_string()
 }
 
 #[cfg(test)]

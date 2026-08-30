@@ -724,6 +724,7 @@ mod sessions_activity_tests {
             turns: 0,
             active_agent: "Build".into(),
             title: None,
+            description: None,
             parent_session_id: None,
             created_by_principal: None,
             shared_with_collaborators: false,

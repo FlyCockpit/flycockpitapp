@@ -11620,8 +11620,29 @@ impl Driver {
         // The title accounting is based on the exact authored source, while
         // the detached utility request gets only a bounded prefix. In
         // particular it must not independently expand an 8MiB artifact.
-        let title_action = self.session.note_user_content(&canonical_user_text);
-        if !matches!(title_action, crate::session::TitleAction::None) {
+        // The same-model path is the fallback with no utility title model and
+        // an explicit preference when both are available. It is launched only
+        // after the foreground prompt is assembled below, so its prefix is the
+        // foreground history plus that exact prompt and it remains invisible to
+        // the main conversation.
+        let (extended, providers) = self.config.configs();
+        let use_session_model_metadata = extended.auto_title_with_session_model
+            || extended.auto_title_model_ref().is_none();
+        let (title_action, metadata_action) = if use_session_model_metadata {
+            (
+                crate::session::TitleAction::None,
+                self.session
+                    .note_user_content_for_metadata(&canonical_user_text),
+            )
+        } else {
+            (
+                self.session.note_user_content(&canonical_user_text),
+                crate::session::MetadataAction::None,
+            )
+        };
+        if !use_session_model_metadata
+            && !matches!(title_action, crate::session::TitleAction::None)
+        {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {
                 crate::engine::text_artifact_frame::bounded_utf8_prefix(
@@ -11632,10 +11653,8 @@ impl Driver {
             } else {
                 user_text.clone()
             };
-            // Resolve auto-title config from the turn-pinned snapshot before the
-            // detached task spawns, rather than re-reading disk inside it
-            // (`engine-config-snapshot-adoption`).
-            let (extended, providers) = self.config.configs();
+            // Config was resolved from the turn-pinned snapshot before the
+            // detached task spawned (`engine-config-snapshot-adoption`).
             // Thread the session's effective redaction table so the detached
             // auto-title call routes through the same non-bypassable scrub
             // chokepoint as the foreground turn (GOALS §7).
@@ -11802,6 +11821,29 @@ impl Driver {
                 delivery_class: Default::default(),
             })
         };
+        if self.stack.len() == 1
+            && !matches!(metadata_action, crate::session::MetadataAction::None)
+        {
+            let top = self.stack.last().expect("stack never empty");
+            let session = self.session.clone();
+            let agent = top.agent.clone();
+            let history = top.history.clone();
+            let source_prompt = next_prompt.clone();
+            let cwd = self.cwd.clone();
+            let config = self.config.clone();
+            tokio::spawn(async move {
+                crate::auto_title::generate_session_metadata_fork(
+                    session,
+                    agent,
+                    history,
+                    source_prompt,
+                    metadata_action,
+                    cwd,
+                    config,
+                )
+                .await;
+            });
+        }
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
         // ROOT stop-gate latch for THIS user turn (`tool-hooks-lifecycle-

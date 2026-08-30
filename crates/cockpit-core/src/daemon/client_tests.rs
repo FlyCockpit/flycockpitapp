@@ -130,6 +130,30 @@ async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
         .unwrap();
 }
 
+async fn accept_restart_if_idle(daemon: &mut ProtoStream<UnixStream>) {
+    let id = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::RestartIfIdle,
+                ..
+            } => id,
+            other => panic!("expected RestartIfIdle, got {other:?}"),
+        },
+        other => panic!("expected RestartIfIdle envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            id,
+            Response::RestartDecision {
+                will_restart: true,
+                reason: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn negotiation_parses_daemon_hello_on_connect() {
     let (_dir, socket, listener) = bind_test_socket();
@@ -340,6 +364,66 @@ async fn in_process_auto_promote_hellos_without_os_socket() {
         .request_ok(Request::DaemonStatus)
         .await
         .expect("promoted owner answers DaemonStatus");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_assistant_promotion_replaces_the_ephemeral_owner_with_persistent() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
+    let _promote = crate::daemon::enable_in_process_auto_promote();
+
+    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
+    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion");
+    let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
+    let socket = paths.socket.clone();
+    let predecessor = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept promotion client");
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
+        accept_restart_if_idle(&mut daemon).await;
+        drop(daemon);
+        drop(listener);
+        std::fs::remove_file(&socket).expect("release accepted predecessor socket");
+    });
+
+    let promoted = promote_ephemeral_owner(&paths, None)
+        .await
+        .expect("accepted promotion must acquire a persistent replacement");
+
+    assert!(promoted.promoted_from_ephemeral);
+    assert!(!promoted.owns_daemon);
+    promoted
+        .client
+        .request_ok(Request::DaemonStatus)
+        .await
+        .expect("persistent replacement answers DaemonStatus");
+    predecessor.await.expect("predecessor task");
+}
+
+#[test]
+fn accepted_promotion_deadline_is_an_observable_terminal_failure() {
+    let error = ensure_promotion_replacement_deadline(Some(std::time::Instant::now()))
+        .expect_err("an expired accepted-handoff deadline must not retry forever");
+    assert!(
+        error
+            .to_string()
+            .contains("persistent Assistant daemon replacement")
+    );
+}
+
+#[test]
+fn accepted_assistant_promotion_delivers_the_persistence_notice() {
+    assert_eq!(
+        lifecycle_startup_notice(None, true).as_deref(),
+        Some(ASSISTANT_PERSISTENCE_NOTICE)
+    );
+    assert_eq!(
+        lifecycle_startup_notice(Some("existing notice".to_string()), true).as_deref(),
+        Some("existing notice"),
+        "an existing lifecycle notice keeps its established priority"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

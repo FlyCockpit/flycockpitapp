@@ -12,6 +12,10 @@ use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 use crate::daemon::proto::{self, Request};
 
 const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
+/// An accepted ephemeral restart is destructive, so its replacement phase is
+/// given one bounded recovery window. This prevents a permanently broken
+/// successor from serially wedging the lifecycle host forever.
+const PROMOTION_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One-line presentation notice emitted after an Assistant promotes the
 /// shared ledger owner from ephemeral to persistent mode.
@@ -364,11 +368,10 @@ pub async fn serve_lifecycle_requests(
                 endpoint: connected.endpoint,
                 owns_daemon: connected.owns_daemon,
                 socket: connected.socket,
-                startup_notice: connected.startup_notice.or_else(|| {
-                    connected
-                        .promoted_from_ephemeral
-                        .then(|| ASSISTANT_PERSISTENCE_NOTICE.to_string())
-                }),
+                startup_notice: lifecycle_startup_notice(
+                    connected.startup_notice,
+                    connected.promoted_from_ephemeral,
+                ),
             });
         match resolved {
             Ok(resolution) => {
@@ -380,6 +383,14 @@ pub async fn serve_lifecycle_requests(
         }
     }
     Ok(())
+}
+
+fn lifecycle_startup_notice(
+    startup_notice: Option<String>,
+    promoted_from_ephemeral: bool,
+) -> Option<String> {
+    startup_notice
+        .or_else(|| promoted_from_ephemeral.then(|| ASSISTANT_PERSISTENCE_NOTICE.to_string()))
 }
 
 /// Test-support composition owned below frontends. TUI tests receive only the
@@ -450,8 +461,11 @@ async fn promote_ephemeral_owner(
     let mut current_paths = paths.clone();
     let mut spawn_permit = None;
     let mut replacement_required = false;
+    let mut replacement_deadline = None;
 
     loop {
+        ensure_promotion_replacement_deadline(replacement_deadline)?;
+
         if !replacement_required
             && lifecycle_request
                 .is_some_and(|request| request.is_cancelled() || request.reply.is_closed())
@@ -591,7 +605,7 @@ async fn promote_ephemeral_owner(
                                     .map_err(anyhow::Error::msg)?;
                                 return spawn_verified_persistent_replacement(
                                     &mut spawn_permit,
-                                    false,
+                                    None,
                                 )
                                 .await;
                             }
@@ -613,7 +627,7 @@ async fn promote_ephemeral_owner(
                         .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
                         .transpose()
                         .map_err(anyhow::Error::msg)?;
-                    return spawn_verified_persistent_replacement(&mut spawn_permit, false).await;
+                    return spawn_verified_persistent_replacement(&mut spawn_permit, None).await;
                 }
                 DiscoverAttachPlan::FailIncompatible | DiscoverAttachPlan::FailUnreachable => {
                     anyhow::bail!(
@@ -625,6 +639,7 @@ async fn promote_ephemeral_owner(
         }
 
         replacement_required = true;
+        replacement_deadline = Some(std::time::Instant::now() + PROMOTION_REPLACEMENT_TIMEOUT);
 
         if !crate::daemon::wait_for_restart_release(
             &current_paths,
@@ -643,6 +658,8 @@ async fn promote_ephemeral_owner(
         }
 
         loop {
+            ensure_promotion_replacement_deadline(replacement_deadline)?;
+
             // `RestartIfIdle` already accepted the destructive handoff. Do
             // not observe cancellation here: dropping the unused permit would
             // otherwise leave the released predecessor without an authorized
@@ -670,7 +687,11 @@ async fn promote_ephemeral_owner(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 DiscoverAttachPlan::Spawn => {
-                    return spawn_verified_persistent_replacement(&mut spawn_permit, true).await;
+                    return spawn_verified_persistent_replacement(
+                        &mut spawn_permit,
+                        replacement_deadline,
+                    )
+                    .await;
                 }
                 DiscoverAttachPlan::FailUnreachable => {
                     // The predecessor may still own its receipt while the
@@ -680,9 +701,16 @@ async fn promote_ephemeral_owner(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 DiscoverAttachPlan::FailIncompatible => {
-                    anyhow::bail!(
-                        "shared daemon became unreachable while promoting Assistant work"
+                    // A competing owner may have appeared between release and
+                    // discovery. Its incompatible hello cannot be used as a
+                    // promotion target, but the accepted handoff still owns
+                    // the replacement obligation. Keep the permit through
+                    // the bounded recovery window instead of dropping it at
+                    // the first incompatible observation.
+                    tracing::warn!(
+                        "accepted assistant promotion observed an incompatible replacement; waiting for a persistent owner"
                     );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
@@ -693,19 +721,44 @@ async fn promote_ephemeral_owner(
 /// discovery identifies the owner as persistent before reporting success.
 async fn spawn_verified_persistent_replacement(
     spawn_permit: &mut Option<cockpit_client::LifecycleSpawnPermit>,
-    terminal_replacement: bool,
+    replacement_deadline: Option<std::time::Instant>,
 ) -> Result<ConnectedDaemon> {
     let canonical = crate::daemon::DaemonPaths::resolve_canonical()?;
+    // Test-only persistent owners are in-process and therefore have no OS
+    // receipt to rediscover. Production replacement spawning always takes
+    // the detached-child path below and is receipt-verified before attach.
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::daemon::in_process_auto_promote_enabled() {
+        let pid = crate::daemon::auto_promote_in_process_persistent().await?;
+        if let Some(permit) = spawn_permit.as_mut() {
+            permit.owner_created();
+        }
+        tracing::info!(pid, "in-process persistent Assistant replacement promoted");
+        let client = connect_local_daemon(&canonical.socket)
+            .await
+            .context("in-process persistent Assistant replacement did not publish a daemon")?;
+        return Ok(ConnectedDaemon {
+            endpoint: local_daemon_endpoint(&canonical.socket),
+            client,
+            owns_daemon: false,
+            socket: canonical.socket,
+            startup_notice: None,
+            promoted_from_ephemeral: true,
+        });
+    }
     let pid = loop {
         match crate::daemon::spawn_detached(false) {
             Ok(pid) => break pid,
-            Err(error) if terminal_replacement => {
+            Err(error) if replacement_deadline.is_some() => {
                 // The predecessor can release its metadata before its SQLite
-                // boot lock. Keep the accepted handoff alive until creation
-                // succeeds instead of returning a daemonless ledger.
+                // boot lock. Retry only inside the accepted handoff's bounded
+                // recovery window; its terminal error must release the
+                // serial lifecycle host for later requests.
+                ensure_promotion_replacement_deadline(replacement_deadline)
+                    .context("spawning persistent Assistant replacement")?;
                 tracing::warn!(
                     error = %error,
-                    "accepted assistant promotion replacement spawn is not ready; retrying"
+                    "accepted assistant promotion replacement spawn is not ready; retrying within recovery window"
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -720,7 +773,7 @@ async fn spawn_verified_persistent_replacement(
         ephemeral = false,
         "assistant daemon promotion spawned replacement"
     );
-    wait_for_verified_persistent_replacement(&canonical.socket, terminal_replacement).await
+    wait_for_verified_persistent_replacement(&canonical.socket, replacement_deadline).await
 }
 
 /// Wait for a persistent published owner and return a client that was checked
@@ -729,10 +782,10 @@ async fn spawn_verified_persistent_replacement(
 /// being replaced.
 async fn wait_for_verified_persistent_replacement(
     expected_socket: &Path,
-    terminal_replacement: bool,
+    replacement_deadline: Option<std::time::Instant>,
 ) -> Result<ConnectedDaemon> {
     let deadline =
-        (!terminal_replacement).then(|| std::time::Instant::now() + SPAWN_DAEMON_TIMEOUT);
+        replacement_deadline.unwrap_or_else(|| std::time::Instant::now() + SPAWN_DAEMON_TIMEOUT);
     let mut backoff = Duration::from_millis(2);
 
     loop {
@@ -748,7 +801,7 @@ async fn wait_for_verified_persistent_replacement(
             }
         }
 
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for a verified persistent daemon replacement at {}",
                 expected_socket.display()
@@ -757,6 +810,18 @@ async fn wait_for_verified_persistent_replacement(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(50));
     }
+}
+
+/// Post-acceptance promotion is a bounded transaction. Before acceptance the
+/// requester remains cancellable; afterward this deadline is the observable
+/// terminal policy for a successor that cannot become a persistent owner.
+fn ensure_promotion_replacement_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        anyhow::bail!(
+            "timed out acquiring a persistent Assistant daemon replacement after accepted restart"
+        );
+    }
+    Ok(())
 }
 
 /// Connect only when the persistent endpoint and PID receipt still name the

@@ -158,6 +158,12 @@ fn tool_results(events: &[TurnEvent]) -> Vec<(&str, &str, &str)> {
                 output,
                 ..
             } => Some((call_id.as_str(), tool.as_str(), output.as_str())),
+            TurnEvent::ToolError {
+                call_id,
+                tool,
+                error,
+                ..
+            } => Some((call_id.as_str(), tool.as_str(), error.as_str())),
             _ => None,
         })
         .collect()

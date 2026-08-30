@@ -480,8 +480,59 @@ fn test_driver_with_url_and_grant(
         assistant_identity_prefix: None,
         mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
-    let driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
+    let mut driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
+    bind_test_session_root(&mut driver);
     (driver, tmp)
+}
+
+/// Standalone driver tests do not go through the worker's deferred root
+/// publication. Mint the reserved `session-root` so child START registration
+/// and continuation snapshots have a durable parent. Tests that assert the
+/// missing-parent refusal clear `agent_instance_id` afterwards.
+fn bind_test_session_root(driver: &mut Driver) {
+    let cwd = driver.cwd.clone();
+    let db = driver.session.db.clone();
+    let session_id = driver.session.id;
+    let created = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bind test session root runtime");
+        runtime.block_on(async {
+            let workspace_ref = crate::agent_tree::workspace_ref_for_host_path(&cwd)?;
+            let created = db
+                .ensure_session_root_agent(
+                    session_id,
+                    None,
+                    workspace_ref,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await?;
+            match db
+                .transition_agent_instance(
+                    session_id,
+                    created.agent_instance_id,
+                    created.revision,
+                    crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                    r#"{"state":"running"}"#,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await?
+            {
+                crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(row) => {
+                    Ok::<_, anyhow::Error>(row)
+                }
+                crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)
+                | crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict => {
+                    Ok(created)
+                }
+            }
+        })
+    })
+    .join()
+    .expect("bind test session root thread")
+    .expect("bind test session root");
+    driver.set_root_agent_instance_id(created.agent_instance_id);
 }
 
 #[tokio::test]

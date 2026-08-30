@@ -210,7 +210,7 @@ impl Tool for WriteTool {
                 None,
             )
         } else {
-            create_new_and_release(&path, normalized.as_bytes(), write_guard).await?
+            create_new_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?
         };
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
@@ -547,6 +547,7 @@ impl ParentPrep {
 }
 
 async fn create_new_and_release(
+    ctx: &ToolCtx,
     path: &std::path::Path,
     bytes: &[u8],
     guard: crate::locks::WriteGuard<'_>,
@@ -582,6 +583,9 @@ async fn create_new_and_release(
         return Err(error);
     }
     let persist_ok = guard.release_after_write().await;
+    ctx.locks
+        .note_read(path, &ctx.lock_identity, ctx.session.id)
+        .await;
     Ok((
         crate::tools::common::WriteReleaseOutcome { persist_ok },
         prep.disclosure,
@@ -2840,7 +2844,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "forced create failure",
         ));
-        let err = create_new_and_release(&path, b"new\n", guard)
+        let err = create_new_and_release(&ctx, &path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -2880,7 +2884,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "forced create failure",
         ));
-        let _ = create_new_and_release(&path, b"new\n", guard)
+        let _ = create_new_and_release(&ctx, &path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -3253,7 +3257,7 @@ mod tests {
 
         let raced = path.clone();
         set_before_file_create_hook(move || std::fs::write(raced, "raced\n").unwrap());
-        let err = create_new_and_release(&path, b"new\n", guard)
+        let err = create_new_and_release(&ctx, &path, b"new\n", guard)
             .await
             .unwrap_err();
 

@@ -2976,22 +2976,21 @@ impl Driver {
                     ));
                 }
             };
-            let parent_agent_instance_id = match self.ensure_root_agent_instance_id().await {
-                Ok(id) => id,
-                Err(error) => {
-                    tracing::warn!(%error, %task_call_id, "single task has no durable parent agent");
-                    return Ok(Some(
-                        self.refuse_minted_noninteractive_workspace_leases(
-                            [task.workspace_lease.clone()],
-                            task_call_id,
-                            task_provider_item_id,
-                            task_function_call_id,
-                            &task.repair_notes,
-                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        )
-                        .await,
-                    ));
-                }
+            let Some(parent_agent_instance_id) =
+                self.stack.last().and_then(|frame| frame.agent_instance_id)
+            else {
+                tracing::warn!(%task_call_id, "single task has no durable parent agent");
+                return Ok(Some(
+                    self.refuse_minted_noninteractive_workspace_leases(
+                        [task.workspace_lease.clone()],
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await,
+                ));
             };
             if let Err(error) = self
                 .session
@@ -6533,21 +6532,20 @@ impl Driver {
                 )?;
             initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
-        let parent_agent_instance_id = match self.ensure_root_agent_instance_id().await {
-            Ok(id) => id,
-            Err(error) => {
-                tracing::warn!(%error, %task_call_id, "batch task has no durable parent agent");
-                return Ok(self
-                    .refuse_minted_noninteractive_workspace_leases(
-                        minted_workspace_leases.clone(),
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
-                        &task.repair_notes,
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                    )
-                    .await);
-            }
+        let Some(parent_agent_instance_id) =
+            self.stack.last().and_then(|frame| frame.agent_instance_id)
+        else {
+            tracing::warn!(%task_call_id, "batch task has no durable parent agent");
+            return Ok(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    minted_workspace_leases.clone(),
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    &task.repair_notes,
+                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                )
+                .await);
         };
         let tree_children = initial_snapshots
             .into_iter()

@@ -3151,6 +3151,13 @@ fn resolve_unprepared_vnext_primary_slot(
     if let Some(selector) = &args.delegation_model {
         return resolve_unprepared_vnext_delegation_selector(def, slot, args, extended, selector);
     }
+    if let Some(model) = &args.model_override
+        && !args.delegated
+    {
+        // Unprepared roots accept a picker pin the same way prepared roots
+        // do: the live override already went through `build_live_model`.
+        return Ok(model.clone());
+    }
     if slot.models.is_empty() {
         if crate::engine::model_roles::default_role_for_agent(&def.name).is_none() {
             // Session-ownable primaries (Build/Plan/…) keep the spawn/resume

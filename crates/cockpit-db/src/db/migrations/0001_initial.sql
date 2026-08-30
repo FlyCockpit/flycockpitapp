@@ -1097,8 +1097,10 @@ CREATE TABLE tool_call_events (
     event_id            TEXT    PRIMARY KEY,
     session_id          TEXT    NOT NULL,
     call_id             TEXT    NOT NULL,
-    -- [relationship:foreign] Same-session parent tool call. Historical
-    -- attribution is retained with the child and cannot cross sessions.
+    -- [relationship:denormalized] Same-session parent tool call attribution.
+    -- Children persist before the parent audit row exists (MCP nested
+    -- dispatches), and journal-failure may store a scrubbed placeholder, so
+    -- this is not a hard parent pointer.
     parent_call_id      TEXT    DEFAULT NULL,
     parent_child_index  INTEGER DEFAULT NULL,
     timestamp           INTEGER NOT NULL,
@@ -1160,10 +1162,9 @@ CREATE TABLE tool_call_events (
     wire_api                TEXT DEFAULT NULL,
     provider_family         TEXT DEFAULT NULL,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    FOREIGN KEY (session_id, parent_call_id)
-        REFERENCES tool_call_events(session_id, call_id)
-        ON DELETE CASCADE ON UPDATE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+    -- parent_call_id is denormalized attribution (including scrubbed
+    -- placeholders after journal failure) and is not a hard parent pointer.
 );
 
 CREATE INDEX idx_tce_session_ts ON tool_call_events (session_id, timestamp);

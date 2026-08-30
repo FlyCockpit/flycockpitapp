@@ -361,8 +361,9 @@ impl DreamEngine {
 
     /// Validate and apply the final merge produced by the orchestrator. The
     /// orchestrator and its one worker layer never receive a write capability.
-    pub async fn apply_orchestrated_change_set(
+    pub(crate) async fn apply_orchestrated_change_set(
         &self,
+        _run_fence: crate::session::DreamRunFence,
         knowledge_base: &KnowledgeBaseRegistryEntry,
         config: &ExtendedConfig,
         providers: &ProvidersConfig,
@@ -372,16 +373,12 @@ impl DreamEngine {
         sink: &dyn DreamSink,
         cancel: CancellationToken,
     ) -> Result<DreamRunOutcome> {
-        // Daemon advisory serialization covers selection through ledger
-        // commit. LocalGitSink additionally holds #138's cross-process/root
-        // fence around the filesystem transaction.
+        // `_run_fence` is the exact per-KB boundary acquired before source
+        // selection and transferred here by the apply owner. LocalGitSink
+        // additionally holds #138's cross-process/root fence around the
+        // filesystem transaction.
         let project_root =
             CanonicalDreamProjectRoot::from_session_path(&self.session.project_root)?;
-        let dream_lock = knowledge_dream_lock_for_root(&project_root, &knowledge_base.id);
-        let _dream_guard = tokio::select! {
-            guard = dream_lock.lock() => guard,
-            () = cancel.cancelled() => bail!("knowledge dream cancelled while waiting for the KB lock"),
-        };
         ensure!(
             matches!(&knowledge_base.source, KnowledgeBaseSource::Local { .. }),
             "remote dream submission is hosted and not implemented"
@@ -464,18 +461,7 @@ pub(crate) fn knowledge_dream_lock_for_root(
     project_root: &CanonicalDreamProjectRoot,
     kb_id: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let key = knowledge_dream_lock_key(project_root, kb_id);
-    let mut locks = LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("knowledge dream lock registry poisoned");
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
-    lock
+    knowledge_dream_run_lock_for_root(project_root, kb_id)
 }
 
 pub(crate) fn knowledge_dream_run_lock_for_root(
@@ -721,6 +707,7 @@ mod tests {
         let run_second = knowledge_dream_run_lock_for_root(&second_root_id, "kb");
         assert!(Arc::ptr_eq(&run_first, &run_first_again));
         assert!(!Arc::ptr_eq(&run_first, &run_second));
+        assert!(Arc::ptr_eq(&first_lock, &run_first));
     }
 
     #[test]

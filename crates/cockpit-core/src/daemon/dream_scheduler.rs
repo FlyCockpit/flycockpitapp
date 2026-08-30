@@ -270,9 +270,9 @@ pub(crate) enum DreamRunDisposition {
     Completed,
 }
 
-/// Execute one complete Dream turn under the daemon-wide per-KB execution
-/// fence. Both scheduled fires and manual CLI runs use this boundary, so they
-/// cannot perform duplicate source selection or concurrent model work.
+/// Execute one complete Dream turn. The initial fast path and the model-facing
+/// source tool both use the shared per-KB execution fence; the latter keeps it
+/// through model work and transfers it to completion-ledger ownership.
 pub(crate) async fn run_knowledge_dream(
     db: &Db,
     registry: &SessionRegistry,
@@ -284,18 +284,23 @@ pub(crate) async fn run_knowledge_dream(
     scheduled: bool,
 ) -> Result<DreamRunDisposition> {
     let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
-    let _run_guard = knowledge_dream_run_lock_for_root(&project_root, &knowledge_base.id)
-        .lock_owned()
-        .await;
-    let consumer = db.ensure_installation_identity().await?;
-    let sources = db
-        .undreamed_sessions_for_knowledge_base(
+    let sources = {
+        // This check avoids starting a Dream session when there is no work.
+        // It deliberately releases before the tool-driven turn begins: the
+        // authoritative source selection acquires the same fence and retains
+        // it through model work and ledger verification.
+        let _run_guard = knowledge_dream_run_lock_for_root(&project_root, &knowledge_base.id)
+            .lock_owned()
+            .await;
+        let consumer = db.ensure_installation_identity().await?;
+        db.undreamed_sessions_for_knowledge_base(
             &knowledge_base.id,
             project_root.as_str(),
             consumer.as_hex(),
             caller_trust,
         )
-        .await?;
+        .await?
+    };
     if sources.is_empty() {
         return Ok(DreamRunDisposition::Empty);
     }
@@ -728,7 +733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independently_scheduled_knowledge_bases_each_persist_their_fire() {
+    async fn independently_scheduled_knowledge_bases_fire_only_when_their_own_cursor_is_due() {
         let db = Db::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         db.set_workspace_trust(root.path(), WorkspaceTrustMode::Trust)
@@ -748,6 +753,27 @@ mod tests {
             .as_hex()
             .to_owned();
         let project_root = root.path().canonicalize().unwrap().display().to_string();
+        let now = Utc::now().timestamp_millis();
+        let hourly_cursor = now - 2 * 60 * 60 * 1_000;
+        let daily_cursor = now;
+        db.record_knowledge_dream_schedule_fire(
+            "hourly",
+            &project_root,
+            &consumer_id,
+            hourly_cursor,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_knowledge_dream_schedule_fire(
+            "daily",
+            &project_root,
+            &consumer_id,
+            daily_cursor,
+            None,
+        )
+        .await
+        .unwrap();
 
         scheduler.run_due_once().await.unwrap();
 
@@ -761,14 +787,15 @@ mod tests {
                     .knowledge_base_last_scheduled_at("daily", &project_root, &consumer_id)
                     .await
                     .unwrap();
-                if hourly.is_some() && daily.is_some() {
+                if hourly.is_some_and(|scheduled_at| scheduled_at > hourly_cursor) {
+                    assert_eq!(daily, Some(daily_cursor));
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("each due knowledge base should fire independently");
+        .expect("the due hourly KB should fire while its not-due daily sibling does not");
     }
 
     #[tokio::test]

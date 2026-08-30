@@ -3858,6 +3858,9 @@ impl Tool for KnowledgeDreamSourcesTool {
         );
         let consumer = ctx.session.db.ensure_installation_identity().await?;
         let project_root = dream::CanonicalDreamProjectRoot::from_session_path(&ctx.cwd)?;
+        ctx.session
+            .acquire_dream_run_fence(&project_root, &knowledge_base.entry.id, &ctx.cancel)
+            .await?;
         let mut sources = ctx
             .session
             .db
@@ -4022,6 +4025,8 @@ impl Tool for KnowledgeDreamApplyTool {
                 }),
             "knowledge_dream_apply requires a prior knowledge_dream_sources call for the same source sessions"
         );
+        let project_root = dream::CanonicalDreamProjectRoot::from_session_path(&ctx.cwd)?;
+        let run_fence = ctx.session.take_dream_run_fence(&project_root, &entry.id)?;
         let cancel = dream_write_cancellation(ctx);
         let sink = dream::LocalGitSink::new(
             ctx.session.clone(),
@@ -4042,6 +4047,7 @@ impl Tool for KnowledgeDreamApplyTool {
         let apply = tokio::spawn(async move {
             engine
                 .apply_orchestrated_change_set(
+                    run_fence,
                     &entry,
                     &extended,
                     &providers,

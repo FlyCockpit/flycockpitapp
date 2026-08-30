@@ -490,6 +490,7 @@ impl Session {
             freshly_created,
             db,
             dream_read_scope: Arc::new(std::sync::RwLock::new(None)),
+            dream_run_fence: Arc::new(Mutex::new(super::DreamRunFenceState::Vacant)),
             secret_vault: vault,
             external_journal: Mutex::new(None),
             transcription_dispatch: Mutex::new(std::collections::HashMap::new()),

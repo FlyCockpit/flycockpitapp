@@ -369,7 +369,7 @@ pub(crate) async fn run_knowledge_dream(
             return Err(error).context("Dream session dropped queue acknowledgement");
         }
     };
-    let (queued_item, _) = queued.map_err(|error| anyhow::anyhow!(error.message))?;
+    let (queued_item, _) = resolve_dream_queue_acknowledgement(&dream_session, queued)?;
     let turn_id = queued_item.id.to_string();
     await_dream_turn_terminal(registry, &handle, &turn_id, DREAM_TURN_TIMEOUT).await?;
 
@@ -402,6 +402,27 @@ pub(crate) async fn run_knowledge_dream(
         disposition: DreamRunDisposition::Completed,
         session_ids,
         commit,
+    })
+}
+
+/// Convert the worker's queue acknowledgement while releasing a fence that
+/// could not have been promoted: a rejected message never enters the driver.
+fn resolve_dream_queue_acknowledgement(
+    dream_session: &crate::session::Session,
+    queued: std::result::Result<
+        (
+            crate::daemon::proto::QueueItem,
+            Vec<crate::daemon::proto::QueueItem>,
+        ),
+        crate::daemon::proto::ErrorPayload,
+    >,
+) -> Result<(
+    crate::daemon::proto::QueueItem,
+    Vec<crate::daemon::proto::QueueItem>,
+)> {
+    queued.map_err(|error| {
+        dream_session.clear_pending_dream_run_fence();
+        anyhow::anyhow!(error.message)
     })
 }
 
@@ -982,6 +1003,46 @@ mod tests {
             scheduled.await.unwrap().unwrap().disposition,
             DreamRunDisposition::Empty
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_dream_queue_rejection_releases_pending_run_fence() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            Session::create_deferred_for_test(
+                db,
+                root.path().to_path_buf(),
+                "Dream",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let entry = test_dream_entry(None);
+        let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let run_fence = crate::session::DreamRunFence::acquire(&project_root, &entry.id).await;
+        session.install_dream_run_fence(run_fence.clone()).unwrap();
+
+        assert!(
+            resolve_dream_queue_acknowledgement(
+                &session,
+                Err(crate::daemon::proto::ErrorPayload {
+                    code: crate::daemon::proto::ErrorCode::UserMessageNotAccepted,
+                    message: "session persistence rejected Dream".to_string(),
+                }),
+            )
+            .is_err(),
+            "an acknowledged queue rejection must be propagated"
+        );
+        drop(run_fence);
+
+        let next_fence = tokio::time::timeout(
+            Duration::from_secs(1),
+            knowledge_dream_run_lock_for_root(&project_root, &entry.id).lock_owned(),
+        )
+        .await
+        .expect("a rejected Dream turn must release the per-KB execution fence");
+        drop(next_fence);
     }
 
     #[tokio::test(start_paused = true)]

@@ -929,6 +929,7 @@ mod tests {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            resume_compaction_offer: None,
             daemon_version: proto::DAEMON_VERSION.to_string(),
             compatible: true,
             env_baseline: None,

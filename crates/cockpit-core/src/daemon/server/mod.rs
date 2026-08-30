@@ -362,6 +362,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             history,
             paused_work,
             repair_required,
+            resume_compaction_offer: _,
             daemon_version: _,
             compatible: _,
             env_baseline: _,

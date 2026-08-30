@@ -5783,6 +5783,12 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         SessionWork::RepairResume { respond_to } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
+        SessionWork::PrepareResumeCompaction { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::ResumeFromCompaction { respond_to } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
         SessionWork::SetRedaction { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
@@ -13315,6 +13321,56 @@ pub(super) async fn run_worker(
                     {
                         break WorkerStop::DriverFailed;
                     }
+                }
+                SessionWork::PrepareResumeCompaction {
+                    idle_for_secs,
+                    respond_to,
+                } => {
+                    let (driver_respond_to, driver_response_rx) = oneshot::channel();
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::PrepareResumeCompaction {
+                            idle_for_secs,
+                            respond_to: driver_respond_to,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send(Err("driver is unavailable".to_string()));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let result = driver_response_rx.await.unwrap_or_else(|error| {
+                        Err(format!("driver resume preparation failed: {error}"))
+                    });
+                    let _ = respond_to.send(result);
+                }
+                SessionWork::ResumeFromCompaction { respond_to } => {
+                    let (driver_respond_to, driver_response_rx) = oneshot::channel();
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::ResumeFromCompaction {
+                            respond_to: driver_respond_to,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send(Err("driver is unavailable".to_string()));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let result = driver_response_rx.await.unwrap_or_else(|error| {
+                        Err(format!("driver resume compaction failed: {error}"))
+                    });
+                    let _ = respond_to.send(result);
                 }
                 SessionWork::Pin { text } => {
                     if !send_driver_control_or_fail(

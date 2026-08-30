@@ -1522,6 +1522,16 @@ export const btwForkInfoSchema = z
   })
   .passthrough();
 export type BtwForkInfo = z.infer<typeof btwForkInfoSchema>;
+export const resumeCompactionOfferSchema = z
+  .object({
+    default: z.enum(["full", "compacted", "ask"]),
+    fullInputTokens: safeU64NumberSchema,
+    compactedInputTokens: safeU64NumberSchema,
+    fullCtxPct: z.number().finite().optional(),
+    compactedCtxPct: z.number().finite().optional(),
+  })
+  .passthrough();
+export type ResumeCompactionOffer = z.infer<typeof resumeCompactionOfferSchema>;
 export const attachedDataSchema = z
   .object({
     session_id: uuidSchema,
@@ -1537,6 +1547,7 @@ export const attachedDataSchema = z
     history: z.array(historyEntryWireSchema),
     paused_work: z.array(pausedWorkSummarySchema),
     repair_required: resumeRepairStateSchema.optional(),
+    resume_compaction_offer: resumeCompactionOfferSchema.optional(),
     daemon_version: z.string(),
     compatible: z.boolean(),
     env_baseline: envSnapshotMetaSchema.optional(),

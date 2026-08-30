@@ -98,6 +98,41 @@ impl App {
         self.push_plain("/prune: cancelled.".to_string());
     }
 
+    /// Present the exact rolling-summary choice returned by an interactive
+    /// away-resume attach. Full context is the default: any non-confirm key
+    /// retains it and the daemon keeps the rolling snapshot banked.
+    pub(super) fn arm_resume_compaction_confirm(
+        &mut self,
+        offer: cockpit_proto::ResumeCompactionOffer,
+    ) {
+        let context = |pct: Option<f64>| {
+            pct.map(|value| format!(" ({value:.0}% ctx)"))
+                .unwrap_or_default()
+        };
+        self.push_plain(format!(
+            "Session was idle. Resume full conversation: {} tokens{} (default), or resume from compaction: {} tokens{}. Press y or Enter for compaction; any other key keeps full context.",
+            offer.full_input_tokens,
+            context(offer.full_ctx_pct),
+            offer.compacted_input_tokens,
+            context(offer.compacted_ctx_pct),
+        ));
+        self.pending_resume_compaction_confirm = true;
+    }
+
+    pub(super) fn commit_resume_compaction(&mut self) {
+        self.pending_resume_compaction_confirm = false;
+        self.send_daemon_request(
+            "resume from compaction",
+            cockpit_proto::Request::ResumeFromCompaction,
+            ControlApplied::None,
+        );
+    }
+
+    pub(super) fn cancel_resume_compaction(&mut self) {
+        self.pending_resume_compaction_confirm = false;
+        self.push_plain("Resume: keeping full conversation.".to_string());
+    }
+
     /// `/compact`: enqueue an in-place compaction turn on the active session.
     pub(super) fn start_compact(&mut self) {
         let submission = ClientUserSubmission::compact_notice();

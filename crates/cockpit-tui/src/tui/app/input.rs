@@ -575,6 +575,7 @@ impl App {
         if is_keys_leader(&key)
             && self.question_dialog.is_none()
             && !self.pending_prune_confirm
+            && !self.pending_resume_compaction_confirm
             && self.pending_stop_confirm.is_none()
         {
             self.toggle_keys_overlay();
@@ -588,6 +589,15 @@ impl App {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.commit_prune(),
                 _ => self.cancel_prune(),
+            }
+            return false;
+        }
+        if self.pending_resume_compaction_confirm && !is_modifier_only(&key) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.commit_resume_compaction()
+                }
+                _ => self.cancel_resume_compaction(),
             }
             return false;
         }
@@ -1476,6 +1486,7 @@ impl App {
             && self.question_dialog.is_none()
             && self.pending_local_choice.is_none()
             && !self.pending_prune_confirm
+            && !self.pending_resume_compaction_confirm
             && self.pending_stop_confirm.is_none()
             && self.pending_compact.is_none()
             && self.pending_mcp_local.is_none()

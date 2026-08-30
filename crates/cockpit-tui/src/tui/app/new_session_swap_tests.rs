@@ -136,6 +136,7 @@ fn switch_outcome_with_epoch(
         history: Vec::new(),
         paused_work: Vec::new(),
         repair_required: None,
+        resume_compaction_offer: None,
         btw_fork: None,
         daemon_version: "test".to_string(),
         daemon_compatible: true,

@@ -165,6 +165,7 @@ pub struct DurableShadowBrief {
     pub snapshot_history: Vec<Message>,
     pub snapshot_turns: usize,
     pub snapshot_tail_turns: usize,
+    pub turns_since_rebuild: usize,
     pub brief: String,
     pub fit_rung: crate::engine::compact_draft::CompactFitRung,
     pub input_coverage: crate::engine::compact_draft::CompactInputCoverage,
@@ -305,6 +306,7 @@ impl From<&ShadowBriefReady> for DurableShadowBrief {
             snapshot_history: ready.snapshot_history.clone(),
             snapshot_turns: ready.snapshot_turns,
             snapshot_tail_turns: ready.snapshot_tail_turns,
+            turns_since_rebuild: ready.turns_since_rebuild,
             brief: ready.brief.clone(),
             fit_rung: ready.fit_rung,
             input_coverage: ready.input_coverage,
@@ -319,6 +321,7 @@ impl From<DurableShadowBrief> for ShadowBriefReady {
             snapshot_history: record.snapshot_history,
             snapshot_turns: record.snapshot_turns,
             snapshot_tail_turns: record.snapshot_tail_turns,
+            turns_since_rebuild: record.turns_since_rebuild,
             brief: record.brief,
             fit_rung: record.fit_rung,
             input_coverage: record.input_coverage,
@@ -354,7 +357,7 @@ impl Driver {
 
     async fn persist_ready_shadow_brief(&self, ready: &ShadowBriefReady) {
         let context = self.resolve_context_config();
-        if !context.compact_shadow {
+        if !context.compact_shadow && !context.rolling_precompaction {
             self.delete_durable_shadow_brief().await;
             return;
         }
@@ -378,7 +381,7 @@ impl Driver {
 
     pub(in crate::engine::driver) async fn load_compaction_shadow_from_store(&mut self) {
         let ctx_cfg = self.resolve_context_config();
-        if !ctx_cfg.compact_shadow {
+        if !ctx_cfg.compact_shadow && !ctx_cfg.rolling_precompaction {
             self.shadow_brief = None;
             self.delete_durable_shadow_brief().await;
             return;
@@ -1016,6 +1019,7 @@ impl Driver {
                 snapshot_history: task.snapshot_history,
                 snapshot_turns: task.snapshot_turns,
                 snapshot_tail_turns: task.snapshot_tail_turns,
+                turns_since_rebuild: task.turns_since_rebuild,
                 brief: success.brief,
                 fit_rung: success.fit_rung,
                 input_coverage: success.input_coverage,
@@ -1068,7 +1072,7 @@ impl Driver {
         }
         self.settle_shadow_brief().await;
         let ctx_cfg = self.resolve_context_config();
-        if !ctx_cfg.compact_shadow {
+        if !ctx_cfg.compact_shadow && !ctx_cfg.rolling_precompaction {
             self.cancel_shadow_brief_inflight().await;
             self.shadow_brief = None;
             self.delete_durable_shadow_brief().await;
@@ -1126,10 +1130,25 @@ impl Driver {
                 .session
                 .last_usage()
                 .is_some_and(|usage| usage.cached_input_tokens > 0);
+            // Never delta-revise a fitted source. Its omitted prefix is not
+            // represented by the old brief, so a later fitted delta cannot
+            // make the combined snapshot full. Rebuild from the entire
+            // current history instead and retain the model's actual coverage.
+            let prior_is_partial = ready.as_ref().is_some_and(|ready| {
+                ready.input_coverage == crate::engine::compact_draft::CompactInputCoverage::Partial
+            });
             let rebuild = ready.is_none()
+                || prior_is_partial
                 || (ctx_cfg.rolling_precompaction_rebuild_turns > 0
-                    && delta_turns >= ctx_cfg.rolling_precompaction_rebuild_turns)
+                    && ready.as_ref().is_some_and(|ready| {
+                        ready.turns_since_rebuild.saturating_add(delta_turns)
+                            >= ctx_cfg.rolling_precompaction_rebuild_turns
+                    }))
                 || warm;
+            let turns_since_rebuild = match ready.as_ref() {
+                Some(ready) if !rebuild => ready.turns_since_rebuild.saturating_add(delta_turns),
+                _ => 0,
+            };
             let (draft_history, prompt_text, purpose) = match ready {
                 Some(ready) if !rebuild => (
                     crate::engine::compact::shadow_revision_history(
@@ -1175,6 +1194,7 @@ impl Driver {
                 snapshot_history,
                 snapshot_turns,
                 snapshot_tail_turns,
+                turns_since_rebuild,
                 cancel,
                 handle,
             }));
@@ -1245,6 +1265,7 @@ impl Driver {
             snapshot_history,
             snapshot_turns,
             snapshot_tail_turns,
+            turns_since_rebuild: 0,
             cancel,
             handle,
         }));
@@ -1306,6 +1327,98 @@ impl Driver {
         self.prepare_compaction_with_source(tx, "resume")
             .await
             .map(Some)
+    }
+
+    /// Build the presentation data for an idle-session resume without
+    /// consuming the exact rolling snapshot. A declined offer therefore keeps
+    /// the snapshot available for a later foreground compaction.
+    pub(in crate::engine::driver) async fn prepare_resume_compaction_offer(
+        &mut self,
+        idle_for_secs: u64,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<Option<crate::daemon::proto::ResumeCompactionOffer>, PrepareCompactionError> {
+        let context = self.resolve_context_config();
+        if context.idle_window_secs == 0 || idle_for_secs < context.idle_window_secs {
+            return Ok(None);
+        }
+        let Some(prepared) = self.prepare_exact_rolling_compaction(tx).await? else {
+            return Ok(None);
+        };
+        let context_window = self
+            .active_model_context_length()
+            .filter(|window| *window > 0);
+        let ctx_pct =
+            |tokens: u64| context_window.map(|window| tokens as f64 / f64::from(window) * 100.0);
+        let default = match context.resume_default {
+            crate::config::providers::ResumeDefault::Full => {
+                crate::daemon::proto::ResumeCompactionDefault::Full
+            }
+            crate::config::providers::ResumeDefault::Compacted => {
+                crate::daemon::proto::ResumeCompactionDefault::Compacted
+            }
+            crate::config::providers::ResumeDefault::Ask => {
+                crate::daemon::proto::ResumeCompactionDefault::Ask
+            }
+        };
+        Ok(Some(crate::daemon::proto::ResumeCompactionOffer {
+            default,
+            full_input_tokens: prepared.tokens_before,
+            compacted_input_tokens: prepared.tokens_after,
+            full_ctx_pct: prepared
+                .trigger_ctx_pct
+                .or_else(|| ctx_pct(prepared.tokens_before)),
+            compacted_ctx_pct: ctx_pct(prepared.tokens_after),
+        }))
+    }
+
+    /// Accept the compacted branch of a prior idle-resume offer. Re-preparing
+    /// from the retained rolling brief rechecks exactness at the same safe
+    /// boundary and remains a zero-inference operation.
+    pub(in crate::engine::driver) async fn apply_exact_rolling_compaction(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<(), String> {
+        if !self.at_safe_boundary() || self.stack.len() != 1 {
+            return Err("resume compaction is unavailable while the session is active".to_string());
+        }
+        let Some(prepared) = self
+            .prepare_exact_rolling_compaction(tx)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("resume compaction snapshot is no longer exact".to_string());
+        };
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PreCompact,
+            "resume",
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some("resume"),
+                ..Default::default()
+            },
+        )
+        .await;
+        self.apply_prepared_compaction(prepared, tx)
+            .await
+            .map_err(|error| match error {
+                PreparedCompactionApplyError::Stale { .. } => {
+                    "resume compaction snapshot is no longer exact".to_string()
+                }
+                PreparedCompactionApplyError::StoreTextArtifacts(error) => error,
+            })?;
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PostCompact,
+            "resume",
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some("resume"),
+                ..Default::default()
+            },
+        )
+        .await;
+        Ok(())
     }
 
     /// Auto-compact trigger (implementation note): at or
@@ -1504,7 +1617,23 @@ impl Driver {
         // Resolve shadow ownership before mutating history with the private
         // prune. An unfinished task is cancelled and falls back to the full
         // synchronous path; a stale ready draft is discarded likewise.
-        let shadow = if ctx_cfg.compact_shadow {
+        let rolling_snapshot_exact = ctx_cfg.rolling_precompaction
+            && matches!(
+                &self.shadow_brief,
+                Some(ShadowBriefState::Ready(ready))
+                    if ready.input_coverage == crate::engine::compact_draft::CompactInputCoverage::Full
+                        && ready.snapshot_history == self.compact_brief_history(&live_history)
+            );
+        let shadow = if rolling_snapshot_exact && source == "resume" {
+            // The attach offer is non-mutating: declining it must leave the
+            // exact rolling snapshot banked for the next compaction. Applying
+            // later re-prepares this deterministic handoff and still performs
+            // zero inference.
+            match &self.shadow_brief {
+                Some(ShadowBriefState::Ready(ready)) => Some(ready.clone()),
+                _ => None,
+            }
+        } else if ctx_cfg.compact_shadow || ctx_cfg.rolling_precompaction {
             self.take_fresh_shadow_brief(ctx_cfg.compact_keep_recent_turns)
                 .await
         } else {
@@ -1516,10 +1645,9 @@ impl Driver {
         // The rolling brief covers this raw root snapshot exactly. The private
         // prune below only removes redundant material, so its existing brief
         // remains valid for the resulting compaction handoff.
-        let rolling_snapshot_exact = ctx_cfg.rolling_precompaction
+        let rolling_snapshot_exact = rolling_snapshot_exact
             && shadow.as_ref().is_some_and(|ready| {
                 ready.input_coverage == crate::engine::compact_draft::CompactInputCoverage::Full
-                    && ready.snapshot_history == self.compact_brief_history(&live_history)
             });
         let trigger_ctx_pct = match (self.context_input_tokens(context_window), context_window) {
             (Some(used), Some(window)) if window > 0 => {
@@ -1805,6 +1933,12 @@ impl Driver {
         }
 
         self.session.reset_compact_self_nudge_latch();
+        // A retained rolling brief was intentionally cloned for a resume
+        // offer. Once its prepared compaction has actually replaced history,
+        // that source snapshot no longer describes the live conversation and
+        // must not survive to a later exactness check.
+        self.shadow_brief = None;
+        self.delete_durable_shadow_brief().await;
         self.auto_compact_gate.mark_committed();
         let _ = tx
             .send(TurnEvent::CompactReady {

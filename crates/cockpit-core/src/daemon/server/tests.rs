@@ -19346,6 +19346,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember".into(),
         },
@@ -21777,6 +21778,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember this".into(),
         },
@@ -21941,6 +21943,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         .unwrap();
                 }
                 ("repair_resume", SessionWork::RepairResume { respond_to }) => {
+                    respond_to.send(Ok(())).unwrap();
+                }
+                ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
                     respond_to.send(Ok(())).unwrap();
                 }
                 ("cancel_turn", SessionWork::Cancel) => {}
@@ -22413,6 +22418,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
@@ -26480,6 +26486,13 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::Compact,
             kind: "compact",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ResumeFromCompaction,
+            kind: "resume_from_compaction",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,

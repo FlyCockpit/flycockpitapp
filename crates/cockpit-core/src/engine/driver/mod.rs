@@ -178,6 +178,19 @@ pub enum DriverControl {
     /// deterministic appendix, derive context tags, create a fresh session,
     /// and emit `CompactReady`.
     Compact,
+    /// Inspect an away-resume without mutating history, so an interactive
+    /// client can retain the full conversation after seeing the offer.
+    PrepareResumeCompaction {
+        idle_for_secs: u64,
+        respond_to: tokio::sync::oneshot::Sender<
+            std::result::Result<Option<crate::daemon::proto::ResumeCompactionOffer>, String>,
+        >,
+    },
+    /// Apply the compacted branch of an away-resume from the retained exact
+    /// rolling snapshot. This is deterministic and performs no inference.
+    ResumeFromCompaction {
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
         text: String,
@@ -1505,6 +1518,11 @@ struct ShadowBriefInFlight {
     snapshot_history: Vec<Message>,
     snapshot_turns: usize,
     snapshot_tail_turns: usize,
+    /// Number of turns incrementally summarized since the last full rebuild.
+    /// This is independent of the current snapshot size: each delta revision
+    /// advances the ready snapshot, so deriving cadence from snapshot deltas
+    /// would otherwise observe only the most recent boundary.
+    turns_since_rebuild: usize,
     cancel: tokio_util::sync::CancellationToken,
     handle: tokio::task::JoinHandle<crate::engine::compact_draft::CompactDraftOutcome>,
 }
@@ -1515,6 +1533,7 @@ struct ShadowBriefReady {
     snapshot_history: Vec<Message>,
     snapshot_turns: usize,
     snapshot_tail_turns: usize,
+    turns_since_rebuild: usize,
     brief: String,
     fit_rung: crate::engine::compact_draft::CompactFitRung,
     input_coverage: crate::engine::compact_draft::CompactInputCoverage,
@@ -5916,6 +5935,19 @@ impl Driver {
                     return;
                 }
                 self.do_compact(tx).await;
+            }
+            DriverControl::PrepareResumeCompaction {
+                idle_for_secs,
+                respond_to,
+            } => {
+                let result = self
+                    .prepare_resume_compaction_offer(idle_for_secs, tx)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ResumeFromCompaction { respond_to } => {
+                let _ = respond_to.send(self.apply_exact_rolling_compaction(tx).await);
             }
             DriverControl::Pin { text } => {
                 self.session.pin_message(&text);

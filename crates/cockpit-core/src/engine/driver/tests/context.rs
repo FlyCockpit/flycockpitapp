@@ -425,7 +425,7 @@ async fn shadow_brief_predrafts() {
     wait_for_shadow_brief(&mut driver).await;
     assert_eq!(
         compact_inference_purposes(&driver).await,
-        ["compact_shadow_brief"]
+        ["rolling_compaction_rebuild"]
     );
     assert!(
         driver
@@ -436,6 +436,143 @@ async fn shadow_brief_predrafts() {
             .unwrap()
             .is_some(),
         "ready shadow brief is persisted eagerly"
+    );
+}
+
+#[tokio::test]
+async fn rolling_precompaction_survives_legacy_shadow_killswitch_and_rebuilds_on_cadence() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        rolling_precompaction_rebuild_turns: 2,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "rolling state persists even when the legacy pressure shadow is disabled"
+    );
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+
+    assert_eq!(
+        compact_inference_purposes(&driver).await,
+        [
+            "rolling_compaction_rebuild",
+            "rolling_compaction_delta",
+            "rolling_compaction_rebuild",
+        ],
+        "the cadence accumulates delta revisions rather than comparing only the latest turn"
+    );
+}
+
+#[tokio::test]
+async fn rolling_partial_snapshot_is_rebuilt_not_delta_promoted() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        rolling_precompaction_rebuild_turns: 24,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+    append_complete_test_turns(&mut driver, 2);
+    let snapshot = driver.compact_brief_history(&driver.stack[0].history);
+    driver.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
+        generation: 1,
+        snapshot_history: snapshot,
+        snapshot_turns: 2,
+        snapshot_tail_turns: 1,
+        turns_since_rebuild: 1,
+        brief: "fitted rolling brief".to_string(),
+        fit_rung: CompactFitRung::HistorySelected,
+        input_coverage: CompactInputCoverage::Partial,
+    }));
+    append_complete_test_turns(&mut driver, 1);
+
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    let calls = crate::sync::lock_or_recover(
+        driver
+            .test_compact_brief_calls
+            .as_ref()
+            .expect("fake compact seam"),
+    );
+    assert_eq!(
+        calls.last().expect("rolling call").purpose,
+        "rolling_compaction_rebuild"
+    );
+    assert_eq!(
+        crate::engine::compact::complete_exchange_count(
+            &calls.last().expect("rolling call").history
+        ),
+        3,
+        "a partial prior snapshot must be rebuilt from full current history"
+    );
+}
+
+#[tokio::test]
+async fn exact_resume_offer_retains_snapshot_and_apply_uses_no_inference() {
+    use crate::config::providers::{CacheMode, ContextConfig, ResumeDefault};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        idle_window_secs: 1,
+        resume_default: ResumeDefault::Ask,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+    append_complete_test_turns(&mut driver, 2);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    let before = compact_inference_purposes(&driver).await;
+
+    let offer = driver
+        .prepare_resume_compaction_offer(1, &tx)
+        .await
+        .expect("resume offer preparation succeeds")
+        .expect("exact rolling snapshot is offered after idle window");
+    assert!(offer.compacted_input_tokens <= offer.full_input_tokens);
+    assert!(matches!(
+        driver.shadow_brief,
+        Some(ShadowBriefState::Ready(_))
+    ));
+    assert_eq!(compact_inference_purposes(&driver).await, before);
+
+    driver
+        .apply_exact_rolling_compaction(&tx)
+        .await
+        .expect("accepted exact offer applies");
+    assert_eq!(compact_inference_purposes(&driver).await, before);
+    assert!(
+        driver.shadow_brief.is_none(),
+        "applied snapshot is discarded"
     );
 }
 
@@ -463,7 +600,7 @@ async fn compact_uses_shadow_delta() {
     assert_eq!(
         purposes
             .iter()
-            .filter(|p| p.as_str() == "compact_shadow_brief")
+            .filter(|p| p.as_str() == "rolling_compaction_rebuild")
             .count(),
         1,
         "the shadow/full draft runs exactly once"
@@ -484,7 +621,7 @@ async fn compact_uses_shadow_delta() {
             .expect("fake compact seam"),
     );
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].purpose, "compact_shadow_brief");
+    assert_eq!(calls[0].purpose, "rolling_compaction_rebuild");
     assert_eq!(calls[1].purpose, "compact_brief_delta");
     assert!(calls[1].prompt.contains("<existing_shadow_brief>"));
     assert_eq!(
@@ -543,7 +680,7 @@ async fn ready_brief_survives_driver_drop() {
     assert_eq!(
         purposes
             .iter()
-            .filter(|purpose| purpose.as_str() == "compact_shadow_brief")
+            .filter(|purpose| purpose.as_str() == "rolling_compaction_rebuild")
             .count(),
         1
     );
@@ -610,6 +747,7 @@ async fn load_without_row_clears_memory_view() {
         snapshot_history: vec![Message::user("memory only")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "memory only".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -631,6 +769,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         snapshot_history: vec![Message::user("snapshot"), Message::assistant("briefed")],
         snapshot_turns: 1,
         snapshot_tail_turns: 1,
+        turns_since_rebuild: 0,
         brief: "stored brief".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -662,6 +801,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         snapshot_history: vec![Message::user("older")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "older brief".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -729,6 +869,7 @@ async fn stale_loaded_brief_is_discarded() {
         snapshot_history: vec![Message::user("old")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "too old".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -767,6 +908,7 @@ async fn killswitch_writes_no_rows() {
         snapshot_history: vec![Message::user("delete me")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "delete me".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -1550,6 +1692,7 @@ async fn manual_compact_cancels_shadow() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         cancel,
         handle: tokio::spawn(std::future::pending::<
             crate::engine::compact_draft::CompactDraftOutcome,
@@ -1570,6 +1713,7 @@ async fn manual_compact_cancels_shadow() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         cancel: ending_cancel,
         handle: tokio::spawn(std::future::pending::<
             crate::engine::compact_draft::CompactDraftOutcome,
@@ -1596,6 +1740,7 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         cancel,
         handle: tokio::spawn(std::future::pending::<
             crate::engine::compact_draft::CompactDraftOutcome,
@@ -1620,6 +1765,7 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "ready".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -3411,6 +3557,7 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
         snapshot_history: snapshot_history.clone(),
         snapshot_turns: 2,
         snapshot_tail_turns: 1,
+        turns_since_rebuild: 0,
         cancel: tokio_util::sync::CancellationToken::new(),
         handle: tokio::spawn(async {
             crate::engine::compact_draft::CompactDraftOutcome::Success(

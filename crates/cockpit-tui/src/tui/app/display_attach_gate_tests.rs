@@ -1,17 +1,11 @@
 use super::should_attempt_display_attach;
 use std::cell::Cell;
 
-/// The happy path: no runner, prompt closed, not daemonless, believed
+/// The happy path: no runner, prompt closed, believed
 /// connected, and the daemon answers → attach.
 #[test]
 fn attaches_when_daemon_reachable() {
-    assert!(should_attempt_display_attach(
-        false,
-        false,
-        false,
-        true,
-        || true
-    ));
+    assert!(should_attempt_display_attach(false, false, true, || true));
 }
 
 /// A runner already exists → no attach, and the probe is never run
@@ -19,7 +13,7 @@ fn attaches_when_daemon_reachable() {
 #[test]
 fn skips_when_runner_exists_without_probing() {
     let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(true, false, false, true, || {
+    let attach = should_attempt_display_attach(true, false, true, || {
         probed.set(true);
         true
     });
@@ -32,7 +26,7 @@ fn skips_when_runner_exists_without_probing() {
 #[test]
 fn skips_while_prompt_open() {
     let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(false, true, false, true, || {
+    let attach = should_attempt_display_attach(false, true, true, || {
         probed.set(true);
         true
     });
@@ -40,28 +34,11 @@ fn skips_while_prompt_open() {
     assert!(!probed.get());
 }
 
-/// Daemonless ("continue without daemon") → never eager-spawn the owned
-/// ephemeral daemon purely to display an id (deliberate non-goal). Probe
-/// is skipped even though `daemon_connected` is true in this mode.
-#[test]
-fn skips_in_daemonless_mode() {
-    let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(false, false, true, true, || {
-        probed.set(true);
-        true
-    });
-    assert!(!attach);
-    assert!(
-        !probed.get(),
-        "daemonless must not probe/attach for display"
-    );
-}
-
 /// `daemon_connected` is false → no attach, no probe.
 #[test]
 fn skips_when_not_connected() {
     let probed = Cell::new(false);
-    let attach = should_attempt_display_attach(false, false, false, false, || {
+    let attach = should_attempt_display_attach(false, false, false, || {
         probed.set(true);
         true
     });
@@ -74,11 +51,5 @@ fn skips_when_not_connected() {
 /// is the "Start and connect" startup gap that previously double-spawned.
 #[test]
 fn waits_when_socket_not_yet_bound() {
-    assert!(!should_attempt_display_attach(
-        false,
-        false,
-        false,
-        true,
-        || false
-    ));
+    assert!(!should_attempt_display_attach(false, false, true, || false));
 }

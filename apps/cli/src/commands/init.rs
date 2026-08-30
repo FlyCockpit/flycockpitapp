@@ -53,7 +53,7 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
     let prompt = build_init_prompt(&shown, mode);
 
     let mode_lc = if args.ephemeral {
-        OwnedSessionMode::AlwaysEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     } else {
         OwnedSessionMode::AttachOrEphemeral
     };

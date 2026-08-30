@@ -2351,9 +2351,9 @@ pub struct DaemonContext {
     redaction_generation: std::sync::atomic::AtomicU64,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
     /// Live count of connected clients. Each [`handle_client`] task
-    /// increments on accept and decrements on exit. The ephemeral
-    /// self-reaping watchdog (Layer C) watches the receiver side for
-    /// "no clients" transitions; the persistent daemon ignores it.
+    /// increments on accept and decrements on exit. Ephemeral owners watch
+    /// the receiver side for their final-client transition; persistent
+    /// owners ignore it.
     client_count: tokio::sync::watch::Sender<usize>,
     /// Daemon-wide graceful-shutdown gate
     /// (`daemon-graceful-drain-shutdown.md`). Shared with the registry
@@ -3499,8 +3499,8 @@ impl DaemonContext {
         });
     }
 
-    /// Subscribe to the live connected-client count. Used by the
-    /// ephemeral idle watchdog (Layer C).
+    /// Subscribe to the live connected-client count. Used by ephemeral
+    /// lifetime ownership.
     pub fn client_presence(&self) -> tokio::sync::watch::Receiver<usize> {
         self.client_count.subscribe()
     }
@@ -4966,7 +4966,7 @@ async fn run_in_process_client(
     mut request_rx: mpsc::Receiver<cockpit_client::InProcessRequest>,
     event_tx: mpsc::Sender<proto::Event>,
 ) {
-    let _client_guard = ctx.track_client();
+    let mut client_guard = None;
     let client_instance_id = Uuid::new_v4();
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
@@ -5099,6 +5099,9 @@ async fn run_in_process_client(
                     let attached = matches!(&result, Ok(Response::Attached { .. }));
                     if (is_attach && attached) || state.attached.is_none() {
                         shared = state.shared_snapshot();
+                    }
+                    if is_attach && attached {
+                        client_guard.get_or_insert_with(|| ctx.track_client());
                     }
                     let _ = reply.send(result);
                     if is_attach && attached {
@@ -5243,9 +5246,6 @@ async fn handle_client_transport_as<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Count this client for the lifetime of the task. The guard
-    // decrements on every return below (Layer C presence tracking).
-    let _client_guard = ctx.track_client();
     let proto = ProtoStream::new(stream);
     let (reader, writer) = proto.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -5696,6 +5696,10 @@ async fn run_client_executor(
     );
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
+    // A connection becomes a lifetime reference only after a successful
+    // session Attach. Discovery/hello probes must not race a newly spawned
+    // ephemeral owner into shutdown.
+    let mut client_guard = None;
     loop {
         tokio::select! {
             biased;
@@ -5717,6 +5721,7 @@ async fn run_client_executor(
                             frame,
                             &mut state,
                             &mut shared,
+                            &mut client_guard,
                             &ctx,
                             &event_cmd_tx,
                             &writer_tx,
@@ -5741,6 +5746,7 @@ async fn handle_client_frame(
     frame: RecvFrame,
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
+    client_guard: &mut Option<ClientGuard>,
     ctx: &Arc<DaemonContext>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
@@ -5896,6 +5902,9 @@ async fn handle_envelope(
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
+            }
+            if is_attach && attached {
+                client_guard.get_or_insert_with(|| ctx.track_client());
             }
             let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);

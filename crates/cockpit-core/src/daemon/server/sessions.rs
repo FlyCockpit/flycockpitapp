@@ -10,9 +10,9 @@ pub(super) async fn list_sessions(
 ) -> std::result::Result<Response, ErrorPayload> {
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
-    // and the TUI's daemonless direct-DB fallback produce the same shape
+    // and the TUI's unavailable-connection fallback produce the same shape
     // (ordering / scoping / fork-grouping). The daemon adds its live
-    // processing overlay below; daemonless readers still get the durable
+    // processing overlay below; disconnected readers still get the durable
     // DB-derived state.
     let db = ctx.db.clone();
     let mut sessions = db

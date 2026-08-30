@@ -20,10 +20,8 @@ use tokio::sync::watch;
 
 /// Grace period the daemon waits for in-flight inference + tool calls to
 /// drain before it force-exits and aborts whatever is still running. Held
-/// at the same 30s as [`crate::daemon::EPHEMERAL_IDLE_GRACE`] per the
-/// drain-shutdown spec: an idle ephemeral daemon reaps after 30s of idle;
-/// a draining daemon (of either kind) waits at most this long for work to
-/// finish.
+/// while a draining daemon (of either lifetime) waits at most this long for
+/// work to finish.
 pub const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// The daemon's lifecycle phase. Monotonic: `Running → Draining → Forced`.

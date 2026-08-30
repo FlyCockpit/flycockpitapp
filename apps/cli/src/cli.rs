@@ -403,7 +403,7 @@ pub struct LearnArgs {
     /// Source request. Multiple words and sources are forwarded together.
     #[arg(required = true, num_args = 1..)]
     pub sources: Vec<String>,
-    /// Prefer a private ephemeral daemon. If a persistent daemon already
+    /// Prefer an ephemeral daemon. If a persistent daemon already
     /// holds the exclusive ledger lock, attach to it instead.
     #[arg(long)]
     pub ephemeral: bool,
@@ -729,7 +729,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub thinking: bool,
 
-    /// Prefer a private ephemeral daemon that stops when this run
+    /// Prefer an ephemeral daemon that stops after its final client
     /// completes. If a persistent daemon already holds the exclusive
     /// ledger lock, attach to it instead (and leave it running).
     #[arg(long)]
@@ -1596,7 +1596,7 @@ pub struct InitArgs {
     /// Regenerate (overwrite from scratch) an existing target file.
     #[arg(long)]
     pub force: bool,
-    /// Prefer a private ephemeral daemon. If a persistent daemon already
+    /// Prefer an ephemeral daemon. If a persistent daemon already
     /// holds the exclusive ledger lock, attach to it instead.
     #[arg(long)]
     pub ephemeral: bool,

@@ -14,11 +14,6 @@ impl App {
     ///   `None` state retries here.
     /// - The "daemon not running" prompt is closed — we don't spawn a
     ///   daemon out from under the user's choice.
-    /// - Not daemonless. In daemonless mode there is no daemon to merely
-    ///   *show* an id for; eager-attaching would spawn the owned ephemeral
-    ///   daemon purely for display. The short id appears once a daemon comes
-    ///   up on its own (the first message). `daemon_connected` stays true in
-    ///   that mode (the `/sessions` pane needs it), so it can't be the gate.
     /// - The canonical daemon probe is allowed to start. After "Start and
     ///   connect" the just-spawned socket isn't bound for a beat; probing in
     ///   the background lets us wait quietly and attach the instant it's up
@@ -30,7 +25,6 @@ impl App {
         let should_probe = should_attempt_display_attach(
             self.agent_runner.is_some(),
             self.daemon_prompt.is_some(),
-            self.daemonless,
             self.daemon_connected,
             || true,
         );
@@ -72,7 +66,6 @@ impl App {
         let attach = should_attempt_display_attach(
             self.agent_runner.is_some(),
             self.daemon_prompt.is_some(),
-            self.daemonless,
             self.daemon_connected,
             || true,
         );
@@ -81,18 +74,13 @@ impl App {
         }
     }
 
-    /// The daemon lifecycle this TUI attaches with. Daemonless mode owns a
-    /// fresh pid+nonce ephemeral daemon (`AlwaysEphemeral`); otherwise the TUI
-    /// attaches to the canonical daemon, auto-promoting a persistent one if
-    /// none is running.
+    /// The TUI attaches to the current ledger owner, preferring the selected
+    /// lifetime only when it must create that owner.
     pub(super) fn lifecycle_intent(&self) -> cockpit_client::LifecycleIntent {
-        if self.daemonless {
-            // First attach spawns our owned pid+nonce ephemeral daemon; later
-            // re-attaches (`/compact`, `/sessions` resume, `/new`) reconnect
-            // to that same daemon instead of spawning a second one.
-            cockpit_client::LifecycleIntent::AttachOwnEphemeral
+        if self.ephemeral_preference {
+            cockpit_client::LifecycleIntent::AttachOrEphemeral
         } else {
-            cockpit_client::LifecycleIntent::AttachOrAutoPromote
+            cockpit_client::LifecycleIntent::AttachOrPersistent
         }
     }
 
@@ -332,8 +320,6 @@ impl App {
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();
-            // In daemonless mode this runner spawned our own ephemeral
-            // daemon; arm the ownership guard so it's reaped on exit.
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
             // (session-id-display-and-lazy-persist).
@@ -375,9 +361,8 @@ impl App {
             // engine then injects, so the indicator matches what's actually
             // sent. Best-effort: a daemon that can't answer leaves the
             // launch-time estimate in place (no regression). Targets the
-            // runner's own socket so it reaches an owned pid+nonce ephemeral
-            // daemon (daemonless / auto-spawn), not just the canonical one —
-            // reuses the just-established daemon, no new spawn, one request.
+            // runner's endpoint so it reuses the established ledger owner
+            // without another discovery or spawn.
             self.refresh_guidance_estimate_from_daemon(r.endpoint.clone());
             if let Some(info) = live_btw_fork {
                 self.open_btw_pane_from_info(info, true);

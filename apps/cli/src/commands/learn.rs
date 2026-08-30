@@ -15,7 +15,7 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     let subject = subject_from_parts(&args.sources);
     let prompt = build_learn_prompt(&subject);
     let mode = if args.ephemeral {
-        OwnedSessionMode::AlwaysEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     } else {
         OwnedSessionMode::AttachOrEphemeral
     };

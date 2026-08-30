@@ -4,10 +4,8 @@
 //!   - Start a shared daemon (spawns a detached persistent child at the
 //!     canonical socket; survives this window and is managed with
 //!     `cockpit daemon {stop,status}`).
-//!   - Run a private daemon for this window only (daemonless mode): the
-//!     TUI owns a pid+nonce *ephemeral* daemon, isolated from the canonical
-//!     daemon and from any other TUI, that is torn down when this window
-//!     exits ([`DaemonChoice::ContinueWithout`]).
+//!   - Start an ephemeral daemon: it is shared at the canonical ledger
+//!     endpoint and shuts down after its final client detaches.
 //!   - Exit.
 //!
 //! The chosen action is returned to the caller via [`DaemonChoice`].
@@ -26,7 +24,7 @@ pub const DIALOG_HEIGHT: u16 = 14;
 #[derive(Debug, Clone, Copy)]
 pub enum DaemonChoice {
     StartAndConnect,
-    ContinueWithout,
+    StartEphemeral,
     Exit,
 }
 
@@ -63,7 +61,7 @@ impl DaemonPromptDialog {
         self.cursor = index.min(2);
         self.chosen = Some(match self.cursor {
             0 => DaemonChoice::StartAndConnect,
-            1 => DaemonChoice::ContinueWithout,
+            1 => DaemonChoice::StartEphemeral,
             _ => DaemonChoice::Exit,
         });
     }
@@ -86,7 +84,7 @@ impl DaemonPromptDialog {
             KeyCode::Enter => {
                 self.chosen = Some(match self.cursor {
                     0 => DaemonChoice::StartAndConnect,
-                    1 => DaemonChoice::ContinueWithout,
+                    1 => DaemonChoice::StartEphemeral,
                     _ => DaemonChoice::Exit,
                 });
                 true
@@ -117,18 +115,18 @@ impl DaemonPromptDialog {
             muted,
         )));
         lines.push(Line::from(Span::styled(
-            "later with `cockpit daemon stop`), or run a private daemon just".to_string(),
+            "later with `cockpit daemon stop`), or start an ephemeral daemon".to_string(),
             muted,
         )));
         lines.push(Line::from(Span::styled(
-            "for this window that shuts down automatically when you exit.".to_string(),
+            "that shuts down automatically after its final client exits.".to_string(),
             muted,
         )));
         lines.push(Line::default());
 
         let options = [
             "Start a shared daemon and connect (Recommended)",
-            "Run a private daemon for this window only",
+            "Start an ephemeral daemon",
             "Exit",
         ];
         for (i, label) in options.iter().enumerate() {

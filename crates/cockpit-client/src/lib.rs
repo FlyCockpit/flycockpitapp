@@ -167,10 +167,11 @@ impl ClientEndpoint {
 /// composition layer; the TUI never probes or spawns a daemon itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleIntent {
-    AttachOrAutoPromote,
+    /// Attach to the current owner, or start a persistent owner.
+    AttachOrPersistent,
+    /// Attach to the current owner, or start a reference-counted ephemeral
+    /// owner at the shared ledger socket.
     AttachOrEphemeral,
-    AlwaysEphemeral,
-    AttachOwnEphemeral,
     EnsurePersistent,
 }
 
@@ -1552,7 +1553,7 @@ mod tests {
         let (client, mut requests) = LifecycleClient::channel(1);
         let resolve = tokio::spawn(async move {
             client
-                .resolve(LifecycleIntent::AlwaysEphemeral)
+                .resolve(LifecycleIntent::AttachOrEphemeral)
                 .await
                 .expect("resolution")
         });
@@ -1581,7 +1582,7 @@ mod tests {
     async fn cancelled_lifecycle_resolution_closes_reply_and_acceptance() {
         let (client, mut requests) = LifecycleClient::channel(1);
         let resolve = tokio::spawn(async move {
-            let _ = client.resolve(LifecycleIntent::AlwaysEphemeral).await;
+            let _ = client.resolve(LifecycleIntent::AttachOrEphemeral).await;
         });
         let request = requests.recv().await.expect("lifecycle request");
         resolve.abort();

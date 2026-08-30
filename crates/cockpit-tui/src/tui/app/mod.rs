@@ -484,7 +484,7 @@ struct StartupDaemonState {
     prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
     connected: bool,
     socket: Option<std::path::PathBuf>,
-    daemonless: bool,
+    ephemeral_preference: bool,
     notice: Option<String>,
 }
 
@@ -501,24 +501,24 @@ fn startup_daemon_state(
             prompt: Some(crate::tui::daemon_prompt::DaemonPromptDialog::new()),
             connected: false,
             socket: None,
-            daemonless: false,
+            ephemeral_preference: false,
             notice: None,
         },
         cockpit_config::extended::DaemonAutostart::Private => StartupDaemonState {
             prompt: None,
             connected: true,
             socket: None,
-            daemonless: true,
+            ephemeral_preference: true,
             notice: daemon_autostart_notice(
                 false,
-                "started a private cockpit daemon for this window only",
+                "will start an ephemeral cockpit daemon when needed",
             ),
         },
         cockpit_config::extended::DaemonAutostart::Shared => StartupDaemonState {
             prompt: None,
             connected: true,
             socket: None,
-            daemonless: false,
+            ephemeral_preference: false,
             notice: None,
         },
     }
@@ -1130,8 +1130,6 @@ pub(super) fn decide_ctrl_c(
 ///   alone (it was already surfaced to the user);
 /// - the "daemon not running" prompt is closed (`!prompt_open`) — never spawn
 ///   a daemon out from under the user's pending choice;
-/// - not daemonless (`!daemonless`) — eager-attaching there would spawn the
-///   owned ephemeral daemon purely to display an id (a deliberate non-goal);
 /// - we believe a daemon should be reachable (`daemon_connected`); and
 /// - the canonical daemon actually answers right now (`probe_when()`) — so we
 ///   don't fire against the not-yet-bound socket in the "Start and connect"
@@ -1139,11 +1137,10 @@ pub(super) fn decide_ctrl_c(
 fn should_attempt_display_attach(
     has_runner: bool,
     prompt_open: bool,
-    daemonless: bool,
     daemon_connected: bool,
     probe_when: impl FnOnce() -> bool,
 ) -> bool {
-    if has_runner || prompt_open || daemonless || !daemon_connected {
+    if has_runner || prompt_open || !daemon_connected {
         return false;
     }
     probe_when()
@@ -2099,13 +2096,10 @@ pub struct App {
     pub(super) pending_local_choice: Option<LocalChoice>,
     /// True after we've successfully connected to (or started) the daemon.
     pub(super) daemon_connected: bool,
-    /// Daemonless mode (`DaemonChoice::ContinueWithout`): this TUI owns its
-    /// own pid+nonce *ephemeral* daemon, fully isolated from the canonical
-    /// persistent daemon and from any other TUI's ephemeral daemon. Set when
-    /// the user picks "Continue without daemon" at the launch prompt; it
-    /// flips the agent-runner lifecycle to `AlwaysEphemeral` so we spawn (and
-    /// own) a fresh daemon rather than auto-promoting the canonical one.
-    pub(super) daemonless: bool,
+    /// Prefer an ephemeral owner when this TUI is the first client of the
+    /// ledger. A pre-existing owner always wins, and either owner remains
+    /// reachable at the canonical socket.
+    pub(super) ephemeral_preference: bool,
     /// Lines emitted by an in-flight `/fetch-models` task. The event
     /// loop drains this each tick and appends to history.
     pub(super) fetch_models_progress: Arc<Mutex<Vec<String>>>,
@@ -3758,7 +3752,7 @@ impl App {
             last_composer_edit_at: None,
             pending_local_choice: None,
             daemon_connected: daemon_state.connected,
-            daemonless: daemon_state.daemonless,
+            ephemeral_preference: daemon_state.ephemeral_preference,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
             pending_runner_attach: None,
@@ -4180,17 +4174,6 @@ impl App {
                 async_shutdown.export_cleanup_retry_scheduled,
             );
         }
-        // Daemonless teardown (happy path): reap the owned ephemeral daemon
-        // and stop its signal watcher. The guard routes a synchronous
-        // `StopDaemon` through the daemon's single graceful drain path, so
-        // an in-flight ephemeral daemon drains before exiting. This fires on
-        // a clean quit *and* the error path below (the guard's `Drop` is the
-        // backstop if `run` returns early); SIGINT/SIGTERM are covered by the
-        // signal task. The self-reaping idle watchdog remains the backstop
-        // for an uncatchable death (SIGKILL). Reaping here is independent of
-        // whether a message was sent — a persisted session never keeps an
-        // owned ephemeral daemon alive past its owner's exit.
-
         // Build the exit-tail text while we still own the alt screen
         // (history is in memory; rendering is irrelevant — we want
         // the plaintext projection of recent entries).
@@ -4773,7 +4756,7 @@ fn spawn_git_refresh(
         loop {
             interval.tick().await;
             // Only overwrite on a successful RPC. A transiently unavailable
-            // daemon (or the daemonless fallback) leaves the last-known pill
+            // daemon leaves the last-known pill
             // in place instead of clearing it; a successful `None` (not in a
             // repo / detached HEAD) still clears it, matching the old local
             // behaviour.

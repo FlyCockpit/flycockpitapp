@@ -6,7 +6,8 @@
 //! - **Default:** attach to a long-running daemon if one is up;
 //!   otherwise spawn an ephemeral daemon that exits when the run
 //!   completes.
-//! - **`--ephemeral`:** spawn a private daemon that exits when the run
+//! - **`--ephemeral`:** prefer a reference-counted daemon that exits after
+//!   the final client detaches; an existing owner is always reused.
 //!   completes, unless a persistent daemon already holds the exclusive
 //!   ledger lock — then this run attaches to that owner and leaves it
 //!   running.
@@ -266,7 +267,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     }
 
     let mode = if args.ephemeral {
-        OwnedSessionMode::AlwaysEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     } else {
         OwnedSessionMode::AttachOrEphemeral
     };

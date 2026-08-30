@@ -4,15 +4,12 @@
 //! `cockpit-client`; this module owns only process and daemon lifecycle.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
 use crate::daemon::proto::{self, Request};
-
-static OWN_EPHEMERAL_PATHS: OnceLock<Mutex<Option<crate::daemon::DaemonPaths>>> = OnceLock::new();
 
 const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 const LIFECYCLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,11 +30,9 @@ async fn retain_guard_after_acceptance<G>(
 
 fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
     match intent {
-        cockpit_client::LifecycleIntent::AttachOrAutoPromote
-        | cockpit_client::LifecycleIntent::EnsurePersistent => LifecycleMode::AttachOrAutoPromote,
+        cockpit_client::LifecycleIntent::AttachOrPersistent
+        | cockpit_client::LifecycleIntent::EnsurePersistent => LifecycleMode::AttachOrPersistent,
         cockpit_client::LifecycleIntent::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
-        cockpit_client::LifecycleIntent::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
-        cockpit_client::LifecycleIntent::AttachOwnEphemeral => LifecycleMode::AttachOwnEphemeral,
     }
 }
 
@@ -46,28 +41,10 @@ fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
 /// Strategy for getting a daemon to talk to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleMode {
-    /// "Attach if running, otherwise auto-promote a long-running
-    /// background daemon." The TUI's default.
-    AttachOrAutoPromote,
-    /// "Attach if running, otherwise spawn a temporary daemon I'll
-    /// stop on exit." Default for `cockpit run`.
+    /// Attach to any current owner, otherwise start a persistent owner.
+    AttachOrPersistent,
+    /// Attach to any current owner, otherwise start an ephemeral owner.
     AttachOrEphemeral,
-    /// Prefer a private ephemeral daemon that stops when the caller
-    /// exits. If a persistent daemon already holds the exclusive
-    /// ledger lock, attach to that owner instead. Used by
-    /// `cockpit run --ephemeral`.
-    AlwaysEphemeral,
-    /// "Attach to *my own* per-process ephemeral daemon if it's already
-    /// running, otherwise spawn it." The daemonless TUI's mode
-    /// (`DaemonChoice::ContinueWithout`): the first attach spawns the
-    /// owned ephemeral daemon; every later re-attach in the same TUI
-    /// (`/compact`, `/sessions` resume, `/new`) reconnects to that *same*
-    /// cached instance path instead of spawning a second one. The path keeps
-    /// the caller pid prefix plus a per-spawn nonce via
-    /// [`crate::daemon::DaemonPaths::allocate_ephemeral`],
-    /// so it never touches the canonical socket and stays isolated from
-    /// any other TUI's ephemeral daemon. `owns_daemon = true`.
-    AttachOwnEphemeral,
 }
 
 /// Connect-or-spawn result: a ready-to-use client plus a flag the
@@ -162,17 +139,15 @@ struct OwnedDaemonSession {
 /// intentionally absent because it requires a different async guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnedSessionMode {
-    AttachOrAutoPromote,
+    AttachOrPersistent,
     AttachOrEphemeral,
-    AlwaysEphemeral,
 }
 
 impl OwnedSessionMode {
     fn lifecycle(self) -> LifecycleMode {
         match self {
-            Self::AttachOrAutoPromote => LifecycleMode::AttachOrAutoPromote,
+            Self::AttachOrPersistent => LifecycleMode::AttachOrPersistent,
             Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
-            Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
         }
     }
 }
@@ -325,7 +300,7 @@ pub struct PersistentDaemonSession {
 /// Product CLI commands that need installation state must go through this
 /// helper. Spawn failure is fail-closed: callers must not open SQLite.
 pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
-    let connected = probe_or_spawn(LifecycleMode::AttachOrAutoPromote).await?;
+    let connected = probe_or_spawn(LifecycleMode::AttachOrPersistent).await?;
     if connected.owns_daemon {
         anyhow::bail!(
             "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"
@@ -459,35 +434,18 @@ enum DiscoverAttachPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartWaitPlan {
     WaitForReplacement,
-    Spawn,
     FailWedged,
 }
 
-fn ephemeral_may_spawn_private(mode: LifecycleMode) -> bool {
-    matches!(
-        mode,
-        LifecycleMode::AlwaysEphemeral | LifecycleMode::AttachOrEphemeral
-    )
-}
-
 fn discover_attach_plan(
-    mode: LifecycleMode,
     status: crate::daemon::DaemonStatus,
     has_hello: bool,
 ) -> DiscoverAttachPlan {
     use crate::daemon::DaemonStatus;
     match status {
         DaemonStatus::Running => DiscoverAttachPlan::AttachRunning,
-        DaemonStatus::IncompatibleProtocol if ephemeral_may_spawn_private(mode) => {
-            DiscoverAttachPlan::Spawn
-        }
         DaemonStatus::IncompatibleProtocol => DiscoverAttachPlan::FailIncompatible,
         DaemonStatus::LivePidSocketUnreachable if !has_hello => DiscoverAttachPlan::WaitForRestart,
-        DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid
-            if ephemeral_may_spawn_private(mode) =>
-        {
-            DiscoverAttachPlan::Spawn
-        }
         DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid => {
             DiscoverAttachPlan::FailUnreachable
         }
@@ -495,13 +453,9 @@ fn discover_attach_plan(
     }
 }
 
-fn after_restart_wait(mode: LifecycleMode, error: SharedWaitError) -> RestartWaitPlan {
+fn after_restart_wait(error: SharedWaitError) -> RestartWaitPlan {
     match error {
-        SharedWaitError::Released if !ephemeral_may_spawn_private(mode) => {
-            RestartWaitPlan::WaitForReplacement
-        }
-        SharedWaitError::Released => RestartWaitPlan::Spawn,
-        SharedWaitError::Wedged if ephemeral_may_spawn_private(mode) => RestartWaitPlan::Spawn,
+        SharedWaitError::Released => RestartWaitPlan::WaitForReplacement,
         SharedWaitError::Wedged => RestartWaitPlan::FailWedged,
     }
 }
@@ -512,33 +466,16 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
 
     match mode {
-        LifecycleMode::AttachOrAutoPromote
-        | LifecycleMode::AttachOrEphemeral
-        | LifecycleMode::AlwaysEphemeral => {
+        LifecycleMode::AttachOrPersistent | LifecycleMode::AttachOrEphemeral => {
             let discovered = discover().await;
-            match discover_attach_plan(mode, discovered.status, discovered.hello.is_some()) {
+            match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
                 DiscoverAttachPlan::AttachRunning => {
-                    let attach_notice = matches!(mode, LifecycleMode::AlwaysEphemeral)
-                        .then(|| EPHEMERAL_ATTACH_NOTICE.to_string());
-                    let attached = if matches!(
-                        mode,
-                        LifecycleMode::AttachOrAutoPromote | LifecycleMode::AlwaysEphemeral
-                    ) {
-                        attach_running_with_skew_check(discovered.paths.clone(), attach_notice)
-                            .await
-                    } else {
-                        connect_shared_running(discovered.paths.clone(), None).await
-                    };
+                    let attached =
+                        attach_running_with_skew_check(discovered.paths.clone(), None).await;
                     match attached {
                         Ok(connected) => return Ok(connected),
                         Err(error) if is_protocol_version_mismatch(&error) => {
                             return Err(error);
-                        }
-                        Err(error) if ephemeral_may_spawn_private(mode) => {
-                            tracing::debug!(
-                                error = %error,
-                                "shared daemon disappeared after discover; spawning a private daemon"
-                            );
                         }
                         Err(error) => return Err(error),
                     }
@@ -546,11 +483,7 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                 DiscoverAttachPlan::WaitForRestart => {
                     let observed_pid =
                         cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
-                    let startup_notice =
-                        matches!(mode, LifecycleMode::AlwaysEphemeral).then(|| {
-                            "waiting for the already-running persistent daemon to finish restart"
-                                .to_string()
-                        });
+                    let startup_notice = None;
                     match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
                         Ok(client) => {
                             return Ok(ConnectedDaemon {
@@ -563,7 +496,7 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                                 owned_in_process_guard: None,
                             });
                         }
-                        Err(error) => match after_restart_wait(mode, error) {
+                        Err(error) => match after_restart_wait(error) {
                             RestartWaitPlan::WaitForReplacement => {
                                 tracing::info!(
                                     "canonical daemon pid released; waiting for the restart replacement"
@@ -588,11 +521,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                                         );
                                     }
                                 }
-                            }
-                            RestartWaitPlan::Spawn => {
-                                tracing::info!(
-                                    "canonical daemon pid released or never bound; spawning a replacement"
-                                );
                             }
                             RestartWaitPlan::FailWedged => {
                                 anyhow::bail!(
@@ -630,57 +558,21 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                 }
             }
         }
-        LifecycleMode::AttachOwnEphemeral => {
-            // Daemonless TUI sessions stay in this process. Existing helpers
-            // still carry the owned ephemeral socket path as a stable lookup
-            // key; `connect_local_daemon` resolves a registered in-process
-            // context instead of opening a Unix socket.
-            let own = own_ephemeral_paths()?;
-            let (in_process_endpoint, guard) = crate::daemon::boot_in_process(
-                own.clone(),
-                crate::daemon::terminal::default_host_factory(),
-            )
-            .await?;
-            let endpoint = cockpit_client::ClientEndpoint::InProcess(in_process_endpoint);
-            return Ok(ConnectedDaemon {
-                client: DaemonClient::connect_endpoint(&endpoint).await?,
-                endpoint,
-                owns_daemon: guard.is_some(),
-                socket: own.socket,
-                startup_notice: None,
-                owned_daemon_guard: None,
-                owned_in_process_guard: guard,
-            });
-        }
     }
 
     // No reachable daemon to attach to — spawn one.
     //
-    // `AttachOrAutoPromote` (the canonical TUI) promotes a *persistent*
-    // daemon at the canonical path. The ephemeral modes spawn a unique
-    // pid+nonce ephemeral daemon (Layer B): socket/pid the canonical
-    // `daemon stop`/`status` never sees, with the self-reaping watchdog
-    // armed (Layer C) so an uncatchable foreground death can't orphan it.
-    let ephemeral = matches!(
-        mode,
-        LifecycleMode::AttachOrEphemeral
-            | LifecycleMode::AlwaysEphemeral
-            | LifecycleMode::AttachOwnEphemeral
-    );
+    // Both lifetimes use the canonical socket. A client preference decides
+    // only the first owner's lifetime; an existing owner always wins.
+    let ephemeral = matches!(mode, LifecycleMode::AttachOrEphemeral);
 
     let (paths, pid, owned_daemon_guard) = if ephemeral {
-        // Allocate the exact ephemeral path set in the parent, then hand it
-        // to the spawned daemon to bind. Daemonless TUI reattachments reuse
-        // their cached owned path; `AlwaysEphemeral` allocates fresh here.
-        let paths = match mode {
-            LifecycleMode::AttachOwnEphemeral => own_ephemeral_paths()?,
-            _ => DaemonPaths::allocate_ephemeral()?,
-        };
+        let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
         let child = spawn_detached_ephemeral(&paths)?;
         let pid = child.id();
         // Arm ownership before any await or other cancellation point. From
-        // here onward every early return owns a guard whose Drop stops exactly
-        // this pid+nonce daemon.
+        // here onward every early return owns a guard whose Drop stops this
+        // exact canonical ephemeral daemon.
         let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), child);
         (paths, pid, Some(guard))
     } else {
@@ -742,9 +634,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         owned_in_process_guard: None,
     })
 }
-
-const EPHEMERAL_ATTACH_NOTICE: &str =
-    "attaching to the already-running persistent daemon; this run will not stop it";
 
 async fn connect_shared_running(
     paths: crate::daemon::DaemonPaths,
@@ -827,32 +716,6 @@ fn format_skew_restart_notice(
         }
         None => format!("daemon version skew: {skew_reason}"),
     })
-}
-
-fn own_ephemeral_paths() -> Result<crate::daemon::DaemonPaths> {
-    let slot = OWN_EPHEMERAL_PATHS.get_or_init(|| Mutex::new(None));
-    let mut guard = slot
-        .lock()
-        .map_err(|_| anyhow!("owned ephemeral path cache poisoned"))?;
-    if let Some(paths) = guard.clone() {
-        return Ok(paths);
-    }
-    let paths = crate::daemon::DaemonPaths::allocate_ephemeral()?;
-    *guard = Some(paths.clone());
-    Ok(paths)
-}
-
-#[cfg(test)]
-fn reset_own_ephemeral_paths_for_test() {
-    if let Some(slot) = OWN_EPHEMERAL_PATHS.get() {
-        *slot.lock().unwrap() = None;
-    }
-}
-
-#[cfg(test)]
-fn set_own_ephemeral_paths_for_test(paths: crate::daemon::DaemonPaths) {
-    let slot = OWN_EPHEMERAL_PATHS.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap() = Some(paths);
 }
 
 /// Connect by socket-path key: a registered in-process owner first, otherwise

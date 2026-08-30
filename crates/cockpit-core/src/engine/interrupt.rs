@@ -824,7 +824,7 @@ pub struct PreResolvedInterruptQuestion {
     /// Exact durable executor identity for AgentTree-owned QuestionTool
     /// replays. This is deliberately distinct from `agent`, which remains a
     /// human-readable display label and may be shared by recursive children.
-    /// `None` is only for legacy/daemonless interrupt compatibility.
+    /// `None` is only for legacy isolated interrupt compatibility.
     pub agent_instance_id: Option<Uuid>,
     pub agent: String,
     pub description: String,
@@ -999,7 +999,7 @@ fn question_key(
     // An AgentTree UUID is the stable replay identity. Do not include the
     // display name in that branch: an executor may be renamed between park
     // and recovery, and recursive siblings are allowed to share a name.
-    // Legacy/daemonless rows intentionally retain their historical
+    // Legacy isolated rows intentionally retain their historical
     // display-name key while no typed owner exists.
     let identity = match agent_instance_id {
         Some(agent_instance_id) => serde_json::json!({
@@ -1970,7 +1970,7 @@ pub async fn raise_and_wait(
     // In a daemon-owned session it must not silently create a second,
     // interrupt-only decision path.  Prefer the exact task-local executor
     // identity; the root lookup covers driver controls that run outside the
-    // turn task-local scope.  Isolated/daemonless helpers intentionally keep
+    // turn task-local scope. Isolated helpers intentionally keep
     // the legacy implementation below.
     let owner = crate::engine::agent::current_agent_instance_id().or(db
         .session_root_agent(session_id)
@@ -2008,7 +2008,7 @@ pub async fn raise_and_wait(
     }
 }
 
-/// Legacy/daemonless implementation.  Production callers enter
+/// Legacy isolated implementation. Production callers enter
 /// [`raise_and_wait`] and are promoted to the typed AgentTree bridge when a
 /// durable executor exists; this stays available only for helpers that have
 /// deliberately not established a daemon-owned session root.
@@ -2346,10 +2346,10 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         return InterruptOutcome::Resolved(response);
     }
     // The normal turn dispatcher is intentionally usable by lightweight
-    // helpers too. A daemonless caller has no typed owner, so only that
+    // helpers too. An isolated caller has no typed owner, so only that
     // explicit legacy case can use the historical name-keyed path.
     let Some(agent_instance_id) = agent_instance_id else {
-        // A daemonless helper has no tree to own. Do not make the compatibility
+        // An isolated helper has no tree to own. Do not make the compatibility
         // path affect normal production behavior. Unit tests exercise
         // historical Approver prompt shapes without a daemon tree, so retain
         // their isolated interrupt-only path; production host effects still

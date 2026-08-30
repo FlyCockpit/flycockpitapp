@@ -672,9 +672,8 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
             r#"
             fn lifecycle(self) -> LifecycleMode {
                 match self {
-                    Self::AttachOrAutoPromote => LifecycleMode::AttachOrAutoPromote,
+                    Self::AttachOrPersistent => LifecycleMode::AttachOrPersistent,
                     Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
-                    Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
                 }
             }
         "#
@@ -1591,8 +1590,8 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
 
     for (before, after) in [
         (
-            "Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral",
-            "Self::AlwaysEphemeral => LifecycleMode::AttachOrAutoPromote",
+            "Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral",
+            "Self::AttachOrEphemeral => LifecycleMode::AttachOrPersistent",
         ),
         (
             "fn client(&self) -> &DaemonClient {\n        &self.client\n    }",

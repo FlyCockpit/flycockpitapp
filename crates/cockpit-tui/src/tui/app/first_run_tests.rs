@@ -57,7 +57,7 @@ fn daemon_autostart_ask_shows_modal() {
 
     assert!(state.prompt.is_some());
     assert!(!state.connected);
-    assert!(!state.daemonless);
+    assert!(!state.ephemeral_preference);
 }
 
 #[test]

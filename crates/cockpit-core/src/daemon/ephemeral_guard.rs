@@ -1,5 +1,5 @@
 //! Ownership contract for an ephemeral daemon spawned by a foreground
-//! process (`cockpit run` and the daemonless TUI). One owner per
+//! process (`cockpit run` and ephemeral TUI sessions). One owner per
 //! ephemeral daemon; the owner is responsible for reaping it on exit.
 //!
 //! [`EphemeralDaemonGuard`] is the single, shared mechanism — there is
@@ -12,10 +12,9 @@
 //!
 //! The shutdown it requests routes through the daemon's single graceful
 //! drain path (`StopDaemon` → `server::request_shutdown`), so an in-flight
-//! ephemeral daemon drains its work before exiting. The self-reaping idle
-//! watchdog (Layer C, [`crate::daemon::EPHEMERAL_IDLE_GRACE`]) remains the
-//! backstop for an *uncatchable* owner death (SIGKILL, power loss) that no
-//! guard or signal handler can observe.
+//! ephemeral daemon drains its work before exiting. A socket ephemeral owner
+//! also observes its client reference count and begins this same teardown
+//! after its final client detaches.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -96,7 +96,7 @@ use text_recovery::*;
 
 // A concrete executor frame owns this identity, not the shared `Agent`
 // definition. Keep it task-local so same-named children cannot overwrite one
-// another while turn code stays reusable by daemonless callers.
+// another while turn code stays reusable by isolated callers.
 tokio::task_local! {
     static CURRENT_AGENT_INSTANCE_ID: Option<uuid::Uuid>;
 }

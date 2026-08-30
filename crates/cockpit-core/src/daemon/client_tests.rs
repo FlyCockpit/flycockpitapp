@@ -304,18 +304,9 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
     server.await.unwrap();
 }
 
-/// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`
-/// §1). `LifecycleMode::AttachOwnEphemeral` attaches to this process's
-/// cached ephemeral daemon when it's already up and reports
-/// `owns_daemon = true` at that exact socket — i.e. a re-attach in the
-/// same daemonless TUI (`/compact`, `/sessions` resume, `/new`)
-/// reconnects to the owned daemon instead of spawning a second one. The
-/// daemon is run in-process at the cached path with isolated XDG dirs, so
-/// the spawn branch (which would launch a child) is never taken.
 #[tokio::test]
 async fn connect_uses_registered_in_process_context_without_socket() {
     let _guard = crate::test_env::lock_async().await;
-    reset_own_ephemeral_paths_for_test();
     let root = tempfile::tempdir().expect("daemon path tempdir");
 
     let paths = temp_ephemeral_paths(root.path(), "cockpit-in-process-test");
@@ -346,44 +337,6 @@ async fn connect_uses_registered_in_process_context_without_socket() {
     );
     drop(client);
     drop(ctx);
-    reset_own_ephemeral_paths_for_test();
-}
-
-#[tokio::test]
-async fn attach_own_ephemeral_uses_in_process_context() {
-    let _guard = crate::test_env::lock_async().await;
-    reset_own_ephemeral_paths_for_test();
-    let root = tempfile::tempdir().expect("daemon path tempdir");
-
-    let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-owned");
-    set_own_ephemeral_paths_for_test(own.clone());
-    let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
-    let _ctx = crate::daemon::boot_in_process_with_db(own.clone(), db)
-        .await
-        .expect("boot local daemon context");
-
-    let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)
-        .await
-        .expect("attach to own in-process daemon");
-    assert!(
-        !connected.owns_daemon,
-        "in-process daemonless mode needs no child-process guard"
-    );
-    assert_eq!(
-        connected.socket, own.socket,
-        "must reuse the process-local owned path as the local transport key"
-    );
-    assert!(
-        !connected.socket.exists(),
-        "in-process daemonless mode must not bind a Unix socket"
-    );
-    connected
-        .client
-        .request_ok(Request::DaemonStatus)
-        .await
-        .expect("owned in-process daemon answers");
-
-    reset_own_ephemeral_paths_for_test();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -431,34 +384,6 @@ async fn boot_test_persistent_daemon_hellos_without_os_socket() {
         .request_ok(Request::DaemonStatus)
         .await
         .expect("booted owner answers DaemonStatus");
-}
-
-#[test]
-fn attach_own_ephemeral_reuses_cached_path() {
-    let _guard = crate::test_env::lock();
-    let root = tempfile::tempdir().expect("daemon path tempdir");
-    let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-cache");
-    reset_own_ephemeral_paths_for_test();
-    set_own_ephemeral_paths_for_test(own.clone());
-
-    let first = own_ephemeral_paths().expect("first owned path");
-    let second = own_ephemeral_paths().expect("second owned path");
-
-    assert_eq!(first.socket, own.socket);
-    assert_eq!(first.socket, second.socket);
-    assert_eq!(first.pid_file, own.pid_file);
-    assert_eq!(first.pid_file, second.pid_file);
-    reset_own_ephemeral_paths_for_test();
-}
-
-#[test]
-fn always_ephemeral_allocates_fresh_paths() {
-    let root = tempfile::tempdir().expect("daemon path tempdir");
-    let first = temp_ephemeral_paths(root.path(), "cockpit-eph-test-always-one");
-    let second = temp_ephemeral_paths(root.path(), "cockpit-eph-test-always-two");
-
-    assert_ne!(first.socket, second.socket);
-    assert_ne!(first.pid_file, second.pid_file);
 }
 
 #[tokio::test]
@@ -512,24 +437,16 @@ async fn cancelled_lifecycle_acceptance_reaps_unclaimed_guard() {
 #[test]
 fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AttachOrAutoPromote),
-        LifecycleMode::AttachOrAutoPromote
+        mode_for_intent(cockpit_client::LifecycleIntent::AttachOrPersistent),
+        LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
         mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
-        LifecycleMode::AttachOrAutoPromote
+        LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
         mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
         LifecycleMode::AttachOrEphemeral
-    );
-    assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AlwaysEphemeral),
-        LifecycleMode::AlwaysEphemeral
-    );
-    assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::AttachOwnEphemeral),
-        LifecycleMode::AttachOwnEphemeral
     );
 }
 
@@ -538,68 +455,29 @@ fn discover_attach_plan_restart_release_spawns_instead_of_failing() {
     use crate::daemon::DaemonStatus;
 
     assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrAutoPromote,
-            DaemonStatus::LivePidSocketUnreachable,
-            false,
-        ),
+        discover_attach_plan(DaemonStatus::LivePidSocketUnreachable, false),
         DiscoverAttachPlan::WaitForRestart
     );
     assert_eq!(
-        after_restart_wait(
-            LifecycleMode::AttachOrAutoPromote,
-            SharedWaitError::Released
-        ),
+        after_restart_wait(SharedWaitError::Released),
         RestartWaitPlan::WaitForReplacement
     );
     assert_eq!(
-        after_restart_wait(LifecycleMode::AlwaysEphemeral, SharedWaitError::Released),
-        RestartWaitPlan::Spawn
-    );
-    assert_eq!(
-        after_restart_wait(LifecycleMode::AttachOrEphemeral, SharedWaitError::Wedged),
-        RestartWaitPlan::Spawn
-    );
-    assert_eq!(
-        after_restart_wait(LifecycleMode::AttachOrAutoPromote, SharedWaitError::Wedged),
+        after_restart_wait(SharedWaitError::Wedged),
         RestartWaitPlan::FailWedged
     );
 }
 
 #[test]
-fn discover_attach_plan_ephemeral_spawns_beside_incompatible_or_unverified() {
+fn discover_attach_plan_fails_closed_for_unavailable_owners() {
     use crate::daemon::DaemonStatus;
 
     assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AlwaysEphemeral,
-            DaemonStatus::IncompatibleProtocol,
-            true,
-        ),
-        DiscoverAttachPlan::Spawn
-    );
-    assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrEphemeral,
-            DaemonStatus::UnverifiedPid,
-            false,
-        ),
-        DiscoverAttachPlan::Spawn
-    );
-    assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrAutoPromote,
-            DaemonStatus::IncompatibleProtocol,
-            true,
-        ),
+        discover_attach_plan(DaemonStatus::IncompatibleProtocol, true),
         DiscoverAttachPlan::FailIncompatible
     );
     assert_eq!(
-        discover_attach_plan(
-            LifecycleMode::AttachOrAutoPromote,
-            DaemonStatus::UnverifiedPid,
-            false,
-        ),
+        discover_attach_plan(DaemonStatus::UnverifiedPid, false),
         DiscoverAttachPlan::FailUnreachable
     );
 }

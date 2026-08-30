@@ -1556,12 +1556,13 @@ pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> 
     Ok(())
 }
 
-/// Workspace-wide inspection tools walk their root internally and cannot
-/// safely prove which files a query will touch before traversal. Deny their
-/// entire operation whenever that root contains a trust-required local KB.
-/// Targeted native tools use [`ensure_local_knowledge_path_access`] instead.
+/// Workspace-wide inspection and opaque host-proxy tools cannot safely prove
+/// which files a model-authored request will touch before it executes. Deny
+/// their entire operation whenever that root contains a trust-required local
+/// KB. Targeted native tools use [`ensure_local_knowledge_path_access`]
+/// instead.
 pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
-    const WORKSPACE_WALKERS: &[&str] = &[
+    const UNBOUNDED_HOST_ACCESS_TOOLS: &[&str] = &[
         "code",
         "context_pack",
         "change_impact",
@@ -1572,18 +1573,38 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
         "grep",
         "hot",
         "harness_invoke",
+        // An MCP script can invoke any configured third-party server. The
+        // server's runtime capability is not knowable from the outer script,
+        // so this is an opaque host-filesystem proxy just like a workspace
+        // walker when a local KB requires a trusted model.
+        "mcp",
         "search",
         "symbol_find",
         "tree",
         "word",
         "worktree_orchestrate",
     ];
-    if WORKSPACE_WALKERS.contains(&tool_name) && !denied_local_knowledge_roots(ctx)?.is_empty() {
+    if UNBOUNDED_HOST_ACCESS_TOOLS.contains(&tool_name)
+        && !denied_local_knowledge_roots(ctx)?.is_empty()
+    {
         bail!(
             "access denied: `{tool_name}` cannot inspect this workspace because it contains a local knowledge base that requires a trusted model"
         );
     }
     Ok(())
+}
+
+/// Reject MCP server access for an untrusted model when a configured local KB
+/// requires a trusted model. A configured server is arbitrary host code: its
+/// initialization, discovery, and tool calls can all inspect the filesystem,
+/// so this must fence the connection boundary rather than only named tools.
+pub(crate) fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    if denied_local_knowledge_roots(ctx)?.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base that requires a trusted model"
+    );
 }
 
 /// Resolve a workspace-local KB to the filesystem object that owns it.

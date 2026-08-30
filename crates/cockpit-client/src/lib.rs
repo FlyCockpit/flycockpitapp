@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -172,7 +173,23 @@ pub enum LifecycleIntent {
     /// Attach to the current owner, or start a reference-counted ephemeral
     /// owner at the shared ledger socket.
     AttachOrEphemeral,
-    EnsurePersistent,
+}
+
+impl LifecycleIntent {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::AttachOrPersistent => 0,
+            Self::AttachOrEphemeral => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::AttachOrPersistent,
+            1 => Self::AttachOrEphemeral,
+            _ => unreachable!("invalid lifecycle intent"),
+        }
+    }
 }
 
 pub struct LifecycleResolution {
@@ -190,12 +207,37 @@ pub struct LifecycleRequest {
 #[derive(Clone)]
 pub struct LifecycleClient {
     requests: mpsc::Sender<LifecycleRequest>,
+    default_intent: Arc<AtomicU8>,
 }
 
 impl LifecycleClient {
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<LifecycleRequest>) {
         let (requests, receive) = mpsc::channel(capacity);
-        (Self { requests }, receive)
+        (
+            Self {
+                requests,
+                default_intent: Arc::new(AtomicU8::new(
+                    LifecycleIntent::AttachOrPersistent.as_u8(),
+                )),
+            },
+            receive,
+        )
+    }
+
+    /// Bind the TUI's configured default lifetime to this presentation-owned
+    /// capability. Explicit lifecycle resolution remains available for host
+    /// composition; ordinary TUI consumers use [`Self::resolve_default`].
+    pub fn with_default_intent(&self, default_intent: LifecycleIntent) -> Self {
+        self.set_default_intent(default_intent);
+        self.clone()
+    }
+
+    /// Update the selected default for every clone of this capability. The
+    /// TUI calls this after applying a live config snapshot so subsequent
+    /// background work cannot retain a stale lifetime preference.
+    pub fn set_default_intent(&self, default_intent: LifecycleIntent) {
+        self.default_intent
+            .store(default_intent.as_u8(), Ordering::Release);
     }
 
     /// An explicitly unavailable lifecycle capability for presentation state
@@ -219,6 +261,14 @@ impl LifecycleClient {
             .await
             .map_err(|_| "daemon lifecycle resolution timed out".to_string())?
             .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())?
+    }
+
+    /// Resolve using the lifetime selected for this presentation capability.
+    /// The configured lifetime applies only if this request must create a new
+    /// owner; the lifecycle host still attaches to an existing owner first.
+    pub async fn resolve_default(&self) -> Result<LifecycleResolution, String> {
+        let intent = LifecycleIntent::from_u8(self.default_intent.load(Ordering::Acquire));
+        self.resolve(intent).await
     }
 }
 
@@ -1664,6 +1714,17 @@ mod tests {
                 .is_ok()
         );
         let _resolution = resolve.await.expect("resolve task");
+    }
+
+    #[tokio::test]
+    async fn configured_default_lifecycle_resolution_sends_selected_intent() {
+        let (client, mut requests) = LifecycleClient::channel(1);
+        let client = client.with_default_intent(LifecycleIntent::AttachOrEphemeral);
+        let resolve = tokio::spawn(async move { client.resolve_default().await });
+        let request = requests.recv().await.expect("lifecycle request");
+        assert_eq!(request.intent, LifecycleIntent::AttachOrEphemeral);
+        drop(request);
+        assert!(resolve.await.expect("resolve task").is_err());
     }
 
     #[tokio::test]

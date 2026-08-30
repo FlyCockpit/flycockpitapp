@@ -2698,7 +2698,7 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     let tui = tui_production_sources();
     for required in [
         "LifecycleIntent::AttachOrEphemeral",
-        "LifecycleIntent::EnsurePersistent",
+        "resolve_default()",
         "connect_endpoint",
         "ClientEndpoint",
     ] {

@@ -392,13 +392,16 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
         LifecycleMode::AttachOrPersistent
     );
     assert_eq!(
-        mode_for_intent(cockpit_client::LifecycleIntent::EnsurePersistent),
-        LifecycleMode::AttachOrPersistent
-    );
-    assert_eq!(
         mode_for_intent(cockpit_client::LifecycleIntent::AttachOrEphemeral),
         LifecycleMode::AttachOrEphemeral
     );
+}
+
+#[test]
+fn cancelled_lifecycle_request_cannot_authorize_owner_spawn() {
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    drop(receiver);
+    assert!(authorize_lifecycle_spawn(&reply).is_err());
 }
 
 #[test]

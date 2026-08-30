@@ -15,8 +15,7 @@ const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
     match intent {
-        cockpit_client::LifecycleIntent::AttachOrPersistent
-        | cockpit_client::LifecycleIntent::EnsurePersistent => {
+        cockpit_client::LifecycleIntent::AttachOrPersistent => {
             LifecycleMode::from_background_agents(true)
         }
         cockpit_client::LifecycleIntent::AttachOrEphemeral => {
@@ -322,20 +321,15 @@ pub async fn serve_lifecycle_requests(
             continue;
         }
         let mode = mode_for_intent(request.intent);
-        let resolved = probe_or_spawn(mode).await.and_then(|mut connected| {
-            if matches!(
-                request.intent,
-                cockpit_client::LifecycleIntent::EnsurePersistent
-            ) && connected.owns_daemon
-            {
-                anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
-            }
-            Ok(cockpit_client::LifecycleResolution {
-                endpoint: connected.endpoint,
-                owns_daemon: connected.owns_daemon,
-                socket: connected.socket,
-                startup_notice: connected.startup_notice,
-            })
+        let resolved = probe_or_spawn_with_spawn_authorization(mode, || {
+            authorize_lifecycle_spawn(&request.reply)
+        })
+        .await
+        .map(|connected| cockpit_client::LifecycleResolution {
+            endpoint: connected.endpoint,
+            owns_daemon: connected.owns_daemon,
+            socket: connected.socket,
+            startup_notice: connected.startup_notice,
         });
         match resolved {
             Ok(resolution) => {
@@ -345,6 +339,17 @@ pub async fn serve_lifecycle_requests(
                 let _ = request.reply.send(Err(error.to_string()));
             }
         }
+    }
+    Ok(())
+}
+
+fn authorize_lifecycle_spawn(
+    reply: &tokio::sync::oneshot::Sender<
+        std::result::Result<cockpit_client::LifecycleResolution, String>,
+    >,
+) -> Result<()> {
+    if reply.is_closed() {
+        anyhow::bail!("daemon lifecycle request was cancelled before owner spawn");
     }
     Ok(())
 }
@@ -401,6 +406,20 @@ fn after_restart_wait(error: SharedWaitError) -> RestartWaitPlan {
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
+    probe_or_spawn_with_spawn_authorization(mode, || Ok(())).await
+}
+
+/// Resolve a daemon under a caller-supplied authority check. The check runs
+/// immediately before the only owner-creation path, after every discovery or
+/// restart wait. Lifecycle callers use it to ensure a timed-out or replaced
+/// request cannot create an owner using stale lifetime policy.
+async fn probe_or_spawn_with_spawn_authorization<F>(
+    mode: LifecycleMode,
+    authorize_spawn: F,
+) -> Result<ConnectedDaemon>
+where
+    F: Fn() -> Result<()>,
+{
     use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
 
     match mode {
@@ -494,7 +513,11 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         }
     }
 
-    // No reachable daemon to attach to — spawn one.
+    // No reachable daemon to attach to — spawn one. The authority check is
+    // deliberately adjacent to this funnel: no await or other cancellation
+    // point may intervene between observing authority and creating an owner.
+    authorize_spawn()?;
+
     //
     // Both lifetimes use the canonical socket. A client preference decides
     // only the first owner's lifetime; an existing owner always wins.

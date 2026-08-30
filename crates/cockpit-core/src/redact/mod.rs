@@ -2637,9 +2637,8 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/session/recording.rs",
         "crates/cockpit-core/src/skills/auto_select/mod.rs",
-        "crates/cockpit-core/src/tools/artifact_read.rs",
-        "crates/cockpit-core/src/tools/artifact_search.rs",
         "crates/cockpit-core/src/tools/read.rs",
+        "crates/cockpit-core/src/tools/recall.rs",
         "crates/cockpit-core/src/tools/skill.rs",
     ];
 

@@ -449,6 +449,88 @@ impl SealedRuntime {
         Ok(authorized.action.descriptor().completion_response())
     }
 
+    /// Copy a granted existing sealed value into an immutable KB attachment.
+    ///
+    /// This is a sealed use, not a resolver shortcut: it follows the same
+    /// metadata authorization, exact grant claim, live-trust recheck, and
+    /// redaction-before-custody sequence as [`Self::use_sealed_value`]. The
+    /// resulting token is safe metadata; the literal never enters markdown or
+    /// the caller-visible result.
+    pub async fn copy_to_knowledge_base(
+        &self,
+        request: &UseSealedValueRequest,
+        ctx: &SealedUseContext,
+        redaction: &dyn SealedRedactionSink,
+        trust: &dyn SealedProjectTrustSource,
+        kb_id: super::identity::SealedKnowledgeBaseId,
+        kb_store: &super::reference::KnowledgeBaseSealedStore,
+    ) -> Result<super::reference::SealedReference, SealedUseDenied> {
+        let record = self
+            .db
+            .sealed_value_record(request.sealed_value_id.to_string())
+            .await
+            .map_err(|_| SealedUseDenied)?;
+        let grant = self
+            .db
+            .sealed_action_grant_for(sealed_grant_selector(request, ctx))
+            .await
+            .map_err(|_| SealedUseDenied)?;
+        let global_reaches_project = match record.as_ref() {
+            Some(row) if row.scope == SealedScopeKind::Global => self
+                .db
+                .sealed_global_reaches_project(
+                    row.record_id.clone(),
+                    ctx.project_key.as_str().to_string(),
+                )
+                .await
+                .map_err(|_| SealedUseDenied)?,
+            _ => true,
+        };
+        let authorized = authorize_sealed_use(
+            request,
+            ctx,
+            SealedAuthorizationInputs {
+                record,
+                grant,
+                global_reaches_project,
+            },
+            &self.registry,
+        )?;
+        if authorized.action.knowledge_base_copy_target() != Some(&kb_id) {
+            return Err(SealedUseDenied);
+        }
+        let Some(claimed) = self
+            .db
+            .claim_sealed_action_grant(
+                authorized.grant().grant_id.clone(),
+                authorized.grant().use_epoch,
+                ctx.now_ms,
+            )
+            .await
+            .map_err(|_| SealedUseDenied)?
+        else {
+            return Err(SealedUseDenied);
+        };
+        let live_trust = trust.current_trust().await.map_err(|_| SealedUseDenied)?;
+        if !live_trust.is_trusted() || live_trust != ctx.project_trust {
+            return Err(SealedUseDenied);
+        }
+        let literal = self.resolve_literal(&claimed).await?;
+        let identity = SealedRedactionIdentity {
+            scope: claimed.scope,
+            record_id: Some(
+                SealedRecordId::parse(&claimed.record_id).map_err(|_| SealedUseDenied)?,
+            ),
+            name: SealedName::canonical(&claimed.name).map_err(|_| SealedUseDenied)?,
+            version: u32::try_from(claimed.active_version).map_err(|_| SealedUseDenied)?,
+        };
+        redaction
+            .register_before_use(&literal, &identity)
+            .await
+            .map_err(|_| SealedUseDenied)?;
+        kb_store.create(kb_id, literal).map_err(|_| SealedUseDenied)
+    }
+
     /// Resolve from the *claimed* record only.
     ///
     /// Taking [`SealedClaimedUse`] rather than the authorization result is the
@@ -491,6 +573,7 @@ impl SealedRuntime {
                     .map_err(|_| SealedUseDenied)?
                     .ok_or(SealedUseDenied)
             }
+            SealedScopeKind::KnowledgeBase => Err(SealedUseDenied),
         }
     }
 }

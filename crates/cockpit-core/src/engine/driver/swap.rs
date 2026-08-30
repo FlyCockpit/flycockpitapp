@@ -763,6 +763,9 @@ impl Driver {
         })
         .await;
         self.stack[root_idx].agent = rebuilt;
+        // Endpoint-scoped cache-hit evidence is not transferable across a
+        // live switch, even if a later selection happens to name the old id.
+        self.session.clear_observed_cache_hit();
         // A foreground child remains the schedule authority until it returns.
         // The rebuilt root becomes active naturally at the next root boundary.
         if self.active_frame_index() == Some(root_idx) {

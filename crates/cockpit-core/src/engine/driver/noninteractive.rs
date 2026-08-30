@@ -1596,7 +1596,7 @@ pub(in crate::engine::driver) fn overlapping_write_scope_pair(
 impl Driver {
     /// A child installation is immutable evidence only when its durable parent
     /// is itself pinned to a resolved installed-agent profile.  Legacy roots
-    /// (including daemonless callers) have no such profile, so publishing an
+    /// (including isolated callers) have no such profile, so publishing an
     /// installation UUID for them would create a row the ledger cannot prove.
     async fn published_child_installation_id(
         &self,
@@ -9568,11 +9568,13 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             cwd: child_cwd.clone(),
             config: config.clone(),
             session_short_id: session.short_id(),
+            workspace_scratch_dir: session.workspace_scratch_dir(),
             assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
             knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
             interactive: false,
-            mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().reachable_bindings()),
+            mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().admitted_entries()),
+            mcp_root_catalog: parent_agent.mcp_resolver.root_catalog(),
             model_override: None,
             delegation_model: model,
             delegated: true,
@@ -10272,6 +10274,11 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
     }
     let ctx = crate::engine::tool::ToolCtx {
         agent_id: agent.name.clone(),
+        executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+        knowledge_access_trusted: agent.model.is_trusted(),
+        caller_model: Some(crate::engine::tool::CallerModel::from_model(
+            agent.model.as_ref(),
+        )),
         agent_instance_id: Some(agent_instance_id),
         lock_identity: agent.name.clone(),
         write_scope: agent.write_scope.clone(),
@@ -10311,12 +10318,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         env_overlay: agent.env_overlay.clone(),
         config: config.clone(),
-        mcp_resolver: {
-            agent
-                .mcp_resolver
-                .observe_config_generation(config.snapshot().generation);
-            agent.mcp_resolver.clone()
-        },
+        mcp_resolver: agent.mcp_resolver.clone(),
     };
     let call = crate::engine::message::ToolCall {
         id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -12136,11 +12138,13 @@ pub(crate) async fn run_noninteractive_resumable(
                     cwd: child_cwd.clone(),
                     config: config.clone(),
                     session_short_id: session.short_id(),
+                    workspace_scratch_dir: session.workspace_scratch_dir(),
                     assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                     knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
                     interactive: false,
-                    mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
+                    mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
+                    mcp_root_catalog: agent.mcp_resolver.root_catalog(),
                     model_override: None,
                     delegation_model: model,
                     delegated: true,
@@ -12640,13 +12644,13 @@ pub(crate) async fn run_noninteractive_resumable(
                         cwd: child_cwd.clone(),
                         config: config.clone(),
                         session_short_id: session.short_id(),
+                        workspace_scratch_dir: session.workspace_scratch_dir(),
                         assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                         knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
                         interactive: false,
-                        mcp_parent_reachable: Some(
-                            agent.mcp_resolver.catalog().reachable_bindings(),
-                        ),
+                        mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
+                        mcp_root_catalog: agent.mcp_resolver.root_catalog(),
                         model_override: None,
                         delegation_model: entry.model.clone(),
                         delegated: true,

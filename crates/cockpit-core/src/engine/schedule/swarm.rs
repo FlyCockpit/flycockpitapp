@@ -798,6 +798,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         cwd: ctx.cwd.clone(),
         config: pinned.clone(),
         session_short_id: ctx.session.short_id(),
+        workspace_scratch_dir: ctx.session.workspace_scratch_dir(),
         // Inherit the parent agent's identity prefix so a `spawn` → bee/scout/goal
         // worker in an assistant session keeps the SOUL/USER identity.
         assistant_identity_prefix: ctx.agent.assistant_identity_prefix.clone(),
@@ -805,7 +806,8 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         knowledge_base_system_prefix: ctx.session.knowledge_base_system_prompt(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
-        mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().reachable_bindings()),
+        mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().admitted_entries()),
+        mcp_root_catalog: ctx.agent.mcp_resolver.root_catalog(),
         // Plan-level overrides don't apply to ad-hoc swarm fan-out.
         model_override: None,
         delegation_model: None,

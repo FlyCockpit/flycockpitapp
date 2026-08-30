@@ -730,19 +730,19 @@ mod tests {
     }
 
     fn test_dream_entry_with_id(id: &str, schedule: Option<&str>) -> KnowledgeBaseRegistryEntry {
-        KnowledgeBaseRegistryEntry {
-            id: id.into(),
-            name: format!("KB {id}"),
-            description: "test".into(),
-            source: KnowledgeBaseSource::Local {
+        KnowledgeBaseRegistryEntry::new(
+            id.into(),
+            format!("KB {id}"),
+            "test".into(),
+            KnowledgeBaseSource::Local {
                 path: PathBuf::from("kb"),
             },
-            embedding_ownership: KnowledgeBaseEmbeddingOwnership::Local,
-            dream_model: Some("p:dream".into()),
-            dream_schedule: schedule.map(str::to_owned),
-            trust_required: false,
-            merge_policy: KnowledgeBaseMergePolicy::Auto,
-        }
+            KnowledgeBaseEmbeddingOwnership::Local,
+            Some("p:dream".into()),
+            schedule.map(str::to_owned),
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        )
     }
 
     fn test_dream_providers() -> ProvidersConfig {
@@ -1012,7 +1012,7 @@ mod tests {
         let registry = test_registry(&db);
         let entry = test_dream_entry(None);
         let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
-        let project_id = crate::session::project_id_for(root.path());
+        let project_id = crate::session::project_id_for(root.path()).unwrap();
         db.set_workspace_trust(root.path(), WorkspaceTrustMode::Trust)
             .await
             .unwrap();

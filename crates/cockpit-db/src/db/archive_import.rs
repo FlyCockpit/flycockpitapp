@@ -74,6 +74,9 @@ pub struct ImportedArchiveTextArtifact {
     pub representation: TextArtifactRepresentation,
     pub created_at: i64,
     pub content: String,
+    /// A daemon-owned path staged by core before this import transaction. It
+    /// is absent for small inline bodies.
+    pub staged_blob_session_id: Option<Uuid>,
     /// Present only on a user-input source owner. The event sequence is
     /// remapped by the one import transaction before this immutable envelope
     /// is inserted.
@@ -671,6 +674,7 @@ fn restore_events_and_artifacts(
             source_artifact_id: artifact.source_artifact_id,
             session_id: id_map[&artifact.source_session_id],
             event_seq,
+            staged_blob_session_id: artifact.staged_blob_session_id,
             candidate: TextArtifactCandidate {
                 relation: artifact.relation,
                 projection_slot: artifact.projection_slot,

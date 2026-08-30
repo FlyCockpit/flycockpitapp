@@ -32,6 +32,9 @@ impl HistoryCallerTrust {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: Uuid,
+    /// Owning workspace identity, used by the history-scope consent gate
+    /// before a cross-workspace result is exposed.
+    pub project_id: String,
     pub short_id: Option<String>,
     pub title: Option<String>,
     /// `last_active_at_unix_ms` — the human-date source + recency
@@ -41,6 +44,15 @@ pub struct SearchHit {
     pub snippet: String,
     /// BM25 relevance (lower = more relevant, FTS5 convention). Kept on
     /// the hit so a future re-ranker can blend it with other signals.
+    pub bm25: f64,
+}
+
+/// A current-session artifact discovery hit. The body remains in its bounded
+/// `cockpit://session/<id>/artifacts/<id>` pseudofile; this is only a snippet.
+#[derive(Debug, Clone)]
+pub struct ArtifactSearchHit {
+    pub artifact_id: Uuid,
+    pub snippet: String,
     pub bm25: f64,
 }
 
@@ -82,7 +94,7 @@ impl Db {
             )
             .context(
                 "FTS5 is not available in this SQLite build; \
-                 session_search/session_read require it and there is no LIKE fallback",
+                 history_search/cockpit recall require it and there is no LIKE fallback",
             )?;
             Ok(())
         })
@@ -141,8 +153,10 @@ impl Db {
                 project_id.as_deref(),
                 exclude_session,
                 since,
+                None,
                 pool,
                 caller_trust,
+                None,
                 None,
             )
         })
@@ -170,10 +184,91 @@ impl Db {
                 None,
                 exclude_session,
                 since,
+                None,
                 pool,
                 caller_trust,
                 Some(&session_ids),
+                None,
             )
+        })
+        .await
+    }
+
+    /// Search sessions with an event newer than the durable global event-seq
+    /// fence. This preserves main's fresh-session knowledge retrieval without
+    /// exposing a second history-search tool surface.
+    pub async fn search_candidates_after_session_event_seq_for_trust(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        after_session_event_seq: i64,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                exclude_session,
+                None,
+                Some(after_session_event_seq),
+                pool,
+                caller_trust,
+                None,
+                None,
+            )
+        })
+        .await
+    }
+
+    /// Global FTS discovery restricted to sessions visible to `reader_project`.
+    /// The consent predicate is part of the ranked SQL result set, so the
+    /// requested pool is selected from permitted sessions rather than filtered
+    /// after an arbitrary candidate cap.
+    pub async fn search_permitted_candidates_for_trust(
+        &self,
+        query: &str,
+        reader_project: &str,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                None,
+                exclude_session,
+                since,
+                None,
+                pool,
+                caller_trust,
+                None,
+                Some(&reader_project),
+            )
+        })
+        .await
+    }
+
+    /// FTS discovery over immutable artifacts owned by one current session.
+    /// Artifact rows inherit the trust classification of their owner event.
+    pub async fn search_current_artifact_candidates_for_trust(
+        &self,
+        query: &str,
+        session_id: Uuid,
+        limit: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<ArtifactSearchHit>> {
+        let query = query.to_string();
+        self.read(move |conn| {
+            search_current_artifact_candidates_inner(conn, &query, session_id, limit, caller_trust)
         })
         .await
     }
@@ -194,6 +289,66 @@ impl Db {
     ) -> Result<Vec<ThreadTurn>> {
         self.read(move |conn| Self::thread_turns_conn_for_trust(conn, session_id, caller_trust))
             .await
+    }
+
+    /// Recall-provider transcript lookup with the workspace-consent predicate
+    /// in the same SQL statement that reads the target rows.
+    pub async fn thread_turns_for_reader_project_and_trust(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<ThreadTurn>> {
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT e.seq, e.type, json_extract(e.data_json, '$.text') AS text
+                       FROM session_events AS e
+                       JOIN sessions AS s ON s.session_id = e.session_id
+                      WHERE e.session_id = ?1
+                        AND e.type IN ('user_message', 'assistant_message')
+                        AND (?2 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                        AND (s.project_id = ?3
+                             OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                         WHERE reader.project_id = ?3
+                                           AND reader.outbound_enabled = 1)
+                                 AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                             WHERE target.project_id = s.project_id
+                                               AND target.inbound_enabled = 1)))
+                      ORDER BY e.seq ASC",
+                )
+                .context("preparing consent-scoped thread turns")?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        session_id.to_string(),
+                        caller_trust.can_read_trusted(),
+                        reader_project,
+                    ],
+                    |row| {
+                        let kind: String = row.get("type")?;
+                        let role = match kind.as_str() {
+                            "assistant_message" => "assistant",
+                            _ => "user",
+                        }
+                        .to_string();
+                        let text: Option<String> = row.get("text")?;
+                        Ok(ThreadTurn {
+                            seq: row.get("seq")?,
+                            role,
+                            text: text.unwrap_or_default(),
+                        })
+                    },
+                )
+                .context("querying consent-scoped thread turns")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding consent-scoped thread turn")?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     pub fn thread_turns_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
@@ -265,7 +420,8 @@ impl Db {
                     "SELECT f.seq
                        FROM session_fts
                        JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
-                       JOIN session_events AS e ON e.seq = f.seq
+                       JOIN session_events AS e
+                         ON e.session_id = f.session_id AND e.seq = f.seq
                       WHERE session_fts MATCH ?1
                         AND f.row_kind = 'message'
                         AND f.session_id = ?2
@@ -297,17 +453,24 @@ impl Db {
             .await
     }
 
-    pub async fn search_lineage_candidates(
+    pub async fn search_lineage_candidates_in_sessions(
         &self,
         query: &str,
-        session_id: Uuid,
-        pool: u32,
+        reader_project: &str,
+        session_ids: &[Uuid],
         caller_trust: HistoryCallerTrust,
     ) -> Result<Vec<SearchHit>> {
         let query = query.to_string();
+        let reader_project = reader_project.to_string();
+        let session_ids = session_ids.to_vec();
         self.read(move |conn| {
-            let lineage = compaction_lineage_sessions_conn(conn, session_id)?;
-            search_candidates_in_sessions_inner(conn, &query, &lineage, pool, caller_trust)
+            search_candidates_in_sessions_inner(
+                conn,
+                &query,
+                &reader_project,
+                &session_ids,
+                caller_trust,
+            )
         })
         .await
     }
@@ -315,17 +478,20 @@ impl Db {
     pub async fn scan_tool_events_in_sessions(
         &self,
         query: &str,
+        reader_project: &str,
         session_ids: &[Uuid],
         caller_trust: HistoryCallerTrust,
         max_sessions: u32,
         max_rows_per_session: u32,
     ) -> Result<ToolEventScan> {
         let query = query.to_string();
+        let reader_project = reader_project.to_string();
         let session_ids = session_ids.to_vec();
         self.read(move |conn| {
             scan_tool_events_in_sessions_conn(
                 conn,
                 &query,
+                &reader_project,
                 &session_ids,
                 caller_trust,
                 max_sessions,
@@ -342,9 +508,11 @@ fn search_candidates_inner(
     project_id: Option<&str>,
     exclude_session: Option<Uuid>,
     since: Option<i64>,
+    after_session_event_seq: Option<i64>,
     pool: u32,
     caller_trust: HistoryCallerTrust,
     allowed_session_ids: Option<&[Uuid]>,
+    reader_project: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
         return Ok(Vec::new());
@@ -361,35 +529,60 @@ fn search_candidates_inner(
     let mut stmt = conn
         .prepare(
             "SELECT f.session_id AS session_id,
+                    s.project_id  AS project_id,
                     s.short_id    AS short_id,
                     s.title       AS title,
                     s.last_active_at_unix_ms AS last_active_at_unix_ms,
                     CASE f.row_kind
                       WHEN 'title' THEN s.title
+                      WHEN 'description' THEN s.description
                       WHEN 'compaction' THEN COALESCE(
                         json_extract(e.data_json, '$.brief_text'),
                         json_extract(e.data_json, '$.handoff_text'),
                         json_extract(h.payload_json, '$.brief_text'),
                         json_extract(h.payload_json, '$.handoff_text')
                       )
+                      WHEN 'artifact' THEN a.content
                       ELSE json_extract(e.data_json, '$.text')
                     END AS body,
                     bm25(session_fts) AS rank
                FROM session_fts
                JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
                JOIN sessions AS s ON s.session_id = f.session_id
-          LEFT JOIN session_events AS e ON e.seq = f.seq
+          LEFT JOIN session_events AS e
+                 ON e.session_id = f.session_id AND e.seq = f.seq
           LEFT JOIN compaction_handoffs AS h
                  ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                 AND h.session_id = e.session_id
+          LEFT JOIN session_text_artifacts AS a
+                 ON a.session_id = f.session_id AND a.artifact_id = f.artifact_id
               WHERE session_fts MATCH ?1
+                AND f.row_kind <> 'artifact'
                 AND s.archived_at_unix_ms IS NULL
                 AND s.is_dream_session = 0
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
-                AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
-                AND (?6 IS NULL OR f.session_id IN (SELECT value FROM json_each(?6)))
+                AND (?5 IS NULL OR EXISTS (
+                    SELECT 1 FROM session_events AS later_event
+                     WHERE later_event.session_id = s.session_id
+                       AND later_event.seq > ?5
+                ))
+                AND (?6
+                     OR f.row_kind = 'title'
+                     OR (f.row_kind = 'description'
+                         AND s.description_model_trust = 'untrusted')
+                     OR (f.row_kind NOT IN ('title', 'description')
+                         AND (e.model_trust IS NULL OR e.model_trust <> 'trusted')))
+                AND (?7 IS NULL
+                     OR s.project_id = ?7
+                     OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                  WHERE reader.project_id = ?7
+                                    AND reader.outbound_enabled = 1)
+                         AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                     WHERE target.project_id = s.project_id
+                                       AND target.inbound_enabled = 1)))
+                AND (?8 IS NULL OR f.session_id IN (SELECT value FROM json_each(?8)))
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
@@ -406,13 +599,16 @@ fn search_candidates_inner(
                 project_id,
                 exclude,
                 since,
+                after_session_event_seq,
                 caller_trust.can_read_trusted(),
+                reader_project,
                 allowed_session_ids,
             ],
             |row| {
                 let sid: String = row.get("session_id")?;
                 Ok((
                     sid,
+                    row.get::<_, String>("project_id")?,
                     row.get::<_, Option<String>>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
                     row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -430,7 +626,7 @@ fn search_candidates_inner(
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
     for r in rows {
-        let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+        let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
             r.context("decoding search hit")?;
         let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
         if by_session.contains_key(&session_id) {
@@ -444,6 +640,7 @@ fn search_candidates_inner(
             session_id,
             SearchHit {
                 session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -467,8 +664,8 @@ fn search_candidates_inner(
 fn search_candidates_in_sessions_inner(
     conn: &Connection,
     query: &str,
+    reader_project: &str,
     session_ids: &[Uuid],
-    pool: u32,
     caller_trust: HistoryCallerTrust,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
@@ -481,30 +678,49 @@ fn search_candidates_in_sessions_inner(
         let mut stmt = conn
             .prepare(
                 "SELECT f.session_id AS session_id,
+                        s.project_id AS project_id,
                         s.short_id AS short_id,
                         s.title AS title,
                         s.last_active_at_unix_ms AS last_active_at_unix_ms,
                         CASE f.row_kind
                           WHEN 'title' THEN s.title
+                          WHEN 'description' THEN s.description
                           WHEN 'compaction' THEN COALESCE(
                             json_extract(e.data_json, '$.brief_text'),
                             json_extract(e.data_json, '$.handoff_text'),
                             json_extract(h.payload_json, '$.brief_text'),
                             json_extract(h.payload_json, '$.handoff_text')
                           )
+                          WHEN 'artifact' THEN a.content
                           ELSE json_extract(e.data_json, '$.text')
                         END AS body,
                         bm25(session_fts) AS rank
                    FROM session_fts
                    JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
                    JOIN sessions AS s ON s.session_id = f.session_id
-              LEFT JOIN session_events AS e ON e.seq = f.seq
+              LEFT JOIN session_events AS e
+                     ON e.session_id = f.session_id AND e.seq = f.seq
               LEFT JOIN compaction_handoffs AS h
                      ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
                     AND h.session_id = e.session_id
+              LEFT JOIN session_text_artifacts AS a
+                     ON a.session_id = f.session_id AND a.artifact_id = f.artifact_id
                   WHERE session_fts MATCH ?1
+                    AND f.row_kind <> 'artifact'
                     AND f.session_id = ?2
-                    AND (?3 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                    AND (?3
+                         OR f.row_kind = 'title'
+                         OR (f.row_kind = 'description'
+                             AND s.description_model_trust = 'untrusted')
+                         OR (f.row_kind NOT IN ('title', 'description')
+                             AND (e.model_trust IS NULL OR e.model_trust <> 'trusted')))
+                    AND (s.project_id = ?4
+                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                     WHERE reader.project_id = ?4
+                                       AND reader.outbound_enabled = 1)
+                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                         WHERE target.project_id = s.project_id
+                                           AND target.inbound_enabled = 1)))
                   ORDER BY rank ASC, f.seq ASC",
             )
             .context("preparing lineage search")?;
@@ -513,12 +729,14 @@ fn search_candidates_in_sessions_inner(
                 params![
                     match_query,
                     session_id.to_string(),
-                    caller_trust.can_read_trusted()
+                    caller_trust.can_read_trusted(),
+                    reader_project,
                 ],
                 |row| {
                     let sid: String = row.get("session_id")?;
                     Ok((
                         sid,
+                        row.get::<_, String>("project_id")?,
                         row.get::<_, Option<String>>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
                         row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -529,7 +747,7 @@ fn search_candidates_in_sessions_inner(
             )
             .context("querying lineage search")?;
         for row in rows {
-            let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+            let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
                 row.context("decoding lineage search hit")?;
             let hit_session_id =
                 Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
@@ -541,18 +759,73 @@ fn search_candidates_in_sessions_inner(
             };
             out.push(SearchHit {
                 session_id: hit_session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
                 snippet: canonical_snippet(&body, &terms),
                 bm25,
             });
-            if out.len() as u32 >= pool {
-                return Ok(rank_candidates(out));
-            }
         }
     }
     Ok(rank_candidates(out))
+}
+
+fn search_current_artifact_candidates_inner(
+    conn: &Connection,
+    query: &str,
+    session_id: Uuid,
+    limit: u32,
+    caller_trust: HistoryCallerTrust,
+) -> Result<Vec<ArtifactSearchHit>> {
+    let Some(match_query) = literal_fts_match_query(query) else {
+        return Ok(Vec::new());
+    };
+    let terms = literal_fts_terms(query);
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.artifact_id, a.content, bm25(session_fts) AS rank
+               FROM session_fts
+               JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
+               JOIN session_text_artifacts AS a
+                 ON a.session_id = f.session_id AND a.artifact_id = f.artifact_id
+               JOIN session_events AS e
+                 ON e.session_id = f.session_id AND e.seq = f.seq
+              WHERE session_fts MATCH ?1
+                AND f.row_kind = 'artifact'
+                AND f.session_id = ?2
+                AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+              ORDER BY rank ASC, a.created_at ASC
+              LIMIT ?4",
+        )
+        .context("preparing current artifact history search")?;
+    let rows = stmt
+        .query_map(
+            params![
+                match_query,
+                session_id.to_string(),
+                caller_trust.can_read_trusted(),
+                i64::from(limit)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>("artifact_id")?,
+                    row.get::<_, String>("content")?,
+                    row.get::<_, f64>("rank")?,
+                ))
+            },
+        )
+        .context("querying current artifact history search")?;
+    rows.map(|row| {
+        let (artifact_id, body, bm25) = row.context("decoding current artifact history hit")?;
+        Ok(ArtifactSearchHit {
+            artifact_id: Uuid::parse_str(&artifact_id)
+                .with_context(|| format!("artifact_id `{artifact_id}`"))?,
+            snippet: canonical_snippet(&body, &terms),
+            bm25,
+        })
+    })
+    .collect()
 }
 
 fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<Uuid>> {
@@ -656,6 +929,7 @@ fn compaction_links(conn: &Connection) -> Result<Vec<(Uuid, Uuid)>> {
 fn scan_tool_events_in_sessions_conn(
     conn: &Connection,
     query: &str,
+    reader_project: &str,
     session_ids: &[Uuid],
     caller_trust: HistoryCallerTrust,
     max_sessions: u32,
@@ -670,19 +944,56 @@ fn scan_tool_events_in_sessions_conn(
     }
     let needle = terms.join(" ");
     let mut hits = Vec::new();
-    let mut truncated = session_ids.len() > max_sessions as usize;
-    for session_id in session_ids.iter().take(max_sessions as usize) {
+    let mut truncated = false;
+    let mut permitted_sessions = 0usize;
+    for session_id in session_ids {
+        // Count only consent-permitted lineage sessions against the bounded
+        // scan budget. The event query below repeats this predicate before
+        // reading event JSON, so a revocation between these statements still
+        // fails closed for the target data.
+        let allowed: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                  FROM sessions AS s
+                 WHERE s.session_id = ?1
+                   AND (s.project_id = ?2
+                        OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                    WHERE reader.project_id = ?2
+                                      AND reader.outbound_enabled = 1)
+                            AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                        WHERE target.project_id = s.project_id
+                                          AND target.inbound_enabled = 1)))
+            )",
+            params![session_id.to_string(), reader_project],
+            |row| row.get(0),
+        )?;
+        if allowed == 0 {
+            continue;
+        }
+        if permitted_sessions >= max_sessions as usize {
+            truncated = true;
+            continue;
+        }
+        permitted_sessions += 1;
         let fetch_limit = i64::from(max_rows_per_session.clamp(1, 100)) + 1;
         let mut stmt = conn
             .prepare(
-                "SELECT seq, type, data_json
-                   FROM session_events
-                  WHERE session_id = ?1
+                "SELECT e.seq, e.type, e.data_json
+                   FROM session_events AS e
+                   JOIN sessions AS s ON s.session_id = e.session_id
+                  WHERE e.session_id = ?1
                     AND type IN ('tool_call', 'tool_call_started', 'tool_call_completed', 'tool_rejected')
-                    AND instr(lower(data_json), lower(?2)) > 0
-                    AND (?3 OR model_trust IS NULL OR model_trust <> 'trusted')
-                  ORDER BY seq ASC
-                  LIMIT ?4",
+                    AND instr(lower(e.data_json), lower(?2)) > 0
+                    AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                    AND (s.project_id = ?4
+                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                     WHERE reader.project_id = ?4
+                                       AND reader.outbound_enabled = 1)
+                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                         WHERE target.project_id = s.project_id
+                                           AND target.inbound_enabled = 1)))
+                  ORDER BY e.seq ASC
+                  LIMIT ?5",
             )
             .context("preparing bounded tool event scan")?;
         let rows = stmt
@@ -691,6 +1002,7 @@ fn scan_tool_events_in_sessions_conn(
                     session_id.to_string(),
                     needle,
                     caller_trust.can_read_trusted(),
+                    reader_project,
                     fetch_limit
                 ],
                 |row| {
@@ -843,7 +1155,9 @@ fn rank_candidates(mut candidates: Vec<SearchHit>) -> Vec<SearchHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::history_scope::WorkspaceHistoryScope;
     use crate::db::session_log::{SessionEventContext, SessionEventKind};
+    use crate::db::sessions::SessionDescriptionProvenance;
     use rusqlite::params;
     use serde_json::json;
 
@@ -1121,6 +1435,7 @@ mod tests {
         let scan = db
             .scan_tool_events_in_sessions(
                 "secretamber",
+                "p",
                 &[session.session_id],
                 HistoryCallerTrust::Untrusted,
                 1,
@@ -1132,6 +1447,117 @@ mod tests {
         assert!(scan.hits[0].snippet.contains("visible"));
         assert!(!scan.hits[0].snippet.contains("secretamber trusted"));
         assert!(!scan.truncated);
+    }
+
+    #[tokio::test]
+    async fn lineage_and_transcript_reads_recheck_workspace_consent_in_their_data_queries() {
+        let db = Db::open_in_memory().unwrap();
+        let foreign = db
+            .create_session("workspace-b", "/b", "Foreign")
+            .await
+            .unwrap();
+        msg(
+            &db,
+            foreign.session_id,
+            SessionEventKind::UserMessage,
+            "cross-workspace lodestone",
+        )
+        .await;
+
+        assert!(
+            db.search_lineage_candidates_in_sessions(
+                "lodestone",
+                "workspace-a",
+                &[foreign.session_id],
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            db.thread_turns_for_reader_project_and_trust(
+                "workspace-a",
+                foreign.session_id,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        db.set_workspace_history_scope(
+            "workspace-a",
+            WorkspaceHistoryScope {
+                outbound: true,
+                inbound: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.set_workspace_history_scope(
+            "workspace-b",
+            WorkspaceHistoryScope {
+                outbound: false,
+                inbound: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.search_lineage_candidates_in_sessions(
+                "lodestone",
+                "workspace-a",
+                &[foreign.session_id],
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            db.thread_turns_for_reader_project_and_trust(
+                "workspace-a",
+                foreign.session_id,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+
+        db.set_workspace_history_scope(
+            "workspace-b",
+            WorkspaceHistoryScope {
+                outbound: false,
+                inbound: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.search_lineage_candidates_in_sessions(
+                "lodestone",
+                "workspace-a",
+                &[foreign.session_id],
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            db.thread_turns_for_reader_project_and_trust(
+                "workspace-a",
+                foreign.session_id,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1624,6 +2050,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn descriptions_are_indexed_as_history_discovery_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        db.set_session_description(
+            session.session_id,
+            "durable sapphire migration context",
+            SessionDescriptionProvenance {
+                provider_id: "test-provider",
+                model_id: "test-model",
+                model_trust: "untrusted",
+            },
+        )
+        .await
+        .unwrap();
+
+        let hits = db
+            .search_candidates("sapphire", Some("p"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("sapphire"));
+    }
+
+    #[tokio::test]
+    async fn trusted_descriptions_are_hidden_from_untrusted_history_search() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        db.set_session_description(
+            session.session_id,
+            "trusted zircon migration context",
+            SessionDescriptionProvenance {
+                provider_id: "trusted-provider",
+                model_id: "trusted-model",
+                model_trust: "trusted",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.search_candidates_for_trust(
+                "zircon",
+                Some("p"),
+                None,
+                None,
+                10,
+                HistoryCallerTrust::Untrusted,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            db.search_candidates_for_trust(
+                "zircon",
+                Some("p"),
+                None,
+                None,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn backfill_indexes_preexisting_rows() {
         // Simulate pre-migration data: insert events with the FTS triggers
         // dropped, then re-run the backfill statements and confirm the
@@ -1661,7 +2156,8 @@ mod tests {
                  INSERT INTO session_fts (rowid, body)
                  SELECT d.rowid, json_extract(e.data_json, '$.text')
                  FROM session_fts_docs AS d
-                 JOIN session_events AS e ON e.seq = d.seq
+                 JOIN session_events AS e
+                   ON e.session_id = d.session_id AND e.seq = d.seq
                  WHERE d.row_kind = 'message';",
             )?;
             Ok(())

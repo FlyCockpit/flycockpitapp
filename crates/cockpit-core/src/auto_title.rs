@@ -30,7 +30,8 @@ use std::path::Path;
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
 use crate::engine::agent::TurnEvent;
-use crate::session::{Session, TitleAction};
+use crate::engine::message::{Message, collect_tool_calls, tool_result_message};
+use crate::session::{MetadataAction, MetadataWork, Session, TitleAction};
 
 static UTILITY_MODEL_UNSET_LOGGED: OnceLock<()> = OnceLock::new();
 
@@ -408,6 +409,239 @@ fn build_title_prompt(content_prefix: &str) -> String {
     )
 }
 
+/// Run the optional same-model metadata pass on an ephemeral in-memory fork.
+/// Its request reuses the foreground agent's exact system prompt and native
+/// tool definitions; only the trailing user instruction is new. The metadata
+/// function lives solely behind the fork's Monty host catalog, so it never
+/// changes the native tool block or becomes discoverable to the main agent.
+///
+/// This intentionally bypasses the normal turn loop: fork messages, model
+/// output, and Monty results remain in this local vector and cannot enter the
+/// foreground transcript. At most two model turns are allowed, and every
+/// error is best-effort / silent to the user.
+pub(crate) async fn generate_session_metadata_fork(
+    session: Arc<Session>,
+    model: crate::engine::model::Model,
+    system: String,
+    agent_name: String,
+    params: crate::engine::model::ModelParams,
+    mut history: Vec<Message>,
+    source_prompt: Message,
+    tools: Vec<crate::engine::message::ToolDefinition>,
+    endpoint_recovery_enabled: bool,
+    work: MetadataWork,
+    cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    cancel: tokio_util::sync::CancellationToken,
+    sealed_egress: Option<Arc<crate::redact::RedactionTable>>,
+) {
+    if matches!(work.action, MetadataAction::None) || cancel.is_cancelled() {
+        return;
+    }
+
+    // Revocation has to race the synchronous Monty host call in the durable
+    // SQLite serialization domain, not merely cancel this async task. The
+    // conditional generation advance makes a cancellation/drain win over any
+    // write that has not already linearized.
+    let fork_finished = tokio_util::sync::CancellationToken::new();
+    let _finish_revocation = MetadataForkRevocationGuard(fork_finished.clone());
+    let revocation_session = session.clone();
+    let revocation_cancel = cancel.clone();
+    let revocation_shutdown = model.shutdown_gate();
+    let expected_generation = work.expected_metadata_fork_generation;
+    tokio::spawn(async move {
+        watch_metadata_fork_revocation(
+            revocation_session,
+            expected_generation,
+            fork_finished,
+            revocation_cancel,
+            revocation_shutdown,
+        )
+        .await;
+    });
+
+    // The foreground prompt is part of the reused prefix. The only new data
+    // is this final fork instruction and its one-shot call skeleton.
+    history.push(source_prompt);
+    let mut prompt = Message::user(metadata_fork_instruction(work.action));
+    let shutdown_gate = model.shutdown_gate();
+
+    for _ in 0..2 {
+        let completion = tokio::select! {
+            _ = wait_for_metadata_fork_revocation(cancel.clone(), shutdown_gate.clone()) => return,
+            completion = model.complete_captured_with_sealed_egress(
+                &system,
+                &history,
+                // Retain the user instruction so a failed attempt can be
+                // represented in the recovery turn's provider history.
+                prompt.clone(),
+                &tools,
+                params.clone(),
+                &agent_name,
+                endpoint_recovery_enabled,
+                &cancel,
+                sealed_egress.as_deref(),
+            ) => completion,
+        };
+        let Ok(((_, content, _), _, _)) = completion else {
+            return;
+        };
+        let calls = collect_tool_calls(&content);
+        let Some((monty_call_index, call)) = calls
+            .iter()
+            .enumerate()
+            .find(|(_, call)| call.function.name == "mcp")
+        else {
+            // The fork is not allowed to act on ordinary assistant prose or a
+            // non-Monty tool call. Retain this failed attempt so the recovery
+            // turn still receives the concrete skeleton it refers to. Every
+            // ignored tool call also receives an ephemeral result, preserving
+            // the provider's assistant/tool-result pairing invariant.
+            history.push(prompt);
+            history.push(Message::Assistant { id: None, content });
+            for ignored_call in calls {
+                history.push(tool_result_message(
+                    &ignored_call,
+                    metadata_fork_ignored_tool_result(),
+                ));
+            }
+            prompt = Message::user(metadata_fork_retry_instruction());
+            continue;
+        };
+        let Some(script) = call
+            .function
+            .arguments
+            .get("script")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let host = crate::mcp::builtin::HostContext::metadata_fork(
+            session.clone(),
+            cwd.clone(),
+            config.clone(),
+            work.expected_user_content_tokens,
+            work.expected_metadata_fork_generation,
+            cancel.clone(),
+            shutdown_gate.clone(),
+        );
+        let cfg = crate::mcp::config::McpConfig::default();
+        let result = tokio::select! {
+            _ = wait_for_metadata_fork_revocation(cancel.clone(), shutdown_gate.clone()) => return,
+            result = crate::mcp::sandbox::run_with_host(script, &cfg, &host) => result,
+        };
+        let Ok(result) = result else {
+            return;
+        };
+        let updated = serde_json::from_str::<serde_json::Value>(&result)
+            .ok()
+            .and_then(|value| value.get("updated").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        if updated {
+            return;
+        }
+        // The metadata function has already declined its conditional write.
+        // Keep the complete first exchange only in the ephemeral fork before
+        // the one permitted recovery turn. Any additional calls are never
+        // executed, but receive synthetic results so their history pairing
+        // remains valid.
+        history.push(prompt);
+        history.push(Message::Assistant { id: None, content });
+        for (index, ignored_call) in calls.into_iter().enumerate() {
+            let output = if index == monty_call_index {
+                result.clone()
+            } else {
+                metadata_fork_ignored_tool_result()
+            };
+            history.push(tool_result_message(&ignored_call, output));
+        }
+        prompt = Message::user(metadata_fork_retry_instruction());
+    }
+}
+
+fn metadata_fork_ignored_tool_result() -> String {
+    r#"{"ignored":true,"reason":"The metadata fork only executes Monty calls."}"#.to_string()
+}
+
+/// Cancels the revocation watcher once this short-lived, ephemeral fork has
+/// finished normally. Dropping the outer task on any path also drops this
+/// guard, so no watcher is left behind after a best-effort fork exits.
+struct MetadataForkRevocationGuard(tokio_util::sync::CancellationToken);
+
+impl Drop for MetadataForkRevocationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Revoke a metadata fork if its foreground lifecycle ends first. A normal
+/// fork completion merely stops the watcher. The lifecycle branch must retain
+/// priority because cancellation drops the completion guard too.
+async fn watch_metadata_fork_revocation(
+    session: Arc<Session>,
+    expected_generation: i64,
+    fork_finished: tokio_util::sync::CancellationToken,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+) {
+    // A cancelled outer fork drops `MetadataForkRevocationGuard`, making both
+    // branches ready. The normal-finish signal is not evidence that no
+    // cancellation occurred, so the durable lifecycle fence wins this tie.
+    tokio::select! {
+        biased;
+        _ = wait_for_metadata_fork_revocation(cancel, shutdown_gate) => {}
+        _ = fork_finished.cancelled() => return,
+    }
+    if let Err(error) = session.revoke_metadata_fork(expected_generation) {
+        tracing::warn!(%error, "metadata fork: durable revocation failed");
+    }
+}
+
+/// The metadata task is a child of both the foreground run and the daemon
+/// lifecycle.  A cancellation, drain, or force transition drops its current
+/// provider/Monty future before it can make the generated write.
+async fn wait_for_metadata_fork_revocation(
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+) {
+    let mut shutdown = shutdown_gate.subscribe();
+    loop {
+        if cancel.is_cancelled() || shutdown_gate.is_draining() {
+            return;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown_gate.is_draining() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn metadata_fork_instruction(action: MetadataAction) -> String {
+    let cadence = match action {
+        MetadataAction::TitleAndDescribe => {
+            "Produce a fresh concise kebab-case title and a one-sentence description."
+        }
+        MetadataAction::Describe => {
+            "Refresh the one-sentence description and keep or refine the concise kebab-case title."
+        }
+        MetadataAction::None => unreachable!("metadata fork is never started without work"),
+    };
+    format!(
+        "{cadence} Do this now through Monty, with no explanation and no other tool calls. \
+         Use exactly this call skeleton and replace only the two placeholder strings:\n\n\
+         mcp.invoke(\"cockpit\", \"set_session_metadata\", {{\"title\": \"short-kebab-title\", \
+         \"description\": \"One concise sentence describing the work and context.\"}})"
+    )
+}
+
+fn metadata_fork_retry_instruction() -> String {
+    "Finish now with the exact Monty set_session_metadata call shown previously. Do not explain or call any other tool.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +656,59 @@ mod tests {
             "only the wrapper </content> should remain: {prompt}"
         );
         assert!(prompt.contains("<\\/content>"));
+    }
+
+    #[test]
+    fn metadata_fork_instruction_prefills_the_combined_monty_call() {
+        let instruction = metadata_fork_instruction(MetadataAction::TitleAndDescribe);
+        assert!(instruction.contains("mcp.invoke"));
+        assert!(instruction.contains("set_session_metadata"));
+        assert!(instruction.contains("\"title\""));
+        assert!(instruction.contains("\"description\""));
+    }
+
+    #[tokio::test]
+    async fn metadata_revocation_wins_when_fork_completion_is_already_signalled() {
+        let session = Arc::new(
+            Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                std::path::PathBuf::from("/metadata-revocation-race"),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let work = session
+            .note_user_content_for_metadata("cancelled metadata boundary")
+            .expect("first user boundary schedules metadata");
+        let work = session.activate_metadata_fork(work).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let fork_finished = tokio_util::sync::CancellationToken::new();
+
+        // Dropping the real guard after cancellation produces precisely this
+        // tie. The biased watcher must durably revoke, not treat it as a
+        // normal finish.
+        cancel.cancel();
+        fork_finished.cancel();
+        let expected_generation = work.expected_metadata_fork_generation;
+        watch_metadata_fork_revocation(
+            session.clone(),
+            expected_generation,
+            fork_finished,
+            cancel,
+            crate::daemon::shutdown::ShutdownSignal::new(),
+        )
+        .await;
+        assert!(
+            !session
+                .set_auto_metadata(
+                    "cancelled-fork",
+                    "The cancelled fork must not publish metadata.",
+                    work.expected_user_content_tokens,
+                    expected_generation,
+                )
+                .unwrap()
+        );
     }
 
     #[test]

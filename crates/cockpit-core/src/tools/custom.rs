@@ -189,7 +189,8 @@ impl Tool for CustomBashTool {
 
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
-        let sandbox_on = ctx.session.sandbox_enabled();
+        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+        let sandbox_on = ctx.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
         let confine = match crate::tools::shell_sandbox::gate_decision(
             sandbox_on,
             crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
@@ -197,6 +198,11 @@ impl Tool for CustomBashTool {
             crate::tools::shell_sandbox::SandboxGate::Confine => true,
             crate::tools::shell_sandbox::SandboxGate::Unconfined => false,
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
+                if !denied_knowledge_paths.is_empty() {
+                    return Ok(ToolOutput::text(format!(
+                        "Access denied: custom tools cannot run because the required shell confinement is unavailable ({reason}) while a local knowledge base requires a trusted model."
+                    )));
+                }
                 return Ok(ToolOutput::text(format!(
                     "Error: the shell sandbox cannot start here ({reason}); custom tools will not run until the user turns the sandbox off explicitly"
                 )));
@@ -241,15 +247,18 @@ impl Tool for CustomBashTool {
             }
         }
 
+        let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
         let mut command = if confine {
-            crate::tools::shell_sandbox::build_sandboxed_command(
+            crate::tools::shell_sandbox::build_sandboxed_command_with_sandbox_roots(
                 &cmd,
                 &ctx.cwd,
                 ctx.session.tmp_dir().as_deref(),
+                Some(&workspace_scratch_dir),
                 &scrub,
                 &session_env,
                 &[],
                 ctx.write_scope.as_deref(),
+                &denied_knowledge_paths,
             )
             .await?
         } else {

@@ -103,7 +103,7 @@ fn spawn_run(mut command: Command) -> Output {
 fn no_prompt_sources_errors() {
     let home = IsolatedHome::new();
     let mut command = home.cockpit();
-    command.args(["run", "--ephemeral"]);
+    command.args(["run"]);
     let output = spawn_run(command);
     assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
     assert!(
@@ -112,26 +112,8 @@ fn no_prompt_sources_errors() {
     );
 }
 
-#[test]
-fn ephemeral_rejects_continuation() {
-    let home = IsolatedHome::new();
-    for continuation in [
-        ["-c", "message"],
-        ["-s", "00000000-0000-0000-0000-000000000001"],
-    ] {
-        let mut command = home.cockpit();
-        command.args(["run", "--ephemeral"]);
-        command.args(continuation);
-        let output = spawn_run(command);
-        assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
-        assert!(String::from_utf8_lossy(&output.stderr).contains(
-            "--ephemeral sessions cannot be continued; drop --ephemeral or start a new session"
-        ));
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ephemeral_flag_combinations_dispatch() {
+async fn one_shot_run_dispatches() {
     // Keep the provider alive for the spawned run process; dropping it closes the listener.
     let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
@@ -139,13 +121,7 @@ async fn ephemeral_flag_combinations_dispatch() {
     home.trust_project();
 
     let mut command = home.cockpit();
-    command.args([
-        "--no-sandbox",
-        "run",
-        "--ephemeral",
-        "--json",
-        "message argument wins",
-    ]);
+    command.args(["--no-sandbox", "run", "--json", "message argument wins"]);
     let output = spawn_run(command);
     assert!(output.status.success(), "{}", output_text(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -206,7 +182,7 @@ async fn org_logging_indicator_does_not_corrupt_ndjson() {
     .unwrap();
 
     let mut command = home.cockpit();
-    command.args(["--no-sandbox", "run", "--ephemeral", "--json", "message"]);
+    command.args(["--no-sandbox", "run", "--json", "message"]);
     let output = spawn_run(command);
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(
@@ -229,7 +205,7 @@ async fn inference_failure_is_loud() {
     home.trust_project();
 
     let mut default_command = home.cockpit();
-    default_command.args(["run", "--ephemeral", "cause inference failure"]);
+    default_command.args(["run", "cause inference failure"]);
     let default_output = spawn_run(default_command);
     assert_eq!(
         default_output.status.code(),
@@ -249,7 +225,7 @@ async fn inference_failure_is_loud() {
     );
 
     let mut json_command = home.cockpit();
-    json_command.args(["run", "--ephemeral", "--json", "cause inference failure"]);
+    json_command.args(["run", "--json", "cause inference failure"]);
     let json_output = spawn_run(json_command);
     assert_eq!(
         json_output.status.code(),
@@ -277,13 +253,7 @@ async fn usage_errors_exit_two_and_post_attach_error_keeps_session_id() {
     home.trust_project();
 
     let mut invalid_agent = home.cockpit();
-    invalid_agent.args([
-        "run",
-        "--ephemeral",
-        "--agent",
-        "definitely-not-an-agent",
-        "message",
-    ]);
+    invalid_agent.args(["run", "--agent", "definitely-not-an-agent", "message"]);
     let output = spawn_run(invalid_agent);
     assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -292,7 +262,7 @@ async fn usage_errors_exit_two_and_post_attach_error_keeps_session_id() {
     std::fs::write(home.project_path().join("invalid.png"), b"not a png")
         .expect("write invalid attachment");
     let mut invalid_attachment = home.cockpit();
-    invalid_attachment.args(["run", "--ephemeral", "--file", "invalid.png", "message"]);
+    invalid_attachment.args(["run", "--file", "invalid.png", "message"]);
     let output = spawn_run(invalid_attachment);
     assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -312,7 +282,6 @@ async fn cwd_flag_sets_workspace_root() {
     let mut refused = home.cockpit();
     refused.args([
         "run",
-        "--ephemeral",
         "--cwd",
         target.to_str().expect("utf-8 target"),
         "message",
@@ -343,7 +312,6 @@ async fn cwd_flag_sets_workspace_root() {
         "--project",
         target.to_str().expect("utf-8 target"),
         "run",
-        "--ephemeral",
         "--json",
         "message",
     ]);
@@ -413,7 +381,7 @@ async fn run_approval_auto_denied() {
     home.trust_project();
 
     let mut default_command = home.cockpit();
-    default_command.args(["run", "--ephemeral", "trigger sandbox approval"]);
+    default_command.args(["run", "trigger sandbox approval"]);
     let default_output = spawn_run(default_command);
     assert!(
         default_output.status.success(),
@@ -440,7 +408,7 @@ async fn run_approval_auto_denied() {
     );
 
     let mut json_command = home.cockpit();
-    json_command.args(["run", "--ephemeral", "--json", "trigger sandbox approval"]);
+    json_command.args(["run", "--json", "trigger sandbox approval"]);
     let json_output = spawn_run(json_command);
     assert!(
         json_output.status.success(),
@@ -459,7 +427,7 @@ async fn run_approval_auto_denied() {
     assert!(stdout.contains("\"outcome\":\"auto_denied\""), "{stdout}");
 
     let mut question_command = home.cockpit();
-    question_command.args(["run", "--ephemeral", "--json", "trigger question decision"]);
+    question_command.args(["run", "--json", "trigger question decision"]);
     let question_output = spawn_run(question_command);
     assert!(
         question_output.status.success(),
@@ -489,7 +457,6 @@ async fn run_approve_class_grants() {
     let mut command = home.cockpit();
     command.args([
         "run",
-        "--ephemeral",
         "--json",
         "--approve",
         "path",

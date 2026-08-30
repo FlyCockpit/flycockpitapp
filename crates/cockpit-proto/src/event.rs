@@ -1584,6 +1584,13 @@ pub enum Event {
         message: Option<String>,
     },
 
+    /// The lifetime of this live daemon changed. **Daemon-global**: every
+    /// attached client must replace its cached exit policy before deciding
+    /// whether to show the ephemeral-owner detach prompt.
+    DaemonLifetimeChanged {
+        ephemeral_owner: bool,
+    },
+
     /// Remote relay connector state changed. **Daemon-global**: carries no
     /// session content and is broadcast to every connected client so status
     /// chrome can show connected/reconnecting/off without polling.
@@ -1778,6 +1785,7 @@ macro_rules! event_variants {
             (Event::TandemState { .. }, "tandem_state");
             (Event::GitignoreAllow { .. }, "gitignore_allow");
             (Event::CaffeinateState { .. }, "caffeinate_state");
+            (Event::DaemonLifetimeChanged { .. }, "daemon_lifetime_changed");
             #[cfg(feature = "remote")]
             (Event::ConnectorStatus { .. }, "connector_status");
             (Event::TerminalOutput { .. }, "terminal_output");

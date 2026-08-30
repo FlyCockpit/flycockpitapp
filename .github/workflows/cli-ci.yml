@@ -142,6 +142,9 @@ jobs:
       - name: Check test assertion integrity
         run: bash scripts/check-test-assertion-integrity.sh
 
+      - name: Check Code-root constructor inventory
+        run: bash scripts/check-code-root-constructors.sh
+
       - name: Doc tests
         run: cargo test --locked --workspace --exclude tenant-authority --doc
 

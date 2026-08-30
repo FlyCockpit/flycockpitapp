@@ -21,7 +21,7 @@ pub async fn run(cmd: ScheduleCommand) -> Result<()> {
 
 async fn list(args: ScheduleListArgs) -> Result<()> {
     let response =
-        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrPersistent, |client| {
             Box::pin(async move {
                 client
                     .request_ok(Request::ListScheduledJobs { owner: args.owner })
@@ -45,7 +45,7 @@ async fn list(args: ScheduleListArgs) -> Result<()> {
 async fn create(args: ScheduleCreateArgs) -> Result<()> {
     let job = build_create(args)?;
     let response =
-        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrPersistent, |client| {
             Box::pin(async move { client.request_ok(Request::CreateScheduledJob { job }).await })
         })
         .await?;
@@ -79,7 +79,7 @@ fn parse_missed_run_policy(raw: &str) -> Result<MissedRunPolicy> {
 
 async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
     let response =
-        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrPersistent, |client| {
             let id = id.to_string();
             Box::pin(async move {
                 client
@@ -97,7 +97,7 @@ async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
 
 async fn run_now(id: &str) -> Result<()> {
     let response =
-        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrAutoPromote, |client| {
+        crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrPersistent, |client| {
             let id = id.to_string();
             Box::pin(async move { client.request_ok(Request::RunScheduledJob { id }).await })
         })

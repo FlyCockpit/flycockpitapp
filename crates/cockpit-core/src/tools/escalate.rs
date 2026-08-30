@@ -248,13 +248,14 @@ async fn approval_for_escalation(
                 return Ok(EscalationApproval::StandingReject { scope });
             }
             let (extended, providers) = ctx.config.configs();
+            let safety_args = serde_json::json!({ "command": command });
             let outcome = evaluate(
                 extended.guard_model_ref(),
                 &providers,
                 ctx.redact.clone(),
                 None,
                 "bash",
-                command,
+                &safety_args,
             )
             .await;
             match escalation_route(ApprovalMode::Auto, Some(outcome)) {

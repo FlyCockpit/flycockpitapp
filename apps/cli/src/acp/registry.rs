@@ -459,8 +459,21 @@ impl OutboundPermissionRegistry {
                     let resolve_request_id = format!("acp:{request_id}");
                     entry.resolve_request_id = Some(resolve_request_id.clone());
                     Some(ResolveCodeRootInterruptV1 {
-                        client_request_id: resolve_request_id,
-                        selected_choice: choice,
+                        attachment_capability:
+                            cockpit_proto::CodeRootAttachmentCapabilityV1::new_opaque(
+                                entry.attachment.clone(),
+                            )
+                            .expect("registry attachment identity is bounded ASCII"),
+                        attention_id: cockpit_proto::OpaqueAsciiId128V1::new(
+                            entry.attention_id.clone(),
+                        )
+                        .expect("registry attention identity is bounded ASCII"),
+                        client_request_id: cockpit_proto::OpaqueAsciiId128V1::new(
+                            resolve_request_id,
+                        )
+                        .expect("derived resolve id is bounded ASCII"),
+                        selected_choice: cockpit_proto::OpaqueAsciiId128V1::new(choice)
+                            .expect("issued choice is bounded ASCII"),
                     })
                 }
             }

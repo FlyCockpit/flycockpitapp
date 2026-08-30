@@ -232,17 +232,19 @@ fn production_tokens(path: &Path) -> String {
         .join(" ")
 }
 
-/// PascalCase catalog lifecycle identifiers: `Install`, `InstallMcp`,
-/// `Release`, `ReleaseBinding`. Does not match `Released`,
-/// `AgentInstallation`, or lowercase `release_by_id`.
+/// Catalog lifecycle identifiers in exported-API and conventional Rust forms:
+/// `Install`, `InstallMcp`, `install_mcp`, `Release`, `ReleaseBinding`, and
+/// `release_by_id`. Does not match `Released` or `AgentInstallation`.
 fn is_catalog_lifecycle_ident(name: &str) -> bool {
-    fn pascal_prefix(name: &str, prefix: &str) -> bool {
+    fn lifecycle_prefix(name: &str, prefix: &str) -> bool {
         name == prefix
-            || name
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+            || name.strip_prefix(prefix).is_some_and(|rest| {
+                rest.starts_with('_') || rest.starts_with(|c: char| c.is_ascii_uppercase())
+            })
     }
-    pascal_prefix(name, "Install") || pascal_prefix(name, "Release")
+    ["Install", "Release", "install", "release"]
+        .iter()
+        .any(|prefix| lifecycle_prefix(name, prefix))
 }
 
 #[cfg(test)]
@@ -255,11 +257,13 @@ mod tests {
         assert!(is_catalog_lifecycle_ident("InstallMcp"));
         assert!(is_catalog_lifecycle_ident("Release"));
         assert!(is_catalog_lifecycle_ident("ReleaseBinding"));
+        assert!(is_catalog_lifecycle_ident("install"));
+        assert!(is_catalog_lifecycle_ident("install_mcp"));
+        assert!(is_catalog_lifecycle_ident("release_by_id"));
         assert!(!is_catalog_lifecycle_ident("Released"));
         assert!(!is_catalog_lifecycle_ident("AgentInstallation"));
         assert!(!is_catalog_lifecycle_ident("Installation"));
-        assert!(!is_catalog_lifecycle_ident("release_by_id"));
-        assert!(!is_catalog_lifecycle_ident("install"));
+        assert!(!is_catalog_lifecycle_ident("releaser"));
     }
 
     #[test]

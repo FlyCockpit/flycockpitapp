@@ -11628,17 +11628,14 @@ impl Driver {
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata =
             extended.auto_title_with_session_model || extended.auto_title_model_ref().is_none();
-        let (title_action, metadata_action) = if use_session_model_metadata {
+        let (title_action, mut metadata_work) = if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,
                 self.session
                     .note_user_content_for_metadata(&canonical_user_text),
             )
         } else {
-            (
-                self.session.note_user_content(&canonical_user_text),
-                crate::session::MetadataAction::None,
-            )
+            (self.session.note_user_content(&canonical_user_text), None)
         };
         if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
         {
@@ -11820,28 +11817,6 @@ impl Driver {
                 delivery_class: Default::default(),
             })
         };
-        if self.stack.len() == 1 && !matches!(metadata_action, crate::session::MetadataAction::None)
-        {
-            let top = self.stack.last().expect("stack never empty");
-            let session = self.session.clone();
-            let agent = top.agent.clone();
-            let history = top.history.clone();
-            let source_prompt = next_prompt.clone();
-            let cwd = self.cwd.clone();
-            let config = self.config.clone();
-            tokio::spawn(async move {
-                crate::auto_title::generate_session_metadata_fork(
-                    session,
-                    agent,
-                    history,
-                    source_prompt,
-                    metadata_action,
-                    cwd,
-                    config,
-                )
-                .await;
-            });
-        }
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
         // ROOT stop-gate latch for THIS user turn (`tool-hooks-lifecycle-
@@ -12056,6 +12031,13 @@ impl Driver {
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                if is_root && let Some(work) = metadata_work.take() {
+                    // The turn phase consumes this only after it has assembled
+                    // and successfully dispatched the foreground request. That
+                    // gives the fork the exact post-prune prefix and a real
+                    // cache-warming ordering edge.
+                    self.session.queue_metadata_fork(work);
+                }
                 let foreground_queue = crate::engine::agent::ForegroundQueueBridge {
                     queue: input_rx.clone(),
                     target: self.active_queue_target(),

@@ -117,7 +117,7 @@ CREATE TABLE sessions (
     fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
     description        TEXT CHECK (
-        description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 1000
+        description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
     ),                                            -- generated old-session context (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (

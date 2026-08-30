@@ -1753,13 +1753,20 @@ impl Db {
         session_id: Uuid,
         title: &str,
         description: &str,
+        expected_user_content_tokens: i64,
     ) -> Result<bool> {
         let affected = conn
             .execute(
                 "UPDATE sessions
                  SET title = ?1, description = ?2, title_recovery_nudge_state = 0
-                 WHERE session_id = ?3 AND user_renamed = 0 AND ephemeral = 0",
-                params![title, description, session_id.to_string()],
+                 WHERE session_id = ?3 AND user_renamed = 0 AND ephemeral = 0
+                   AND user_content_tokens = ?4",
+                params![
+                    title,
+                    description,
+                    session_id.to_string(),
+                    expected_user_content_tokens,
+                ],
             )
             .context("setting auto session metadata")?;
         Ok(affected > 0)

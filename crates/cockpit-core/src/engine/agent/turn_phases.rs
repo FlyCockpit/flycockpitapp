@@ -2541,6 +2541,11 @@ pub(crate) async fn run_turn(
     let display_slot =
         Some(shared_display_slot.unwrap_or_else(|| new_display_attempt_slot(&session, &config)));
 
+    // Claim scheduled metadata work at the exact foreground dispatch seam.
+    // If this request is cancelled or errors, the work is dropped with this
+    // turn; it cannot be accidentally attached to a later user boundary.
+    let metadata_work = is_root.then(|| session.take_metadata_fork()).flatten();
+
     let completion = model
         .complete_prepared_with_pre_drain(
             prepared_request,
@@ -2615,6 +2620,44 @@ pub(crate) async fn run_turn(
             return Err(provider_error_remains_primary(e, audit_settled));
         }
     };
+
+    if let Some(work) = metadata_work {
+        // This runs only after the foreground request completed successfully.
+        // `history`, `prompt`, `tools`, system, model, and parameters are the
+        // same values that prepared that request, after all pruning and live
+        // injections. The foreground request therefore owns cache warming
+        // before the detached trailing metadata instruction can dispatch.
+        let session = session.clone();
+        let model = model.clone();
+        let system = agent.system.clone();
+        let agent_name = agent.name.clone();
+        let params = agent.params.clone();
+        let history = history.clone();
+        let prompt = prompt.clone();
+        let tools = tools.clone();
+        let cwd = cwd.to_path_buf();
+        let config = config.clone();
+        let cancel = cancel.clone();
+        let sealed_egress = sealed_egress.clone();
+        tokio::spawn(async move {
+            crate::auto_title::generate_session_metadata_fork(
+                session,
+                model,
+                system,
+                agent_name,
+                params,
+                history,
+                prompt,
+                tools,
+                work,
+                cwd,
+                config,
+                cancel,
+                sealed_egress,
+            )
+            .await;
+        });
+    }
 
     // Settle the dispatch-time record to `completed`, filling the phase-timestamp
     // columns now known (`first_token_ms` / `completed_ms`) WITHOUT touching the

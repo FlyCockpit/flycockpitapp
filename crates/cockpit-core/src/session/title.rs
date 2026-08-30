@@ -6,7 +6,12 @@ impl Session {
     /// Apply the combined output of the cache-reusing self-metadata fork.
     /// The durable update is atomic: a manual title or ephemeral session wins
     /// the race and leaves both generated fields untouched.
-    pub fn set_auto_metadata(&self, title: &str, description: &str) -> Result<bool> {
+    pub fn set_auto_metadata(
+        &self,
+        title: &str,
+        description: &str,
+        expected_user_content_tokens: usize,
+    ) -> Result<bool> {
         let session_id = self.id;
         let title_for_db = title.to_string();
         let description_for_db = description.to_string();
@@ -18,6 +23,7 @@ impl Session {
                     session_id,
                     &title_for_db,
                     &description_for_db,
+                    expected_user_content_tokens as i64,
                 )
             })
             .context("setting auto session metadata")?;
@@ -265,33 +271,49 @@ impl Session {
     /// session. It is the mutually exclusive alternative to
     /// [`Self::note_user_content`], so it consumes the shared durable slot
     /// itself rather than racing the utility-title path.
-    pub fn note_user_content_for_metadata(&self, text: &str) -> MetadataAction {
+    pub fn note_user_content_for_metadata(&self, text: &str) -> Option<MetadataWork> {
         let increment = crate::auto_title::estimate_tokens(text);
         if increment == 0 {
-            return MetadataAction::None;
+            return None;
         }
-        self.user_content_tokens
-            .fetch_add(increment, Ordering::Relaxed);
+        let user_content_tokens = self
+            .user_content_tokens
+            .fetch_add(increment, Ordering::Relaxed)
+            + increment;
         let user_turns = self.user_content_turns.fetch_add(1, Ordering::Relaxed) + 1;
         if self.user_renamed() {
             self.persist_title_progress();
-            return MetadataAction::None;
+            return None;
         }
         let last_slot = self.title_stage.load(Ordering::Relaxed);
         let Some(slot) = scheduled_metadata_slot(user_turns, last_slot) else {
             self.persist_title_progress();
-            return MetadataAction::None;
+            return None;
         };
         self.title_stage.store(slot, Ordering::Relaxed);
         if slot >= 8 && slot <= 16 {
             self.title_nudge_slot_pending.store(slot, Ordering::Relaxed);
         }
         self.persist_title_progress();
-        if slot <= 16 {
-            MetadataAction::TitleAndDescribe
-        } else {
-            MetadataAction::Describe
-        }
+        Some(MetadataWork {
+            action: if slot <= 16 {
+                MetadataAction::TitleAndDescribe
+            } else {
+                MetadataAction::Describe
+            },
+            expected_user_content_tokens: user_content_tokens,
+        })
+    }
+
+    /// Queue metadata work only for the imminent root inference.  The turn
+    /// phase consumes it before the provider call and drops it on cancellation
+    /// or error, preventing a stale slot from leaking into a later turn.
+    pub(crate) fn queue_metadata_fork(&self, work: MetadataWork) {
+        *self.pending_metadata_fork.lock().unwrap() = Some(work);
+    }
+
+    pub(crate) fn take_metadata_fork(&self) -> Option<MetadataWork> {
+        self.pending_metadata_fork.lock().unwrap().take()
     }
 
     fn title_nudge_threshold_reached(&self) -> bool {
@@ -456,12 +478,18 @@ mod metadata_tests {
             MetadataAction::TitleAndDescribe,
         ] {
             assert_eq!(
-                session.note_user_content_for_metadata("user content"),
-                expected
+                session
+                    .note_user_content_for_metadata("user content")
+                    .map(|work| work.action)
+                    .unwrap_or(MetadataAction::None),
+                expected,
             );
         }
         for _ in 5..=16 {
-            let action = session.note_user_content_for_metadata("user content");
+            let action = session
+                .note_user_content_for_metadata("user content")
+                .map(|work| work.action)
+                .unwrap_or(MetadataAction::None);
             if session.user_content_turns() == 8 || session.user_content_turns() == 16 {
                 assert_eq!(action, MetadataAction::TitleAndDescribe);
             } else {
@@ -471,13 +499,54 @@ mod metadata_tests {
         for _ in 17..=31 {
             assert_eq!(
                 session.note_user_content_for_metadata("later user boundary"),
-                MetadataAction::None
+                None
             );
         }
         assert_eq!(
             session.note_user_content_for_metadata("next user boundary"),
-            MetadataAction::Describe
+            Some(MetadataWork {
+                action: MetadataAction::Describe,
+                expected_user_content_tokens: session.user_content_tokens(),
+            })
         );
         assert_eq!(session.title_stage(), 32);
+    }
+
+    #[test]
+    fn metadata_write_is_fenced_to_its_user_boundary_and_accepts_unicode_contract() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-write-fence"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let first = session
+            .note_user_content_for_metadata("first boundary")
+            .expect("first boundary schedules metadata");
+        let second = session
+            .note_user_content_for_metadata("newer boundary")
+            .expect("second boundary schedules metadata");
+
+        assert!(
+            !session
+                .set_auto_metadata(
+                    "stale-title",
+                    "stale description",
+                    first.expected_user_content_tokens,
+                )
+                .unwrap(),
+            "an older fork must not publish over newer user content"
+        );
+        assert!(
+            session
+                .set_auto_metadata(
+                    "fresh-title",
+                    &"😀".repeat(1000),
+                    second.expected_user_content_tokens,
+                )
+                .unwrap()
+        );
     }
 }

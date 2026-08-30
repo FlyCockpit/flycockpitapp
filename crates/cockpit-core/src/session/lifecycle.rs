@@ -524,6 +524,7 @@ impl Session {
             user_content_turns: AtomicUsize::new(user_content_turns),
             title_stage: AtomicU8::new(normalize_title_slot(row.title_stage)),
             title_nudge_slot_pending: AtomicU8::new(0),
+            pending_metadata_fork: Mutex::new(None),
             compact_self_nudge_stage: AtomicU8::new(0),
             title_failure_noticed: std::sync::atomic::AtomicBool::new(false),
             redaction_placeholder_noticed: std::sync::atomic::AtomicBool::new(false),

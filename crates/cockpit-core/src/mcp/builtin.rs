@@ -59,6 +59,13 @@ pub struct HostContext {
     pub builtin_registry: Arc<BuiltinRegistry>,
     pub native_tool_ctx: Option<Arc<ToolCtx>>,
     pub scan_tool_results: bool,
+    /// Present only for the isolated metadata fork. It fences the generated
+    /// write to the user-content boundary that scheduled the fork.
+    metadata_expected_user_content_tokens: Option<i64>,
+    /// The foreground run's lifecycle owners. The fork must not write after a
+    /// user cancel or daemon drain.
+    metadata_cancel: Option<tokio_util::sync::CancellationToken>,
+    metadata_shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     #[cfg(test)]
     test_builtin_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
@@ -93,6 +100,9 @@ impl HostContext {
             builtin_registry: ctx.mcp_builtin_registry.clone(),
             native_tool_ctx: Some(Arc::new(ctx.clone_stripped())),
             scan_tool_results: true,
+            metadata_expected_user_content_tokens: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             #[cfg(test)]
             test_builtin_gate: None,
             #[cfg(test)]
@@ -110,6 +120,9 @@ impl HostContext {
         session: Arc<Session>,
         cwd: PathBuf,
         config: crate::daemon::session_worker::SessionConfigHandle,
+        expected_user_content_tokens: usize,
+        cancel: tokio_util::sync::CancellationToken,
+        shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
     ) -> Self {
         Self {
             db: Some(session.db.clone()),
@@ -124,6 +137,9 @@ impl HostContext {
             builtin_registry: Arc::new(BuiltinRegistry::metadata_fork()),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: Some(expected_user_content_tokens as i64),
+            metadata_cancel: Some(cancel),
+            metadata_shutdown_gate: Some(shutdown_gate),
             #[cfg(test)]
             test_builtin_gate: None,
             #[cfg(test)]
@@ -141,7 +157,14 @@ impl HostContext {
         &self,
         fallback: &crate::mcp::config::McpConfig,
     ) -> crate::mcp::resolver::EffectiveCatalog {
-        if let Some(ctx) = &self.native_tool_ctx {
+        if self.metadata_expected_user_content_tokens.is_some() {
+            // The fork catalog is a distinct source with exactly one builtin.
+            // Do not reconstruct persistent config here: even `mcp.search`
+            // must not open or enumerate an external catalog.
+            crate::mcp::resolver::EffectiveCatalog::from_mcp_config(
+                &crate::mcp::config::McpConfig::default(),
+            )
+        } else if let Some(ctx) = &self.native_tool_ctx {
             let mut catalog = (*ctx.mcp_resolver.catalog()).clone();
             catalog.supplement_persistent_config(fallback);
             catalog
@@ -165,6 +188,9 @@ impl HostContext {
             builtin_registry: default_registry(),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             #[cfg(test)]
             test_builtin_gate: None,
             #[cfg(test)]
@@ -1345,11 +1371,25 @@ fn set_session_metadata<'a>(
         if description.is_empty() || description.chars().count() > 1000 {
             bail!("`cockpit.set_session_metadata` description must be 1 to 1000 characters");
         }
+        let expected_user_content_tokens = ctx
+            .metadata_expected_user_content_tokens
+            .context("`cockpit.set_session_metadata` is only available to the metadata fork")?;
+        if ctx
+            .metadata_cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || ctx
+                .metadata_shutdown_gate
+                .as_ref()
+                .is_some_and(crate::daemon::shutdown::ShutdownSignal::is_draining)
+        {
+            bail!("`cockpit.set_session_metadata` metadata fork is no longer live");
+        }
         let session = ctx
             .session
             .as_ref()
             .context("`cockpit.set_session_metadata` requires a live session")?;
-        if !session.set_auto_metadata(title, description)? {
+        if !session.set_auto_metadata(title, description, expected_user_content_tokens as usize)? {
             bail!("`cockpit.set_session_metadata` did not update session metadata");
         }
         Ok(serde_json::json!({
@@ -3029,6 +3069,9 @@ mod tests {
             builtin_registry: default_registry(),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             test_builtin_gate: None,
             test_external_invoke: None,
             test_external_approval_entered: None,
@@ -3127,6 +3170,9 @@ mod tests {
             builtin_registry: default_registry(),
             native_tool_ctx: None,
             scan_tool_results: false,
+            metadata_expected_user_content_tokens: None,
+            metadata_cancel: None,
+            metadata_shutdown_gate: None,
             test_builtin_gate: None,
             test_external_invoke: None,
             test_external_approval_entered: None,

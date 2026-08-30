@@ -31,7 +31,7 @@ use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
 use crate::engine::agent::TurnEvent;
 use crate::engine::message::{Message, collect_tool_calls, tool_result_message};
-use crate::session::{MetadataAction, Session, TitleAction};
+use crate::session::{MetadataAction, MetadataWork, Session, TitleAction};
 
 static UTILITY_MODEL_UNSET_LOGGED: OnceLock<()> = OnceLock::new();
 
@@ -419,45 +419,45 @@ fn build_title_prompt(content_prefix: &str) -> String {
 /// output, and Monty results remain in this local vector and cannot enter the
 /// foreground transcript. At most two model turns are allowed, and every
 /// error is best-effort / silent to the user.
-pub async fn generate_session_metadata_fork(
+pub(crate) async fn generate_session_metadata_fork(
     session: Arc<Session>,
-    agent: Arc<crate::engine::agent::Agent>,
+    model: crate::engine::model::Model,
+    system: String,
+    agent_name: String,
+    params: crate::engine::model::ModelParams,
     mut history: Vec<Message>,
     source_prompt: Message,
-    action: MetadataAction,
+    tools: Vec<crate::engine::message::ToolDefinition>,
+    work: MetadataWork,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    cancel: tokio_util::sync::CancellationToken,
+    sealed_egress: Option<Arc<crate::redact::RedactionTable>>,
 ) {
-    if matches!(action, MetadataAction::None) {
+    if matches!(work.action, MetadataAction::None) || cancel.is_cancelled() {
         return;
     }
 
     // The foreground prompt is part of the reused prefix. The only new data
     // is this final fork instruction and its one-shot call skeleton.
     history.push(source_prompt);
-    let mut prompt = Message::user(metadata_fork_instruction(action));
-    let active_tools = crate::engine::agent::turn_toolbox(&agent, &session, &cwd, &config).await;
-    let mut tools = active_tools.definitions(agent.tool_steering);
-    if crate::leak_report::route_advertises_report_leak(agent.model.is_trusted(), &tools) {
-        tools.push(crate::leak_report::report_leak_tool_definition());
-    }
-    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut prompt = Message::user(metadata_fork_instruction(work.action));
+    let shutdown_gate = model.shutdown_gate();
 
     for _ in 0..2 {
-        let completion = agent
-            .model
-            .complete_captured(
-                &agent.system,
+        let completion = tokio::select! {
+            _ = wait_for_metadata_fork_revocation(cancel.clone(), shutdown_gate.clone()) => return,
+            completion = model.complete_captured_with_sealed_egress(
+                &system,
                 &history,
                 prompt,
                 &tools,
-                agent.params.clone(),
-                &agent.name,
-                None,
+                params.clone(),
+                &agent_name,
                 &cancel,
-                None,
-            )
-            .await;
+                sealed_egress.as_deref(),
+            ) => completion,
+        };
         let Ok(((_, content, _), _, _)) = completion else {
             return;
         };
@@ -481,9 +481,16 @@ pub async fn generate_session_metadata_fork(
             session.clone(),
             cwd.clone(),
             config.clone(),
+            work.expected_user_content_tokens,
+            cancel.clone(),
+            shutdown_gate.clone(),
         );
-        let cfg = agent.mcp_resolver.catalog().to_mcp_config();
-        let Ok(result) = crate::mcp::sandbox::run_with_host(script, &cfg, &host).await else {
+        let cfg = crate::mcp::config::McpConfig::default();
+        let result = tokio::select! {
+            _ = wait_for_metadata_fork_revocation(cancel.clone(), shutdown_gate.clone()) => return,
+            result = crate::mcp::sandbox::run_with_host(script, &cfg, &host) => result,
+        };
+        let Ok(result) = result else {
             return;
         };
         let updated = serde_json::from_str::<serde_json::Value>(&result)
@@ -499,6 +506,29 @@ pub async fn generate_session_metadata_fork(
             return;
         }
         prompt = Message::user(metadata_fork_retry_instruction());
+    }
+}
+
+/// The metadata task is a child of both the foreground run and the daemon
+/// lifecycle.  A cancellation, drain, or force transition drops its current
+/// provider/Monty future before it can make the generated write.
+async fn wait_for_metadata_fork_revocation(
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+) {
+    let mut shutdown = shutdown_gate.subscribe();
+    loop {
+        if cancel.is_cancelled() || shutdown_gate.is_draining() {
+            return;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown_gate.is_draining() {
+                    return;
+                }
+            }
+        }
     }
 }
 

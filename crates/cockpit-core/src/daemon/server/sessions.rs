@@ -324,6 +324,9 @@ pub(super) async fn end_btw_fork(
         .end_btw_fork(parent_session_id)
         .await
         .map_err(internal)?;
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %parent_session_id, "btw text artifact cleanup remains pending");
+    }
     Ok(Response::Ack)
 }
 
@@ -355,6 +358,9 @@ pub(super) async fn discard_session(
         .discard_ephemeral_session(session_id)
         .await
         .map_err(internal)?;
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %session_id, "discarded-session text artifact cleanup remains pending");
+    }
     Ok(Response::Ack)
 }
 
@@ -484,6 +490,9 @@ pub(super) async fn delete_session(
         }
     }
     ctx.db.delete_session(session_id).await.map_err(internal)?;
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %session_id, "text artifact blob cleanup remains pending");
+    }
     Ok(Response::Ack)
 }
 

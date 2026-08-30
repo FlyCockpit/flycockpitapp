@@ -8288,7 +8288,7 @@ impl Driver {
             "oversized source carries media attachments"
         );
         anyhow::ensure!(
-            canonical.request.text.len() > 64 * 1024
+            canonical.request.text.len() > 1024
                 && canonical.request.text.len()
                     <= crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES,
             "oversized source violates FCM2 bounds"
@@ -11611,6 +11611,85 @@ impl Driver {
                     return Ok(());
                 }
             }
+            // Crossing the active spill threshold selected this phase-two path.
+            // Every accepted source is therefore blob-backed, including a
+            // source just above a per-agent threshold below the default 8 KiB.
+            let source_blob_path = {
+                let path = crate::text_artifact_blob::new_path(self.session.id);
+                if let Err(error) = self
+                    .session
+                    .db
+                    .stage_text_artifact_blob_cleanup_intent(
+                        path.clone(),
+                        self.session.id,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "staging oversized user paste cleanup failed");
+                    let _ = self
+                        .reject_reserved_oversized_user_submission(
+                            oversized.reservation.clone(),
+                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            tx,
+                        )
+                        .await;
+                    return Ok(());
+                }
+                match crate::text_artifact_blob::write_at(&path, &oversized.source_text) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tracing::error!(%error, "oversized user paste disk spill failed; refusing inline SQLite fallback");
+                        let _ = self.reject_reserved_oversized_user_submission(
+                            oversized.reservation.clone(),
+                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            tx,
+                        ).await;
+                        return Ok(());
+                    }
+                }
+            };
+            let model_projection =
+                (user_text != oversized.source_text).then_some(user_text.clone());
+            let model_projection_blob_path = if let Some(projection) = model_projection.as_deref() {
+                let path = crate::text_artifact_blob::new_path(self.session.id);
+                if let Err(error) = self
+                    .session
+                    .db
+                    .stage_text_artifact_blob_cleanup_intent(
+                        path.clone(),
+                        self.session.id,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "staging oversized user projection cleanup failed");
+                    let _ = self
+                        .reject_reserved_oversized_user_submission(
+                            oversized.reservation.clone(),
+                            crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            tx,
+                        )
+                        .await;
+                    return Ok(());
+                }
+                match crate::text_artifact_blob::write_at(&path, projection) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::error!(%error, "oversized user projection disk spill failed; refusing inline SQLite fallback");
+                        let _ = self
+                            .reject_reserved_oversized_user_submission(
+                                oversized.reservation.clone(),
+                                crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                tx,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
             let materialization = self
                 .session
                 .db
@@ -11647,8 +11726,15 @@ impl Driver {
                             &user_text,
                         ).expect("accepted oversized composition is constructed from closed host parts"),
                         source_text: oversized.source_text.clone(),
-                        model_projection: (user_text != oversized.source_text)
-                            .then_some(user_text.clone()),
+                        source_blob_path: Some(source_blob_path),
+                        source_preview_lines: Some(self
+                            .stack
+                            .last()
+                            .and_then(|frame| frame.agent.context_policy.as_ref())
+                            .map(crate::agents::ContextPolicy::artifact_preview_lines)
+                            .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES)),
+                        model_projection_blob_path,
+                        model_projection,
                         agent: Some(active_agent.clone()),
                         context: crate::db::text_artifacts::TextArtifactEventContext {
                             origin_principal: origin_principal.clone(),
@@ -11727,10 +11813,31 @@ impl Driver {
                         .await;
                     }
                     let effective = projection_artifact.as_ref().unwrap_or(&source_artifact);
-                    let outbound_content = self.redact.scrub(&effective.content);
-                    match crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content(
+                    let effective_content =
+                        match crate::text_artifact_blob::read_artifact_content(effective) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                tracing::error!(%error, event_seq, "materialized user artifact blob is unavailable");
+                                let _ = tx
+                                    .send(TurnEvent::Notice {
+                                        text: "Oversized message was stored but its pseudofile is unavailable; no provider was called."
+                                            .to_owned(),
+                                    })
+                                    .await;
+                                return Ok(());
+                            }
+                        };
+                    let outbound_content = self.redact.scrub(&effective_content);
+                    let preview_lines = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.context_policy.as_ref())
+                        .map(crate::agents::ContextPolicy::artifact_preview_lines)
+                        .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                    match crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content_and_preview_lines(
                         effective,
                         &outbound_content,
+                        preview_lines,
                     ) {
                         Ok(frame) => Some((event_seq, frame)),
                         Err(error) => {

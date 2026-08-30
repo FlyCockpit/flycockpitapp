@@ -165,8 +165,10 @@ fn glob_blocking(
             continue;
         }
         if !writer.writeln(&rel) {
+            // Keep retaining source records after the model-facing budget
+            // trips so the shared artifact boundary can apply the configured
+            // spill threshold to the complete bounded listing.
             hit_cap = true;
-            break;
         }
         count += 1;
         if count >= MAX_ENTRIES {
@@ -179,10 +181,15 @@ fn glob_blocking(
         return Ok(ToolOutput::text("No matching files.".to_string()));
     }
     let truncated = writer.is_truncated() || hit_cap;
+    let capture = writer.text_artifact_capture();
     let mut body = writer.into_string();
     if truncated {
         body.push_str("... [truncated; narrow the pattern or pass a `path`]\n");
-        Ok(ToolOutput::truncated_text(body))
+        let output = ToolOutput::truncated_text(body);
+        Ok(match capture {
+            Some(capture) => output.with_text_artifact_capture(capture),
+            None => output,
+        })
     } else {
         Ok(ToolOutput::text(body))
     }

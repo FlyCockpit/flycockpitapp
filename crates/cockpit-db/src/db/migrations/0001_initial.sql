@@ -3823,7 +3823,7 @@ CREATE TABLE session_text_artifacts (
     CHECK(host_original_bytes >= host_captured_bytes),
     CHECK(host_dropped_bytes = host_original_bytes - host_captured_bytes),
     CHECK(stored_source_bytes <= host_captured_bytes),
-    CHECK(content_bytes = length(CAST(content AS BLOB))),
+    CHECK(json_extract(provenance_json, '$.blob_path') IS NOT NULL OR content_bytes = length(CAST(content AS BLOB))),
     CHECK(content_bytes = stored_source_bytes),
     CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
     CHECK((owner_relation = 'source_user_input' AND owner_slot = -1) OR (owner_relation <> 'source_user_input' AND owner_slot >= 0)),
@@ -4626,6 +4626,25 @@ CREATE TABLE task_delegation_sidecar_cleanup_intents (
 
 CREATE INDEX idx_task_delegation_sidecar_cleanup_created
     ON task_delegation_sidecar_cleanup_intents(created_at_unix_ms, sidecar_path);
+
+-- Text-artifact bodies are daemon-private files, while a session cascade is
+-- owned by SQLite.  Preserve every blob identity before the cascade so every
+-- deletion path (retention, boot sweep, direct transaction, and RPC) leaves
+-- replayable filesystem cleanup work after commit.
+CREATE TABLE text_artifact_blob_cleanup_intents (
+    blob_path TEXT PRIMARY KEY CHECK (
+        length(blob_path) BETWEEN 1 AND 4096
+        AND blob_path LIKE 'text-artifacts/%'
+        AND blob_path NOT LIKE '%..%'
+        AND blob_path NOT LIKE '%\n%'
+        AND blob_path NOT LIKE '%\r%'
+    ),
+    session_id TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
+);
+
+CREATE INDEX idx_text_artifact_blob_cleanup_created
+    ON text_artifact_blob_cleanup_intents(created_at_unix_ms, blob_path);
 
 -- A sidecar is published before its referencing payload transaction starts.
 -- This intent is committed first, so boot recovery can remove a file left by

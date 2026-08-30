@@ -4821,7 +4821,7 @@ fn validate_oversized_artifact_admission(
         "FCM2 tag expansions do not match the submission"
     );
     anyhow::ensure!(
-        canonical.request.text.len() > 64 * 1024,
+        canonical.request.text.len() > 1024,
         "FCM2 artifact admission does not cross the inline threshold"
     );
     // The receipt digest is intentionally computed from the unresolved wire
@@ -5093,13 +5093,23 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                     Uuid::from_bytes(row.queue_item_id)
                 )
             })?;
+        let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
-            || canonical.request.text.len() <= 64 * 1024
             || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
             continue;
         }
+        // The receipt-owned reservation, not a historical byte threshold,
+        // identifies an artifact-backed submission. Per-agent thresholds can
+        // be below 64 KiB, so a restart must reconstruct every live lease.
+        let Some(reservation) = session
+            .db
+            .reserved_text_artifact_submission(session.id, row.client_submission_id)
+            .await?
+        else {
+            continue;
+        };
         let (delivery_class, persisted_target) = match (
             canonical.request.resolved_delivery_class,
             canonical.request.resolved_queue_target.clone(),
@@ -5120,19 +5130,11 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         } else {
             restarted_root_target.clone()
         };
-        let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         anyhow::ensure!(
             canonical.request.client_submission_id == client_submission_id
                 && row.queue_item_id == row.client_submission_id,
             "accepted oversized FCM2 queue identity is inconsistent"
         );
-        let reservation = session
-            .db
-            .reserved_text_artifact_submission(session.id, row.client_submission_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("accepted oversized FCM2 queue row lacks its reservation")
-            })?;
         let run_invocation_id =
             if reservation.reservation.run_invocation_bound {
                 session

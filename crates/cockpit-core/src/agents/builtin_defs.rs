@@ -218,6 +218,8 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
             def.context_policy = Some(ContextPolicy {
                 auto_compact_pct: Some(60),
                 inline_caps: Some(InlineCapsProfile::Conservative),
+                artifact_spill_bytes: None,
+                artifact_preview_lines: None,
             });
             // No extra capabilities — the conservative preset.
         }

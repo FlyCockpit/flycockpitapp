@@ -146,8 +146,10 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
     crate::tools::history_scope::require_recall_permission(ctx)?;
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     for entry in history_entries(ctx).await? {
-        if matcher.is_match(&entry) && !writer.writeln(&entry) {
-            break;
+        if matcher.is_match(&entry) {
+            // The model view is token-capped, but retain the complete bounded
+            // discovery listing for the common configurable spill boundary.
+            let _ = writer.writeln(&entry);
         }
     }
     if writer.is_empty() {
@@ -156,10 +158,15 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
         )));
     }
     let truncated = writer.is_truncated();
+    let capture = writer.text_artifact_capture();
     let mut body = writer.into_string();
     if truncated {
         body.push_str("... [truncated; narrow the pattern]\n");
-        Ok(Some(ToolOutput::truncated_text(body)))
+        let output = ToolOutput::truncated_text(body);
+        Ok(Some(match capture {
+            Some(capture) => output.with_text_artifact_capture(capture),
+            None => output,
+        }))
     } else {
         Ok(Some(ToolOutput::text(body)))
     }
@@ -375,7 +382,8 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
             .db
             .text_artifact_for_trust(session_id, artifact_id, caller_history_trust(ctx))
             .await?
-            .map(|artifact| artifact.content)),
+            .map(|artifact| crate::text_artifact_blob::read_artifact_content(&artifact))
+            .transpose()?),
     }
 }
 

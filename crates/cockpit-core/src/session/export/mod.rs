@@ -1048,7 +1048,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
     // placeholder renderer at write time.
     let mut text_artifact_files: Vec<(String, String)> = Vec::new(); // (path, exported content)
     let mut text_artifact_index: Vec<Value> = Vec::new();
-    let mut exported_source_text: HashMap<(Uuid, i64), String> = HashMap::new();
+    let mut exported_source_preview: HashMap<(Uuid, i64), (String, usize)> = HashMap::new();
     // Projection state remains marker-free event metadata, but an available
     // tool artifact's previews describe the same exported body. Keep the
     // length-preserving form separately so the ordinary placeholder scrubber
@@ -1101,14 +1101,27 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             // A later include-sensitive export has no raw body to restore and
             // must retain both its exact safe bytes and its representation
             // rather than relabeling them as raw.
+            let raw_content =
+                match crate::text_artifact_blob::path_from_provenance(&entry.provenance_json)? {
+                    Some(blob_path) => {
+                        crate::text_artifact_blob::read(&blob_path).with_context(|| {
+                            format!("reading text artifact {} for export", entry.artifact_id)
+                        })?
+                    }
+                    None => entry.content.clone(),
+                };
+            anyhow::ensure!(
+                raw_content.len() == entry.content_bytes,
+                "text artifact blob accounting differs from its ledger row"
+            );
             let content = if entry.representation
                 == crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
             {
-                entry.content.clone()
+                raw_content
             } else if options.redacted {
-                redact_artifact_length_preserving(&entry.content, export_redactor)
+                redact_artifact_length_preserving(&raw_content, export_redactor)
             } else {
-                entry.content.clone()
+                raw_content
             };
             debug_assert_eq!(content.len(), entry.content_bytes);
             let representation_mode = if entry.representation
@@ -1120,7 +1133,18 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "raw"
             };
             if entry.relation == crate::db::text_artifacts::TextArtifactRelation::SourceUserInput {
-                exported_source_text.insert((entry.session_id, entry.event_seq), content.clone());
+                let provenance: Value = serde_json::from_str(&entry.provenance_json)
+                    .context("parsing source artifact provenance for export")?;
+                let preview_lines = provenance
+                    .get("preview_lines")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                exported_source_preview.insert(
+                    (entry.session_id, entry.event_seq),
+                    (content.clone(), preview_lines),
+                );
             }
             let model_envelope = if entry.relation
                 == crate::db::text_artifacts::TextArtifactRelation::SourceUserInput
@@ -1449,28 +1473,32 @@ fn build_zip_with_options_and_env_conn_with_redactor(
     });
 
     // Event members ordinarily use the common one-pass export scrubber. A
-    // `user_input_source` is different: its canonical event text must remain
-    // byte-identical to its separately exported, length-preserving source
-    // artifact. Scrub the complete event once, then restore that one canonical
-    // field from the already length-preserving body before the prescrubbed
-    // writer serializes it. This keeps every other event field protected while
-    // preventing a configurable placeholder from changing source accounting.
+    // `user_input_source` keeps only its bounded, length-preserving preview in
+    // the event; the separately exported artifact sidecar is the full body.
+    // Rebuild that preview after the sidecar has crossed the export redactor so
+    // import can verify the same no-full-body SQLite invariant.
     for value in &mut event_values {
-        let source_text = value
+        let source_preview = value
             .get("session_id")
             .and_then(Value::as_str)
             .and_then(|session_id| Uuid::parse_str(session_id).ok())
             .zip(value.get("seq").and_then(Value::as_i64))
-            .and_then(|key| exported_source_text.get(&key).cloned());
+            .and_then(|key| exported_source_preview.get(&key).cloned());
         redact_value_for_export(value, export_redactor);
-        if let Some(source_text) = source_text {
+        if let Some((source_text, preview_lines)) = source_preview {
             let data = value
                 .get_mut("data")
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| {
                     anyhow!("source artifact event lost its object data during export")
                 })?;
-            data.insert("text".to_string(), json!(source_text));
+            data.insert(
+                "text".to_string(),
+                json!(crate::engine::text_artifact_frame::utf8_preview_lines(
+                    &source_text,
+                    preview_lines,
+                )),
+            );
         }
         restore_exported_tool_artifact_previews(value, &exported_tool_artifact_previews)?;
     }

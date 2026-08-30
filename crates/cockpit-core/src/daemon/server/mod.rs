@@ -4638,6 +4638,9 @@ fn terminal_temp_root(paths: &DaemonPaths) -> PathBuf {
 }
 
 async fn run_boot_housekeeping(db: &Db) {
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(db).await {
+        tracing::warn!(%error, "replaying text artifact blob cleanup intents on boot failed");
+    }
     // Drop autocomplete-tally rows that have aged out of the 30-day
     // window. Best-effort — a prune failure shouldn't block boot.
     let before = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
@@ -4658,6 +4661,9 @@ async fn run_boot_housekeeping(db: &Db) {
         Ok(n) if n > 0 => tracing::info!(count = n, "swept orphaned ephemeral sessions on boot"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping ephemeral sessions on boot failed"),
+    }
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(db).await {
+        tracing::warn!(%error, "reconciling swept ephemeral text artifacts on boot failed");
     }
     match db.sweep_empty_display_sessions().await {
         Ok(n) if n > 0 => tracing::info!(count = n, "swept empty display-only sessions on boot"),
@@ -4913,7 +4919,12 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
 
 async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
     match db.run_retention_pass(&cfg, now_secs).await {
-        Ok(outcome) => log_retention_outcome(outcome),
+        Ok(outcome) => {
+            log_retention_outcome(outcome);
+            if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&db).await {
+                tracing::warn!(%error, "retention text artifact cleanup remains pending");
+            }
+        }
         Err(error) => tracing::warn!(error = %error, "session payload retention pass failed"),
     }
 }

@@ -2571,6 +2571,8 @@ async fn effective_auto_compact_pct_defaults_when_unset() {
     let conservative = crate::agents::ContextPolicy {
         auto_compact_pct: Some(60),
         inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     };
     assert_eq!(
         driver.effective_auto_compact_pct(&cfg, Some(&conservative)),
@@ -2598,6 +2600,8 @@ async fn effective_auto_compact_pct_explicit_override_wins() {
     let policy = crate::agents::ContextPolicy {
         auto_compact_pct: Some(60),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     };
 
     assert_eq!(driver.effective_auto_compact_pct(&cfg, None), 50);
@@ -2670,6 +2674,8 @@ async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
     agent.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(60),
         inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     driver.stack[0].agent = Arc::new(agent);
     driver.session.set_active_tool_names(["mcp"], false);

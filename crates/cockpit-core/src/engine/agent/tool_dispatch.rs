@@ -2127,13 +2127,34 @@ async fn execute_ordinary_call_unscoped(
         tracing::warn!(tool = %resolved_name, "discarding retained tool capture because result safety recheck was unavailable");
         artifact_capture = None;
     }
+    let artifact_spill_bytes = env
+        .agent
+        .context_policy
+        .as_ref()
+        .map(crate::agents::ContextPolicy::artifact_spill_bytes)
+        .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
+    let artifact_preview_lines = env
+        .agent
+        .context_policy
+        .as_ref()
+        .map(crate::agents::ContextPolicy::artifact_preview_lines)
+        .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+    if artifact_capture.is_none()
+        && canonical_result_is_text_only
+        && result.as_ref().is_ok_and(|output| !output.truncated)
+        && output_str.len() > artifact_spill_bytes
+    {
+        artifact_capture = Some(crate::intel::budget::capture_text_artifact_body(
+            &output_str,
+        ));
+    }
     let artifact_capture = artifact_capture.filter(|capture| {
         crate::engine::agent::text_artifact_capture_is_persistable(
             resolved_name,
             Some(capture),
             &output_str,
             recheck_modified_output,
-        )
+        ) && capture.content.len() > artifact_spill_bytes
     });
 
     let truncated = matches!(
@@ -2340,12 +2361,31 @@ async fn execute_ordinary_call_unscoped(
     }
     let mut model_artifact_frame = None;
     let tool_call_seq = if let Some(capture) = artifact_capture.as_ref() {
-        let provenance_json = serde_json::json!({
+        let mut provenance = serde_json::json!({
             "agent_id": &env.agent.name,
             "tool": resolved_name,
             "call_id": &tc.id,
-        })
-        .to_string();
+            "source": "tool_result",
+            "preview_lines": artifact_preview_lines,
+        });
+        // `artifact_capture` was filtered at the common boundary above.  A
+        // configured spill is fail-closed: retaining it inline would put the
+        // large secret-bearing body in SQLite after the disk invariant failed.
+        let staged_at = chrono::Utc::now().timestamp_millis();
+        let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
+        env.session
+            .db
+            .stage_text_artifact_blob_cleanup_intent(
+                staged_blob_path.clone(),
+                env.session.id,
+                staged_at,
+            )
+            .await
+            .context("staging tool artifact blob cleanup")?;
+        let blob_path = crate::text_artifact_blob::write_at(&staged_blob_path, &capture.content)
+            .with_context(|| format!("spilling tool result for {resolved_name}"))?;
+        provenance["blob_path"] = serde_json::Value::String(blob_path.clone());
+        let provenance_json = provenance.to_string();
         let candidate = crate::db::text_artifacts::TextArtifactCandidate {
             relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
             projection_slot: Some(0),
@@ -2368,6 +2408,7 @@ async fn execute_ordinary_call_unscoped(
             ts_ms: chrono::Utc::now().timestamp_millis(),
             data_json: event_data.to_string(),
             artifacts: vec![candidate.clone()],
+            staged_blob_paths: vec![blob_path.clone()],
             unavailable_projection: None,
         };
         match env.session.db.record_event_with_text_artifacts(event).await {
@@ -2380,9 +2421,10 @@ async fn execute_ordinary_call_unscoped(
                     (Some(slot), true) => {
                         match slot.admission {
                             crate::db::text_artifacts::TextArtifactAdmission::Stored(artifact) => {
-                                let (preview_head, preview_tail) =
-                                    crate::engine::text_artifact_frame::utf8_preview_pair(
-                                        &artifact.content,
+                                let preview_head =
+                                    crate::engine::text_artifact_frame::utf8_preview_lines(
+                                        &candidate.content,
+                                        artifact_preview_lines,
                                     );
                                 model_artifact_frame = Some(
                                     crate::engine::text_artifact_frame::render_artifact_frame(
@@ -2398,14 +2440,17 @@ async fn execute_ordinary_call_unscoped(
                                             host_dropped_bytes: artifact.host_dropped_bytes,
                                             stored_source_bytes: artifact.stored_source_bytes,
                                             content_bytes: artifact.content_bytes,
-                                            line_count: artifact.content.lines().count(),
-                                            preview_head,
-                                            preview_tail,
+                                            line_count: candidate.content.lines().count(),
+                                            preview_head: &preview_head,
+                                            preview_tail: "",
                                         },
                                     ),
                                 );
                             }
                             admission => {
+                                if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
+                                    tracing::error!(%error, %blob_path, "rejected tool artifact blob cleanup failed");
+                                }
                                 let reason = match admission {
                                 crate::db::text_artifacts::TextArtifactAdmission::ArtifactLimit => "artifact_limit",
                                 crate::db::text_artifacts::TextArtifactAdmission::SessionQuota => "session_quota",
@@ -2418,6 +2463,9 @@ async fn execute_ordinary_call_unscoped(
                         }
                     }
                     (None, _) => {
+                        if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
+                            tracing::error!(%error, %blob_path, "unowned tool artifact blob cleanup failed");
+                        }
                         tracing::error!(tool = %resolved_name, "tool artifact event returned no matching owner slot");
                         model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
                             &candidate,
@@ -2425,6 +2473,9 @@ async fn execute_ordinary_call_unscoped(
                         ));
                     }
                     (Some(_), false) => {
+                        if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
+                            tracing::error!(%error, %blob_path, "duplicate tool artifact blob cleanup failed");
+                        }
                         tracing::error!(tool = %resolved_name, "tool artifact event returned duplicate owner slots");
                         model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
                             &candidate,
@@ -2435,6 +2486,9 @@ async fn execute_ordinary_call_unscoped(
                 Some(result.event_seq)
             }
             Err(error) => {
+                if let Err(cleanup_error) = crate::text_artifact_blob::remove(&blob_path) {
+                    tracing::error!(%cleanup_error, %blob_path, "failed tool artifact blob cleanup after database error");
+                }
                 tracing::warn!(%error, tool = %resolved_name, "tool artifact event composition failed");
                 model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
                     &candidate,
@@ -3767,6 +3821,7 @@ mod tests {
                     .to_string(),
                     created_at: 1,
                 }],
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await

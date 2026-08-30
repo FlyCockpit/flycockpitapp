@@ -272,6 +272,9 @@ pub(super) async fn end_btw_fork(
     if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
         tracing::warn!(%error, %parent_session_id, "ledgered btw sidecar cleanup remains durably pending");
     }
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %parent_session_id, "ledgered btw text artifact cleanup remains pending");
+    }
     Ok(response)
 }
 
@@ -308,6 +311,9 @@ pub(super) async fn discard_session(
     .await?;
     if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
         tracing::warn!(%error, %session_id, "ledgered discard sidecar cleanup remains durably pending");
+    }
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %session_id, "ledgered discard text artifact cleanup remains pending");
     }
     if state
         .attached
@@ -470,6 +476,9 @@ pub(super) async fn delete_session(
     .await?;
     if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
         tracing::warn!(%error, %session_id, "post-commit delegation sidecar cleanup failed; ledgered delete stands");
+    }
+    if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
+        tracing::warn!(%error, %session_id, "post-commit text artifact cleanup failed; ledgered delete stands");
     }
     Ok(response)
 }

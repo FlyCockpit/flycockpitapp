@@ -2048,12 +2048,16 @@ fn agent_def_context_policy_bounds() {
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(10),
         inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     validate_invariants(&def).expect("10 is in range");
 
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(95),
         inline_caps: Some(crate::agents::InlineCapsProfile::Large),
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     validate_invariants(&def).expect("95 is in range");
 
@@ -2061,6 +2065,8 @@ fn agent_def_context_policy_bounds() {
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(9),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     let err = validate_invariants(&def).unwrap_err().to_string();
     assert!(err.contains("autoCompactPct"), "{err}");
@@ -2070,6 +2076,8 @@ fn agent_def_context_policy_bounds() {
     def.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(96),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     let err = validate_invariants(&def).unwrap_err().to_string();
     assert!(err.contains("96"), "{err}");
@@ -2113,6 +2121,8 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
     with_policy.context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(60),
         inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
     });
     let digest_policy = with_policy.vnext_digest_bytes().expect("digest policy");
     assert_ne!(

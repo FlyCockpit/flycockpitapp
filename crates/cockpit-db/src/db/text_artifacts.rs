@@ -23,6 +23,12 @@ pub const MAX_ARTIFACT_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SESSION_ARTIFACT_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 pub const ARTIFACT_RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
 pub const ARTIFACT_RESERVATION_RENEW_AT_REMAINING_MS: i64 = 5 * 60 * 1000;
+pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize = 8 * 1024;
+pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize = 100;
+/// Agent definitions may spill above a 1 KiB threshold. Since admission is
+/// strictly `source_bytes > threshold`, the smallest artifact-backed source
+/// has 1,025 bytes.
+pub const MIN_USER_ARTIFACT_SOURCE_BYTES: usize = 1025;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +185,10 @@ pub struct TextArtifactEventInput {
     pub ts_ms: i64,
     pub data_json: String,
     pub artifacts: Vec<TextArtifactCandidate>,
+    /// Blob paths whose cleanup intents were committed before the filesystem
+    /// write. A path is claimed only if this transaction stores its owner;
+    /// rejected and cancelled admissions deliberately leave the intent live.
+    pub staged_blob_paths: Vec<String>,
     /// A closed, durable projection that deliberately owns no artifact body.
     /// Used when safety could not authorize retaining a capture.
     pub unavailable_projection: Option<TextArtifactUnavailableProjection>,
@@ -393,6 +403,16 @@ pub struct ReservedUserArtifactMaterialization {
     /// artifact on both the live and resumed paths.
     pub model_envelope_json: String,
     pub source_text: String,
+    /// Daemon-owned relative blob path for the immutable source body. The DB
+    /// validates and persists only metadata and the inline preview.
+    pub source_blob_path: Option<String>,
+    /// Ingress-selected model preview height.  Persisting it makes resume
+    /// cache-stable if the agent definition later changes.
+    pub source_preview_lines: Option<usize>,
+    /// Daemon-owned relative blob path for the distinct model projection. A
+    /// preprocessing result is an artifact body in its own right and must not
+    /// become an inline SQLite escape hatch.
+    pub model_projection_blob_path: Option<String>,
     pub model_projection: Option<String>,
     pub agent: Option<String>,
     pub context: TextArtifactEventContext,
@@ -437,6 +457,11 @@ pub(crate) struct ImportedTextArtifactSlot {
     pub source_artifact_id: Uuid,
     pub session_id: Uuid,
     pub event_seq: i64,
+    /// A core-owned archive staging intent is keyed by the archive source
+    /// session until this transaction publishes the destination owner.  The
+    /// intent is consumed here with the artifact row, so a failed import keeps
+    /// the blob reclaimable without giving the database filesystem authority.
+    pub staged_blob_session_id: Option<Uuid>,
     pub candidate: TextArtifactCandidate,
     pub representation: TextArtifactRepresentation,
 }
@@ -1326,13 +1351,8 @@ fn validate_durable_tool_projection<'a>(
         .get("provenance")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow!("durable text-artifact projection lacks provenance"))?;
-    ensure!(
-        provenance.len() == 3
-            && provenance.contains_key("agent_id")
-            && provenance.contains_key("tool")
-            && provenance.contains_key("call_id"),
-        "durable text-artifact projection provenance has an invalid shape"
-    );
+    validate_tool_provenance(provenance)
+        .context("durable text-artifact projection provenance has an invalid shape")?;
     let call_id = provenance
         .get("call_id")
         .and_then(serde_json::Value::as_str)
@@ -1420,24 +1440,55 @@ fn validate_available_projection_artifact(
             "available durable projection {field} differs from its artifact"
         );
     }
+    let (expected_line_count, preview_head, preview_tail) =
+        if has_blob_path(&artifact.provenance_json)? {
+            // Blob-backed rows retain only this ingress-selected preview in
+            // SQLite. Core validates the complete body before rendering.
+            (
+                projection
+                    .get("line_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok()),
+                artifact.content.clone(),
+                String::new(),
+            )
+        } else if uses_ingress_line_preview(&artifact.provenance_json)? {
+            // This is an older inline row that nevertheless carries an
+            // ingress line-preview contract.
+            let preview = artifact_inline_preview(
+                &artifact.content,
+                artifact_preview_lines(&artifact.provenance_json)?,
+            );
+            (
+                Some(artifact.content.lines().count()),
+                preview,
+                String::new(),
+            )
+        } else {
+            let (head, tail) = artifact_preview_pair(&artifact.content);
+            (
+                Some(artifact.content.lines().count()),
+                head.to_owned(),
+                tail.to_owned(),
+            )
+        };
     ensure!(
         projection
             .get("line_count")
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            == Some(artifact.content.lines().count()),
+            == expected_line_count,
         "available durable projection line count differs from its artifact"
     );
-    let (head, tail) = artifact_preview_pair(&artifact.content);
     ensure!(
         projection
             .get("preview_head")
             .and_then(serde_json::Value::as_str)
-            == Some(head)
+            == Some(preview_head.as_str())
             && projection
                 .get("preview_tail")
                 .and_then(serde_json::Value::as_str)
-                == Some(tail),
+                == Some(preview_tail.as_str()),
         "available durable projection preview differs from its artifact"
     );
     let provenance: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
@@ -1470,6 +1521,7 @@ fn record_event_with_text_artifacts_conn(
     // checked again by `insert_artifact_conn` and any unexpected drift rolls
     // back the whole composition.
     validate_event_artifact_slots(input)?;
+    validate_staged_blob_paths(input)?;
     let plans = plan_event_artifact_admissions(conn, input)?;
     let mut states = input
         .artifacts
@@ -1523,6 +1575,7 @@ fn record_event_with_text_artifacts_conn(
         input.ts_ms,
         &serde_json::to_string(&data)?,
     )?;
+    let mut claimed_blob_paths = std::collections::BTreeSet::new();
     let slots = input
         .artifacts
         .iter()
@@ -1541,6 +1594,9 @@ fn record_event_with_text_artifacts_conn(
                     None,
                 )? {
                     TextArtifactAdmission::Stored(artifact) => {
+                        if let Some(path) = blob_path_from_provenance(&candidate.provenance_json)? {
+                            claimed_blob_paths.insert(path);
+                        }
                         TextArtifactAdmission::Stored(artifact)
                     }
                     TextArtifactAdmission::ArtifactLimit => {
@@ -1558,6 +1614,13 @@ fn record_event_with_text_artifacts_conn(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for path in claimed_blob_paths {
+        crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+            conn,
+            &path,
+            input.session_id,
+        )?;
+    }
     Ok(TextArtifactEventResult { event_seq, slots })
 }
 
@@ -1622,6 +1685,28 @@ fn validate_event_artifact_slots(input: &TextArtifactEventInput) -> Result<()> {
     Ok(())
 }
 
+fn validate_staged_blob_paths(input: &TextArtifactEventInput) -> Result<()> {
+    let staged = input
+        .staged_blob_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        staged.len() == input.staged_blob_paths.len(),
+        "duplicate staged text artifact blob path"
+    );
+    let candidate_paths = input
+        .artifacts
+        .iter()
+        .filter_map(|candidate| blob_path_from_provenance(&candidate.provenance_json).transpose())
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    ensure!(
+        staged == candidate_paths,
+        "staged text artifact blobs must exactly match candidate blob paths"
+    );
+    Ok(())
+}
+
 fn plan_event_artifact_admissions(
     conn: &Connection,
     input: &TextArtifactEventInput,
@@ -1671,7 +1756,18 @@ fn projection_state(
         provenance.is_object(),
         "text artifact projection provenance must be an object"
     );
-    let (preview_head, preview_tail) = artifact_preview_pair(&candidate.content);
+    let (preview_head, preview_tail) = if uses_ingress_line_preview(&candidate.provenance_json)? {
+        (
+            artifact_inline_preview(
+                &candidate.content,
+                artifact_preview_lines(&candidate.provenance_json)?,
+            ),
+            String::new(),
+        )
+    } else {
+        let (head, tail) = artifact_preview_pair(&candidate.content);
+        (head.to_owned(), tail.to_owned())
+    };
     Ok(serde_json::json!({
         "version": 1,
         "status": status,
@@ -1693,8 +1789,9 @@ fn projection_state(
 
 /// The durable event state stores exactly the model-frame previews so an
 /// unavailable quota branch can regenerate the same frame without retaining a
-/// second copy of the omitted body. Keep this byte slicing identical to the
-/// core renderer's UTF-8-safe 2KiB/2KiB contract.
+/// second copy of the omitted body. Non-blob artifacts use the core renderer's
+/// UTF-8-safe 2KiB/2KiB preview pair; blob-backed artifacts use the selected
+/// ingress line preview above.
 fn artifact_preview_pair(value: &str) -> (&str, &str) {
     const EACH: usize = 2 * 1024;
     if value.len() <= EACH * 2 {
@@ -1720,7 +1817,16 @@ fn insert_artifact_conn(
     reservation_exclusion: Option<&TextArtifactReservation>,
     archive_import_id: Option<Uuid>,
 ) -> Result<TextArtifactAdmission> {
-    let content_bytes = candidate.content.len();
+    // Blob-backed rows retain only a bounded preview in `content`; their
+    // source accounting remains the size of the daemon-owned body.  The
+    // latter is also what quota accounting and the durable event projection
+    // describe.  This distinction matters when a fork clones an immutable
+    // shared blob from its parent preview row.
+    let content_bytes = if has_blob_path(&candidate.provenance_json)? {
+        candidate.stored_source_bytes
+    } else {
+        candidate.content.len()
+    };
     if content_bytes > MAX_ARTIFACT_CONTENT_BYTES {
         return Ok(TextArtifactAdmission::ArtifactLimit);
     }
@@ -1740,6 +1846,14 @@ fn insert_artifact_conn(
     }
 
     let artifact_id = Uuid::new_v4();
+    let stored_content = if has_blob_path(&candidate.provenance_json)? {
+        artifact_inline_preview(
+            &candidate.content,
+            artifact_preview_lines(&candidate.provenance_json)?,
+        )
+    } else {
+        candidate.content.clone()
+    };
     conn.execute(
         "INSERT INTO session_text_artifacts (
              session_id,artifact_id,kind,capture_reason,content_representation,archive_import_id,
@@ -1757,7 +1871,7 @@ fn insert_artifact_conn(
             event_seq,
             candidate.relation.as_str(),
             candidate.projection_slot.unwrap_or(-1),
-            &candidate.content,
+            &stored_content,
             as_i64(candidate.host_captured_bytes)?,
             as_i64(candidate.host_original_bytes)?,
             as_i64(candidate.host_dropped_bytes)?,
@@ -1787,7 +1901,7 @@ fn insert_artifact_conn(
         kind: candidate.kind,
         capture_reason: candidate.capture_reason,
         representation,
-        content: candidate.content.clone(),
+        content: stored_content,
         host_captured_bytes: candidate.host_captured_bytes,
         host_original_bytes: candidate.host_original_bytes,
         host_dropped_bytes: candidate.host_dropped_bytes,
@@ -1846,7 +1960,8 @@ fn validate_candidate(
         "stored source exceeds host capture"
     );
     ensure!(
-        candidate.stored_source_bytes == candidate.content.len(),
+        has_blob_path(&candidate.provenance_json)?
+            || candidate.stored_source_bytes == candidate.content.len(),
         "stored source byte accounting differs from UTF-8 body"
     );
     ensure!(
@@ -1875,8 +1990,8 @@ fn validate_candidate(
             None,
         ) => {
             ensure!(
-                candidate.content.len() > 64 * 1024,
-                "user input source must cross the oversized threshold"
+                candidate.stored_source_bytes >= MIN_USER_ARTIFACT_SOURCE_BYTES,
+                "user input source is below the supported spill threshold"
             );
             validate_source_provenance(&provenance)?;
         }
@@ -1953,7 +2068,7 @@ fn bounded_provenance_text(
 }
 
 fn validate_tool_provenance(provenance: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-    only_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
+    only_provenance_keys_with_optional(provenance, &["agent_id", "tool", "call_id"], "blob_path")?;
     if let Some(agent_id) = provenance.get("agent_id") {
         ensure!(
             agent_id.is_null()
@@ -1970,7 +2085,7 @@ fn validate_tool_provenance(provenance: &serde_json::Map<String, serde_json::Val
 fn validate_source_provenance(
     provenance: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
-    only_provenance_keys(provenance, &["event_seq"])?;
+    only_provenance_keys_with_optional(provenance, &["event_seq"], "blob_path")?;
     ensure!(
         provenance
             .get("event_seq")
@@ -1981,10 +2096,115 @@ fn validate_source_provenance(
     Ok(())
 }
 
+fn only_provenance_keys_with_optional(
+    provenance: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    optional: &str,
+) -> Result<()> {
+    let expected_len = expected.len()
+        + usize::from(provenance.contains_key(optional))
+        + usize::from(provenance.contains_key("source"))
+        + usize::from(provenance.contains_key("preview_lines"));
+    ensure!(
+        provenance.len() == expected_len
+            && expected.iter().all(|key| provenance.contains_key(*key))
+            && provenance.keys().all(|key| expected.contains(&key.as_str())
+                || key == optional
+                || key == "source"
+                || key == "preview_lines"),
+        "text artifact provenance has an invalid shape"
+    );
+    if let Some(path) = provenance.get(optional) {
+        let path = path
+            .as_str()
+            .ok_or_else(|| anyhow!("text artifact blob path is invalid"))?;
+        ensure!(
+            path.starts_with("text-artifacts/")
+                && !path.contains("..")
+                && !path.bytes().any(|byte| byte.is_ascii_control()),
+            "text artifact blob path is invalid"
+        );
+    }
+    if let Some(source) = provenance.get("source") {
+        ensure!(
+            matches!(source.as_str(), Some("tool_result") | Some("user_paste")),
+            "text artifact source is invalid"
+        );
+    }
+    if let Some(lines) = provenance.get("preview_lines") {
+        ensure!(
+            matches!(lines.as_u64(), Some(1..=10_000)),
+            "text artifact preview line count is invalid"
+        );
+    }
+    Ok(())
+}
+
+fn has_blob_path(provenance_json: &str) -> Result<bool> {
+    Ok(blob_path_from_provenance(provenance_json)?.is_some())
+}
+
+/// Tool artifacts imported from an archive no longer have a daemon-local blob
+/// path, but retain their original `preview_lines` contract.  That contract,
+/// rather than current physical storage, decides the durable model frame.
+fn uses_ingress_line_preview(provenance_json: &str) -> Result<bool> {
+    let provenance: serde_json::Value =
+        serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
+    Ok(provenance.get("preview_lines").is_some())
+}
+
+fn blob_path_from_provenance(provenance_json: &str) -> Result<Option<String>> {
+    let provenance: serde_json::Value =
+        serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
+    match provenance.get("blob_path") {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| anyhow!("text artifact blob path is not a string")),
+    }
+}
+
+fn artifact_preview_lines(provenance_json: &str) -> Result<usize> {
+    let value: serde_json::Value =
+        serde_json::from_str(provenance_json).context("parsing text artifact provenance")?;
+    Ok(value
+        .get("preview_lines")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0 && *value <= 10_000)
+        .unwrap_or(DEFAULT_ARTIFACT_PREVIEW_LINES))
+}
+
+fn artifact_inline_preview(content: &str, max_lines: usize) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut preview = String::new();
+    for line in content.lines().take(max_lines) {
+        if preview.len().saturating_add(line.len()).saturating_add(1) > MAX_BYTES {
+            break;
+        }
+        preview.push_str(line);
+        preview.push('\n');
+    }
+    if preview.is_empty() {
+        let mut end = content.len().min(MAX_BYTES);
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        preview.push_str(&content[..end]);
+    }
+    preview
+}
+
 fn validate_projection_provenance(
     provenance: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
-    only_provenance_keys(provenance, &["source_artifact_id", "preprocessing_version"])?;
+    only_provenance_keys_with_optional(
+        provenance,
+        &["source_artifact_id", "preprocessing_version"],
+        "blob_path",
+    )?;
     let source = provenance
         .get("source_artifact_id")
         .and_then(serde_json::Value::as_str)
@@ -2014,7 +2234,7 @@ fn accept_message_with_reservation_conn(
     // first construct/validate FCM2, but no accepted receipt is ever left for a
     // source that cannot be represented by the artifact store.
     ensure!(
-        (65_537..=MAX_ARTIFACT_CONTENT_BYTES).contains(&source_bytes),
+        (MIN_USER_ARTIFACT_SOURCE_BYTES..=MAX_ARTIFACT_CONTENT_BYTES).contains(&source_bytes),
         "oversized source is outside the artifact reservation domain"
     );
 
@@ -2397,7 +2617,8 @@ fn acquire_reservation_conn(
     input: &TextArtifactReservationInput,
 ) -> Result<TextArtifactReservationAcquire> {
     validate_text_artifact_model_fence(input.model_fence.as_ref())?;
-    if !(65_537..=MAX_ARTIFACT_CONTENT_BYTES).contains(&input.source_bytes) {
+    if !(MIN_USER_ARTIFACT_SOURCE_BYTES..=MAX_ARTIFACT_CONTENT_BYTES).contains(&input.source_bytes)
+    {
         bail!("oversized source is outside the artifact reservation domain");
     }
     if let Some(existing) =
@@ -2791,6 +3012,66 @@ fn materialize_reserved_user_artifacts_conn(
         !canonical_user_event_has_media_or_file_parts(canonical_event),
         "oversized user event cannot carry media/file parts"
     );
+    ensure!(
+        input.source_blob_path.is_some(),
+        "oversized user source must be blob-backed"
+    );
+    ensure!(
+        input.model_projection.is_some() == input.model_projection_blob_path.is_some(),
+        "user projection body and blob path must be supplied together"
+    );
+    ensure!(
+        input.model_projection_blob_path.as_deref() != input.source_blob_path.as_deref(),
+        "user projection must not share its source blob"
+    );
+    let source_preview_lines = input
+        .source_preview_lines
+        .unwrap_or(DEFAULT_ARTIFACT_PREVIEW_LINES);
+    ensure!(
+        (1..=10_000).contains(&source_preview_lines),
+        "source preview line count is invalid"
+    );
+    // The canonical event validates the original FCM2 source, but SQLite must
+    // retain only the same bounded preview as the source artifact. Rebuild the
+    // value here, inside the owner transaction, so no caller can accidentally
+    // persist the full body by serializing the event before artifact admission.
+    let source_preview = artifact_inline_preview(&input.source_text, source_preview_lines);
+    let projection_preview = input
+        .model_projection
+        .as_deref()
+        .map(|projection| artifact_inline_preview(projection, source_preview_lines));
+    let mut persisted_event = canonical_event.clone();
+    persisted_event.insert(
+        "text".to_owned(),
+        serde_json::Value::String(source_preview.clone()),
+    );
+    // These UI-only fields can legitimately echo either durable body. Do not
+    // let an alias recreate the source/projection in `session_events` after
+    // the primary `text` member has been bounded.
+    for key in ["display_text", "preflight_cleaned"] {
+        let Some(value) = persisted_event.get_mut(key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        let replacement = if text == input.source_text {
+            Some(source_preview.clone())
+        } else if input
+            .model_projection
+            .as_deref()
+            .is_some_and(|projection| text == projection)
+        {
+            projection_preview.clone()
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            *value = serde_json::Value::String(replacement);
+        }
+    }
+    let persisted_event_json = serde_json::to_string(&serde_json::Value::Object(persisted_event))
+        .context("serializing bounded oversized user event")?;
     let bound_invocation_id = if reservation.run_invocation_bound {
         Some(
             bound_run_invocation_conn(
@@ -2838,7 +3119,7 @@ fn materialize_reserved_user_artifacts_conn(
         None,
         input.context.borrowed(),
         input.now_ms,
-        &input.canonical_event_json,
+        &persisted_event_json,
     )?;
     conn.execute(
         "INSERT INTO session_user_message_model_envelopes(session_id,event_seq,envelope_json) VALUES(?1,?2,?3)",
@@ -2854,7 +3135,13 @@ fn materialize_reserved_user_artifacts_conn(
         host_original_bytes: input.source_text.len(),
         host_dropped_bytes: 0,
         stored_source_bytes: input.source_text.len(),
-        provenance_json: serde_json::json!({"event_seq": event_seq}).to_string(),
+        provenance_json: serde_json::json!({
+            "event_seq": event_seq,
+            "source": "user_paste",
+            "blob_path": input.source_blob_path.as_deref().expect("source blob path was required"),
+            "preview_lines": source_preview_lines,
+        })
+        .to_string(),
         created_at: input.now_ms,
     };
     let TextArtifactAdmission::Stored(source_artifact) = insert_artifact_conn(
@@ -2880,7 +3167,13 @@ fn materialize_reserved_user_artifacts_conn(
             host_original_bytes: projection.len(),
             host_dropped_bytes: 0,
             stored_source_bytes: projection.len(),
-            provenance_json: serde_json::json!({"source_artifact_id": source_artifact.artifact_id.to_string(), "preprocessing_version": 1}).to_string(),
+            provenance_json: serde_json::json!({
+                "source_artifact_id": source_artifact.artifact_id.to_string(),
+                "preprocessing_version": 1,
+                "blob_path": input.model_projection_blob_path.as_deref().expect("projection blob path was required"),
+                "preview_lines": source_preview_lines,
+            })
+            .to_string(),
             created_at: input.now_ms,
         };
         match insert_artifact_conn(
@@ -2908,6 +3201,21 @@ fn materialize_reserved_user_artifacts_conn(
     } else {
         None
     };
+    crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+        conn,
+        input
+            .source_blob_path
+            .as_deref()
+            .expect("source blob path was required"),
+        reservation.session_id,
+    )?;
+    if let Some(path) = input.model_projection_blob_path.as_deref() {
+        crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+            conn,
+            path,
+            reservation.session_id,
+        )?;
+    }
     let safe_outcome = MessageSafeOutcome::Materialized {
         message_seq: event_seq as u64,
     }
@@ -3159,32 +3467,40 @@ pub(crate) fn import_text_artifact_slots_conn(
                 // Archive event ids are source-local. The destination artifact
                 // is owned by the newly imported event, so rebuild this closed
                 // provenance object instead of trusting a source sequence.
-                candidate.provenance_json =
-                    serde_json::json!({"event_seq": slot.event_seq}).to_string();
+                let mut provenance: serde_json::Value =
+                    serde_json::from_str(&candidate.provenance_json)
+                        .context("imported source provenance is invalid")?;
+                provenance
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("imported source provenance is not an object"))?
+                    .insert("event_seq".to_string(), serde_json::json!(slot.event_seq));
+                candidate.provenance_json = serde_json::to_string(&provenance)?;
             }
             TextArtifactKind::UserInputProjection => {
-                let source_id =
-                    serde_json::from_str::<serde_json::Value>(&candidate.provenance_json)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("source_artifact_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned)
-                        })
-                        .ok_or_else(|| {
-                            anyhow!("imported projection provenance lacks source artifact id")
-                        })?;
+                let mut provenance: serde_json::Value =
+                    serde_json::from_str(&candidate.provenance_json)
+                        .context("imported projection provenance is invalid")?;
+                let source_id = provenance
+                    .get("source_artifact_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        anyhow!("imported projection provenance lacks source artifact id")
+                    })?;
                 let source_id = Uuid::parse_str(&source_id)
                     .context("invalid imported projection source artifact id")?;
                 let destination_source = destination_ids
                     .get(&source_id)
                     .ok_or_else(|| anyhow!("imported projection precedes its source artifact"))?;
-                candidate.provenance_json = serde_json::json!({
-                    "source_artifact_id": destination_source.to_string(),
-                    "preprocessing_version": 1,
-                })
-                .to_string();
+                let object = provenance
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("imported projection provenance is not an object"))?;
+                object.insert(
+                    "source_artifact_id".to_string(),
+                    serde_json::json!(destination_source),
+                );
+                object.insert("preprocessing_version".to_string(), serde_json::json!(1));
+                candidate.provenance_json = serde_json::to_string(&provenance)?;
             }
             TextArtifactKind::ToolResult => {}
         }
@@ -3202,6 +3518,25 @@ pub(crate) fn import_text_artifact_slots_conn(
         )?;
         match admission {
             TextArtifactAdmission::Stored(artifact) => {
+                match (
+                    blob_path_from_provenance(&candidate.provenance_json)?,
+                    slot.staged_blob_session_id,
+                ) {
+                    (Some(path), Some(staged_session_id)) => {
+                        crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+                            conn,
+                            &path,
+                            staged_session_id,
+                        )?;
+                    }
+                    (Some(_), None) => {
+                        bail!("imported blob-backed artifact lacks a staged cleanup intent")
+                    }
+                    (None, Some(_)) => {
+                        bail!("inline imported artifact unexpectedly has a staged blob intent")
+                    }
+                    (None, None) => {}
+                }
                 ensure!(
                     destination_ids
                         .insert(slot.source_artifact_id, artifact.artifact_id)
@@ -3252,6 +3587,9 @@ pub(crate) fn fork_session_artifacts_conn(
         let child_event_seq = *event_map
             .get(&artifact.event_seq)
             .ok_or_else(|| anyhow!("fork artifact event was not copied"))?;
+        // Blob bodies are immutable. Fork rows retain the same validated
+        // daemon-owned path; session deletion checks for surviving references
+        // before enqueuing unlink, so either fork can outlive the other.
         let mut provenance: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
             .context("stored text artifact provenance is invalid")?;
         match artifact.kind {
@@ -3288,6 +3626,10 @@ pub(crate) fn fork_session_artifacts_conn(
             projection_slot: artifact.projection_slot,
             kind: artifact.kind,
             capture_reason: artifact.capture_reason,
+            // For blob-backed parents this is the already-bounded SQLite
+            // preview; `insert_artifact_conn` deliberately derives the full
+            // accounting from `stored_source_bytes` and preserves the shared
+            // immutable blob path.
             content: artifact.content,
             host_captured_bytes: artifact.host_captured_bytes,
             host_original_bytes: artifact.host_original_bytes,
@@ -3643,6 +3985,116 @@ mod tests {
         }
     }
 
+    async fn stage_blob(db: &Db, session_id: Uuid) -> String {
+        let path = format!("text-artifacts/{session_id}/{}.txt", Uuid::new_v4());
+        db.stage_text_artifact_blob_cleanup_intent(path.clone(), session_id, 1)
+            .await
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn minimum_supported_user_spill_materializes_as_a_bounded_event_preview() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let source = "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES);
+        let reservation = reserve(
+            &db,
+            acceptance_input(session.session_id, 250, 100),
+            source.len(),
+            source_digest(&source),
+        )
+        .await;
+        let source_blob_path = stage_blob(&db, session.session_id).await;
+        let materialized = db
+            .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: serde_json::json!({ "text": source }).to_string(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
+                source_text: "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES),
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: Some(1),
+                model_projection_blob_path: None,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: TextArtifactEventContext::default(),
+                now_ms: 101,
+            })
+            .await
+            .unwrap();
+        let ReservedUserArtifactMaterializationResult::Materialized(materialized) = materialized
+        else {
+            panic!("minimum supported spill must materialize");
+        };
+        assert_eq!(
+            materialized.source_artifact.content,
+            "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES)
+        );
+        let event = db
+            .list_session_events(session.session_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            event.data["text"].as_str(),
+            Some(materialized.source_artifact.content.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn forked_blob_backed_user_source_keeps_full_body_accounting() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "Build").await.unwrap();
+        let source = "large fork source line\n".repeat(2_000);
+        let reservation = reserve(
+            &db,
+            acceptance_input(parent.session_id, 249, 100),
+            source.len(),
+            source_digest(&source),
+        )
+        .await;
+        let source_blob_path = stage_blob(&db, parent.session_id).await;
+        let materialized = db
+            .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: serde_json::json!({ "text": source }).to_string(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
+                source_text: source.clone(),
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: Some(7),
+                model_projection_blob_path: None,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: TextArtifactEventContext::default(),
+                now_ms: 101,
+            })
+            .await
+            .unwrap();
+        let ReservedUserArtifactMaterializationResult::Materialized(parent_artifacts) =
+            materialized
+        else {
+            panic!("blob-backed source must materialize");
+        };
+        assert!(parent_artifacts.source_artifact.content.len() < source.len());
+
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        let child_artifact = db
+            .list_text_artifacts(child.session_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(child_artifact.content_bytes, source.len());
+        assert_eq!(child_artifact.stored_source_bytes, source.len());
+        assert_eq!(
+            child_artifact.content, parent_artifacts.source_artifact.content,
+            "a fork retains the bounded ledger preview while sharing the full blob"
+        );
+    }
+
     #[tokio::test]
     async fn oversized_model_fence_is_durable_replay_identity() {
         let db = Db::open_in_memory().unwrap();
@@ -3809,6 +4261,7 @@ mod tests {
         ));
 
         let materialized_at = 100_000;
+        let source_blob_path = stage_blob(&db, session.session_id).await;
         let materialized = db
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
@@ -3816,6 +4269,9 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -3884,6 +4340,7 @@ mod tests {
                 ts_ms: 10,
                 data_json: serde_json::json!({ "output": "visible" }).to_string(),
                 artifacts: vec![tool_candidate(content, 0, "call-0")],
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await
@@ -3916,6 +4373,7 @@ mod tests {
                 ts_ms: 11,
                 data_json: serde_json::json!({"output":"visible capped display"}).to_string(),
                 artifacts: Vec::new(),
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: Some(TextArtifactUnavailableProjection {
                     candidate,
                     reason: TextArtifactUnavailableReason::PersistenceUnavailable,
@@ -4293,6 +4751,9 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
+                source_blob_path: None,
+                source_preview_lines: None,
+                model_projection_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4337,8 +4798,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "Build").await.unwrap();
         let source = "s".repeat(65_537);
+        let projection = format!("rewritten:{}", "p".repeat(65_537));
         let input = acceptance_input(session.session_id, 11, 100);
         let reservation = reserve(&db, input.clone(), source.len(), source_digest(&source)).await;
+        let source_blob_path = stage_blob(&db, session.session_id).await;
+        let projection_blob_path = stage_blob(&db, session.session_id).await;
         let materialized = db
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
@@ -4346,19 +4810,40 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
-                model_projection: Some("different model projection".to_owned()),
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: None,
+                model_projection_blob_path: Some(projection_blob_path),
+                model_projection: Some(projection.clone()),
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
                 now_ms: 101,
             })
             .await
             .unwrap();
-        let (source_event_seq, source_artifact) = match materialized {
-            ReservedUserArtifactMaterializationResult::Materialized(materialized) => {
-                (materialized.event_seq, materialized.source_artifact)
-            }
+        let (source_event_seq, source_artifact, projection_artifact) = match materialized {
+            ReservedUserArtifactMaterializationResult::Materialized(materialized) => (
+                materialized.event_seq,
+                materialized.source_artifact,
+                materialized
+                    .projection_artifact
+                    .expect("distinct projection is materialized"),
+            ),
             other => panic!("expected materialization, got {other:?}"),
         };
+        assert!(source_artifact.content.len() <= 16 * 1024);
+        assert!(projection_artifact.content.len() <= 16 * 1024);
+        assert_eq!(projection_artifact.content_bytes, projection.len());
+        let event = db
+            .list_session_events(session.session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.seq == source_event_seq)
+            .expect("source event is materialized");
+        assert_eq!(
+            event.data["text"].as_str(),
+            Some(source_artifact.content.as_str())
+        );
         let duplicate_source_id = Uuid::new_v4();
         db.transaction(move |conn| {
             insert_direct_artifact_copy(
@@ -4408,6 +4893,7 @@ mod tests {
                     prune_candidate("first\n", 0, "call-prune-0"),
                     prune_candidate("second\n", 1, "call-prune-1"),
                 ],
+                staged_blob_paths: Vec::new(),
                 unavailable_projection: None,
             })
             .await
@@ -5043,6 +5529,8 @@ mod tests {
         })
         .await
         .unwrap();
+        let source_blob_path = stage_blob(&db, session.session_id).await;
+        let projection_blob_path = stage_blob(&db, session.session_id).await;
         let materialization = ReservedUserArtifactMaterialization {
             reservation: reservation.clone(),
             canonical_event_json: serde_json::json!({ "text": source }).to_string(),
@@ -5051,6 +5539,9 @@ mod tests {
             // any owner/event row durable.
             model_envelope_json: r#"{"version":3,"prelude":[{"type":"forced_skill","call_id":"forced-fault","name":"review","args":{"name":"review"},"body":"FORCED","hard_fail":false}],"parts":[{"type":"text","text":"AUTO\nTAG\n"},{"type":"authored_text_slot"}]}"#.to_owned(),
             source_text: source,
+            source_blob_path: Some(source_blob_path),
+            source_preview_lines: None,
+            model_projection_blob_path: Some(projection_blob_path),
             model_projection: Some("rewritten model body".to_owned()),
             agent: Some("Build".to_owned()),
             context: TextArtifactEventContext::default(),
@@ -5223,6 +5714,7 @@ mod tests {
                     source_artifact_id: imported_artifact,
                     session_id: parent_id,
                     event_seq,
+                    staged_blob_session_id: None,
                     candidate: TextArtifactCandidate {
                         relation: TextArtifactRelation::SourceUserInput,
                         projection_slot: None,
@@ -5286,6 +5778,7 @@ mod tests {
                         source_artifact_id: Uuid::new_v4(),
                         session_id: parent_id,
                         event_seq: event_seq + 99,
+                        staged_blob_session_id: None,
                         candidate: TextArtifactCandidate {
                             relation: TextArtifactRelation::SourceUserInput,
                             projection_slot: None,

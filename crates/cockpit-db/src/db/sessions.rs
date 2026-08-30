@@ -1164,36 +1164,75 @@ impl Db {
         .await
     }
 
-    /// Permanently delete exactly the reviewed forest. The current recursive
-    /// subtree is compared inside the deletion transaction, before any root is
-    /// removed, so newly-created descendants or changed/reopened members make
-    /// the complete preview fail rather than widening a confirmed delete.
-    pub async fn delete_storage_sessions_if_unchanged(
+    /// Atomically prove that a storage preview still names the complete ended
+    /// forest, then install the durable deletion fence for every member.
+    ///
+    /// The fence is deliberately committed before daemon teardown starts:
+    /// session resume, containment creation, and write-scope transfer admission
+    /// all consult `lifecycle`, so a stale preview fails before it can stop a
+    /// worker or cancel an invocation. Once this succeeds the selected forest
+    /// is no longer allowed to gain a descendant or resume.
+    pub async fn fence_storage_sessions_if_unchanged(
+        &self,
+        roots: Vec<Uuid>,
+        expected: Vec<StorageSessionCandidate>,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            let mut actual = std::collections::BTreeSet::new();
+            for root in &roots {
+                actual.extend(collect_subtree(conn, *root)?);
+            }
+            let expected_ids: std::collections::BTreeSet<_> = expected
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect();
+            if actual != expected_ids {
+                return Ok(false);
+            }
+            for candidate in &expected {
+                let Some(current) = get_session_inner(conn, candidate.session_id)? else {
+                    return Ok(false);
+                };
+                if current.project_id != candidate.project_id
+                    || current.last_active_at_unix_ms != candidate.last_active_at_unix_ms
+                    || current.ended_at_unix_ms.is_none()
+                    || current.lifecycle != "active"
+                {
+                    return Ok(false);
+                }
+            }
+            for candidate in &expected {
+                let changed = conn.execute(
+                    "UPDATE sessions SET lifecycle = 'deleting'
+                     WHERE session_id = ?1 AND lifecycle = 'active'",
+                    [candidate.session_id.to_string()],
+                )?;
+                if changed != 1 {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Delete a forest already fenced by [`Self::fence_storage_sessions_if_unchanged`].
+    /// This intentionally does not repeat preview identity checks after the
+    /// fence: post-fence teardown itself terminalizes run state, while the
+    /// lifecycle fence prevents the identity-relevant re-entry that could make
+    /// a confirmed preview stale.
+    pub async fn delete_fenced_storage_sessions(
         &self,
         roots: Vec<Uuid>,
         expected: Vec<StorageSessionCandidate>,
     ) -> Result<bool> {
         let deleted = self
             .transaction(move |conn| {
-                let mut actual = std::collections::BTreeSet::new();
-                for root in &roots {
-                    actual.extend(collect_subtree(conn, *root)?);
-                }
-                let expected_ids: std::collections::BTreeSet<_> = expected
-                    .iter()
-                    .map(|candidate| candidate.session_id)
-                    .collect();
-                if actual != expected_ids {
-                    return Ok(false);
-                }
                 for candidate in &expected {
                     let Some(current) = get_session_inner(conn, candidate.session_id)? else {
                         return Ok(false);
                     };
-                    if current.project_id != candidate.project_id
-                        || current.last_active_at_unix_ms != candidate.last_active_at_unix_ms
-                        || current.ended_at_unix_ms.is_none()
-                    {
+                    if current.lifecycle != "deleting" {
                         return Ok(false);
                     }
                 }

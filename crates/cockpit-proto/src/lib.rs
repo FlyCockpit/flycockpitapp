@@ -2739,6 +2739,7 @@ pub enum StorageCategory {
     TaskArtifacts,
     ComputerCapture,
     ResultBlobs,
+    SessionShims,
     SessionTmp,
 }
 

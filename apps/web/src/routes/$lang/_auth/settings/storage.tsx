@@ -53,21 +53,15 @@ function StorageSettings() {
   const [sessionIds, setSessionIds] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const {
-    remote,
-    getStorageReport,
-    dismissStorageManagementHint,
-    previewStorageCleanup,
-    executeStorageCleanup,
-  } = useRemoteSessionsStore(
-    useShallow((state) => ({
-      remote: state.instances[instanceId],
-      getStorageReport: state.getStorageReport,
-      dismissStorageManagementHint: state.dismissStorageManagementHint,
-      previewStorageCleanup: state.previewStorageCleanup,
-      executeStorageCleanup: state.executeStorageCleanup,
-    })),
-  );
+  const { remote, getStorageReport, previewStorageCleanup, executeStorageCleanup } =
+    useRemoteSessionsStore(
+      useShallow((state) => ({
+        remote: state.instances[instanceId],
+        getStorageReport: state.getStorageReport,
+        previewStorageCleanup: state.previewStorageCleanup,
+        executeStorageCleanup: state.executeStorageCleanup,
+      })),
+    );
 
   const load = async () => {
     if (!instanceId) return;
@@ -156,33 +150,6 @@ function StorageSettings() {
               <p className="text-sm text-muted-foreground">{t("storage.waitingForInstance")}</p>
             ) : null}
           </div>
-          {report?.show_management_hint ? (
-            <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/40 px-3 py-2 text-sm">
-              <span>{t("storage.hint", { size: bytes(report.total_bytes) })}</span>
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                onClick={() =>
-                  void (async () => {
-                    try {
-                      await dismissStorageManagementHint(
-                        instanceId,
-                        report.storage_management_hint_version,
-                      );
-                      setReport({ ...report, show_management_hint: false });
-                    } catch (reason) {
-                      setError(
-                        reason instanceof Error ? reason.message : t("storage.executeError"),
-                      );
-                    }
-                  })()
-                }
-              >
-                {t("storage.dismiss")}
-              </Button>
-            </div>
-          ) : null}
           {report ? (
             <>
               <Card>
@@ -194,7 +161,12 @@ function StorageSettings() {
                   {report.categories.map((category) => (
                     <div key={category.category} className="flex justify-between gap-4">
                       <span>{t(`storage.categories.${category.category}`)}</span>
-                      <span className="tabular-nums">{bytes(category.total_bytes)}</span>
+                      <span className="text-right tabular-nums">
+                        {bytes(category.total_bytes)}
+                        <span className="ml-2 text-muted-foreground">
+                          {t("storage.reclaimable", { size: bytes(category.reclaimable_bytes) })}
+                        </span>
+                      </span>
                     </div>
                   ))}
                 </CardContent>

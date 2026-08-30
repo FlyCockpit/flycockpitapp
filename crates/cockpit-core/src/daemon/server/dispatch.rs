@@ -7867,38 +7867,83 @@ async fn handle_serialized_request_impl(
             key,
             expected_version,
         } => {
-            // `mark_app_flag_seen` is classified `local_only`: app flags are
-            // daemon-local UI acknowledgements, NOT a remoted owner mutation, so
-            // the request never reserves a transactional remote-operation ledger
-            // row. `admit_remote_operation` already denies a remote non-owner
-            // (the `local_only` class resolves to no remote class) and returns
-            // `None` for the owner, so any `remote_operation` identity is inert
-            // here by construction — persist locally only. See
-            // `mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger`.
-            let db_key = app_flag_db_key(key);
-            let outcome = ctx
-                .db
-                .write(move |conn| {
-                    crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)
-                })
-                .await
-                .map_err(internal)?;
-            let Some((version, changed)) = outcome else {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: "app flag version changed; refresh before retrying".into(),
-                });
-            };
-            Ok(Response::AppFlagSeen {
+            #[cfg(feature = "remote")]
+            let request = Request::MarkAppFlagSeen {
                 key,
-                version,
-                changed,
+                expected_version,
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(remote_operation, ctx, "mark_app_flag_seen", async {
+                let db_key = app_flag_db_key(key);
+                let outcome = ctx
+                    .db
+                    .write(move |conn| {
+                        crate::db::Db::mark_app_flag_seen_versioned_conn(
+                            conn,
+                            db_key,
+                            expected_version,
+                        )
+                    })
+                    .await
+                    .map_err(internal)?;
+                let Some((version, changed)) = outcome else {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "app flag version changed; refresh before retrying".into(),
+                    });
+                };
+                Ok(Response::AppFlagSeen {
+                    key,
+                    version,
+                    changed,
+                })
             })
         }
         Request::GetStorageReport => super::storage::report(ctx).await,
-        Request::PreviewStorageCleanup { target } => super::storage::preview(ctx, target).await,
+        Request::PreviewStorageCleanup { target } => {
+            #[cfg(feature = "remote")]
+            let request = Request::PreviewStorageCleanup {
+                target: target.clone(),
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "preview_storage_cleanup",
+                super::storage::preview(ctx, target)
+            )
+        }
         Request::ExecuteStorageCleanup { preview_id } => {
-            super::storage::execute(ctx, preview_id).await
+            #[cfg(feature = "remote")]
+            let request = Request::ExecuteStorageCleanup { preview_id };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "execute_storage_cleanup",
+                super::storage::execute(ctx, preview_id)
+            )
         }
         Request::ResolveAssistantSession {
             assistant_id,
@@ -8471,7 +8516,7 @@ async fn handle_serialized_request_impl(
             let mut purged = 0u32;
             for id in &session_ids {
                 if let Ok(session_id) = Uuid::parse_str(id) {
-                    ctx.db.delete_session(session_id).await.map_err(internal)?;
+                    super::sessions::delete_session(ctx, session_id).await?;
                     purged = purged.saturating_add(1);
                 }
             }

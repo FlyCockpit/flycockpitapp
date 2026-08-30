@@ -163,6 +163,19 @@ pub(super) async fn execute(
             directories,
         } => {
             verify_directory_snapshots(&directories).map_err(internal)?;
+            // This transaction is the preview's linearization point. It checks
+            // every root and descendant as one forest and commits the durable
+            // `deleting` fence before any worker is stopped or invocation is
+            // terminalized. A stale preview therefore has no destructive side
+            // effect, including when a later root would otherwise fail.
+            let unchanged = ctx
+                .db
+                .fence_storage_sessions_if_unchanged(roots.clone(), candidates.clone())
+                .await
+                .map_err(internal)?;
+            if !unchanged {
+                return Err(invalid_preview());
+            }
             for root in &roots {
                 super::sessions::prepare_session_deletion(ctx, *root).await?;
                 ctx.db
@@ -173,15 +186,19 @@ pub(super) async fn execute(
                     .await
                     .map_err(internal)?;
             }
+            // Filesystem cleanup is a deletion precondition: do not remove
+            // relational ownership if the session's result-blob namespace
+            // cannot be proven absent.
+            let bytes_freed = remove_previewed_directories(&directories).map_err(internal)?;
             let unchanged = ctx
                 .db
-                .delete_storage_sessions_if_unchanged(roots, candidates)
+                .delete_fenced_storage_sessions(roots, candidates)
                 .await
                 .map_err(internal)?;
             if !unchanged {
                 return Err(invalid_preview());
             }
-            remove_previewed_directories(&directories).map_err(internal)?
+            bytes_freed
         }
         CleanupPlan::RemoveOrphanedWorkspaceStorage {
             orphan_roots,
@@ -431,12 +448,17 @@ fn collect_usage(
         ),
         (
             cockpit_proto::StorageCategory::ComputerCapture,
-            directory_bytes(&state_dir.join("computer-capture"))?,
+            directory_bytes(&data_dir.join("computer-capture"))?,
             0,
         ),
         (
             cockpit_proto::StorageCategory::ResultBlobs,
             directory_bytes(&state_dir.join("result-blobs"))?,
+            0,
+        ),
+        (
+            cockpit_proto::StorageCategory::SessionShims,
+            directory_bytes(&data_dir.join("session-shims"))?,
             0,
         ),
         (
@@ -522,7 +544,7 @@ fn directory_bytes(path: &Path) -> Result<u64> {
 /// The per-session result-blob namespace. Result writers must place a
 /// session's files below this opaque id directory so permanent session deletion
 /// has one unambiguous, daemon-owned filesystem target.
-pub(super) fn result_blob_directory_for_session(session_id: Uuid) -> Result<PathBuf> {
+pub(crate) fn result_blob_directory_for_session(session_id: Uuid) -> Result<PathBuf> {
     Ok(cockpit_config::config::resolve::cockpit_state_dir()?
         .join("result-blobs")
         .join(session_id.to_string()))
@@ -620,13 +642,19 @@ fn verify_directory_snapshots(snapshots: &[DirectorySnapshot]) -> Result<()> {
     Ok(())
 }
 
+/// Fence each pathname out of the production writer namespace before the final
+/// snapshot and recursive removal. `rename` is atomic within the owned parent:
+/// after it succeeds, a writer resolving the normal scratch/config/blob path
+/// can only create content at the old name, which is deliberately left outside
+/// the staged deletion tree. The final comparison is made *after* that fence,
+/// so content written before the fence is never silently swept up either.
 fn remove_previewed_directories(snapshots: &[DirectorySnapshot]) -> Result<u64> {
+    let staged = stage_previewed_directories(snapshots)?;
     let mut bytes_freed = 0_u64;
-    for snapshot in snapshots {
-        // Recheck at the last possible point before removal. The initial
-        // all-target preflight above prevents a later stale target from causing
-        // a partial cleanup; this second check closes ordinary re-entry while
-        // earlier targets are being removed.
+    for snapshot in &staged {
+        // This is intentionally after the namespace fence, rather than a
+        // second check against a writer-visible pathname. No production writer
+        // can re-enter the staged tree by resolving its ordinary path.
         ensure!(
             directory_snapshot(snapshot.path.clone())? == *snapshot,
             "storage target changed after preview: `{}`",
@@ -641,6 +669,55 @@ fn remove_previewed_directories(snapshots: &[DirectorySnapshot]) -> Result<u64> 
         bytes_freed = bytes_freed.saturating_add(snapshot.bytes);
     }
     Ok(bytes_freed)
+}
+
+fn stage_previewed_directories(snapshots: &[DirectorySnapshot]) -> Result<Vec<DirectorySnapshot>> {
+    let mut staged = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let metadata = match std::fs::symlink_metadata(&snapshot.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // An absent directory has no bytes and no recursive-removal
+                // target. It was already represented by the preview snapshot.
+                ensure!(
+                    snapshot.entries.is_empty() && snapshot.bytes == 0,
+                    "storage target disappeared after preview: `{}`",
+                    snapshot.path.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting `{}`", snapshot.path.display()));
+            }
+        };
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "refusing to stage non-directory storage target `{}`",
+            snapshot.path.display()
+        );
+        let parent = snapshot
+            .path
+            .parent()
+            .context("storage target has no parent")?;
+        let name = snapshot
+            .path
+            .file_name()
+            .context("storage target has no file name")?
+            .to_string_lossy();
+        let staged_path = parent.join(format!(".{name}.storage-cleanup-{}", Uuid::now_v7()));
+        std::fs::rename(&snapshot.path, &staged_path).with_context(|| {
+            format!(
+                "fencing storage target `{}` as `{}`",
+                snapshot.path.display(),
+                staged_path.display()
+            )
+        })?;
+        let mut staged_snapshot = snapshot.clone();
+        staged_snapshot.path = staged_path;
+        staged.push(staged_snapshot);
+    }
+    Ok(staged)
 }
 
 fn remove_previewed_directory(path: &Path) -> Result<()> {

@@ -10949,11 +10949,11 @@ async fn delete_session_remote_path_commits_transactional_ledger() {
 
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
-    // `mark_app_flag_seen` is classified `local_only`. Even if an operation
-    // identity is injected (which `admit_remote_operation` never produces for a
-    // `local_only` class), the daemon must persist locally and reserve NO
-    // transactional ledger row.
+async fn mark_app_flag_seen_is_owner_remoted_and_replay_safe() {
+    // The remote Settings shell owns storage-hint dismissal, so this durable
+    // acknowledgement is a nonrepeatable owner mutation rather than a
+    // local-only write. Its completed response is replayed from the remote
+    // operation ledger instead of applying the versioned write twice.
     let ctx = persistent_test_ctx();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
@@ -10975,8 +10975,8 @@ async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
     assert_eq!(version, 1, "the local app flag write must have applied");
     assert_eq!(
         remote_ledger_state(&ctx, &operation).await,
-        None,
-        "a local_only mutation must NOT reserve any transactional ledger row"
+        Some("committed".to_string()),
+        "the owner-remoted acknowledgement must commit a replay record"
     );
 }
 

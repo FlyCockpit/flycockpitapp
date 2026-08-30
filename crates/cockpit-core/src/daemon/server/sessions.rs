@@ -465,7 +465,6 @@ pub(super) async fn delete_session(
         .terminalize_session_run_invocations(session_id, now_wall_ms)
         .await
         .map_err(internal)?;
-    ctx.db.delete_session(session_id).await.map_err(internal)?;
     for scratch_dir in scratch_dirs {
         remove_session_scratch(&scratch_dir).map_err(internal)?;
     }
@@ -489,10 +488,11 @@ pub(super) async fn delete_session(
             }
         }
     }
+    ctx.db.delete_session(session_id).await.map_err(internal)?;
     Ok(Response::Ack)
 }
 
-pub(super) fn remove_session_scratch(path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn remove_session_scratch(path: &std::path::Path) -> anyhow::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

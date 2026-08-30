@@ -18,6 +18,7 @@
     "dismiss": "Dismiss",
     "total": "Total footprint: {{size}}",
     "breakdownDescription": "Measured on disk. Reclaimable items require a separate preview.",
+    "reclaimable": "{{size}} reclaimable",
     "quickActions": "Cleanup actions",
     "previewRequired": "Every cleanup shows its exact items and reclaimed bytes before it runs.",
     "archiveOlderThan30": "Preview archive for sessions older than 30 days",
@@ -39,6 +40,7 @@
       "task_artifacts": "Task artifacts",
       "computer_capture": "Computer captures",
       "result_blobs": "Result blobs",
+      "session_shims": "Session command shims",
       "session_tmp": "Session temporary files"
     }
   },

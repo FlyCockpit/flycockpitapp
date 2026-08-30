@@ -815,7 +815,8 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
         {
             Ok(handle) => handle,
             Err(error) => {
-                if let Err(cleanup_error) = db.delete_session(session_id).await {
+                if let Err(cleanup_error) = delete_refused_scheduled_session(&db, session_id).await
+                {
                     tracing::warn!(
                         error = %cleanup_error,
                         %session_id,
@@ -879,6 +880,31 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
             Err(_) => bail!("scheduled prompt timed out"),
         }
     }
+}
+
+/// The scheduler owns no daemon context, but it still must uphold the global
+/// session-deletion filesystem invariant when it discards a refused session.
+async fn delete_refused_scheduled_session(db: &Db, session_id: uuid::Uuid) -> Result<()> {
+    let subtree = db.session_subtree_ids(session_id).await?;
+    let result_blob_dirs = subtree
+        .iter()
+        .map(|member| crate::daemon::server::storage::result_blob_directory_for_session(*member))
+        .collect::<Result<Vec<_>>>()?;
+    for result_blob_dir in result_blob_dirs {
+        crate::daemon::server::sessions::remove_session_scratch(&result_blob_dir)?;
+        match std::fs::symlink_metadata(&result_blob_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                anyhow::bail!(
+                    "scheduled-session deletion left result blobs at `{}`",
+                    result_blob_dir.display()
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    db.delete_session(session_id).await?;
+    Ok(())
 }
 
 pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {

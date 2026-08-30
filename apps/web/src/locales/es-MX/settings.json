@@ -88,6 +88,7 @@
     "dismiss": "Descartar",
     "total": "Espacio total: {{size}}",
     "breakdownDescription": "Medido en disco. Los elementos recuperables requieren una vista previa.",
+    "reclaimable": "{{size}} recuperables",
     "quickActions": "Acciones de limpieza",
     "previewRequired": "Cada limpieza muestra los elementos exactos y bytes recuperados antes de ejecutarse.",
     "archiveOlderThan30": "Vista previa para archivar sesiones de más de 30 días",
@@ -109,6 +110,7 @@
       "task_artifacts": "Artefactos de tareas",
       "computer_capture": "Capturas de computadora",
       "result_blobs": "Resultados almacenados",
+      "session_shims": "Comandos auxiliares de sesión",
       "session_tmp": "Archivos temporales de sesión"
     }
   }

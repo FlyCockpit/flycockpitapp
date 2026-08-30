@@ -6637,10 +6637,10 @@ mod leaks_tests;
 mod secret_store_boot_tests;
 #[cfg(test)]
 mod secret_store_local_tests;
-mod sessions;
+pub(crate) mod sessions;
 #[cfg(feature = "remote")]
 mod sessions_remote;
-mod storage;
+pub(crate) mod storage;
 #[cfg(test)]
 mod tests;
 

@@ -1604,6 +1604,7 @@ const storageCategorySchema = z.enum([
   "task_artifacts",
   "computer_capture",
   "result_blobs",
+  "session_shims",
   "session_tmp",
 ]);
 const storageCleanupItemSchema = z

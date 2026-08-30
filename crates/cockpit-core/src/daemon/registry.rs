@@ -1047,6 +1047,10 @@ impl SessionRegistry {
         };
         // Resume path.
         if let Some(id) = session_id {
+            anyhow::ensure!(
+                !self.inner.db.is_session_deleting(id).await?,
+                "session {id} is being deleted and cannot be resumed"
+            );
             // Resolve the handle for whichever claim path this attach takes.
             // The reconciliation gate below is applied UNIFORMLY afterwards
             // (finding 3) so no claim path can slip a pre-reconciliation handle
@@ -1191,6 +1195,10 @@ impl SessionRegistry {
             .get_session(session_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
+        anyhow::ensure!(
+            row.lifecycle == "active",
+            "session {session_id} is being deleted and cannot be resumed"
+        );
         let mode = match row.session_entry_mode.as_str() {
             "code" => crate::daemon::proto::SessionEntryMode::Code,
             "assistant" => crate::daemon::proto::SessionEntryMode::Assistant,

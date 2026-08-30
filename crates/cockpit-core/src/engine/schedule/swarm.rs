@@ -1474,6 +1474,7 @@ mod tests {
                 ScheduleEvent::SwarmChildStarted { .. } => order.push("started"),
                 ScheduleEvent::SwarmChildStopGateCompleted { .. } => order.push("gate"),
                 ScheduleEvent::EphemeralCompleted { .. } => {}
+                ScheduleEvent::IdleWakeCompleted { .. } => {}
                 ScheduleEvent::Completed { failed, .. } => {
                     assert!(!failed, "a scout success must be a non-failed Completed");
                     saw_completed = true;

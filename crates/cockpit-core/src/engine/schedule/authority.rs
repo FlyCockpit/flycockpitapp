@@ -26,10 +26,10 @@
 //!   runs the prompt as a real turn in **main history**, then tells the
 //!   authority the iteration finished ([`ScheduleCommand::IterationFinished`])
 //!   so it can schedule the next tick or terminate.
-//! - `keep_in_context = false`: the whole loop runs inside the spawned
-//!   task on an **ephemeral fork** ([`super::loop_runner`]); only `note`s
-//!   (live UI) and the terminal result (via [`ScheduleEvent::Completed`]) cross
-//!   to main.
+//! - `keep_in_context = false`: the whole loop runs inside the spawned task on
+//!   an **ephemeral fork** ([`super::loop_runner`]); ordinary loops promote
+//!   `note`s (live UI) and their terminal result, while idle loops promote
+//!   each acting wake independently and discard read-only wakes.
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -39,6 +39,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::engine::agent::{Agent, TurnEvent};
@@ -95,6 +96,15 @@ pub enum ScheduleEvent {
     /// An idle wake finished in its fork without a visible action. The driver
     /// releases the live slot without recording a transcript turn.
     EphemeralCompleted { job_id: String },
+    /// An idle wake took a visible action. Unlike [`Self::Completed`], this
+    /// settles one wake but leaves the bounded idle loop registered for its
+    /// later wakes. The driver injects this wake's result immediately.
+    IdleWakeCompleted {
+        job_id: String,
+        kind: ScheduleKind,
+        result: String,
+        requests: Vec<SpawnRequest>,
+    },
     /// A genuine recursive-`Swarm` child subagent (`bee` / `scout`) has just
     /// STARTED its background task. Emitted by the runner ([`super::swarm::run_swarm`])
     /// as its FIRST action — on the SAME authority→driver channel and by the
@@ -386,7 +396,7 @@ pub struct ScheduleAuthority {
     swarm_queue: std::collections::VecDeque<SpawnSpec>,
     /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
     /// user message resets their countdown without polling.
-    idle_activity_tx: watch::Sender<u64>,
+    idle_activity_tx: watch::Sender<Instant>,
 }
 
 impl ScheduleAuthority {
@@ -415,7 +425,7 @@ impl ScheduleAuthority {
         ctx: ScheduleContext,
         max_concurrent: usize,
     ) -> Self {
-        let (idle_activity_tx, _) = watch::channel(0_u64);
+        let (idle_activity_tx, _) = watch::channel(Instant::now());
         Self {
             registry: BTreeMap::new(),
             max_concurrent: max_concurrent.max(1),
@@ -673,6 +683,13 @@ impl ScheduleAuthority {
     /// Start a loop/timer that accumulates in the main context. Returns
     /// the registered job id (echoed back to the model so it can cancel).
     pub fn start_loop_in_context(&mut self, args: LoopStartArgs) -> String {
+        // These options are owned by the fork runner: an idle wake needs
+        // per-wake effect classification, and watch mode must suppress model
+        // inference while unchanged. Keep direct authority callers from
+        // bypassing that boundary.
+        if args.idle || !args.watch_paths.is_empty() {
+            return self.start_loop_forked(args);
+        }
         let job_id = new_job_id();
         let kind = args.kind();
         let label = loop_label(&args);
@@ -733,8 +750,7 @@ impl ScheduleAuthority {
     /// Reset this thread's idle schedules after an accepted external user
     /// message. Scheduled work and rejected input never call this method.
     pub fn record_user_activity(&self) {
-        let next = (*self.idle_activity_tx.borrow()).saturating_add(1);
-        let _ = self.idle_activity_tx.send(next);
+        let _ = self.idle_activity_tx.send(Instant::now());
     }
 
     /// Start a background shell job. Returns the job id.
@@ -1203,6 +1219,25 @@ mod tests {
         assert!(!auth.has_loop());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn watch_paths_cannot_bypass_the_fork_runner() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 60,
+            "prompt": "watch status",
+            "watch_paths": ["status.json"]
+        }))
+        .unwrap();
+
+        // The default `keep_in_context = true` must still route through the
+        // runner that computes the digest before requesting inference.
+        let job_id = auth.start_loop_in_context(args);
+        let entry = auth.registry.get(&job_id).expect("registered watch loop");
+        assert!(entry.in_context.is_none());
+        assert!(entry.abort.is_some());
+        assert!(auth.cancel(&job_id));
+    }
+
     /// A timer (`limit = 1`) fires exactly one iteration then completes.
     #[tokio::test(start_paused = true)]
     async fn timer_fires_once() {
@@ -1455,6 +1490,7 @@ mod tests {
                         )
                     }
                     ScheduleEvent::EphemeralCompleted { .. } => {}
+                    ScheduleEvent::IdleWakeCompleted { .. } => {}
                     ScheduleEvent::Completed { .. } => break,
                     ScheduleEvent::LoopIterationDue { .. } => {}
                 }

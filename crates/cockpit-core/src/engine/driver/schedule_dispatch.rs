@@ -28,6 +28,38 @@ impl Driver {
                 // turn nor an inbox item; only their live registry row ends.
                 self.schedule.mark_completed(&job_id);
             }
+            ScheduleEvent::IdleWakeCompleted {
+                job_id,
+                kind,
+                result,
+                requests,
+            } => {
+                if self.persist_on_reentry_owns_started_unsettled_siblings() {
+                    anyhow::bail!(
+                        "persist-on-re-entry owns started-unsettled idle wake completion"
+                    );
+                }
+                // This is deliberately not `mark_completed`: each event is one
+                // acting wake, while the registry row owns the remaining
+                // bounded wakes. Its result is the only main-thread turn this
+                // wake produces.
+                let mut injected =
+                    format!("{}\n{result}", async_result_header(kind.as_str(), &job_id));
+                if !requests.is_empty() {
+                    injected.push_str(
+                        "\n\nThis loop requested new scheduled work (not started — you decide):",
+                    );
+                    for req in &requests {
+                        injected.push_str(&format!("\n- {}", req.summary()));
+                    }
+                }
+                self.run_user_input(
+                    scheduled_job_submission(injected, Some(job_id)),
+                    input_rx,
+                    tx,
+                )
+                .await?;
+            }
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
                 if self.persist_on_reentry_owns_started_unsettled_siblings() {
                     // Do not run the tick or call `iteration_finished`: keep-park
@@ -256,11 +288,12 @@ impl Driver {
                 if limit.is_none() {
                     self.ensure_unbounded_loop_allowed().await?;
                 }
-                let job_id = if parsed.keep_in_context && !parsed.idle {
-                    self.schedule.start_loop_in_context(parsed)
-                } else {
-                    self.schedule.start_loop_forked(parsed)
-                };
+                let job_id =
+                    if parsed.keep_in_context && !parsed.idle && parsed.watch_paths.is_empty() {
+                        self.schedule.start_loop_in_context(parsed)
+                    } else {
+                        self.schedule.start_loop_forked(parsed)
+                    };
                 let noun = if kind == ScheduleKind::Timer {
                     "timer"
                 } else {

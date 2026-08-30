@@ -144,16 +144,15 @@ pub fn split_action(call_args: &Value) -> Result<(ScheduleAction, Value)> {
 
 // ---- Fork-only tools -------------------------------------------------------
 
-/// Shared state the ephemeral-fork loop's tools write into and the
-/// loop runner reads at termination. Notes and re-routed create-requests
-/// accumulate here; `cancelled` flips when the fork cancels its own loop.
+/// Shared ephemeral-fork state. Ordinary loops retain it to terminal
+/// promotion; the loop runner creates a fresh value for every idle wake so
+/// one wake's effect accounting cannot make a later read-only wake durable.
 pub struct ForkScheduleState {
     /// The job id this fork's loop owns — `loop.cancel` must match it.
     own_job_id: String,
     notes: Mutex<Vec<String>>,
     requests: Mutex<Vec<SpawnRequest>>,
     cancelled: std::sync::atomic::AtomicBool,
-    persistent_action: std::sync::atomic::AtomicBool,
 }
 
 impl ForkScheduleState {
@@ -163,19 +162,14 @@ impl ForkScheduleState {
             notes: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             cancelled: std::sync::atomic::AtomicBool::new(false),
-            persistent_action: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn push_note(&self, text: String) {
-        self.persistent_action
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.notes.lock().unwrap().push(text);
     }
 
     fn push_request(&self, req: SpawnRequest) {
-        self.persistent_action
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.requests.lock().unwrap().push(req);
     }
 
@@ -189,8 +183,10 @@ impl ForkScheduleState {
     }
 
     pub fn has_persistent_action(&self) -> bool {
-        self.persistent_action
-            .load(std::sync::atomic::Ordering::SeqCst)
+        if !self.notes.lock().unwrap().is_empty() {
+            return true;
+        }
+        !self.requests.lock().unwrap().is_empty()
     }
 
     /// Drain accumulated notes (called once at termination).
@@ -204,9 +200,9 @@ impl ForkScheduleState {
     }
 }
 
-/// `note(text)` — the only fork→main channel. Shown live in the UI (via a
-/// [`TurnEvent::ScheduleNote`]); enters main context only at loop termination,
-/// bundled with the terminal result.
+/// `note(text)` — a fork→main channel. It is shown live in the UI via a
+/// [`TurnEvent::ScheduleNote`]; ordinary loops bundle it at termination while
+/// idle loops promote it with the acting wake.
 pub struct NoteTool {
     state: Arc<ForkScheduleState>,
     turn_tx: mpsc::Sender<TurnEvent>,

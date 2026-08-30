@@ -2091,7 +2091,7 @@ impl Db {
         );
         let deleting = collect_subtree(conn, session_id)?;
         for member in &deleting {
-            for artifact in crate::db::text_artifacts::list_text_artifacts_conn(conn, member)? {
+            for artifact in crate::db::text_artifacts::list_text_artifacts_conn(conn, *member)? {
                 let value: serde_json::Value = serde_json::from_str(&artifact.provenance_json)
                     .context("parsing text artifact provenance for cleanup")?;
                 let Some(path) = value.get("blob_path").and_then(serde_json::Value::as_str) else {

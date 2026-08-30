@@ -63,12 +63,19 @@ pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
 /// Malformed or unresolvable projection schema fails closed by removing the
 /// value governed by that fragment.
 pub fn strip_model_ephemeral_fields(value: &Value, schema: &Value) -> Value {
-    project_model_value(value, schema, schema, 0).unwrap_or(Value::Null)
+    project_model_value(value, schema, schema, "#", 0, true).unwrap_or(Value::Null)
 }
 
 const MAX_MODEL_EPHEMERAL_SCHEMA_DEPTH: usize = 64;
 
-fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize) -> Option<Value> {
+fn project_model_value(
+    value: &Value,
+    schema: &Value,
+    root: &Value,
+    schema_pointer: &str,
+    depth: usize,
+    follow_reference: bool,
+) -> Option<Value> {
     if depth > MAX_MODEL_EPHEMERAL_SCHEMA_DEPTH {
         return None;
     }
@@ -89,14 +96,15 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
     // JSON Schema permits sibling constraints next to `$ref`. Apply the
     // target first, then the local siblings, so a marker in either location
     // cannot be hidden by reference resolution.
-    if let Some(reference) = schema.get("$ref") {
+    if follow_reference && let Some(reference) = schema.get("$ref") {
         let reference = reference.as_str()?;
         let pointer = reference.strip_prefix('#')?;
         let target = root.pointer(pointer)?;
-        let projected = project_model_value(value, target, root, depth + 1)?;
-        let mut siblings = schema.as_object()?.clone();
-        siblings.remove("$ref");
-        return project_model_value(&projected, &Value::Object(siblings), root, depth + 1);
+        let projected = project_model_value(value, target, root, reference, depth + 1, true)?;
+        // JSON Schema permits sibling constraints next to `$ref`. Revisit this
+        // schema without following the reference so those siblings use their
+        // original root-relative location for composition matching.
+        return project_model_value(&projected, schema, root, schema_pointer, depth + 1, false);
     }
 
     let mut projected = value.clone();
@@ -106,8 +114,36 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
             if matches!(keyword, "anyOf" | "oneOf") && branches.is_empty() {
                 return None;
             }
-            for branch in branches {
-                projected = project_model_value(&projected, branch, root, depth + 1)?;
+            let branch_indexes: Vec<usize> = match keyword {
+                "allOf" => (0..branches.len()).collect(),
+                "anyOf" | "oneOf" => matching_composition_branches(
+                    value,
+                    root,
+                    schema_pointer,
+                    keyword,
+                    branches.len(),
+                )?,
+                _ => unreachable!("composition keywords are fixed above"),
+            };
+            if keyword == "oneOf" && branch_indexes.len() != 1 {
+                return None;
+            }
+            if matches!(keyword, "anyOf" | "oneOf") && branch_indexes.is_empty() {
+                return None;
+            }
+            for index in branch_indexes {
+                let branch_pointer = schema_pointer_child(
+                    &schema_pointer_child(schema_pointer, keyword),
+                    &index.to_string(),
+                );
+                projected = project_model_value(
+                    &projected,
+                    &branches[index],
+                    root,
+                    &branch_pointer,
+                    depth + 1,
+                    true,
+                )?;
             }
         }
     }
@@ -130,7 +166,17 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
                 if let Some(field_schema) = properties.and_then(|properties| properties.get(name)) {
                     matched = true;
                     field_value = field_value.and_then(|value| {
-                        project_model_value(&value, field_schema, root, depth + 1)
+                        project_model_value(
+                            &value,
+                            field_schema,
+                            root,
+                            &schema_pointer_child(
+                                &schema_pointer_child(schema_pointer, "properties"),
+                                name,
+                            ),
+                            depth + 1,
+                            true,
+                        )
                     });
                 }
                 if let Some(patterns) = patterns {
@@ -139,7 +185,17 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
                         if regex.is_match(name) {
                             matched = true;
                             field_value = field_value.and_then(|value| {
-                                project_model_value(&value, field_schema, root, depth + 1)
+                                project_model_value(
+                                    &value,
+                                    field_schema,
+                                    root,
+                                    &schema_pointer_child(
+                                        &schema_pointer_child(schema_pointer, "patternProperties"),
+                                        pattern,
+                                    ),
+                                    depth + 1,
+                                    true,
+                                )
                             });
                         }
                     }
@@ -148,8 +204,16 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
                     field_value = match additional {
                         Value::Bool(false) => None,
                         Value::Bool(true) => field_value,
-                        schema => field_value
-                            .and_then(|value| project_model_value(&value, schema, root, depth + 1)),
+                        schema => field_value.and_then(|value| {
+                            project_model_value(
+                                &value,
+                                schema,
+                                root,
+                                &schema_pointer_child(schema_pointer, "additionalProperties"),
+                                depth + 1,
+                                true,
+                            )
+                        }),
                     };
                 }
                 if let Some(field_value) = field_value {
@@ -169,7 +233,21 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
                 let schema = prefix.and_then(|prefix| prefix.get(index)).or(item_schema);
                 let projected = match schema {
                     Some(Value::Bool(false)) => None,
-                    Some(schema) => project_model_value(item, schema, root, depth + 1),
+                    Some(schema) => project_model_value(
+                        item,
+                        schema,
+                        root,
+                        if prefix.is_some_and(|prefix| index < prefix.len()) {
+                            &schema_pointer_child(
+                                &schema_pointer_child(schema_pointer, "prefixItems"),
+                                &index.to_string(),
+                            )
+                        } else {
+                            &schema_pointer_child(schema_pointer, "items")
+                        },
+                        depth + 1,
+                        true,
+                    ),
                     None => Some(item.clone()),
                 };
                 if let Some(projected) = projected {
@@ -180,6 +258,39 @@ fn project_model_value(value: &Value, schema: &Value, root: &Value, depth: usize
         }
         _ => Some(projected),
     }
+}
+
+/// Return the `anyOf`/`oneOf` branches that validate the source instance.
+///
+/// Validators are addressed by their JSON pointer within the original schema
+/// document, rather than compiled from an isolated branch. This keeps local
+/// references and embedded resource scopes rooted exactly as authored.
+fn matching_composition_branches(
+    value: &Value,
+    root: &Value,
+    schema_pointer: &str,
+    keyword: &str,
+    branch_count: usize,
+) -> Option<Vec<usize>> {
+    let validators = jsonschema::validator_map_for(root).ok()?;
+    let mut matching = Vec::new();
+    for index in 0..branch_count {
+        let branch_pointer = schema_pointer_child(
+            &schema_pointer_child(schema_pointer, keyword),
+            &index.to_string(),
+        );
+        let validator = validators.get(&branch_pointer)?;
+        if validator.is_valid(value) {
+            matching.push(index);
+        }
+    }
+    Some(matching)
+}
+
+/// Add one URI-fragment JSON-Pointer segment.
+fn schema_pointer_child(pointer: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    format!("{pointer}/{escaped}")
 }
 
 /// Marker error a tool returns when the *arguments* were the problem
@@ -683,6 +794,59 @@ mod model_ephemeral_tests {
             Value::Null,
             "a malformed projection fragment fails closed"
         );
+    }
+
+    #[test]
+    fn composition_markers_only_project_the_matching_discriminated_variant() {
+        for keyword in ["anyOf", "oneOf"] {
+            let mut variant_schema = json!({
+                "$defs": {
+                    "ephemeral_payload": { "x-cockpit-model-ephemeral": true },
+                    "public": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "public" },
+                            "payload": { "type": "string" }
+                        },
+                        "required": ["kind", "payload"],
+                        "additionalProperties": false
+                    },
+                    "private": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "private" },
+                            "payload": { "$ref": "#/$defs/ephemeral_payload" }
+                        },
+                        "required": ["kind", "payload"],
+                        "additionalProperties": false
+                    }
+                }
+            });
+            variant_schema.as_object_mut().unwrap().insert(
+                keyword.to_string(),
+                json!([
+                    { "$ref": "#/$defs/public" },
+                    { "$ref": "#/$defs/private" }
+                ]),
+            );
+
+            assert_eq!(
+                strip_model_ephemeral_fields(
+                    &json!({ "kind": "public", "payload": "keep this" }),
+                    &variant_schema,
+                ),
+                json!({ "kind": "public", "payload": "keep this" }),
+                "a nonmatching {keyword} branch must not remove a shared field"
+            );
+            assert_eq!(
+                strip_model_ephemeral_fields(
+                    &json!({ "kind": "private", "payload": "timeline-only" }),
+                    &variant_schema,
+                ),
+                json!({ "kind": "private" }),
+                "the matching {keyword} branch must still remove its marked field"
+            );
+        }
     }
 }
 

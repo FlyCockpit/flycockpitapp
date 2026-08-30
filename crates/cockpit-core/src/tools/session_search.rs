@@ -194,6 +194,9 @@ impl Tool for SessionSearchTool {
             .take(limit as usize)
             .map(|hit| hit.session_id)
             .collect();
+        // Keep the disclosure permit until this call returns. A consent write
+        // cannot commit between the final batch check and its output.
+        let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
         if !ctx
             .session
             .db

@@ -1328,20 +1328,29 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-/// Hash the project root into a 12-char hex id. Stable across symlink
-/// shifts because the input is the realpath when available.
-pub fn project_id_for(root: &Path) -> String {
+/// Derive a workspace key from the live root directory object, rather than
+/// from its pathname. A replacement repository at the same canonical path
+/// therefore gets a new key and cannot inherit the predecessor's sessions or
+/// history-scope consent. The held authority rejects symlink substitution
+/// while taking the platform object proof (device/inode or volume/file ID).
+pub fn project_id_for(root: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let s = canon.to_string_lossy();
+    let canonical = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    let authority =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            &canonical,
+        )
+        .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
     let mut h = Sha256::new();
-    h.update(s.as_bytes());
+    h.update(b"cockpit-workspace-object-identity-v1\0");
+    h.update(authority.identity().as_bytes());
     let out = h.finalize();
-    let mut hex = String::with_capacity(12);
-    for byte in out.iter().take(6) {
+    let mut hex = String::with_capacity(64);
+    for byte in out {
         hex.push_str(&format!("{byte:02x}"));
     }
-    hex
+    Ok(hex)
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
@@ -3149,5 +3158,19 @@ mod tests {
         // Editing to v3 injects, diffed from v2.
         std::fs::write(&path, "v3\n").unwrap();
         assert!(s.guidance_change_injection(tmp.path()).await.is_some());
+    }
+
+    #[test]
+    fn replacement_workspace_at_the_same_path_gets_a_new_project_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let original = project_id_for(&workspace).unwrap();
+
+        std::fs::rename(&workspace, temp.path().join("retired-workspace")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let replacement = project_id_for(&workspace).unwrap();
+
+        assert_ne!(original, replacement);
     }
 }

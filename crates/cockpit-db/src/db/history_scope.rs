@@ -33,6 +33,10 @@ impl Db {
         scope: WorkspaceHistoryScope,
     ) -> Result<()> {
         validate_project_id(project_id)?;
+        // A completed revocation must be ordered after every disclosure that
+        // already passed its final access check, and before every later one.
+        // Tool paths retain the shared permit through their return boundary.
+        let _revocation_fence = self.history_scope_gate.write().await;
         let project_id = project_id.to_string();
         let now = Utc::now().timestamp_millis();
         self.write(move |conn| {
@@ -250,5 +254,30 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn revocation_waits_for_an_in_flight_disclosure_permit() {
+        let db = Db::open_in_memory().unwrap();
+        let permit = db.history_scope_disclosure_permit().await;
+        let revoking_db = db.clone();
+        let revocation = tokio::spawn(async move {
+            revoking_db
+                .set_workspace_history_scope(
+                    "workspace-a",
+                    WorkspaceHistoryScope {
+                        outbound: false,
+                        inbound: false,
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !revocation.is_finished(),
+            "revocation committed while the disclosure permit was retained"
+        );
+        drop(permit);
+        revocation.await.unwrap().unwrap();
     }
 }

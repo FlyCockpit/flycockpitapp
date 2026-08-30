@@ -108,6 +108,11 @@ impl Tool for SessionReadTool {
             .await
             .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?
             .ok_or_else(|| invalid_input("session is no longer accessible"))?;
+        // Retain the shared disclosure permit through every return below.
+        // A consent revocation takes the exclusive side before committing, so
+        // it cannot interleave after this final authorization check.
+        let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
+        crate::tools::history_scope::require_session_access(ctx, session_id).await?;
         if turns.is_empty() {
             return Ok(ToolOutput::text(format!(
                 "Session `{id_arg}` has no user/assistant turns."
@@ -148,9 +153,6 @@ impl Tool for SessionReadTool {
                 redaction.scrub(output.content.model_text()),
             );
         }
-        // This final authorization read is the disclosure linearization point:
-        // a revocation that commits before output is returned wins.
-        crate::tools::history_scope::require_session_access(ctx, session_id).await?;
         Ok(output)
     }
 }

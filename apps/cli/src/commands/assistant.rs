@@ -737,7 +737,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let project_root = temp.path().to_path_buf();
-        let project_id = project_id_for(&project_root);
+        let project_id = project_id_for(&project_root).unwrap();
         let project_root_str = project_root.to_string_lossy().into_owned();
 
         let session = db

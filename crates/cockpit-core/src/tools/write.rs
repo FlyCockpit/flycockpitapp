@@ -1671,7 +1671,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(&canonical);
+        let project_id = crate::session::project_id_for(&canonical).unwrap();
         let project_root = canonical.display().to_string();
         let session_row = db
             .write(move |conn| {

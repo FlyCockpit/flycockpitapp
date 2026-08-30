@@ -1392,7 +1392,7 @@ impl SessionRegistry {
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
-        let project_id = crate::session::project_id_for(&project_root);
+        let project_id = crate::session::project_id_for(&project_root)?;
         let last_used = self
             .inner
             .db

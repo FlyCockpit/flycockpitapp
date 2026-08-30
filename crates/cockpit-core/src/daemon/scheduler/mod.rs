@@ -740,7 +740,7 @@ impl ProductionJobExecutor {
             .with_context(|| format!("validating assistant `{assistant}`"))?;
 
         let root = PathBuf::from(project_root);
-        let project_id = crate::session::project_id_for(&root);
+        let project_id = crate::session::project_id_for(&root)?;
         let root_str = root.to_string_lossy().into_owned();
         let session = self
             .db

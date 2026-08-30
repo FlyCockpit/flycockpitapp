@@ -51,6 +51,11 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_input("`path` is required"))?;
     let target = parse(path, ctx).await?;
+    // Hold the fence before any target-specific lookup. That includes a
+    // not-found result, which must not become an observable probe after a
+    // consent revocation has committed.
+    let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
+    require_target_access(ctx, target).await?;
     let content = match target {
         RecallPath::History => history_directory(ctx).await?,
         target => match pseudofile_content(target, ctx).await? {
@@ -58,8 +63,9 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             None => return Ok(not_found(path, target)),
         },
     };
-    // Revalidate at the output boundary. This is the disclosure
-    // linearization point with a concurrent consent revocation.
+    // Revalidate while retaining the shared disclosure permit through page
+    // rendering and return. Consent writes take the exclusive side before
+    // committing, so revocation cannot race a prepared response.
     require_target_access(ctx, target).await?;
     // Scrub before selecting a page so a secret split across a page boundary
     // cannot leave a prefix or suffix in a later continuation.
@@ -134,6 +140,10 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
     let matcher = globset::Glob::new(&resolved_pattern)
         .map_err(|err| invalid_input(format!("invalid glob `{resolved_pattern}`: {err}")))?
         .compile_matcher();
+    // Discovery returns durable history identifiers. Keep it within the same
+    // disclosure fence as transcript and search output.
+    let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
+    crate::tools::history_scope::require_recall_permission(ctx)?;
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     for entry in history_entries(ctx).await? {
         if matcher.is_match(&entry) && !writer.writeln(&entry) {
@@ -163,10 +173,14 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
         return Ok(None);
     }
     let target = parse(path, ctx).await?;
+    // As with `read`, retain the fence before any target-specific lookup or
+    // not-found response and through construction of the matching output.
+    let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
     require_target_access(ctx, target).await?;
     if matches!(target, RecallPath::History) {
         // #134 owns the final history-search tool. Until then, discovery is
         // FTS-only; never fall back to recursively regex-scanning transcripts.
+        require_target_access(ctx, target).await?;
         return Ok(Some(history_fts_search(args, ctx).await?));
     }
     let pattern = args

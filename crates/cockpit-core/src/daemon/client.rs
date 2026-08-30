@@ -308,10 +308,13 @@ where
 /// This has the same callback boundary as [`run_one_shot_daemon`], but never
 /// returns a client backed by the one-shot ephemeral owner: a resumed session
 /// may be an Assistant, whose daemon-owned work must survive this command.
+/// The callback receives whether lifecycle acquisition promoted the owner;
+/// it must wait for its Attach response before presenting Assistant-only UI.
 pub async fn run_assistant_daemon<T, F>(operation: F) -> std::result::Result<T, OwnedDaemonRunError>
 where
     F: for<'client> std::ops::FnOnce(
             ScopedDaemonClient<'client>,
+            bool,
         ) -> std::pin::Pin<
             std::boxed::Box<dyn std::future::Future<Output = anyhow::Result<T>> + 'client>,
         >,
@@ -324,9 +327,12 @@ where
             "persistent daemon attach produced an ephemeral instance; refusing resumed session"
         )));
     }
-    operation(ScopedDaemonClient {
-        client: &connected.client,
-    })
+    operation(
+        ScopedDaemonClient {
+            client: &connected.client,
+        },
+        connected.promoted_from_ephemeral,
+    )
     .await
     .map_err(OwnedDaemonRunError::OperationOrCleanup)
 }
@@ -1046,6 +1052,20 @@ async fn probe_or_spawn_with_spawn_authorization(
                     let startup_notice = None;
                     match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
                         Ok(client) => {
+                            if matches!(mode, LifecycleMode::PromoteToPersistent)
+                                && discovered.paths.ephemeral
+                            {
+                                // A starting ephemeral owner can publish a
+                                // handshake before the original discovery
+                                // completes. Do not let that restart wait
+                                // bypass Assistant promotion.
+                                drop(client);
+                                return promote_ephemeral_owner(
+                                    &discovered.paths,
+                                    lifecycle_request,
+                                )
+                                .await;
+                            }
                             return Ok(ConnectedDaemon {
                                 endpoint: local_daemon_endpoint(&discovered.paths.socket),
                                 client,
@@ -1062,6 +1082,21 @@ async fn probe_or_spawn_with_spawn_authorization(
                                 );
                                 match wait_for_shared_daemon(&discovered.paths.socket, None).await {
                                     Ok(client) => {
+                                        if matches!(mode, LifecycleMode::PromoteToPersistent)
+                                            && discovered.paths.ephemeral
+                                        {
+                                            // As above, the replacement wait
+                                            // may observe the original
+                                            // ephemeral starter. It is never a
+                                            // valid terminal owner for an
+                                            // Assistant lifecycle request.
+                                            drop(client);
+                                            return promote_ephemeral_owner(
+                                                &discovered.paths,
+                                                lifecycle_request,
+                                            )
+                                            .await;
+                                        }
                                         return Ok(ConnectedDaemon {
                                             endpoint: local_daemon_endpoint(
                                                 &discovered.paths.socket,

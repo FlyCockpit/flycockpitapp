@@ -288,7 +288,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     // Session ids do not carry lifecycle mode at the CLI boundary. Resolve a
     // persistent-capable owner before generic Attach so a durable Assistant
     // never runs under the command's short-lived ephemeral daemon.
-    crate::daemon::client::run_assistant_daemon(|client| {
+    crate::daemon::client::run_assistant_daemon(|client, promoted_from_ephemeral| {
         Box::pin(async move {
             let env_snapshot = crate::env_snapshot::EnvSnapshot::from_process(
                 crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
@@ -309,7 +309,20 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                 })
                 .await?;
             match attached {
-                Response::Attached { session_id: id, .. } if id == session_id => {}
+                Response::Attached {
+                    session_id: id,
+                    session_entry_mode,
+                    ..
+                } if id == session_id => {
+                    if promoted_from_ephemeral
+                        && session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant
+                    {
+                        eprintln!(
+                            "{}",
+                            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
+                        );
+                    }
+                }
                 other => bail!("unexpected attach response: {other:?}"),
             }
             client

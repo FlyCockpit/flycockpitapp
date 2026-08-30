@@ -125,6 +125,7 @@ fn switch_outcome_with_epoch(
         target: SessionTarget::New,
         session_id,
         session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
+        promoted_from_ephemeral: false,
         short_id: short_id.to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],

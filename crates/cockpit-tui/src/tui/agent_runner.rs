@@ -1531,6 +1531,9 @@ pub struct SessionSwitchOutcome {
     pub target: SessionTarget,
     pub session_id: Uuid,
     pub session_entry_mode: proto::SessionEntryMode,
+    /// The lifecycle request replaced an ephemeral owner before this Attach.
+    /// Presentation waits for the attached durable mode above.
+    pub promoted_from_ephemeral: bool,
     pub short_id: String,
     pub active_agent: String,
     pub active_agent_path: Vec<String>,
@@ -1946,28 +1949,29 @@ async fn switch_session_inner(
     // same session id. Adopt a fresh client so the old connection cannot feed
     // pre-Attach events into the new epoch.
     let outgoing_client = current_client.read().await.clone();
-    let endpoint = match target {
+    let (endpoint, promoted_from_ephemeral) = match target {
         SessionTarget::Resume { .. } => {
-            lifecycle
+            let resolution = lifecycle
                 .resolve(LifecycleIntent::PromoteToPersistent)
                 .await
-                .map_err(|error| format!("daemon lifecycle: {error}"))?
-                .endpoint
+                .map_err(|error| format!("daemon lifecycle: {error}"))?;
+            (resolution.endpoint, resolution.promoted_from_ephemeral)
         }
-        SessionTarget::New => endpoint,
+        SessionTarget::New => (endpoint, false),
     };
     let replacement_client = DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| format!("connect replacement session client: {error:#}"))?;
     let client_protocol_version = replacement_client.negotiated().version;
     let request_client = replacement_client.clone();
-    let outcome = switch_session_with_attach_request(
+    let mut outcome = switch_session_with_attach_request(
         attach_context.clone(),
         target,
         client_protocol_version,
         move |request| async move { request_client.request(request).await },
     )
     .await?;
+    outcome.promoted_from_ephemeral = promoted_from_ephemeral;
     cancel_outgoing_turn_after_successful_attach(
         cancel_outgoing_turn_after_attach,
         move || async move { outgoing_client.request(Request::CancelTurn).await },
@@ -2144,6 +2148,7 @@ fn session_switch_outcome_from_attached(
         target,
         session_id: attached.session_id,
         session_entry_mode: attached.session_entry_mode,
+        promoted_from_ephemeral: false,
         short_id: attached.short_id,
         active_agent: attached.active_agent,
         active_agent_path,
@@ -2353,6 +2358,7 @@ async fn try_spawn_inner(
         let owns_daemon = daemon.owns_daemon;
         let socket = daemon.socket.clone();
         let startup_notice = daemon.startup_notice.clone();
+        let promoted_from_ephemeral = daemon.promoted_from_ephemeral;
         let endpoint = daemon.endpoint;
         let client = DaemonClient::connect_endpoint(&endpoint)
             .await
@@ -2444,6 +2450,8 @@ async fn try_spawn_inner(
                 session_entry_mode.as_str(),
             ));
         }
+        let assistant_promotion_notice =
+            promoted_from_ephemeral && session_entry_mode == proto::SessionEntryMode::Assistant;
         // Fetch the autocomplete frequency maps for this session's
         // project. Best-effort: a daemon that doesn't speak
         // `GetUsageCounts` just leaves the maps empty (no ranking).
@@ -2499,6 +2507,7 @@ async fn try_spawn_inner(
             owns_daemon,
             socket,
             startup_notice,
+            assistant_promotion_notice,
             history,
             paused_work,
             repair_required,
@@ -2524,6 +2533,7 @@ async fn try_spawn_inner(
         owns_daemon,
         socket,
         startup_notice,
+        assistant_promotion_notice,
         history,
         paused_work,
         repair_required,
@@ -2541,6 +2551,14 @@ async fn try_spawn_inner(
         events.lock().unwrap().push(QueuedTurnEvent {
             attachment_epoch: 0,
             event: TurnEvent::Notice { text },
+        });
+    }
+    if assistant_promotion_notice {
+        events.lock().unwrap().push(QueuedTurnEvent {
+            attachment_epoch: 0,
+            event: TurnEvent::Notice {
+                text: cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE.to_string(),
+            },
         });
     }
     let event_notify = Arc::new(Notify::new());
@@ -5561,6 +5579,7 @@ mod tests {
             },
             session_id: destination,
             session_entry_mode: proto::SessionEntryMode::Code,
+            promoted_from_ephemeral: false,
             short_id: "dest01".to_string(),
             active_agent: "Build".to_string(),
             active_agent_path: vec!["Build".to_string()],

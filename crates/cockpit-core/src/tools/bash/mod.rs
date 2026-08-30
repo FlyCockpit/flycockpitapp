@@ -410,14 +410,13 @@ async fn call_bash_inner(
         approve_outside_working_directory(ctx, &outside).await?;
     }
     if ctx.workspace_lease.is_none()
-        && let Some(outside) =
-            crate::tools::bash::command_directory_escape_with_workspace_scratch(
-                command,
-                &cwd,
-                &ctx.cwd,
-                ctx.session.tmp_dir().as_deref(),
-                workspace_scratch_dir.as_deref(),
-            )
+        && let Some(outside) = crate::tools::bash::command_directory_escape_with_workspace_scratch(
+            command,
+            &cwd,
+            &ctx.cwd,
+            ctx.session.tmp_dir().as_deref(),
+            workspace_scratch_dir.as_deref(),
+        )
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }

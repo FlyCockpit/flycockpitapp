@@ -2343,6 +2343,45 @@ mod tests {
         assert!(!dir.exists(), "tmp dir must be cleaned up on session end");
     }
 
+    #[test]
+    fn workspace_scratch_is_durable_and_reverse_mapped_by_project_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let project_root = home.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let a = Session::create_for_test(
+            db.clone(),
+            project_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let b = Session::create_for_test(
+            db,
+            project_root.clone(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let scratch_a = a.workspace_scratch_dir().unwrap();
+        let scratch_b = b.workspace_scratch_dir().unwrap();
+        assert_ne!(
+            scratch_a, scratch_b,
+            "concurrent sessions get distinct scratch dirs"
+        );
+        assert!(scratch_a.ends_with(Path::new("sessions").join(a.id.to_string())));
+        assert!(scratch_b.ends_with(Path::new("sessions").join(b.id.to_string())));
+        assert_eq!(
+            workspace_root_for_project_id(&a.project_id).unwrap(),
+            Some(std::fs::canonicalize(&project_root).unwrap())
+        );
+
+        a.end().unwrap();
+        assert!(scratch_a.exists(), "durable scratch survives session end");
+    }
+
     #[tokio::test]
     async fn host_shim_dir_is_under_data_dir() {
         let data_dir = PathBuf::from("/data/cockpit");

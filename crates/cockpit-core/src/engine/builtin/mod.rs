@@ -116,6 +116,10 @@ pub struct SpawnArgs {
     /// is participating in. Empty string is acceptable for legacy /
     /// test paths where a session id isn't yet resolved.
     pub session_short_id: String,
+    /// Durable per-workspace, per-session scratch made available to native and
+    /// shell tools. It is injected into the system prompt so every agent knows
+    /// the exact path it may use across session restarts.
+    pub workspace_scratch_dir: Option<std::path::PathBuf>,
     /// Assistant-owned sessions prepend SOUL.md and USER.md before the
     /// assistant definition body. Preloaded by the session worker so prompt
     /// composition stays pure and stable for the session.
@@ -1190,7 +1194,7 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
     if let Some(model_prompt) = model_prompt {
-        let role_system = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
+        let role_system = compose_system_prompt_for_spawn(&role_prompt, args);
         let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
         out.push_str(model_prompt);
         if !out.ends_with('\n') {
@@ -1204,10 +1208,20 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     } else {
-        let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
+        let mut out = compose_system_prompt_for_spawn(&role_prompt, args);
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     }
+}
+
+fn compose_system_prompt_for_spawn(role_prompt: &str, args: &SpawnArgs) -> String {
+    let mut out = compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd);
+    if let Some(scratch) = args.workspace_scratch_dir.as_deref() {
+        out.push_str("Durable workspace scratch: ");
+        out.push_str(&scratch.display().to_string());
+        out.push('\n');
+    }
+    out
 }
 
 fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
@@ -4206,6 +4220,7 @@ pub(crate) mod tests {
             cwd: cwd.to_path_buf(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             session_short_id: String::new(),
+            workspace_scratch_dir: None,
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
@@ -7640,6 +7655,20 @@ pub(crate) mod tests {
         let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
         let with_snapshot = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
         assert_eq!(with_snapshot, existing);
+    }
+
+    #[test]
+    fn compose_system_prompt_for_model_includes_durable_workspace_scratch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        let scratch = tmp.path().join("state/workspaces/project/sessions/session");
+        args.workspace_scratch_dir = Some(scratch.clone());
+
+        let out = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        assert!(
+            out.contains(&format!("Durable workspace scratch: {}", scratch.display())),
+            "block was: {out}"
+        );
     }
 
     /// Config with a name set, used by the deterministic name-present case.

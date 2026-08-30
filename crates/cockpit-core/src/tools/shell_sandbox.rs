@@ -1,7 +1,8 @@
 //! zerobox shell confinement for the `bash` tool (sandboxing part 2).
 //!
 //! Wraps a `sh -c <command>` invocation in a zerobox `Sandbox` confined
-//! to: the agent cwd (read+write), the per-session tmp dir (read+write),
+//! to: the agent cwd (read+write), the ephemeral per-session tmp dir
+//! (read+write), and the durable workspace scratch dir (read+write),
 //! and `PATH` execution (zerobox's default profile auto-adds a minimal
 //! system-path read entry, so any binary on `PATH` still runs). Reads
 //! outside that allowlist are denied — silently, inside the child only
@@ -102,14 +103,7 @@ pub fn sandbox_policy(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
 ) -> SandboxPolicy {
-    sandbox_policy_with_workspace_scratch(
-        cwd,
-        tmp_dir,
-        None,
-        session_env,
-        extra_paths,
-        write_scope,
-    )
+    sandbox_policy_with_workspace_scratch(cwd, tmp_dir, None, session_env, extra_paths, write_scope)
 }
 
 pub fn sandbox_policy_with_workspace_scratch(
@@ -299,11 +293,12 @@ pub const fn shell_sandbox_supported() -> bool {
 /// run its cancel/timeout loop.
 ///
 /// `command` is the full (prelude-prefixed) shell line. `cwd` is the
-/// agent working directory — read+write inside the sandbox. `tmp_dir`,
-/// when present, is the per-session scratch dir — also read+write, and
-/// counted as inside the boundary by native-tool checks. `extra_env` is
-/// applied on top of the inherited environment (cockpit uses it for the
-/// env-scrub overrides). Reads outside cwd + tmp are denied.
+/// agent working directory — read+write inside the sandbox. `tmp_dir`, when
+/// present, is the ephemeral per-session scratch; `workspace_scratch_dir` is
+/// the durable per-workspace, per-session scratch. Both are read+write and
+/// count as inside the native-tool boundary. `extra_env` is applied on top of
+/// the inherited environment (cockpit uses it for the env-scrub overrides).
+/// Reads outside cwd and these scratch roots are denied.
 ///
 /// Returns an error only if zerobox's policy validation fails (e.g. an
 /// unusable cwd); a failure there is surfaced to the model as a spawn

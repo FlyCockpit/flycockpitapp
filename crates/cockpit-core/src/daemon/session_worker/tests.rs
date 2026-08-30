@@ -3400,6 +3400,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         cwd: cwd.to_path_buf(),
         config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         session_short_id: "abc123".to_string(),
+        workspace_scratch_dir: None,
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: Arc::new(
             crate::model_system_prompt::ModelSystemPromptSnapshot::empty(),

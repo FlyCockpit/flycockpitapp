@@ -47,6 +47,7 @@ pub struct BackgroundHandle {
 pub struct BackgroundLaunch {
     pub confine: bool,
     pub tmp_dir: Option<PathBuf>,
+    pub workspace_scratch_dir: Option<PathBuf>,
     pub session_env: HashMap<String, String>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
@@ -57,6 +58,7 @@ impl BackgroundLaunch {
         Self {
             confine: false,
             tmp_dir: None,
+            workspace_scratch_dir: None,
             session_env,
             #[cfg(test)]
             test_sandbox_build: None,
@@ -64,9 +66,18 @@ impl BackgroundLaunch {
     }
 
     pub fn confined(tmp_dir: Option<PathBuf>, session_env: HashMap<String, String>) -> Self {
+        Self::confined_with_workspace_scratch(tmp_dir, None, session_env)
+    }
+
+    pub fn confined_with_workspace_scratch(
+        tmp_dir: Option<PathBuf>,
+        workspace_scratch_dir: Option<PathBuf>,
+        session_env: HashMap<String, String>,
+    ) -> Self {
         Self {
             confine: true,
             tmp_dir,
+            workspace_scratch_dir,
             session_env,
             #[cfg(test)]
             test_sandbox_build: None,
@@ -643,10 +654,11 @@ async fn build_confined_background_command(
         }
     }
 
-    crate::tools::shell_sandbox::build_sandboxed_command(
+    crate::tools::shell_sandbox::build_sandboxed_command_with_workspace_scratch(
         command,
         cwd,
         launch.tmp_dir.as_deref(),
+        launch.workspace_scratch_dir.as_deref(),
         &scrub_overrides(&launch.session_env),
         &launch.session_env,
         &[],

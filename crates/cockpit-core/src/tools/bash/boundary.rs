@@ -77,14 +77,13 @@ pub fn command_directory_escape_with_workspace_scratch(
                     // delimiter, literal text, or a file descriptor).
                     if kind == RedirectKind::TargetFile
                         && let Some(target) = operand
-                        && let Some(outside) =
-                            redirect_target_escape(
-                                target,
-                                command_cwd,
-                                root,
-                                tmp_dir,
-                                workspace_scratch_dir,
-                            )
+                        && let Some(outside) = redirect_target_escape(
+                            target,
+                            command_cwd,
+                            root,
+                            tmp_dir,
+                            workspace_scratch_dir,
+                        )
                     {
                         return Some(outside);
                     }
@@ -128,14 +127,13 @@ pub fn command_directory_escape_with_workspace_scratch(
                         && prog_i > i
                         && let Some(ShellToken::Word(prog)) = tokens.get(prog_i)
                         && Path::new(prog).is_absolute()
-                        && let Some(outside) =
-                            literal_path_word_escape(
-                                prog,
-                                command_cwd,
-                                root,
-                                tmp_dir,
-                                workspace_scratch_dir,
-                            )
+                        && let Some(outside) = literal_path_word_escape(
+                            prog,
+                            command_cwd,
+                            root,
+                            tmp_dir,
+                            workspace_scratch_dir,
+                        )
                     {
                         return Some(outside);
                     }
@@ -180,38 +178,35 @@ pub fn command_directory_escape_with_workspace_scratch(
                 }
                 if current_program.as_deref() == Some("dd")
                     && let Some(value) = dd_file_operand(word)
-                    && let Some(outside) =
-                        literal_path_word_escape(
-                            value,
-                            command_cwd,
-                            root,
-                            tmp_dir,
-                            workspace_scratch_dir,
-                        )
+                    && let Some(outside) = literal_path_word_escape(
+                        value,
+                        command_cwd,
+                        root,
+                        tmp_dir,
+                        workspace_scratch_dir,
+                    )
                 {
                     return Some(outside);
                 }
                 if literal_path_operand_command(current_program.as_deref())
-                    && let Some(outside) =
-                        literal_path_word_escape(
-                            word,
-                            command_cwd,
-                            root,
-                            tmp_dir,
-                            workspace_scratch_dir,
-                        )
+                    && let Some(outside) = literal_path_word_escape(
+                        word,
+                        command_cwd,
+                        root,
+                        tmp_dir,
+                        workspace_scratch_dir,
+                    )
                 {
                     return Some(outside);
                 }
                 if Path::new(word).is_absolute()
-                    && let Some(outside) =
-                        literal_path_word_escape(
-                            word,
-                            command_cwd,
-                            root,
-                            tmp_dir,
-                            workspace_scratch_dir,
-                        )
+                    && let Some(outside) = literal_path_word_escape(
+                        word,
+                        command_cwd,
+                        root,
+                        tmp_dir,
+                        workspace_scratch_dir,
+                    )
                 {
                     return Some(outside);
                 }

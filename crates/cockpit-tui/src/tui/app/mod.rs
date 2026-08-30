@@ -3487,14 +3487,51 @@ impl App {
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,
     ) -> Self {
+        Self::new_composed_with_session_mode(
+            project,
+            no_sandbox,
+            SessionMode::Code,
+            trust,
+            launch_start,
+            lifecycle,
+        )
+    }
+
+    /// Construct an interactive app with the caller's requested setup mode.
+    /// The daemon remains authoritative after the initial attach; this value
+    /// only controls the first new-session request.
+    pub fn new_composed_with_session_mode(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        session_mode: SessionMode,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
         Self::new_inner(
             project,
             no_sandbox,
-            Some(SessionMode::Code),
+            Some(session_mode),
             trust,
             launch_start,
             Some(lifecycle),
         )
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn composed_constructor_keeps_the_requested_session_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = Self::new_composed_with_session_mode(
+            Some(tmp.path()),
+            false,
+            SessionMode::Computer,
+            StartupWorkspaceTrust::Decided,
+            None,
+            cockpit_client::LifecycleClient::disconnected(),
+        );
+
+        assert_eq!(app.session_mode(), Some(SessionMode::Computer));
     }
 
     pub fn new_composed_with_session(

@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use syn::{Item, Visibility};
+
 fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root).expect("read source directory") {
         let path = entry.expect("read source entry").path();
@@ -43,30 +45,87 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
     let proto = manifest.join("../cockpit-proto/src");
     let mut files = Vec::new();
     collect_rust_files(&proto, &mut files);
-    let mut ingress_definitions = 0;
-    let mut request_source = String::new();
+    let mut public_mcp_ingress_types = Vec::new();
     for path in files {
         let source = fs::read_to_string(&path).expect("read proto source");
-        ingress_definitions += source
-            .matches("pub struct AcpForwardedMcpIngressV1")
-            .count();
-        if path.file_name().is_some_and(|name| name == "request.rs") {
-            request_source = source;
+        let file = syn::parse_file(&source).expect("parse proto source");
+        for item in file.items {
+            let (visibility, ident) = match item {
+                Item::Struct(item) => (&item.vis, item.ident),
+                Item::Enum(item) => (&item.vis, item.ident),
+                Item::Type(item) => (&item.vis, item.ident),
+                _ => continue,
+            };
+            let name = ident.to_string();
+            if matches!(visibility, Visibility::Public(_))
+                && name.contains("Mcp")
+                && name.contains("Ingress")
+            {
+                public_mcp_ingress_types.push(name);
+            }
         }
     }
+    public_mcp_ingress_types.sort();
     assert_eq!(
-        ingress_definitions, 1,
-        "one closed editor-MCP ingress is allowed"
+        public_mcp_ingress_types,
+        vec!["AcpForwardedMcpIngressV1".to_string()],
+        "one public editor-MCP ingress is allowed"
     );
-    for forbidden in [
-        "InstallForwardedMcp",
-        "ReleaseForwardedMcp",
-        "InstallMcpCatalog",
-        "ReleaseMcpCatalog",
-    ] {
-        assert!(
-            !request_source.contains(forbidden),
-            "catalog lifecycle must remain core-internal: {forbidden}"
-        );
+
+    let acp_path = proto.join("acp.rs");
+    let acp_source = fs::read_to_string(&acp_path).expect("read ACP proto source");
+    let acp_file = syn::parse_file(&acp_source).expect("parse ACP proto source");
+    let mut forwarded_mcp_public_types = Vec::new();
+    for item in acp_file.items {
+        let (visibility, ident) = match item {
+            Item::Struct(item) => (&item.vis, item.ident),
+            Item::Enum(item) => (&item.vis, item.ident),
+            Item::Type(item) => (&item.vis, item.ident),
+            _ => continue,
+        };
+        let name = ident.to_string();
+        if matches!(visibility, Visibility::Public(_))
+            && name.contains("Acp")
+            && name.contains("Mcp")
+        {
+            forwarded_mcp_public_types.push(name);
+        }
     }
+    forwarded_mcp_public_types.sort();
+    assert_eq!(
+        forwarded_mcp_public_types,
+        vec![
+            "AcpForwardedMcpDeclarationV1".to_string(),
+            "AcpForwardedMcpIngressV1".to_string(),
+            "AcpForwardedMcpTransportV1".to_string(),
+            "AcpNameValuePairV1".to_string(),
+        ],
+        "the closed ingress family is the only public ACP/MCP type family"
+    );
+
+    let request_path = proto.join("request.rs");
+    let request_source = fs::read_to_string(&request_path).expect("read request proto source");
+    let request_file = syn::parse_file(&request_source).expect("parse request proto source");
+    let request_variants = request_file
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            Item::Enum(item) if item.ident == "Request" => Some(item.variants),
+            _ => None,
+        })
+        .expect("Request enum is present");
+    let public_catalog_lifecycle_routes = request_variants
+        .into_iter()
+        .map(|variant| variant.ident.to_string())
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            (lower.contains("mcp") || lower.contains("catalog"))
+                && (lower.contains("install") || lower.contains("release"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        public_catalog_lifecycle_routes.is_empty(),
+        "catalog lifecycle must remain core-internal, not public Request variants: \
+         {public_catalog_lifecycle_routes:?}"
+    );
 }

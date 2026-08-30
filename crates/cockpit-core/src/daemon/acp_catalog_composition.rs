@@ -64,6 +64,7 @@ pub(crate) async fn close_route(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -73,6 +74,19 @@ mod tests {
         creates: AtomicUsize,
         attaches: AtomicUsize,
         closes: AtomicUsize,
+        create_requests: Mutex<
+            Vec<(
+                ClientPrincipal,
+                proto::CreateCodeRootWithAcpIngressV1Request,
+            )>,
+        >,
+        attach_requests: Mutex<
+            Vec<(
+                ClientPrincipal,
+                proto::AttachExistingCodeRootWithAcpIngressV1Request,
+            )>,
+        >,
+        close_requests: Mutex<Vec<(ClientPrincipal, proto::CloseAcpCodeRootAttachmentV1Request)>>,
     }
 
     fn observed() -> proto::ErrorPayload {
@@ -86,29 +100,41 @@ mod tests {
     impl AcpCatalogCompositionServiceV1 for RecordingComposition {
         async fn create_code_root(
             &self,
-            _principal: &ClientPrincipal,
-            _request: proto::CreateCodeRootWithAcpIngressV1Request,
+            principal: &ClientPrincipal,
+            request: proto::CreateCodeRootWithAcpIngressV1Request,
         ) -> Result<proto::CreateCodeRootWithAcpIngressV1Result, proto::ErrorPayload> {
             self.creates.fetch_add(1, Ordering::Relaxed);
+            self.create_requests
+                .lock()
+                .unwrap()
+                .push((principal.clone(), request));
             Err(observed())
         }
 
         async fn attach_existing_code_root(
             &self,
-            _principal: &ClientPrincipal,
-            _request: proto::AttachExistingCodeRootWithAcpIngressV1Request,
+            principal: &ClientPrincipal,
+            request: proto::AttachExistingCodeRootWithAcpIngressV1Request,
         ) -> Result<proto::AttachExistingCodeRootWithAcpIngressV1Result, proto::ErrorPayload>
         {
             self.attaches.fetch_add(1, Ordering::Relaxed);
+            self.attach_requests
+                .lock()
+                .unwrap()
+                .push((principal.clone(), request));
             Err(observed())
         }
 
         async fn close_code_root_attachment(
             &self,
-            _principal: &ClientPrincipal,
-            _request: proto::CloseAcpCodeRootAttachmentV1Request,
+            principal: &ClientPrincipal,
+            request: proto::CloseAcpCodeRootAttachmentV1Request,
         ) -> Result<proto::CloseAcpCodeRootAttachmentV1Result, proto::ErrorPayload> {
             self.closes.fetch_add(1, Ordering::Relaxed);
+            self.close_requests
+                .lock()
+                .unwrap()
+                .push((principal.clone(), request));
             Err(observed())
         }
     }
@@ -135,7 +161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composed_routes_call_only_the_internal_service_seam_once() {
+    async fn composed_routes_forward_the_exact_closed_contract_to_the_internal_service_once() {
         let service = RecordingComposition::default();
         let principal = ClientPrincipal::Owner;
         let create = proto::CreateCodeRootWithAcpIngressV1Request {
@@ -149,7 +175,11 @@ mod tests {
             },
             ingress: ingress(),
         };
-        assert!(create_route(&service, &principal, create).await.is_err());
+        assert!(
+            create_route(&service, &principal, create.clone())
+                .await
+                .is_err()
+        );
 
         let root_id = proto::CodeRootIdV1(uuid::Uuid::new_v4());
         let attach = proto::AttachExistingCodeRootWithAcpIngressV1Request {
@@ -164,17 +194,37 @@ mod tests {
             },
             ingress: ingress(),
         };
-        assert!(attach_route(&service, &principal, attach).await.is_err());
+        assert!(
+            attach_route(&service, &principal, attach.clone())
+                .await
+                .is_err()
+        );
 
         let close = proto::CloseAcpCodeRootAttachmentV1Request {
             attachment_capability: proto::CodeRootAttachmentCapabilityV1::new_opaque("capability")
                 .unwrap(),
             client_request_id: proto::OpaqueAsciiId128V1::new("close").unwrap(),
         };
-        assert!(close_route(&service, &principal, close).await.is_err());
+        assert!(
+            close_route(&service, &principal, close.clone())
+                .await
+                .is_err()
+        );
 
         assert_eq!(service.creates.load(Ordering::Relaxed), 1);
         assert_eq!(service.attaches.load(Ordering::Relaxed), 1);
         assert_eq!(service.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            service.create_requests.lock().unwrap().as_slice(),
+            &[(principal.clone(), create)]
+        );
+        assert_eq!(
+            service.attach_requests.lock().unwrap().as_slice(),
+            &[(principal.clone(), attach)]
+        );
+        assert_eq!(
+            service.close_requests.lock().unwrap().as_slice(),
+            &[(principal, close)]
+        );
     }
 }

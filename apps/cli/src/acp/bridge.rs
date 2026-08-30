@@ -26,6 +26,17 @@ pub(crate) enum SessionAdmissionMethod {
     Load,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeError(String);
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BridgeError {}
+
 #[derive(Debug, Default)]
 pub(crate) struct BridgeFacade;
 
@@ -34,24 +45,29 @@ impl BridgeFacade {
         &self,
         dto: &SessionAdmissionDto,
         counters: &mut AcpTransportCounters,
-    ) -> SessionAdmissionReceipt {
-        let ingress = self.to_ingress(dto);
+    ) -> Result<SessionAdmissionReceipt, BridgeError> {
+        let ingress = self.to_ingress(dto)?;
         counters.bridge_conversions += 1;
-        SessionAdmissionReceipt {
+        Ok(SessionAdmissionReceipt {
             method: match dto {
                 SessionAdmissionDto::New(_) => SessionAdmissionMethod::New,
                 SessionAdmissionDto::Load(_) => SessionAdmissionMethod::Load,
             },
             server_count: dto.mcp_servers().len(),
             ingress,
-        }
+        })
     }
 
-    pub(crate) fn to_ingress(&self, dto: &SessionAdmissionDto) -> AcpForwardedMcpIngressV1 {
-        match dto {
+    pub(crate) fn to_ingress(
+        &self,
+        dto: &SessionAdmissionDto,
+    ) -> Result<AcpForwardedMcpIngressV1, BridgeError> {
+        let ingress = match dto {
             SessionAdmissionDto::New(new) => self.from_new(new),
             SessionAdmissionDto::Load(load) => self.from_load(load),
-        }
+        };
+        ingress.validate().map_err(BridgeError)?;
+        Ok(ingress)
     }
 
     fn from_new(&self, dto: &SessionNewDto) -> AcpForwardedMcpIngressV1 {

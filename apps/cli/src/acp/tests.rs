@@ -48,7 +48,9 @@ impl SessionIngress for RecordingSessionIngress {
         admission: SessionAdmissionDto,
         counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError> {
-        let receipt = BridgeFacade.admit(&admission, counters);
+        let receipt = BridgeFacade
+            .admit(&admission, counters)
+            .map_err(|_| SessionIngressError::InvalidAdmission)?;
         let session_id = format!("recorded-session-{}", self.admissions.len() + 1);
         self.admissions.push(receipt);
         Ok(json!({ "sessionId": session_id }))
@@ -644,6 +646,48 @@ fn acp_transport_session_new_bridge_conversion_requires_explicit_recording_ingre
     assert!(is_request_only_session_method("session/load"));
     assert!(is_request_only_session_method("session/prompt"));
     assert!(!is_request_only_session_method("session/cancel"));
+}
+
+#[test]
+fn acp_transport_bridge_rejects_proto_invalid_dto_without_counting_or_admitting() {
+    let servers = (0..33)
+        .map(|index| {
+            json!({
+                "name": format!("server-{index}"),
+                "command": "/bin/mcp",
+                "args": [],
+                "env": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let frame = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session/new",
+        "params": { "cwd": "/tmp/project", "mcpServers": servers }
+    }))
+    .unwrap();
+    let mut adapter = AcpAdapter::new_with_session_ingress(
+        MemoryFrameSink::default(),
+        RecordingResolve::default(),
+        RecordingAck::default(),
+        RecordingSessionIngress::default(),
+    );
+
+    let response = send(&mut adapter, &frame).expect("invalid admission receives an error");
+
+    assert!(response.contains("ACP session admission is invalid"));
+    assert_eq!(adapter.counters.dto_produced, 1);
+    assert_eq!(adapter.counters.schema_decode_attempts, 1);
+    assert_eq!(adapter.counters.bridge_conversions, 0);
+    assert!(
+        adapter
+            .session_ingress
+            .lock()
+            .unwrap()
+            .admissions
+            .is_empty()
+    );
 }
 
 #[test]

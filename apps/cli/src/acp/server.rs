@@ -54,8 +54,12 @@ fn run_blocking(handle: &Handle) -> Result<()> {
         let mut counters = AcpTransportCounters::default();
         loop {
             match reader.read_frame(&mut counters) {
-                Ok(Some(frame)) if frames.send(ReaderEvent::Frame(frame)).is_ok() => {}
-                Ok(Some(_)) | Ok(None) => {
+                Ok(Some(frame)) => {
+                    if frames.send(ReaderEvent::Frame(frame)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
                     let _ = frames.send(ReaderEvent::Eof);
                     break;
                 }
@@ -579,6 +583,7 @@ impl Peer {
                 &mut self.adapter.sink,
                 &mut self.adapter.counters,
             )
+            .map(|_| ())
             .map_err(|error| anyhow!(error))
     }
 }

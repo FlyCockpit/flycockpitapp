@@ -723,7 +723,7 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
     }
 
-    pub fn set_media_storage_recovery(
+    pub(crate) fn set_media_storage_recovery(
         &self,
         recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     ) {

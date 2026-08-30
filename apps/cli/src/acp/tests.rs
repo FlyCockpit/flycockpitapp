@@ -1453,7 +1453,10 @@ fn acp_transport_cancelled_permission_fails_closed_when_daemon_cancel_is_unavail
 
     assert!(adapter.connection_closed);
     assert!(adapter.registry.connection_closed());
-    assert_eq!(adapter.registry.state_of(&id), Some(Released));
+    assert_eq!(
+        adapter.registry.state_of(&id),
+        Some(PermissionStateName::Released)
+    );
     assert_eq!(adapter.resolve.calls.len(), 0);
     assert_eq!(adapter.resolve.cancelled_attachments.len(), 1);
     assert!(adapter.ack.ids.is_empty());

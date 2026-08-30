@@ -1048,6 +1048,32 @@ impl Db {
         .await
     }
 
+    /// Internal redaction input: every resolvable Project/Global record.
+    ///
+    /// This is not an inventory surface: callers consume the opaque locators
+    /// only to construct a machine-wide containment table and must not project
+    /// any row or existence result to an agent-facing response.
+    pub async fn machine_scoped_sealed_redaction_records(
+        &self,
+    ) -> Result<Vec<SealedValueRecordRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RECORD_COLUMNS} FROM sealed_value_records
+                  WHERE deleted_at_ms IS NULL
+                    AND active_version >= 1
+                    AND scope IN ('project', 'global')
+                    AND compartment_key IS NOT NULL
+                  ORDER BY created_at_ms ASC, record_id ASC"
+            ))?;
+            let rows = stmt
+                .query_map([], decode_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("listing machine-scoped sealed redaction records")?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Owner-only: edit the safe description of a live sealed value record.
     /// Metadata only — never touches the literal, the name, the scope, or the
     /// version. Returns `true` when a live (non-deleted) record was updated,

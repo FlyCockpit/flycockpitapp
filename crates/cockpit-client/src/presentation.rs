@@ -53,6 +53,10 @@ pub enum ControlRequestOutcome {
     HostCapabilities {
         snapshot: Box<cockpit_proto::HostCapabilitySnapshot>,
     },
+    ExitGuardStatus {
+        ephemeral_owner: bool,
+        has_live_work: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

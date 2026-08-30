@@ -5,6 +5,9 @@
 
 CREATE TABLE scheduled_jobs (
     id                TEXT    PRIMARY KEY,
+    -- Immutable insertion identity. `id` is user-chosen and may be reused,
+    -- so it is not sufficient to fence a stale asynchronous scheduler action.
+    row_identity      TEXT    NOT NULL UNIQUE,
     owner             TEXT    NOT NULL,
     schedule_json     TEXT    NOT NULL CHECK (
         json_valid(schedule_json) AND json_type(schedule_json) = 'object'
@@ -36,6 +39,12 @@ CREATE INDEX idx_scheduled_jobs_next_run
 
 CREATE INDEX idx_scheduled_jobs_owner
     ON scheduled_jobs(owner);
+
+CREATE TRIGGER scheduled_jobs_row_identity_immutable
+BEFORE UPDATE OF row_identity ON scheduled_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'scheduled job row identity is immutable');
+END;
 
 -- Explicit, versioned image-generation monetary policy. JSON is validated by
 -- the typed boundary before insertion; old versions remain referenced by the

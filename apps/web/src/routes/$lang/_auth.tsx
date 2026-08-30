@@ -16,6 +16,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { StorageManagementHints } from "@/components/storage-management-hints";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { authClient } from "@/lib/auth-client";
 import { decideProtectedRouteAccess } from "@/lib/route-session-access";
@@ -40,6 +41,7 @@ export const Route = createFileRoute("/$lang/_auth")({
 });
 
 function AuthLayout() {
+  const { lang } = Route.useParams();
   const { session } = Route.useRouteContext();
   const appSettings = useQuery(orpc.settings.getAll.queryOptions());
   const { t } = useTranslation(["common", "dashboard"]);
@@ -76,7 +78,12 @@ function AuthLayout() {
     return <TwoFactorSetupRequired />;
   }
 
-  return <Outlet />;
+  return (
+    <>
+      <StorageManagementHints lang={lang} />
+      <Outlet />
+    </>
+  );
 }
 
 function TwoFactorSetupRequired() {

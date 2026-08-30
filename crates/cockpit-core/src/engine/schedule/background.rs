@@ -47,6 +47,7 @@ pub struct BackgroundHandle {
 pub struct BackgroundLaunch {
     pub confine: bool,
     pub tmp_dir: Option<PathBuf>,
+    pub workspace_scratch_dir: Option<PathBuf>,
     pub session_env: HashMap<String, String>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
@@ -57,16 +58,22 @@ impl BackgroundLaunch {
         Self {
             confine: false,
             tmp_dir: None,
+            workspace_scratch_dir: None,
             session_env,
             #[cfg(test)]
             test_sandbox_build: None,
         }
     }
 
-    pub fn confined(tmp_dir: Option<PathBuf>, session_env: HashMap<String, String>) -> Self {
+    pub fn confined(
+        tmp_dir: Option<PathBuf>,
+        workspace_scratch_dir: PathBuf,
+        session_env: HashMap<String, String>,
+    ) -> Self {
         Self {
             confine: true,
             tmp_dir,
+            workspace_scratch_dir: Some(workspace_scratch_dir),
             session_env,
             #[cfg(test)]
             test_sandbox_build: None,
@@ -643,10 +650,11 @@ async fn build_confined_background_command(
         }
     }
 
-    crate::tools::shell_sandbox::build_sandboxed_command(
+    crate::tools::shell_sandbox::build_sandboxed_command_with_workspace_scratch(
         command,
         cwd,
         launch.tmp_dir.as_deref(),
+        launch.workspace_scratch_dir.as_deref(),
         &scrub_overrides(&launch.session_env),
         &launch.session_env,
         &[],
@@ -982,10 +990,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
-        let launch = BackgroundLaunch::confined(Some(tmp.path().join("tmp")), HashMap::new())
-            .with_test_sandbox_build(TestSandboxBuild::ShellSuccess {
-                calls: calls.clone(),
-            });
+        let launch = BackgroundLaunch::confined(
+            Some(tmp.path().join("tmp")),
+            tmp.path().join("workspace-scratch"),
+            HashMap::new(),
+        )
+        .with_test_sandbox_build(TestSandboxBuild::ShellSuccess {
+            calls: calls.clone(),
+        });
         let (turn_tx, _turn_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let (_handle, task) = spawn_test_job(
@@ -1019,8 +1031,12 @@ mod tests {
         let cfg = crate::config::extended::RedactConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
-        let launch = BackgroundLaunch::confined(Some(tmp.path().join("tmp")), HashMap::new())
-            .with_test_sandbox_build(TestSandboxBuild::Error("sandbox build failed".to_string()));
+        let launch = BackgroundLaunch::confined(
+            Some(tmp.path().join("tmp")),
+            tmp.path().join("workspace-scratch"),
+            HashMap::new(),
+        )
+        .with_test_sandbox_build(TestSandboxBuild::Error("sandbox build failed".to_string()));
         let (turn_tx, _turn_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let (_handle, task) = spawn_test_job(

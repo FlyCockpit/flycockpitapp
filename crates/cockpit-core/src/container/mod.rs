@@ -371,6 +371,7 @@ impl ContainerManager {
         image: &str,
         mode: SandboxMode,
         map: &MountMap,
+        workspace_scratch_mount: &ContainerMount,
         profile_mounts: &[ContainerMount],
         network_enabled: bool,
         runtime: &ContainerRuntime,
@@ -387,6 +388,7 @@ impl ContainerManager {
             image,
             mode,
             map,
+            workspace_scratch_mount,
             profile_mounts,
             network_enabled,
             HostPlatform::current(),
@@ -642,6 +644,20 @@ impl MountMap {
         }
     }
 
+    /// Map a session's durable workspace scratch independently of the project
+    /// mount. Windows cannot expose two unrelated host directories at the
+    /// project's `/workspace` container location.
+    pub fn workspace_scratch_for_current_platform(host_root: PathBuf) -> Self {
+        if cfg!(windows) {
+            Self {
+                host_root,
+                container_root: PathBuf::from("/cockpit/workspace-scratch"),
+            }
+        } else {
+            Self::unix(host_root)
+        }
+    }
+
     pub fn to_container(&self, host_path: &Path) -> Option<PathBuf> {
         let rel = path_relative_to(host_path, &self.host_root)?;
         if rel.as_os_str().is_empty() {
@@ -682,6 +698,20 @@ pub fn project_mount(mode: SandboxMode, map: &MountMap) -> ContainerMount {
         host: map.host_root.clone(),
         container: map.container_root.clone(),
         read_only: mode.project_read_only(),
+    }
+}
+
+/// Mount the session's durable workspace scratch with write access.
+///
+/// Scratch remains writable even when the project mount is read-only: it is
+/// the explicitly agent-writable state area for this session, not project
+/// source. Its map is separate from the project map because on Windows the
+/// two host roots have distinct container locations.
+pub fn workspace_scratch_mount(map: &MountMap) -> ContainerMount {
+    ContainerMount {
+        host: map.host_root.clone(),
+        container: map.container_root.clone(),
+        read_only: false,
     }
 }
 
@@ -803,6 +833,7 @@ pub fn build_create_args(
     image: &str,
     mode: SandboxMode,
     map: &MountMap,
+    workspace_scratch_mount: &ContainerMount,
     profile_mounts: &[ContainerMount],
     network_enabled: bool,
     platform: HostPlatform,
@@ -826,6 +857,8 @@ pub fn build_create_args(
     args.push(OsString::from("HOME=/tmp"));
     args.push(OsString::from("-v"));
     args.push(project_mount(mode, map).volume_arg());
+    args.push(OsString::from("-v"));
+    args.push(workspace_scratch_mount.volume_arg());
     for mount in profile_mounts {
         args.push(OsString::from("-v"));
         args.push(mount.volume_arg());
@@ -1166,6 +1199,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_scratch_mount_uses_a_distinct_windows_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let map = MountMap::workspace_scratch_for_current_platform(scratch.clone());
+        #[cfg(windows)]
+        assert_eq!(
+            map.to_container(&scratch),
+            Some(PathBuf::from("/cockpit/workspace-scratch"))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(map.to_container(&scratch), Some(scratch));
+        assert!(!workspace_scratch_mount(&map).read_only);
+    }
+
+    #[test]
     fn resource_profile_roots_map_to_mounts_and_skip_project_roots() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("repo");
@@ -1238,12 +1288,16 @@ mod tests {
         let id = Uuid::nil();
         let tmp = tempfile::tempdir().unwrap();
         let map = MountMap::unix(tmp.path().to_path_buf());
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_map = MountMap::unix(scratch.path().to_path_buf());
+        let scratch_mount = workspace_scratch_mount(&scratch_map);
         let args = build_create_args(
             ContainerRuntimeKind::Podman,
             id,
             "cockpit-sandbox:abc",
             SandboxMode::ContainerReadonly,
             &map,
+            &scratch_mount,
             &[],
             false,
             HostPlatform::Linux,
@@ -1253,6 +1307,9 @@ mod tests {
         assert!(rendered.contains(&"none".into()));
         assert!(rendered.contains(&"--userns=keep-id".into()));
         assert!(rendered.iter().any(|s| s.ends_with(":ro")));
+        let scratch_arg = scratch_mount.volume_arg();
+        let scratch_arg = scratch_arg.to_string_lossy();
+        assert!(rendered.contains(&scratch_arg));
 
         let env = BTreeMap::from([("KEEP".to_string(), "ok".to_string())]);
         let exec = build_exec_args("cockpit-sess", Path::new("/workspace"), &env, "echo hi");

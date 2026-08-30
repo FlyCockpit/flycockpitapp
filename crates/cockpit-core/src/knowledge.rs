@@ -2316,39 +2316,6 @@ async fn retrieve_from_knowledge_bases(
     Ok(all)
 }
 
-pub(crate) async fn attached_bundles_available(
-    session: &Session,
-    cwd: &Path,
-    allowed_knowledge_bases: Option<&BTreeSet<String>>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-) -> bool {
-    let extended = config.extended();
-    match attached_bundles(session, cwd, allowed_knowledge_bases, &extended).await {
-        Ok(bundles) => {
-            let mut available = false;
-            for knowledge_base in bundles {
-                match knowledge_base.provider.is_available().await {
-                    Ok(true) => available = true,
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            knowledge_base = %knowledge_base.entry.id,
-                            "knowledge provider availability check failed closed"
-                        );
-                        return false;
-                    }
-                }
-            }
-            available
-        }
-        Err(error) => {
-            tracing::warn!(%error, "knowledge registry availability check failed closed");
-            false
-        }
-    }
-}
-
 pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
@@ -2574,13 +2541,14 @@ pub(crate) async fn with_memory_search_if_attached(
     let allowed_knowledge_bases = definition
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
         .cloned();
-    if attached_bundles_available(session, cwd, allowed_knowledge_bases.as_ref(), config).await {
-        toolbox.with(Arc::new(MemorySearchTool {
-            allowed_knowledge_bases,
-        }))
-    } else {
-        toolbox.without(MEMORY_SEARCH_TOOL_NAME)
-    }
+    // Keep the schema present for the whole agent lifetime. Attachment state
+    // is deliberately resolved in `MemorySearchTool::call`, where an absent
+    // bundle produces the normal content-free availability result instead of
+    // churning the provider's cacheable tools array.
+    let _ = (session, cwd, config);
+    toolbox.with(Arc::new(MemorySearchTool {
+        allowed_knowledge_bases,
+    }))
 }
 
 /// A turn-toolbox instance binds the executing agent definition's KB
@@ -3684,35 +3652,17 @@ timestamp: 2026-08-29T12:00:00Z
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("hosted"));
         assert!(diagnostic.contains("not implemented"));
-
-        fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
-        fs::write(
-            tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"id":"available","name":"Available","description":"Available local knowledge","source":{"kind":"local","path":"available"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"},{"id":"hosted","name":"Hosted","description":"Deferred hosted knowledge","source":{"kind":"remote","url":"https://knowledge.example.test"},"embeddingOwnership":"remote-owned","trustRequired":false,"mergePolicy":"auto"}]}"#,
-        )
-        .unwrap();
-        assert!(
-            !attached_bundles_available(
-                &session,
-                tmp.path(),
-                None,
-                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
-                    tmp.path()
-                )
-            )
-            .await
-        );
     }
 
     #[tokio::test]
-    async fn memory_search_tool_gated() {
+    async fn memory_search_tool_schema_is_stable_when_bundles_change() {
         let _env = crate::test_env::lock_async().await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
         let base = crate::engine::tool::ToolBox::new();
         assert!(
-            !with_memory_search_if_attached(
+            with_memory_search_if_attached(
                 base.clone(),
                 &session,
                 tmp.path(),

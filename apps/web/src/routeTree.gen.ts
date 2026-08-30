@@ -40,6 +40,7 @@ import { Route as LangAdminVideosVideoIdRouteImport } from './routes/$lang/admin
 import { Route as LangAdminAssetsCleanupRouteImport } from './routes/$lang/admin/assets/cleanup'
 import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
 import { Route as LangAuthSettingsPrivacyRouteImport } from './routes/$lang/_auth/settings/privacy'
+import { Route as LangAuthSettingsStorageRouteImport } from './routes/$lang/_auth/settings/storage'
 import { Route as LangAuthInstancesInstanceIdRouteImport } from './routes/$lang/_auth/instances.$instanceId'
 import { Route as LangAuthInstancesInstanceIdTerminalRouteImport } from './routes/$lang/_auth/instances.$instanceId.terminal'
 import { Route as LangAuthInstancesInstanceIdSharingRouteImport } from './routes/$lang/_auth/instances.$instanceId.sharing'
@@ -201,6 +202,11 @@ const LangAuthSettingsPrivacyRoute = LangAuthSettingsPrivacyRouteImport.update({
   path: '/privacy',
   getParentRoute: () => LangAuthSettingsRoute,
 } as any)
+const LangAuthSettingsStorageRoute = LangAuthSettingsStorageRouteImport.update({
+  id: '/storage',
+  path: '/storage',
+  getParentRoute: () => LangAuthSettingsRoute,
+} as any)
 const LangAuthInstancesInstanceIdRoute =
   LangAuthInstancesInstanceIdRouteImport.update({
     id: '/$instanceId',
@@ -258,6 +264,7 @@ export interface FileRoutesByFullPath {
   '/$lang/admin/': typeof LangAdminIndexRoute
   '/$lang/instances/$instanceId': typeof LangAuthInstancesInstanceIdRouteWithChildren
   '/$lang/settings/privacy': typeof LangAuthSettingsPrivacyRoute
+  '/$lang/settings/storage': typeof LangAuthSettingsStorageRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/admin/assets/cleanup': typeof LangAdminAssetsCleanupRoute
   '/$lang/admin/videos/$videoId': typeof LangAdminVideosVideoIdRoute
@@ -290,6 +297,7 @@ export interface FileRoutesByTo {
   '/$lang/admin': typeof LangAdminIndexRoute
   '/$lang/instances/$instanceId': typeof LangAuthInstancesInstanceIdRouteWithChildren
   '/$lang/settings/privacy': typeof LangAuthSettingsPrivacyRoute
+  '/$lang/settings/storage': typeof LangAuthSettingsStorageRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/admin/assets/cleanup': typeof LangAdminAssetsCleanupRoute
   '/$lang/admin/videos/$videoId': typeof LangAdminVideosVideoIdRoute
@@ -329,6 +337,7 @@ export interface FileRoutesById {
   '/$lang/admin/': typeof LangAdminIndexRoute
   '/$lang/_auth/instances/$instanceId': typeof LangAuthInstancesInstanceIdRouteWithChildren
   '/$lang/_auth/settings/privacy': typeof LangAuthSettingsPrivacyRoute
+  '/$lang/_auth/settings/storage': typeof LangAuthSettingsStorageRoute
   '/$lang/_auth/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/admin/assets/cleanup': typeof LangAdminAssetsCleanupRoute
   '/$lang/admin/videos/$videoId': typeof LangAdminVideosVideoIdRoute
@@ -368,6 +377,7 @@ export interface FileRouteTypes {
     | '/$lang/admin/'
     | '/$lang/instances/$instanceId'
     | '/$lang/settings/privacy'
+    | '/$lang/settings/storage'
     | '/$lang/settings/security'
     | '/$lang/admin/assets/cleanup'
     | '/$lang/admin/videos/$videoId'
@@ -400,6 +410,7 @@ export interface FileRouteTypes {
     | '/$lang/admin'
     | '/$lang/instances/$instanceId'
     | '/$lang/settings/privacy'
+    | '/$lang/settings/storage'
     | '/$lang/settings/security'
     | '/$lang/admin/assets/cleanup'
     | '/$lang/admin/videos/$videoId'
@@ -438,6 +449,7 @@ export interface FileRouteTypes {
     | '/$lang/admin/'
     | '/$lang/_auth/instances/$instanceId'
     | '/$lang/_auth/settings/privacy'
+    | '/$lang/_auth/settings/storage'
     | '/$lang/_auth/settings/security'
     | '/$lang/admin/assets/cleanup'
     | '/$lang/admin/videos/$videoId'
@@ -674,6 +686,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthSettingsPrivacyRouteImport
       parentRoute: typeof LangAuthSettingsRoute
     }
+    '/$lang/_auth/settings/storage': {
+      id: '/$lang/_auth/settings/storage'
+      path: '/storage'
+      fullPath: '/$lang/settings/storage'
+      preLoaderRoute: typeof LangAuthSettingsStorageRouteImport
+      parentRoute: typeof LangAuthSettingsRoute
+    }
     '/$lang/_auth/instances/$instanceId': {
       id: '/$lang/_auth/instances/$instanceId'
       path: '/$instanceId'
@@ -762,12 +781,14 @@ const LangAuthInstancesRouteWithChildren =
 
 interface LangAuthSettingsRouteChildren {
   LangAuthSettingsPrivacyRoute: typeof LangAuthSettingsPrivacyRoute
+  LangAuthSettingsStorageRoute: typeof LangAuthSettingsStorageRoute
   LangAuthSettingsSecurityRoute: typeof LangAuthSettingsSecurityRoute
   LangAuthSettingsIndexRoute: typeof LangAuthSettingsIndexRoute
 }
 
 const LangAuthSettingsRouteChildren: LangAuthSettingsRouteChildren = {
   LangAuthSettingsPrivacyRoute: LangAuthSettingsPrivacyRoute,
+  LangAuthSettingsStorageRoute: LangAuthSettingsStorageRoute,
   LangAuthSettingsSecurityRoute: LangAuthSettingsSecurityRoute,
   LangAuthSettingsIndexRoute: LangAuthSettingsIndexRoute,
 }

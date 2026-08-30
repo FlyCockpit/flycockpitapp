@@ -13,6 +13,7 @@
     "workspace_trust_mode.ignore_config": 2,
     "workspace_trust_mode.untrusted": 3,
     "app_flag_key.daemon_autostart_notice": 1,
+    "app_flag_key.storage_management_hint": 2,
     "assistant_session_resolution_mode.most_recent_or_create": 1,
     "export_session_kind.transcript_json": 1,
     "export_session_kind.debug_bundle": 2,

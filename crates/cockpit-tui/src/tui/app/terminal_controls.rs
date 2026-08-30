@@ -32,7 +32,119 @@ impl App {
             );
             false
         } else {
-            true
+            // This response is the detach-time authority: local `busy` and
+            // schedule projections can lag the worker that owns the work.
+            // Keep the client attached until its daemon snapshot arrives.
+            if !self
+                .agent_runner
+                .as_ref()
+                .is_some_and(|runner| runner.is_ok())
+            {
+                return true;
+            }
+            self.send_daemon_request(
+                "exit check",
+                cockpit_proto::Request::ExitGuardStatus,
+                ControlApplied::ExitGuardStatus,
+            );
+            false
+        }
+    }
+
+    pub(super) fn apply_exit_guard_status(&mut self, ephemeral_owner: bool, has_live_work: bool) {
+        if !has_live_work {
+            self.exit_requested = true;
+        } else if ephemeral_owner {
+            self.open_exit_guard_prompt();
+        } else {
+            let notice = format!(
+                "This session is still running in the background; reattach with {}",
+                self.exit_reattach_command()
+            );
+            self.exit_notice = Some(notice.clone());
+            self.show_toast(notice, ToastKind::Info);
+            self.exit_requested = true;
+        }
+    }
+
+    pub(super) fn exit_reattach_command(&self) -> String {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(crate::tui::agent_runner::AgentRunner::session_id)
+            .or(self.launch.session_id)
+            .map(|session_id| format!("cockpit run --session {session_id}"))
+            .unwrap_or_else(|| "cockpit".to_string())
+    }
+
+    fn open_exit_guard_prompt(&mut self) {
+        use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+
+        let interrupt_id = uuid::Uuid::new_v4();
+        self.pending_local_choice = Some(LocalChoice::ExitGuard(interrupt_id));
+        self.question_dialog = Some(
+            crate::tui::dialog::question::QuestionDialog::new(
+                interrupt_id,
+                String::new(),
+                InterruptQuestionSet {
+                    questions: vec![InterruptQuestion::Single {
+                        prompt: "This session is still working. What would you like to do?"
+                            .to_string(),
+                        options: vec![
+                            InterruptOption {
+                                id: "stop_all".to_string(),
+                                label: "Stop all".to_string(),
+                                description: Some(
+                                    "Cancel work and stop the ephemeral daemon.".to_string(),
+                                ),
+                                secondary: false,
+                            },
+                            InterruptOption {
+                                id: "background".to_string(),
+                                label: "Run in background".to_string(),
+                                description: Some(
+                                    "Keep work running and make this daemon persistent."
+                                        .to_string(),
+                                ),
+                                secondary: false,
+                            },
+                        ],
+                        allow_freetext: false,
+                        command_detail: None,
+                        permission: false,
+                        approval_class: None,
+                        sandbox_escalation: None,
+                    }],
+                },
+                self.dialog_lockout(),
+            )
+            .with_keyboard_enhancement_active(self.keyboard_enhancement_active),
+        );
+    }
+
+    pub(super) fn resolve_exit_guard_choice(&mut self, selected: Option<&str>) {
+        match selected {
+            Some("stop_all") => self.send_daemon_request(
+                "stop all",
+                // This is intentionally wider than ctrl+c's CancelTurn: when
+                // another client keeps the daemon alive, every session-owned
+                // scheduled/background job must stop before we detach.
+                cockpit_proto::Request::CancelAllSessionWork,
+                ControlApplied::ExitAfterStoppingWork,
+            ),
+            Some("background") => self.send_daemon_request(
+                "run in background",
+                cockpit_proto::Request::PromoteToPersistent,
+                ControlApplied::ExitAfterBackgroundPromotion,
+            ),
+            _ => {
+                self.send_daemon_request(
+                    "cancel exit",
+                    cockpit_proto::Request::ReleaseExitGuard,
+                    ControlApplied::None,
+                );
+                self.show_toast("Exit cancelled", ToastKind::Info);
+            }
         }
     }
 

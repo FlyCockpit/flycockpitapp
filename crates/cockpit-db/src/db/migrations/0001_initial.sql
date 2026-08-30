@@ -208,6 +208,8 @@ CREATE TABLE sessions (
     -- the same automatic title opportunity.
     user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
     title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
+    -- Monotonic ownership fence for an in-flight same-model metadata fork.
+    metadata_fork_generation INTEGER NOT NULL DEFAULT 0 CHECK (metadata_fork_generation >= 0),
 
     -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
     -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is
@@ -1111,6 +1113,14 @@ CREATE INDEX idx_sealed_values_session_created
 CREATE TABLE app_flags (
     key     TEXT    PRIMARY KEY,
     seen_at INTEGER NOT NULL
+);
+
+-- Durable daemon-owned work left after a session's relational deletion has
+-- committed but its fenced directory could not yet be unlinked. The path is
+-- an opaque staging pathname produced by the storage daemon, never UI input.
+CREATE TABLE storage_directory_cleanup_intents (
+    staged_path TEXT PRIMARY KEY,
+    created_at_unix_ms INTEGER NOT NULL
 );
 
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------

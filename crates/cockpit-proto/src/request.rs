@@ -897,6 +897,19 @@ pub enum Request {
         key: AppFlagKey,
         expected_version: u64,
     },
+    /// Read the daemon-owned, whole-installation storage footprint for the
+    /// Settings → Storage page. This has no deletion side effect.
+    GetStorageReport,
+    /// Create a single-use dry-run cleanup plan. Destructive work is impossible
+    /// without the separately returned preview id.
+    PreviewStorageCleanup {
+        target: StorageCleanupTarget,
+    },
+    /// Execute exactly one unexpired dry-run plan returned by
+    /// `PreviewStorageCleanup`.
+    ExecuteStorageCleanup {
+        preview_id: Uuid,
+    },
     ResolveAssistantSession {
         assistant_id: String,
         project_root: String,
@@ -1028,6 +1041,19 @@ pub enum Request {
     /// daemon aborts the streaming completion and returns control to
     /// the agent stack so the user can redirect.
     CancelTurn,
+
+    /// Cancel every live unit of work in the attached session: the foreground
+    /// turn and all loop, timer, background, and swarm jobs.
+    CancelAllSessionWork,
+    /// Convert the current reference-counted daemon owner into a persistent
+    /// owner without interrupting its live session workers.
+    PromoteToPersistent,
+    /// Authoritative attached-session snapshot used immediately before a
+    /// client detaches.
+    ExitGuardStatus,
+    /// Release this attached client's pending exit-guard decision without
+    /// changing daemon lifetime.
+    ReleaseExitGuard,
 
     FsList {
         project_root: String,
@@ -1654,6 +1680,10 @@ pub enum Request {
     /// Run `/compact` on the attached session's foreground agent. Acked
     /// immediately; the in-place boundary arrives as a `CompactReady` event.
     Compact,
+
+    /// Accept the compacted branch of a prior interactive attach's rolling
+    /// snapshot at the daemon's safe boundary.
+    ResumeFromCompaction,
 
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
@@ -4111,6 +4141,9 @@ macro_rules! request_variants {
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
+            (Request::GetStorageReport, "get_storage_report");
+            (Request::PreviewStorageCleanup { .. }, "preview_storage_cleanup");
+            (Request::ExecuteStorageCleanup { .. }, "execute_storage_cleanup");
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
@@ -4124,6 +4157,10 @@ macro_rules! request_variants {
             (Request::ReadRedactedExportChunk { .. }, "read_redacted_export_chunk");
             (Request::Curator { .. }, "curator");
             (Request::CancelTurn, "cancel_turn");
+            (Request::CancelAllSessionWork, "cancel_all_session_work");
+            (Request::PromoteToPersistent, "promote_to_persistent");
+            (Request::ExitGuardStatus, "exit_guard_status");
+            (Request::ReleaseExitGuard, "release_exit_guard");
             (Request::FsList { .. }, "fs_list");
             (Request::FsStat { .. }, "fs_stat");
             (Request::FsRead { .. }, "fs_read");
@@ -4196,6 +4233,7 @@ macro_rules! request_variants {
             (Request::CancelSchedule { .. }, "cancel_schedule");
             (Request::Prune, "prune");
             (Request::Compact, "compact");
+            (Request::ResumeFromCompaction, "resume_from_compaction");
             (Request::Pin { .. }, "pin");
             #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential");
@@ -4423,6 +4461,9 @@ macro_rules! command {
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
+            (Request::GetStorageReport, "get_storage_report", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::PreviewStorageCleanup { target }, "preview_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "target:StorageCleanupTarget", [target: StorageCleanupTarget => param]);
+            (Request::ExecuteStorageCleanup { preview_id }, "execute_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "preview_id:Uuid", [preview_id: Uuid => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
@@ -4440,6 +4481,10 @@ macro_rules! command {
             (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32", [transfer_id: $crate::bulk_transfer::BulkTransferId => param, chunk_index: u32 => param]);
             (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::CancelAllSessionWork, "cancel_all_session_work", owner_only, attached, true, local_only, none, serialized, none, "-", []);
+            (Request::PromoteToPersistent, "promote_to_persistent", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::ExitGuardStatus, "exit_guard_status", owner_only, attached, false, local_only, none, serialized, none, "-", []);
+            (Request::ReleaseExitGuard, "release_exit_guard", owner_only, attached, false, local_only, none, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
             (Request::FsStat { project_root, path }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::FsRead { project_root, path, base64 }, "fs_read", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|base64:bool", [project_root: String => project_root, path: String => file_existing(project_root), base64: bool => param]);
@@ -4512,6 +4557,7 @@ macro_rules! command {
             (Request::CancelSchedule { job_id }, "cancel_schedule", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "job_id:String", [job_id: String => param]);
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::ResumeFromCompaction, "resume_from_compaction", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String", [text: String => param]);
             #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);
@@ -5042,6 +5088,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         }
         "ActiveModelSwitchTrigger"
         | "AppFlagKey"
+        | "StorageCleanupTarget"
         | "ApprovalMode"
         | "AssistantSessionResolutionMode"
         | "AttachmentPurpose"

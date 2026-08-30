@@ -1213,7 +1213,7 @@ async fn execute_ordinary_call_unscoped(
     // is the existing deny status string this path already produces (`gate.rs`
     // block status for the gate, the tool-call-completed lifecycle status for
     // the loop guard, and the canonical `review_cage_denied` kind for the cage).
-    let permission_denied_kind: Option<&'static str> =
+    let mut permission_denied_kind: Option<&'static str> =
         // A reserved native-computer name is a structural refusal, never a
         // permission denial — even when the same call would ALSO trip the loop
         // guard or review cage (its reserved-refusal arm wins the `result`
@@ -1378,6 +1378,72 @@ async fn execute_ordinary_call_unscoped(
             },
         )
         .await;
+        let verification = match verification {
+            crate::engine::verification::VerificationOutcome::Escalate { plan } => {
+                // A trusted-minimal projection failure must never degrade to
+                // a model-visible refusal that the user cannot act on. Keep
+                // the already-reserved original call in the park payload so
+                // a user-approved replay consumes this durable decision
+                // rather than collecting/adjudicating a second operation.
+                let operation_id = plan.operation_id;
+                payload.verification = Some(
+                    crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        dispatch_attempt_revision: plan.attempt_revision,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
+                    },
+                );
+                let label = format!(
+                    "verification could not safely project this `{resolved_name}` call for automatic approval; approve it manually"
+                );
+                let decision = match env.ctx.approver.as_ref() {
+                    Some(approver) => crate::engine::interrupt::with_interrupt_park_payload(
+                        payload.clone(),
+                        approver.authorize(crate::approval::AuthorizationRequest::NativeTool {
+                            label: &label,
+                            input: &args,
+                        }),
+                    )
+                    .await,
+                    None => Ok(crate::approval::Decision::NoninteractiveDeny),
+                };
+                match decision {
+                    Ok(crate::approval::Decision::Allow { .. }) => {
+                        crate::engine::verification::VerificationOutcome::DispatchOriginal { plan }
+                    }
+                    Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                        return (Err(crate::engine::interrupt::InterruptParked.into()), 0);
+                    }
+                    Ok(_) | Err(_) => {
+                        verification_blocked = true;
+                        // This is a real user-approval boundary, unlike an
+                        // ordinary verification block. Preserve its observer
+                        // audit after the rejected tool result is durable.
+                        permission_denied_kind = Some("blocked_verification");
+                        let _ = env
+                            .session
+                            .db
+                            .cancel_verification_dispatch_no_submission(
+                                env.session.id,
+                                operation_id,
+                                plan.attempt_revision,
+                                crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                                    crate::db::verification_ledger::VerificationDigest::of(
+                                        b"verification-projection-escalation-declined",
+                                    ),
+                                ),
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                        crate::engine::verification::VerificationOutcome::Block {
+                            message: "verification could not safely project this action for automatic approval and the user declined to run it manually; revise and re-emit".into(),
+                            operation_id: Some(operation_id),
+                        }
+                    }
+                }
+            }
+            outcome => outcome,
+        };
         match verification {
             crate::engine::verification::VerificationOutcome::Block {
                 message,

@@ -58,6 +58,10 @@ pub(crate) enum VerificationOutcome {
         message: String,
         operation_id: Option<Uuid>,
     },
+    /// The automatic adjudicator could not safely receive this action. The
+    /// original call is durably selected and reserved, but must be approved
+    /// by the user before it can enter the host-effect boundary.
+    Escalate { plan: VerificationDispatchPlan },
     /// Revise mode: dispatch substituted args.
     Revise {
         args: Value,
@@ -661,22 +665,26 @@ async fn run_verification(
                     .host_verification_operation(input.session.id, created.operation_id)
                     .await?
                     .context("verification operation disappeared")?;
-                input
+                let dispatching = input
                     .session
                     .db
-                    .suppress_verification_synthesis(
+                    .select_verification_original(
                         input.session.id,
                         created.operation_id,
                         op.revision,
-                        VerificationSynthesisTerminal::Failed,
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await?;
-                return Ok(VerificationOutcome::Block {
-                    message: "verification could not safely project this action for automatic approval; user approval is required"
-                        .into(),
-                    operation_id: Some(created.operation_id),
-                });
+                let plan = reserve_dispatch(
+                    &input,
+                    created.operation_id,
+                    dispatching.revision,
+                    original_digest.clone(),
+                    VerificationSurrogateKind::NormalizedOriginal,
+                    input.args,
+                )
+                .await?;
+                return Ok(VerificationOutcome::Escalate { plan });
             }
             Err(_)
                 if rule.resolved_on_adjudication_failure()
@@ -1547,6 +1555,59 @@ mod tests {
         assert_eq!(
             rows[0].estimate_state,
             VerificationEstimateState::EstimateUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_failure_returns_a_durable_user_escalation() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(NamedFixtureTool {
+            name: "plan_write".into(),
+            called: Arc::new(AtomicBool::new(false)),
+        }));
+        let agent = test_agent(tools, Some(verify_grant_inheriting_cost()));
+        let (session, instance_id) = prepared_session(tmp.path()).await;
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
+        let args = serde_json::json!({
+            "content": "plan body",
+            "expected_revision": "not-an-integer",
+        });
+
+        let outcome = run_verification(
+            InterceptInput {
+                session: &session,
+                agent: &agent,
+                model: &model,
+                ctx: &ctx,
+                history: &[],
+                resolved_name: "plan_write",
+                args: &args,
+                call_id: "call-1",
+            },
+            ToolClass::ArtifactWrite,
+            instance_id,
+        )
+        .await
+        .unwrap();
+        crate::engine::verification::estimate::set_test_model_price(None);
+
+        let VerificationOutcome::Escalate { plan } = outcome else {
+            panic!("projection failure must escalate to user approval, got {outcome:?}");
+        };
+        assert!(plan.attempt_revision >= 0);
+        let operations = session
+            .db
+            .list_verification_operations_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_ne!(
+            operations[0].state,
+            crate::db::verification_ledger::VerificationOperationState::Failed,
+            "projection failure must retain the operation for user-authorized dispatch"
         );
     }
 

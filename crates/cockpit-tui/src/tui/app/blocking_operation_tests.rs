@@ -18,7 +18,6 @@ impl Drop for BarrierRelease {
 }
 
 fn activate_composer(app: &mut App) {
-    app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.overlay = Overlay::None;
     app.question_dialog = None;
@@ -893,7 +892,6 @@ fn owned_barrier(
 async fn curator_command_is_async_with_pending_line() {
     let (barrier, arrived) = owned_barrier(BlockingOperationKind::CuratorMaintenance);
     let mut app = App::new(None, false);
-    app.daemon_prompt = None;
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.handle_curator_command("status");
     arrived.await.unwrap();

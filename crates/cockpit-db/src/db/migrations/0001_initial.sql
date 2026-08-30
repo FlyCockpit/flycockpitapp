@@ -116,6 +116,9 @@ CREATE TABLE sessions (
     -- parent session. NULL means the parent's durable tail at fork time.
     fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
+    description        TEXT CHECK (
+        description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
+    ),                                            -- generated old-session context (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -182,10 +185,12 @@ CREATE TABLE sessions (
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
-    -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
-    -- the same automatic title opportunity.
+    -- title/metadata slot (0, 1, 2, 4, 8, 16, 32, 64, or 128) so a resumed
+    -- session never repeats the same automatic metadata opportunity.
     user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
-    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
+    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16, 32, 64, 128)),
+    -- Monotonic ownership fence for an in-flight same-model metadata fork.
+    metadata_fork_generation INTEGER NOT NULL DEFAULT 0 CHECK (metadata_fork_generation >= 0),
 
     -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
     -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is
@@ -1081,15 +1086,6 @@ CREATE TABLE sealed_values (
 
 CREATE INDEX idx_sealed_values_session_created
     ON sealed_values(session_id, created_at ASC, value_id ASC);
-
--- ---- app_flags -------------------------------------------------------------
--- Machine-local one-time UI flags. These are deliberately outside project
--- config so onboarding notices do not depend on workspace trust state.
-
-CREATE TABLE app_flags (
-    key     TEXT    PRIMARY KEY,
-    seen_at INTEGER NOT NULL
-);
 
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------
 
@@ -4381,6 +4377,24 @@ CREATE TABLE workspace_trust (
 CREATE INDEX idx_workspace_trust_updated_at
     ON workspace_trust(updated_at_unix_ms DESC);
 
+-- ---- workspace history recall scope --------------------------------------------------------
+-- Independent from execution sandbox and workspace trust. Missing workspace
+-- rows are fail-closed (current workspace only). The machine default table is
+-- reserved for onboarding; no flow reads or writes it in v0.1 yet.
+CREATE TABLE workspace_history_scopes (
+    project_id TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 4096),
+    outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (outbound_enabled IN (0, 1)),
+    inbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (inbound_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE machine_history_scope_default (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cross_workspace_recall_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK (cross_workspace_recall_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
 -- ---- task delegations -----------------------------------------------------------------------
 -- Durable state for delegated `task` runs: one job per task call, one
 -- child row per labeled child run, plus pending steer messages and the
@@ -4640,7 +4654,8 @@ CREATE TABLE session_plan_docs (
     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     content TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 0,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    model_trust TEXT CHECK (model_trust IS NULL OR model_trust IN ('trusted', 'untrusted'))
 );
 
 -- ---- installation_identity -------------------------------------------------

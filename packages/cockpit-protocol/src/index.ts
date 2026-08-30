@@ -671,14 +671,7 @@ export const pendingGuidanceProposalSchema = z
 export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
 
 const requestParamSchemas = {
-  get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
   get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
-  mark_app_flag_seen: z
-    .object({
-      key: z.literal("daemon_autostart_notice"),
-      expected_version: safeU64NumberSchema,
-    })
-    .strict(),
   resolve_assistant_session: z
     .object({
       assistant_id: z.string().min(1),
@@ -693,6 +686,14 @@ const requestParamSchemas = {
       expected_config_generation: safeU64NumberSchema,
     })
     .strict(),
+  set_workspace_history_scope: z
+    .object({
+      project_root: projectRootSchema,
+      outbound: z.boolean(),
+      inbound: z.boolean(),
+    })
+    .strict(),
+  get_workspace_history_scope: z.object({ project_root: projectRootSchema }).strict(),
   archive_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
   attach: z.union([
     // A fresh session has no durable session identity yet, so it must name
@@ -834,7 +835,12 @@ const requestParamSchemas = {
   resolve_interrupt: z
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
+  promote_to_persistent: z.undefined(),
+  cancel_all_session_work: z.undefined(),
+  exit_guard_status: z.undefined(),
+  release_exit_guard: z.undefined(),
   restart_if_idle: z.undefined(),
+  resume_from_compaction: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
@@ -1070,11 +1076,17 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // array directly so it stays in sync with `clientRequestSchema` by
 // construction.
 const clientRequestVariants = [
-  requestVariant("get_app_flag", requestParamSchemas.get_app_flag),
   requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
-  requestVariant("mark_app_flag_seen", requestParamSchemas.mark_app_flag_seen),
   requestVariant("resolve_assistant_session", requestParamSchemas.resolve_assistant_session),
   requestVariant("set_workspace_trust", requestParamSchemas.set_workspace_trust),
+  requestVariant(
+    "set_workspace_history_scope",
+    requestParamSchemas.set_workspace_history_scope,
+  ),
+  requestVariant(
+    "get_workspace_history_scope",
+    requestParamSchemas.get_workspace_history_scope,
+  ),
   requestVariant("archive_session", requestParamSchemas.archive_session),
   requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
   requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
@@ -1107,7 +1119,12 @@ const clientRequestVariants = [
   requestVariant("resolve_agent_decision", requestParamSchemas.resolve_agent_decision),
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
+  requestVariantNoParams("promote_to_persistent"),
+  requestVariantNoParams("cancel_all_session_work"),
+  requestVariantNoParams("exit_guard_status"),
+  requestVariantNoParams("release_exit_guard"),
   requestVariantNoParams("restart_if_idle"),
+  requestVariantNoParams("resume_from_compaction"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("send_user_message_bulk", requestParamSchemas.send_user_message_bulk),
@@ -1222,8 +1239,6 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
-  "app_flag",
-  "app_flag_seen",
   "assistant_session_resolved",
   "config_refreshed",
   "attached",
@@ -1245,6 +1260,7 @@ export const responseNameSchema = z.enum([
   "session_setup_snapshot",
   "models",
   "restart_decision",
+  "exit_guard_status",
   "run_invocation_status",
   "remote_operation_status",
   "run_invocation_cancel_result",
@@ -1259,6 +1275,7 @@ export const responseNameSchema = z.enum([
   "bulk_transfer_chunk_accepted",
   "bulk_transfer_chunk",
   "workspace_trust_set",
+  "workspace_history_scope",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -1522,6 +1539,16 @@ export const btwForkInfoSchema = z
   })
   .passthrough();
 export type BtwForkInfo = z.infer<typeof btwForkInfoSchema>;
+export const resumeCompactionOfferSchema = z
+  .object({
+    default: z.enum(["full", "compacted", "ask"]),
+    fullInputTokens: safeU64NumberSchema,
+    compactedInputTokens: safeU64NumberSchema,
+    fullCtxPct: z.number().finite().optional(),
+    compactedCtxPct: z.number().finite().optional(),
+  })
+  .passthrough();
+export type ResumeCompactionOffer = z.infer<typeof resumeCompactionOfferSchema>;
 export const attachedDataSchema = z
   .object({
     session_id: uuidSchema,
@@ -1537,6 +1564,7 @@ export const attachedDataSchema = z
     history: z.array(historyEntryWireSchema),
     paused_work: z.array(pausedWorkSummarySchema),
     repair_required: resumeRepairStateSchema.optional(),
+    resume_compaction_offer: resumeCompactionOfferSchema.optional(),
     daemon_version: z.string(),
     compatible: z.boolean(),
     env_baseline: envSnapshotMetaSchema.optional(),
@@ -1567,26 +1595,6 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
-  responseVariant(
-    "app_flag",
-    z
-      .object({
-        key: z.literal("daemon_autostart_notice"),
-        seen: z.boolean(),
-        version: safeU64NumberSchema,
-      })
-      .strict(),
-  ),
-  responseVariant(
-    "app_flag_seen",
-    z
-      .object({
-        key: z.literal("daemon_autostart_notice"),
-        version: safeU64NumberSchema,
-        changed: z.boolean(),
-      })
-      .strict(),
-  ),
   responseVariant(
     "assistant_session_resolved",
     z.object({ session: sessionSummaryWireSchema, created: z.boolean() }).strict(),
@@ -1628,6 +1636,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         live_application_pending: z.array(uuidSchema).optional(),
       })
       .strict(),
+  ),
+  responseVariant(
+    "workspace_history_scope",
+    z.object({ outbound: z.boolean(), inbound: z.boolean() }).strict(),
   ),
   responseVariant(
     "config_refreshed",
@@ -2011,6 +2023,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ will_restart: z.boolean(), reason: z.string().optional() }).passthrough(),
   ),
   responseVariant(
+    "exit_guard_status",
+    z.object({ ephemeral_owner: z.boolean(), has_live_work: z.boolean() }).passthrough(),
+  ),
+  responseVariant(
     "fs_list",
     z.object({ entries: z.array(fsEntryWireSchema), truncated: z.boolean() }).passthrough(),
   ),
@@ -2105,6 +2121,7 @@ export const knownEventKindSchema = z.enum([
   "connector_status",
   "context_projection",
   "daemon_draining",
+  "daemon_lifetime_changed",
   "default_model_update_result",
   "delegation_recursion_state",
   "env_drift_warning",
@@ -2429,10 +2446,15 @@ const workspaceTrustReconciliationDataSchema = z
   })
   .strict();
 
+const daemonLifetimeChangedDataSchema = z
+  .object({ ephemeral_owner: z.boolean() })
+  .strict();
+
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
   agent_tree_changed: agentTreeChangedDataSchema,
   default_model_update_result: defaultModelUpdateResultDataSchema,
+  daemon_lifetime_changed: daemonLifetimeChangedDataSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   host_capabilities_changed: hostCapabilitiesChangedDataSchema,
@@ -2514,6 +2536,7 @@ export const sessionSummarySchema = z
     turns: safeU64NumberSchema,
     active_agent: z.string(),
     title: z.string().nullable().optional(),
+    description: z.string().nullable().optional(),
     parent_session_id: uuidSchema.nullable().optional(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),

@@ -35,7 +35,6 @@ fn reasoning_expanded(entry: &HistoryEntry) -> bool {
 
 fn plain_app(tmp: &tempfile::TempDir) -> App {
     let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
     app.dialog = Dialog::None;
     app.composer.set_vim_enabled(false);
     app

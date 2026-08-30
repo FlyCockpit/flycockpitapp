@@ -413,15 +413,13 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
-    negotiated_protocol_version: u32,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
     let session = require_session(ctx, session_id).await?;
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
-    {
+    if session.ended_at_unix_ms.is_none() {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),

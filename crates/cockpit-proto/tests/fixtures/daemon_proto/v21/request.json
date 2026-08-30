@@ -1,10 +1,4 @@
 {
-  "get_app_flag": {
-    "params": {
-      "key": "daemon_autostart_notice"
-    },
-    "request": "get_app_flag"
-  },
   "get_startup_disclosures": {
     "params": {
       "project_root": "/tmp/project"
@@ -17,12 +11,11 @@
     },
     "request": "get_workspace_trust"
   },
-  "mark_app_flag_seen": {
+  "get_workspace_history_scope": {
     "params": {
-      "expected_version": 7,
-      "key": "daemon_autostart_notice"
+      "project_root": "/tmp/project"
     },
-    "request": "mark_app_flag_seen"
+    "request": "get_workspace_history_scope"
   },
   "resolve_assistant_session": {
     "params": {
@@ -39,6 +32,14 @@
       "project_root": "/tmp/project"
     },
     "request": "set_workspace_trust"
+  },
+  "set_workspace_history_scope": {
+    "params": {
+      "inbound": true,
+      "outbound": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_history_scope"
   },
   "archive_session": {
     "params": {
@@ -721,6 +722,9 @@
   },
   "restart_if_idle": {
     "request": "restart_if_idle"
+  },
+  "resume_from_compaction": {
+    "request": "resume_from_compaction"
   },
   "resume_paused_work": {
     "params": {

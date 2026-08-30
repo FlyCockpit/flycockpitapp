@@ -33,16 +33,14 @@ async fn finish_lifecycle_with_deadline(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(error).context("daemon lifecycle task failed"),
         Err(_) => {
-            // Aborting only retires the async request actor. Every accepted or
-            // provisional daemon owner is RAII-bound to a process-lifetime OS
-            // reaper/supervisor, so dropping the actor transfers cleanup
-            // rather than cancelling it. Bound the abort acknowledgement too:
-            // top-level CLI exit must never turn 35 seconds into infinity.
+            // Aborting retires only the async request actor. Socket-owner
+            // lifetime remains with the daemon's attached-client reference
+            // count, so actor cancellation cannot stop another client.
+            // Bound the abort acknowledgement too: top-level CLI exit must
+            // never turn 35 seconds into infinity.
             task.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut *task).await;
-            anyhow::bail!(
-                "daemon lifecycle cleanup exceeded {deadline:?}; ownership transferred to the runtime-independent reaper"
-            )
+            anyhow::bail!("daemon lifecycle task did not retire within {deadline:?}")
         }
     }
 }
@@ -84,7 +82,14 @@ pub async fn run_mode(
     let trust = prepare_tui_workspace_trust(project)?;
 
     let (lifecycle, lifecycle_task) = lifecycle_composition();
-    let mut app = App::new_composed(project, no_sandbox, mode, trust, launch_start, lifecycle);
+    let mut app = App::new_composed_with_session_mode(
+        project,
+        no_sandbox,
+        mode,
+        trust,
+        launch_start,
+        lifecycle,
+    );
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;

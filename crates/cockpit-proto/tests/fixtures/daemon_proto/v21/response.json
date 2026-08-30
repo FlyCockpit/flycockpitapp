@@ -1,20 +1,4 @@
 {
-  "app_flag": {
-    "data": {
-      "key": "daemon_autostart_notice",
-      "seen": false,
-      "version": 7
-    },
-    "response": "app_flag"
-  },
-  "app_flag_seen": {
-    "data": {
-      "changed": true,
-      "key": "daemon_autostart_notice",
-      "version": 8
-    },
-    "response": "app_flag_seen"
-  },
   "assistant_session_resolved": {
     "data": {
       "created": true,
@@ -66,6 +50,13 @@
       "mode": "trust"
     },
     "response": "workspace_trust"
+  },
+  "workspace_history_scope": {
+    "data": {
+      "inbound": true,
+      "outbound": true
+    },
+    "response": "workspace_history_scope"
   },
   "flycockpit_stored": {
     "response": "flycockpit_stored"
@@ -2474,7 +2465,7 @@
                 "per_upload_bytes": 4194304,
                 "global_bytes": 268435456
               },
-              "autostart": "shared"
+              "background_agents": true
             },
             "mediaResources": {
               "version": 1,

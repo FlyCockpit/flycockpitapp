@@ -1792,6 +1792,43 @@ fn authorized_ctx() -> (
     (tmp, ctx, authority, attachments, swapped, held)
 }
 
+#[tokio::test]
+async fn av_path_tools_cannot_admit_a_trust_required_knowledge_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge = tmp.path().join(".cockpit/knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        r#"{"knowledgeBases":[{"id":"private","name":"Private","description":"Private local knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(knowledge.join("protected.mp4"), b"not inspected").unwrap();
+
+    let mut ctx = crate::tools::common::test_ctx(tmp.path());
+    ctx.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
+    let (authority, _, _, _) = fixture_authority(*ctx.session.id.as_bytes());
+    let authority = Arc::new(authority);
+    let ctx = ctx.with_media_authority(authority.clone());
+    let runner = Arc::new(FakeAvArgvRunner::new());
+
+    for kind in tool_kinds() {
+        let error = tool_for(kind, runner.clone())
+            .call(
+                json!({"source": {"path": ".cockpit/knowledge/protected.mp4"}}),
+                &ctx,
+            )
+            .await
+            .expect_err("an untrusted model must not admit a protected KB media source");
+        assert!(
+            error
+                .to_string()
+                .contains("local knowledge base that requires a trusted model"),
+            "{kind:?}: unexpected error: {error:#}"
+        );
+    }
+    assert_eq!(authority.io_counters().path_authorizations, 0);
+}
+
 fn tool_for(kind: ToolKind, runner: Arc<dyn AvArgvRunner>) -> Box<dyn Tool> {
     match kind {
         ToolKind::InspectAudio => Box::new(InspectAudioTool::with_runner(runner)),

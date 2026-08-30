@@ -173,7 +173,7 @@
           },
           "allow_remote_config": false,
           "agent_chooses_subagent_model": false,
-          "project_knowledge": false,
+          "knowledgeBases": [],
           "knowledge_inject_max_tokens": 2048,
           "prompt_injection_guard": {
             "threshold": "off",
@@ -210,7 +210,7 @@
               "per_upload_bytes": 4194304,
               "global_bytes": 268435456
             },
-            "autostart": "shared"
+            "background_agents": true
           },
           "mediaResources": {
             "version": 1,

@@ -126,6 +126,9 @@ impl HttpsSealedAction {
                 parameters,
                 ..
             } => (origins, credential_placement, path_template, parameters),
+            SealedActionKind::KnowledgeBaseCopy { .. } => {
+                bail!("knowledge-base copy actions do not have an HTTPS executor")
+            }
         };
         let origin = origins
             .iter()

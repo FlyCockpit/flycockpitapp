@@ -109,6 +109,11 @@ impl Tool for HistorySearchTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let scope = HistorySearchScope::parse(&args)?;
+        crate::tools::history_scope::require_recall_permission(ctx)?;
+        crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
+        // Keep consent stable across discovery, target-redaction union, and
+        // output construction. Revocations acquire the exclusive side first.
+        let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
         ctx.session
             .db
             .fts5_available()
@@ -279,6 +284,21 @@ async fn render_session_hits(
             "cockpit://session/{id}/transcript  {}  {title}\n    {}\n",
             human_date(hit.last_active_at_unix_ms),
             snippet.trim()
+        ));
+    }
+    let displayed: Vec<_> = hits
+        .iter()
+        .take(limit as usize)
+        .map(|hit| hit.session_id)
+        .collect();
+    if !ctx
+        .session
+        .db
+        .sessions_access_allowed(&ctx.session.project_id, &displayed)
+        .await?
+    {
+        return Err(invalid_input(
+            "history access changed before results could be returned",
         ));
     }
     Ok(ToolOutput::text(out))

@@ -179,6 +179,29 @@ pub(crate) struct PreparedCompletionRequest {
     pub single_handoff: bool,
 }
 
+/// The explicit provider-cache boundary for an agent completion.
+///
+/// `stable_prefix` is constructed when an agent is spawned and must remain
+/// byte-identical until that agent is rebuilt or re-postured for model
+/// failover. `volatile_messages` is the complete per-turn history, including
+/// host-injected time, knowledge, guidance, skill-catalog, and nudge messages.
+/// Keeping the pair at the request boundary prevents a future injector from
+/// accidentally folding volatile state back into the provider preamble.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AgentPromptParts<'a> {
+    pub(crate) stable_prefix: &'a str,
+    pub(crate) volatile_messages: &'a [Message],
+}
+
+impl<'a> AgentPromptParts<'a> {
+    pub(crate) fn new(stable_prefix: &'a str, volatile_messages: &'a [Message]) -> Self {
+        Self {
+            stable_prefix,
+            volatile_messages,
+        }
+    }
+}
+
 /// When set (by `--debug-last-message`), every call to [`Model::complete`]
 /// writes a pretty-printed JSON dump of the outbound request to this
 /// path before invoking rig. The file is overwritten each turn.

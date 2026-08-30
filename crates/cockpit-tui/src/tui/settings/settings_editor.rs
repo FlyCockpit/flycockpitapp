@@ -2596,6 +2596,7 @@ mod tests {
                 compact_shadow_margin_pct: 10,
                 auto_prune_pct: 55,
                 auto_prune_prunable_pct: 35,
+                ..ContextConfig::default()
             },
             ..ProviderEntry::default()
         };

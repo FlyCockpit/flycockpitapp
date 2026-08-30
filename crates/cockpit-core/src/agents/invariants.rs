@@ -715,6 +715,7 @@ mod grant_tests {
             delegation: DelegationPolicy::default(),
             questions: None,
             verification: None,
+            allowed_knowledge_bases: None,
         });
         // A v2 definition has no user-authored tool authority, so legacy tool
         // validation must not reinterpret its ignored internal fields.

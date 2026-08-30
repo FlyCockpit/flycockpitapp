@@ -19,7 +19,7 @@ impl Session {
     ) -> Result<Self> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::create(db, project_root, active_agent, resolver, vault)
+        Self::create_with_test_workspace_root(db, project_root, active_agent, resolver, vault)
     }
 
     pub fn create_deferred_for_test(
@@ -30,7 +30,13 @@ impl Session {
     ) -> Result<Self> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::create_deferred(db, project_root, active_agent, resolver, vault)
+        Self::create_deferred_with_test_workspace_root(
+            db,
+            project_root,
+            active_agent,
+            resolver,
+            vault,
+        )
     }
 
     pub fn create_assistant_deferred_for_test(
@@ -42,7 +48,7 @@ impl Session {
     ) -> Result<Self> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::create_assistant_deferred(
+        Self::create_assistant_deferred_with_test_workspace_root(
             db,
             project_root,
             active_agent,
@@ -60,7 +66,13 @@ impl Session {
     ) -> Result<Self> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::create_fork(db, parent_session_id, fork_point_turn_id, resolver, vault)
+        Self::create_fork_with_test_workspace_root(
+            db,
+            parent_session_id,
+            fork_point_turn_id,
+            resolver,
+            vault,
+        )
     }
 
     pub fn resume_for_test(
@@ -70,6 +82,6 @@ impl Session {
     ) -> Result<Option<Self>> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::resume(db, session_id, resolver, vault)
+        Self::resume_with_test_workspace_root(db, session_id, resolver, vault)
     }
 }

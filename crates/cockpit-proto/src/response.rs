@@ -16,6 +16,32 @@ pub struct ImageIngressAdmissionReceiptV1 {
     pub height: u32,
 }
 
+/// Daemon-selected policy for an idle-session resume with a current rolling
+/// compaction snapshot. `Ask` is surfaced to interactive clients only;
+/// headless attaches always retain the full conversation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCompactionDefault {
+    Full,
+    Compacted,
+    Ask,
+}
+
+/// The non-mutating choice presented when an idled session has an exact
+/// rolling compaction snapshot. Token and context figures let a client label
+/// both choices without independently reconstructing the compaction plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeCompactionOffer {
+    pub default: ResumeCompactionDefault,
+    pub full_input_tokens: u64,
+    pub compacted_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_ctx_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_ctx_pct: Option<f64>,
+}
+
 // ---- Responses -------------------------------------------------------------
 
 /// Daemon → client RPC responses. Each variant is the typed answer to
@@ -56,6 +82,14 @@ pub enum Response {
         will_restart: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+
+    /// Authoritative state used by the client exit guard. This is deliberately
+    /// an attached-session response so the worker's live state and the owner
+    /// lifetime come from one daemon decision point.
+    ExitGuardStatus {
+        ephemeral_owner: bool,
+        has_live_work: bool,
     },
 
     /// A user message was accepted by the session worker. `status = queued`
@@ -164,6 +198,12 @@ pub enum Response {
         paused_work: Vec<PausedWorkSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repair_required: Option<Box<ResumeRepairState>>,
+        /// Present only for an interactive away-resume whose configured
+        /// policy is `ask` and whose rolling snapshot exactly covers history.
+        /// Accept with [`Request::ResumeFromCompaction`]; retaining full
+        /// context needs no follow-up request.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resume_compaction_offer: Option<ResumeCompactionOffer>,
         #[serde(default = "default_daemon_version")]
         daemon_version: String,
         #[serde(default)]
@@ -645,6 +685,20 @@ pub enum Response {
         key: AppFlagKey,
         version: u64,
         changed: bool,
+    },
+    StorageReport {
+        total_bytes: u64,
+        categories: Vec<StorageCategoryUsage>,
+        orphaned_workspace_storage: Vec<StorageCleanupItem>,
+        archived_sessions: Vec<StorageCleanupItem>,
+        show_management_hint: bool,
+        storage_management_hint_version: u64,
+    },
+    StorageCleanupPreview {
+        preview: StorageCleanupPreview,
+    },
+    StorageCleanupCompleted {
+        bytes_freed: u64,
     },
     AssistantSessionResolved {
         session: SessionSummary,
@@ -1439,6 +1493,7 @@ macro_rules! response_variants {
             (Response::MediaUploadStatus(..), "media_upload_status");
             (Response::ConfigRefreshed { .. }, "config_refreshed");
             (Response::RestartDecision { .. }, "restart_decision");
+            (Response::ExitGuardStatus { .. }, "exit_guard_status");
             (Response::UserMessageQueued { .. }, "user_message_queued");
             (Response::DelegationSteer { .. }, "delegation_steer");
             (Response::AttachmentUploadStarted { .. }, "attachment_upload_started");
@@ -1523,6 +1578,9 @@ macro_rules! response_variants {
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");
             (Response::AppFlagSeen { .. }, "app_flag_seen");
+            (Response::StorageReport { .. }, "storage_report");
+            (Response::StorageCleanupPreview { .. }, "storage_cleanup_preview");
+            (Response::StorageCleanupCompleted { .. }, "storage_cleanup_completed");
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");

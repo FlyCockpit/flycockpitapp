@@ -427,6 +427,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
                     "write",
                     "edit",
                     "history_search",
+                    "knowledge_retrieve",
                 ]
                 .into_iter()
                 .map(str::to_string)

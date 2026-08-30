@@ -152,6 +152,37 @@ impl Db {
                 project_id.as_deref(),
                 exclude_session,
                 since,
+                None,
+                pool,
+                caller_trust,
+                None,
+            )
+        })
+        .await
+    }
+
+    /// Search sessions with an event newer than the durable global event-seq
+    /// fence. This preserves main's fresh-session knowledge retrieval without
+    /// exposing a second history-search tool surface.
+    pub async fn search_candidates_after_session_event_seq_for_trust(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        after_session_event_seq: i64,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                exclude_session,
+                None,
+                Some(after_session_event_seq),
                 pool,
                 caller_trust,
                 None,
@@ -182,6 +213,7 @@ impl Db {
                 None,
                 exclude_session,
                 since,
+                None,
                 pool,
                 caller_trust,
                 Some(&reader_project),
@@ -441,6 +473,7 @@ fn search_candidates_inner(
     project_id: Option<&str>,
     exclude_session: Option<Uuid>,
     since: Option<i64>,
+    after_session_event_seq: Option<i64>,
     pool: u32,
     caller_trust: HistoryCallerTrust,
     reader_project: Option<&str>,
@@ -493,16 +526,21 @@ fn search_candidates_inner(
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
-                AND (?5
+                AND (?5 IS NULL OR EXISTS (
+                    SELECT 1 FROM session_events AS later_event
+                     WHERE later_event.session_id = s.session_id
+                       AND later_event.seq > ?5
+                ))
+                AND (?6
                      OR f.row_kind = 'title'
                      OR (f.row_kind = 'description'
                          AND s.description_model_trust = 'untrusted')
                      OR (f.row_kind NOT IN ('title', 'description')
                          AND (e.model_trust IS NULL OR e.model_trust <> 'trusted')))
-                AND (?6 IS NULL
-                     OR s.project_id = ?6
+                AND (?7 IS NULL
+                     OR s.project_id = ?7
                      OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
-                                  WHERE reader.project_id = ?6
+                                  WHERE reader.project_id = ?7
                                     AND reader.outbound_enabled = 1)
                          AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
                                      WHERE target.project_id = s.project_id
@@ -519,6 +557,7 @@ fn search_candidates_inner(
                 project_id,
                 exclude,
                 since,
+                after_session_event_seq,
                 caller_trust.can_read_trusted(),
                 reader_project,
             ],

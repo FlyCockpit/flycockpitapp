@@ -671,11 +671,14 @@ export const pendingGuidanceProposalSchema = z
 export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
 
 const requestParamSchemas = {
-  get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
+  get_storage_report: z.undefined(),
+  get_app_flag: z
+    .object({ key: z.enum(["daemon_autostart_notice", "storage_management_hint"]) })
+    .strict(),
   get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
   mark_app_flag_seen: z
     .object({
-      key: z.literal("daemon_autostart_notice"),
+      key: z.enum(["daemon_autostart_notice", "storage_management_hint"]),
       expected_version: safeU64NumberSchema,
     })
     .strict(),
@@ -686,6 +689,41 @@ const requestParamSchemas = {
       mode: z.literal("most_recent_or_create"),
     })
     .strict(),
+  preview_storage_cleanup: z
+    .object({
+      target: z.discriminatedUnion("kind", [
+        z
+          .object({
+            kind: z.literal("archive_sessions_older_than"),
+            data: z
+              .object({ age_days: u32Schema, include_renamed_or_pinned: z.boolean() })
+              .strict(),
+          })
+          .strict(),
+        z
+          .object({
+            kind: z.literal("permanently_delete_sessions"),
+            data: z.object({ session_ids: z.array(uuidSchema) }).strict(),
+          })
+          .strict(),
+        z
+          .object({
+            kind: z.literal("permanently_delete_archived_sessions_older_than"),
+            data: z
+              .object({ age_days: u32Schema, include_renamed_or_pinned: z.boolean() })
+              .strict(),
+          })
+          .strict(),
+        z
+          .object({
+            kind: z.literal("remove_orphaned_workspace_storage"),
+            data: z.object({ project_ids: z.array(z.string().min(1)) }).strict(),
+          })
+          .strict(),
+      ]),
+    })
+    .strict(),
+  execute_storage_cleanup: z.object({ preview_id: uuidSchema }).strict(),
   set_workspace_trust: z
     .object({
       project_root: projectRootSchema,
@@ -842,7 +880,12 @@ const requestParamSchemas = {
   resolve_interrupt: z
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
+  promote_to_persistent: z.undefined(),
+  cancel_all_session_work: z.undefined(),
+  exit_guard_status: z.undefined(),
+  release_exit_guard: z.undefined(),
   restart_if_idle: z.undefined(),
+  resume_from_compaction: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
@@ -1082,9 +1125,18 @@ const clientRequestVariants = [
   requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
   requestVariant("mark_app_flag_seen", requestParamSchemas.mark_app_flag_seen),
   requestVariant("resolve_assistant_session", requestParamSchemas.resolve_assistant_session),
+  requestVariantNoParams("get_storage_report"),
+  requestVariant("preview_storage_cleanup", requestParamSchemas.preview_storage_cleanup),
+  requestVariant("execute_storage_cleanup", requestParamSchemas.execute_storage_cleanup),
   requestVariant("set_workspace_trust", requestParamSchemas.set_workspace_trust),
-  requestVariant("set_workspace_history_scope", requestParamSchemas.set_workspace_history_scope),
-  requestVariant("get_workspace_history_scope", requestParamSchemas.get_workspace_history_scope),
+  requestVariant(
+    "set_workspace_history_scope",
+    requestParamSchemas.set_workspace_history_scope,
+  ),
+  requestVariant(
+    "get_workspace_history_scope",
+    requestParamSchemas.get_workspace_history_scope,
+  ),
   requestVariant("archive_session", requestParamSchemas.archive_session),
   requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
   requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
@@ -1117,7 +1169,12 @@ const clientRequestVariants = [
   requestVariant("resolve_agent_decision", requestParamSchemas.resolve_agent_decision),
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
+  requestVariantNoParams("promote_to_persistent"),
+  requestVariantNoParams("cancel_all_session_work"),
+  requestVariantNoParams("exit_guard_status"),
+  requestVariantNoParams("release_exit_guard"),
   requestVariantNoParams("restart_if_idle"),
+  requestVariantNoParams("resume_from_compaction"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("send_user_message_bulk", requestParamSchemas.send_user_message_bulk),
@@ -1232,8 +1289,6 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
-  "app_flag",
-  "app_flag_seen",
   "assistant_session_resolved",
   "config_refreshed",
   "attached",
@@ -1255,11 +1310,15 @@ export const responseNameSchema = z.enum([
   "session_setup_snapshot",
   "models",
   "restart_decision",
+  "exit_guard_status",
   "run_invocation_status",
   "remote_operation_status",
   "run_invocation_cancel_result",
   "session_messages",
   "session_live_status",
+  "storage_report",
+  "storage_cleanup_preview",
+  "storage_cleanup_completed",
   "sessions",
   "stats_rollup",
   "startup_disclosures",
@@ -1533,6 +1592,16 @@ export const btwForkInfoSchema = z
   })
   .passthrough();
 export type BtwForkInfo = z.infer<typeof btwForkInfoSchema>;
+export const resumeCompactionOfferSchema = z
+  .object({
+    default: z.enum(["full", "compacted", "ask"]),
+    fullInputTokens: safeU64NumberSchema,
+    compactedInputTokens: safeU64NumberSchema,
+    fullCtxPct: z.number().finite().optional(),
+    compactedCtxPct: z.number().finite().optional(),
+  })
+  .passthrough();
+export type ResumeCompactionOffer = z.infer<typeof resumeCompactionOfferSchema>;
 export const attachedDataSchema = z
   .object({
     session_id: uuidSchema,
@@ -1548,6 +1617,7 @@ export const attachedDataSchema = z
     history: z.array(historyEntryWireSchema),
     paused_work: z.array(pausedWorkSummarySchema),
     repair_required: resumeRepairStateSchema.optional(),
+    resume_compaction_offer: resumeCompactionOfferSchema.optional(),
     daemon_version: z.string(),
     compatible: z.boolean(),
     env_baseline: envSnapshotMetaSchema.optional(),
@@ -1571,6 +1641,59 @@ const statsRollupWireSchema = z
     language: passthroughObjectSchema,
   })
   .passthrough();
+const storageCategorySchema = z.enum([
+  "ledger",
+  "sessions_by_age",
+  "workspace_scratch",
+  "local_configs",
+  "worktrees",
+  "task_artifacts",
+  "computer_capture",
+  "result_blobs",
+  "session_shims",
+  "session_tmp",
+]);
+const storageCleanupItemSchema = z
+  .object({
+    label: z.string(),
+    session_id: uuidSchema.optional(),
+    bytes: safeU64NumberSchema,
+    last_used_at_unix_ms: safeI64NumberSchema.optional(),
+  })
+  .strict();
+export const storageReportResultSchema = z
+  .object({
+    total_bytes: safeU64NumberSchema,
+    categories: z.array(
+      z
+        .object({
+          category: storageCategorySchema,
+          total_bytes: safeU64NumberSchema,
+          reclaimable_bytes: safeU64NumberSchema,
+        })
+        .strict(),
+    ),
+    orphaned_workspace_storage: z.array(storageCleanupItemSchema),
+    archived_sessions: z.array(storageCleanupItemSchema),
+    show_management_hint: z.boolean(),
+    storage_management_hint_version: safeU64NumberSchema,
+  })
+  .strict();
+export const storageCleanupPreviewResultSchema = z
+  .object({
+    preview: z
+      .object({
+        preview_id: uuidSchema,
+        target: requestParamSchemas.preview_storage_cleanup.shape.target,
+        items: z.array(storageCleanupItemSchema),
+        bytes_to_free: safeU64NumberSchema,
+      })
+      .strict(),
+  })
+  .strict();
+export const storageCleanupCompletedResultSchema = z
+  .object({ bytes_freed: safeU64NumberSchema })
+  .strict();
 const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>(
   response: Name,
   data: Schema,
@@ -1582,7 +1705,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     "app_flag",
     z
       .object({
-        key: z.literal("daemon_autostart_notice"),
+        key: z.enum(["daemon_autostart_notice", "storage_management_hint"]),
         seen: z.boolean(),
         version: safeU64NumberSchema,
       })
@@ -1592,12 +1715,15 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     "app_flag_seen",
     z
       .object({
-        key: z.literal("daemon_autostart_notice"),
+        key: z.enum(["daemon_autostart_notice", "storage_management_hint"]),
         version: safeU64NumberSchema,
         changed: z.boolean(),
       })
       .strict(),
   ),
+  responseVariant("storage_report", storageReportResultSchema),
+  responseVariant("storage_cleanup_preview", storageCleanupPreviewResultSchema),
+  responseVariant("storage_cleanup_completed", storageCleanupCompletedResultSchema),
   responseVariant(
     "assistant_session_resolved",
     z.object({ session: sessionSummaryWireSchema, created: z.boolean() }).strict(),
@@ -1889,11 +2015,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                   .strict()
                   .optional(),
                 locked_reason: z
-                  .enum([
-                    "terminal",
-                    "inherited_from_profile",
-                    "host_policy",
-                  ])
+                  .enum(["terminal", "inherited_from_profile", "host_policy"])
                   .optional(),
               })
               .strict()
@@ -1905,7 +2027,9 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                     name: z.string().min(1),
                     tier: z.enum(["enabled", "discoverable", "disabled"]),
                     locked: z.boolean().optional(),
-                    legal_tiers: z.array(z.enum(["enabled", "discoverable", "disabled"])).optional(),
+                    legal_tiers: z
+                      .array(z.enum(["enabled", "discoverable", "disabled"]))
+                      .optional(),
                     family: z.string().optional(),
                   })
                   .strict(),
@@ -2026,6 +2150,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ will_restart: z.boolean(), reason: z.string().optional() }).passthrough(),
   ),
   responseVariant(
+    "exit_guard_status",
+    z.object({ ephemeral_owner: z.boolean(), has_live_work: z.boolean() }).passthrough(),
+  ),
+  responseVariant(
     "fs_list",
     z.object({ entries: z.array(fsEntryWireSchema), truncated: z.boolean() }).passthrough(),
   ),
@@ -2120,6 +2248,7 @@ export const knownEventKindSchema = z.enum([
   "connector_status",
   "context_projection",
   "daemon_draining",
+  "daemon_lifetime_changed",
   "default_model_update_result",
   "delegation_recursion_state",
   "env_drift_warning",
@@ -2444,10 +2573,15 @@ const workspaceTrustReconciliationDataSchema = z
   })
   .strict();
 
+const daemonLifetimeChangedDataSchema = z
+  .object({ ephemeral_owner: z.boolean() })
+  .strict();
+
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
   agent_tree_changed: agentTreeChangedDataSchema,
   default_model_update_result: defaultModelUpdateResultDataSchema,
+  daemon_lifetime_changed: daemonLifetimeChangedDataSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   host_capabilities_changed: hostCapabilitiesChangedDataSchema,
@@ -2529,6 +2663,7 @@ export const sessionSummarySchema = z
     turns: safeU64NumberSchema,
     active_agent: z.string(),
     title: z.string().nullable().optional(),
+    description: z.string().nullable().optional(),
     parent_session_id: uuidSchema.nullable().optional(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),
@@ -2619,6 +2754,9 @@ export type FsWriteResult = z.infer<typeof fsWriteResultSchema>;
 export type GitStatusResult = z.infer<typeof gitStatusResultSchema>;
 export type GitDiffFileResult = z.infer<typeof gitDiffFileResultSchema>;
 export type SessionLiveStatusResult = z.infer<typeof sessionLiveStatusResultSchema>;
+export type StorageReportResult = z.infer<typeof storageReportResultSchema>;
+export type StorageCleanupPreviewResult = z.infer<typeof storageCleanupPreviewResultSchema>;
+export type StorageCleanupCompletedResult = z.infer<typeof storageCleanupCompletedResultSchema>;
 
 export function parseListSessionsResult(value: unknown) {
   return listSessionsResultSchema.parse(value);
@@ -2658,6 +2796,15 @@ export function parseGitDiffFileResult(value: unknown) {
 }
 export function parseSessionLiveStatusResult(value: unknown) {
   return sessionLiveStatusResultSchema.parse(value);
+}
+export function parseStorageReportResult(value: unknown) {
+  return storageReportResultSchema.parse(value);
+}
+export function parseStorageCleanupPreviewResult(value: unknown) {
+  return storageCleanupPreviewResultSchema.parse(value);
+}
+export function parseStorageCleanupCompletedResult(value: unknown) {
+  return storageCleanupCompletedResultSchema.parse(value);
 }
 
 export function createEnvelope(id: string, request: ClientRequest): ClientEnvelope {

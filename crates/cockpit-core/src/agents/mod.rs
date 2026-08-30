@@ -695,7 +695,7 @@ fn tool_family(name: &str) -> &'static str {
         | "defer_to_orchestrator"
         | "schedule"
         | "start_build" => "coordination",
-        "history_search" | "todo" => "memory",
+        "history_search" | "knowledge_retrieve" | "todo" => "memory",
         "skill" | "skill_manage" | "mcp" => "extensions",
         "grep" | "glob" => "sandbox",
         _ => "other",

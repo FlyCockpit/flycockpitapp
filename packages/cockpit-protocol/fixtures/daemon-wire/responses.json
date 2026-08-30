@@ -58,9 +58,7 @@
   "attached": {
     "data": {
       "active_agent": "active_agent-fixture",
-      "active_agent_path": [
-        "active_agent_path-fixture"
-      ],
+      "active_agent_path": ["active_agent_path-fixture"],
       "active_model_state": {
         "default_selection": {
           "model": "model-fixture",
@@ -92,15 +90,9 @@
         "baseline_digest": "base",
         "candidate_digest": "cand",
         "changed_keys": 3,
-        "changed_secret_keys": [
-          "TOKEN"
-        ],
-        "path_added": [
-          "/opt/bin"
-        ],
-        "path_removed": [
-          "/bin"
-        ],
+        "changed_secret_keys": ["TOKEN"],
+        "path_added": ["/opt/bin"],
+        "path_removed": ["/bin"],
         "removed_keys": 2
       },
       "env_policy_applied": "update-daemon",
@@ -150,19 +142,22 @@
       "project_root": "project_root-fixture",
       "repair_required": {
         "detail": "detail",
-        "failing_tool_call_ids": [
-          "call-1"
-        ],
+        "failing_tool_call_ids": ["call-1"],
         "failure_kind": "missing_tool_result",
         "model": "model",
         "provider": "fixture",
         "safe_last_turn_seq": 4,
         "session_id": "11111111-1111-4111-8111-111111111111",
         "short_id": "abc123",
-        "suggested_actions": [
-          "repair_synthetic_tool_results"
-        ],
+        "suggested_actions": ["repair_synthetic_tool_results"],
         "wire_api": "responses"
+      },
+      "resume_compaction_offer": {
+        "compactedCtxPct": 20.0,
+        "compactedInputTokens": 2000,
+        "default": "ask",
+        "fullCtxPct": 80.0,
+        "fullInputTokens": 8000
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
       "short_id": "short_id-fixture",
@@ -371,10 +366,7 @@
               }
             ]
           },
-          "thinking_modes": [
-            "off",
-            "high"
-          ],
+          "thinking_modes": ["off", "high"],
           "trust": "untrusted"
         }
       ],
@@ -670,8 +662,8 @@
   },
   "workspace_history_scope": {
     "data": {
-      "outbound": true,
-      "inbound": false
+      "inbound": true,
+      "outbound": true
     },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
@@ -759,11 +751,14 @@
           "allowed": [{ "provider_id": "vendor", "model_id": "model-a", "is_default": true }]
         },
         "tools": [
-          { "name": "read", "tier": "enabled", "legal_tiers": ["enabled", "discoverable", "disabled"], "family": "filesystem" }
+          {
+            "name": "read",
+            "tier": "enabled",
+            "legal_tiers": ["enabled", "discoverable", "disabled"],
+            "family": "filesystem"
+          }
         ],
-        "mcps": [
-          { "name": "docs", "scope": "workspace", "enabled": true, "profile": "default" }
-        ],
+        "mcps": [{ "name": "docs", "scope": "workspace", "enabled": true, "profile": "default" }],
         "candidates": [
           {
             "installation": {
@@ -808,9 +803,7 @@
                     "config_provider_index": 0
                   }
                 ],
-                "allowed_choice_ids": [
-                  "choice-0-offering-0"
-                ],
+                "allowed_choice_ids": ["choice-0-offering-0"],
                 "unmatched_recommendations": [
                   {
                     "recommendation_id": "unmatched",
@@ -861,6 +854,47 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_enablement_trace",
+    "v": 21
+  },
+  "storage_report": {
+    "data": {
+      "total_bytes": 536870913,
+      "categories": [
+        { "category": "ledger", "total_bytes": 1, "reclaimable_bytes": 0 },
+        { "category": "result_blobs", "total_bytes": 536870912, "reclaimable_bytes": 0 }
+      ],
+      "orphaned_workspace_storage": [],
+      "archived_sessions": [],
+      "show_management_hint": true,
+      "storage_management_hint_version": 0
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "storage_report",
+    "v": 21
+  },
+  "storage_cleanup_preview": {
+    "data": {
+      "preview": {
+        "preview_id": "22222222-2222-4222-8222-222222222222",
+        "target": {
+          "kind": "archive_sessions_older_than",
+          "data": { "age_days": 30, "include_renamed_or_pinned": false }
+        },
+        "items": [],
+        "bytes_to_free": 0
+      }
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "storage_cleanup_preview",
+    "v": 21
+  },
+  "storage_cleanup_completed": {
+    "data": { "bytes_freed": 0 },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "storage_cleanup_completed",
     "v": 21
   },
   "guidance_proposal_reviewed": {

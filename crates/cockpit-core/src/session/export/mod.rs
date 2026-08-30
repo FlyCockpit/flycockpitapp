@@ -1413,11 +1413,14 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 fs_safe_scrubbed(&rec.provider, export_redactor),
                 fs_safe_scrubbed(&rec.model, export_redactor),
             );
+            let workspace_scratch_dir =
+                crate::session::workspace_scratch_path_for_session(&s.project_id, s.session_id)?;
             let tool_call_validation = tandem_validation::validate_tandem_tool_calls(
                 &rec.request,
                 rec.response.as_ref(),
-                Path::new(&target.project_root),
+                Path::new(&s.project_root),
                 None,
+                Some(&workspace_scratch_dir),
             );
             // The on-disk tandem file: identity + status + request + response +
             // usage (the response/usage distinguish a tandem record from a plain

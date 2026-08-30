@@ -66,6 +66,10 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         require_recall_authority(ctx)?;
     }
     let target = parse(path, ctx).await?;
+    // Hold the disclosure fence across target resolution, redaction, loading,
+    // and rendering so a completed consent revocation cannot race a response.
+    let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
+    require_target_access(ctx, target).await?;
     // Rehydrate and union the target's durable redaction knowledge before
     // loading any target-owned bytes for the recall response.
     let redactor = redactor_for_target(ctx, target).await?;
@@ -76,6 +80,7 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             None => return Ok(not_found(path, target)),
         },
     };
+    require_target_access(ctx, target).await?;
     // Scrub before selecting a page so a secret split across a page boundary
     // cannot leave a prefix or suffix in a later continuation.
     render_page(&redactor.scrub(&content), path, args)
@@ -187,6 +192,9 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     }
     require_recall_authority(ctx)?;
     let target = parse(path, ctx).await?;
+    // Retain this through output construction, including a not-found result.
+    let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
+    require_target_access(ctx, target).await?;
     if matches!(target, RecallPath::History) {
         return Err(invalid_input(
             "use `history_search` for cockpit history discovery; grep only searches one returned pseudofile",
@@ -234,6 +242,7 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             return Ok(Some(truncated_search_output(out)));
         }
     }
+    require_target_access(ctx, target).await?;
     Ok(Some(ToolOutput::text(if out.is_empty() {
         "No matches.".to_string()
     } else {
@@ -284,12 +293,35 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
         // data query, so revocation cannot race an authorization preflight.
         return Ok(id);
     }
-    ctx.session
+    let mut sessions = ctx
+        .session
         .db
-        .get_session_by_short_id(&ctx.session.project_id, id)
+        .accessible_sessions_by_short_id(&ctx.session.project_id, id)
         .await?
-        .map(|row| row.session_id)
-        .ok_or_else(|| invalid_input(format!("no session with short id `{id}`")))
+        .into_iter();
+    let Some(session_id) = sessions.next() else {
+        return Err(invalid_input(format!(
+            "no accessible session with short id `{id}`"
+        )));
+    };
+    if sessions.next().is_some() {
+        return Err(invalid_input(format!(
+            "short id `{id}` is ambiguous; use the session UUID"
+        )));
+    }
+    Ok(session_id)
+}
+
+async fn require_target_access(ctx: &ToolCtx, target: RecallPath) -> Result<()> {
+    match target {
+        RecallPath::History => Ok(()),
+        RecallPath::Transcript(session_id)
+        | RecallPath::Compaction(session_id, _)
+        | RecallPath::Plan(session_id)
+        | RecallPath::Artifact(session_id, _) => {
+            crate::tools::history_scope::require_session_access(ctx, session_id).await
+        }
+    }
 }
 
 async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<String>> {

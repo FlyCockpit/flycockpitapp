@@ -62,7 +62,13 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("list-packages"),
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
+    ToolTimeoutSafety::abandon_safe("knowledge_retrieve"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
+    // Knowledge dreams observe cancellation only while waiting for their
+    // write fence. Once the blocking transaction starts it must reach its
+    // commit/defer boundary, so it must not claim the dispatcher's stronger
+    // cleanup-before-return cancellation contract.
+    ToolTimeoutSafety::abandon_safe("knowledge_dream_apply"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),
     ToolTimeoutSafety::human_blocking("question"),
@@ -360,6 +366,11 @@ async fn dispatch_tool_with_policy_unscoped(
                 "workspace lease is unavailable at this tool boundary: {error:#}"
             ))
         })?;
+    // Whole-workspace index/walk tools cannot prove their eventual file set
+    // before traversing. Keep trust-required KB sources out of those model
+    // operations at the common production dispatcher boundary.
+    crate::knowledge::ensure_workspace_tool_access(&ctx, name)
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
     // command/MCP/harness/filesystem/package/computer candidate carries facts

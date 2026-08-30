@@ -104,6 +104,20 @@ pub async fn check_native_access(
     path: &Path,
     required: SandboxPathAccess,
 ) -> Result<PathBuf> {
+    // A review cage is a hard outer boundary. Apply it before every authority
+    // branch, including a workspace lease: a leased attached KB must not
+    // escape a package-scoped background review task.
+    let cage_path = effective_native_path(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(cage) = &ctx.review_cage
+        && cage.auto_deny_approvals()
+        && !cage.preauthorizes_package_path(&cage_path)
+    {
+        return Err(invalid_input(format!(
+            "`{}` is outside the session boundary and background review cannot approve it",
+            cage_path.display()
+        )));
+    }
+
     // A workspace lease is a hard filesystem boundary, not an additional
     // source of approval. In particular, a stale lease or a workspace path
     // outside its visibility root must never fall through to the ambient
@@ -205,19 +219,6 @@ pub async fn check_native_access(
             )));
         }
     };
-
-    // A review cage is a hard boundary, not an approval policy. Check it
-    // before the implicit KB read capability so an attached source cannot
-    // escape a package-scoped review task.
-    if let Some(cage) = &ctx.review_cage
-        && cage.auto_deny_approvals()
-        && !cage.preauthorizes_package_path(&effective)
-    {
-        return Err(invalid_input(format!(
-            "`{}` is outside the session boundary and background review cannot approve it",
-            effective.display()
-        )));
-    }
 
     // Configured local KBs are a hard filesystem boundary. This common
     // native-path choke point covers read, write, edit, LSP, skills, and every
@@ -1120,10 +1121,16 @@ mod tests {
                 extended,
             ),
         );
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            knowledge.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        )));
 
         let error = check_native_access(&ctx, &note, SandboxPathAccess::Read)
             .await
-            .expect_err("a review cage must remain a hard outer boundary");
+            .expect_err("a review cage must remain a hard outer boundary even with a lease");
         assert!(
             error
                 .to_string()

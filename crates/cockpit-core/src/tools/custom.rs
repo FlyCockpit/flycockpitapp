@@ -189,9 +189,13 @@ impl Tool for CustomBashTool {
 
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
-        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
-        let write_denied_knowledge_paths =
-            crate::knowledge::configured_local_knowledge_roots(&ctx.cwd, &ctx.config.extended());
+        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
+        let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+            &ctx.session,
+            &ctx.cwd,
+            &ctx.config.extended(),
+        )
+        .await;
         let sandbox_on = ctx.session.sandbox_enabled()
             || !denied_knowledge_paths.is_empty()
             || !write_denied_knowledge_paths.is_empty();

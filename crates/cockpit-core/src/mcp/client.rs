@@ -76,9 +76,12 @@ impl McpConnectContext {
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
             agent_id: ctx.agent_id.clone(),
             agent_bound: false,
-            host_access_denial: crate::knowledge::ensure_mcp_host_access(ctx)
-                .err()
-                .map(|error| error.to_string()),
+            // The complete KB registry includes the asynchronously resolved
+            // assistant source. The async dispatcher and MCP-tool boundaries
+            // add that source before any host process is reached; retain the
+            // configured-source subset here for callers that build a context
+            // ahead of the ordinary tool dispatch path.
+            host_access_denial: crate::knowledge::configured_mcp_host_access_denial(ctx),
         }
     }
 

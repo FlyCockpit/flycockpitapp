@@ -385,9 +385,13 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
-    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
-    let write_denied_knowledge_paths =
-        crate::knowledge::configured_local_knowledge_roots(&ctx.cwd, &ctx.config.extended());
+    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
+    let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+    )
+    .await;
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);

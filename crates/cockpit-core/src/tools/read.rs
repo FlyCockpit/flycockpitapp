@@ -228,6 +228,7 @@ pub(crate) async fn read_impl_outcome_with_path(
     let path = crate::tools::sandbox::effective_native_path(&path)
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     crate::knowledge::ensure_local_knowledge_path_access(ctx, &path)
+        .await
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     // Directory case: `read` needs a single file. Detect it with a portable
     // `is_dir()` check (never errno/ErrorKind — `os error 21` is Unix-only) so

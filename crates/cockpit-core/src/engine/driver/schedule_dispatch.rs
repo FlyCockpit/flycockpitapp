@@ -427,6 +427,7 @@ impl Driver {
         // boundary: protected roots force zerobox confinement even when the
         // ordinary session sandbox is disabled.
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots_for_model(
+            &self.session,
             &self.cwd,
             &self.config.extended(),
             agent
@@ -435,11 +436,16 @@ impl Driver {
                 .and_then(crate::agents::AgentDef::allowed_knowledge_bases),
             !agent.delegated && agent.model.is_trusted(),
         )
+        .await
         .map_err(|error| {
             format!("Error: cannot resolve local knowledge-base access policy: {error}")
         })?;
-        let write_denied_knowledge_paths =
-            crate::knowledge::configured_local_knowledge_roots(&self.cwd, &self.config.extended());
+        let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+            &self.session,
+            &self.cwd,
+            &self.config.extended(),
+        )
+        .await;
         let sandbox_on = self.session.sandbox_enabled()
             || !denied_knowledge_paths.is_empty()
             || !write_denied_knowledge_paths.is_empty();

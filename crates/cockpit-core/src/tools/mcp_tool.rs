@@ -113,7 +113,8 @@ impl Tool for McpTool {
         // configured third-party server, including one with filesystem or
         // command access. This also protects direct Tool callers from
         // bypassing the common dispatcher.
-        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())?;
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name()).await?;
+        crate::knowledge::ensure_mcp_host_access(ctx).await?;
 
         let script = args
             .get("script")

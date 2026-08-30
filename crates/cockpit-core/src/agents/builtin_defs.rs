@@ -169,7 +169,15 @@ fn def_with_normal(
     // embedded default and the same agent re-parsed from its ejected file
     // compare byte-equal (eject faithfulness).
     let body = prompt.trim_end().to_string();
-    let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
+    let vnext = if name == "docs-answerer" {
+        // The docs pipeline is an internal two-stage implementation, not a
+        // user-authored AgentDef language. The answerer must nevertheless
+        // carry its explicit no-KB grant in the definition snapshot so prompt
+        // injection, toolbox construction, and every ToolCtx agree.
+        let mut definition = builtin_vnext(name, mode);
+        definition.allowed_knowledge_bases = Some(std::collections::BTreeSet::new());
+        Some(definition)
+    } else if name == "docs-resolver" {
         // The docs pipeline is an internal two-stage implementation, not a
         // user-authored AgentDef language. Keep its fixed surfaces outside
         // vNext discovery and serialization.
@@ -767,6 +775,16 @@ fn docs_answerer_def() -> AgentDef {
 mod tests {
     use super::*;
     use crate::agents::{AgentCapability, PostureResolution};
+
+    #[test]
+    fn docs_answerer_definition_attaches_no_knowledge_bases() {
+        let def = embedded_internal_default("docs-answerer").expect("docs answerer definition");
+        assert!(
+            def.allowed_knowledge_bases()
+                .is_some_and(|bases| bases.is_empty()),
+            "docs answerer must carry an explicit empty KB allowlist"
+        );
+    }
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {

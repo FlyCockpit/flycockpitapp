@@ -1328,16 +1328,10 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
     }
 }
 
-const WORKSPACE_BIRTH_TOKEN_MAX_BYTES: usize = 64;
-
-/// Derive a workspace key from both the live root directory object and a
-/// birth token held in that directory object's metadata. Object IDs alone are
-/// not a lifetime identity: Unix inodes and Windows file IDs can be recycled
-/// after deletion. Object metadata is deliberately not a repository entry, so
-/// ordinary cleanup or edits of untracked files cannot detach a live workspace
-/// from its sessions or history-scope consent. A replacement directory creates
-/// a fresh token and cannot inherit the predecessor's sessions or consent even
-/// if its platform object ID is recycled.
+/// Derive a workspace key from the held root directory object, not a path or
+/// workspace metadata. This is a read-only observation: resolving a workspace
+/// must work on read-only and metadata-limited filesystems, and no user-owned
+/// workspace state can change the key while that directory object is live.
 pub fn project_id_for(root: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
@@ -1346,31 +1340,14 @@ pub fn project_id_for(root: &Path) -> Result<String> {
             &canonical,
         )
         .with_context(|| format!("proving workspace root identity {}", canonical.display()))?;
-    let birth_token = authority
-        .workspace_birth_token()
-        .context("reading workspace birth token from directory metadata")?;
-    validate_workspace_birth_token(&birth_token)?;
-    Ok(project_id_from_workspace_evidence(
-        authority.identity(),
-        &birth_token,
-    ))
+    Ok(project_id_from_workspace_object(authority.identity()))
 }
 
-fn validate_workspace_birth_token(token: &[u8]) -> Result<()> {
-    anyhow::ensure!(
-        !token.is_empty() && token.len() <= WORKSPACE_BIRTH_TOKEN_MAX_BYTES,
-        "workspace birth token has an invalid length"
-    );
-    Ok(())
-}
-
-fn project_id_from_workspace_evidence(object_identity: &str, birth_token: &[u8]) -> String {
+fn project_id_from_workspace_object(object_identity: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"cockpit-workspace-identity-v2\0");
+    h.update(b"cockpit-workspace-object-identity-v1\0");
     h.update(object_identity.as_bytes());
-    h.update(b"\0");
-    h.update(birth_token);
     let out = h.finalize();
     let mut hex = String::with_capacity(64);
     for byte in out {
@@ -3201,62 +3178,18 @@ mod tests {
     }
 
     #[test]
-    fn untracked_file_cleanup_cannot_change_a_live_workspace_project_id() {
+    fn workspace_contents_cannot_change_a_live_workspace_project_id() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let original = project_id_for(&workspace).unwrap();
 
-        // The historical file name is intentionally ordinary untracked
-        // repository content now. Its modification and cleanup must not
-        // affect the directory-object metadata that owns workspace identity.
-        let untracked = workspace.join(".cockpit-workspace-birth-token");
+        // Workspace contents are not identity input. Their modification and
+        // cleanup must not detach a live workspace from its consent state.
+        let untracked = workspace.join("repository-artifact");
         std::fs::write(&untracked, "edited by repository tooling").unwrap();
         assert_eq!(project_id_for(&workspace).unwrap(), original);
         std::fs::remove_file(untracked).unwrap();
         assert_eq!(project_id_for(&workspace).unwrap(), original);
-    }
-
-    #[test]
-    fn concurrent_workspace_identity_initialization_observes_one_complete_token() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let workers = (0..8)
-            .map(|_| {
-                let start = std::sync::Arc::clone(&start);
-                let workspace = workspace.clone();
-                std::thread::spawn(move || {
-                    start.wait();
-                    project_id_for(&workspace)
-                })
-            })
-            .collect::<Vec<_>>();
-        let ids = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap().unwrap())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert_eq!(ids.len(), 1, "all callers must observe the same project ID");
-    }
-
-    #[test]
-    fn recycled_filesystem_object_identity_cannot_reuse_a_project_id() {
-        // This models the platform case the filesystem cannot conveniently
-        // force in a deterministic test: a replacement directory receives
-        // the exact same device/inode or volume/file ID as its predecessor.
-        // The independent birth token still partitions their history.
-        let recycled_object_identity = "recycled-platform-object";
-        let original = project_id_from_workspace_evidence(
-            recycled_object_identity,
-            b"00112233-4455-4677-8899-aabbccddeeff",
-        );
-        let replacement = project_id_from_workspace_evidence(
-            recycled_object_identity,
-            b"ffeeddcc-bbaa-4766-8899-001122334455",
-        );
-
-        assert_ne!(original, replacement);
     }
 }

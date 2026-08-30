@@ -24,7 +24,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -36,6 +36,7 @@ use crate::db::Db;
 use crate::db::sessions::SessionRow;
 use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
+use crate::knowledge::KnowledgeBasePromptSnapshot;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
 pub mod export;
@@ -384,6 +385,15 @@ pub struct Session {
     redaction_table_json: Mutex<Option<String>>,
     secret_path_matcher: OnceLock<crate::secret_paths::SecretPathMatcher>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
+    /// KB identity/freshness facts bound to the active root definition and
+    /// rendered into its cached system prefix. Frozen across turns and never
+    /// rewritten after a dream completes; root replacement is the sole
+    /// rebinding boundary.
+    knowledge_base_prompt_snapshot: RwLock<Arc<KnowledgeBasePromptSnapshot>>,
+    /// Kept separately from the snapshot value because an empty attachment
+    /// set is a valid completed capture. A false value means worker startup
+    /// was interrupted before the first root-definition-bound capture.
+    knowledge_base_prompt_snapshot_captured: AtomicBool,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -1236,6 +1246,91 @@ impl Session {
         self.model_system_prompt_snapshot.clone()
     }
 
+    /// Stable KB block for the cached root system prompt. Its source is a
+    /// root-definition-bound snapshot, never a live registry or dream-status
+    /// read.
+    pub fn knowledge_base_system_prompt(&self) -> String {
+        self.knowledge_base_prompt_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render_system_block()
+    }
+
+    /// Whether worker startup still has to bind the initial root's KB prompt
+    /// snapshot. This is intentionally independent of `freshly_created`: a
+    /// durable row can survive an interrupted first startup before capture.
+    pub(crate) fn needs_knowledge_base_prompt_snapshot_capture(&self) -> bool {
+        !self
+            .knowledge_base_prompt_snapshot_captured
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_knowledge_base_prompt_snapshot_for_test(&mut self, raw: &str) {
+        *self
+            .knowledge_base_prompt_snapshot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Arc::new(KnowledgeBasePromptSnapshot::from_json_str(raw));
+        self.knowledge_base_prompt_snapshot_captured
+            .store(true, Ordering::Release);
+    }
+
+    /// Return one-line, per-turn freshness facts for dreams that completed
+    /// after this session began. This does not update the cached system prompt.
+    /// A failed freshness read fails the turn before model dispatch rather than
+    /// sending a turn with a potentially stale prefix and no notice.
+    ///
+    /// This deliberately does not acknowledge a notice. The caller appends a
+    /// returned message to the live turn history immediately before dispatch;
+    /// that history is the delivery record. If a turn is cancelled, times out,
+    /// or is retried before dispatch, asking again returns the same notice, so
+    /// an acknowledgement can never outlive the history that delivers it.
+    pub async fn knowledge_base_freshness_notices(&self) -> Result<Vec<String>> {
+        let snapshot = self
+            .knowledge_base_prompt_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if snapshot.entries().is_empty() {
+            return Ok(Vec::new());
+        }
+        let consumer = self
+            .db
+            .ensure_installation_identity()
+            .await
+            .context("loading installation identity for knowledge freshness")?;
+        let project_root = self.project_root.to_string_lossy().into_owned();
+        let mut fresh = Vec::new();
+        for entry in snapshot.entries() {
+            let current = self
+                .db
+                .knowledge_dream_completion(&entry.id, &project_root, consumer.as_hex())
+                .await
+                .with_context(|| format!("loading knowledge freshness for `{}`", entry.id))?;
+            let Some(current) = current else {
+                continue;
+            };
+            if current.revision > entry.dream_completion_revision {
+                fresh.push((
+                    entry.id.clone(),
+                    entry.name.clone(),
+                    current.revision,
+                    current.completed_at_unix_ms,
+                ));
+            }
+        }
+        Ok(fresh
+            .into_iter()
+            .map(|(_id, name, revision, timestamp)| {
+                format!(
+                    "KB {name} finished a new dream at {} (completion revision {revision}); newer knowledge is now available.",
+                    crate::knowledge::format_dream_timestamp(timestamp)
+                )
+            })
+            .collect())
+    }
+
     /// Record that the model successfully used the dedicated tool `tool` this
     /// session, for the defensive bash-routing nudge's self-suppression
     /// (implementation note). Only the
@@ -1978,6 +2073,74 @@ mod tests {
         assert!(scope.read().unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn dream_completion_injects_freshness_without_rewriting_kb_prefix() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        *session
+            .knowledge_base_prompt_snapshot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(
+            KnowledgeBasePromptSnapshot::from_json_str(
+                r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":null}]}"#,
+            ),
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let root = root.path().to_string_lossy().into_owned();
+        db.attach_session_to_knowledge_base("team", &root, session.id)
+            .await
+            .unwrap();
+        db.record_knowledge_dream_completion("team", &root, consumer.as_hex(), &[session.id])
+            .await
+            .unwrap();
+
+        let notices = session.knowledge_base_freshness_notices().await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("KB Team Notes finished a new dream at"));
+        assert!(notices[0].contains("newer knowledge is now available"));
+        assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
+        assert_eq!(
+            session.knowledge_base_freshness_notices().await.unwrap(),
+            notices,
+            "detecting freshness must not acknowledge it before the caller records it in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_base_freshness_read_failure_is_returned() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::create_for_test(
+            db,
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"","name":"Broken","description":"bad fixture","last_dreamed_at_unix_ms":null}]}"#,
+        );
+
+        let error = session
+            .knowledge_base_freshness_notices()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("loading knowledge freshness for ``"),
+            "{error:#}"
+        );
+    }
+
     fn providers_config(
         entries: impl IntoIterator<Item = (&'static str, ProviderEntry)>,
     ) -> ProvidersConfig {
@@ -2262,6 +2425,101 @@ mod tests {
         assert!(s2.title().is_none());
         assert!(!s2.user_renamed());
         assert!(!s2.is_freshly_created());
+    }
+
+    #[test]
+    fn resume_restores_persisted_knowledge_base_prompt_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+        let snapshot = r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#;
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET knowledge_base_prompt_snapshot_json = ?1,
+                     knowledge_base_prompt_snapshot_captured = 1
+                 WHERE session_id = ?2",
+                rusqlite::params![snapshot, session_id.to_string()],
+            )
+            .context("persisting test knowledge-base prompt snapshot")?;
+            Ok(())
+        })
+        .unwrap();
+        drop(session);
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            resumed.knowledge_base_system_prompt(),
+            "Knowledge bases (root-definition snapshot):\n- Team Notes (id: team): Shared decisions\n  Last dreamed at: 1970-01-01T00:00:01+00:00\nNewer information may live in sessions after these timestamps; search it through the retrieval subagent.\n"
+        );
+        assert!(
+            !resumed.needs_knowledge_base_prompt_snapshot_capture(),
+            "a persisted snapshot must not be recaptured on resume"
+        );
+    }
+
+    #[test]
+    fn resume_distinguishes_uncommitted_kb_capture_from_captured_empty_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let session_id = session.id;
+        drop(session);
+
+        let interrupted = Session::resume_for_test(
+            db.clone(),
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            interrupted.needs_knowledge_base_prompt_snapshot_capture(),
+            "a durable row before initial capture must retry root binding"
+        );
+        drop(interrupted);
+
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET knowledge_base_prompt_snapshot_json = '{\"entries\":[]}',
+                     knowledge_base_prompt_snapshot_captured = 1
+                 WHERE session_id = ?1",
+                rusqlite::params![session_id.to_string()],
+            )
+            .context("persisting captured empty knowledge-base snapshot")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let resumed = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !resumed.needs_knowledge_base_prompt_snapshot_capture(),
+            "a captured empty snapshot is a completed stable-prefix binding"
+        );
     }
 
     #[tokio::test]

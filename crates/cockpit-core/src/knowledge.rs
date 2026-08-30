@@ -29,11 +29,127 @@ use crate::config::extended::{
     ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
     KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
 };
+use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
 use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
+
+/// Immutable knowledge-base facts captured when a root definition is bound.
+/// This renders into that root's cached system prefix; live dream completion
+/// deliberately never rewrites it, and instead becomes a one-turn history
+/// injection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct KnowledgeBasePromptSnapshot {
+    entries: Vec<KnowledgeBasePromptSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KnowledgeBasePromptSnapshotEntry {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) last_dreamed_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) dream_completion_revision: i64,
+}
+
+impl KnowledgeBasePromptSnapshot {
+    pub(crate) fn capture(
+        config: &ExtendedConfig,
+        conn: &rusqlite::Connection,
+        project_root: &str,
+        assistant_name: Option<&str>,
+        allowed_knowledge_bases: Option<&BTreeSet<String>>,
+        trust_mode: WorkspaceTrustMode,
+    ) -> Result<Self> {
+        let consumer = crate::db::installation_identity::ensure_installation_identity_conn(conn)?;
+        let attached = prompt_snapshot_entries_from_registry(
+            assistant_knowledge_registry_entry_for_session_start(conn, assistant_name)?,
+            config,
+            Path::new(project_root),
+            allowed_knowledge_bases,
+            trust_mode,
+        )?;
+        let entries = attached
+            .into_iter()
+            .map(|entry| {
+                let completion = crate::db::knowledge_dreams::knowledge_dream_completion_conn(
+                    conn,
+                    &entry.id,
+                    project_root,
+                    consumer.as_hex(),
+                )?;
+                Ok(KnowledgeBasePromptSnapshotEntry {
+                    id: entry.id.clone(),
+                    name: entry.name,
+                    description: entry.description,
+                    last_dreamed_at_unix_ms: completion
+                        .map(|completion| completion.completed_at_unix_ms),
+                    dream_completion_revision: completion
+                        .map_or(0, |completion| completion.revision),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn from_json_str(raw: &str) -> Self {
+        if raw.trim().is_empty() {
+            return Self::default();
+        }
+        match serde_json::from_str(raw) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "failed to decode knowledge-base prompt snapshot");
+                Self::default()
+            }
+        }
+    }
+
+    pub(crate) fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub(crate) fn render_system_block(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::from("Knowledge bases (root-definition snapshot):\n");
+        for entry in &self.entries {
+            out.push_str("- ");
+            out.push_str(&entry.name);
+            out.push_str(" (id: ");
+            out.push_str(&entry.id);
+            out.push_str("): ");
+            out.push_str(&entry.description);
+            out.push('\n');
+            out.push_str("  Last dreamed at: ");
+            match entry.last_dreamed_at_unix_ms {
+                Some(timestamp) => out.push_str(&format_dream_timestamp(timestamp)),
+                None => out.push_str("never"),
+            }
+            out.push('\n');
+        }
+        out.push_str(
+            "Newer information may live in sessions after these timestamps; search it through the retrieval subagent.\n",
+        );
+        out
+    }
+
+    pub(crate) fn entries(&self) -> &[KnowledgeBasePromptSnapshotEntry] {
+        &self.entries
+    }
+}
+
+pub(crate) fn format_dream_timestamp(timestamp_unix_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_unix_ms)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| format!("invalid unix-ms timestamp {timestamp_unix_ms}"))
+}
 
 pub(crate) mod dream;
 pub use dream::build_dream_prompt;
@@ -3448,12 +3564,13 @@ pub(crate) async fn attached_bundles(
     extended: &ExtendedConfig,
     executing_model_trusted: bool,
 ) -> Result<AttachedKnowledgeBases> {
+    let assistant = assistant_knowledge_registry_entry(session).await?;
     let mut seen = BTreeSet::new();
     let mut seen_attachment_ids = BTreeSet::new();
     let mut knowledge_bases = Vec::new();
     let mut denied_knowledge_base_ids = Vec::new();
     let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
-    if let Some(assistant) = assistant_knowledge_registry_entry(session).await? {
+    if let Some(assistant) = assistant {
         registry.push(assistant);
     }
     registry.extend(
@@ -3568,6 +3685,114 @@ pub(crate) async fn attached_bundles(
         bundles: knowledge_bases,
         denied_knowledge_base_ids,
     })
+}
+
+/// Resolve the entries that can appear in a root's frozen KB prompt. This
+/// deliberately applies the same registry, attachment-identity, allow-list,
+/// trust, and local-source availability rules as live attachment resolution.
+/// It stops before creating sealed identities or providers because snapshot
+/// capture runs with the session-row transaction rather than a live session
+/// vault.
+fn prompt_snapshot_entries_from_registry(
+    assistant: Option<RegistryKnowledgeBase>,
+    extended: &ExtendedConfig,
+    cwd: &Path,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    trust_mode: WorkspaceTrustMode,
+) -> Result<Vec<KnowledgeBaseRegistryEntry>> {
+    let mut seen = BTreeSet::new();
+    let mut seen_attachment_ids = BTreeSet::new();
+    let mut entries = Vec::new();
+    let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
+    if let Some(assistant) = assistant {
+        registry.push(assistant);
+    }
+    registry.extend(
+        extended
+            .knowledge_bases
+            .iter()
+            .cloned()
+            .map(workspace_knowledge_base),
+    );
+
+    for RegistryKnowledgeBase { mut entry, local } in registry {
+        if !seen.insert(entry.id.clone()) {
+            bail!(
+                "knowledge base registry contains duplicate ID `{}`",
+                entry.id
+            );
+        }
+        if let Some(local) = local {
+            let root = if local.root.is_absolute() {
+                local.root
+            } else {
+                cwd.join(local.root)
+            };
+            if !entry.has_bound_attachment_identity() {
+                let Some((root, attachment_id)) = local_source_attachment_identity(&root)? else {
+                    continue;
+                };
+                entry = entry.with_bound_attachment_identity(attachment_id);
+                entry.source = KnowledgeBaseSource::Local { path: root };
+            } else {
+                entry.source = KnowledgeBaseSource::Local { path: root };
+            }
+            let KnowledgeBaseSource::Local { path } = &entry.source else {
+                unreachable!("local registry entry must retain its local source");
+            };
+            if !local_knowledge_base_available_for_prompt(path)? {
+                continue;
+            }
+        }
+        validate_registry_entry(&entry)?;
+        if !seen_attachment_ids.insert(entry.attachment_id()) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                entry.attachment_id()
+            );
+        }
+        if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
+            continue;
+        }
+        if entry.trust_required && trust_mode != WorkspaceTrustMode::Trust {
+            continue;
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Probe a local source with the same bounded, retained-descriptor snapshot
+/// used by live attachment resolution. Prompt capture only needs to know
+/// whether the KB can supply content; sealed identity assignment remains a
+/// live-session concern.
+fn local_knowledge_base_available_for_prompt(root: &Path) -> Result<bool> {
+    let source = match cockpit_config::config::open_config_directory_nofollow(root) {
+        Ok(source) => source,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening knowledge base source {}", root.display()));
+        }
+    };
+    let documents =
+        cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+            &source,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )
+        .with_context(|| format!("snapshotting knowledge base source {}", root.display()))?;
+    parse_bundle_snapshot(root.to_path_buf(), documents, &source)?;
+    Ok(true)
 }
 
 /// Resolve a model-visible registry label to the immutable attachment identity
@@ -4273,10 +4498,33 @@ async fn assistant_knowledge_registry_entry(
     else {
         return Ok(None);
     };
-    let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
-    let config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&snapshot.row.config_json)
-            .context("parsing assistant identity for knowledge cache")?;
+    assistant_knowledge_registry_entry_from_row(&snapshot.row).map(Some)
+}
+
+/// Session creation already owns the database connection that will store the
+/// frozen snapshot, so it cannot re-enter the async assistant snapshot
+/// coordinator. It still resolves the assistant registry entry through the
+/// same validated row-to-entry conversion used by live retrieval.
+fn assistant_knowledge_registry_entry_for_session_start(
+    conn: &rusqlite::Connection,
+    name: Option<&str>,
+) -> Result<Option<RegistryKnowledgeBase>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    crate::assistants::validate_assistant_name(name)?;
+    let row = crate::db::Db::get_assistant_conn(conn, name)?.with_context(|| {
+        format!("assistant `{name}` disappeared while capturing knowledge snapshot")
+    })?;
+    assistant_knowledge_registry_entry_from_row(&row).map(Some)
+}
+
+fn assistant_knowledge_registry_entry_from_row(
+    row: &cockpit_db::assistants::AssistantRow,
+) -> Result<RegistryKnowledgeBase> {
+    let root = crate::assistants::validate_row_home(row)?.join("knowledge");
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .context("parsing assistant identity for knowledge cache")?;
     if config.installation_id.is_nil() {
         bail!("assistant knowledge has no installation identity");
     }
@@ -4284,8 +4532,8 @@ async fn assistant_knowledge_registry_entry(
     cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
     let entry = KnowledgeBaseRegistryEntry::new(
         format!("assistant-{}", config.installation_id),
-        format!("Assistant: {name}"),
-        format!("Knowledge installed with assistant `{name}`."),
+        format!("Assistant: {}", row.name),
+        format!("Knowledge installed with assistant `{}`.", row.name),
         KnowledgeBaseSource::Local { path: root.clone() },
         KnowledgeBaseEmbeddingOwnership::Local,
         None,
@@ -4294,20 +4542,20 @@ async fn assistant_knowledge_registry_entry(
         KnowledgeBaseMergePolicy::Auto,
     )
     .with_bound_attachment_identity(config.installation_id);
-    Ok(Some(RegistryKnowledgeBase {
+    Ok(RegistryKnowledgeBase {
         entry,
         local: Some(RegistryLocalKb {
             root,
             assistant_snapshot_root: Some(PathBuf::from(format!(
                 "assistant://{}/knowledge",
-                snapshot.row.name
+                row.name
             ))),
             snapshot: None,
             sidecars: Some(KbSidecars::in_root(
                 &cache_root.join(config.installation_id.to_string()),
             )),
         }),
-    }))
+    })
 }
 
 fn validate_registry_entry(entry: &KnowledgeBaseRegistryEntry) -> Result<()> {
@@ -5590,6 +5838,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn knowledge_prompt_snapshot_renders_stable_identity_and_frozen_freshness() {
+        let snapshot = KnowledgeBasePromptSnapshot::from_json_str(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Decisions and conventions","last_dreamed_at_unix_ms":0}]}"#,
+        );
+
+        let first = snapshot.render_system_block();
+        let second = snapshot.render_system_block();
+        assert_eq!(first, second, "cached KB prefix must be byte-stable");
+        assert!(first.contains("Team Notes (id: team): Decisions and conventions"));
+        assert!(first.contains("Last dreamed at: 1970-01-01T00:00:00+00:00"));
+        assert!(first.contains("Newer information may live in sessions"));
+        assert!(!first.contains("undreamed"));
+    }
 
     struct MockEmbedder;
     struct DimEmbedder(usize);
@@ -6960,6 +7223,47 @@ timestamp: 2026-08-29T12:00:00Z
         .unwrap();
         assert_eq!(attached.bundles.len(), 1);
         assert_eq!(attached.bundles[0].entry.id, "project");
+    }
+
+    #[test]
+    fn prompt_snapshot_uses_its_carried_trust_authority_for_attachments() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(&tmp.path().join("available"));
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let mut available = project_knowledge_registry_entry();
+        available.id = "available".to_string();
+        available.name = "Available".to_string();
+        available.trust_required = false;
+        available.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("available"),
+        };
+        let mut restricted = available.clone();
+        restricted.id = "restricted".to_string();
+        restricted.name = "Restricted".to_string();
+        restricted.trust_required = true;
+        let config = ExtendedConfig {
+            knowledge_bases: vec![available, restricted],
+            ..Default::default()
+        };
+        let allowed = BTreeSet::from(["available".to_string(), "restricted".to_string()]);
+        let root = tmp.path().to_string_lossy().into_owned();
+
+        let snapshot = db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                KnowledgeBasePromptSnapshot::capture(
+                    &config,
+                    conn,
+                    &root,
+                    None,
+                    Some(&allowed),
+                    WorkspaceTrustMode::Trust,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.entries().len(), 2);
+        assert_eq!(snapshot.entries()[0].id, "available");
+        assert_eq!(snapshot.entries()[1].id, "restricted");
     }
 
     #[tokio::test]

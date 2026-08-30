@@ -803,6 +803,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         // worker in an assistant session keeps the SOUL/USER identity.
         assistant_identity_prefix: ctx.agent.assistant_identity_prefix.clone(),
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
+        knowledge_base_system_prefix: ctx.session.knowledge_base_system_prompt(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
         mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().admitted_entries()),

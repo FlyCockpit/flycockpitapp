@@ -14,7 +14,9 @@ mod tests {
         AgentInstallationScope, ProviderAlias, RedactedAgentProfileSnapshot,
         RedactedBindingEvidence, RedactedQuestionPolicy,
     };
-    use crate::db::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
+    use crate::db::db::agent_tree_decisions::{
+        AgentInstanceState, AgentTransitionOutcome, NewAgentInstance,
+    };
     use crate::db::wire::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use sha2::{Digest, Sha256};
 
@@ -3958,10 +3960,10 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::db::agent_installations::RedactedQuestionPolicy;
 use crate::db::agent_tree_decisions::{
-    AgentInstanceRow, AgentInstanceState, AgentTransitionOutcome, AgentTreePage,
-    AgentTreePageCursor, DecisionAttentionRow, DecisionRequestRow, DecisionState,
-    DecisionTransitionOutcome, HostCapabilityRefreshAuthority as DbHostCapabilityRefreshAuthority,
-    NewDecisionRequest, StoredQuestionOverride,
+    AgentInstanceRow, AgentInstanceState, AgentTreePage, AgentTreePageCursor, DecisionAttentionRow,
+    DecisionRequestRow, DecisionState, DecisionTransitionOutcome,
+    HostCapabilityRefreshAuthority as DbHostCapabilityRefreshAuthority, NewDecisionRequest,
+    StoredQuestionOverride,
 };
 use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, ResolveResponse};
 

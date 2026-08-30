@@ -361,6 +361,7 @@ fn scratch_session(
         db,
         cwd.to_path_buf(),
         "background_review",
+        &crate::config::extended::ExtendedConfig::default(),
         resolver,
         vault,
     )?))

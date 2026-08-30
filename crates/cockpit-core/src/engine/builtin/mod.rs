@@ -128,6 +128,9 @@ pub struct SpawnArgs {
     pub assistant_identity_prefix: Option<String>,
     /// Frozen model-specific prompt snapshot for this session/invocation.
     pub model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
+    /// Frozen KB identity/freshness block for this session. It is appended to
+    /// the cached system prompt and never replaced by live dream status.
+    pub knowledge_base_system_prefix: String,
     /// Whether this agent is being spawned into a user-facing
     /// interactive session (the daemon root, or an interactive handoff
     /// such as `builder`) versus a one-shot leaf delegation
@@ -1134,7 +1137,20 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         || args.compiled_guidance.clone(),
         |compiler| compiler.compile(&args.cwd, model.provider_id(), model.model_id_ref()),
     );
-    let role_prompt = assistant_role_prompt(role_prompt, args.assistant_identity_prefix.as_deref());
+    // The session snapshot is bound to the interactive root's exact
+    // definition. A delegated child can have a narrower (or disjoint) KB
+    // allowlist, so it must not inherit root-only metadata into its cached
+    // prefix. Its live tools remain governed by its own definition.
+    let knowledge_base_system_prefix = if args.delegated {
+        ""
+    } else {
+        &args.knowledge_base_system_prefix
+    };
+    let role_prompt = stable_session_role_prompt(
+        role_prompt,
+        args.assistant_identity_prefix.as_deref(),
+        knowledge_base_system_prefix,
+    );
     let model_prompt = args
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
@@ -1170,6 +1186,26 @@ fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
     }
     out.push('\n');
     out.push_str(role_prompt);
+    out
+}
+
+fn stable_session_role_prompt(
+    role_prompt: &str,
+    assistant_identity_prefix: Option<&str>,
+    knowledge_base_system_prefix: &str,
+) -> String {
+    let role_prompt = assistant_role_prompt(role_prompt, assistant_identity_prefix);
+    let knowledge_base_system_prefix = knowledge_base_system_prefix.trim();
+    if knowledge_base_system_prefix.is_empty() {
+        return role_prompt;
+    }
+    let mut out = String::with_capacity(knowledge_base_system_prefix.len() + role_prompt.len() + 2);
+    out.push_str(knowledge_base_system_prefix);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&role_prompt);
     out
 }
 
@@ -2101,6 +2137,7 @@ pub(crate) async fn reposture_agent_for_candidate(
         &role,
         candidate_model,
         agent.assistant_identity_prefix.as_deref(),
+        agent.delegated,
         session,
         cwd,
     );
@@ -2120,11 +2157,21 @@ fn compose_reposture_system(
     role: &str,
     model: &Model,
     assistant_identity_prefix: Option<&str>,
+    delegated: bool,
     session: &crate::session::Session,
     cwd: &Path,
 ) -> String {
     let snapshot = session.model_system_prompt_snapshot();
-    let role = assistant_role_prompt(role, assistant_identity_prefix);
+    let knowledge_base_system_prefix = if delegated {
+        String::new()
+    } else {
+        session.knowledge_base_system_prompt()
+    };
+    let role = stable_session_role_prompt(
+        role,
+        assistant_identity_prefix,
+        &knowledge_base_system_prefix,
+    );
     let short_id = session.short_id();
     let role_system = compose_system_prompt(&role, &short_id, cwd);
     match snapshot.get(model.provider_id(), model.model_id_ref()) {
@@ -4153,6 +4200,7 @@ pub(crate) mod tests {
             workspace_scratch_dir: cwd.join("workspace-scratch"),
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
+            knowledge_base_system_prefix: String::new(),
             interactive: true,
             mcp_parent_reachable: None,
             mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd)
@@ -7578,6 +7626,40 @@ pub(crate) mod tests {
         let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
         let with_snapshot = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
         assert_eq!(with_snapshot, existing);
+    }
+
+    #[test]
+    fn compose_system_prompt_keeps_kb_snapshot_in_cached_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.knowledge_base_system_prefix =
+            "Knowledge bases (root-definition snapshot):\n- Team Notes\n".to_string();
+
+        let first = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        let second = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+
+        assert_eq!(
+            first, second,
+            "KB prefix must be byte-identical across turns"
+        );
+        assert!(first.contains("Knowledge bases (root-definition snapshot):"));
+        assert!(first.contains("- Team Notes"));
+    }
+
+    #[test]
+    fn delegated_agent_omits_root_knowledge_base_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.delegated = true;
+        args.knowledge_base_system_prefix =
+            "Knowledge bases (root-definition snapshot):\n- Root-only Notes\n".to_string();
+
+        let prompt = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+
+        assert!(
+            !prompt.contains("Root-only Notes"),
+            "a delegated definition must not receive root-scoped KB metadata"
+        );
     }
 
     /// Config with a name set, used by the deterministic name-present case.

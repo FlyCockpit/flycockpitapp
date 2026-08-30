@@ -2237,7 +2237,7 @@ pub(crate) async fn run_turn(
         model.is_trusted(),
         tx,
     )
-    .await;
+    .await?;
 
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
@@ -3616,11 +3616,24 @@ async fn inject_turn_start_system_messages(
     is_root: bool,
     context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
-) {
+) -> Result<()> {
     let active_tool_names = active_tools.names();
     let sandbox_escalate_present = active_tool_names.contains(&"escalate");
     if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
         history.push(Message::System { content: notice });
+    }
+    // Dream completion is volatile session state. Deliver it only as a
+    // root-turn history message; the stable KB snapshot in the cached system
+    // prefix is intentionally never rewritten.
+    if is_root {
+        for notice in session.knowledge_base_freshness_notices().await? {
+            if !history
+                .iter()
+                .any(|message| matches!(message, Message::System { content } if content == &notice))
+            {
+                history.push(Message::System { content: notice });
+            }
+        }
     }
     if let Some(nudge) =
         session.unnamed_session_title_nudge(active_tool_names.contains(&"mcp"), is_root)
@@ -3666,6 +3679,7 @@ async fn inject_turn_start_system_messages(
     {
         history.push(Message::System { content: nudge });
     }
+    Ok(())
 }
 
 /// Inject every host-owned, per-turn prompt addition immediately before the
@@ -3686,8 +3700,9 @@ async fn inject_volatile_context(
     redact: Arc<RedactionTable>,
     executing_model_trusted: bool,
     tx: &mpsc::Sender<TurnEvent>,
-) {
-    inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history).await;
+) -> Result<()> {
+    inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history)
+        .await?;
     let active_tool_names = active_tools.names();
     super::inject_available_skills_catalog(history, cwd, config, &active_tool_names);
 
@@ -3712,6 +3727,7 @@ async fn inject_volatile_context(
     if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
         inject_live_project_guidance_change(history, cwd, config, redact, tx, &message).await;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3779,6 +3795,140 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn next_root_turn_injects_later_dream_without_changing_cached_kb_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let project_root = root.path().to_string_lossy().into_owned();
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+
+        // Exercise the non-empty production completion writer: the source must
+        // remain attached until the consumed snapshot is committed.
+        db.attach_session_to_knowledge_base("team", &project_root, session.id)
+            .await
+            .unwrap();
+        db.record_knowledge_dream_completion(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            &[session.id],
+        )
+        .await
+        .unwrap();
+        let mut history = Vec::new();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await
+        .unwrap();
+
+        assert!(history.iter().any(|message| {
+            matches!(message, Message::System { content }
+                if content.contains("KB Team Notes finished a new dream at")
+                    && content.contains("newer knowledge is now available"))
+        }));
+        assert_eq!(
+            session.knowledge_base_system_prompt(),
+            prefix_before,
+            "turn-start freshness delivery must leave the cached KB prefix byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_freshness_uses_revision_when_completion_clock_does_not_advance() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let consumer = db.ensure_installation_identity().await.unwrap();
+        let project_root = root.path().to_string_lossy().into_owned();
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let prefix_before = session.knowledge_base_system_prompt();
+        let mut history = Vec::new();
+
+        db.record_knowledge_dream_manual_empty_check(
+            "team",
+            &project_root,
+            consumer.as_hex(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await
+        .unwrap();
+        assert!(history.iter().any(|message| {
+            matches!(message, Message::System { content }
+                if content.contains("completion revision 2"))
+        }));
+
+        db.record_knowledge_dream_manual_empty_check("team", &project_root, consumer.as_hex(), 999)
+            .await
+            .unwrap();
+        inject_turn_start_system_messages(
+            &session,
+            &ToolBox::new(),
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| matches!(message, Message::System { content } if content.contains("KB Team Notes finished a new dream at")))
+                .count(),
+            2,
+            "a backwards clock must not collapse a later completion into an earlier notice"
+        );
+        assert_eq!(session.knowledge_base_system_prompt(), prefix_before);
+    }
+
     fn tool_call(name: &str, args: Value) -> ToolCall {
         ToolCall {
             id: rig::message::ToolCallId::new_or_mint("call-1".to_string()),
@@ -3809,7 +3959,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         let nudges: Vec<_> = history
             .iter()
@@ -3828,7 +3979,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         let nudge_count = history
             .iter()
             .filter(|message| {
@@ -3855,7 +4007,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -3883,7 +4036,8 @@ mod tests {
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
-            .await;
+            .await
+            .unwrap();
 
         let compact_nudges: Vec<_> = history
             .iter()
@@ -3903,7 +4057,8 @@ mod tests {
         );
 
         inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
-            .await;
+            .await
+            .unwrap();
         let compact_nudge_count = history
             .iter()
             .filter(|message| {
@@ -3925,7 +4080,8 @@ mod tests {
             },
             &mut inactive_history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             inactive_history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("request_compact"))
@@ -3951,7 +4107,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -3967,7 +4124,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
@@ -3992,7 +4150,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         let adverts: Vec<_> = history
             .iter()
@@ -4022,7 +4181,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(

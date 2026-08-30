@@ -6361,6 +6361,7 @@ pub(super) async fn run_worker(
         workspace_scratch_dir: session.workspace_scratch_dir(),
         assistant_identity_prefix,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+        knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,
@@ -6472,6 +6473,59 @@ pub(super) async fn run_worker(
         Err(error) => {
             let message = format!(
                 "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+            );
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
+    // The root loader is the only authority for the definition whose
+    // allowlist governs live KB retrieval/tool admission. A new session
+    // captures from that already-loaded definition, then rebuilds from the
+    // same pinned definition with the resulting prefix. This deliberately
+    // avoids a second name-based filesystem resolution between snapshot
+    // capture and root construction.
+    //
+    // A resumed session retains its durable snapshot. The narrow exception is
+    // a row that survived an interrupted first-worker startup before its
+    // initial capture committed: its explicit completion marker remains
+    // false, so retry the first root-definition-bound capture. Recapturing a
+    // completed snapshot here would let a dream completion while the worker
+    // was down rewrite the session-frozen prefix and erase the next-turn
+    // freshness notice.
+    let root_result = if session.needs_knowledge_base_prompt_snapshot_capture() {
+        (|| -> anyhow::Result<_> {
+            let definition = root_result
+                .definition
+                .as_deref()
+                .context("constructed root has no definition to bind its knowledge-base prompt")?;
+            let captured = session.capture_knowledge_base_prompt_snapshot_for_agent(
+                &spawn_args.config.extended(),
+                definition,
+                crate::config::trust::read_shared_workspace_trust_policy(&trust_policy).mode,
+            )?;
+            let mut args = spawn_args.clone();
+            args.knowledge_base_system_prefix = captured.system_prefix();
+            let rebuilt = builtin::rebuild_from_pinned_definition(&root_result, &args)?;
+            session.commit_knowledge_base_prompt_snapshot(captured)?;
+            Ok(rebuilt)
+        })()
+    } else {
+        Ok(root_result)
+    };
+    let root_result = match root_result {
+        Ok(root) => root,
+        Err(error) => {
+            let message = format!(
+                "constructed root `{root_agent_name}` could not bind its knowledge-base prompt: {error:#}"
             );
             tracing::error!(%message, %session_id, "session startup refused");
             let mut driver_failed = false;

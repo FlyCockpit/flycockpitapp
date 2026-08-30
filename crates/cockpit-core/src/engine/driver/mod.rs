@@ -14588,6 +14588,7 @@ impl Driver {
             workspace_scratch_dir: self.session.workspace_scratch_dir(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
+            knowledge_base_system_prefix: self.session.knowledge_base_system_prompt(),
             interactive,
             mcp_parent_reachable: None,
             mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),

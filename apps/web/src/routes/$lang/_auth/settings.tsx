@@ -7,7 +7,11 @@ export const Route = createFileRoute("/$lang/_auth/settings")({
   component: SettingsLayout,
 });
 
-type SettingsRoute = "/$lang/settings" | "/$lang/settings/security" | "/$lang/settings/privacy";
+type SettingsRoute =
+  | "/$lang/settings"
+  | "/$lang/settings/security"
+  | "/$lang/settings/privacy"
+  | "/$lang/settings/storage";
 
 function SettingsLayout() {
   const { lang } = Route.useParams();

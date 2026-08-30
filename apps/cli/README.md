@@ -124,7 +124,9 @@ On the first launch for a workspace, Cockpit asks for a workspace trust decision
 - `ignore-config` opens the workspace without project config.
 - `untrusted` records the refusal and exits.
 
-The default daemon mode starts the shared background daemon and shows a one-time notice. You can change that later with `daemon.autostart` in config.
+Agents stay running in the background after all windows close by default. Set
+`daemon.background_agents` to `false` to use a reference-counted owner that
+stops agents and owned processes when the last client exits.
 
 ### Provider And Model
 

@@ -490,7 +490,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let project_id = crate::session::project_id_for(project);
+        let project_id = crate::session::project_id_for(project).unwrap();
         let project_root = project.display().to_string();
         let session_row = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -525,6 +525,9 @@ mod tests {
         (
             ToolCtx {
                 agent_id: "helper".to_string(),
+                executing_model_trusted: false,
+                knowledge_access_trusted: false,
+                caller_model: None,
                 agent_instance_id: None,
                 lock_identity: "helper".to_string().clone(),
                 write_scope: None,

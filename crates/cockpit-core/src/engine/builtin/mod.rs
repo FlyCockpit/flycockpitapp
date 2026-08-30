@@ -84,6 +84,7 @@ pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
 pub(crate) const HISTORY_PROMPT: &str = include_str!("history.md");
+pub(crate) const KNOWLEDGE_PROMPT: &str = include_str!("knowledge.md");
 pub(crate) const DEEPTHINK_PROMPT: &str = include_str!("deepthink.md");
 pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
 pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
@@ -116,6 +117,10 @@ pub struct SpawnArgs {
     /// is participating in. Empty string is acceptable for legacy /
     /// test paths where a session id isn't yet resolved.
     pub session_short_id: String,
+    /// Durable per-workspace, per-session scratch made available to native and
+    /// shell tools. It is injected into the system prompt so every agent knows
+    /// the exact path it may use across session restarts.
+    pub workspace_scratch_dir: std::path::PathBuf,
     /// Assistant-owned sessions prepend SOUL.md and USER.md before the
     /// assistant definition body. Preloaded by the session worker so prompt
     /// composition stays pure and stable for the session.
@@ -133,10 +138,14 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// Parent-reachable MCP bindings `(server, profile)`. Child catalogs
-    /// intersect agent-bound servers with this set; scope-level servers stay
-    /// visible.
-    pub mcp_parent_reachable: Option<std::collections::BTreeSet<(String, String)>>,
+    /// Parent-admitted MCP server identities. Child catalogs intersect
+    /// agent-bound servers with these complete source-tagged entries;
+    /// scope-level servers stay visible.
+    pub mcp_parent_reachable: Option<crate::mcp::resolver::ParentReachableCatalog>,
+    /// Immutable catalog admitted by the daemon root worker. Factories may
+    /// project an agent package onto it, but must never rediscover persistent
+    /// MCP files for a descendant or a turn refresh.
+    pub mcp_root_catalog: std::sync::Arc<crate::mcp::resolver::EffectiveCatalog>,
     /// Root selection (explicit fresh choice, persisted installed-root resume,
     /// or legacy plan-level override). A delegated vNext child never inherits
     /// this field: it resolves its own prepared slot default unless its direct
@@ -537,6 +546,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_invoke",
         "session_search",
         "session_lineage_search",
+        "knowledge_retrieve",
         "todo",
         "write",
         "edit",
@@ -544,6 +554,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "grep",
         "glob",
         "use_sealed_value",
+        "knowledge_sealed_create",
+        "knowledge_sealed_copy",
         "inspect_audio",
         "inspect_video",
         "extract_video_clip",
@@ -692,6 +704,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "knowledge_retrieve",
+            summary: "Retrieve cited attached-KB knowledge and bounded fresh-session updates.",
+            condition: Some("knowledge retrieval subagent"),
+        },
+        BuiltinToolInventoryItem {
             family: "Session",
             name: "delegation_payload_retrieve",
             summary: "Retrieve an elided delegation payload.",
@@ -768,6 +786,18 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             name: "use_sealed_value",
             summary: "Use a granted sealed value by reference through a granted action.",
             condition: Some("Requires an Owner-issued sealed-value action grant."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "knowledge_sealed_create",
+            summary: "Create a vault-backed symbolic sealed reference for an attached KB.",
+            condition: Some("The KB must be attached and accessible to this model."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "knowledge_sealed_copy",
+            summary: "Copy an Owner-granted sealed value into an attached KB.",
+            condition: Some("Requires an exact Owner-issued sealed-value action grant."),
         },
         BuiltinToolInventoryItem {
             family: "Media",
@@ -926,6 +956,8 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
+        Arc::new(tools::knowledge_sealed::CreateKnowledgeBaseSealedValueTool),
+        Arc::new(tools::knowledge_sealed::CopyKnowledgeBaseSealedValueTool),
         Arc::new(tools::audio_video::InspectAudioTool::new()),
         Arc::new(tools::audio_video::InspectVideoTool::new()),
         Arc::new(tools::audio_video::ExtractVideoClipTool::new()),
@@ -975,6 +1007,12 @@ pub(crate) fn materialize_tool_by_name(
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "knowledge_sealed_create" => tb.with(Arc::new(
+            tools::knowledge_sealed::CreateKnowledgeBaseSealedValueTool,
+        )),
+        "knowledge_sealed_copy" => tb.with(Arc::new(
+            tools::knowledge_sealed::CopyKnowledgeBaseSealedValueTool,
+        )),
         "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
         | "extract_audio" | "transcribe_audio"
             if media_forbidden =>
@@ -1050,6 +1088,10 @@ pub(crate) fn materialize_tool_by_name(
         "session_lineage_search" => {
             tb.with(Arc::new(tools::session_search::SessionLineageSearchTool))
         }
+        "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
+            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                .cloned(),
+        ))),
         "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
             args.swarm_depth,
             args.swarm_max_depth,
@@ -1096,24 +1138,23 @@ fn mcp_resolver_for(
     args: &SpawnArgs,
     def: &crate::agents::AgentDef,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
-        args.cwd.clone(),
-        args.config.snapshot().generation,
+    crate::mcp::resolver::EffectiveCatalogResolver::for_agent_from_root_catalog(
+        args.mcp_root_catalog.clone(),
         def,
-    );
-    match args.mcp_parent_reachable.clone() {
-        Some(parent) => resolver.with_parent_reachable(parent),
-        None => resolver,
-    }
+        args.mcp_parent_reachable.clone(),
+    )
 }
 
 fn mcp_resolver_for_cwd(
     args: &SpawnArgs,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
-        args.cwd.clone(),
-        args.config.snapshot().generation,
-    )
+    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::from_root_catalog(
+        args.mcp_root_catalog.clone(),
+    );
+    match args.mcp_parent_reachable.clone() {
+        Some(parent) => resolver.with_parent_reachable(parent),
+        None => resolver,
+    }
 }
 
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
@@ -1131,7 +1172,7 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
     if let Some(model_prompt) = model_prompt {
-        let role_system = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
+        let role_system = compose_system_prompt_for_spawn(&role_prompt, args);
         let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
         out.push_str(model_prompt);
         if !out.ends_with('\n') {
@@ -1145,10 +1186,18 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     } else {
-        let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
+        let mut out = compose_system_prompt_for_spawn(&role_prompt, args);
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     }
+}
+
+fn compose_system_prompt_for_spawn(role_prompt: &str, args: &SpawnArgs) -> String {
+    let mut out = compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd);
+    out.push_str("Durable workspace scratch: ");
+    out.push_str(&args.workspace_scratch_dir.display().to_string());
+    out.push('\n');
+    out
 }
 
 fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
@@ -1225,7 +1274,7 @@ fn compose_system_prompt_with(
 /// line. Project guidance is injected as user-role history, not system text.
 /// Used by the fresh-chat context
 /// indicator to size the actual baseline sent to the model, in both
-/// daemon (calibrated) and daemonless (raw cl100k) modes. Pass the empty
+/// daemon (calibrated) and isolated (raw cl100k) modes. Pass the empty
 /// string for `session_short_id` when no session exists yet — it simply
 /// omits the `Session:` line, matching what the engine sends.
 pub fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> String {
@@ -1600,17 +1649,17 @@ fn with_audio_video_tools(
             crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
         };
     }
-    if args.media_availability.is_available() {
-        tb = match effective_tool_tier(def, "transcribe_audio", false) {
-            crate::agents::ToolTier::Enabled => {
-                add_tool_by_name(tb, "transcribe_audio", def, args)?
-            }
-            crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
-            }
-            crate::agents::ToolTier::Disabled => tb,
-        };
-    }
+    // Materialize the transcriber even when the spawn snapshot cannot expose
+    // it. `materialize_tool_by_name` retains it as dormant in that case, and
+    // the stable advertised projection keeps its schema in `tools[]`; the
+    // root-scoped authority remains enforced at call time.
+    tb = match effective_tool_tier(def, "transcribe_audio", false) {
+        crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "transcribe_audio", def, args)?,
+        crate::agents::ToolTier::Discoverable => {
+            add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
+        }
+        crate::agents::ToolTier::Disabled => tb,
+    };
     Ok(tb)
 }
 
@@ -1750,15 +1799,11 @@ pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) ->
     })?;
     let mut definition = (**definition).clone();
     let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
-    // A foreground child may already carry the parent's no-widening
-    // intersection. Rebuilding from its governing definition must not restore
-    // grants removed at admission. `load_resolved_def` only intersects when
-    // `args.mcp_parent_reachable` is Some; copy the live admission ceiling
-    // so a root-shaped rebuild (`None`) cannot widen the catalog.
+    // Tool-surface refreshes are config-driven, not a new MCP admission. Keep
+    // this agent's exact catalog projection so the turn cannot observe edited
+    // mcp.json files or acquire newly added persistent servers.
     rebuilt.posture = agent.posture.clone();
-    if let Some(parent) = agent.mcp_resolver.parent_reachable() {
-        rebuilt.mcp_resolver = rebuilt.mcp_resolver.with_parent_reachable(parent);
-    }
+    rebuilt.mcp_resolver = agent.mcp_resolver.clone();
     Ok(rebuilt)
 }
 
@@ -2765,7 +2810,11 @@ pub(crate) async fn unknown_agent_rejection(
 /// The bundled reachable subagent set for `Plan` plus any user-authored
 /// custom subagent (`mode` `subagent`/`all`).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
-    let mut out: Vec<String> = vec!["explore".to_string(), "history".to_string()];
+    let mut out: Vec<String> = vec![
+        "explore".to_string(),
+        "history".to_string(),
+        "knowledge".to_string(),
+    ];
     append_custom_subagents(&mut out, cwd);
     out
 }
@@ -2785,6 +2834,7 @@ fn build_subagents(
         "builder".to_string(),
         "explore".to_string(),
         "history".to_string(),
+        "knowledge".to_string(),
         "docs".to_string(),
     ];
     if computer_subagent_reachable(config, cwd) {
@@ -3354,13 +3404,13 @@ pub fn build(args: &SpawnArgs) -> Agent {
         "task",
         crate::engine::tool::ToolDescOverride {
             text: Some(
-                "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates, knowledge retrieves cited KB context); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
             verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
-                 well-scoped piece to `builder` to write/edit files, or to `explore` for \
-                 read-only investigation, with a complete standalone brief (goal, constraints, \
+                 well-scoped piece to `builder` to write/edit files, `explore` for \
+                 read-only investigation, or `knowledge` for cited KB retrieval, with a complete standalone brief (goal, constraints, \
                  exact files, what \"done\" looks like). Each `builder` task is one \
                  implementation slice, not a bundle of unrelated asks. If the user asks for a \
                  follow-up implementation iteration after `builder` returns, start a fresh \
@@ -3443,6 +3493,13 @@ pub fn explore(args: &SpawnArgs) -> Agent {
 /// compaction lineage in its own context, then returns a short report.
 pub fn history(args: &SpawnArgs) -> Agent {
     embedded_agent("history", args)
+}
+
+/// `knowledge` — read-only KB retrieval specialist. Its only explicit tool
+/// aggregates provider-backed KB citations with the dream-bounded fresh
+/// session subset; it cannot write either source.
+pub fn knowledge(args: &SpawnArgs) -> Agent {
+    embedded_agent("knowledge", args)
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It is intentionally a
@@ -4142,10 +4199,13 @@ pub(crate) mod tests {
             cwd: cwd.to_path_buf(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             session_short_id: String::new(),
+            workspace_scratch_dir: cwd.join("workspace-scratch"),
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
             mcp_parent_reachable: None,
+            mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd)
+                .catalog(),
             model_override: None,
             delegation_model: None,
             delegated: false,
@@ -4355,6 +4415,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn knowledge_agent_has_only_cited_read_only_retrieval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("knowledge", &args).unwrap();
+        let names = agent.tools.names();
+
+        assert!(names.contains(&"knowledge_retrieve"));
+        for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
+            assert!(
+                !names.contains(&forbidden),
+                "knowledge must not receive `{forbidden}`: {names:?}"
+            );
+        }
+        assert!(agent.role_prompt.contains("cited synthesis"));
+        assert!(agent.role_prompt.contains("staleness"));
+    }
+
+    #[test]
+    fn knowledge_is_reachable_from_builtin_task_surfaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        assert!(
+            build_subagents(&config, tmp.path())
+                .iter()
+                .any(|agent| agent == "knowledge"),
+            "Build-family task surfaces must expose knowledge retrieval"
+        );
+        assert!(
+            plan_subagents(tmp.path())
+                .iter()
+                .any(|agent| agent == "knowledge"),
+            "Plan task surfaces must expose knowledge retrieval"
+        );
+    }
+
+    #[test]
     fn bundled_agents_without_defer_to_orchestrator_stay_without_it() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -4399,6 +4496,7 @@ pub(crate) mod tests {
             ("builder", builder as fn(&SpawnArgs) -> Agent),
             ("explore", explore as fn(&SpawnArgs) -> Agent),
             ("history", history as fn(&SpawnArgs) -> Agent),
+            ("knowledge", knowledge as fn(&SpawnArgs) -> Agent),
         ] {
             let loaded = load(name, &args).unwrap();
             let factory_agent = factory(&args);
@@ -4489,10 +4587,6 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let profile = crate::mcp::config::DEFAULT_PROFILE;
         let mut args = test_spawn_args(&project);
-        args.mcp_parent_reachable = Some(std::collections::BTreeSet::from([(
-            "reachable".to_string(),
-            profile.to_string(),
-        )]));
         let def = crate::agents::AgentDef {
             name: "child-mcp".to_string(),
             description: "custom".to_string(),
@@ -4528,43 +4622,61 @@ pub(crate) mod tests {
             private_subagents: std::collections::BTreeMap::new(),
             source: project.join("child-mcp.md"),
         };
+        let mut parent_def = def.clone();
+        parent_def.mcp_bindings.truncate(1);
+        args.mcp_parent_reachable = Some(
+            mcp_resolver_for(&args, &parent_def)
+                .catalog()
+                .admitted_entries(),
+        );
 
         let agent = agent_from_def(&def, &args).expect("child constructs");
         assert!(
-            agent
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("reachable"),
+            agent.mcp_resolver.catalog().contains("reachable"),
             "parent-reachable bound server stays visible at admission"
         );
         assert!(
-            !agent.mcp_resolver.catalog().servers.contains_key("secret"),
+            !agent.mcp_resolver.catalog().contains("secret"),
             "agent-bound servers the parent cannot reach must drop at admission"
         );
+        let admitted_catalog = agent.mcp_resolver.catalog();
+        std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+        std::fs::write(
+            project.join(".cockpit/mcp.json"),
+            br#"{ "servers": { "new-persistent": { "transport": "streamable", "endpoint": "https://new/mcp" } } }"#,
+        )
+        .unwrap();
 
         let mut rebuild_args = test_spawn_args(&project);
         rebuild_args.mcp_parent_reachable = None;
         let rebuilt = rebuild_from_pinned_definition(&agent, &rebuild_args)
             .expect("pinned rebuild constructs");
+        assert!(rebuilt.mcp_resolver.catalog().contains("reachable"));
         assert!(
-            rebuilt
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("reachable")
-        );
-        assert!(
-            !rebuilt
-                .mcp_resolver
-                .catalog()
-                .servers
-                .contains_key("secret"),
+            !rebuilt.mcp_resolver.catalog().contains("secret"),
             "rebuild must not restore agent-bound servers the parent could not reach"
         );
         assert_eq!(
             rebuilt.mcp_resolver.parent_reachable(),
             agent.mcp_resolver.parent_reachable()
+        );
+        assert!(
+            Arc::ptr_eq(&admitted_catalog, &rebuilt.mcp_resolver.catalog()),
+            "a turn rebuild must retain the agent's admitted catalog projection"
+        );
+        assert!(
+            !rebuilt.mcp_resolver.catalog().contains("new-persistent"),
+            "edited persistent configuration is visible only to a new root worker"
+        );
+        let descendant_args = SpawnArgs {
+            mcp_parent_reachable: Some(agent.mcp_resolver.catalog().admitted_entries()),
+            mcp_root_catalog: agent.mcp_resolver.root_catalog(),
+            ..rebuild_args
+        };
+        let descendant = agent_from_def(&def, &descendant_args).expect("descendant constructs");
+        assert!(
+            !descendant.mcp_resolver.catalog().contains("new-persistent"),
+            "a descendant projects its parent root snapshot, not the current disk catalog"
         );
     }
 
@@ -7571,6 +7683,20 @@ pub(crate) mod tests {
         assert_eq!(with_snapshot, existing);
     }
 
+    #[test]
+    fn compose_system_prompt_for_model_includes_durable_workspace_scratch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        let scratch = tmp.path().join("state/workspaces/project/sessions/session");
+        args.workspace_scratch_dir = scratch.clone();
+
+        let out = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        assert!(
+            out.contains(&format!("Durable workspace scratch: {}", scratch.display())),
+            "block was: {out}"
+        );
+    }
+
     /// Config with a name set, used by the deterministic name-present case.
     fn cfg_with_name(name: &str) -> ExtendedConfig {
         ExtendedConfig {
@@ -7716,6 +7842,12 @@ pub(crate) mod tests {
         let out = compose_system_prompt("ROLE", "abc", tmp.path());
         assert!(!out.contains("Project guidance"));
         assert!(!out.contains("RULES"));
+        // Every changing turn addition stays in the history half of
+        // `AgentPromptParts`, never in the cache-stable system prefix.
+        assert!(!out.contains("[time:"));
+        assert!(!out.contains("[knowledge]"));
+        assert!(!out.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(!out.contains("[project guidance notice]"));
     }
 
     /// Contract test: when multiple configured filenames exist in the

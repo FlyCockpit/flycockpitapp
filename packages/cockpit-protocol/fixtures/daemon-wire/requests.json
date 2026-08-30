@@ -355,6 +355,12 @@
     "request": "restart_if_idle",
     "v": 21
   },
+  "resume_from_compaction": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "request": "resume_from_compaction",
+    "v": 21
+  },
   "resume_paused_work": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
@@ -436,9 +442,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
     "params": {
-      "session_ids": [
-        "11111111-1111-4111-8111-111111111111"
-      ]
+      "session_ids": ["11111111-1111-4111-8111-111111111111"]
     },
     "request": "session_live_status",
     "v": 21
@@ -503,6 +507,26 @@
       "project_root": "/tmp/project"
     },
     "request": "set_workspace_trust",
+    "v": 21
+  },
+  "set_workspace_history_scope": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "inbound": true,
+      "outbound": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_history_scope",
+    "v": 21
+  },
+  "get_workspace_history_scope": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_workspace_history_scope",
     "v": 21
   },
   "share_session": {
@@ -615,6 +639,31 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
     "request": "get_guidance_enablement_trace",
+    "v": 21
+  },
+  "get_storage_report": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "request": "get_storage_report",
+    "v": 21
+  },
+  "preview_storage_cleanup": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "target": {
+        "kind": "archive_sessions_older_than",
+        "data": { "age_days": 30, "include_renamed_or_pinned": false }
+      }
+    },
+    "request": "preview_storage_cleanup",
+    "v": 21
+  },
+  "execute_storage_cleanup": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": { "preview_id": "22222222-2222-4222-8222-222222222222" },
+    "request": "execute_storage_cleanup",
     "v": 21
   },
   "review_guidance_proposal": {

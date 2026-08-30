@@ -1,5 +1,5 @@
 //! Cross-session full-text recall query layer (`session_search` /
-//! `session_read`, prompt `search-old-sessions.md`).
+//! `cockpit://` pseudofile recall, prompt `search-old-sessions.md`).
 //!
 //! Backed by the `session_fts` FTS5 virtual table (migration 0013). The
 //! engine is BM25 ranking with a `last_active_at_unix_ms` recency tiebreaker; no
@@ -32,6 +32,9 @@ impl HistoryCallerTrust {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: Uuid,
+    /// Owning workspace identity. History-scope policy is applied above this
+    /// raw search layer before a hit is exposed to a caller.
+    pub project_id: String,
     pub short_id: Option<String>,
     pub title: Option<String>,
     /// `last_active_at_unix_ms` — the human-date source + recency
@@ -44,7 +47,7 @@ pub struct SearchHit {
     pub bm25: f64,
 }
 
-/// A message turn read back from a thread (`session_read`).
+/// A message turn read back from a thread through `cockpit://` recall.
 #[derive(Debug, Clone)]
 pub struct ThreadTurn {
     pub seq: i64,
@@ -82,7 +85,7 @@ impl Db {
             )
             .context(
                 "FTS5 is not available in this SQLite build; \
-                 session_search/session_read require it and there is no LIKE fallback",
+                 session recall requires it and there is no LIKE fallback",
             )?;
             Ok(())
         })
@@ -138,8 +141,73 @@ impl Db {
                 conn,
                 &query,
                 project_id.as_deref(),
+                None,
                 exclude_session,
                 since,
+                None,
+                pool,
+                caller_trust,
+            )
+        })
+        .await
+    }
+
+    /// Search only sessions that the requesting workspace may disclose.  The
+    /// consent predicate is evaluated inside the ranked SQL query, before its
+    /// bounded candidate pool is cut off.
+    pub async fn search_accessible_candidates_for_trust(
+        &self,
+        query: &str,
+        reader_project: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let reader_project = reader_project.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                Some(&reader_project),
+                exclude_session,
+                since,
+                None,
+                pool,
+                caller_trust,
+            )
+        })
+        .await
+    }
+
+    /// Search matching threads restricted to sessions that have at least one
+    /// event strictly after `after_session_event_seq`. Unlike wall-clock
+    /// activity timestamps, `session_events.seq` is a durable global ordering
+    /// fence, so this is suitable for a snapshot/commit freshness boundary.
+    pub async fn search_candidates_after_session_event_seq_for_trust(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        after_session_event_seq: i64,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                None,
+                exclude_session,
+                None,
+                Some(after_session_event_seq),
                 pool,
                 caller_trust,
             )
@@ -148,7 +216,7 @@ impl Db {
     }
 
     /// All `user_message` / `assistant_message` turns of a thread,
-    /// ordered by `seq` (oldest first). Powers `session_read`'s
+    /// ordered by `seq` (oldest first). Powers `cockpit://` transcript
     /// windowing — the tool slices this in Rust per the `read`-tool
     /// pagination conventions. Non-message events are skipped.
     pub async fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
@@ -211,7 +279,7 @@ impl Db {
     }
 
     /// `seq`s within a thread whose message text matches `query` (FTS5),
-    /// oldest first. `session_read` centers its window on these. Empty
+    /// oldest first. Recall consumers center windows on these. Empty
     /// when the thread has no textual match.
     pub async fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
         self.thread_match_seqs_for_trust(session_id, query, HistoryCallerTrust::Trusted)
@@ -257,6 +325,30 @@ impl Db {
                 out.push(r.context("decoding match seq")?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Read transcript turns only when the target is visible to the reader in
+    /// the same SQLite snapshot. `None` deliberately covers both an absent
+    /// session and a non-consenting workspace.
+    pub async fn thread_turns_for_access(
+        &self,
+        reader_project: &str,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<Vec<ThreadTurn>>> {
+        let reader_project = reader_project.to_string();
+        self.read(move |conn| {
+            if crate::db::history_scope::session_access_allowed_conn(
+                conn,
+                &reader_project,
+                session_id,
+            )? {
+                Self::thread_turns_conn_for_trust(conn, session_id, caller_trust).map(Some)
+            } else {
+                Ok(None)
+            }
         })
         .await
     }
@@ -309,8 +401,10 @@ fn search_candidates_inner(
     conn: &Connection,
     query: &str,
     project_id: Option<&str>,
+    reader_project: Option<&str>,
     exclude_session: Option<Uuid>,
     since: Option<i64>,
+    after_session_event_seq: Option<i64>,
     pool: u32,
     caller_trust: HistoryCallerTrust,
 ) -> Result<Vec<SearchHit>> {
@@ -329,6 +423,7 @@ fn search_candidates_inner(
     let mut stmt = conn
         .prepare(
             "SELECT f.session_id AS session_id,
+                    s.project_id  AS project_id,
                     s.short_id    AS short_id,
                     s.title       AS title,
                     s.last_active_at_unix_ms AS last_active_at_unix_ms,
@@ -355,7 +450,19 @@ fn search_candidates_inner(
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
-                AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                AND (?5 IS NULL OR EXISTS (
+                    SELECT 1
+                      FROM session_events AS later_event
+                     WHERE later_event.session_id = s.session_id
+                       AND later_event.seq > ?5
+                ))
+                AND (?6 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                AND (?7 IS NULL OR s.project_id = ?7 OR (
+                    EXISTS (SELECT 1 FROM workspace_history_scopes reader
+                            WHERE reader.project_id = ?7 AND reader.outbound_enabled = 1)
+                    AND EXISTS (SELECT 1 FROM workspace_history_scopes target
+                                WHERE target.project_id = s.project_id AND target.inbound_enabled = 1)
+                ))
               ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
         )
         .context("preparing search_candidates")?;
@@ -368,12 +475,15 @@ fn search_candidates_inner(
                 project_id,
                 exclude,
                 since,
-                caller_trust.can_read_trusted()
+                after_session_event_seq,
+                caller_trust.can_read_trusted(),
+                reader_project
             ],
             |row| {
                 let sid: String = row.get("session_id")?;
                 Ok((
                     sid,
+                    row.get::<_, String>("project_id")?,
                     row.get::<_, Option<String>>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
                     row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -391,7 +501,7 @@ fn search_candidates_inner(
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
     for r in rows {
-        let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+        let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
             r.context("decoding search hit")?;
         let session_id = Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
         if by_session.contains_key(&session_id) {
@@ -405,6 +515,7 @@ fn search_candidates_inner(
             session_id,
             SearchHit {
                 session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -441,8 +552,9 @@ fn search_candidates_in_sessions_inner(
     for session_id in session_ids {
         let mut stmt = conn
             .prepare(
-                "SELECT f.session_id AS session_id,
-                        s.short_id AS short_id,
+            "SELECT f.session_id AS session_id,
+                    s.project_id AS project_id,
+                    s.short_id AS short_id,
                         s.title AS title,
                         s.last_active_at_unix_ms AS last_active_at_unix_ms,
                         CASE f.row_kind
@@ -480,6 +592,7 @@ fn search_candidates_in_sessions_inner(
                     let sid: String = row.get("session_id")?;
                     Ok((
                         sid,
+                        row.get::<_, String>("project_id")?,
                         row.get::<_, Option<String>>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
                         row.get::<_, i64>("last_active_at_unix_ms")?,
@@ -490,7 +603,7 @@ fn search_candidates_in_sessions_inner(
             )
             .context("querying lineage search")?;
         for row in rows {
-            let (sid, short_id, title, last_active_at_unix_ms, body, bm25) =
+            let (sid, project_id, short_id, title, last_active_at_unix_ms, body, bm25) =
                 row.context("decoding lineage search hit")?;
             let hit_session_id =
                 Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
@@ -502,6 +615,7 @@ fn search_candidates_in_sessions_inner(
             };
             out.push(SearchHit {
                 session_id: hit_session_id,
+                project_id,
                 short_id,
                 title,
                 last_active_at_unix_ms,
@@ -517,10 +631,10 @@ fn search_candidates_in_sessions_inner(
 }
 
 fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<Uuid>> {
-    let existing = existing_session_ids(conn)?;
-    if !existing.contains(&session_id) {
+    let projects = session_projects(conn)?;
+    let Some(root_project) = projects.get(&session_id) else {
         return Ok(Vec::new());
-    }
+    };
     let links = compaction_links(conn)?;
     let mut visited = std::collections::HashSet::new();
     visited.insert(session_id);
@@ -528,7 +642,7 @@ fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Resu
     let mut backwards = Vec::new();
     let mut cursor = session_id;
     while let Some((predecessor, _)) = links.iter().find(|(_, successor)| *successor == cursor) {
-        if !existing.contains(predecessor) || !visited.insert(*predecessor) {
+        if projects.get(predecessor) != Some(root_project) || !visited.insert(*predecessor) {
             break;
         }
         backwards.push(*predecessor);
@@ -539,7 +653,7 @@ fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Resu
     let mut forwards = Vec::new();
     cursor = session_id;
     while let Some((_, successor)) = links.iter().find(|(predecessor, _)| *predecessor == cursor) {
-        if !existing.contains(successor) || !visited.insert(*successor) {
+        if projects.get(successor) != Some(root_project) || !visited.insert(*successor) {
             break;
         }
         forwards.push(*successor);
@@ -552,17 +666,25 @@ fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Resu
     Ok(lineage)
 }
 
-fn existing_session_ids(conn: &Connection) -> Result<std::collections::HashSet<Uuid>> {
+fn session_projects(conn: &Connection) -> Result<std::collections::HashMap<Uuid, String>> {
     let mut stmt = conn
-        .prepare("SELECT session_id FROM sessions")
+        .prepare("SELECT session_id, project_id FROM sessions")
         .context("preparing session id scan")?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, String>("session_id"))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>("session_id")?,
+                row.get::<_, String>("project_id")?,
+            ))
+        })
         .context("querying session ids")?;
-    let mut out = std::collections::HashSet::new();
+    let mut out = std::collections::HashMap::new();
     for row in rows {
-        let sid = row.context("decoding session id")?;
-        out.insert(Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?);
+        let (sid, project_id) = row.context("decoding session id")?;
+        out.insert(
+            Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?,
+            project_id,
+        );
     }
     Ok(out)
 }
@@ -964,6 +1086,65 @@ mod tests {
             turns
                 .iter()
                 .all(|turn| !turn.text.contains("trusted hidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_bounded_search_includes_only_sessions_with_later_events() {
+        let db = Db::open_in_memory().unwrap();
+        let before = db.create_session("p", "/before", "Build").await.unwrap();
+        let after = db.create_session("p", "/after", "Build").await.unwrap();
+        msg(
+            &db,
+            before.session_id,
+            SessionEventKind::UserMessage,
+            "quartz decision before dream",
+        )
+        .await;
+        let boundary = msg(
+            &db,
+            after.session_id,
+            SessionEventKind::UserMessage,
+            "quartz decision before dream",
+        )
+        .await;
+
+        let no_later_events = db
+            .search_candidates_after_session_event_seq_for_trust(
+                "quartz",
+                Some("p"),
+                None,
+                boundary,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert!(no_later_events.is_empty());
+
+        let later = msg(
+            &db,
+            after.session_id,
+            SessionEventKind::UserMessage,
+            "post-dream activity",
+        )
+        .await;
+        assert!(later > boundary);
+
+        let hits = db
+            .search_candidates_after_session_event_seq_for_trust(
+                "quartz",
+                Some("p"),
+                None,
+                boundary,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.session_id).collect::<Vec<_>>(),
+            vec![after.session_id]
         );
     }
 

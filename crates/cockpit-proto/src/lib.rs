@@ -1257,18 +1257,15 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v21 cuts `send_user_message` over to the V2
-/// tagged ingress envelope (`SendUserMessageV2 { ingress }`), carries
+/// Current wire schema version. v21 includes the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
-/// profiles, and agent-dimensioned MCP scopes on the attached-session,
-/// daemon-owned setup inventory, and moves media preview bytes from a raw JSON
-/// number array to bounded base64. v20 and every older fixture remain frozen
-/// migration evidence, not a compatibility window.
+/// profiles, agent-dimensioned MCP scopes, bounded base64 media previews, and
+/// the rolling-precompaction resume choice.
 pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships. v21 is current-only: the V2 ingress cutover and preview
-/// encoding change are an explicit breaking contract with no compatibility shim.
+/// compacted v1 ships. v21 is current-only: all pre-launch wire changes are
+/// edited in place, with no compatibility shim.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -1954,8 +1951,9 @@ impl DelegationSteerResult {
 mod response;
 pub use response::{
     ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
-    Response, RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
-    RunInvocationStatusV1, RunInvocationTerminalReason,
+    Response, ResumeCompactionDefault, ResumeCompactionOffer, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};
@@ -2723,6 +2721,77 @@ pub enum FlycockpitOrgSyncOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum AppFlagKey {
     DaemonAutostartNotice,
+    StorageManagementHint,
+}
+
+/// A daemon-owned storage bucket. Bytes are measured on disk, never estimated
+/// from database row counts, so the settings surface can explain the actual
+/// local footprint before proposing a cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageCategory {
+    Ledger,
+    SessionsByAge,
+    WorkspaceScratch,
+    LocalConfigs,
+    Worktrees,
+    TaskArtifacts,
+    ComputerCapture,
+    ResultBlobs,
+    SessionShims,
+    SessionTmp,
+}
+
+/// One category in the daemon's local storage report. `reclaimable_bytes`
+/// measures data that an available user-confirmed cleanup can release; it is
+/// accounting only and never deletion authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCategoryUsage {
+    pub category: StorageCategory,
+    pub total_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+/// A filesystem item in a dry-run cleanup preview. Paths are daemon-generated
+/// display values; callers never send filesystem paths back as deletion
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCleanupItem {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "data")]
+pub enum StorageCleanupTarget {
+    ArchiveSessionsOlderThan {
+        age_days: u32,
+        include_renamed_or_pinned: bool,
+    },
+    PermanentlyDeleteSessions {
+        session_ids: Vec<Uuid>,
+    },
+    PermanentlyDeleteArchivedSessionsOlderThan {
+        age_days: u32,
+        include_renamed_or_pinned: bool,
+    },
+    RemoveOrphanedWorkspaceStorage {
+        project_ids: Vec<String>,
+    },
+}
+
+/// A daemon-generated, single-use cleanup plan. The caller must present its
+/// `preview_id` to execute; arbitrary paths and byte counts are never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCleanupPreview {
+    pub preview_id: Uuid,
+    pub target: StorageCleanupTarget,
+    pub items: Vec<StorageCleanupItem>,
+    pub bytes_to_free: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2737,7 +2806,6 @@ mod tui_ownership_rpc_contract_tests {
 
     #[test]
     fn missing_rpc_protocol_contract_rejects_open_ended_policy_values() {
-        assert!(serde_json::from_str::<AppFlagKey>(r#""arbitrary-string""#).is_err());
         assert!(serde_json::from_str::<WorkspaceTrustMode>(r#""future-mode""#).is_err());
         assert!(
             serde_json::from_str::<AssistantSessionResolutionMode>(r#""create-always""#).is_err()
@@ -3077,13 +3145,14 @@ impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWireLiteral
 
 /// The safe scope kind of a sealed value, for the sealed-owner begin and
 /// inventory wire shapes. Carries no key material; the key is a separate
-/// `scope_key` field (a session id or canonical project key).
+/// `scope_key` field (a session id, canonical project key, or KB id).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SealedOwnerScopeKind {
     Session,
     Project,
     Global,
+    KnowledgeBase,
 }
 
 /// One safe row of the sealed-owner inventory. The plaintext literal is
@@ -4535,7 +4604,6 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "git_diff_file",
         "git_status",
         "get_inventory_bundle",
-        "get_app_flag",
         "get_startup_disclosures",
         "get_session_setup_snapshot",
         "list_guidance_proposals",
@@ -4552,17 +4620,20 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "resolve_agent_decision",
         "resolve_assistant_session",
         "restart_if_idle",
+        "exit_guard_status",
+        "release_exit_guard",
         "resume_paused_work",
         "send_user_message",
         "send_user_message_bulk",
         "session_live_status",
         "set_active_model",
         "set_workspace_trust",
+        "set_workspace_history_scope",
+        "get_workspace_history_scope",
         "set_agent",
         "set_default_model",
         "set_model_favorite",
         "share_session",
-        "mark_app_flag_seen",
         "stats_rollup",
         "unarchive_session",
     ];
@@ -4575,8 +4646,6 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         // Migrated to a typed bulk transfer reference.
         "export_session_data",
         "attached",
-        "app_flag",
-        "app_flag_seen",
         "assistant_session_resolved",
         "forked",
         "fs_list",
@@ -4588,6 +4657,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "history_page",
         "inventory_bundle",
         "restart_decision",
+        "exit_guard_status",
         "run_invocation_cancel_result",
         "run_invocation_status",
         "session_messages",
@@ -4604,6 +4674,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "agent_tree_page",
         "user_message_queued",
         "workspace_trust_set",
+        "workspace_history_scope",
     ];
 
     #[test]
@@ -8326,12 +8397,6 @@ mod tests {
     #[test]
     fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
         let fixture = proto_fixture_files::read_fixture("response.json");
-        assert!(
-            fixture["app_flag"]["data"]
-                .get("client_operation_id")
-                .is_none()
-        );
-        assert!(fixture["app_flag"]["data"].get("request_hash").is_none());
         let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
         assert_eq!(
             denylist[0]["consumed_entry_id"],

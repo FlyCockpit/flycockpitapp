@@ -116,6 +116,9 @@ CREATE TABLE sessions (
     -- parent session. NULL means the parent's durable tail at fork time.
     fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
+    description        TEXT CHECK (
+        description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
+    ),                                            -- generated old-session context (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -182,10 +185,12 @@ CREATE TABLE sessions (
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
-    -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
-    -- the same automatic title opportunity.
+    -- title/metadata slot (0, 1, 2, 4, 8, 16, 32, 64, or 128) so a resumed
+    -- session never repeats the same automatic metadata opportunity.
     user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
-    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
+    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16, 32, 64, 128)),
+    -- Monotonic ownership fence for an in-flight same-model metadata fork.
+    metadata_fork_generation INTEGER NOT NULL DEFAULT 0 CHECK (metadata_fork_generation >= 0),
 
     -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
     -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is
@@ -1089,6 +1094,14 @@ CREATE INDEX idx_sealed_values_session_created
 CREATE TABLE app_flags (
     key     TEXT    PRIMARY KEY,
     seen_at INTEGER NOT NULL
+);
+
+-- Durable daemon-owned work left after a session's relational deletion has
+-- committed but its fenced directory could not yet be unlinked.  The path is
+-- an opaque staging pathname produced by the storage daemon, never UI input.
+CREATE TABLE storage_directory_cleanup_intents (
+    staged_path TEXT PRIMARY KEY,
+    created_at_unix_ms INTEGER NOT NULL
 );
 
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------
@@ -3191,7 +3204,51 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
--- ---- session full-text search (`session_search` / `session_read`) -----------------
+-- ---- session full-text search (`session_search` / `cockpit://` recall) -------------
+
+-- ---- scheduled jobs --------------------------------------------------------
+-- The immutable insertion identity fences stale asynchronous actions when a
+-- user-chosen job id is deleted and later reused.
+CREATE TABLE scheduled_jobs (
+    id                TEXT    PRIMARY KEY,
+    row_identity      TEXT    NOT NULL UNIQUE,
+    owner             TEXT    NOT NULL,
+    schedule_json     TEXT    NOT NULL CHECK (
+        json_valid(schedule_json) AND json_type(schedule_json) = 'object'
+        AND length(CAST(schedule_json AS BLOB)) <= 65536
+    ),
+    payload_json      TEXT    NOT NULL CHECK (
+        json_valid(payload_json)
+        AND length(CAST(payload_json AS BLOB)) <= 1048576
+    ),
+    enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
+    last_run_at       INTEGER,
+    next_run_at       INTEGER,
+    last_result_json  TEXT CHECK (
+        last_result_json IS NULL OR (
+            json_valid(last_result_json)
+            AND length(CAST(last_result_json AS BLOB)) <= 1048576
+        )
+    ),
+    failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+    backoff_until     INTEGER,
+    disabled_notice   TEXT
+);
+
+CREATE INDEX idx_scheduled_jobs_next_run
+    ON scheduled_jobs(enabled, next_run_at);
+
+CREATE INDEX idx_scheduled_jobs_owner
+    ON scheduled_jobs(owner);
+
+CREATE TRIGGER scheduled_jobs_row_identity_immutable
+BEFORE UPDATE OF row_identity ON scheduled_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'scheduled job row identity is immutable');
+END;
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session TITLE plus the text of `user_message` /
 -- `assistant_message` events and model-written compaction briefs/handoffs.
@@ -3231,6 +3288,30 @@ CREATE UNIQUE INDEX session_fts_docs_one_title
 
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
+
+-- ---- knowledge dream ledger -------------------------------------------------
+-- Dream snapshots the project's global `session_events.seq` before it reads
+-- input, then advances this per-concrete-KB-attachment boundary only after it
+-- has durably folded every event through that sequence into the attachment.
+-- Retrieval never writes this table: it uses the exact ordering boundary to
+-- find sessions with a later event that may not have been dreamed yet.
+-- `knowledge_base_attachment_id` is a source-derived UUID (or a
+-- host-installer UUID), deliberately distinct from the user-configured,
+-- workspace-local registry `id`.
+CREATE TABLE knowledge_dream_ledger (
+    project_uuid BLOB NOT NULL CHECK (
+        typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
+        AND project_uuid <> zeroblob(16)
+    ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,
+    knowledge_base_attachment_id BLOB NOT NULL CHECK (
+        typeof(knowledge_base_attachment_id) = 'blob'
+        AND length(knowledge_base_attachment_id) = 16
+        AND knowledge_base_attachment_id <> zeroblob(16)
+    ),
+    last_dreamed_session_event_seq INTEGER NOT NULL CHECK (last_dreamed_session_event_seq >= 0),
+    updated_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_uuid, knowledge_base_attachment_id)
+);
 
 -- Event sync: `user_message` / `assistant_message` rows carry conversational
 -- text at data_json.'$.text'. `session_compacted` rows carry model-written
@@ -4380,6 +4461,24 @@ CREATE TABLE workspace_trust (
 
 CREATE INDEX idx_workspace_trust_updated_at
     ON workspace_trust(updated_at_unix_ms DESC);
+
+-- ---- workspace history recall scope --------------------------------------------------------
+-- Independent from execution sandbox and workspace trust. Missing workspace
+-- rows are fail-closed (current workspace only). The machine default table is
+-- reserved for onboarding; no flow reads or writes it in v0.1 yet.
+CREATE TABLE workspace_history_scopes (
+    project_id TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 4096),
+    outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (outbound_enabled IN (0, 1)),
+    inbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK (inbound_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE machine_history_scope_default (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cross_workspace_recall_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK (cross_workspace_recall_enabled IN (0, 1)),
+    updated_at_unix_ms INTEGER NOT NULL
+);
 
 -- ---- task delegations -----------------------------------------------------------------------
 -- Durable state for delegated `task` runs: one job per task call, one
@@ -5913,7 +6012,9 @@ BEGIN
 END;
 
 -- ---- scoped sealed values --------------------------------------------------
--- Owner-managed sealed values across Session, Project, and Global scope.
+-- Owner-managed sealed values across Session, Project, Global, and Knowledge
+-- Base scope. KB references use the daemon vault directly; their markdown
+-- contains only resolver-agnostic symbolic tokens.
 --
 -- Only Session literals live in SQLite (the pre-existing `sealed_values`
 -- table above). Project and Global literals live in a dedicated sealed-value
@@ -5929,9 +6030,10 @@ END;
 -- half-live.
 CREATE TABLE sealed_value_records (
     record_id       TEXT    PRIMARY KEY,
-    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global', 'knowledge_base')),
     -- session_id for session scope, canonical project key for project scope,
-    -- and the empty string for global scope (global names are unique globally).
+    -- the KB id for knowledge-base scope, and the empty string for global
+    -- scope (global names are unique globally).
     scope_key       TEXT    NOT NULL,
     name            TEXT    NOT NULL,
     description     TEXT    NOT NULL,
@@ -5941,9 +6043,9 @@ CREATE TABLE sealed_value_records (
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL,
     deleted_at_ms   INTEGER,
-    -- Session literals never leave SQLite, so a session record never carries a
-    -- compartment locator.
-    CHECK (scope <> 'session' OR compartment_key IS NULL),
+    -- Session and knowledge-base literals use vault items directly, so neither
+    -- record kind carries a compartment locator.
+    CHECK (scope NOT IN ('session', 'knowledge_base') OR compartment_key IS NULL),
     -- Global records are unique globally; their scope key is always empty.
     CHECK ((scope = 'global') = (scope_key = '')),
     UNIQUE (scope, scope_key, name)
@@ -5962,7 +6064,7 @@ END;
 -- Deleted names are never reused. The tombstone outlives the record row so a
 -- later create of the same canonical name in the same scope is refused.
 CREATE TABLE sealed_value_name_tombstones (
-    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global', 'knowledge_base')),
     scope_key     TEXT    NOT NULL,
     name          TEXT    NOT NULL,
     retired_at_ms INTEGER NOT NULL,
@@ -6320,6 +6422,7 @@ CREATE TABLE secret_vault_items (
         'subscription_ack',
         'sealed_compartment',
         'session_sealed_value',
+        'knowledge_base_sealed_value',
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,

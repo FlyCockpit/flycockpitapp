@@ -54,9 +54,10 @@ use serde::{Deserialize, Serialize};
 
 use super::action::{
     OwnerAuthority, SealedActionDescriptor, SealedActionId, SealedActionRevision, SealedCompletion,
-    SealedParamSpec,
+    SealedHostAction, SealedParamSpec, SealedParams,
 };
-use super::identity::{SealedDescription, SealedProjectKey};
+use super::compartment::SealedLiteralHandle;
+use super::identity::{SealedDescription, SealedKnowledgeBaseId, SealedProjectKey};
 
 /// Maximum number of origins in one HTTPS action's allowlist.
 pub const HTTPS_MAX_ORIGINS: usize = 8;
@@ -362,6 +363,11 @@ pub enum SealedActionKind {
         projection: SealedProjectionId,
         parameters: BTreeMap<String, SealedParamSpecJson>,
     },
+    /// A local-only custody transfer to exactly one immutable KB attachment.
+    /// It has no outbound destination and no model-supplied parameters.
+    KnowledgeBaseCopy {
+        knowledge_base_id: SealedKnowledgeBaseId,
+    },
 }
 
 impl SealedActionKind {
@@ -446,6 +452,12 @@ impl SealedActionKind {
                 }
                 Ok(())
             }
+            Self::KnowledgeBaseCopy { knowledge_base_id } => {
+                if knowledge_base_id.as_uuid().is_nil() {
+                    bail!("knowledge-base copy action has a nil attachment id");
+                }
+                Ok(())
+            }
         }
     }
 
@@ -482,6 +494,18 @@ impl SealedActionKind {
                 descriptor.validate()?;
                 Ok(descriptor)
             }
+            Self::KnowledgeBaseCopy { .. } => {
+                let descriptor = SealedActionDescriptor {
+                    action_id,
+                    revision,
+                    summary: summary.to_string(),
+                    parameters: BTreeMap::new(),
+                    completion: SealedCompletion::fixed(std::iter::empty::<(String, String)>()),
+                    response_after_ms: HTTPS_TIMEOUT_MS,
+                };
+                descriptor.validate()?;
+                Ok(descriptor)
+            }
         }
     }
 
@@ -489,6 +513,7 @@ impl SealedActionKind {
     pub fn projection(&self) -> SealedProjectionId {
         match self {
             Self::Https { projection, .. } => *projection,
+            Self::KnowledgeBaseCopy { .. } => SealedProjectionId::None,
         }
     }
 
@@ -496,6 +521,7 @@ impl SealedActionKind {
     pub fn origins(&self) -> Option<&HttpsOriginAllowlist> {
         match self {
             Self::Https { origins, .. } => Some(origins),
+            Self::KnowledgeBaseCopy { .. } => None,
         }
     }
 
@@ -506,7 +532,52 @@ impl SealedActionKind {
                 credential_placement,
                 ..
             } => Some(credential_placement),
+            Self::KnowledgeBaseCopy { .. } => None,
         }
+    }
+}
+
+/// Closed local executor for a KB-copy capability. `invoke` is deliberately
+/// unreachable for production use: the sealed runtime consumes this kind only
+/// through `copy_to_knowledge_base`, where it writes to the bound attachment.
+#[derive(Debug)]
+struct KnowledgeBaseCopyAction {
+    descriptor: SealedActionDescriptor,
+    knowledge_base_id: SealedKnowledgeBaseId,
+}
+
+impl KnowledgeBaseCopyAction {
+    fn from_snapshot(snapshot: &SealedActionSnapshot) -> Result<Self> {
+        let SealedActionKind::KnowledgeBaseCopy { knowledge_base_id } = &snapshot.kind else {
+            bail!("knowledge-base copy executor requires a copy action snapshot");
+        };
+        Ok(Self {
+            descriptor: snapshot.kind.compile_descriptor(
+                &snapshot.action_id,
+                snapshot.revision,
+                &snapshot.description,
+            )?,
+            knowledge_base_id: knowledge_base_id.clone(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SealedHostAction for KnowledgeBaseCopyAction {
+    fn descriptor(&self) -> &SealedActionDescriptor {
+        &self.descriptor
+    }
+
+    fn knowledge_base_copy_target(&self) -> Option<&SealedKnowledgeBaseId> {
+        Some(&self.knowledge_base_id)
+    }
+
+    async fn invoke(
+        &self,
+        _literal: SealedLiteralHandle<'_>,
+        _params: &SealedParams,
+    ) -> Result<()> {
+        bail!("knowledge-base copy actions may only run through the sealed copy runtime")
     }
 }
 
@@ -787,6 +858,7 @@ fn summary_from_row(
     let kind = decode_validated_kind(&row.kind_json)?;
     let kind_tag = match kind {
         SealedActionKind::Https { .. } => "https",
+        SealedActionKind::KnowledgeBaseCopy { .. } => "knowledge_base_copy",
     };
     Ok(SealedActionInstanceSummary {
         action_id: row.action_id.clone(),
@@ -873,11 +945,22 @@ pub async fn build_live_registry(
         let Ok(snapshot) = snapshot_from_row(&row) else {
             continue;
         };
-        let Ok(action) = executor::HttpsSealedAction::from_snapshot(&snapshot, transport.clone())
-        else {
-            continue;
-        };
-        builder = builder.with_action(std::sync::Arc::new(action))?;
+        match &snapshot.kind {
+            SealedActionKind::Https { .. } => {
+                let Ok(action) =
+                    executor::HttpsSealedAction::from_snapshot(&snapshot, transport.clone())
+                else {
+                    continue;
+                };
+                builder = builder.with_action(std::sync::Arc::new(action))?;
+            }
+            SealedActionKind::KnowledgeBaseCopy { .. } => {
+                let Ok(action) = KnowledgeBaseCopyAction::from_snapshot(&snapshot) else {
+                    continue;
+                };
+                builder = builder.with_action(std::sync::Arc::new(action))?;
+            }
+        }
     }
     Ok(builder.build())
 }

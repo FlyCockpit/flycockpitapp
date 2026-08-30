@@ -96,7 +96,7 @@ use text_recovery::*;
 
 // A concrete executor frame owns this identity, not the shared `Agent`
 // definition. Keep it task-local so same-named children cannot overwrite one
-// another while turn code stays reusable by daemonless callers.
+// another while turn code stays reusable by isolated callers.
 tokio::task_local! {
     static CURRENT_AGENT_INSTANCE_ID: Option<uuid::Uuid>;
 }
@@ -416,9 +416,8 @@ pub struct Agent {
     /// fresh build for that candidate model (identity prefix + role body). `None`
     /// for non-assistant sessions.
     pub assistant_identity_prefix: Option<String>,
-    /// Source-tagged MCP catalog frozen at agent construction. Global and
-    /// workspace layers still refresh on file/generation change; the agent
-    /// package layer stays pinned until the agent is rebuilt.
+    /// Source-tagged MCP catalog frozen at agent construction and threaded
+    /// read-only through every `ToolCtx` built for this agent.
     pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
@@ -460,19 +459,29 @@ pub(crate) async fn turn_toolbox(
             .await
             .is_none()
         {
-            toolbox = toolbox.without("transcribe_audio");
+            toolbox = toolbox.deactivate_direct_native_media_for_transcription_dispatch();
         }
     } else {
-        for &name in
-            crate::tool_media_authority::MediaToolAvailability::unavailable().omitted_tool_names()
-        {
-            toolbox = toolbox.without(name);
-        }
+        toolbox = toolbox.deactivate_direct_native_media_tools();
     }
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
-    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config).await;
+    let executing_model = format!(
+        "{}:{}",
+        agent.model.provider_id(),
+        agent.model.model_id_ref()
+    );
+    toolbox = crate::knowledge::with_memory_search_if_attached(
+        toolbox,
+        session,
+        cwd,
+        agent.definition.as_deref(),
+        config,
+        &executing_model,
+        agent.model.is_trusted(),
+    )
+    .await;
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
     toolbox.apply_capabilities(&env, cwd, target)
 }
@@ -729,6 +738,15 @@ async fn toolbox_with_retrieval_if_needed(
     session: &Session,
     posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
+    // These retrieval tools are intentionally availability-gated: advertising
+    // a durable artifact or delegation payload before it exists would create a
+    // capability oracle. Their appearance therefore reflects a genuine new
+    // session resource and is an explicitly accepted cache-boundary change.
+    // Start by removing any static registration so a rebuilt/restarted session
+    // gets the same artifact-dependent surface as a newly-created one.
+    tools = tools.without("artifact_read").without("artifact_search");
+    // Escalation is likewise a real session policy change, not a probe result;
+    // its schema changes only when that user-controlled policy changes.
     if session.sandbox_escalation_enabled()
         && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {
@@ -779,7 +797,9 @@ async fn record_usage_blocking(
     session: Arc<Session>,
     call_id: Uuid,
     usage: crate::tokens::TokenUsage,
+    model: &Model,
 ) -> anyhow::Result<()> {
+    session.note_cache_hit_for_endpoint(model.provider_id(), model.model_id_ref(), usage);
     session.record_usage(call_id, usage).await
 }
 
@@ -1528,6 +1548,9 @@ mod redaction_placeholder_guard_tests {
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
+            executing_model_trusted: false,
+            knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,

@@ -678,6 +678,7 @@ fn validations(request: &Value, response: &Value) -> Vec<Value> {
         Some(response),
         Path::new("/proj"),
         None,
+        None,
     )
     .as_array()
     .unwrap()
@@ -4012,6 +4013,7 @@ async fn tandem_validation_applies_bash_session_boundary_without_running() {
         Some(&response),
         root.path(),
         None,
+        None,
     )
     .as_array()
     .unwrap()
@@ -4021,6 +4023,37 @@ async fn tandem_validation_applies_bash_session_boundary_without_running() {
     assert_eq!(rows[1]["status"], "would_require_approval");
     assert_eq!(rows[1]["schema_valid"], true);
     assert_eq!(rows[2]["status"], "would_require_approval");
+}
+
+#[tokio::test]
+async fn tandem_validation_accepts_bash_targeting_durable_workspace_scratch() {
+    let request = request_with_tools(vec![tool_def(
+        "bash",
+        crate::tools::bash::BashTool::new().parameters(),
+    )]);
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let response = json!([
+        {
+            "type": "tool_use",
+            "name": "bash",
+            "input": {"cwd": scratch.path(), "command": "printf x > durable.txt"}
+        },
+    ]);
+
+    let rows = super::tandem_validation::validate_tandem_tool_calls(
+        &request,
+        Some(&response),
+        root.path(),
+        None,
+        Some(scratch.path()),
+    )
+    .as_array()
+    .unwrap()
+    .clone();
+
+    assert_eq!(rows[0]["status"], "valid");
+    assert_eq!(rows[0]["schema_valid"], true);
 }
 
 #[tokio::test]

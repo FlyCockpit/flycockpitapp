@@ -548,7 +548,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_list",
         "harness_invoke",
         "history_search",
-        "knowledge_retrieve",
+        "semantic_search",
+        "structured_search",
         "todo",
         "write",
         "edit",
@@ -699,9 +700,15 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Knowledge",
-            name: "knowledge_retrieve",
-            summary: "Retrieve cited attached-KB knowledge and bounded fresh-session updates.",
-            condition: Some("knowledge retrieval subagent"),
+            name: "semantic_search",
+            summary: "Semantically search attached knowledge bases with citations.",
+            condition: Some("knowledge-base attachment resolved at call time"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "structured_search",
+            summary: "Search attached knowledge by text, frontmatter, or structured data.",
+            condition: Some("knowledge-base attachment resolved at call time"),
         },
         BuiltinToolInventoryItem {
             family: "Session",
@@ -1058,7 +1065,11 @@ pub(crate) fn materialize_tool_by_name(
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
         "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
-        "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
+        "semantic_search" => tb.with(Arc::new(crate::knowledge::SemanticSearchTool::new(
+            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                .cloned(),
+        ))),
+        "structured_search" => tb.with(Arc::new(crate::knowledge::StructuredSearchTool::new(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                 .cloned(),
         ))),

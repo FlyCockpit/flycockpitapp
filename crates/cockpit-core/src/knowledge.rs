@@ -17,21 +17,19 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use crate::config::extended::RedactConfig;
 use crate::config::extended::{
     ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
     KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
 };
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
-use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
@@ -181,8 +179,8 @@ pub(crate) const INDEX_LOGIC_VERSION: i64 = 2;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
-const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
-const KNOWLEDGE_RETRIEVE_TOOL_NAME: &str = "knowledge_retrieve";
+const SEMANTIC_SEARCH_TOOL_NAME: &str = "semantic_search";
+const STRUCTURED_SEARCH_TOOL_NAME: &str = "structured_search";
 const KNOWLEDGE_DREAM_SOURCES_TOOL_NAME: &str = "knowledge_dream_sources";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
@@ -203,8 +201,8 @@ const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN: &[u8] =
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
     &[
-        MEMORY_SEARCH_TOOL_NAME,
-        KNOWLEDGE_RETRIEVE_TOOL_NAME,
+        SEMANTIC_SEARCH_TOOL_NAME,
+        STRUCTURED_SEARCH_TOOL_NAME,
         KNOWLEDGE_DREAM_SOURCES_TOOL_NAME,
         KNOWLEDGE_DREAM_APPLY_TOOL_NAME,
     ]
@@ -316,6 +314,38 @@ pub(crate) struct SearchResult {
     pub score: f64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StructuredSearchQuery {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default, rename = "type")]
+    concept_type: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    timestamp: Option<TimestampFilter>,
+    #[serde(default, rename = "structured")]
+    structured_filters: Vec<StructuredValueFilter>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TimestampFilter {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StructuredValueFilter {
+    column: String,
+    equals: JsonValue,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexStats {
     pub embedded_chunks: usize,
@@ -355,6 +385,7 @@ struct ChunkDoc {
 pub(crate) trait KbProvider: Send + Sync {
     async fn is_available(&self) -> Result<bool>;
     async fn retrieve(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    async fn structured_search(&self, query: &StructuredSearchQuery) -> Result<Vec<SearchResult>>;
     /// Apply model-produced OKF output through the provider that owns the KB.
     /// Dream execution must use this rather than resolving a local root itself,
     /// so local Git transactions and future hosted writes stay interchangeable.
@@ -1900,6 +1931,36 @@ impl KbProvider for LocalKb {
         for result in &mut results {
             result.knowledge_base_id = self.entry.id.clone();
             result.knowledge_base_name = self.entry.name.clone();
+            result.source_path = self.root.join(&result.source_path).display().to_string();
+        }
+        Ok(results)
+    }
+
+    async fn structured_search(&self, query: &StructuredSearchQuery) -> Result<Vec<SearchResult>> {
+        if !self.is_available().await? {
+            bail!(
+                "local knowledge base `{}` does not exist at {}",
+                self.entry.id,
+                self.root.display()
+            );
+        }
+        let sidecars = self.sidecars.canonicalized()?;
+        let sidecar_lock = sidecar_lock(&sidecars);
+        let _sidecar_guard = sidecar_lock.lock().await;
+        let bundle = self
+            .snapshot
+            .clone()
+            .context("local structured knowledge search requires a retained knowledge snapshot")?;
+        let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        let index = open_index_connection(&sidecars.index, &process_lock)?;
+        ensure_index_schema(&index)?;
+        rebuild_index(&index, &bundle)?;
+        persist_private_sidecar_connection(&index, &sidecars.index, &process_lock)?;
+        let mut results = structured_search_index(&index, query)?;
+        for result in &mut results {
+            result.knowledge_base_id = self.entry.id.clone();
+            result.knowledge_base_name = self.entry.name.clone();
+            result.source_path = self.root.join(&result.source_path).display().to_string();
         }
         Ok(results)
     }
@@ -1944,6 +2005,11 @@ impl KbProvider for RemoteKb {
 
     async fn retrieve(&self, _query: &str, _limit: usize) -> Result<Vec<SearchResult>> {
         // TODO(#136): implement hosted KbProvider retrieval for remote-owned KBs.
+        bail!("remote knowledge-base providers are not implemented")
+    }
+
+    async fn structured_search(&self, _query: &StructuredSearchQuery) -> Result<Vec<SearchResult>> {
+        // TODO(#136): implement hosted structured search for remote-owned KBs.
         bail!("remote knowledge-base providers are not implemented")
     }
 
@@ -3263,6 +3329,134 @@ fn keyword_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i6
     Ok(out)
 }
 
+fn structured_search_index(
+    conn: &Connection,
+    query: &StructuredSearchQuery,
+) -> Result<Vec<SearchResult>> {
+    let mut sql = String::from(
+        "SELECT c.id, c.path, c.body, c.citations_json\n         FROM concepts c\n         WHERE 1 = 1",
+    );
+    let mut values = Vec::new();
+
+    if let Some(query) = query.query.as_deref() {
+        let fts = fts_query(query);
+        if !fts.is_empty() {
+            sql.push_str(
+                "\n AND EXISTS (\n    SELECT 1 FROM chunks_fts\n    WHERE chunks_fts.concept_id = c.id AND chunks_fts MATCH ?\n )",
+            );
+            values.push(SqlValue::Text(fts));
+        }
+    }
+    if let Some(concept_type) = query.concept_type.as_deref() {
+        sql.push_str(
+            "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'type' AND cf.value = ?\n )",
+        );
+        values.push(SqlValue::Text(concept_type.to_string()));
+    }
+    if let Some(title) = query.title.as_deref() {
+        sql.push_str(
+            "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'title' AND cf.value LIKE ? ESCAPE '!'\n )",
+        );
+        values.push(SqlValue::Text(format!("%{}%", escape_like(title))));
+    }
+    for tag in &query.tags {
+        sql.push_str(
+            "\n AND EXISTS (\n    SELECT 1 FROM json_each(c.tags_json) tag\n    WHERE tag.value = ?\n )",
+        );
+        values.push(SqlValue::Text(tag.clone()));
+    }
+    if let Some(timestamp) = &query.timestamp {
+        if let Some(after) = timestamp.after.as_deref() {
+            sql.push_str(
+                "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'timestamp' AND cf.value >= ?\n )",
+            );
+            values.push(SqlValue::Text(after.to_string()));
+        }
+        if let Some(before) = timestamp.before.as_deref() {
+            sql.push_str(
+                "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'timestamp' AND cf.value <= ?\n )",
+            );
+            values.push(SqlValue::Text(before.to_string()));
+        }
+    }
+    if !query.structured_filters.is_empty() {
+        sql.push_str("\n AND EXISTS (SELECT 1 FROM structured_rows sr WHERE sr.concept_id = c.id");
+        for filter in &query.structured_filters {
+            sql.push_str(
+                "\n AND EXISTS (SELECT 1 FROM structured_values sv WHERE sv.row_id = sr.id AND sv.column_name = ? AND ",
+            );
+            values.push(SqlValue::Text(filter.column.clone()));
+            append_structured_value_predicate(&mut sql, &mut values, &filter.equals)?;
+            sql.push(')');
+        }
+        sql.push(')');
+    }
+    sql.push_str("\n ORDER BY c.id\n LIMIT ?");
+    values.push(SqlValue::Integer(
+        query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20) as i64,
+    ));
+
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        let citations_json: String = row.get(3)?;
+        Ok(SearchResult {
+            knowledge_base_id: String::new(),
+            knowledge_base_name: String::new(),
+            concept_id: row.get(0)?,
+            source_path: row.get(1)?,
+            chunk_index: 0,
+            snippet: row.get(2)?,
+            citations: serde_json::from_str(&citations_json).unwrap_or_default(),
+            score: 1.0,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn append_structured_value_predicate(
+    sql: &mut String,
+    values: &mut Vec<SqlValue>,
+    value: &JsonValue,
+) -> Result<()> {
+    match value {
+        JsonValue::String(value) => {
+            sql.push_str("sv.value_type = 'text' AND sv.value_text = ?");
+            values.push(SqlValue::Text(value.clone()));
+        }
+        JsonValue::Bool(value) => {
+            sql.push_str("sv.value_type = 'boolean' AND sv.value_boolean = ?");
+            values.push(SqlValue::Integer(if *value { 1 } else { 0 }));
+        }
+        JsonValue::Number(value) if value.is_i64() => {
+            sql.push_str("sv.value_type = 'integer' AND sv.value_integer = ?");
+            values.push(SqlValue::Integer(value.as_i64().expect("checked is_i64")));
+        }
+        JsonValue::Number(value) if value.is_u64() => {
+            let value = i64::try_from(value.as_u64().expect("checked is_u64"))
+                .map_err(|_| anyhow::anyhow!("structured filter integers must fit in i64"))?;
+            sql.push_str("sv.value_type = 'integer' AND sv.value_integer = ?");
+            values.push(SqlValue::Integer(value));
+        }
+        JsonValue::Number(value) => {
+            let value = value
+                .as_f64()
+                .context("structured filter number is not representable as f64")?;
+            sql.push_str("(sv.value_type = 'real' AND sv.value_real = ?)");
+            values.push(SqlValue::Real(value));
+        }
+        _ => bail!("structured filter values must be strings, numbers, or booleans"),
+    }
+    Ok(())
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_")
+}
+
 fn fts_query(query: &str) -> String {
     query
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
@@ -3317,58 +3511,6 @@ fn rrf_merge(
     Ok(out)
 }
 
-pub(crate) fn render_injection(
-    results: &[SearchResult],
-    max_tokens: usize,
-    redact: &RedactionTable,
-) -> Option<String> {
-    if results.is_empty() || max_tokens == 0 {
-        return None;
-    }
-    let mut out = String::from("[knowledge]\nRelevant cited memory from attached OKF bundles:\n");
-    for result in results {
-        let citation = citation_label(result);
-        out.push_str("- ");
-        out.push_str(&result.concept_id);
-        out.push_str(" — ");
-        out.push_str(&short_summary(&result.snippet));
-        out.push_str(" [");
-        out.push_str(&citation);
-        out.push_str("]\n");
-        let scrubbed = redact.scrub(&out);
-        if crate::tokens::count(&scrubbed) > max_tokens {
-            out.push_str("- [knowledge truncated by token budget]\n");
-            break;
-        }
-    }
-    let scrubbed = redact.scrub(&out);
-    Some(token_cap(&scrubbed, max_tokens))
-}
-
-pub(crate) fn retrieval_query_from_turn(history: &[Message], prompt: &Message) -> String {
-    let mut parts = history
-        .iter()
-        .rev()
-        .take(6)
-        .filter_map(message_text)
-        .collect::<Vec<_>>();
-    parts.reverse();
-    if let Some(text) = message_text(prompt) {
-        parts.push(text);
-    }
-    parts.join("\n")
-}
-
-fn message_text(message: &Message) -> Option<String> {
-    let text = match message {
-        Message::User { content } => crate::engine::message::extract_user_text(content),
-        Message::Assistant { content, .. } => crate::engine::message::extract_text(content),
-        Message::System { content } => content.clone(),
-    };
-    let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
 fn citation_label(result: &SearchResult) -> String {
     let citation = result
         .citations
@@ -3376,8 +3518,8 @@ fn citation_label(result: &SearchResult) -> String {
         .map(|citation| format!("{}: {}", citation.label, citation.target))
         .unwrap_or_else(|| format!("{}#chunk-{}", result.source_path, result.chunk_index));
     format!(
-        "{} (knowledge base: {} / {})",
-        citation, result.knowledge_base_name, result.knowledge_base_id
+        "{}; source: {} (knowledge base: {} / {})",
+        citation, result.source_path, result.knowledge_base_name, result.knowledge_base_id
     )
 }
 
@@ -3387,91 +3529,6 @@ fn short_summary(snippet: &str) -> String {
         cleaned
     } else {
         format!("{}…", cleaned.chars().take(240).collect::<String>())
-    }
-}
-
-fn token_cap(body: &str, max_tokens: usize) -> String {
-    if crate::tokens::count(body) <= max_tokens {
-        return body.to_string();
-    }
-    let mut out = String::new();
-    for word in body.split_whitespace() {
-        let candidate = if out.is_empty() {
-            word.to_string()
-        } else {
-            format!("{out} {word}")
-        };
-        if crate::tokens::count(&candidate) > max_tokens.saturating_sub(8) {
-            break;
-        }
-        out = candidate;
-    }
-    out.push_str(" [knowledge truncated]");
-    out
-}
-
-pub(crate) async fn inject_knowledge_for_turn(
-    history: &mut Vec<Message>,
-    session: &Session,
-    cwd: &Path,
-    definition: Option<&crate::agents::AgentDef>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-    query: &str,
-    redact: Arc<RedactionTable>,
-    executing_model_trusted: bool,
-) {
-    let extended = config.extended();
-    let providers = config.providers();
-    if let Err(error) = validate_dream_models(&extended, &providers) {
-        tracing::warn!(%error, "refusing knowledge injection because dream-model policy is invalid");
-        return;
-    }
-    let attachments = match attached_bundles(
-        session,
-        cwd,
-        definition.and_then(crate::agents::AgentDef::allowed_knowledge_bases),
-        &extended,
-        executing_model_trusted,
-    )
-    .await
-    {
-        Ok(bundles) => bundles,
-        Err(error) => {
-            tracing::warn!(%error, "refusing knowledge injection because knowledge attachment resolution failed");
-            return;
-        }
-    };
-    if attachments.bundles.is_empty() {
-        return;
-    }
-    match production_embedder(&extended, config, redact.clone(), session).await {
-        Ok(Some(embedder)) => {
-            match retrieve_from_knowledge_bases(
-                &attachments.bundles,
-                embedder,
-                query,
-                DEFAULT_SEARCH_LIMIT,
-                Some(&crate::sealed::LocalVaultResolver::new(
-                    session.secret_vault().clone(),
-                )),
-                executing_model_trusted,
-            )
-            .await
-            {
-                Ok(results) => {
-                    if let Some(block) =
-                        render_injection(&results, extended.knowledge_inject_max_tokens, &redact)
-                    {
-                        history.push(Message::user(block));
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "knowledge retrieval failed"),
-            }
-        }
-        Ok(None) => {
-            tracing::debug!("knowledge bundle attached but no embedding_model is configured")
-        }
-        Err(error) => tracing::warn!(%error, "building knowledge embedder failed"),
     }
 }
 
@@ -3554,6 +3611,51 @@ async fn retrieve_from_knowledge_bases(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     all.truncate(limit);
+    Ok(all)
+}
+
+async fn retrieve_structured_from_knowledge_bases(
+    knowledge_bases: &[AttachedKnowledgeBase],
+    query: &StructuredSearchQuery,
+    resolver: Option<&dyn crate::sealed::SealedResolver>,
+    trusted_reader: bool,
+) -> Result<Vec<SearchResult>> {
+    let mut all = Vec::new();
+    for knowledge_base in knowledge_bases {
+        match knowledge_base.provider.is_available().await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    knowledge_base = %knowledge_base.entry.id,
+                    "skipping unavailable knowledge provider"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "checking availability of knowledge base `{}`",
+                        knowledge_base.entry.id
+                    )
+                });
+            }
+        }
+        let mut results = knowledge_base.provider.structured_search(query).await?;
+        if let Some(resolver) = resolver {
+            for result in &mut results {
+                result.snippet = crate::sealed::resolve_kb_markdown(
+                    &result.snippet,
+                    &knowledge_base.sealed_id,
+                    resolver,
+                    trusted_reader,
+                )
+                .await?;
+            }
+        }
+        all.extend(results);
+    }
+    all.sort_by(|a, b| a.concept_id.cmp(&b.concept_id));
+    all.truncate(query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20));
     Ok(all)
 }
 
@@ -4653,7 +4755,7 @@ fn provider_for(
     }
 }
 
-pub(crate) async fn with_memory_search_if_attached(
+pub(crate) async fn with_knowledge_search_tools(
     toolbox: crate::engine::tool::ToolBox,
     session: &Session,
     cwd: &Path,
@@ -4666,12 +4768,16 @@ pub(crate) async fn with_memory_search_if_attached(
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
         .cloned();
     // Keep the search schema present for the whole agent lifetime. Attachment
-    // state is deliberately resolved in `MemorySearchTool::call`, where an
+    // state is deliberately resolved in each search tool's `call`, where an
     // absent bundle produces the normal content-free availability result
     // instead of churning the provider's cacheable tools array.
-    let toolbox = toolbox.with(Arc::new(MemorySearchTool {
-        allowed_knowledge_bases: allowed_knowledge_bases.clone(),
-    }));
+    let toolbox = toolbox
+        .with(Arc::new(SemanticSearchTool::new(
+            allowed_knowledge_bases.clone(),
+        )))
+        .with(Arc::new(StructuredSearchTool::new(
+            allowed_knowledge_bases.clone(),
+        )));
     let extended = config.extended();
     let dream_writes_enabled = attached_bundles(
         session,
@@ -4717,8 +4823,31 @@ fn knowledge_access_denied_message(knowledge_base_ids: &[String]) -> String {
 /// A turn-toolbox instance binds the executing agent definition's KB
 /// restriction.  The tool can therefore refresh workspace configuration at
 /// call time without re-resolving a mutable, same-named agent definition.
-pub(crate) struct MemorySearchTool {
+pub(crate) struct SemanticSearchTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+impl SemanticSearchTool {
+    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            allowed_knowledge_bases,
+        }
+    }
+}
+
+/// Search the disposable OKF index using FTS, frontmatter, and structured-row
+/// predicates. Like semantic search, the schema is always advertised and the
+/// attached KB set is resolved only when the tool is called.
+pub(crate) struct StructuredSearchTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+impl StructuredSearchTool {
+    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            allowed_knowledge_bases,
+        }
+    }
 }
 
 /// The production model-facing dream executor.  It accepts a complete,
@@ -4955,208 +5084,6 @@ impl Tool for KnowledgeDreamApplyTool {
             ctx.knowledge_access_trusted,
         )
         .await?;
-        /* Retrieval implementation is defined below beside the stable memory search surface.
-                        if bundles.is_empty() {
-                            return Ok(ToolOutput::text(
-                                "No attached knowledge bundles are available; no fresh-session subset was searched.",
-                            ));
-                        }
-
-                        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
-                        let results =
-                            match production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session)
-                                .await?
-                            {
-                                Some(embedder) => {
-                                    retrieve_from_knowledge_bases(&bundles, embedder, &args.query, limit).await?
-                                }
-                                None => Vec::new(),
-                            };
-                        let freshness = retrieve_undreamed_session_hits(&bundles, &args.query, limit, ctx).await?;
-                        Ok(ToolOutput::text(render_knowledge_retrieval(
-                            &results,
-                            &freshness,
-                            ctx.redact.as_ref(),
-                        )))
-                    }
-                }
-
-        struct FreshSessionRetrieval {
-                    hits: Vec<crate::db::session_search::SearchHit>,
-                    boundary_knowledge_bases: Vec<String>,
-                    oldest_boundary_session_event_seq: Option<i64>,
-                    missing_boundary_knowledge_bases: Vec<String>,
-                }
-
-                async fn retrieve_undreamed_session_hits(
-                    bundles: &[AttachedKnowledgeBase],
-                    query: &str,
-                    limit: usize,
-                    ctx: &ToolCtx,
-                ) -> Result<FreshSessionRetrieval> {
-                    let project_uuid = ctx
-                        .session
-                        .db
-                        .authoritative_project_uuid(&ctx.session.project_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
-                    let mut boundary_knowledge_bases = Vec::new();
-                    let mut missing_boundary_knowledge_bases = Vec::new();
-                    let mut oldest_boundary_session_event_seq = None;
-                    for bundle in bundles {
-                        match ctx
-                            .session
-                            .db
-                            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
-                                project_uuid,
-                                knowledge_base_attachment_id: bundle.entry.attachment_id(),
-                            })
-                            .await?
-                        {
-                            Some(boundary) => {
-                                boundary_knowledge_bases.push(bundle.entry.id.clone());
-                                oldest_boundary_session_event_seq = Some(
-                                    oldest_boundary_session_event_seq
-                                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
-                                        .unwrap_or(boundary.last_dreamed_session_event_seq),
-                                );
-                            }
-                            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
-                        }
-                    }
-
-                    // A missing ordering boundary is not evidence that history has been dreamed. On
-                    // first use (and whenever any attached KB lacks a ledger row), search the
-                    // project's matching session history conservatively instead of silently
-                    // returning no fresh results. Once every attached KB has a boundary, the
-                    // oldest exact event boundary safely bounds the shared candidate set.
-                    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
-                        match oldest_boundary_session_event_seq {
-                            // The DB predicate is strictly greater than this durable global
-                            // event sequence. A later commit receives a greater sequence even
-                            // when it shares the dream snapshot's millisecond timestamp.
-                            Some(boundary) => (Some(boundary), true),
-                            None => (None, false),
-                        }
-                    } else {
-                        (None, true)
-                    };
-                    let hits = if search_enabled {
-                        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
-                        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
-                        let hits = match after_session_event_seq {
-                            Some(boundary) => {
-                                ctx.session
-                                    .db
-                                    .search_candidates_after_session_event_seq_for_trust(
-                                        query,
-                                        Some(ctx.session.project_id.as_str()),
-                                        None,
-                                        boundary,
-                                        pool,
-                                        caller_trust,
-                                    )
-                                    .await?
-                            }
-                            None => {
-                                ctx.session
-                                    .db
-                                    .search_candidates_for_trust(
-                                        query,
-                                        Some(ctx.session.project_id.as_str()),
-                                        None,
-                                        None,
-                                        pool,
-                                        caller_trust,
-                                    )
-                                    .await?
-                            }
-                        };
-                        hits.into_iter().take(limit).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(FreshSessionRetrieval {
-                        hits,
-                        boundary_knowledge_bases,
-                        oldest_boundary_session_event_seq,
-                        missing_boundary_knowledge_bases,
-                    })
-                }
-
-                fn render_knowledge_retrieval(
-                    results: &[SearchResult],
-                    freshness: &FreshSessionRetrieval,
-                    redact: &RedactionTable,
-                ) -> String {
-                    let mut out = String::from("knowledge_retrieve results:\n");
-                    if results.is_empty() {
-                        out.push_str(
-                            "- No matching knowledge-base entries (or no embedding model is configured).\n",
-                        );
-                    } else {
-                        out.push_str("Knowledge-base citations:\n");
-                        for result in results {
-                            out.push_str("- ");
-                            out.push_str(&result.concept_id);
-                            out.push_str(" — ");
-                            out.push_str(&short_summary(&result.snippet));
-                            out.push_str(" [");
-                            out.push_str(&citation_label(result));
-                            out.push_str("]\n");
-                        }
-                    }
-
-                    if !freshness.missing_boundary_knowledge_bases.is_empty() {
-                        out.push_str(
-                            "Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
-                        );
-                        render_fresh_session_hits(&mut out, &freshness.hits);
-                    } else {
-                        match freshness.oldest_boundary_session_event_seq {
-                            Some(boundary) => {
-                                out.push_str(
-                                    "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence ",
-                                );
-                                out.push_str(&boundary.to_string());
-                                out.push_str(" for KB(s) ");
-                                out.push_str(&freshness.boundary_knowledge_bases.join(", "));
-                                out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
-                                render_fresh_session_hits(&mut out, &freshness.hits);
-                            }
-                            None => out.push_str(
-                                "Fresh-session staleness check: no eligible fresh-session boundary is available.\n",
-                            ),
-                        }
-                    }
-                    if !freshness.missing_boundary_knowledge_bases.is_empty() {
-                        out.push_str("KB(s) without a dream ordering boundary: ");
-                        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
-                        out.push_str(".\n");
-                    }
-                    redact.scrub(&out)
-                }
-
-                fn render_fresh_session_hits(out: &mut String, hits: &[crate::db::session_search::SearchHit]) {
-                    if hits.is_empty() {
-                        out.push_str("- No matching undreamed-session updates.\n");
-                    } else {
-                        out.push_str("Undreamed-session citations:\n");
-                        for hit in hits {
-                            let fallback_reference = hit.session_id.to_string();
-                            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
-                            out.push_str("- session ");
-                            out.push_str(reference);
-                            out.push_str(" — ");
-                            out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
-                            out.push_str(" — ");
-                            out.push_str(&short_summary(&hit.snippet));
-                            out.push_str(" [session ref: ");
-                            out.push_str(&hit.session_id.to_string());
-                            out.push_str("]\n");
-                        }
-            }
-        */
         let knowledge_base = bundles
             .bundles
             .iter()
@@ -5481,277 +5408,32 @@ fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutp
     ToolOutput::text(text)
 }
 
-/// Read-only retrieval surface used by the built-in `knowledge` specialist.
-/// It combines cited KB matches with a bounded view of sessions that may have
-/// advanced since the shared dream boundary.
-pub(crate) struct KnowledgeRetrieveTool {
-    allowed_knowledge_bases: Option<BTreeSet<String>>,
-}
-
-impl KnowledgeRetrieveTool {
-    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
-        Self {
-            allowed_knowledge_bases,
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for KnowledgeRetrieveTool {
-    fn name(&self) -> &str {
-        KNOWLEDGE_RETRIEVE_TOOL_NAME
-    }
-
-    fn description(&self) -> &str {
-        "retrieve cited knowledge-base results and bounded undreamed-session updates"
-    }
-
-    fn verbose_description(&self) -> Option<String> {
-        Some(
-            "Search attached knowledge bases through their configured providers and return cited results plus a bounded, trust-filtered view of sessions newer than the recorded dream boundary."
-                .to_string(),
-        )
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "retrieval query" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum cited results from each source" }
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let args: MemorySearchArgs = typed_args(args)?;
-        if args.query.trim().is_empty() {
-            return Err(invalid_input("knowledge_retrieve query must not be empty"));
-        }
-        let extended = ctx.config.extended();
-        let providers = ctx.config.providers();
-        validate_dream_models(&extended, &providers)?;
-        let bundles = attached_bundles(
-            &ctx.session,
-            &ctx.cwd,
-            self.allowed_knowledge_bases.as_ref(),
-            &extended,
-            ctx.knowledge_access_trusted,
-        )
-        .await?;
-        if bundles.bundles.is_empty() {
-            if !bundles.denied_knowledge_base_ids.is_empty() {
-                return Err(anyhow::anyhow!(knowledge_access_denied_message(
-                    &bundles.denied_knowledge_base_ids
-                )));
-            }
-            return Ok(ToolOutput::text(
-                "No attached knowledge bundles are available; no fresh-session subset was searched.",
-            ));
-        }
-
-        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
-        let results =
-            match production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session)
-                .await?
-            {
-                Some(embedder) => {
-                    retrieve_from_knowledge_bases(
-                        &bundles.bundles,
-                        embedder,
-                        &args.query,
-                        limit,
-                        Some(&crate::sealed::LocalVaultResolver::new(
-                            ctx.session.secret_vault().clone(),
-                        )),
-                        ctx.knowledge_access_trusted,
-                    )
-                    .await?
-                }
-                None => Vec::new(),
-            };
-        let freshness =
-            retrieve_undreamed_session_hits(&bundles.bundles, &args.query, limit, ctx).await?;
-        Ok(ToolOutput::text(render_knowledge_retrieval(
-            &results,
-            &freshness,
-            ctx.redact.as_ref(),
-        )))
-    }
-}
-
-struct FreshSessionRetrieval {
-    hits: Vec<crate::db::session_search::SearchHit>,
-    boundary_knowledge_bases: Vec<String>,
-    oldest_boundary_session_event_seq: Option<i64>,
-    missing_boundary_knowledge_bases: Vec<String>,
-}
-
-async fn retrieve_undreamed_session_hits(
-    bundles: &[AttachedKnowledgeBase],
-    query: &str,
-    limit: usize,
-    ctx: &ToolCtx,
-) -> Result<FreshSessionRetrieval> {
-    let project_uuid = ctx
-        .session
-        .db
-        .authoritative_project_uuid(&ctx.session.project_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
-    let mut boundary_knowledge_bases = Vec::new();
-    let mut missing_boundary_knowledge_bases = Vec::new();
-    let mut oldest_boundary_session_event_seq = None;
-    for bundle in bundles {
-        match ctx
-            .session
-            .db
-            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
-                project_uuid,
-                knowledge_base_attachment_id: bundle.entry.attachment_id(),
-            })
-            .await?
-        {
-            Some(boundary) => {
-                boundary_knowledge_bases.push(bundle.entry.id.clone());
-                oldest_boundary_session_event_seq = Some(
-                    oldest_boundary_session_event_seq
-                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
-                        .unwrap_or(boundary.last_dreamed_session_event_seq),
-                );
-            }
-            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
-        }
-    }
-    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
-        match oldest_boundary_session_event_seq {
-            Some(boundary) => (Some(boundary), true),
-            None => (None, false),
-        }
-    } else {
-        (None, true)
-    };
-    let hits = if search_enabled {
-        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
-        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
-        let hits = match after_session_event_seq {
-            Some(boundary) => {
-                ctx.session
-                    .db
-                    .search_candidates_after_session_event_seq_for_trust(
-                        query,
-                        Some(ctx.session.project_id.as_str()),
-                        None,
-                        boundary,
-                        pool,
-                        caller_trust,
-                    )
-                    .await?
-            }
-            None => {
-                ctx.session
-                    .db
-                    .search_candidates_for_trust(
-                        query,
-                        Some(ctx.session.project_id.as_str()),
-                        None,
-                        None,
-                        pool,
-                        caller_trust,
-                    )
-                    .await?
-            }
-        };
-        hits.into_iter().take(limit).collect()
-    } else {
-        Vec::new()
-    };
-    Ok(FreshSessionRetrieval {
-        hits,
-        boundary_knowledge_bases,
-        oldest_boundary_session_event_seq,
-        missing_boundary_knowledge_bases,
-    })
-}
-
-fn render_knowledge_retrieval(
-    results: &[SearchResult],
-    freshness: &FreshSessionRetrieval,
-    redact: &RedactionTable,
-) -> String {
-    let mut out = String::from("knowledge_retrieve results:\n");
-    if results.is_empty() {
-        out.push_str(
-            "- No matching knowledge-base entries (or no embedding model is configured).\n",
-        );
-    } else {
-        out.push_str("Knowledge-base citations:\n");
-        for result in results {
-            out.push_str(&format!(
-                "- {} — {} [{}]\n",
-                result.concept_id,
-                short_summary(&result.snippet),
-                citation_label(result),
-            ));
-        }
-    }
-    match freshness.oldest_boundary_session_event_seq {
-        Some(boundary) if freshness.missing_boundary_knowledge_bases.is_empty() => out.push_str(&format!(
-            "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence {boundary} for KB(s) {}.\n",
-            freshness.boundary_knowledge_bases.join(", "),
-        )),
-        _ => out.push_str("Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so matching project sessions were searched conservatively.\n"),
-    }
-    if !freshness.missing_boundary_knowledge_bases.is_empty() {
-        out.push_str("KB(s) without a dream ordering boundary: ");
-        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
-        out.push_str(".\n");
-    }
-    if freshness.hits.is_empty() {
-        out.push_str("- No matching undreamed-session updates.\n");
-    } else {
-        out.push_str("Undreamed-session citations:\n");
-        for hit in &freshness.hits {
-            out.push_str(&format!(
-                "- session {} — {} — {} [session ref: {}]\n",
-                hit.short_id.as_deref().unwrap_or_default(),
-                hit.title.as_deref().unwrap_or("(untitled)"),
-                short_summary(&hit.snippet),
-                hit.session_id,
-            ));
-        }
-    }
-    redact.scrub(&out)
-}
-
 #[derive(Debug, Deserialize)]
-struct MemorySearchArgs {
+struct SemanticSearchArgs {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
 }
 
 #[async_trait]
-impl Tool for MemorySearchTool {
+impl Tool for SemanticSearchTool {
     fn name(&self) -> &str {
-        MEMORY_SEARCH_TOOL_NAME
+        SEMANTIC_SEARCH_TOOL_NAME
     }
 
     fn description(&self) -> &str {
-        "search attached OKF memory bundles with citations"
+        "semantically search attached OKF knowledge bundles with citations"
     }
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search attached named OKF knowledge bases for a specific query and return cited ranked results."
+                "Search attached named OKF knowledge bases with vector similarity and return cited ranked results."
                 .to_string(),
         )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -5767,9 +5449,9 @@ impl Tool for MemorySearchTool {
     }
 
     async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let args: MemorySearchArgs = typed_args(args)?;
+        let args: SemanticSearchArgs = typed_args(args)?;
         if args.query.trim().is_empty() {
-            return Err(invalid_input("memory_search query must not be empty"));
+            return Err(invalid_input("semantic_search query must not be empty"));
         }
         let extended = ctx.config.extended();
         let providers = ctx.config.providers();
@@ -5796,7 +5478,7 @@ impl Tool for MemorySearchTool {
             production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session).await?
         else {
             return Ok(ToolOutput::text(
-                "No embedding_model is configured, so memory_search cannot build the knowledge index.",
+                "No embedding_model is configured, so semantic_search cannot build the knowledge index.",
             ));
         };
         let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
@@ -5816,11 +5498,201 @@ impl Tool for MemorySearchTool {
     }
 }
 
+#[async_trait]
+impl Tool for StructuredSearchTool {
+    fn name(&self) -> &str {
+        STRUCTURED_SEARCH_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "search attached OKF knowledge by full text, frontmatter, or structured data with citations"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Search the disposable OKF index without embeddings. Combine full-text `query`, frontmatter filters, and exact structured row values; results are cited concepts that can be inspected with read."
+                .to_string(),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "full-text query over concept bodies" },
+                "type": { "type": "string", "description": "exact concept type frontmatter filter" },
+                "title": { "type": "string", "description": "case-sensitive title frontmatter substring filter" },
+                "tags": { "type": "array", "items": { "type": "string" }, "description": "tags every matching concept must have" },
+                "timestamp": {
+                    "type": "object",
+                    "properties": {
+                        "after": { "type": "string", "description": "inclusive timestamp frontmatter lower bound" },
+                        "before": { "type": "string", "description": "inclusive timestamp frontmatter upper bound" }
+                    },
+                    "additionalProperties": false,
+                    "description": "inclusive timestamp frontmatter range"
+                },
+                "structured": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "column": { "type": "string", "description": "structured row column name" },
+                            "equals": { "type": ["string", "number", "boolean"], "description": "exact scalar value in the same structured row" }
+                        },
+                        "required": ["column", "equals"],
+                        "additionalProperties": false
+                    },
+                    "description": "exact structured-row predicates; all predicates must match one row"
+                },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum cited concepts" }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let query: StructuredSearchQuery = typed_args(args)?;
+        validate_structured_search_query(&query)?;
+        let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        validate_dream_models(&extended, &providers)?;
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
+        if bundles.bundles.is_empty() {
+            if !bundles.denied_knowledge_base_ids.is_empty() {
+                return Err(anyhow::anyhow!(knowledge_access_denied_message(
+                    &bundles.denied_knowledge_base_ids
+                )));
+            }
+            return Ok(ToolOutput::text(
+                "No attached knowledge bundles are available.",
+            ));
+        }
+        let results = retrieve_structured_from_knowledge_bases(
+            &bundles.bundles,
+            &query,
+            Some(&crate::sealed::LocalVaultResolver::new(
+                ctx.session.secret_vault().clone(),
+            )),
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
+        Ok(ToolOutput::text(render_structured_tool_results(
+            &results,
+            ctx.redact.as_ref(),
+        )))
+    }
+}
+
+fn validate_structured_search_query(query: &StructuredSearchQuery) -> Result<()> {
+    let has_query = query
+        .query
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if query.query.is_some() && !has_query {
+        return Err(invalid_input("structured_search query must not be empty"));
+    }
+    if let Some(query) = query.query.as_deref()
+        && fts_query(query).is_empty()
+    {
+        return Err(invalid_input(
+            "structured_search query must contain searchable text",
+        ));
+    }
+    for (name, value) in [("type", &query.concept_type), ("title", &query.title)] {
+        if value
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(invalid_input(format!(
+                "structured_search {name} must not be empty"
+            )));
+        }
+    }
+    if query.tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err(invalid_input(
+            "structured_search tags must not contain empty values",
+        ));
+    }
+    if let Some(timestamp) = &query.timestamp {
+        if timestamp
+            .after
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+            || timestamp
+                .before
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(invalid_input(
+                "structured_search timestamp bounds must not be empty",
+            ));
+        }
+        if timestamp.after.is_none() && timestamp.before.is_none() {
+            return Err(invalid_input(
+                "structured_search timestamp requires after or before",
+            ));
+        }
+    }
+    for filter in &query.structured_filters {
+        if filter.column.trim().is_empty() {
+            return Err(invalid_input(
+                "structured_search structured column must not be empty",
+            ));
+        }
+        if !filter.equals.is_string() && !filter.equals.is_number() && !filter.equals.is_boolean() {
+            return Err(invalid_input(
+                "structured_search structured equals must be a string, number, or boolean",
+            ));
+        }
+    }
+    if !has_query
+        && query.concept_type.is_none()
+        && query.title.is_none()
+        && query.tags.is_empty()
+        && query.timestamp.is_none()
+        && query.structured_filters.is_empty()
+    {
+        return Err(invalid_input(
+            "structured_search requires query, frontmatter, timestamp, or structured filters",
+        ));
+    }
+    Ok(())
+}
+
+fn render_structured_tool_results(results: &[SearchResult], redact: &RedactionTable) -> String {
+    if results.is_empty() {
+        return "No matching structured knowledge entries.".to_string();
+    }
+    let mut out = String::from("structured_search results:\n");
+    for result in results {
+        out.push_str("- ");
+        out.push_str(&result.concept_id);
+        out.push_str(" — ");
+        out.push_str(&short_summary(&result.snippet));
+        out.push_str(" [");
+        out.push_str(&citation_label(result));
+        out.push_str("]\n");
+    }
+    redact.scrub(&out)
+}
+
 fn render_tool_results(results: &[SearchResult], redact: &RedactionTable) -> String {
     if results.is_empty() {
-        return "No matching memory entries.".to_string();
+        return "No matching knowledge entries.".to_string();
     }
-    let mut out = String::from("memory_search results:\n");
+    let mut out = String::from("semantic_search results:\n");
     for result in results {
         out.push_str("- ");
         out.push_str(&result.concept_id);
@@ -5964,168 +5836,6 @@ mod tests {
             0.0
         };
         vec![exact_anchor, deploy, incident]
-    }
-
-    #[test]
-    fn composite_retrieval_renders_kb_and_undreamed_session_citations() {
-        let results = vec![SearchResult {
-            knowledge_base_id: "project".to_string(),
-            knowledge_base_name: "Project knowledge".to_string(),
-            concept_id: "deploy-policy".to_string(),
-            source_path: "concepts/deploy.md".to_string(),
-            chunk_index: 0,
-            snippet: "Deploy through the green lane.".to_string(),
-            citations: Vec::new(),
-            score: 1.0,
-        }];
-        let session_id = uuid::Uuid::new_v4();
-        let freshness = FreshSessionRetrieval {
-            hits: vec![crate::db::session_search::SearchHit {
-                session_id,
-                project_id: "project".to_string(),
-                short_id: Some("ab12cd".to_string()),
-                title: Some("Recent deploy discussion".to_string()),
-                last_active_at_unix_ms: 101,
-                snippet: "The rollout is waiting for approval.".to_string(),
-                bm25: -1.0,
-            }],
-            boundary_knowledge_bases: vec!["project".to_string()],
-            oldest_boundary_session_event_seq: Some(100),
-            missing_boundary_knowledge_bases: Vec::new(),
-        };
-
-        let rendered = render_knowledge_retrieval(&results, &freshness, &RedactionTable::empty());
-        assert!(rendered.contains("concepts/deploy.md#chunk-0"));
-        assert!(rendered.contains("session ab12cd"));
-        assert!(rendered.contains(&session_id.to_string()));
-        assert!(rendered.contains("may not yet be dreamed"));
-    }
-
-    #[tokio::test]
-    async fn fresh_retrieval_includes_the_current_session_before_the_first_boundary() {
-        let tmp = TempDir::new().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.session
-            .db
-            .insert_session_event(
-                ctx.session.id,
-                crate::db::session_log::SessionEventKind::UserMessage,
-                None,
-                None,
-                &json!({ "text": "current session has the windfall launch decision" }),
-            )
-            .await
-            .unwrap();
-        let entry = project_knowledge_registry_entry();
-        let bundles = vec![AttachedKnowledgeBase {
-            provider: Arc::new(RemoteKb {
-                entry: entry.clone(),
-            }),
-            entry,
-            sealed_id: crate::sealed::SealedKnowledgeBaseId::parse(
-                "4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9",
-            )
-            .unwrap(),
-        }];
-
-        let freshness = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            freshness.missing_boundary_knowledge_bases,
-            vec!["project".to_string()]
-        );
-        assert!(
-            freshness
-                .hits
-                .iter()
-                .any(|hit| hit.session_id == ctx.session.id)
-        );
-    }
-
-    #[tokio::test]
-    async fn fresh_retrieval_uses_the_event_sequence_boundary_not_a_timestamp() {
-        let tmp = TempDir::new().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
-        let entry = project_knowledge_registry_entry();
-        let bundles = vec![AttachedKnowledgeBase {
-            provider: Arc::new(RemoteKb {
-                entry: entry.clone(),
-            }),
-            entry,
-            sealed_id: crate::sealed::SealedKnowledgeBaseId::parse(
-                "4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9",
-            )
-            .unwrap(),
-        }];
-        let first = ctx
-            .session
-            .db
-            .insert_session_event(
-                ctx.session.id,
-                crate::db::session_log::SessionEventKind::UserMessage,
-                None,
-                None,
-                &json!({ "text": "windfall decision before dream" }),
-            )
-            .await
-            .unwrap();
-        let project_uuid = ctx
-            .session
-            .db
-            .authoritative_project_uuid(&ctx.session.project_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let boundary = ctx
-            .session
-            .db
-            .snapshot_knowledge_dream_boundary(project_uuid)
-            .await
-            .unwrap();
-        assert_eq!(boundary, first);
-        ctx.session
-            .db
-            .record_knowledge_dream_boundary(
-                crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
-                    project_uuid,
-                    knowledge_base_attachment_id: bundles[0].entry.attachment_id(),
-                },
-                boundary,
-                0,
-            )
-            .await
-            .unwrap();
-
-        let before_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
-            .await
-            .unwrap();
-        assert!(before_later_event.hits.is_empty());
-
-        let later = ctx
-            .session
-            .db
-            .insert_session_event(
-                ctx.session.id,
-                crate::db::session_log::SessionEventKind::UserMessage,
-                None,
-                None,
-                &json!({ "text": "post-dream activity" }),
-            )
-            .await
-            .unwrap();
-        assert!(later > boundary);
-
-        let after_later_event = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
-            .await
-            .unwrap();
-        assert!(
-            after_later_event
-                .hits
-                .iter()
-                .any(|hit| hit.session_id == ctx.session.id)
-        );
     }
 
     #[tokio::test]
@@ -6429,20 +6139,6 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    #[test]
-    fn fresh_retrieval_reports_its_conservative_first_use_search() {
-        let freshness = FreshSessionRetrieval {
-            hits: Vec::new(),
-            boundary_knowledge_bases: Vec::new(),
-            oldest_boundary_session_event_seq: None,
-            missing_boundary_knowledge_bases: vec!["project".to_string()],
-        };
-
-        let rendered = render_knowledge_retrieval(&[], &freshness, &RedactionTable::empty());
-        assert!(rendered.contains("searched conservatively"));
-        assert!(rendered.contains("no session history can yet be proven dreamed"));
-    }
-
     fn write_bundle(root: &Path) {
         fs::create_dir_all(root).unwrap();
         fs::write(root.join("index.md"), "# Index\n\n- [[deploy]]\n").unwrap();
@@ -6614,6 +6310,67 @@ timestamp: 2026-08-29T12:00:00Z
         assert_eq!(markdown_rows, 1);
         assert_eq!(resource_rows, 1);
         assert_eq!(count, 4);
+    }
+
+    #[tokio::test]
+    async fn structured_search_filters_frontmatter_fts_and_one_structured_row() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("inventory.csv"),
+            "sku,count,active\nA-1,4,true\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("structured.md"),
+            r#"---
+type: catalog
+title: Inventory
+resource: inventory.csv
+tags: [warehouse, current]
+timestamp: 2026-08-29T12:00:00Z
+---
+
+Inventory facts for warehouse operations.
+
+# Citations
+
+- [inventory](docs/inventory.md)
+"#,
+        )
+        .unwrap();
+
+        let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let results = structured_search_index(
+            &index.index,
+            &StructuredSearchQuery {
+                query: Some("warehouse operations".to_string()),
+                concept_type: Some("catalog".to_string()),
+                title: Some("ventor".to_string()),
+                tags: vec!["warehouse".to_string(), "current".to_string()],
+                timestamp: Some(TimestampFilter {
+                    after: Some("2026-08-01T00:00:00Z".to_string()),
+                    before: Some("2026-09-01T00:00:00Z".to_string()),
+                }),
+                structured_filters: vec![
+                    StructuredValueFilter {
+                        column: "count".to_string(),
+                        equals: JsonValue::from(4),
+                    },
+                    StructuredValueFilter {
+                        column: "active".to_string(),
+                        equals: JsonValue::from(true),
+                    },
+                ],
+                limit: Some(6),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].concept_id, "structured");
+        assert_eq!(results[0].citations[0].target, "docs/inventory.md");
     }
 
     #[tokio::test]
@@ -7079,37 +6836,6 @@ timestamp: 2026-08-29T12:00:00Z
         assert!(paraphrase.iter().any(|r| r.concept_id == "deploy"));
     }
 
-    #[test]
-    fn knowledge_injection_capped_and_redacted() {
-        let redact = {
-            let cfg = RedactConfig {
-                enabled: true,
-                denylist: vec!["sk-secret".to_string()],
-                placeholder: "[redacted]".to_string(),
-                ..RedactConfig::default()
-            };
-            RedactionTable::build(&cfg, Path::new(".")).unwrap()
-        };
-        let results = vec![SearchResult {
-            knowledge_base_id: "project".to_string(),
-            knowledge_base_name: "Project".to_string(),
-            concept_id: "deploy".to_string(),
-            source_path: "deploy.md".to_string(),
-            chunk_index: 0,
-            snippet: "Use sk-secret and the green deploy pipeline with citations.".to_string(),
-            citations: vec![Citation {
-                label: "runbook".to_string(),
-                target: "docs/deploy.md".to_string(),
-            }],
-            score: 1.0,
-        }];
-        let rendered = render_injection(&results, 80, &redact).unwrap();
-        assert!(rendered.contains("runbook"));
-        assert!(rendered.contains("[redacted]"));
-        assert!(!rendered.contains("sk-secret"));
-        assert!(crate::tokens::count(&rendered) <= 80);
-    }
-
     #[tokio::test]
     async fn project_bundle_requires_a_trusted_model() {
         let _env = crate::test_env::lock_async().await;
@@ -7441,36 +7167,12 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[tokio::test]
-    async fn memory_search_tool_schema_is_stable_when_bundles_change() {
+    async fn knowledge_search_tool_schemas_are_stable_when_bundles_change() {
         let _env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path()).await;
         let base = crate::engine::tool::ToolBox::new();
-        assert!(
-            with_memory_search_if_attached(
-                base.clone(),
-                &session,
-                tmp.path(),
-                None,
-                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
-                    tmp.path()
-                ),
-                "openai:gpt-5",
-                false,
-            )
-            .await
-            .names()
-            .contains(&"memory_search")
-        );
-
-        write_bundle(&tmp.path().join(".cockpit/knowledge"));
-        fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
-        fs::write(
-            tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"openai:gpt-5","trustRequired":true,"mergePolicy":"auto"}]}"#,
-        )
-        .unwrap();
-        let untrusted_toolbox = with_memory_search_if_attached(
+        let unavailable_toolbox = with_knowledge_search_tools(
             base.clone(),
             &session,
             tmp.path(),
@@ -7480,13 +7182,44 @@ timestamp: 2026-08-29T12:00:00Z
             false,
         )
         .await;
-        assert!(untrusted_toolbox.names().contains(&"memory_search"));
+        assert!(unavailable_toolbox.names().contains(&"semantic_search"));
+        assert!(unavailable_toolbox.names().contains(&"structured_search"));
+        let unavailable_definitions = serde_json::to_vec(
+            &unavailable_toolbox.definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+
+        write_bundle(&tmp.path().join(".cockpit/knowledge"));
+        fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"openai:gpt-5","trustRequired":true,"mergePolicy":"auto"}]}"#,
+        )
+        .unwrap();
+        let untrusted_toolbox = with_knowledge_search_tools(
+            base.clone(),
+            &session,
+            tmp.path(),
+            None,
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            "openai:gpt-5",
+            false,
+        )
+        .await;
+        assert!(untrusted_toolbox.names().contains(&"semantic_search"));
+        assert!(untrusted_toolbox.names().contains(&"structured_search"));
+        assert_eq!(
+            unavailable_definitions,
+            serde_json::to_vec(&untrusted_toolbox.definitions(crate::agents::ToolSteering::Terse),)
+                .unwrap(),
+            "KB attachment changes must not change the serialized search tool array"
+        );
         assert!(
             !untrusted_toolbox
                 .names()
                 .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
         );
-        let attached_toolbox = with_memory_search_if_attached(
+        let attached_toolbox = with_knowledge_search_tools(
             base,
             &session,
             tmp.path(),
@@ -7497,9 +7230,16 @@ timestamp: 2026-08-29T12:00:00Z
         )
         .await;
         let attached = attached_toolbox.names();
-        assert!(attached.contains(&"memory_search"));
+        assert!(attached.contains(&"semantic_search"));
+        assert!(attached.contains(&"structured_search"));
+        assert_eq!(
+            unavailable_definitions,
+            serde_json::to_vec(&attached_toolbox.definitions(crate::agents::ToolSteering::Terse),)
+                .unwrap(),
+            "KB trust changes must not change the serialized search tool array"
+        );
         assert!(attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME));
-        let mismatched_toolbox = with_memory_search_if_attached(
+        let mismatched_toolbox = with_knowledge_search_tools(
             crate::engine::tool::ToolBox::new(),
             &session,
             tmp.path(),
@@ -7509,7 +7249,16 @@ timestamp: 2026-08-29T12:00:00Z
             true,
         )
         .await;
-        assert!(mismatched_toolbox.names().contains(&"memory_search"));
+        assert!(mismatched_toolbox.names().contains(&"semantic_search"));
+        assert!(mismatched_toolbox.names().contains(&"structured_search"));
+        assert_eq!(
+            unavailable_definitions,
+            serde_json::to_vec(
+                &mismatched_toolbox.definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            "KB model attachment changes must not change the serialized search tool array"
+        );
         assert!(
             !mismatched_toolbox
                 .names()

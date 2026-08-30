@@ -472,7 +472,7 @@ pub(crate) async fn turn_toolbox(
         agent.model.provider_id(),
         agent.model.model_id_ref()
     );
-    toolbox = crate::knowledge::with_memory_search_if_attached(
+    toolbox = crate::knowledge::with_knowledge_search_tools(
         toolbox,
         session,
         cwd,

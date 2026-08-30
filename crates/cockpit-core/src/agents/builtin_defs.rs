@@ -550,15 +550,14 @@ fn history_def() -> AgentDef {
     def
 }
 
-/// `knowledge` — a read-only retrieval specialist. It has no direct KB write
-/// surface: `knowledge_retrieve` reads attached KBs through `KbProvider` and
-/// consults only the dream-bounded fresh-session subset.
+/// `knowledge` — a read-only retrieval specialist. It composes KB search
+/// primitives with native reads and has no direct KB write surface.
 fn knowledge_def() -> AgentDef {
     def_with_normal(
         "knowledge",
-        "Read-only knowledge retrieval specialist; returns a cited synthesis from attached KBs and bounded fresh sessions.",
+        "Read-only knowledge retrieval specialist; composes cited KB search primitives and reads into a concise synthesis.",
         AgentMode::Subagent,
-        &["knowledge_retrieve"],
+        &["read", "semantic_search", "structured_search"],
         crate::engine::builtin::KNOWLEDGE_PROMPT,
         None,
     )
@@ -1062,8 +1061,12 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"knowledge"));
         assert_eq!(
             def.tools,
-            Some(vec!["knowledge_retrieve".to_string()]),
-            "the KB specialist receives only its read-only composite retrieval tool"
+            Some(vec![
+                "read".to_string(),
+                "semantic_search".to_string(),
+                "structured_search".to_string(),
+            ]),
+            "the KB specialist receives only native read and its read-only search primitives"
         );
         for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
             assert!(
@@ -1076,8 +1079,8 @@ mod tests {
             );
         }
         assert!(
-            def.prompt.contains("knowledge_retrieve"),
-            "the specialist prompt must direct every request through provider-backed retrieval"
+            def.prompt.contains("semantic_search") && def.prompt.contains("structured_search"),
+            "the specialist prompt must direct retrieval through both provider-backed search primitives"
         );
     }
 }

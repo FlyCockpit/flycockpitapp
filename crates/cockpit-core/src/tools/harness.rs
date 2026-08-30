@@ -327,6 +327,11 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
+        // The dispatcher normally applies this fence, but direct tool callers
+        // must not be able to hand ambient filesystem access to a harness.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
         // An external harness is an OS subprocess, not a Cockpit native tool.
         // We do not yet have an OS confinement primitive that can prove every
         // configured harness operation stays within a workspace lease's
@@ -760,6 +765,42 @@ mod tests {
             .call(invoke_args(), ctx)
             .await
             .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn direct_invoke_keeps_local_knowledge_host_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(workspace.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![
+                        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                            "private".to_string(),
+                            "Private".to_string(),
+                            "Private local knowledge".to_string(),
+                            crate::config::extended::KnowledgeBaseSource::Local {
+                                path: workspace.path().join("knowledge"),
+                            },
+                            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                            None,
+                            None,
+                            false,
+                            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let error = HarnessInvokeTool
+            .call(invoke_args(), &ctx)
+            .await
+            .expect_err("direct harness calls must not receive a local KB host path");
+        assert!(error.to_string().contains("knowledge bases are read-only"));
     }
 
     #[test]

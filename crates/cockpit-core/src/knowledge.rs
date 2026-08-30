@@ -4545,6 +4545,11 @@ pub(crate) async fn ensure_local_knowledge_media_path_access(
 /// their entire operation whenever a local KB root is withheld from the
 /// model. Native `glob` and `grep` prove their requested root and filter each
 /// discovered entry, so they remain available to browse attached roots.
+///
+/// A smaller set of opaque host tools can mutate through an ambient process
+/// even when their own Cockpit-facing interface is advisory or read-only.
+/// Those tools are unavailable whenever *any* local KB is attached: attached
+/// KBs are a read-only capability, not an ambient host write capability.
 pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
     const UNBOUNDED_HOST_ACCESS_TOOLS: &[&str] = &[
         "code",
@@ -4567,6 +4572,18 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "word",
         "worktree_orchestrate",
     ];
+    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] =
+        &["harness_invoke", "lsp", "worktree_orchestrate"];
+
+    if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
+        && !configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
+            .await
+            .is_empty()
+    {
+        bail!(
+            "access denied: `{tool_name}` is unavailable because attached local knowledge bases are read-only"
+        );
+    }
     if UNBOUNDED_HOST_ACCESS_TOOLS.contains(&tool_name)
         && !denied_local_knowledge_roots(ctx).await?.is_empty()
     {
@@ -7748,6 +7765,51 @@ timestamp: 2026-08-29T12:00:00Z
                 .await
                 .unwrap();
         assert_eq!(denied, vec![home.join("knowledge")]);
+    }
+
+    #[tokio::test]
+    async fn opaque_write_capable_host_tools_preserve_attached_kb_read_only_policy() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let knowledge_root = tmp.path().join("knowledge");
+        write_bundle(&knowledge_root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "ordinary".to_string(),
+            "Ordinary".to_string(),
+            "An attached read-only local source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                ExtendedConfig {
+                    knowledge_bases: vec![entry],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        // An ordinary attached KB remains readable through bounded inspection
+        // tools, but opaque host processes must not inherit a write path.
+        ensure_workspace_tool_access(&ctx, "code").await.unwrap();
+        for tool in ["harness_invoke", "lsp", "worktree_orchestrate"] {
+            let error = ensure_workspace_tool_access(&ctx, tool)
+                .await
+                .expect_err("opaque host tool must not receive ambient KB write access");
+            assert!(
+                error.to_string().contains("knowledge bases are read-only"),
+                "unexpected {tool} error: {error:#}"
+            );
+        }
     }
 
     #[tokio::test]

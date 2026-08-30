@@ -43,7 +43,7 @@ pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
 /// - MCP dispatch is deliberately unchanged because MCP schemas/results do not
 ///   participate in this host-owned marker contract;
 /// - the existing `ToolOutput` sandbox, exit-code, resource, and output-sidecar
-///   exclusions are expressed by `ToolOutput::result_schema` below.
+///   exclusions are expressed by `ToolOutput::result_metadata_schema` below.
 ///
 /// This is an ownership/type bound over every production `wire_input_json`
 /// consumer. Deferred write/edit reconciliation reads that already-projected
@@ -550,13 +550,59 @@ mod model_ephemeral_tests {
     }
 
     #[test]
-    fn default_result_schema_marks_existing_output_metadata() {
+    fn result_metadata_schema_marks_existing_output_metadata() {
         let metadata = json!({
             "sandbox": { "enabled": true },
             "resource": { "cpu": 1 },
             "exit_code": 1,
             "output_sidecar": { "stdout": "full" }
         });
+        assert_eq!(
+            strip_model_ephemeral_fields(&metadata, &ToolOutput::result_metadata_schema()),
+            json!({}),
+            "ToolOutput audit metadata remains model-ephemeral"
+        );
+    }
+
+    #[test]
+    fn native_result_schema_keeps_its_own_ref_root_and_field_namespace() {
+        let native_schema = json!({
+            "$defs": {
+                "result": {
+                    "type": "object",
+                    "properties": {
+                        "visible": { "type": "string" },
+                        "secret": { "x-cockpit-model-ephemeral": true },
+                        "sandbox": { "type": "string" },
+                        "resource": { "type": "string" },
+                        "exit_code": { "type": "integer" },
+                        "output_sidecar": { "type": "string" }
+                    }
+                }
+            },
+            "$ref": "#/$defs/result"
+        });
+        let result = json!({
+            "visible": "shown",
+            "secret": "never replayed",
+            "sandbox": "ordinary result field",
+            "resource": "ordinary result field",
+            "exit_code": 0,
+            "output_sidecar": "ordinary result field"
+        });
+
+        assert_eq!(
+            strip_model_ephemeral_fields(&result, &native_schema),
+            json!({
+                "visible": "shown",
+                "sandbox": "ordinary result field",
+                "resource": "ordinary result field",
+                "exit_code": 0,
+                "output_sidecar": "ordinary result field"
+            }),
+            "native schemas retain local $ref resolution and do not inherit ToolOutput metadata markers"
+        );
+
         let native_schema = json!({
             "type": "object",
             "properties": {
@@ -564,17 +610,10 @@ mod model_ephemeral_tests {
                 "secret": { "x-cockpit-model-ephemeral": true }
             }
         });
-        let projection_schema = ToolOutput::result_projection_schema(&native_schema);
-
-        assert_eq!(
-            strip_model_ephemeral_fields(&metadata, &projection_schema),
-            json!({}),
-            "native result schemas retain the mandatory ToolOutput metadata exclusions"
-        );
         assert_eq!(
             strip_model_ephemeral_fields(
                 &json!({"visible": "shown", "secret": "never replayed"}),
-                &projection_schema,
+                &native_schema,
             ),
             json!({"visible": "shown"}),
             "the native schema's own result-field markers remain active"
@@ -841,10 +880,9 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for structured tool-result fields. This is deliberately
     /// separate from the provider-visible argument schema: result fields are
     /// produced by the host, persisted for the transcript, and then projected
-    /// into model history at store time. The dispatcher always composes this
-    /// with the mandatory [`ToolOutput`] metadata schema, so an override only
-    /// adds result-field markers and cannot make audit metadata model-visible.
-    /// The default carries no additional result-field markers.
+    /// into model history at store time. This schema governs canonical result
+    /// contents only; [`ToolOutput`] audit metadata is projected independently
+    /// with its own schema. The default carries no result-field markers.
     fn result_schema(&self) -> Value {
         serde_json::json!({})
     }
@@ -1288,7 +1326,7 @@ impl ToolOutput {
     /// Schema for the structured, timeline-only metadata every tool output may
     /// carry. Keeping this marker list beside the output shape replaces the
     /// dispatcher's former hand-maintained model-exclusion list.
-    pub fn result_schema() -> Value {
+    pub fn result_metadata_schema() -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1300,22 +1338,12 @@ impl ToolOutput {
         })
     }
 
-    /// Compose a tool's declared result schema with the non-negotiable schema
-    /// for [`Self`] metadata. Result schemas describe both canonical JSON
-    /// content and the structured metadata projection, so this composition is
-    /// the single boundary that preserves the legacy metadata exclusions when
-    /// a native tool declares its own result fields.
-    pub fn result_projection_schema(tool_schema: &Value) -> Value {
-        serde_json::json!({
-            "allOf": [Self::result_schema(), tool_schema]
-        })
-    }
-
     /// Durable structured metadata, retained for the timeline/export surface.
     /// Its model projection is derived at dispatch through
-    /// [`Self::result_projection_schema`], which always includes
-    /// [`Self::result_schema`] alongside a native tool's declared result
-    /// fields.
+    /// [`Self::result_metadata_schema`]. This is intentionally distinct from
+    /// a native tool's result-content schema: the two describe different JSON
+    /// object namespaces, and native schemas must retain their own `$ref`
+    /// root.
     pub fn result_metadata(&self) -> serde_json::Map<String, Value> {
         let mut metadata = serde_json::Map::new();
         if let Some(sandbox) = &self.sandbox

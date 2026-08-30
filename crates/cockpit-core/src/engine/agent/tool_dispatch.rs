@@ -1910,22 +1910,18 @@ async fn execute_ordinary_call_unscoped(
         Ok(out) => out.result_metadata(),
         Err(_) => serde_json::Map::new(),
     };
-    // The tool schema supplies marker declarations for its canonical result
-    // fields. `ToolOutput` owns audit metadata, whose exclusions must remain
-    // mandatory even when a native tool overrides its result schema.
-    let model_result_schema = env
+    // Canonical result contents and ToolOutput audit metadata are distinct JSON
+    // namespaces. Keep the native schema as its own projection root so local
+    // references such as `#/$defs/result` resolve against the schema that
+    // declared them; metadata uses ToolOutput's fixed marker schema instead.
+    let model_result_contents_schema = env
         .active_tools
         .get(resolved_name)
-        .map(|tool| ToolOutput::result_projection_schema(&tool.result_schema()));
-    let model_result_metadata = model_result_schema
-        .as_ref()
-        .map(|schema| {
-            crate::engine::tool::strip_model_ephemeral_fields(
-                &Value::Object(result_metadata.clone()),
-                schema,
-            )
-        })
-        .unwrap_or_else(|| Value::Object(result_metadata.clone()));
+        .map(|tool| tool.result_schema());
+    let model_result_metadata = crate::engine::tool::strip_model_ephemeral_fields(
+        &Value::Object(result_metadata.clone()),
+        &ToolOutput::result_metadata_schema(),
+    );
     // Part B: `bash`'s sandbox-state sub-object for the tool_call event.
     // Only `bash` populates it; every other tool leaves it `None`, so the
     // event omits the `sandbox` key. Never model-facing (token economy).
@@ -2025,7 +2021,7 @@ async fn execute_ordinary_call_unscoped(
         .as_ref()
         .ok()
         .map(|output| {
-            model_result_schema
+            model_result_contents_schema
                 .as_ref()
                 .map(|schema| output.content.strip_model_ephemeral_fields(schema))
                 .unwrap_or_else(|| Ok(output.content.clone()))
@@ -3226,18 +3222,34 @@ mod tests {
 
         fn result_schema(&self) -> Value {
             serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "visible": { "type": "string" },
-                    "secret": { "type": "string", "x-cockpit-model-ephemeral": true }
-                }
+                "$defs": {
+                    "result": {
+                        "type": "object",
+                        "properties": {
+                            "visible": { "type": "string" },
+                            "secret": { "type": "string", "x-cockpit-model-ephemeral": true },
+                            "sandbox": { "type": "string" },
+                            "resource": { "type": "string" },
+                            "exit_code": { "type": "integer" },
+                            "output_sidecar": { "type": "string" }
+                        }
+                    }
+                },
+                "$ref": "#/$defs/result"
             })
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
             ToolOutput::canonical(vec![
                 crate::typed_media_result::CanonicalToolResultContent::Json {
-                    value: serde_json::json!({"visible": "kept result", "secret": "result sentinel"}),
+                    value: serde_json::json!({
+                        "visible": "kept result",
+                        "secret": "result sentinel",
+                        "sandbox": "native sandbox result",
+                        "resource": "native resource result",
+                        "exit_code": 73,
+                        "output_sidecar": "native sidecar result"
+                    }),
                 },
             ])
             .map(|output| {
@@ -4079,6 +4091,25 @@ mod tests {
                 _ => None,
             })
             .expect("tool result text")
+    }
+
+    fn last_tool_result_json(history: &[Message]) -> Value {
+        let Some(Message::User { content }) = history.last() else {
+            panic!("expected trailing tool result, got {history:?}");
+        };
+        content
+            .iter()
+            .find_map(|part| match part {
+                UserContent::ToolResult(result) => result.content.iter().find_map(|result_part| {
+                    if let ToolResultContent::Json { value } = result_part {
+                        Some(value.clone())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            })
+            .expect("tool result JSON")
     }
 
     fn history_has_tool_result(history: &[Message], call_id: &str) -> bool {
@@ -6220,6 +6251,9 @@ mod tests {
         const SANDBOX_SECRET: &str = "sandbox metadata sentinel";
         const RESOURCE_SECRET: &str = "resource metadata sentinel";
         const SIDECAR_SECRET: &str = "sidecar metadata sentinel";
+        const NATIVE_SANDBOX: &str = "native sandbox result";
+        const NATIVE_RESOURCE: &str = "native resource result";
+        const NATIVE_SIDECAR: &str = "native sidecar result";
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(ModelEphemeralTool));
         let agent = test_agent(tools.clone());
@@ -6263,7 +6297,11 @@ mod tests {
         assert!(!live_wire.contains(SANDBOX_SECRET), "{live_wire}");
         assert!(!live_wire.contains(RESOURCE_SECRET), "{live_wire}");
         assert!(!live_wire.contains(SIDECAR_SECRET), "{live_wire}");
-        assert!(!live_wire.contains("exit_code"), "{live_wire}");
+        assert!(!live_wire.contains("987654321"), "{live_wire}");
+        assert!(live_wire.contains(NATIVE_SANDBOX), "{live_wire}");
+        assert!(live_wire.contains(NATIVE_RESOURCE), "{live_wire}");
+        assert!(live_wire.contains(NATIVE_SIDECAR), "{live_wire}");
+        assert_eq!(last_tool_result_json(&live_history)["exit_code"], 73);
         assert_eq!(
             assistant_call_args(&live_history),
             serde_json::json!({"visible": "kept argument"})
@@ -6297,6 +6335,11 @@ mod tests {
                 .to_string()
                 .contains(RESULT_SECRET)
         );
+        assert!(
+            event.data["canonical_output_text"]
+                .to_string()
+                .contains(NATIVE_SANDBOX)
+        );
 
         let restarted =
             crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
@@ -6309,9 +6352,13 @@ mod tests {
         assert!(!restart_wire.contains(SANDBOX_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(RESOURCE_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(SIDECAR_SECRET), "{restart_wire}");
-        assert!(!restart_wire.contains("exit_code"), "{restart_wire}");
+        assert!(!restart_wire.contains("987654321"), "{restart_wire}");
         assert!(restart_wire.contains("kept argument"), "{restart_wire}");
         assert!(restart_wire.contains("kept result"), "{restart_wire}");
+        assert!(restart_wire.contains(NATIVE_SANDBOX), "{restart_wire}");
+        assert!(restart_wire.contains(NATIVE_RESOURCE), "{restart_wire}");
+        assert!(restart_wire.contains(NATIVE_SIDECAR), "{restart_wire}");
+        assert_eq!(last_tool_result_json(&restarted.history)["exit_code"], 73);
     }
 
     #[tokio::test]

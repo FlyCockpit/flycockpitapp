@@ -3504,6 +3504,7 @@ mod steering_tests {
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),
             ("history_search", ToolEffect::ReadOnly),
+            ("thread_start", ToolEffect::Mutating),
             ("skill", ToolEffect::Dynamic),
             ("skill_manage", ToolEffect::Dynamic),
             ("spawn", ToolEffect::Dynamic),

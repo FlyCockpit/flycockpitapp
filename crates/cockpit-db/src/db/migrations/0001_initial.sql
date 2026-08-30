@@ -2774,7 +2774,8 @@ CREATE TABLE session_events (
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
         'goal_progress_diagnostic', 'resource_promotion', 'notice',
-        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree'
+        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree',
+        'thread_anchor'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

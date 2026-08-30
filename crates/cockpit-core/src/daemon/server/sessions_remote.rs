@@ -172,8 +172,21 @@ pub(super) async fn fork_session(
     parent_session_id: Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
+    fresh_thread: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    if fresh_thread && ephemeral {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "a fresh thread cannot be ephemeral".to_string(),
+        });
+    }
+    if fresh_thread && fork_point_turn_id.is_none() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "a fresh thread requires a message anchor".to_string(),
+        });
+    }
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -190,6 +203,7 @@ pub(super) async fn fork_session(
             parent_session_id,
             fork_point,
             ephemeral,
+            fresh_thread,
             session_id,
             now,
         )?;

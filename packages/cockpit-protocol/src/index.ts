@@ -1032,6 +1032,7 @@ const requestParamSchemas = {
       parent_session_id: uuidSchema,
       fork_point_turn_id: z.string().nullable().optional(),
       ephemeral: z.boolean().optional(),
+      fresh_thread: z.boolean().optional(),
     })
     .strict(),
   fs_create_dir: z.object({ project_root: projectRootSchema, path: z.string() }).strict(),

@@ -355,6 +355,7 @@ impl Session {
                     parent_session_id,
                     fork_point_turn_id,
                     false,
+                    false,
                     Uuid::new_v4(),
                     Utc::now().timestamp_millis(),
                 )
@@ -735,6 +736,7 @@ impl Session {
                     conn,
                     parent_session_id,
                     fork_point_turn_id,
+                    false,
                     false,
                     Uuid::new_v4(),
                     Utc::now().timestamp_millis(),

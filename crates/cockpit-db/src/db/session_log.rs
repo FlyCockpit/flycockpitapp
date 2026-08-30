@@ -167,10 +167,14 @@ pub enum SessionEventKind {
     /// data/export only: the event is an ordered invalidation, not a tree
     /// snapshot or a resolver-context carrier.
     AgentTree,
+    /// A fresh child thread's pointer to the message in its parent that
+    /// prompted it. The payload carries identifiers only, never copied parent
+    /// text, and does not enter the child's model context.
+    ThreadAnchor,
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -200,6 +204,7 @@ impl SessionEventKind {
         Self::HookRun,
         Self::ToolCallScheduling,
         Self::AgentTree,
+        Self::ThreadAnchor,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -233,6 +238,7 @@ impl SessionEventKind {
             SessionEventKind::HookRun => "hook_run",
             SessionEventKind::ToolCallScheduling => "tool_call_scheduling",
             SessionEventKind::AgentTree => "agent_tree",
+            SessionEventKind::ThreadAnchor => "thread_anchor",
         }
     }
 }
@@ -2080,9 +2086,9 @@ mod tests {
             SessionEventKind::ToolCallScheduling.as_str(),
             "tool_call_scheduling"
         );
-        // The closed inventory has 29 kinds (appended, not substituted) and
+        // The closed inventory has 30 kinds (appended, not substituted) and
         // every wire string is distinct.
-        assert_eq!(SessionEventKind::ALL.len(), 29);
+        assert_eq!(SessionEventKind::ALL.len(), 30);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
         assert_eq!(
             unique.len(),

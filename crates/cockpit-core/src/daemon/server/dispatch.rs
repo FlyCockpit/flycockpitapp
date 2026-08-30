@@ -11562,6 +11562,7 @@ async fn handle_serialized_request_impl(
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
+            fresh_thread,
         } => {
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
@@ -11572,6 +11573,7 @@ async fn handle_serialized_request_impl(
                         parent_session_id,
                         fork_point_turn_id: fork_point_turn_id.clone(),
                         ephemeral,
+                        fresh_thread,
                     },
                     operation,
                 )?;
@@ -11581,6 +11583,7 @@ async fn handle_serialized_request_impl(
                     parent_session_id,
                     fork_point_turn_id,
                     ephemeral,
+                    fresh_thread,
                     &ledger,
                 )
                 .await;
@@ -11591,6 +11594,7 @@ async fn handle_serialized_request_impl(
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
+                fresh_thread,
             )
             .await
         }

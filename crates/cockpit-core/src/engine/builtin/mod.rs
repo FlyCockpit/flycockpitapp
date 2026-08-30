@@ -548,6 +548,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_list",
         "harness_invoke",
         "history_search",
+        "thread_start",
         "knowledge_retrieve",
         "todo",
         "write",
@@ -696,6 +697,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             name: "history_search",
             summary: "Search persisted history by scope.",
             condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "thread_start",
+            summary: "Start a fresh child thread from a recorded message.",
+            condition: Some("interactive assistant sessions"),
         },
         BuiltinToolInventoryItem {
             family: "Knowledge",
@@ -930,6 +937,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::return_tool::ReturnTool),
         Arc::new(tools::plan_doc::StartBuildTool),
         Arc::new(tools::session_search::HistorySearchTool),
+        Arc::new(tools::thread_start::ThreadStartTool),
         Arc::new(tools::todo::TodoTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
@@ -1058,6 +1066,7 @@ pub(crate) fn materialize_tool_by_name(
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
         "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
+        "thread_start" => tb.with(Arc::new(tools::thread_start::ThreadStartTool)),
         "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                 .cloned(),
@@ -2732,7 +2741,7 @@ fn test_host_tool_surface(cwd: &Path, name: &str) -> Option<Vec<String>> {
 fn default_assistant_tools() -> Vec<String> {
     let mut tools = default_custom_tools();
     tools.extend(
-        ["mcp", "history_search", "skill_manage"]
+        ["mcp", "history_search", "thread_start", "skill_manage"]
             .into_iter()
             .map(str::to_string),
     );
@@ -6399,6 +6408,7 @@ pub(crate) mod tests {
         let names = known_agent_tool_names();
         assert!(names.contains(&"todo"));
         assert!(names.contains(&"history_search"));
+        assert!(names.contains(&"thread_start"));
         // `goal` is deliberately not a grantable/runtime tool: the session goal
         // is host/driver-owned durable state, not a tool an agent may mention in
         // `tools:` (see `worker_cannot_create_or_mutate_goal`). Its retired
@@ -6415,7 +6425,7 @@ pub(crate) mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "history_search"] {
+        for name in ["todo", "history_search", "thread_start"] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }

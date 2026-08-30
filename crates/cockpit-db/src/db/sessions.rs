@@ -1771,7 +1771,7 @@ impl Db {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
     ) -> Result<SessionRow> {
-        self.create_fork_inner(parent_session_id, fork_point_turn_id, false)
+        self.create_fork_inner(parent_session_id, fork_point_turn_id, false, false)
             .await
     }
 
@@ -1784,7 +1784,19 @@ impl Db {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
     ) -> Result<SessionRow> {
-        self.create_fork_inner(parent_session_id, fork_point_turn_id, true)
+        self.create_fork_inner(parent_session_id, fork_point_turn_id, true, false)
+            .await
+    }
+
+    /// Create a persistent child thread anchored to one message in its parent.
+    /// The thread starts with a fresh transcript; only its durable anchor
+    /// reference links it back to the source message.
+    pub async fn create_thread(
+        &self,
+        parent_session_id: Uuid,
+        anchor_turn_id: String,
+    ) -> Result<SessionRow> {
+        self.create_fork_inner(parent_session_id, Some(anchor_turn_id), false, true)
             .await
     }
 
@@ -1946,6 +1958,7 @@ impl Db {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
         ephemeral: bool,
+        fresh_thread: bool,
     ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
         let now_unix_ms = Utc::now().timestamp_millis();
@@ -1955,6 +1968,7 @@ impl Db {
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
+                fresh_thread,
                 session_id,
                 now_unix_ms,
             )
@@ -1967,6 +1981,7 @@ impl Db {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
         ephemeral: bool,
+        fresh_thread: bool,
         session_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<SessionRow> {
@@ -1978,6 +1993,7 @@ impl Db {
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
+            fresh_thread,
             session_id,
             now_unix_ms,
         )?;
@@ -1994,6 +2010,7 @@ impl Db {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
         ephemeral: bool,
+        fresh_thread: bool,
         session_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<SessionRow> {
@@ -2007,6 +2024,10 @@ impl Db {
             parent_session_id.to_string().as_str(),
             fork_point_turn_id.as_deref(),
         )?;
+        ensure!(
+            !fresh_thread || fork_point_turn_id.is_some(),
+            "a thread must be anchored to a parent message"
+        );
         let short_id = generate_unique_short_id(conn, &parent.project_id)
             .context("generating fork short_id")?;
         let row = SessionRow {
@@ -2041,8 +2062,8 @@ impl Db {
             ephemeral,
             btw_parent_session_id: None,
             btw_tangent: false,
-            user_content_tokens: parent.user_content_tokens,
-            title_stage: parent.title_stage,
+            user_content_tokens: if fresh_thread { 0 } else { parent.user_content_tokens },
+            title_stage: if fresh_thread { 0 } else { parent.title_stage },
             // A fork (plain or ephemeral `/side`) is a distinct session:
             // never inherit the parent's unconsumed recovery nudge.
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
@@ -2058,6 +2079,27 @@ impl Db {
         };
         let row = insert_fork_row_with_short_id_retry(conn, row, &fork_point_turn_id)
             .context("inserting fork session")?;
+        if fresh_thread {
+            let anchor_turn_id = fork_point_turn_id
+                .as_deref()
+                .expect("fresh threads require an anchor turn id");
+            crate::db::session_log::Db::insert_session_event_json_conn(
+                conn,
+                session_id,
+                crate::db::session_log::SessionEventKind::ThreadAnchor,
+                None,
+                None,
+                crate::db::session_log::SessionEventContext::default(),
+                now_unix_ms,
+                &serde_json::json!({
+                    "parent_session_id": parent_session_id,
+                    "parent_turn_id": anchor_turn_id,
+                })
+                .to_string(),
+            )
+            .context("recording thread anchor")?;
+            return Ok(row);
+        }
         copy_fork_transcript(
             conn,
             parent_session_id,
@@ -5903,6 +5945,34 @@ mod tests {
         // Idempotent: a second call returns the same id, doesn't churn.
         let again = db.ensure_short_id(s.session_id).await.unwrap();
         assert_eq!(again, backfilled);
+    }
+
+    #[tokio::test]
+    async fn thread_starts_fresh_with_only_a_durable_anchor_reference() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "assistant").await.unwrap();
+        record_message(&db, parent.session_id, "keep this out", false).await;
+        let anchor = record_message(&db, parent.session_id, "start here", true).await;
+
+        let thread = db
+            .create_thread(parent.session_id, anchor.to_string())
+            .await
+            .unwrap();
+
+        let anchor_str = anchor.to_string();
+        assert_eq!(thread.parent_session_id, Some(parent.session_id));
+        assert_eq!(thread.fork_point_turn_id.as_deref(), Some(anchor_str.as_str()));
+        assert!(!thread.ephemeral);
+        assert_eq!(thread.user_content_tokens, 0);
+        assert_eq!(thread.title_stage, 0);
+
+        let events = db.list_session_events(thread.session_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SessionEventKind::ThreadAnchor.as_str());
+        let data: serde_json::Value = serde_json::from_str(&events[0].data_json).unwrap();
+        assert_eq!(data["parent_session_id"], parent.session_id.to_string());
+        assert_eq!(data["parent_turn_id"], anchor_str);
+        assert_eq!(db.list_session_events(parent.session_id).await.unwrap().len(), 2);
     }
 
     // ---- `/side` ephemeral side-conversation forks (migration 0017) -------

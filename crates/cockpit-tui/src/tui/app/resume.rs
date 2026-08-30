@@ -419,6 +419,7 @@ impl App {
                             parent_session_id,
                             fork_point_turn_id,
                             false,
+                            false,
                         )?;
                         Ok(AsyncActionPayload::ForkCreated {
                             parent_session_id,

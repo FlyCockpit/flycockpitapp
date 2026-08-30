@@ -534,6 +534,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "promote_to_persistent",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "exit_guard_status",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2870,9 +2875,9 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 224);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 147);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 85);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 232);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 156);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 84);
     }
 
     #[test]

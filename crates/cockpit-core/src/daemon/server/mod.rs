@@ -66,6 +66,7 @@ fn start_persistent_scheduler(
     db: &Db,
     registry: &SessionRegistry,
     shutdown: &crate::daemon::shutdown::ShutdownSignal,
+    start_gate: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Option<DaemonSchedulerHandle> {
     #[cfg(feature = "extended")]
     {
@@ -80,12 +81,12 @@ fn start_persistent_scheduler(
                 Arc::new(crate::daemon::scheduler::SystemClock),
                 executor,
             ))
-            .start_with_callbacks(shutdown.clone(), callbacks),
+            .start_with_callbacks_gated(shutdown.clone(), callbacks, start_gate),
         )
     }
     #[cfg(not(feature = "extended"))]
     {
-        let _ = (db, registry, shutdown);
+        let _ = (db, registry, shutdown, start_gate);
         None
     }
 }
@@ -2347,6 +2348,7 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 
 struct PromotedPersistentServices {
     media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    service_start_gate: Option<tokio::sync::watch::Sender<bool>>,
     #[cfg(feature = "extended")]
     image_generation_worker: Option<tokio::task::JoinHandle<()>>,
 }
@@ -2358,6 +2360,7 @@ struct PromotedPersistentServices {
 struct PreparedPersistentServices {
     resource_scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
     media_storage_recovery: Arc<crate::media_storage::MediaStorageRecovery>,
+    service_start_gate: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "extended")]
     image_generation_artifact_root:
         Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
@@ -2377,6 +2380,7 @@ impl PromotedPersistentServices {
     fn empty() -> Self {
         Self {
             media_storage_recovery: None,
+            service_start_gate: None,
             #[cfg(feature = "extended")]
             image_generation_worker: None,
         }
@@ -2610,12 +2614,20 @@ impl DaemonContext {
         let services = self.prepare_persistent_services()?;
         let mut persistent_paths = self.paths.clone();
         persistent_paths.ephemeral = false;
-        self.write_persistent_endpoint_record(&persistent_paths)?;
-        // The endpoint and lifetime state form the publication boundary. Only
-        // after both commit may any scheduler, media authority, or worker be
-        // made visible or started.
-        self.ephemeral_lifetime.store(false, Ordering::Release);
+        let _service_transition = self.registry.lock_persistent_service_transition();
+        // Install every persistent service authority before publishing the
+        // lifetime or persistent endpoint. `restart_decision` keeps the
+        // reaper and lifetime snapshots outside this transition, and the
+        // synchronous registry setters make the authorities available to
+        // production consumers before either final publication store below.
         self.activate_persistent_services(services);
+        self.ephemeral_lifetime.store(false, Ordering::Release);
+        if let Err(error) = self.write_persistent_endpoint_record(&persistent_paths) {
+            self.ephemeral_lifetime.store(true, Ordering::Release);
+            self.deactivate_persistent_services();
+            return Err(error);
+        }
+        self.start_persistent_service_tasks();
         self.clear_exit_guard_reservation(exit_guard_reservation);
         self.broadcast_global(proto::Event::DaemonLifetimeChanged {
             ephemeral_owner: false,
@@ -2675,24 +2687,33 @@ impl DaemonContext {
     /// Return the currently installed durable scheduler without retaining the
     /// installation lock across an async scheduler operation.
     pub(crate) fn scheduler(&self) -> Option<DaemonSchedulerHandle> {
+        // Prepared promotion services are deliberately not observable while
+        // this owner still has ephemeral lifetime. This makes the lifetime
+        // store below the single publication edge for scheduler admission.
+        if self.is_ephemeral_lifetime() {
+            return None;
+        }
         crate::sync::lock_or_recover(&self.scheduler).clone()
     }
 
-    /// Start the durable scheduler after the persistent publication boundary
-    /// has committed. Starting it earlier would let a promotion that later
-    /// fails endpoint publication execute durable jobs as an ephemeral owner.
-    fn install_persistent_scheduler(&self) {
+    /// Install the durable scheduler with a closed start gate. Its loop opens
+    /// only after endpoint and lifetime publication commit, so a failed
+    /// promotion cannot dispatch durable work.
+    fn install_persistent_scheduler(&self, start_gate: tokio::sync::watch::Receiver<bool>) {
         let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
         if scheduler.is_some() {
             return;
         }
-        if let Some(handle) = start_persistent_scheduler(&self.db, &self.registry, &self.shutdown) {
+        if let Some(handle) =
+            start_persistent_scheduler(&self.db, &self.registry, &self.shutdown, Some(start_gate))
+        {
             self.registry.set_scheduler(handle.clone());
             *scheduler = Some(handle);
         }
     }
 
     fn prepare_persistent_services(&self) -> Result<PreparedPersistentServices> {
+        let (service_start_gate, _) = tokio::sync::watch::channel(false);
         let resource_scheduler =
             Arc::new(crate::engine::resource_scheduler::ResourceScheduler::new(
                 ExtendedConfig::default().resource_scheduler,
@@ -2722,18 +2743,18 @@ impl DaemonContext {
         Ok(PreparedPersistentServices {
             resource_scheduler,
             media_storage_recovery: media_storage,
+            service_start_gate,
             #[cfg(feature = "extended")]
             image_generation_artifact_root,
         })
     }
 
-    /// Publish prepared persistent services only after `promote_to_persistent`
-    /// has committed endpoint and lifetime state while holding
-    /// `restart_decision`.
+    /// Install prepared persistent services while `promote_to_persistent`
+    /// holds `restart_decision`, before endpoint and lifetime publication.
     fn activate_persistent_services(&self, services: PreparedPersistentServices) {
         self.registry
             .set_resource_scheduler(Some(services.resource_scheduler));
-        self.install_persistent_scheduler();
+        self.install_persistent_scheduler(services.service_start_gate.subscribe());
         self.registry
             .set_media_storage_recovery(Some(services.media_storage_recovery.clone()));
         self.registry.set_message_media_authority(
@@ -2751,11 +2772,12 @@ impl DaemonContext {
         let mut promoted_services =
             crate::sync::lock_or_recover(&self.promoted_persistent_services);
         promoted_services.media_storage_recovery = Some(services.media_storage_recovery);
+        promoted_services.service_start_gate = Some(services.service_start_gate.clone());
         #[cfg(feature = "extended")]
         {
             let dispatch = self.registry.image_generation_dispatch_registry();
             promoted_services.image_generation_worker = Some(
-                crate::daemon::image_generation_worker::spawn_image_generation_worker(
+                crate::daemon::image_generation_worker::spawn_image_generation_worker_gated(
                     self.db.clone(),
                     self.image_generation_boot_id,
                     self.started_at,
@@ -2764,14 +2786,52 @@ impl DaemonContext {
                     Arc::new(dispatch),
                     services.image_generation_artifact_root,
                     self.shutdown.clone(),
+                    Some(services.service_start_gate.subscribe()),
                 ),
             );
+        }
+    }
+
+    /// Undo a not-yet-published promotion. Endpoint publication is the only
+    /// fallible step after service preparation; no persistent service may
+    /// remain reachable if it fails.
+    fn deactivate_persistent_services(&self) {
+        self.registry.set_resource_scheduler(None);
+        self.registry.clear_scheduler();
+        if let Some(scheduler) = crate::sync::lock_or_recover(&self.scheduler).take() {
+            scheduler.abort();
+        }
+        self.registry.set_media_storage_recovery(None);
+        self.registry.clear_message_media_authority();
+        self.registry.clear_tool_media_runtime();
+        let mut promoted_services =
+            crate::sync::lock_or_recover(&self.promoted_persistent_services);
+        promoted_services.media_storage_recovery = None;
+        promoted_services.service_start_gate = None;
+        #[cfg(feature = "extended")]
+        if let Some(worker) = promoted_services.image_generation_worker.take() {
+            worker.abort();
+        }
+    }
+
+    /// Release task loops only after endpoint and lifetime publication. The
+    /// handles are already available to persistent consumers, but no durable
+    /// scheduler or worker can dispatch before that publication succeeds.
+    fn start_persistent_service_tasks(&self) {
+        if let Some(start_gate) = crate::sync::lock_or_recover(&self.promoted_persistent_services)
+            .service_start_gate
+            .as_ref()
+        {
+            let _ = start_gate.send(true);
         }
     }
 
     pub(crate) fn active_media_storage_recovery(
         &self,
     ) -> Option<Arc<crate::media_storage::MediaStorageRecovery>> {
+        if self.is_ephemeral_lifetime() {
+            return None;
+        }
         crate::sync::lock_or_recover(&self.promoted_persistent_services)
             .media_storage_recovery
             .clone()
@@ -2932,7 +2992,7 @@ impl DaemonContext {
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
         let scheduler = (!paths.ephemeral)
-            .then(|| start_persistent_scheduler(&db, &registry, &shutdown))
+            .then(|| start_persistent_scheduler(&db, &registry, &shutdown, None))
             .flatten();
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());

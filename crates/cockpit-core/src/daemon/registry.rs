@@ -190,6 +190,9 @@ struct Inner {
         Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
+    /// Serializes the all-or-nothing persistent-service snapshot copied into
+    /// a newly created session with an in-place lifetime promotion.
+    persistent_service_transition: Mutex<()>,
     resource_scheduler: Mutex<Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>>,
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     /// Durable write-scope authority. Late-installed like `scheduler`: the
@@ -669,6 +672,7 @@ impl SessionRegistry {
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
+                persistent_service_transition: Mutex::new(()),
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
                 message_media_authority: Arc::new(Mutex::new(None)),
@@ -721,6 +725,13 @@ impl SessionRegistry {
 
     pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
         *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
+    }
+
+    /// Fence a promotion's service installation against the synchronous
+    /// session-worker construction snapshot. The guard is never held across
+    /// an await by either side.
+    pub(crate) fn lock_persistent_service_transition(&self) -> std::sync::MutexGuard<'_, ()> {
+        crate::sync::lock_or_recover(&self.inner.persistent_service_transition)
     }
 
     pub fn set_media_storage_recovery(
@@ -1993,6 +2004,10 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        // A concurrent promotion either finishes its complete service bundle
+        // before this snapshot, or this new session keeps the coherent
+        // pre-promotion bundle. It can never retain an intermediate mix.
+        let _persistent_service_transition = self.lock_persistent_service_transition();
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
         self.copy_tool_media_runtime_to_session(&session);
@@ -2963,6 +2978,7 @@ mod tests {
         scheduler.start_with_sleeper(
             ShutdownSignal::new(),
             Arc::new(PendingSchedulerSleeper),
+            None,
             None,
         )
     }

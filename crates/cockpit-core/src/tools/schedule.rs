@@ -270,40 +270,97 @@ impl ForkScheduleState {
 /// Authority-owned handoff for the one idle wake that is currently executing.
 /// Exactly one side may take the state: the runner after a normal iteration or
 /// the authority when cancellation aborts that runner.
-pub type ActiveIdleWake = Arc<Mutex<Option<Arc<ForkScheduleState>>>>;
+pub type ActiveIdleWake = Arc<Mutex<ActiveIdleWakeState>>;
 
-pub fn new_active_idle_wake() -> ActiveIdleWake {
-    Arc::new(Mutex::new(None))
+#[derive(Default)]
+pub struct ActiveIdleWakeState {
+    cancelled: bool,
+    phase: ActiveIdleWakePhase,
 }
 
-pub fn install_active_idle_wake(active: &ActiveIdleWake, state: Arc<ForkScheduleState>) {
-    *active.lock().unwrap() = Some(state);
+#[derive(Default)]
+enum ActiveIdleWakePhase {
+    #[default]
+    Idle,
+    Running(Arc<ForkScheduleState>),
+    Publishing,
+}
+
+pub enum IdleWakeCancellationClaim {
+    Idle,
+    Running(Arc<ForkScheduleState>),
+    Publishing,
+}
+
+pub fn new_active_idle_wake() -> ActiveIdleWake {
+    Arc::new(Mutex::new(ActiveIdleWakeState::default()))
+}
+
+pub fn install_active_idle_wake(active: &ActiveIdleWake, state: Arc<ForkScheduleState>) -> bool {
+    let mut guard = active.lock().unwrap();
+    if guard.cancelled {
+        state.seal_for_cancellation();
+        return false;
+    }
+    debug_assert!(matches!(guard.phase, ActiveIdleWakePhase::Idle));
+    guard.phase = ActiveIdleWakePhase::Running(state);
+    true
 }
 
 pub fn take_active_idle_wake_for_cancellation(
     active: &ActiveIdleWake,
-) -> Option<Arc<ForkScheduleState>> {
-    let state = active.lock().unwrap().take();
-    if let Some(state) = state.as_ref() {
-        state.seal_for_cancellation();
+) -> IdleWakeCancellationClaim {
+    let mut guard = active.lock().unwrap();
+    guard.cancelled = true;
+    match std::mem::take(&mut guard.phase) {
+        ActiveIdleWakePhase::Idle => IdleWakeCancellationClaim::Idle,
+        ActiveIdleWakePhase::Running(state) => {
+            state.seal_for_cancellation();
+            IdleWakeCancellationClaim::Running(state)
+        }
+        ActiveIdleWakePhase::Publishing => {
+            guard.phase = ActiveIdleWakePhase::Publishing;
+            IdleWakeCancellationClaim::Publishing
+        }
     }
-    state
 }
 
-pub fn take_active_idle_wake_if(
+pub fn begin_active_idle_wake_publication(
     active: &ActiveIdleWake,
     expected: &Arc<ForkScheduleState>,
 ) -> bool {
     let mut guard = active.lock().unwrap();
-    if guard
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, expected))
-    {
-        guard.take();
-        true
-    } else {
-        false
+    match &guard.phase {
+        ActiveIdleWakePhase::Running(current) if Arc::ptr_eq(current, expected) => {
+            guard.phase = ActiveIdleWakePhase::Publishing;
+            true
+        }
+        _ => false,
     }
+}
+
+/// Release a completed no-op wake without granting it ownership of a durable
+/// event. A concurrent cancellation can still claim `Running` and publish its
+/// own terminal marker.
+pub fn finish_active_idle_wake_without_publication(
+    active: &ActiveIdleWake,
+    expected: &Arc<ForkScheduleState>,
+) -> bool {
+    let mut guard = active.lock().unwrap();
+    match &guard.phase {
+        ActiveIdleWakePhase::Running(current) if Arc::ptr_eq(current, expected) => {
+            guard.phase = ActiveIdleWakePhase::Idle;
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn finish_active_idle_wake_publication(active: &ActiveIdleWake) -> bool {
+    let mut guard = active.lock().unwrap();
+    debug_assert!(matches!(guard.phase, ActiveIdleWakePhase::Publishing));
+    guard.phase = ActiveIdleWakePhase::Idle;
+    guard.cancelled
 }
 
 /// Track a possibly effectful parent operation in an idle fork. The wrapper
@@ -814,13 +871,48 @@ mod tests {
         let active = new_active_idle_wake();
         let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
         assert!(state.push_note("already acted".into()));
-        install_active_idle_wake(&active, state.clone());
+        assert!(install_active_idle_wake(&active, state.clone()));
 
-        let claimed = take_active_idle_wake_for_cancellation(&active).unwrap();
+        let IdleWakeCancellationClaim::Running(claimed) =
+            take_active_idle_wake_for_cancellation(&active)
+        else {
+            panic!("cancellation must claim the running wake");
+        };
         assert!(Arc::ptr_eq(&claimed, &state));
         assert_eq!(claimed.take_notes(), vec!["already acted".to_string()]);
         assert!(!claimed.push_note("must not be lost after cancellation".into()));
-        assert!(take_active_idle_wake_for_cancellation(&active).is_none());
+        assert!(!install_active_idle_wake(
+            &active,
+            Arc::new(ForkScheduleState::new("late".into()))
+        ));
+    }
+
+    #[test]
+    fn cancellation_during_publication_leaves_the_event_with_the_runner() {
+        let active = new_active_idle_wake();
+        let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        assert!(install_active_idle_wake(&active, state.clone()));
+        assert!(begin_active_idle_wake_publication(&active, &state));
+        assert!(matches!(
+            take_active_idle_wake_for_cancellation(&active),
+            IdleWakeCancellationClaim::Publishing
+        ));
+        assert!(finish_active_idle_wake_publication(&active));
+    }
+
+    #[test]
+    fn no_op_release_does_not_claim_publication_or_block_the_next_wake() {
+        let active = new_active_idle_wake();
+        let no_op = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        assert!(install_active_idle_wake(&active, no_op.clone()));
+        assert!(finish_active_idle_wake_without_publication(&active, &no_op));
+
+        let next = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        assert!(install_active_idle_wake(&active, next.clone()));
+        assert!(matches!(
+            take_active_idle_wake_for_cancellation(&active),
+            IdleWakeCancellationClaim::Running(claimed) if Arc::ptr_eq(&claimed, &next)
+        ));
     }
 
     /// Minimal `ToolCtx` for unit-testing fork tools (they don't touch the

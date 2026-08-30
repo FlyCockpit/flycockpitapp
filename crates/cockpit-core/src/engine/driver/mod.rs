@@ -7942,6 +7942,13 @@ impl Driver {
             .observe_submission(submission.origin, has_oversized_artifact_lease);
     }
 
+    pub(crate) fn set_idle_activity_sender(
+        &mut self,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+    ) {
+        self.schedule.set_idle_activity_sender(sender);
+    }
+
     /// Tools whose in-flight execution can be adopted by the
     /// background-terminal/async machinery so `[send now]` injects without
     /// waiting for the call to finish. Never cancel/kill the in-flight call.
@@ -11794,7 +11801,7 @@ impl Driver {
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity().await;
                         }
-                        self.schedule.record_user_activity();
+                        self.schedule.record_materialized_user_activity();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {

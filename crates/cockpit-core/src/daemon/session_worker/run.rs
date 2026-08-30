@@ -6066,6 +6066,7 @@ pub(super) async fn run_worker(
     >,
     trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
+    idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
@@ -6863,6 +6864,7 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    driver.set_idle_activity_sender(idle_activity_tx);
     driver.bind_enqueue_target(foreground_input_target.clone());
     let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
     driver.set_adopted_process_registry(adopted_processes.clone());

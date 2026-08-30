@@ -50,7 +50,8 @@ use crate::engine::schedule::spec::{
 use crate::redact::RedactionTable;
 use crate::session::Session;
 use crate::tools::schedule::{
-    ActiveIdleWake, new_active_idle_wake, take_active_idle_wake_for_cancellation,
+    ActiveIdleWake, IdleWakeCancellationClaim, new_active_idle_wake,
+    take_active_idle_wake_for_cancellation,
 };
 
 use super::{background, swarm};
@@ -99,6 +100,14 @@ pub enum ScheduleEvent {
     /// An idle wake finished in its fork without a visible action. The driver
     /// releases the live slot without recording a transcript turn.
     EphemeralCompleted { job_id: String },
+    /// Cancellation raced an acting idle wake after the runner acquired
+    /// publication ownership. The acting event is ordered ahead of this
+    /// lifecycle-only marker; no synthetic cancellation turn is needed.
+    IdleWakePublicationCancelled {
+        job_id: String,
+        label: String,
+        kind: ScheduleKind,
+    },
     /// An idle wake took a visible action. Unlike [`Self::Completed`], this
     /// settles one wake but leaves the bounded idle loop registered for its
     /// later wakes. The driver injects this wake's result immediately.
@@ -404,6 +413,8 @@ pub struct ScheduleAuthority {
     /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
     /// user message resets their countdown without polling.
     idle_activity_tx: watch::Sender<Instant>,
+    /// True when daemon ingress publishes accepted inline/media activity.
+    ingress_activity_owned: bool,
 }
 
 impl ScheduleAuthority {
@@ -420,6 +431,14 @@ impl ScheduleAuthority {
     /// hands to every spawned job.
     pub fn set_write_scope_source(&mut self, write_scope: crate::write_scope::WriteScopeSource) {
         self.ctx.write_scope = Some(write_scope);
+    }
+
+    /// Bind the daemon-ingress activity epoch. The worker handle publishes to
+    /// this sender as soon as durable queue admission succeeds, independently
+    /// of whether the driver is currently executing a turn.
+    pub fn set_idle_activity_sender(&mut self, sender: watch::Sender<Instant>) {
+        self.idle_activity_tx = sender;
+        self.ingress_activity_owned = true;
     }
 
     /// Build an authority. `event_tx` is drained by the driver at the turn
@@ -444,6 +463,7 @@ impl ScheduleAuthority {
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
             idle_activity_tx,
+            ingress_activity_owned: false,
         }
     }
 
@@ -762,6 +782,18 @@ impl ScheduleAuthority {
     /// Reset this thread's idle schedules after an accepted external user
     /// message. Scheduled work and rejected input never call this method.
     pub fn record_user_activity(&self) {
+        if !self.ingress_activity_owned {
+            self.publish_user_activity();
+        }
+    }
+
+    /// Phase-two FCM2 materialization occurs inside the driver and therefore
+    /// remains the acceptance boundary even when ordinary ingress owns resets.
+    pub fn record_materialized_user_activity(&self) {
+        self.publish_user_activity();
+    }
+
+    fn publish_user_activity(&self) {
         let _ = self.idle_activity_tx.send(Instant::now());
     }
 
@@ -816,17 +848,21 @@ impl ScheduleAuthority {
         // effect records synchronously into this authority-owned state, so a
         // cancellation racing an in-flight wake cannot erase an action that
         // already happened.
-        let idle_wake = entry
+        let idle_wake_claim = entry
             .active_idle_wake
             .as_ref()
-            .and_then(take_active_idle_wake_for_cancellation);
+            .map(take_active_idle_wake_for_cancellation);
+        let publication_owned_by_runner = matches!(
+            &idle_wake_claim,
+            Some(IdleWakeCancellationClaim::Publishing)
+        );
         // Stop any armed tick timer + spawned task.
         if let Some(ic) = &mut entry.in_context
             && let Some(t) = ic.timer_abort.take()
         {
             t.abort();
         }
-        if let Some(a) = entry.abort.take() {
+        if !publication_owned_by_runner && let Some(a) = entry.abort.take() {
             a.abort();
         }
         if let Some(bg) = &entry.background {
@@ -851,43 +887,44 @@ impl ScheduleAuthority {
         // Ephemeral loops + background: the spawned task is aborted; we
         // synthesize the terminal completion here since the task won't get
         // to send its own.
-        else {
+        else if !publication_owned_by_runner {
             let was_swarm = entry.kind == ScheduleKind::Swarm;
-            let (result, requests) = if let Some(state) = idle_wake {
-                let notes = state.take_notes();
-                let requests = state.take_requests();
-                let actions = state.take_actions();
-                if notes.is_empty() && requests.is_empty() && actions.is_empty() {
+            let (result, requests) =
+                if let Some(IdleWakeCancellationClaim::Running(state)) = idle_wake_claim {
+                    let notes = state.take_notes();
+                    let requests = state.take_requests();
+                    let actions = state.take_actions();
+                    if notes.is_empty() && requests.is_empty() && actions.is_empty() {
+                        (
+                            format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                            requests,
+                        )
+                    } else {
+                        let mut result = format!(
+                            "{} `{}` cancelled after an acting idle wake.",
+                            entry.kind.as_str(),
+                            entry.label
+                        );
+                        if !actions.is_empty() {
+                            result.push_str("\nActions:");
+                            for action in actions {
+                                result.push_str(&format!("\n- {action}"));
+                            }
+                        }
+                        if !notes.is_empty() {
+                            result.push_str("\nNotes:");
+                            for note in notes {
+                                result.push_str(&format!("\n- {note}"));
+                            }
+                        }
+                        (result, requests)
+                    }
+                } else {
                     (
                         format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
-                        requests,
+                        Vec::new(),
                     )
-                } else {
-                    let mut result = format!(
-                        "{} `{}` cancelled after an acting idle wake.",
-                        entry.kind.as_str(),
-                        entry.label
-                    );
-                    if !actions.is_empty() {
-                        result.push_str("\nActions:");
-                        for action in actions {
-                            result.push_str(&format!("\n- {action}"));
-                        }
-                    }
-                    if !notes.is_empty() {
-                        result.push_str("\nNotes:");
-                        for note in notes {
-                            result.push_str(&format!("\n- {note}"));
-                        }
-                    }
-                    (result, requests)
-                }
-            } else {
-                (
-                    format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
-                    Vec::new(),
-                )
-            };
+                };
             self.send_terminal_event(ScheduleEvent::Completed {
                 job_id: entry.job_id.clone(),
                 label: entry.label.clone(),
@@ -1546,7 +1583,8 @@ mod tests {
                         )
                     }
                     ScheduleEvent::EphemeralCompleted { .. } => {}
-                    ScheduleEvent::IdleWakeCompleted { .. } => {}
+                    ScheduleEvent::IdleWakeCompleted { .. }
+                    | ScheduleEvent::IdleWakePublicationCancelled { .. } => {}
                     ScheduleEvent::Completed { .. } => break,
                     ScheduleEvent::LoopIterationDue { .. } => {}
                 }

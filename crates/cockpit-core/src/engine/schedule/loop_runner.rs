@@ -31,7 +31,8 @@ use crate::engine::tool::ToolBox;
 use crate::intel::budget::BudgetedWriter;
 use crate::tools::schedule::{
     ActiveIdleWake, ForkScheduleState, ForkScheduleTool, IdleWakeActionTool, NoteTool,
-    install_active_idle_wake, take_active_idle_wake_if,
+    begin_active_idle_wake_publication, finish_active_idle_wake_publication,
+    finish_active_idle_wake_without_publication, install_active_idle_wake,
 };
 
 use super::{ASYNC_RESULT_TOKEN_CAP, FORK_HISTORY_BYTE_CAP, FORK_HISTORY_MESSAGE_CAP};
@@ -195,7 +196,9 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             .clone()
             .unwrap_or_else(|| Arc::new(ForkScheduleState::new(job_id.clone())));
         if let Some(active_idle_wake) = active_idle_wake.as_ref() {
-            install_active_idle_wake(active_idle_wake, state.clone());
+            if !install_active_idle_wake(active_idle_wake, state.clone()) {
+                return;
+            }
         }
         let fork_agent = persistent_agent.clone().unwrap_or_else(|| {
             Arc::new(build_fork_agent(
@@ -226,7 +229,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 if args.idle {
                     if !active_idle_wake
                         .as_ref()
-                        .is_some_and(|active| take_active_idle_wake_if(active, &state))
+                        .is_some_and(|active| begin_active_idle_wake_publication(active, &state))
                     {
                         return;
                     }
@@ -238,29 +241,28 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             }
         }
 
-        // Normal runner completion and external cancellation race to claim
-        // this wake's state. If cancellation won, it already owns the only
-        // durable promotion and this aborted task must not emit a duplicate.
-        if args.idle
-            && !active_idle_wake
-                .as_ref()
-                .is_some_and(|active| take_active_idle_wake_if(active, &state))
-        {
-            return;
-        }
-
         cap_fork_history(&mut fork_history);
         iteration += 1;
 
         if args.idle {
-            let acted = state.has_persistent_action() || !last_result.trim().is_empty();
-            let notes = state.take_notes();
-            let requests = state.take_requests();
-            let actions = state.take_actions();
-            // A non-empty terminal assistant response is itself a message to
-            // the user. `note` and forked create-requests are the other two
-            // constrained effect channels in this toolbox.
+            let acted = wake_has_durable_dispatch(&state);
+            // Only explicit effect channels make a wake durable: `note`
+            // sends to the user, create-requests raise inbox work, and wrapped
+            // non-read-only tools record mutation. A model conclusion after a
+            // read-only inspection is deliberately discarded.
             if acted {
+                // Claim publication before draining action records. If
+                // cancellation wins first, it owns the terminal promotion; if
+                // it arrives later, this runner owns exactly this event.
+                if !active_idle_wake
+                    .as_ref()
+                    .is_some_and(|active| begin_active_idle_wake_publication(active, &state))
+                {
+                    return;
+                }
+                let notes = state.take_notes();
+                let requests = state.take_requests();
+                let actions = state.take_actions();
                 let result = bundle_terminal(
                     &label,
                     args.kind(),
@@ -277,6 +279,26 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                         requests,
                     })
                     .await;
+                if active_idle_wake
+                    .as_ref()
+                    .is_some_and(finish_active_idle_wake_publication)
+                {
+                    let _ = event_tx
+                        .send(ScheduleEvent::IdleWakePublicationCancelled {
+                            job_id,
+                            label,
+                            kind: args.kind(),
+                        })
+                        .await;
+                    return;
+                }
+            } else if !active_idle_wake
+                .as_ref()
+                .is_some_and(|active| finish_active_idle_wake_without_publication(active, &state))
+            {
+                // Cancellation claimed the no-op before it was released. It
+                // owns the terminal marker; this runner must remain silent.
+                return;
             }
         }
 
@@ -330,6 +352,10 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             requests,
         })
         .await;
+}
+
+fn wake_has_durable_dispatch(state: &ForkScheduleState) -> bool {
+    state.has_persistent_action()
 }
 
 enum WakeWait {
@@ -707,6 +733,17 @@ fn fork_history_bytes(history: &[Message]) -> usize {
         .iter()
         .map(|m| serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0))
         .sum()
+}
+
+#[cfg(test)]
+mod idle_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_conclusion_has_no_durable_dispatch() {
+        let state = ForkScheduleState::new("idle-read-only".into());
+        assert!(!wake_has_durable_dispatch(&state));
+    }
 }
 
 #[cfg(test)]

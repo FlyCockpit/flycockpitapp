@@ -28,6 +28,20 @@ impl Driver {
                 // turn nor an inbox item; only their live registry row ends.
                 self.schedule.mark_completed(&job_id);
             }
+            ScheduleEvent::IdleWakePublicationCancelled {
+                job_id,
+                label,
+                kind,
+            } => {
+                let _ = tx
+                    .send(TurnEvent::ScheduleCompleted {
+                        job_id,
+                        label,
+                        kind: kind.as_str().to_string(),
+                        failed: false,
+                    })
+                    .await;
+            }
             ScheduleEvent::IdleWakeCompleted {
                 job_id,
                 kind,

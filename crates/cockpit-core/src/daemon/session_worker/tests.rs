@@ -2254,6 +2254,19 @@ fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUse
     }
 }
 
+#[tokio::test]
+async fn worker_handle_publishes_user_activity_without_worker_queue_progress() {
+    let handle = test_session_handle();
+    let mut activity = handle.subscribe_user_activity_for_test();
+
+    handle.record_user_activity();
+
+    activity
+        .changed()
+        .await
+        .expect("live activity epoch must remain connected");
+}
+
 async fn recv_queue_updated_for_test(event_rx: &mut EventReceiver) -> Vec<proto::QueueItem> {
     match tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
         .await

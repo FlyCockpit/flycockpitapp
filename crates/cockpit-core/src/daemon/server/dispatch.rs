@@ -3909,15 +3909,6 @@ async fn handle_send_user_message(
     } else {
         None
     };
-    // Legacy-sized/media messages retain their existing admission behavior.
-    // Oversized FCM2 messages record activity only after the worker has
-    // durably accepted both the receipt triple and source reservation.
-    if origin == proto::UserMessageOrigin::ExternalRoot
-        && artifact_admission.is_none()
-        && let Some(scheduler) = &ctx.scheduler
-    {
-        scheduler.record_user_activity().await;
-    }
     let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
         origin,
         &text,
@@ -4061,6 +4052,17 @@ async fn handle_send_user_message(
         Ok(result) => result,
         Err(error) => return Err(error),
     };
+    // Inline/media admission is now durable. Publish both activity epochs at
+    // ingress, before returning the queue acknowledgement: the worker handle's
+    // watch sender reaches in-process idle forks even while the driver is busy,
+    // and the daemon scheduler owns persistent jobs. Oversized FCM2 advances
+    // both epochs at phase-two materialization in the driver instead.
+    if origin == proto::UserMessageOrigin::ExternalRoot && artifact_admission.is_none() {
+        handle.record_user_activity();
+        if let Some(scheduler) = &ctx.scheduler {
+            scheduler.record_user_activity().await;
+        }
+    }
     // Oversized activity is advanced by the driver only after phase-two
     // materialization. The dispatch path must not create an accepted-turn
     // side effect merely because phase one reserved a lease.

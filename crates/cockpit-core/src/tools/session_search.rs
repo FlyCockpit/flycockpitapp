@@ -405,7 +405,10 @@ async fn render_thread_list(
     if threads.is_empty() {
         return Ok(ToolOutput::text("No assistant threads in this workspace."));
     }
-    let ids = threads.iter().map(|thread| thread.session_id).collect::<Vec<_>>();
+    let ids = threads
+        .iter()
+        .map(|thread| thread.session_id)
+        .collect::<Vec<_>>();
     if !ctx
         .session
         .db

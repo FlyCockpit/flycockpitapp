@@ -42,13 +42,17 @@ impl Tool for ThreadStartTool {
             .get("message_seq")
             .and_then(Value::as_i64)
             .filter(|seq| *seq > 0)
-            .ok_or_else(|| invalid_input("`message_seq` must be a positive recorded message sequence"))?;
+            .ok_or_else(|| {
+                invalid_input("`message_seq` must be a positive recorded message sequence")
+            })?;
         let thread = ctx
             .session
             .db
             .create_thread(ctx.session.id, seq.to_string())
             .await?;
-        let short_id = thread.short_id.unwrap_or_else(|| thread.session_id.to_string());
+        let short_id = thread
+            .short_id
+            .unwrap_or_else(|| thread.session_id.to_string());
         Ok(ToolOutput::text(format!(
             "Started fresh thread {short_id} from message {seq}. Its transcript is empty; the parent/message anchor is retained for navigation and history search."
         )))

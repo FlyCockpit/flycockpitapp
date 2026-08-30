@@ -245,7 +245,9 @@ pub(super) async fn fork_session(
                 message: "a fresh thread requires a message anchor".to_string(),
             });
         };
-        ctx.db.create_thread(parent_session_id, anchor_turn_id).await
+        ctx.db
+            .create_thread(parent_session_id, anchor_turn_id)
+            .await
     } else if ephemeral {
         ctx.db
             .create_ephemeral_fork(parent_session_id, fork_point_turn_id.clone())

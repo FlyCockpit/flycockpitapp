@@ -2062,7 +2062,11 @@ impl Db {
             ephemeral,
             btw_parent_session_id: None,
             btw_tangent: false,
-            user_content_tokens: if fresh_thread { 0 } else { parent.user_content_tokens },
+            user_content_tokens: if fresh_thread {
+                0
+            } else {
+                parent.user_content_tokens
+            },
             title_stage: if fresh_thread { 0 } else { parent.title_stage },
             // A fork (plain or ephemeral `/side`) is a distinct session:
             // never inherit the parent's unconsumed recovery nudge.
@@ -5961,7 +5965,10 @@ mod tests {
 
         let anchor_str = anchor.to_string();
         assert_eq!(thread.parent_session_id, Some(parent.session_id));
-        assert_eq!(thread.fork_point_turn_id.as_deref(), Some(anchor_str.as_str()));
+        assert_eq!(
+            thread.fork_point_turn_id.as_deref(),
+            Some(anchor_str.as_str())
+        );
         assert!(!thread.ephemeral);
         assert_eq!(thread.user_content_tokens, 0);
         assert_eq!(thread.title_stage, 0);
@@ -5972,7 +5979,13 @@ mod tests {
         let data: serde_json::Value = serde_json::from_str(&events[0].data_json).unwrap();
         assert_eq!(data["parent_session_id"], parent.session_id.to_string());
         assert_eq!(data["parent_turn_id"], anchor_str);
-        assert_eq!(db.list_session_events(parent.session_id).await.unwrap().len(), 2);
+        assert_eq!(
+            db.list_session_events(parent.session_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     // ---- `/side` ephemeral side-conversation forks (migration 0017) -------

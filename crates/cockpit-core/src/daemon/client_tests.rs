@@ -109,6 +109,27 @@ async fn send_daemon_hello(
         .unwrap();
 }
 
+async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
+    let id = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::DaemonStatus,
+                ..
+            } => id,
+            other => panic!("expected lifetime confirmation, got {other:?}"),
+        },
+        other => panic!("expected lifetime confirmation envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            id,
+            daemon_status_response_with("0.1.handshake", proto::PROTOCOL_VERSION),
+        ))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn negotiation_parses_daemon_hello_on_connect() {
     let (_dir, socket, listener) = bind_test_socket();
@@ -116,6 +137,7 @@ async fn negotiation_parses_daemon_hello_on_connect() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
+        confirm_client_lifetime(&mut daemon).await;
     });
 
     let client = DaemonClient::connect(&socket).await.unwrap();
@@ -195,6 +217,7 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
         )
         .await;
         daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+        confirm_client_lifetime(&mut daemon).await;
         let request_id = match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
                 Body::Request { id, request, .. } => {

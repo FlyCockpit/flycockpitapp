@@ -2789,7 +2789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_socket_owner_reaps_after_detached_rpc_client_disconnects() {
+    async fn ephemeral_socket_owner_reaps_after_connected_client_drops_before_request() {
         let harness = DaemonTestHarness::new();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
@@ -2811,15 +2811,13 @@ mod tests {
         let client = cockpit_client::DaemonClient::connect(&paths.socket)
             .await
             .expect("connect detached socket client");
-        client
-            .request_ok(proto::Request::DaemonStatus)
-            .await
-            .expect("detached client RPC succeeds without Attach");
         drop(client);
 
         tokio::time::timeout(Duration::from_secs(3), daemon_task)
             .await
-            .expect("detached client disconnect must reap the ephemeral owner")
+            .expect(
+                "connected client drop before an application request must reap the ephemeral owner",
+            )
             .expect("daemon task joins")
             .expect("daemon drain completes after detached client disconnect");
         assert!(!paths.socket.exists(), "last client removes the socket");
@@ -2885,6 +2883,10 @@ mod tests {
         let client_b = cockpit_client::DaemonClient::connect(&paths.socket)
             .await
             .expect("connect second socket client");
+        // The completed connection confirmation must retain the owner before
+        // B sends any application request; otherwise this A -> B handoff can
+        // race the ephemeral reaper into draining at count zero.
+        drop(client_a);
         client_b
             .request_ok(proto::Request::Attach {
                 session_id: Some(session_id),
@@ -2902,7 +2904,6 @@ mod tests {
             .await
             .expect("second socket client attaches");
 
-        drop(client_a);
         client_b
             .request_ok(proto::Request::DaemonStatus)
             .await

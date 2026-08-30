@@ -4979,7 +4979,7 @@ async fn run_in_process_client(
 ) {
     // An in-process endpoint is handed only to the owning foreground process;
     // opening it is therefore the same lifetime reference as a socket client
-    // sending its first valid protocol envelope.
+    // completing its post-hello lifetime confirmation.
     let _client_guard = ctx.track_client();
     let client_instance_id = Uuid::new_v4();
     let mut state = MutableClientState::detached_with_principal(
@@ -5257,11 +5257,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // A hello-only connection is a reachability probe, not a client lifetime
-    // reference. Defer the claim until the peer sends a valid protocol
-    // envelope, then retain it through every transport teardown path. This
-    // keeps discovery from reaping an ephemeral owner during its creator's
-    // startup handoff while still covering detached RPC clients and pre-Attach
-    // failures.
+    // reference. Defer the claim until the peer sends its post-hello lifetime
+    // confirmation (a valid protocol envelope), then retain it through every
+    // transport teardown path. This keeps discovery from reaping an ephemeral
+    // owner during its creator's startup handoff while still covering detached
+    // RPC clients and pre-Attach failures.
     let client_lifetime = DeferredClientLifetime::new(ctx.clone());
     let proto = ProtoStream::new(stream);
     let (reader, writer) = proto.into_split();

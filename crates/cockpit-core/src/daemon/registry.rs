@@ -1533,11 +1533,31 @@ impl SessionRegistry {
             );
         }
         let preserve_root_model_override = model_override.is_some();
-        let active = initial_model
-            .clone()
-            .or_else(|| model_override.cloned())
-            .or_else(|| providers_cfg.active_model.clone())
-            .context("no model selected for the new session")?;
+        // Computer's dedicated factory may need to select an eligible model
+        // instead of the ordinary configured active model. Select it here,
+        // before the deferred session is staged, and retain the exact result
+        // as the root pin. The factory receives that pin at worker startup,
+        // so no live Computer root can diverge from the session ledger.
+        let mut worker_model_override =
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+                Some(
+                    crate::engine::builtin::computer_primary_active_model_selection(
+                        &providers_cfg,
+                        &extended_cfg,
+                        &project_root,
+                        model_override,
+                    )?,
+                )
+            } else {
+                model_override.cloned()
+            };
+        let active = match worker_model_override.clone() {
+            Some(selection) => selection,
+            None => initial_model
+                .clone()
+                .or_else(|| providers_cfg.active_model.clone())
+                .context("no model selected for the new session")?,
+        };
         let project_id = crate::session::project_id_for(&project_root)?;
         let last_used = self
             .inner
@@ -1614,7 +1634,16 @@ impl SessionRegistry {
                     &workspace_layer,
                 )?;
             hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
-            if initial_model.is_none() && model_override.is_none() {
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+                let selection = crate::engine::builtin::computer_primary_active_model_selection(
+                    &providers_cfg,
+                    &extended_cfg,
+                    &session.project_root,
+                    model_override,
+                )?;
+                session.set_active_model_ref(selection.clone())?;
+                worker_model_override = Some(selection);
+            } else if initial_model.is_none() && model_override.is_none() {
                 session.set_active_model_ref(
                     providers_cfg
                         .active_model
@@ -1630,7 +1659,7 @@ impl SessionRegistry {
             &providers_cfg,
             &extended_cfg,
             client_no_sandbox,
-            model_override,
+            worker_model_override.as_ref(),
             preserve_root_model_override,
             None,
             trust_policy,

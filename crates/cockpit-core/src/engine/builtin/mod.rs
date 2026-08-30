@@ -367,7 +367,7 @@ fn computer_primary_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
     target: crate::computer::DisplayTarget,
-    selected_model: Option<&Model>,
+    selected_model: Option<(&str, &str)>,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     computer_candidate(
         providers,
@@ -378,6 +378,49 @@ fn computer_primary_candidate(
         true,
         selected_model,
     )
+}
+
+/// Resolve the one model selection a Computer primary is permitted to run.
+///
+/// The session registry calls this before it stages a new session's active
+/// model.  The same selection is then passed back to [`computer_primary`] as
+/// its root pin, so the ledger, request preferences, and factory-installed
+/// model are one authority rather than two independently chosen candidates.
+pub(crate) fn computer_primary_active_model_selection(
+    providers: &crate::config::providers::ProvidersConfig,
+    extended: &crate::config::extended::ExtendedConfig,
+    cwd: &Path,
+    requested_model: Option<&crate::config::providers::ActiveModelRef>,
+) -> Result<crate::config::providers::ActiveModelRef> {
+    let target = match extended.computer_target {
+        crate::config::extended::ComputerTarget::Virtual => crate::computer::DisplayTarget::Virtual,
+        crate::config::extended::ComputerTarget::RealDesktop => {
+            crate::computer::DisplayTarget::RealDesktop
+        }
+    };
+    let selected_model =
+        requested_model.map(|model| (model.provider.as_str(), model.model.as_str()));
+    let Some((provider, model, _)) =
+        computer_primary_candidate(providers, cwd, target, selected_model)
+    else {
+        bail!(
+            "Computer requires a configured vision-capable model with a native computer_use contract and computer_use enabled"
+        );
+    };
+
+    // A caller's explicit root pin carries its associated model preferences;
+    // a factory-selected fallback must not inherit preferences from a
+    // different active model.
+    Ok(requested_model
+        .filter(|requested| requested.provider == provider && requested.model == model)
+        .cloned()
+        .unwrap_or(crate::config::providers::ActiveModelRef {
+            provider,
+            model,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }))
 }
 
 fn computer_subagent_candidate(
@@ -402,13 +445,13 @@ fn computer_candidate(
     agent: &str,
     target: crate::computer::DisplayTarget,
     require_backend: bool,
-    selected_model: Option<&Model>,
+    selected_model: Option<(&str, &str)>,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
         for model in &provider.models {
-            if selected_model.is_some_and(|selected| {
-                selected.provider_id() != provider_id || selected.model_id_ref() != model.id
+            if selected_model.is_some_and(|(selected_provider, selected_model)| {
+                selected_provider != provider_id || selected_model != model.id
             }) {
                 continue;
             }
@@ -471,7 +514,12 @@ fn computer_candidate(
                     target,
                     require_backend,
                     geometry: None,
-                    approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
+                    // A real desktop is a distinct safety boundary. Its
+                    // catalog/config tier still governs reachability, but it
+                    // can never remove the per-action Ask approval required
+                    // alongside the desktop grant.
+                    approval_required: target == crate::computer::DisplayTarget::RealDesktop
+                        || tier == crate::config::extended::ComputerUseMode::Ask,
                 },
             ));
         }
@@ -3678,7 +3726,9 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
             &providers,
             &args.cwd,
             target,
-            args.model_override.as_deref(),
+            args.model_override
+                .as_deref()
+                .map(|model| (model.provider_id(), model.model_id_ref())),
         )
     };
     let Some((provider_id, model_id, native_computer)) = candidate else {
@@ -6033,13 +6083,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn computer_primary_defaults_to_real_desktop_and_ask() {
+    fn computer_primary_real_desktop_forces_ask_even_when_configured_yolo() {
         let tmp = tempfile::tempdir().unwrap();
         write_computer_provider_config(
             tmp.path(),
             "{}",
             r#"{
                 "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
                 "models": [{
                     "id": "vision",
                     "subagent_invokable": false,
@@ -6063,6 +6114,40 @@ pub(crate) mod tests {
         assert!(agent.tools.names().contains(&"read"));
         assert!(agent.tools.names().contains(&"bash"));
         assert!(agent.tools.names().contains(&"task"));
+    }
+
+    #[test]
+    fn computer_primary_selection_replaces_an_ineligible_active_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [
+                    { "id": "text" },
+                    {
+                        "id": "vision",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+
+        let args = disk_model_spawn_args(tmp.path(), "text");
+        let (extended, providers) = args.config.configs();
+        let selected =
+            computer_primary_active_model_selection(&providers, &extended, tmp.path(), None)
+                .expect("Computer must select its eligible model before session staging");
+
+        assert_eq!(selected.provider, "p");
+        assert_eq!(selected.model, "vision");
+        assert!(selected.reasoning_effort.is_none());
+        assert!(selected.thinking_mode.is_none());
+        assert!(selected.prompt_cache_retention.is_none());
     }
 
     #[test]

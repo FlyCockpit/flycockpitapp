@@ -2464,11 +2464,17 @@ async fn run_container_shell(
         Err(reason) => return RunOutcome::SpawnError(std::io::Error::other(reason)),
     };
     let map = crate::container::MountMap::for_current_platform(ctx.cwd.clone());
-    let Some(container_cwd) = map.to_container(cwd) else {
+    let workspace_scratch_map = crate::container::MountMap::workspace_scratch_for_current_platform(
+        ctx.session.workspace_scratch_dir(),
+    );
+    let workspace_scratch_mount = crate::container::workspace_scratch_mount(&workspace_scratch_map);
+    let Some(container_cwd) = workspace_scratch_map
+        .to_container(cwd)
+        .or_else(|| map.to_container(cwd))
+    else {
         return RunOutcome::SpawnError(std::io::Error::other(format!(
-            "working directory {} is outside the container project mount {}",
+            "working directory {} is outside the container project and workspace scratch mounts",
             cwd.display(),
-            ctx.cwd.display()
         )));
     };
     let resolved = match crate::container::resolve_dockerfile_for_session(
@@ -2507,6 +2513,7 @@ async fn run_container_shell(
             &image,
             container_mode,
             &map,
+            &workspace_scratch_mount,
             &profile_mounts,
             ctx.session.container_network_enabled(),
             &runtime,

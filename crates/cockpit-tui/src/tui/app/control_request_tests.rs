@@ -12,6 +12,7 @@ use cockpit_client::presentation::{
 };
 use cockpit_core::config::extended::ApprovalMode;
 use cockpit_proto::{Request, Response};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
@@ -134,6 +135,25 @@ fn control_request_without_runner_reports_not_delivered() {
         history_lines(&app),
         vec!["/prune: send a message first to start a session"]
     );
+}
+
+#[test]
+fn resume_compaction_enter_keeps_the_displayed_full_history_default() {
+    let mut app = app();
+    app.pending_resume_compaction_confirm = true;
+
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+    assert!(
+        !app.pending_resume_compaction_confirm,
+        "Enter must resolve the choice rather than leave the confirmation armed"
+    );
+    assert_eq!(
+        history_lines(&app),
+        vec!["Resume: keeping full conversation."],
+        "Enter must accept the displayed full-history default without dispatching compaction"
+    );
+    assert!(app.pending_control_requests.is_empty());
 }
 
 #[tokio::test]

@@ -1655,6 +1655,13 @@ pub enum Request {
     /// immediately; the in-place boundary arrives as a `CompactReady` event.
     Compact,
 
+    /// Accept the compacted branch of a prior interactive attach's
+    /// [`crate::ResumeCompactionOffer`]. The daemon revalidates the exact
+    /// rolling snapshot at the safe boundary and applies its deterministic
+    /// handoff without model inference. Not sending this request retains the
+    /// full conversation and leaves the snapshot banked.
+    ResumeFromCompaction,
+
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
         text: String,
@@ -4196,6 +4203,7 @@ macro_rules! request_variants {
             (Request::CancelSchedule { .. }, "cancel_schedule");
             (Request::Prune, "prune");
             (Request::Compact, "compact");
+            (Request::ResumeFromCompaction, "resume_from_compaction");
             (Request::Pin { .. }, "pin");
             #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential");
@@ -4512,6 +4520,7 @@ macro_rules! command {
             (Request::CancelSchedule { job_id }, "cancel_schedule", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "job_id:String", [job_id: String => param]);
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::ResumeFromCompaction, "resume_from_compaction", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String", [text: String => param]);
             #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);

@@ -15169,6 +15169,7 @@ async fn attached_state_with_worker_receiver(
                     .expect("test workspace identity"),
                 ),
                 _interactive_guard: None,
+                resume_compaction_offer_issued: false,
             }),
             pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
@@ -15182,6 +15183,56 @@ async fn attached_state_with_worker_receiver(
         session_row.session_id,
         work_rx,
     )
+}
+
+#[tokio::test]
+async fn resume_from_compaction_requires_this_attachment_to_receive_an_offer() {
+    let ctx = test_ctx();
+    let project_root = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project_root.path()).await;
+
+    let error = handle_request(Request::ResumeFromCompaction, &mut state, &ctx)
+        .await
+        .expect_err("an attached client without an offer must retain full history");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("offered interactive away-resume"));
+    assert!(matches!(
+        work_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    state
+        .attached
+        .as_mut()
+        .expect("attached state")
+        .resume_compaction_offer_issued = true;
+    let ctx_for_request = ctx.clone();
+    let request = tokio::spawn(async move {
+        let response =
+            handle_request(Request::ResumeFromCompaction, &mut state, &ctx_for_request).await;
+        (response, state)
+    });
+    let SessionWork::ResumeFromCompaction { respond_to } = work_rx
+        .recv()
+        .await
+        .expect("an offered attachment delivers resume work")
+    else {
+        panic!("expected resume compaction work");
+    };
+    respond_to
+        .send(Ok(()))
+        .expect("request receiver remains open");
+    let (response, mut state) = request.await.expect("request joins");
+    assert!(matches!(response, Ok(Response::Ack)));
+    let error = handle_request(Request::ResumeFromCompaction, &mut state, &ctx)
+        .await
+        .expect_err("an offer is consumed by its first acceptance request");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(matches!(
+        work_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
@@ -19408,6 +19459,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember".into(),
         },
@@ -21837,6 +21889,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember this".into(),
         },
@@ -22001,6 +22054,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         .unwrap();
                 }
                 ("repair_resume", SessionWork::RepairResume { respond_to }) => {
+                    respond_to.send(Ok(())).unwrap();
+                }
+                ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
                     respond_to.send(Ok(())).unwrap();
                 }
                 ("cancel_turn", SessionWork::Cancel) => {}
@@ -22477,6 +22533,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
@@ -26566,6 +26623,13 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::Compact,
             kind: "compact",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ResumeFromCompaction,
+            kind: "resume_from_compaction",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
@@ -33864,6 +33928,7 @@ async fn btw_concurrent_with_parent_turn() {
             handle: parent_handle,
             workspace_identity: None,
             _interactive_guard: None,
+            resume_compaction_offer_issued: false,
         }),
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -33941,6 +34006,7 @@ async fn btw_concurrent_with_parent_turn() {
             handle: btw_handle,
             workspace_identity: None,
             _interactive_guard: None,
+            resume_compaction_offer_issued: false,
         }),
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),

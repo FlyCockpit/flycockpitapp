@@ -16,6 +16,32 @@ pub struct ImageIngressAdmissionReceiptV1 {
     pub height: u32,
 }
 
+/// Daemon-selected policy for an idle-session resume with a current rolling
+/// compaction snapshot. `Ask` is surfaced to interactive clients only;
+/// headless attaches always retain the full conversation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCompactionDefault {
+    Full,
+    Compacted,
+    Ask,
+}
+
+/// The non-mutating choice presented when an idled session has an exact
+/// rolling compaction snapshot. Token and context figures let a client label
+/// both choices without independently reconstructing the compaction plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeCompactionOffer {
+    pub default: ResumeCompactionDefault,
+    pub full_input_tokens: u64,
+    pub compacted_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_ctx_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_ctx_pct: Option<f64>,
+}
+
 // ---- Responses -------------------------------------------------------------
 
 /// Daemon → client RPC responses. Each variant is the typed answer to
@@ -172,6 +198,12 @@ pub enum Response {
         paused_work: Vec<PausedWorkSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repair_required: Option<Box<ResumeRepairState>>,
+        /// Present only for an interactive away-resume whose configured
+        /// policy is `ask` and whose rolling snapshot exactly covers history.
+        /// Accept with [`Request::ResumeFromCompaction`]; retaining full
+        /// context needs no follow-up request.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resume_compaction_offer: Option<ResumeCompactionOffer>,
         #[serde(default = "default_daemon_version")]
         daemon_version: String,
         #[serde(default)]

@@ -769,6 +769,7 @@ impl App {
         let short_id = outcome.short_id.clone();
         let paused_work = outcome.paused_work.clone();
         let repair_required = outcome.repair_required.clone();
+        let resume_compaction_offer = outcome.resume_compaction_offer.clone();
         let btw_fork = outcome.btw_fork.clone();
         let daemon_version = outcome.daemon_version.clone();
         let daemon_compatible = outcome.daemon_compatible;
@@ -821,6 +822,9 @@ impl App {
                     self.push_plain(format!("/resume: switched to session {label}."));
                     if let Some(repair) = repair_required {
                         self.maybe_prompt_resume_repair(repair);
+                    }
+                    if let Some(offer) = resume_compaction_offer {
+                        self.arm_resume_compaction_confirm(offer);
                     }
                     self.maybe_prompt_paused_work(session_id, paused_work);
                     self.maybe_show_daemon_version_chip(&daemon_version, daemon_compatible);

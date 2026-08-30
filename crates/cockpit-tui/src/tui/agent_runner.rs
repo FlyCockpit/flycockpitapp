@@ -404,6 +404,9 @@ pub struct AgentRunner {
     /// Responses resume repair state, when the daemon opened the session
     /// read-only because provider replay cannot be rebuilt safely.
     pub repair_required: Option<proto::ResumeRepairState>,
+    /// Non-mutating full-vs-compacted choice returned by an interactive
+    /// away-resume attach.
+    pub resume_compaction_offer: Option<proto::ResumeCompactionOffer>,
     /// Live `/btw` fork advertised by the daemon when attaching to a parent
     /// session. The TUI may attach a second runner to this session id for the
     /// side pane; the main runner remains bound to the parent.
@@ -593,6 +596,7 @@ impl AgentRunner {
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
+            resume_compaction_offer: None,
             btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
@@ -925,6 +929,7 @@ impl AgentRunner {
         self.history = outcome.history.clone();
         self.paused_work = outcome.paused_work.clone();
         self.repair_required = outcome.repair_required.clone();
+        self.resume_compaction_offer = outcome.resume_compaction_offer.clone();
         self.btw_fork = outcome.btw_fork.clone();
         acknowledge_history_receipts(&self.awaiting_durable, outcome.session_id, &outcome.history);
         self.submission_session_tx
@@ -1548,6 +1553,7 @@ pub struct SessionSwitchOutcome {
     pub history: Vec<proto::HistoryEntry>,
     pub paused_work: Vec<proto::PausedWorkSummary>,
     pub repair_required: Option<proto::ResumeRepairState>,
+    pub resume_compaction_offer: Option<proto::ResumeCompactionOffer>,
     pub btw_fork: Option<proto::BtwForkInfo>,
     pub daemon_version: String,
     pub daemon_compatible: bool,
@@ -2085,6 +2091,7 @@ where
             history,
             paused_work,
             repair_required,
+            resume_compaction_offer,
             btw_fork,
             daemon_version,
             compatible,
@@ -2110,6 +2117,7 @@ where
                     history,
                     paused_work,
                     repair_required: repair_required.map(|repair| *repair),
+                    resume_compaction_offer,
                     btw_fork,
                     daemon_version,
                     daemon_compatible: compatible,
@@ -2144,6 +2152,7 @@ struct SessionSwitchAttached {
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
+    resume_compaction_offer: Option<proto::ResumeCompactionOffer>,
     btw_fork: Option<proto::BtwForkInfo>,
     daemon_version: String,
     daemon_compatible: bool,
@@ -2174,6 +2183,7 @@ fn session_switch_outcome_from_attached(
         history: attached.history,
         paused_work: attached.paused_work,
         repair_required: attached.repair_required,
+        resume_compaction_offer: attached.resume_compaction_offer,
         btw_fork: attached.btw_fork,
         daemon_version: attached.daemon_version,
         daemon_compatible: attached.daemon_compatible,
@@ -2420,6 +2430,7 @@ async fn try_spawn_inner(
             history,
             paused_work,
             repair_required,
+            resume_compaction_offer,
             btw_fork,
             daemon_version,
             daemon_compatible,
@@ -2436,6 +2447,7 @@ async fn try_spawn_inner(
                 history,
                 paused_work,
                 repair_required,
+                resume_compaction_offer,
                 btw_fork,
                 daemon_version,
                 compatible,
@@ -2452,6 +2464,7 @@ async fn try_spawn_inner(
                 history,
                 paused_work,
                 repair_required.map(|repair| *repair),
+                resume_compaction_offer,
                 btw_fork,
                 daemon_version,
                 compatible,
@@ -2529,6 +2542,7 @@ async fn try_spawn_inner(
             history,
             paused_work,
             repair_required,
+            resume_compaction_offer,
             btw_fork,
             daemon_version,
             daemon_compatible,
@@ -2556,6 +2570,7 @@ async fn try_spawn_inner(
         history,
         paused_work,
         repair_required,
+        resume_compaction_offer,
         btw_fork,
         daemon_version,
         daemon_compatible,
@@ -3141,6 +3156,7 @@ async fn try_spawn_inner(
         history,
         paused_work,
         repair_required,
+        resume_compaction_offer,
         btw_fork,
         daemon_version,
         daemon_compatible,
@@ -5172,6 +5188,7 @@ mod tests {
             history,
             paused_work: Vec::new(),
             repair_required: None,
+            resume_compaction_offer: None,
             daemon_version: "test".to_string(),
             compatible: true,
             env_baseline: None,
@@ -5633,6 +5650,7 @@ mod tests {
             }],
             paused_work: Vec::new(),
             repair_required: None,
+            resume_compaction_offer: None,
             btw_fork: None,
             daemon_version: "test".to_string(),
             daemon_compatible: true,
@@ -6748,6 +6766,7 @@ mod tests {
                 history,
                 paused_work: Vec::new(),
                 repair_required: None,
+                resume_compaction_offer: None,
                 btw_fork: None,
                 daemon_version: "test".to_string(),
                 daemon_compatible: true,
@@ -6827,6 +6846,7 @@ mod tests {
                         history: Vec::new(),
                         paused_work: Vec::new(),
                         repair_required: None,
+                        resume_compaction_offer: None,
                         daemon_version: "test".to_string(),
                         compatible: true,
                         env_baseline: None,

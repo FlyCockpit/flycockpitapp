@@ -326,6 +326,7 @@ impl App {
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
+            let resume_compaction_offer = r.resume_compaction_offer.clone();
             self.reset_display_attach_backoff();
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
@@ -373,6 +374,9 @@ impl App {
             self.refresh_guidance_estimate_from_daemon(r.endpoint.clone());
             if let Some(info) = live_btw_fork {
                 self.open_btw_pane_from_info(info, true);
+            }
+            if let Some(offer) = resume_compaction_offer {
+                self.arm_resume_compaction_confirm(offer);
             }
         }
         let refresh_skills = runner.is_ok();

@@ -12328,6 +12328,63 @@ async fn handle_serialized_request_impl(
             finish_nonrepeatable_response!(remote_operation, ctx, "compact", Response::Ack)
         }
 
+        Request::ResumeFromCompaction => {
+            // Exactness is rechecked by the worker, but only an interactive
+            // away-resume that was actually offered this branch may request
+            // it. Keep the authorization connection-local so a headless
+            // attach, reattach, or a second request cannot borrow an offer.
+            let handle = {
+                let att = state.attached.as_mut().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::NotAttached,
+                    message: "client has not attached to a session".into(),
+                })?;
+                if !att.resume_compaction_offer_issued {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message:
+                            "resume compaction requires an offered interactive away-resume choice"
+                                .into(),
+                    });
+                }
+                // Consume before sending work. If the worker is unavailable
+                // or the exact snapshot has changed, a new eligible attach
+                // must obtain a fresh offer rather than replaying stale
+                // authority.
+                att.resume_compaction_offer_issued = false;
+                att.handle.clone()
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::ResumeFromCompaction,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::ResumeFromCompaction { respond_to })
+                .await
+                .map_err(session_work_error)?;
+            response_rx
+                .await
+                .map_err(internal)?
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: error,
+                })?;
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "resume_from_compaction",
+                Response::Ack
+            )
+        }
+
         Request::Pin { text } => {
             let att = require_attached(state)?;
             #[cfg(feature = "remote")]
@@ -26272,6 +26329,27 @@ pub(super) async fn attach(
     } else {
         None
     };
+    // Capture the durable activity age before this attach itself updates the
+    // recency marker. Cache timestamps are intentionally in-memory only and
+    // do not survive daemon restart; session activity is the durable resume
+    // clock for the user-configured idle window.
+    let resume_idle_for_secs = if interactive && session_id.is_some() && since_seq.is_none() {
+        let row = ctx
+            .db
+            .get_session(handle.session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {}", handle.session_id),
+            })?;
+        let elapsed_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(row.last_active_at_unix_ms);
+        Some(u64::try_from(elapsed_ms / 1_000).unwrap_or(0))
+    } else {
+        None
+    };
     let session_id = handle.session_id;
     // Reuse the worker's attach-time root proof.  Capturing a fresh proof here
     // would permit an A→B→A swap between worker construction and client
@@ -26308,10 +26386,46 @@ pub(super) async fn attach(
     drain_client_attachment_ownership(state, ctx, "reattach").await?;
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
-        handle,
+        handle: handle.clone(),
         workspace_identity: Some(workspace_identity),
         _interactive_guard: interactive_guard,
+        resume_compaction_offer_issued: false,
     });
+
+    // An interactive away-resume gets its policy from the live driver's
+    // per-model context config. Headless attaches never ask or compact: they
+    // retain full history by construction. Preparing an offer is
+    // non-mutating, and `ask` leaves the retained snapshot available until a
+    // later explicit `ResumeFromCompaction` request.
+    let resume_compaction_offer = if let Some(idle_for_secs) = resume_idle_for_secs {
+        let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(SessionWork::PrepareResumeCompaction {
+                idle_for_secs,
+                respond_to,
+            })
+            .await
+            .map_err(session_work_error)?;
+        let offer = response_rx.await.map_err(internal)?.map_err(internal)?;
+        match offer {
+            Some(offer) if offer.default == proto::ResumeCompactionDefault::Compacted => {
+                let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+                handle
+                    .send_work(SessionWork::ResumeFromCompaction { respond_to })
+                    .await
+                    .map_err(session_work_error)?;
+                response_rx.await.map_err(internal)?.map_err(internal)?;
+                None
+            }
+            Some(offer) if offer.default == proto::ResumeCompactionDefault::Ask => Some(offer),
+            Some(_) | None => None,
+        }
+    } else {
+        None
+    };
+    if let Err(error) = handle.session().touch() {
+        tracing::warn!(%error, %session_id, "marking session active after attach failed");
+    }
 
     // Hydrate the queue and gitignore read-allowlist for this client. The
     // just-subscribed `event_rx` receives both full-list replacements, so a
@@ -26439,6 +26553,15 @@ pub(super) async fn attach(
         .map_err(internal)?
         .map(btw_info_to_proto);
 
+    if resume_compaction_offer.is_some()
+        && let Some(att) = state.attached.as_mut()
+    {
+        // All remaining attach work is complete, so this client is about to
+        // receive the explicit `ask` choice. Automatic compacted defaults do
+        // not authorize the public accept request.
+        att.resume_compaction_offer_issued = true;
+    }
+
     Ok(Response::Attached {
         session_id,
         session_entry_mode,
@@ -26457,6 +26580,7 @@ pub(super) async fn attach(
             .as_ref()
             .and_then(|att| att.handle.repair_required())
             .map(Box::new),
+        resume_compaction_offer,
         daemon_version: proto::DAEMON_VERSION.to_string(),
         compatible: proto::is_protocol_compatible(client_protocol_version),
         env_baseline: Some(env_baseline_meta),

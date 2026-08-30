@@ -1257,18 +1257,15 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v21 cuts `send_user_message` over to the V2
-/// tagged ingress envelope (`SendUserMessageV2 { ingress }`), carries
+/// Current wire schema version. v21 includes the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
-/// profiles, and agent-dimensioned MCP scopes on the attached-session,
-/// daemon-owned setup inventory, and moves media preview bytes from a raw JSON
-/// number array to bounded base64. v20 and every older fixture remain frozen
-/// migration evidence, not a compatibility window.
+/// profiles, agent-dimensioned MCP scopes, bounded base64 media previews, and
+/// the rolling-precompaction resume choice.
 pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships. v21 is current-only: the V2 ingress cutover and preview
-/// encoding change are an explicit breaking contract with no compatibility shim.
+/// compacted v1 ships. v21 is current-only: all pre-launch wire changes are
+/// edited in place, with no compatibility shim.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -1954,8 +1951,9 @@ impl DelegationSteerResult {
 mod response;
 pub use response::{
     ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
-    Response, RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
-    RunInvocationStatusV1, RunInvocationTerminalReason,
+    Response, ResumeCompactionDefault, ResumeCompactionOffer, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};

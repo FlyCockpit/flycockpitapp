@@ -336,6 +336,12 @@
     "request": "restart_if_idle",
     "v": 21
   },
+  "resume_from_compaction": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "request": "resume_from_compaction",
+    "v": 21
+  },
   "resume_paused_work": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",

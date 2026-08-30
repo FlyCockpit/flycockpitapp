@@ -2386,6 +2386,16 @@ pub enum SessionWork {
     Prune,
     /// Run `/compact` (fresh-thread handoff) on the foreground agent.
     Compact,
+    /// Build a non-mutating away-resume offer from an exact rolling snapshot.
+    PrepareResumeCompaction {
+        idle_for_secs: u64,
+        respond_to:
+            oneshot::Sender<std::result::Result<Option<proto::ResumeCompactionOffer>, String>>,
+    },
+    /// Apply a previously offered exact rolling compaction without inference.
+    ResumeFromCompaction {
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
         text: String,

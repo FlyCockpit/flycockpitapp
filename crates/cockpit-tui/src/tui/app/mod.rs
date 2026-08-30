@@ -2477,6 +2477,10 @@ pub struct App {
     /// else cancels). `Some` holds nothing meaningful — its presence is
     /// the armed flag; the numbers were already pushed to history.
     pub(super) pending_prune_confirm: bool,
+    /// Exact rolling compaction was offered on an away-resume. Only `y`
+    /// accepts the compacted branch; Enter and every other key retain full
+    /// history.
+    pub(super) pending_resume_compaction_confirm: bool,
     /// Bare `/stop` confirm armed: the user ran `/stop` with no id, saw
     /// the `Stop N job(s) in this session? [y/N]` prompt, and the next
     /// `y` commits (anything else cancels). Carries the current-session
@@ -3421,10 +3425,31 @@ impl App {
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,
     ) -> Self {
+        Self::new_composed_with_session_mode(
+            project,
+            no_sandbox,
+            SessionMode::Code,
+            trust,
+            launch_start,
+            lifecycle,
+        )
+    }
+
+    /// Construct an interactive app with the caller's requested setup mode.
+    /// The daemon remains authoritative after the initial attach; this value
+    /// only controls the first new-session request.
+    pub fn new_composed_with_session_mode(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        session_mode: SessionMode,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
         Self::new_inner(
             project,
             no_sandbox,
-            Some(SessionMode::Code),
+            Some(session_mode),
             trust,
             launch_start,
             Some(lifecycle),
@@ -3836,6 +3861,7 @@ impl App {
             elided_event_ids: std::collections::HashSet::new(),
             pending_compact: None,
             pending_prune_confirm: false,
+            pending_resume_compaction_confirm: false,
             pending_stop_confirm: None,
             pending_usage: Vec::new(),
             pending_external_edit: false,

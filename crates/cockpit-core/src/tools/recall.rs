@@ -556,9 +556,9 @@ async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
         let compactions = ctx
             .session
             .db
-            .compaction_count_for_trust(session.session_id, caller_history_trust(ctx))
+            .compaction_numbers_for_trust(session.session_id, caller_history_trust(ctx))
             .await?;
-        for n in 1..=compactions {
+        for n in compactions {
             entries.push(format!("cockpit://session/{short}/compactions/{n}"));
         }
         for artifact in ctx

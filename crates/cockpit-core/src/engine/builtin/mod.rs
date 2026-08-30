@@ -3694,13 +3694,14 @@ pub fn goal_control(
 /// `Plan` — the user-facing planning agent. It investigates the
 /// project, keeps a session-scoped virtual plan document, and hands the final
 /// standalone plan to a fresh `Build` session when the user agrees. Its sole
-/// intended mutation is the plan pseudofile through the generic `write` tool.
+/// intended mutation is the plan pseudofile through a capability-bound `write`
+/// tool that cannot fall through to the host filesystem.
 pub fn plan(args: &SpawnArgs) -> Agent {
     let def = crate::agents::embedded_default("Plan").expect("Plan has an embedded definition");
     let base_tools = with_lsp_nav(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::write::WriteTool))
+            .with(Arc::new(crate::tools::write::PlanWriteTool))
             .with(Arc::new(crate::tools::bash::BashTool::new())),
     ))
     .with(Arc::new(crate::tools::plan_doc::StartBuildTool))

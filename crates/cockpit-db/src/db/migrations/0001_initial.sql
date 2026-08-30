@@ -1065,6 +1065,31 @@ CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_
 CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_unix_ms DESC)
   WHERE assistant_name IS NOT NULL;
 
+-- ---- knowledge dream scope + completion ledger ----------------------------
+-- Attachment is the explicit consent boundary for cross-session dream reads.
+-- KB definitions remain configuration-owned, so kb_id intentionally has no
+-- foreign key to a duplicated SQLite registry.
+CREATE TABLE knowledge_base_session_attachments (
+    kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    attached_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (kb_id, session_id)
+);
+CREATE INDEX idx_kb_session_attachments_session
+    ON knowledge_base_session_attachments(session_id, kb_id);
+
+-- Immutable completion facts. consumer_id is the local installation identity
+-- today and is reserved for hosted MCP-token consumers without a schema change.
+CREATE TABLE knowledge_dreamed_sessions (
+    kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
+    consumer_id TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    dreamed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (kb_id, consumer_id, session_id)
+);
+CREATE INDEX idx_knowledge_dreamed_sessions_last
+    ON knowledge_dreamed_sessions(kb_id, consumer_id, dreamed_at_unix_ms DESC);
+
 -- ---- sealed_values ---------------------------------------------------------
 -- Session-owned write-only values. The literal column is nullable so a vault
 -- item can replace the plaintext without a rebuild dance.

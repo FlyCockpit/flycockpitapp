@@ -52,6 +52,35 @@ impl DefaultModelUpdateResult {
     }
 }
 
+impl Driver {
+    /// Rebuild a newly resolved root from its exact pinned definition after
+    /// freezing the KB facts that definition is allowed to see.  A root
+    /// replacement is an allowed cached-prefix boundary; dream completion is
+    /// not and never reaches this helper.
+    fn rebuild_root_with_knowledge_base_snapshot(&self, agent: Agent) -> Result<Agent> {
+        let definition = agent
+            .definition
+            .as_deref()
+            .context("constructed root has no definition to bind its knowledge-base prompt")?;
+        let captured = self
+            .session
+            .capture_knowledge_base_prompt_snapshot_for_agent(
+                &self.config.extended(),
+                definition,
+                crate::config::trust::runtime_policy().map_or(
+                    crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+                    |policy| policy.mode,
+                ),
+            )?;
+        let mut args = self.spawn_args(true);
+        args.knowledge_base_system_prefix = captured.system_prefix();
+        let rebuilt = crate::engine::builtin::rebuild_from_pinned_definition(&agent, &args)?;
+        self.session
+            .commit_knowledge_base_prompt_snapshot(captured)?;
+        Ok(rebuilt)
+    }
+}
+
 /// Durable session-model authority for the journaled session+default
 /// transaction. Every mutation is a guarded CAS on `active_model_revision`.
 ///
@@ -1764,6 +1793,13 @@ impl Driver {
                 return false;
             }
         };
+        let agent = match self.rebuild_root_with_knowledge_base_snapshot(agent) {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%error, requested = %name, "prepared primary KB prompt binding failed");
+                return false;
+            }
+        };
         self.stack[0].agent = Arc::new(agent);
         self.stack[0].queue_target = crate::engine::message::QueueTarget::root(name.to_string());
         self.schedule.set_agent(self.stack[0].agent.clone());
@@ -1806,6 +1842,13 @@ impl Driver {
         }
         match crate::engine::builtin::load(name, &self.spawn_args(true)) {
             Ok(agent) => {
+                let agent = match self.rebuild_root_with_knowledge_base_snapshot(agent) {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        tracing::warn!(%error, requested = %name, "primary swap KB prompt binding failed");
+                        return false;
+                    }
+                };
                 // An abandoned skill the outgoing primary declined to follow
                 // must not cross the swap as authoritative instructions for
                 // the new primary (implementation note).

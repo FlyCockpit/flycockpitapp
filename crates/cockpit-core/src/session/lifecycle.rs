@@ -173,6 +173,20 @@ fn capture_knowledge_base_prompt_snapshot_json(
     .context("capturing knowledge-base prompt snapshot")
 }
 
+/// An uncommitted KB prompt snapshot captured for one exact root definition.
+/// Construct the root with [`Self::system_prefix`] before committing it, so a
+/// failed root rebuild can never replace the running agent's cached prefix.
+pub(crate) struct CapturedKnowledgeBasePromptSnapshot {
+    raw: String,
+    snapshot: Arc<crate::knowledge::KnowledgeBasePromptSnapshot>,
+}
+
+impl CapturedKnowledgeBasePromptSnapshot {
+    pub(crate) fn system_prefix(&self) -> String {
+        self.snapshot.render_system_block()
+    }
+}
+
 impl Session {
     /// Create a brand-new session, inserting its row in the DB.
     #[allow(dead_code)]
@@ -180,7 +194,7 @@ impl Session {
         db: Db,
         project_root: PathBuf,
         active_agent: &str,
-        config: &crate::config::extended::ExtendedConfig,
+        _config: &crate::config::extended::ExtendedConfig,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
@@ -199,19 +213,9 @@ impl Session {
         })?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let allowed_knowledge_bases = crate::agents::resolve(&project_root, active_agent)?
-            .and_then(|definition| definition.allowed_knowledge_bases().cloned());
-        row.knowledge_base_prompt_snapshot_json = capture_knowledge_base_prompt_snapshot_json(
-            &db,
-            config,
-            &project_root,
-            None,
-            allowed_knowledge_bases.as_ref(),
-            crate::config::trust::runtime_policy().map_or(
-                crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
-                |policy| policy.mode,
-            ),
-        )?;
+        // The worker freezes this only after the actual root has been loaded.
+        // Capturing it here from a separately resolved name would let a
+        // filesystem-backed definition change before the root is constructed.
         let row_for_db = row.clone();
         let row = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -293,34 +297,66 @@ impl Session {
         Ok(())
     }
 
-    /// Freeze the KB prompt only after the daemon's final durable trust
-    /// observation, using the retained, trust-filtered config projection that
-    /// is about to be published to this worker.
-    pub(crate) fn set_deferred_knowledge_base_prompt_snapshot(
-        &mut self,
+    /// Capture the stable KB facts for the exact definition that is about to
+    /// become the root.  The definition is supplied by the successful root
+    /// loader, rather than re-resolved by name, so workspace edits cannot
+    /// split the prompt allowlist from the live tool/retrieval allowlist.
+    pub(crate) fn capture_knowledge_base_prompt_snapshot_for_agent(
+        &self,
         config: &crate::config::extended::ExtendedConfig,
-        assistant_name: Option<&str>,
-        allowed_knowledge_bases: Option<&std::collections::BTreeSet<String>>,
-        trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            self.pending_row.lock().unwrap().is_some(),
-            "knowledge-base prompt snapshot may only be set before persistence"
-        );
-        let snapshot = capture_knowledge_base_prompt_snapshot_json(
+        definition: &crate::agents::AgentDef,
+        trust_mode: crate::db::workspace_trust::WorkspaceTrustMode,
+    ) -> Result<CapturedKnowledgeBasePromptSnapshot> {
+        let raw = capture_knowledge_base_prompt_snapshot_json(
             &self.db,
             config,
             &self.project_root,
-            assistant_name,
-            allowed_knowledge_bases,
-            trust_policy.mode,
+            self.assistant_name.as_deref(),
+            definition.allowed_knowledge_bases(),
+            trust_mode,
         )?;
-        self.knowledge_base_prompt_snapshot =
-            Arc::new(crate::knowledge::KnowledgeBasePromptSnapshot::from_json_str(&snapshot));
-        anyhow::ensure!(
-            self.stage_pending_row(|row| row.knowledge_base_prompt_snapshot_json = snapshot),
-            "deferred session row disappeared while capturing knowledge-base prompt snapshot"
-        );
+        Ok(CapturedKnowledgeBasePromptSnapshot {
+            snapshot: Arc::new(crate::knowledge::KnowledgeBasePromptSnapshot::from_json_str(&raw)),
+            raw,
+        })
+    }
+
+    /// Publish a root-definition-bound KB snapshot together with the
+    /// session's in-memory view.  Dream completion never calls this method;
+    /// only root construction/replacement may change the cached prefix.
+    pub(crate) fn commit_knowledge_base_prompt_snapshot(
+        &self,
+        captured: CapturedKnowledgeBasePromptSnapshot,
+    ) -> Result<()> {
+        if self.stage_pending_row(|row| {
+            row.knowledge_base_prompt_snapshot_json = captured.raw.clone();
+        }) {
+            *self
+                .knowledge_base_prompt_snapshot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = captured.snapshot;
+            return Ok(());
+        }
+        let session_id = self.id;
+        let raw = captured.raw.clone();
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE sessions SET knowledge_base_prompt_snapshot_json = ?1 WHERE session_id = ?2",
+                    rusqlite::params![raw, session_id.to_string()],
+                )
+                .context("updating session knowledge-base prompt snapshot")?;
+                anyhow::ensure!(
+                    changed == 1,
+                    "session disappeared while updating its knowledge-base prompt snapshot"
+                );
+                Ok(())
+            })
+            .context("persisting session knowledge-base prompt snapshot")?;
+        *self
+            .knowledge_base_prompt_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = captured.snapshot;
         Ok(())
     }
 
@@ -531,11 +567,11 @@ impl Session {
         let model_system_prompt_snapshot = Arc::new(ModelSystemPromptSnapshot::from_json_str(
             &row.model_system_prompt_snapshot_json,
         ));
-        let knowledge_base_prompt_snapshot = Arc::new(
+        let knowledge_base_prompt_snapshot = RwLock::new(Arc::new(
             crate::knowledge::KnowledgeBasePromptSnapshot::from_json_str(
                 &row.knowledge_base_prompt_snapshot_json,
             ),
-        );
+        ));
         let short_id = match row.short_id.clone() {
             Some(s) => s,
             None => {

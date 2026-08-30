@@ -6463,6 +6463,46 @@ pub(super) async fn run_worker(
             return;
         }
     };
+    // The root loader is the only authority for the definition whose
+    // allowlist governs live KB retrieval/tool admission. Capture from that
+    // already-loaded definition, then rebuild from the same pinned definition
+    // with the resulting prefix. This deliberately avoids a second name-based
+    // filesystem resolution between snapshot capture and root construction.
+    let root_result = (|| -> anyhow::Result<_> {
+        let definition = root_result
+            .definition
+            .as_deref()
+            .context("constructed root has no definition to bind its knowledge-base prompt")?;
+        let captured = session.capture_knowledge_base_prompt_snapshot_for_agent(
+            &spawn_args.config.extended(),
+            definition,
+            crate::config::trust::read_shared_workspace_trust_policy(&trust_policy).mode,
+        )?;
+        let mut args = spawn_args.clone();
+        args.knowledge_base_system_prefix = captured.system_prefix();
+        let rebuilt = builtin::rebuild_from_pinned_definition(&root_result, &args)?;
+        session.commit_knowledge_base_prompt_snapshot(captured)?;
+        Ok(rebuilt)
+    })();
+    let root_result = match root_result {
+        Ok(root) => root,
+        Err(error) => {
+            let message = format!(
+                "constructed root `{root_agent_name}` could not bind its knowledge-base prompt: {error:#}"
+            );
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
     let root = Arc::new(root_result);
     let root_is_vnext = root
         .definition

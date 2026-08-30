@@ -39,9 +39,10 @@ use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, 
 use crate::redact::RedactionTable;
 use crate::session::Session;
 
-/// Immutable knowledge-base facts captured when a session starts. This renders
-/// into the cached system prefix; live dream completion deliberately never
-/// rewrites it, and instead becomes a one-turn history injection.
+/// Immutable knowledge-base facts captured when a root definition is bound.
+/// This renders into that root's cached system prefix; live dream completion
+/// deliberately never rewrites it, and instead becomes a one-turn history
+/// injection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct KnowledgeBasePromptSnapshot {
@@ -121,7 +122,7 @@ impl KnowledgeBasePromptSnapshot {
             return String::new();
         }
 
-        let mut out = String::from("Knowledge bases (session-start snapshot):\n");
+        let mut out = String::from("Knowledge bases (root-definition snapshot):\n");
         for entry in &self.entries {
             out.push_str("- ");
             out.push_str(&entry.name);

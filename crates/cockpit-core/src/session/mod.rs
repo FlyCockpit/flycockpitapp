@@ -24,7 +24,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -357,9 +357,11 @@ pub struct Session {
     redaction_table_json: Mutex<Option<String>>,
     secret_path_matcher: OnceLock<crate::secret_paths::SecretPathMatcher>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
-    /// Immutable session-start KB identity/freshness facts rendered into the
-    /// cached system prefix. Never rewritten after a dream completes.
-    knowledge_base_prompt_snapshot: Arc<KnowledgeBasePromptSnapshot>,
+    /// KB identity/freshness facts bound to the active root definition and
+    /// rendered into its cached system prefix. Frozen across turns and never
+    /// rewritten after a dream completes; root replacement is the sole
+    /// rebinding boundary.
+    knowledge_base_prompt_snapshot: RwLock<Arc<KnowledgeBasePromptSnapshot>>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -1187,15 +1189,22 @@ impl Session {
         self.model_system_prompt_snapshot.clone()
     }
 
-    /// Stable KB block for the cached system prompt. Its source is the
-    /// session-start snapshot, never a live registry or dream-status read.
+    /// Stable KB block for the cached root system prompt. Its source is a
+    /// root-definition-bound snapshot, never a live registry or dream-status
+    /// read.
     pub fn knowledge_base_system_prompt(&self) -> String {
-        self.knowledge_base_prompt_snapshot.render_system_block()
+        self.knowledge_base_prompt_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render_system_block()
     }
 
     #[cfg(test)]
     pub(crate) fn set_knowledge_base_prompt_snapshot_for_test(&mut self, raw: &str) {
-        self.knowledge_base_prompt_snapshot =
+        *self
+            .knowledge_base_prompt_snapshot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Arc::new(KnowledgeBasePromptSnapshot::from_json_str(raw));
     }
 
@@ -1208,7 +1217,11 @@ impl Session {
     /// or is retried before dispatch, asking again returns the same notice, so
     /// an acknowledgement can never outlive the history that delivers it.
     pub async fn knowledge_base_freshness_notices(&self) -> Vec<String> {
-        let snapshot = self.knowledge_base_prompt_snapshot.clone();
+        let snapshot = self
+            .knowledge_base_prompt_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         if snapshot.entries().is_empty() {
             return Vec::new();
         }
@@ -1753,7 +1766,10 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        session.knowledge_base_prompt_snapshot = Arc::new(
+        *session
+            .knowledge_base_prompt_snapshot
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(
             KnowledgeBasePromptSnapshot::from_json_str(
                 r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":null}]}"#,
             ),

@@ -22,6 +22,21 @@ fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value
         .unwrap_or_else(|| args.clone())
 }
 
+/// The display/audit projection is intentionally distinct from this model-wire
+/// projection. `x-cockpit-model-ephemeral` fields remain in the former, while
+/// this value is the only argument shape persisted for replay.
+fn model_history_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
+    let display_args = ordinary_ledger_args(env, resolved_name, args);
+    env.active_tools
+        .get(resolved_name)
+        .map(|tool| {
+            crate::engine::tool::strip_model_ephemeral_fields(&display_args, &tool.parameters())
+        })
+        // MCP is intentionally unaffected: third-party schemas and their
+        // unstructured results do not participate in this marker contract.
+        .unwrap_or(display_args)
+}
+
 #[derive(Debug)]
 pub(crate) struct SchedulerDurableOrder {
     next_started: std::sync::atomic::AtomicUsize,
@@ -1251,7 +1266,7 @@ async fn execute_ordinary_call_unscoped(
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
         let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
-        let ledger_wire = ordinary_ledger_args(env, resolved_name, &args);
+        let ledger_wire = model_history_args(env, resolved_name, &args);
         let start_data = serde_json::json!({
             "tool": resolved_name,
             "original_input": ledger_original,
@@ -1887,10 +1902,24 @@ async fn execute_ordinary_call_unscoped(
         ),
         Err(_) => (None, None, None),
     };
-    let output_sidecar = match &result {
-        Ok(out) => out.output_sidecar.as_ref().map(|s| s.payload.clone()),
-        Err(_) => None,
+    // Keep the complete result metadata in the durable/display projection.
+    // The schema marker produces the model projection at this one storage
+    // boundary; today's built-in metadata fields are all marked, so this is
+    // empty without a dispatcher-maintained exclusion list.
+    let result_metadata = match &result {
+        Ok(out) => out.result_metadata(),
+        Err(_) => serde_json::Map::new(),
     };
+    let model_result_metadata = env
+        .active_tools
+        .get(resolved_name)
+        .map(|tool| {
+            crate::engine::tool::strip_model_ephemeral_fields(
+                &Value::Object(result_metadata.clone()),
+                &tool.result_schema(),
+            )
+        })
+        .unwrap_or_else(|| Value::Object(result_metadata.clone()));
     // Part B: `bash`'s sandbox-state sub-object for the tool_call event.
     // Only `bash` populates it; every other tool leaves it `None`, so the
     // event omits the `sandbox` key. Never model-facing (token economy).
@@ -1938,7 +1967,20 @@ async fn execute_ordinary_call_unscoped(
     if let Some(canonical) =
         history_rewrite_args(wire_args.as_ref(), &args, repair_outcome.valid, &recovery)
     {
-        rewrite_assistant_tool_call(history, &tc.id, canonical);
+        rewrite_assistant_tool_call(
+            history,
+            &tc.id,
+            model_history_args(env, resolved_name, &canonical),
+        );
+    } else {
+        // Store-time projection must also rewrite the live assistant call.
+        // Otherwise a marked value would survive in the just-built history
+        // until restart even though the durable replay row correctly omits it.
+        rewrite_assistant_tool_call(
+            history,
+            &tc.id,
+            model_history_args(env, resolved_name, &args),
+        );
     }
     if let Some(signature) = repair_outcome
         .valid
@@ -1973,6 +2015,20 @@ async fn execute_ordinary_call_unscoped(
         Ok(output) => Some(resolve_tool_media_handoffs(env, tc, output).await),
         Err(_) => None,
     };
+    let model_result_contents = result
+        .as_ref()
+        .ok()
+        .map(|output| {
+            env.active_tools
+                .get(resolved_name)
+                .map(|tool| {
+                    output
+                        .content
+                        .strip_model_ephemeral_fields(&tool.result_schema())
+                })
+                .unwrap_or_else(|| Ok(output.content.clone()))
+        })
+        .transpose()?;
     let (raw_output, hard_fail, fail_kind) = match (&result, &resolved_media_handoffs) {
         (Ok(_), Some(Err(error))) => (
             format!("Error: {error}"),
@@ -2208,7 +2264,7 @@ async fn execute_ordinary_call_unscoped(
     // tool's safe projection. Project both forms independently so shape/name
     // recovery remains visible without ever persisting secret fields.
     let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
-    let ledger_wire = ordinary_ledger_args(env, resolved_name, &args);
+    let ledger_wire = model_history_args(env, resolved_name, &args);
     scheduler_await_commit().await;
     if let Err(e) = env
         .session
@@ -2268,7 +2324,14 @@ async fn execute_ordinary_call_unscoped(
                 .iter()
                 .all(|part| !part.is_media_reference())
             && output_str == output.content.model_text())
-        .then(|| serde_json::to_value(output.content.parts()))
+        .then(|| {
+            serde_json::to_value(
+                model_result_contents
+                    .as_ref()
+                    .unwrap_or(&output.content)
+                    .parts(),
+            )
+        })
     });
     let canonical_history_output = match canonical_history_output.transpose() {
         Ok(output) => output,
@@ -2306,24 +2369,8 @@ async fn execute_ordinary_call_unscoped(
     if let Recovery::NameRepair { original: orig, .. } = &recovery {
         event_data["original_tool"] = serde_json::json!(orig);
     }
-    if let Some(meta) = &sandbox_meta
-        && let Ok(meta_val) = serde_json::to_value(meta)
-    {
-        event_data["sandbox"] = meta_val;
-    }
-    if let Some(meta) = &resource_meta
-        && let Ok(meta_val) = serde_json::to_value(meta)
-    {
-        event_data["resource"] = meta_val;
-    }
-    // `bash` exit code (export-audit fidelity): the authoritative structured
-    // source for "which bash calls failed", so an auditor never has to regex
-    // the human-readable `exit: N` line out of `output` (which is kept for
-    // backward compatibility). Present only for `bash` calls that actually
-    // ran a shell — `None` (key omitted) on spawn/timeout/cancel paths and
-    // on every non-`bash` tool.
-    if let Some(code) = exit_code {
-        event_data["exit_code"] = serde_json::json!(code);
+    if let Some(event_data) = event_data.as_object_mut() {
+        event_data.extend(result_metadata.clone());
     }
     // Post-result hint (`engine::bash_hints`): the user-side `data.hint`
     // surface (`{ kind, text, severity }`), surfaced as a TUI chip and
@@ -2332,9 +2379,6 @@ async fn execute_ordinary_call_unscoped(
     // `wire_output` below (wire-vs-user split, GOALS §14).
     if let Some(hint) = &hint_value {
         event_data["hint"] = hint.clone();
-    }
-    if let Some(sidecar) = &output_sidecar {
-        event_data["output_sidecar"] = sidecar.clone();
     }
     // Rejected-call event (export-audit fidelity): emitted just BEFORE the
     // (hard-fail) `tool_call` row so a hallucinated / unrepairable call is a
@@ -2643,18 +2687,8 @@ async fn execute_ordinary_call_unscoped(
                 }
             };
         }
-        if let Some(code) = exit_code {
-            completed_data["exit_code"] = serde_json::json!(code);
-        }
-        if let Some(meta) = &sandbox_meta
-            && let Ok(meta_val) = serde_json::to_value(meta)
-        {
-            completed_data["sandbox"] = meta_val;
-        }
-        if let Some(meta) = &resource_meta
-            && let Ok(meta_val) = serde_json::to_value(meta)
-        {
-            completed_data["resource"] = meta_val;
+        if let Some(completed_data) = completed_data.as_object_mut() {
+            completed_data.extend(result_metadata.clone());
         }
         if let Some(hint) = &hint_value {
             completed_data["hint"] = hint.clone();
@@ -2692,9 +2726,19 @@ async fn execute_ordinary_call_unscoped(
     // (`ToolEnd`) and persisted unchanged above; only the model's history
     // copy carries the notes. Off / no-hint → `wire_output` == `output_str`,
     // byte-identical to today.
+    let projected_output = model_result_contents
+        .as_ref()
+        .map(|content| content.model_text())
+        .unwrap_or(&output_str);
+    let model_result_metadata_suffix = match model_result_metadata {
+        Value::Object(ref fields) if !fields.is_empty() => {
+            serde_json::to_string(fields).context("serializing model-visible result fields")?
+        }
+        _ => String::new(),
+    };
     let mut wire_output =
         if repair_hints.is_empty() || verification_blocked || verification_disclosure.is_some() {
-            output_str
+            projected_output.to_string()
         } else {
             let mut prefixed = String::new();
             for hint in &repair_hints {
@@ -2702,9 +2746,15 @@ async fn execute_ordinary_call_unscoped(
                 prefixed.push_str(&repair::repair_note_for_prompt(hint));
                 prefixed.push_str("</repair_note>\n");
             }
-            prefixed.push_str(&output_str);
+            prefixed.push_str(projected_output);
             prefixed
         };
+    if !model_result_metadata_suffix.is_empty() {
+        if !wire_output.is_empty() {
+            wire_output.push('\n');
+        }
+        wire_output.push_str(&model_result_metadata_suffix);
+    }
     // Failed-command verification guard → the WIRE tool_result
     // (implementation note). When a `bash`
     // command exits NON-ZERO (or is signaled — `exit_code == None` on a
@@ -2907,14 +2957,22 @@ async fn execute_ordinary_call_unscoped(
         let wire_contents = match &result {
             Ok(output)
                 if !hard_fail
-                    && wire_output == output.content.model_text()
-                    && output
-                        .content
+                    && wire_output
+                        == model_result_contents
+                            .as_ref()
+                            .unwrap_or(&output.content)
+                            .model_text()
+                    && model_result_contents
+                        .as_ref()
+                        .unwrap_or(&output.content)
                         .parts()
                         .iter()
                         .all(|part| !part.is_media_reference()) =>
             {
-                output.content.to_rig_contents()?
+                model_result_contents
+                    .as_ref()
+                    .unwrap_or(&output.content)
+                    .to_rig_contents()?
             }
             _ => vec![rig::message::ToolResultContent::text(wire_output)],
         };

@@ -24,6 +24,68 @@ use crate::engine::message::ToolDefinition;
 
 pub use crate::daemon::proto::ToolFailKind;
 
+/// JSON Schema extension marking a persisted tool field as display-only.
+///
+/// Values under a marked field stay in the durable timeline, but are removed
+/// from the model-wire projection before that projection is stored.  The same
+/// projection is used by the live turn and session rehydration, so a marked
+/// value cannot enter a later model request.
+pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
+
+/// Strip fields declared with [`MODEL_EPHEMERAL_SCHEMA_KEY`] from a JSON value.
+///
+/// The extension is intentionally a storage concern, not JSON-Schema
+/// validation vocabulary: providers still receive the complete input schema
+/// and may emit the field. We understand object properties and array items so
+/// native and custom tools can mark fields at any nesting depth. Unknown or
+/// malformed schema fragments fail closed to the existing no-op projection.
+pub fn strip_model_ephemeral_fields(value: &Value, schema: &Value) -> Value {
+    if schema
+        .get(MODEL_EPHEMERAL_SCHEMA_KEY)
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Value::Null;
+    }
+
+    match value {
+        Value::Object(object) => {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            let mut projected = serde_json::Map::with_capacity(object.len());
+            for (name, field) in object {
+                let field_schema = properties.and_then(|properties| properties.get(name));
+                if field_schema.is_some_and(|field_schema| {
+                    field_schema
+                        .get(MODEL_EPHEMERAL_SCHEMA_KEY)
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                }) {
+                    continue;
+                }
+                projected.insert(
+                    name.clone(),
+                    field_schema
+                        .map(|field_schema| strip_model_ephemeral_fields(field, field_schema))
+                        .unwrap_or_else(|| field.clone()),
+                );
+            }
+            Value::Object(projected)
+        }
+        Value::Array(items) => schema
+            .get("items")
+            .map(|item_schema| {
+                Value::Array(
+                    items
+                        .iter()
+                        .map(|item| strip_model_ephemeral_fields(item, item_schema))
+                        .collect(),
+                )
+            })
+            .unwrap_or_else(|| value.clone()),
+        _ => value.clone(),
+    }
+}
+
 /// Marker error a tool returns when the *arguments* were the problem
 /// (see [`ToolFailKind::Invocation`]). The dispatcher downcasts to this
 /// to classify the failure; build it with [`invalid_input`].
@@ -341,6 +403,74 @@ fn lexical_normalize(path: impl AsRef<Path>) -> PathBuf {
 }
 
 #[cfg(test)]
+mod model_ephemeral_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strips_marked_args_and_structured_results_without_touching_display_value() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "visible": { "type": "string" },
+                "ephemeral": { "x-cockpit-model-ephemeral": true },
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "keep": { "type": "string" },
+                        "drop": { "x-cockpit-model-ephemeral": true }
+                    }
+                }
+            }
+        });
+        let display = json!({
+            "visible": "shown",
+            "ephemeral": "timeline-only",
+            "nested": { "keep": "also shown", "drop": "never replayed" }
+        });
+
+        assert_eq!(
+            strip_model_ephemeral_fields(&display, &schema),
+            json!({ "visible": "shown", "nested": { "keep": "also shown" } })
+        );
+        assert_eq!(
+            display["ephemeral"], "timeline-only",
+            "the durable/display projection remains complete"
+        );
+
+        let contents = CanonicalToolResultContents::new(vec![
+            crate::typed_media_result::CanonicalToolResultContent::Json { value: display },
+        ])
+        .unwrap();
+        let projected = contents.strip_model_ephemeral_fields(&schema).unwrap();
+        assert_eq!(
+            projected.parts(),
+            &[
+                crate::typed_media_result::CanonicalToolResultContent::Json {
+                    value: json!({ "visible": "shown", "nested": { "keep": "also shown" } })
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn default_result_schema_marks_existing_output_metadata() {
+        let metadata = json!({
+            "sandbox": { "enabled": true },
+            "resource": { "cpu": 1 },
+            "exit_code": 1,
+            "output_sidecar": { "stdout": "full" }
+        });
+
+        assert_eq!(
+            strip_model_ephemeral_fields(&metadata, &ToolOutput::result_schema()),
+            json!({}),
+            "the prior ToolOutput metadata exclusion is declarative"
+        );
+    }
+}
+
+#[cfg(test)]
 mod typed_args_tests {
     use super::*;
     use serde::Deserialize;
@@ -529,6 +659,15 @@ pub trait Tool: Send + Sync {
     /// here must match.
     fn verbose_parameters(&self) -> Option<Value> {
         None
+    }
+
+    /// JSON Schema for structured tool-result fields. This is deliberately
+    /// separate from the provider-visible argument schema: result fields are
+    /// produced by the host, persisted for the transcript, and then projected
+    /// into model history at store time. The default expresses the existing
+    /// `ToolOutput` audit metadata through the declarative marker.
+    fn result_schema(&self) -> Value {
+        ToolOutput::result_schema()
     }
 
     /// Run the tool. The args have already passed through §12 repair (or
@@ -720,6 +859,25 @@ impl CanonicalToolResultContents {
                 crate::typed_media_result::CanonicalToolResultContent::Text { .. }
             )
         })
+    }
+
+    /// Return the model-wire form of a structured result. Text and media are
+    /// not field-addressable JSON and therefore pass through unchanged; JSON
+    /// parts are projected by the tool's declared result schema.
+    pub fn strip_model_ephemeral_fields(&self, schema: &Value) -> anyhow::Result<Self> {
+        let parts = self
+            .parts
+            .iter()
+            .map(|part| match part {
+                crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    crate::typed_media_result::CanonicalToolResultContent::Json {
+                        value: crate::engine::tool::strip_model_ephemeral_fields(value, schema),
+                    }
+                }
+                _ => part.clone(),
+            })
+            .collect();
+        Self::new(parts)
     }
 
     pub fn push_str(&mut self, value: &str) {
@@ -948,6 +1106,45 @@ mod context_usage_snapshot_tests {
 }
 
 impl ToolOutput {
+    /// Schema for the structured, timeline-only metadata every tool output may
+    /// carry. Keeping this marker list beside the output shape replaces the
+    /// dispatcher's former hand-maintained model-exclusion list.
+    pub fn result_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "sandbox": { "x-cockpit-model-ephemeral": true },
+                "resource": { "x-cockpit-model-ephemeral": true },
+                "exit_code": { "x-cockpit-model-ephemeral": true },
+                "output_sidecar": { "x-cockpit-model-ephemeral": true }
+            }
+        })
+    }
+
+    /// Durable structured metadata, retained for the timeline/export surface.
+    /// Its model projection is derived exclusively from [`Self::result_schema`]
+    /// (or a native tool's [`Tool::result_schema`] override).
+    pub fn result_metadata(&self) -> serde_json::Map<String, Value> {
+        let mut metadata = serde_json::Map::new();
+        if let Some(sandbox) = &self.sandbox
+            && let Ok(value) = serde_json::to_value(sandbox)
+        {
+            metadata.insert("sandbox".to_string(), value);
+        }
+        if let Some(resource) = &self.resource
+            && let Ok(value) = serde_json::to_value(resource)
+        {
+            metadata.insert("resource".to_string(), value);
+        }
+        if let Some(exit_code) = self.exit_code {
+            metadata.insert("exit_code".to_string(), Value::from(exit_code));
+        }
+        if let Some(sidecar) = &self.output_sidecar {
+            metadata.insert("output_sidecar".to_string(), sidecar.payload.clone());
+        }
+        metadata
+    }
+
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),

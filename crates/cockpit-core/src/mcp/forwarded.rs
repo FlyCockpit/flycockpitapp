@@ -6,6 +6,7 @@
 //! disk cache, and durable approval grants.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -139,6 +140,22 @@ pub struct AcpForwardedMcpCatalogV1 {
     normalized_entries: Vec<Arc<AcpForwardedMcpEntryV1>>,
     state: RwLock<EpochState>,
     cancellation: CancellationToken,
+}
+
+// The catalog deliberately retains editor-supplied environment values and
+// headers in memory.  A derived implementation would expose those values via
+// its entries, including when `Result::unwrap_err` formats a successful value
+// in a test failure.  Keep diagnostic output structural and secret-free.
+impl fmt::Debug for AcpForwardedMcpCatalogV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcpForwardedMcpCatalogV1")
+            .field("root_id", &self.root_id)
+            .field("epoch", &self.epoch)
+            .field("entry_count", &self.entries.len())
+            .field("released", &self.is_released())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -452,6 +469,17 @@ fn validate_and_convert(
 struct ValidatedEntries {
     by_name: BTreeMap<String, Arc<AcpForwardedMcpEntryV1>>,
     normalized: Vec<Arc<AcpForwardedMcpEntryV1>>,
+}
+
+// See `AcpForwardedMcpCatalogV1` above: these normalized entries may contain
+// editor-supplied credentials, so validation failures must not format them.
+impl fmt::Debug for ValidatedEntries {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatedEntries")
+            .field("entry_count", &self.normalized.len())
+            .finish_non_exhaustive()
+    }
 }
 
 fn validate_stdio_command(command: &str) -> Result<PathBuf> {

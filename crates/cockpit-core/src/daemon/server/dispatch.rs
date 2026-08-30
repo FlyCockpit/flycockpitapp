@@ -5584,7 +5584,9 @@ async fn rollback_acp_catalog_composition_failure(
     .await;
     let root_rollback = if archive_root {
         match pending.root_id {
-            Some(root_id) => super::sessions::archive_session(ctx, root_id, true).await,
+            Some(root_id) => super::sessions::archive_session(ctx, root_id, true)
+                .await
+                .map(|_| ()),
             None => Ok(()),
         }
     } else {

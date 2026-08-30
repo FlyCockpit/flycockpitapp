@@ -433,6 +433,19 @@ impl ScheduleAuthority {
         self.ctx.write_scope = Some(write_scope);
     }
 
+    /// Rebind scheduled work to the context that remains live after a thread
+    /// compaction. The registry and the idle-activity sender deliberately stay
+    /// in this authority: replacing either would duplicate live timers or lose
+    /// an idle wake's accepted-user anchor.
+    ///
+    /// Today's compaction resets the session in place, but keeping this as an
+    /// explicit boundary also gives a successor-session handoff one place to
+    /// retarget work created after the handoff without recreating the live
+    /// schedule state.
+    pub(crate) fn migrate_to_live_context(&mut self, session: Arc<Session>) {
+        self.ctx.session = session;
+    }
+
     /// Bind the daemon-ingress activity epoch. The worker handle publishes to
     /// this sender as soon as durable queue admission succeeds, independently
     /// of whether the driver is currently executing a turn.
@@ -795,6 +808,11 @@ impl ScheduleAuthority {
 
     fn publish_user_activity(&self) {
         let _ = self.idle_activity_tx.send(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn idle_activity_anchor_for_tests(&self) -> Instant {
+        *self.idle_activity_tx.borrow()
     }
 
     /// Start a background shell job. Returns the job id.
@@ -1353,6 +1371,49 @@ mod tests {
             other => panic!("expected timer Completed, got {other:?}"),
         }
         assert!(!auth.has_loop());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn migration_keeps_a_bounded_timer_armed_once() {
+        let (mut auth, mut events, _ui, tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 5, "prompt": "fire", "limit": 1
+        }))
+        .unwrap();
+        let job_id = auth.start_loop_in_context(args);
+        let db = auth.ctx.session.db.clone();
+        let successor = Arc::new(
+            crate::session::Session::create_for_test(
+                db,
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+
+        auth.migrate_to_live_context(successor.clone());
+        assert_eq!(auth.ctx.session.id, successor.id);
+        assert_eq!(
+            auth.snapshot().len(),
+            1,
+            "migration must not clone the timer"
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ScheduleEvent::LoopIterationDue { job_id: ref due, .. } if due == &job_id
+        ));
+        auth.iteration_finished(&job_id);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ScheduleEvent::Completed {
+                kind: ScheduleKind::Timer,
+                ..
+            }
+        ));
+        assert!(auth.snapshot().is_empty(), "the bound remains one firing");
     }
 
     /// `loop.cancel` ends a live in-context loop early and emits a

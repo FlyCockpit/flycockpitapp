@@ -1918,6 +1918,11 @@ impl Driver {
         // 5. Reset the foreground model context in place.
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
         self.drop_stale_owner_ledgers().await;
+        // Keep the one live schedule authority attached to the compacted
+        // thread. Its registry and idle-activity sender are the timer/wake
+        // state, so compaction must rebind the live context rather than
+        // recreate the authority (which would duplicate or orphan timers).
+        self.schedule.migrate_to_live_context(self.session.clone());
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 

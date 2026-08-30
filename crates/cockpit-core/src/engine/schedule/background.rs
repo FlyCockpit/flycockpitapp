@@ -71,13 +71,13 @@ impl BackgroundLaunch {
 
     pub fn confined_with_workspace_scratch(
         tmp_dir: Option<PathBuf>,
-        workspace_scratch_dir: Option<PathBuf>,
+        workspace_scratch_dir: PathBuf,
         session_env: HashMap<String, String>,
     ) -> Self {
         Self {
             confine: true,
             tmp_dir,
-            workspace_scratch_dir,
+            workspace_scratch_dir: Some(workspace_scratch_dir),
             session_env,
             #[cfg(test)]
             test_sandbox_build: None,

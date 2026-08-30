@@ -204,10 +204,7 @@ fn sandbox_policy_with_visibility_restriction(
         push_unique_path(&mut allow_read_roots, tmp.to_path_buf());
         push_unique_path(&mut allow_write_roots, tmp.to_path_buf());
     }
-    if workspace_write_allowed
-        && !restrict_to_visibility
-        && let Some(scratch) = workspace_scratch_dir
-    {
+    if let Some(scratch) = workspace_scratch_dir {
         push_unique_path(&mut allow_read_roots, scratch.to_path_buf());
         push_unique_path(&mut allow_write_roots, scratch.to_path_buf());
     }
@@ -369,9 +366,9 @@ pub async fn build_sandboxed_command_with_visibility_root(
     restrict_to_visibility: bool,
     workspace_write_allowed: bool,
 ) -> Result<tokio::process::Command> {
-    // Session scratch is shared state and may sit outside a child lease. A
-    // writable leased shell instead receives a dedicated scratch directory
-    // below its visibility root; read/execute-only leases receive none.
+    // The ephemeral tmp remains lease-local, while the session's durable
+    // scratch is an explicit capability and remains available outside a child
+    // lease's workspace visibility root.
     let lease_scratch = if restrict_to_visibility && workspace_write_allowed {
         let scratch_root = write_scope
             .filter(|scope| cockpit_host::path_containment::contained_under(visibility_root, scope))
@@ -1001,6 +998,32 @@ mod tests {
                     .allow_write_roots
                     .contains(&shared_tmp.path().to_path_buf()),
             "a shared session temp dir must not escape a workspace lease"
+        );
+    }
+
+    #[test]
+    fn leased_policy_admits_durable_workspace_scratch() {
+        let lease_root = tempfile::tempdir().unwrap();
+        let workspace_scratch = tempfile::tempdir().unwrap();
+        let policy = sandbox_policy_with_visibility_restriction(
+            lease_root.path(),
+            None,
+            Some(workspace_scratch.path()),
+            &std::collections::HashMap::new(),
+            &[],
+            Some(std::path::Path::new("/__cockpit-deny-writes__")),
+            true,
+            false,
+        );
+        assert!(
+            policy
+                .allow_read_roots
+                .contains(&workspace_scratch.path().to_path_buf())
+        );
+        assert!(
+            policy
+                .allow_write_roots
+                .contains(&workspace_scratch.path().to_path_buf())
         );
     }
 

@@ -481,6 +481,12 @@ impl Session {
             None => load_redaction_table_from_vault(&vault, row.session_id)
                 .context("loading vault redaction table while resuming session")?,
         };
+        // Durable workspace scratch is a required session capability. Create
+        // and publish its reverse-map marker before returning a usable session
+        // so every later prompt and sandbox consumer has the same path.
+        let workspace_scratch_dir =
+            workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
+                .context("initializing required durable workspace scratch")?;
         Ok(Self {
             id: row.session_id,
             project_id: row.project_id,
@@ -531,7 +537,7 @@ impl Session {
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
-            workspace_scratch_dir: Mutex::new(None),
+            workspace_scratch_dir,
             host_shim_dir: Mutex::new(None),
             sandbox_mode: AtomicU8::new(sandbox_mode_to_u8(
                 crate::tools::sandbox_mode::SandboxMode::Sandbox,
@@ -597,29 +603,8 @@ impl Session {
     ///
     /// This is intentionally separate from [`Self::tmp_dir`]: ending or
     /// dropping a session removes only the ephemeral system-temp directory.
-    pub fn workspace_scratch_dir(&self) -> Option<PathBuf> {
-        let mut slot = self.workspace_scratch_dir.lock().unwrap();
-        if let Some(dir) = slot.as_ref() {
-            return Some(dir.clone());
-        }
-        let dir = match workspace_scratch_dir_for_session(
-            &self.project_id,
-            &self.project_root,
-            self.id,
-        ) {
-            Ok(dir) => dir,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    project_id = %self.project_id,
-                    project_root = %self.project_root.display(),
-                    "creating durable workspace scratch dir failed"
-                );
-                return None;
-            }
-        };
-        *slot = Some(dir.clone());
-        Some(dir)
+    pub fn workspace_scratch_dir(&self) -> PathBuf {
+        self.workspace_scratch_dir.clone()
     }
 
     /// Per-session host shim directory under the Cockpit data dir. Used for

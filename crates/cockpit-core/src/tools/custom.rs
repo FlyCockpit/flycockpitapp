@@ -247,7 +247,7 @@ impl Tool for CustomBashTool {
                 &cmd,
                 &ctx.cwd,
                 ctx.session.tmp_dir().as_deref(),
-                workspace_scratch_dir.as_deref(),
+                Some(&workspace_scratch_dir),
                 &scrub,
                 &session_env,
                 &[],

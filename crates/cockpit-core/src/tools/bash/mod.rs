@@ -393,6 +393,7 @@ async fn call_bash_inner(
 
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && !lease.covers_cwd(&cwd)
+        && !cockpit_host::path_containment::contained_under(&workspace_scratch_dir, &cwd)
     {
         return Err(crate::engine::tool::invalid_input(format!(
             "refused: bash cwd `{}` is outside workspace lease visibility `{}`",
@@ -404,7 +405,7 @@ async fn call_bash_inner(
             &cwd,
             &ctx.cwd,
             ctx.session.tmp_dir().as_deref(),
-            workspace_scratch_dir.as_deref(),
+            Some(&workspace_scratch_dir),
         )
     {
         approve_outside_working_directory(ctx, &outside).await?;
@@ -415,7 +416,7 @@ async fn call_bash_inner(
             &cwd,
             &ctx.cwd,
             ctx.session.tmp_dir().as_deref(),
-            workspace_scratch_dir.as_deref(),
+            Some(&workspace_scratch_dir),
         )
     {
         approve_outside_working_directory(ctx, &outside).await?;
@@ -696,7 +697,7 @@ async fn call_bash_inner(
         crate::tools::shell_sandbox::sandbox_policy_with_workspace_scratch(
             sandbox_cwd,
             tmp_dir.as_deref(),
-            workspace_scratch_dir.as_deref(),
+            Some(&workspace_scratch_dir),
             &session_env,
             &extra_sandbox_paths,
             ctx.write_scope.as_deref(),
@@ -2654,7 +2655,7 @@ async fn run_shell(
             cwd,
             visibility_root,
             tmp_dir,
-            workspace_scratch_dir.as_deref(),
+            Some(&workspace_scratch_dir),
             scrub,
             session_env,
             extra_sandbox_paths,

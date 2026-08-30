@@ -103,9 +103,11 @@ pub async fn check_native_access(
     required: SandboxPathAccess,
 ) -> Result<PathBuf> {
     // A workspace lease is a hard filesystem boundary, not an additional
-    // source of approval.  In particular, a stale lease, a read-only lease
-    // used for a write, or a path outside its visibility root must never fall
-    // through to the ambient `approve_path` flow.
+    // source of approval. In particular, a stale lease or a workspace path
+    // outside its visibility root must never fall through to the ambient
+    // `approve_path` flow. The session's own durable scratch is the explicit
+    // capability exception: it remains read/write for the leased agent even
+    // when the workspace lease is read-only.
     if let Some(lease) = ctx.workspace_lease.as_deref() {
         if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
             crate::workspace_lease::expire_active_workspace_lease_if_due(&ctx.session.db, lease)
@@ -123,17 +125,6 @@ pub async fn check_native_access(
                 lease.id
             )));
         }
-        let permitted = match required {
-            SandboxPathAccess::Read => lease.allows_read(),
-            SandboxPathAccess::ReadWrite => lease.allows_write(),
-        };
-        if !permitted {
-            return Err(invalid_input(format!(
-                "`{}` is denied by workspace lease `{}` operation authority",
-                path.display(),
-                lease.id
-            )));
-        }
         let effective = effective_native_path(path).map_err(|err| {
             invalid_input(format!(
                 "`{}` cannot be proven inside workspace lease `{}`: {err}",
@@ -141,7 +132,21 @@ pub async fn check_native_access(
                 lease.id
             ))
         })?;
-        if !lease.covers_path(&effective) {
+        let session_scratch = ctx.session.workspace_scratch_dir();
+        let is_session_scratch =
+            cockpit_host::path_containment::contained_under(&session_scratch, &effective);
+        let permitted = match required {
+            SandboxPathAccess::Read => lease.allows_read(),
+            SandboxPathAccess::ReadWrite => lease.allows_write(),
+        };
+        if !permitted && !is_session_scratch {
+            return Err(invalid_input(format!(
+                "`{}` is denied by workspace lease `{}` operation authority",
+                path.display(),
+                lease.id
+            )));
+        }
+        if !lease.covers_path(&effective) && !is_session_scratch {
             return Err(invalid_input(format!(
                 "`{}` is outside workspace lease visibility `{}`",
                 effective.display(),
@@ -454,9 +459,11 @@ fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
         }
         // Session scratch remains usable; sibling worktrees and the primary
         // repository are not implicit lease visibility.
-        return [ctx.session.tmp_dir(), ctx.session.workspace_scratch_dir()]
+        let tmp_dir = ctx.session.tmp_dir();
+        let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+        return tmp_dir
             .iter()
-            .flatten()
+            .chain(std::iter::once(&workspace_scratch_dir))
             .any(|scratch| cockpit_host::path_containment::contained_under(scratch, path));
     }
     let tmp_dir = ctx.session.tmp_dir();
@@ -465,7 +472,7 @@ fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
         path,
         &ctx.cwd,
         tmp_dir.as_deref(),
-        workspace_scratch_dir.as_deref(),
+        Some(&workspace_scratch_dir),
     )
 }
 
@@ -773,6 +780,23 @@ mod tests {
         let tmp_dir = ctx.session.tmp_dir().expect("session tmp dir");
         let scratch = tmp_dir.join("scratch.txt");
         check_native_access(&ctx, &scratch, SandboxPathAccess::Read)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn leased_native_access_allows_durable_workspace_scratch() {
+        let lease_root = tempfile::tempdir().unwrap();
+        let mut ctx = sandboxed_ctx(lease_root.path());
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            lease_root.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::none(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        )));
+        let scratch_file = ctx.session.workspace_scratch_dir().join("scratch.txt");
+
+        check_native_access(&ctx, &scratch_file, SandboxPathAccess::ReadWrite)
             .await
             .unwrap();
     }

@@ -262,7 +262,7 @@ pub struct Session {
     /// Durable per-workspace scratch, partitioned by session under the Cockpit
     /// state directory. Unlike [`Self::tmp_dir`], this directory deliberately
     /// survives session end and daemon restart.
-    workspace_scratch_dir: Mutex<Option<PathBuf>>,
+    workspace_scratch_dir: PathBuf,
     /// Per-session host executable shims under the Cockpit data dir. These
     /// are separate from [`Self::tmp_dir`] so shell PATH shims live in a
     /// stable user-data location, but they share the same end/drop cleanup.
@@ -1356,6 +1356,25 @@ struct WorkspaceDirMarker {
     last_used_at_unix_ms: i64,
 }
 
+/// Per-workspace process-local serialization for marker read/modify/write.
+///
+/// The marker itself is published with a crash-atomic replacement, so readers
+/// in other processes observe either the previous complete document or the
+/// next one. The mutex preserves the timestamp and canonical-root invariant
+/// between concurrent sessions in this daemon before that publication occurs.
+static WORKSPACE_MARKER_LOCKS: OnceLock<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn workspace_marker_lock(project_id: &str) -> Arc<Mutex<()>> {
+    let locks = WORKSPACE_MARKER_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(project_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// Return the durable workspace root for a known `project_id`. This is a
 /// direct path calculation; it never scans project roots or re-hashes paths.
 pub fn workspace_dir_for_project_id(project_id: &str) -> Result<PathBuf> {
@@ -1403,29 +1422,54 @@ fn workspace_scratch_dir_for_session(
     let marker_path = workspace_dir.join(".workspace.json");
     let canonical_root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_root = canonical_root.to_string_lossy().into_owned();
+    let marker_lock = workspace_marker_lock(project_id);
+    let _marker_guard = marker_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Utc::now().timestamp_millis();
-    let created_at_unix_ms = std::fs::read(&marker_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<WorkspaceDirMarker>(&bytes).ok())
-        .filter(|marker| {
-            marker.project_id == project_id
-                && marker.canonical_root == canonical_root.to_string_lossy()
-        })
-        .map(|marker| marker.created_at_unix_ms)
-        .unwrap_or(now);
+    let created_at_unix_ms = match std::fs::read(&marker_path) {
+        Ok(bytes) => {
+            let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing `{}`", marker_path.display()))?;
+            anyhow::ensure!(
+                marker.project_id == project_id && marker.canonical_root == canonical_root,
+                "workspace marker does not match this project identity"
+            );
+            marker.created_at_unix_ms
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => now,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", marker_path.display()));
+        }
+    };
     let marker = WorkspaceDirMarker {
         project_id: project_id.to_string(),
-        canonical_root: canonical_root.to_string_lossy().into_owned(),
+        canonical_root,
         created_at_unix_ms,
         last_used_at_unix_ms: now,
     };
-    std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker)?)
-        .with_context(|| format!("writing `{}`", marker_path.display()))?;
+    let mut marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    marker_bytes.push(b'\n');
+    cockpit_host::private_fs::write_private_file(&marker_path, &marker_bytes)
+        .with_context(|| format!("atomically publishing `{}`", marker_path.display()))?;
 
-    let session_dir = workspace_dir.join("sessions").join(session_id.to_string());
+    let session_dir = workspace_scratch_path_for_session(project_id, session_id)?;
     std::fs::create_dir_all(&session_dir)
         .with_context(|| format!("creating `{}`", session_dir.display()))?;
     Ok(session_dir)
+}
+
+/// Calculate a session's durable scratch path without touching the filesystem.
+/// Consumers that inspect persisted history use this rather than recreating a
+/// marker or depending on the live session object.
+pub(crate) fn workspace_scratch_path_for_session(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(workspace_dir_for_project_id(project_id)?
+        .join("sessions")
+        .join(session_id.to_string()))
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
@@ -2365,8 +2409,8 @@ mod tests {
         )
         .unwrap();
 
-        let scratch_a = a.workspace_scratch_dir().unwrap();
-        let scratch_b = b.workspace_scratch_dir().unwrap();
+        let scratch_a = a.workspace_scratch_dir();
+        let scratch_b = b.workspace_scratch_dir();
         assert_ne!(
             scratch_a, scratch_b,
             "concurrent sessions get distinct scratch dirs"
@@ -2380,6 +2424,33 @@ mod tests {
 
         a.end().unwrap();
         assert!(scratch_a.exists(), "durable scratch survives session end");
+    }
+
+    #[test]
+    fn concurrent_workspace_scratch_initialization_keeps_marker_parseable() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let project_root = home.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_id = project_id_for(&project_root);
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+
+        let (first_scratch, second_scratch) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                workspace_scratch_dir_for_session(&project_id, &project_root, first_id).unwrap()
+            });
+            let second = scope.spawn(|| {
+                workspace_scratch_dir_for_session(&project_id, &project_root, second_id).unwrap()
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_ne!(first_scratch, second_scratch);
+        assert_eq!(
+            workspace_root_for_project_id(&project_id).unwrap(),
+            Some(std::fs::canonicalize(&project_root).unwrap())
+        );
     }
 
     #[tokio::test]

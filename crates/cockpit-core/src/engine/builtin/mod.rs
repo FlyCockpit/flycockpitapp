@@ -119,7 +119,7 @@ pub struct SpawnArgs {
     /// Durable per-workspace, per-session scratch made available to native and
     /// shell tools. It is injected into the system prompt so every agent knows
     /// the exact path it may use across session restarts.
-    pub workspace_scratch_dir: Option<std::path::PathBuf>,
+    pub workspace_scratch_dir: std::path::PathBuf,
     /// Assistant-owned sessions prepend SOUL.md and USER.md before the
     /// assistant definition body. Preloaded by the session worker so prompt
     /// composition stays pure and stable for the session.
@@ -1216,11 +1216,9 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
 
 fn compose_system_prompt_for_spawn(role_prompt: &str, args: &SpawnArgs) -> String {
     let mut out = compose_system_prompt(role_prompt, &args.session_short_id, &args.cwd);
-    if let Some(scratch) = args.workspace_scratch_dir.as_deref() {
-        out.push_str("Durable workspace scratch: ");
-        out.push_str(&scratch.display().to_string());
-        out.push('\n');
-    }
+    out.push_str("Durable workspace scratch: ");
+    out.push_str(&args.workspace_scratch_dir.display().to_string());
+    out.push('\n');
     out
 }
 
@@ -4220,7 +4218,7 @@ pub(crate) mod tests {
             cwd: cwd.to_path_buf(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             session_short_id: String::new(),
-            workspace_scratch_dir: None,
+            workspace_scratch_dir: cwd.join("workspace-scratch"),
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
@@ -7662,7 +7660,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());
         let scratch = tmp.path().join("state/workspaces/project/sessions/session");
-        args.workspace_scratch_dir = Some(scratch.clone());
+        args.workspace_scratch_dir = scratch.clone();
 
         let out = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
         assert!(

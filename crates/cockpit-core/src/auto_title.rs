@@ -449,13 +449,14 @@ pub(crate) async fn generate_session_metadata_fork(
     let revocation_shutdown = model.shutdown_gate();
     let expected_generation = work.expected_metadata_fork_generation;
     tokio::spawn(async move {
-        tokio::select! {
-            _ = fork_finished.cancelled() => return,
-            _ = wait_for_metadata_fork_revocation(revocation_cancel, revocation_shutdown) => {}
-        }
-        if let Err(error) = revocation_session.revoke_metadata_fork(expected_generation) {
-            tracing::warn!(%error, "metadata fork: durable revocation failed");
-        }
+        watch_metadata_fork_revocation(
+            revocation_session,
+            expected_generation,
+            fork_finished,
+            revocation_cancel,
+            revocation_shutdown,
+        )
+        .await;
     });
 
     // The foreground prompt is part of the reused prefix. The only new data
@@ -541,6 +542,29 @@ impl Drop for MetadataForkRevocationGuard {
     }
 }
 
+/// Revoke a metadata fork if its foreground lifecycle ends first. A normal
+/// fork completion merely stops the watcher. The lifecycle branch must retain
+/// priority because cancellation drops the completion guard too.
+async fn watch_metadata_fork_revocation(
+    session: Arc<Session>,
+    expected_generation: i64,
+    fork_finished: tokio_util::sync::CancellationToken,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+) {
+    // A cancelled outer fork drops `MetadataForkRevocationGuard`, making both
+    // branches ready. The normal-finish signal is not evidence that no
+    // cancellation occurred, so the durable lifecycle fence wins this tie.
+    tokio::select! {
+        biased;
+        _ = wait_for_metadata_fork_revocation(cancel, shutdown_gate) => {}
+        _ = fork_finished.cancelled() => return,
+    }
+    if let Err(error) = session.revoke_metadata_fork(expected_generation) {
+        tracing::warn!(%error, "metadata fork: durable revocation failed");
+    }
+}
+
 /// The metadata task is a child of both the foreground run and the daemon
 /// lifecycle.  A cancellation, drain, or force transition drops its current
 /// provider/Monty future before it can make the generated write.
@@ -609,6 +633,50 @@ mod tests {
         assert!(instruction.contains("set_session_metadata"));
         assert!(instruction.contains("\"title\""));
         assert!(instruction.contains("\"description\""));
+    }
+
+    #[tokio::test]
+    async fn metadata_revocation_wins_when_fork_completion_is_already_signalled() {
+        let session = Arc::new(
+            Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                std::path::PathBuf::from("/metadata-revocation-race"),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let work = session
+            .note_user_content_for_metadata("cancelled metadata boundary")
+            .expect("first user boundary schedules metadata");
+        let work = session.activate_metadata_fork(work).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let fork_finished = tokio_util::sync::CancellationToken::new();
+
+        // Dropping the real guard after cancellation produces precisely this
+        // tie. The biased watcher must durably revoke, not treat it as a
+        // normal finish.
+        cancel.cancel();
+        fork_finished.cancel();
+        let expected_generation = work.expected_metadata_fork_generation;
+        watch_metadata_fork_revocation(
+            session.clone(),
+            expected_generation,
+            fork_finished,
+            cancel,
+            crate::daemon::shutdown::ShutdownSignal::new(),
+        )
+        .await;
+        assert!(
+            !session
+                .set_auto_metadata(
+                    "cancelled-fork",
+                    "The cancelled fork must not publish metadata.",
+                    work.expected_user_content_tokens,
+                    expected_generation,
+                )
+                .unwrap()
+        );
     }
 
     #[test]

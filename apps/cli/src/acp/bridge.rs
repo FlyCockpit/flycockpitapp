@@ -9,6 +9,7 @@ use cockpit_proto::{
     AcpNameValuePairV1, OpaqueAsciiId128V1,
 };
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 use super::AcpTransportCounters;
 use super::dto::{McpServerDto, NameValueDto, SessionAdmissionDto, SessionLoadDto, SessionNewDto};
@@ -91,8 +92,13 @@ impl BridgeFacade {
 
 fn opaque_digest(domain: &str, value: &str) -> OpaqueAsciiId128V1 {
     let digest = Sha256::digest([domain.as_bytes(), b"\0", value.as_bytes()].concat());
-    OpaqueAsciiId128V1::new(format!("{domain}-{:x}", digest))
-        .expect("SHA-256 based ACP identity is bounded printable ASCII")
+    let mut encoded = String::with_capacity(domain.len() + 1 + digest.len() * 2);
+    encoded.push_str(domain);
+    encoded.push('-');
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    OpaqueAsciiId128V1::new(encoded).expect("SHA-256 based ACP identity is bounded printable ASCII")
 }
 
 fn declaration_from_dto(server: &McpServerDto) -> AcpForwardedMcpDeclarationV1 {

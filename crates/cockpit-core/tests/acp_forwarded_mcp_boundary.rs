@@ -50,17 +50,14 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
         let source = fs::read_to_string(&path).expect("read proto source");
         let file = syn::parse_file(&source).expect("parse proto source");
         for item in file.items {
-            let (visibility, ident) = match item {
-                Item::Struct(item) => (&item.vis, item.ident),
-                Item::Enum(item) => (&item.vis, item.ident),
-                Item::Type(item) => (&item.vis, item.ident),
+            let (is_public, ident) = match item {
+                Item::Struct(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
+                Item::Enum(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
+                Item::Type(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
                 _ => continue,
             };
             let name = ident.to_string();
-            if matches!(visibility, Visibility::Public(_))
-                && name.contains("Mcp")
-                && name.contains("Ingress")
-            {
+            if is_public && name.contains("Mcp") && name.contains("Ingress") {
                 public_mcp_ingress_types.push(name);
             }
         }
@@ -77,17 +74,14 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
     let acp_file = syn::parse_file(&acp_source).expect("parse ACP proto source");
     let mut forwarded_mcp_public_types = Vec::new();
     for item in acp_file.items {
-        let (visibility, ident) = match item {
-            Item::Struct(item) => (&item.vis, item.ident),
-            Item::Enum(item) => (&item.vis, item.ident),
-            Item::Type(item) => (&item.vis, item.ident),
+        let (is_public, ident) = match item {
+            Item::Struct(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
+            Item::Enum(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
+            Item::Type(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
             _ => continue,
         };
         let name = ident.to_string();
-        if matches!(visibility, Visibility::Public(_))
-            && name.contains("Acp")
-            && name.contains("Mcp")
-        {
+        if is_public && name.contains("Acp") && name.contains("Mcp") {
             forwarded_mcp_public_types.push(name);
         }
     }

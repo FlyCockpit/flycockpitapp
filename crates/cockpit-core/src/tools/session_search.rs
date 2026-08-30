@@ -3,7 +3,9 @@
 //! Finds prior conversations whose title or message text matches a
 //! query, ranked by FTS5 BM25 with `last_active_at_unix_ms` recency as the
 //! tiebreaker (migration 0013 / [`crate::db::session_search`]). Defaults
-//! to the current project, excludes archived + the live session, and
+//! to the current project and excludes archived sessions; ordinary history
+//! scopes exclude the live session, while the thread scope searches the same
+//! collection it lists, including the active thread when it is one. It
 //! returns one highlighted ~150-char snippet per recall target. The companion
 //! `read cockpit://session/<short_id-or-uuid>/transcript` reads a chosen thread back.
 //!
@@ -183,7 +185,7 @@ impl Tool for HistorySearchTool {
                             query,
                             &assistant_name,
                             &ctx.session.project_id,
-                            Some(ctx.session.id),
+                            None,
                             since,
                             limit,
                             trust,
@@ -626,6 +628,67 @@ mod tests {
             .unwrap();
         assert!(out.content.contains(other.short_id.as_ref().unwrap()));
         assert!(out.content.contains("peregrine") || out.content.contains('['));
+    }
+
+    #[tokio::test]
+    async fn thread_search_includes_the_active_thread() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let db = ctx.session.db.clone();
+        let parent_session_id = ctx.session.id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET assistant_name = 'assistant' WHERE session_id = ?1",
+                [parent_session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let anchor = db
+            .insert_session_event(
+                parent_session_id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "thread anchor" }),
+            )
+            .await
+            .unwrap();
+        let thread = db
+            .create_thread(parent_session_id, anchor.to_string())
+            .await
+            .unwrap();
+        db.insert_session_event(
+            thread.session_id,
+            SessionEventKind::UserMessage,
+            None,
+            None,
+            &json!({ "text": "the active thread discusses moonstone" }),
+        )
+        .await
+        .unwrap();
+        ctx.session = Arc::new(
+            crate::session::Session::resume_for_test(
+                db,
+                thread.session_id,
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap()
+            .unwrap(),
+        );
+
+        let out = HistorySearchTool
+            .call(json!({ "scope": "threads", "query": "moonstone" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains(thread.short_id.as_deref().unwrap()),
+            "active thread must be searchable in the listed thread collection: {}",
+            out.content
+        );
     }
 
     #[tokio::test]

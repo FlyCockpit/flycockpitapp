@@ -7,74 +7,6 @@ use cockpit_proto::{Body, Envelope, ProtoStream};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-#[tokio::test]
-async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
-    use tokio::io::AsyncBufReadExt as _;
-
-    struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
-    impl Drop for NotifyDrop {
-        fn drop(&mut self) {
-            if let Some(notify) = self.0.take() {
-                let _ = notify.send(());
-            }
-        }
-    }
-
-    let root = tempfile::tempdir().unwrap();
-    let socket = root.path().join("owned-session.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let stop = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut reader = tokio::io::BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        line
-    });
-    let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
-    let (_events, event_rx) = tokio::sync::mpsc::channel(1);
-    let client = DaemonClient::from_in_process(cockpit_client::InProcessConnection {
-        requests,
-        events: event_rx,
-    });
-    let (watcher_dropped, watcher_drop) = tokio::sync::oneshot::channel();
-    let (watcher_started_tx, watcher_started_rx) = tokio::sync::oneshot::channel();
-    let signal_task = tokio::spawn(async move {
-        let _notify = NotifyDrop(Some(watcher_dropped));
-        let _ = watcher_started_tx.send(());
-        std::future::pending::<()>().await;
-    });
-    let session = OwnedDaemonSession {
-        client,
-        guard: Some(crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new_for_socket(socket)),
-        signal_task: Some(signal_task),
-    };
-    // Aborting an unpolled task drops the captured sender without running
-    // `NotifyDrop`. Wait until the watcher has constructed its guard so Drop
-    // abort exercises the live cleanup path.
-    watcher_started_rx.await.unwrap();
-
-    tokio::task::spawn_blocking(move || drop(session))
-        .await
-        .unwrap();
-
-    // The blocking drop calls `task.abort()`, but the actual abort (and the
-    // `NotifyDrop` that signals `watcher_drop`) is processed asynchronously by
-    // the runtime.  Under parallel nextest execution the abort may not be
-    // scheduled for several polls.  A brief sleep gives the runtime time to
-    // process it before the timeout wait begins.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    tokio::time::timeout(Duration::from_secs(2), watcher_drop)
-        .await
-        .expect("signal watcher was detached")
-        .unwrap();
-    let line = tokio::time::timeout(Duration::from_secs(2), stop)
-        .await
-        .expect("guard cleanup did not contact daemon")
-        .unwrap();
-    assert!(line.contains("stop_daemon"));
-}
-
 #[test]
 fn ephemeral_spawn_arms_raii_before_the_first_wait() {
     let source = include_str!("client.rs");
@@ -386,52 +318,23 @@ async fn boot_test_persistent_daemon_hellos_without_os_socket() {
         .expect("booted owner answers DaemonStatus");
 }
 
-#[tokio::test]
-async fn lifecycle_guard_is_retained_only_after_endpoint_acceptance() {
-    struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for DropSpy {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut retained = Vec::new();
-    let (accepted, acceptance) = tokio::sync::oneshot::channel();
-    accepted.send(()).unwrap();
-    retain_guard_after_acceptance(
-        Some(DropSpy(std::sync::Arc::clone(&drops))),
-        acceptance,
-        &mut retained,
-    )
-    .await;
-    assert_eq!(retained.len(), 1);
-    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-    drop(retained);
-    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn cancelled_lifecycle_acceptance_reaps_unclaimed_guard() {
-    struct DropSpy(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for DropSpy {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut retained = Vec::new();
-    let (accepted, acceptance) = tokio::sync::oneshot::channel::<()>();
-    drop(accepted);
-    retain_guard_after_acceptance(
-        Some(DropSpy(std::sync::Arc::clone(&drops))),
-        acceptance,
-        &mut retained,
-    )
-    .await;
-    assert!(retained.is_empty());
-    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+#[test]
+fn socket_ephemeral_shutdown_authority_transfers_to_client_presence_after_boot() {
+    let source = include_str!("client.rs");
+    let receipt = source
+        .find("guard.bind_published_receipt()?")
+        .expect("the provisional guard binds the boot receipt");
+    let disarm = source[receipt..]
+        .find("guard.disarm()")
+        .map(|offset| receipt + offset)
+        .expect("a booted ephemeral guard transfers shutdown authority");
+    assert!(receipt < disarm);
+    assert!(
+        !source.contains("take_owned_daemon_guard")
+            && !source.contains("take_lifecycle_guard")
+            && !source.contains("owned_daemons"),
+        "no foreground or lifecycle actor may retain socket-owner shutdown authority"
+    );
 }
 
 #[test]

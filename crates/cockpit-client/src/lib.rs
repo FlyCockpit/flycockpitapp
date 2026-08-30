@@ -185,9 +185,6 @@ pub struct LifecycleResolution {
 pub struct LifecycleRequest {
     pub intent: LifecycleIntent,
     pub reply: oneshot::Sender<Result<LifecycleResolution, String>>,
-    /// The resolver retains any owned-daemon guard only after the requester
-    /// acknowledges that it received the endpoint capability.
-    pub accepted: oneshot::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -211,26 +208,17 @@ impl LifecycleClient {
 
     pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
         let (reply, receive) = oneshot::channel();
-        let (accepted, acceptance) = oneshot::channel();
         tokio::time::timeout(
             REQUEST_TIMEOUT,
-            self.requests.send(LifecycleRequest {
-                intent,
-                reply,
-                accepted: acceptance,
-            }),
+            self.requests.send(LifecycleRequest { intent, reply }),
         )
         .await
         .map_err(|_| "daemon lifecycle request enqueue timed out".to_string())?
         .map_err(|_| "daemon lifecycle resolver has stopped".to_string())?;
-        let resolution = tokio::time::timeout(REQUEST_TIMEOUT, receive)
+        tokio::time::timeout(REQUEST_TIMEOUT, receive)
             .await
             .map_err(|_| "daemon lifecycle resolution timed out".to_string())?
-            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())??;
-        accepted
-            .send(())
-            .map_err(|_| "daemon lifecycle resolver retired before acceptance".to_string())?;
-        Ok(resolution)
+            .map_err(|_| "daemon lifecycle resolver dropped its reply".to_string())?
     }
 }
 
@@ -1549,7 +1537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_resolution_requires_requester_acceptance() {
+    async fn lifecycle_resolution_returns_endpoint() {
         let (client, mut requests) = LifecycleClient::channel(1);
         let resolve = tokio::spawn(async move {
             client
@@ -1575,11 +1563,10 @@ mod tests {
                 .is_ok()
         );
         let _resolution = resolve.await.expect("resolve task");
-        request.accepted.await.expect("endpoint acceptance");
     }
 
     #[tokio::test]
-    async fn cancelled_lifecycle_resolution_closes_reply_and_acceptance() {
+    async fn cancelled_lifecycle_resolution_closes_reply() {
         let (client, mut requests) = LifecycleClient::channel(1);
         let resolve = tokio::spawn(async move {
             let _ = client.resolve(LifecycleIntent::AttachOrEphemeral).await;
@@ -1588,7 +1575,6 @@ mod tests {
         resolve.abort();
         let _ = resolve.await;
         assert!(request.reply.is_closed());
-        assert!(request.accepted.await.is_err());
     }
 
     #[tokio::test]

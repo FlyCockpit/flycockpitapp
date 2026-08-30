@@ -12,21 +12,6 @@ use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 use crate::daemon::proto::{self, Request};
 
 const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
-const LIFECYCLE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn retain_guard_after_acceptance<G>(
-    guard: Option<G>,
-    accepted: tokio::sync::oneshot::Receiver<()>,
-    retained: &mut Vec<G>,
-) {
-    if tokio::time::timeout(LIFECYCLE_ACCEPT_TIMEOUT, accepted)
-        .await
-        .is_ok_and(|accepted| accepted.is_ok())
-        && let Some(guard) = guard
-    {
-        retained.push(guard);
-    }
-}
 
 fn mode_for_intent(intent: cockpit_client::LifecycleIntent) -> LifecycleMode {
     match intent {
@@ -47,96 +32,23 @@ pub enum LifecycleMode {
     AttachOrEphemeral,
 }
 
-/// Connect-or-spawn result: a ready-to-use client plus a flag the
-/// caller honors when it's time to shut down — `owns_daemon = true`
-/// means "you spawned this daemon, so stop it on your way out."
+/// Connect-or-spawn result: a ready-to-use client and the lifetime selected
+/// for a newly spawned owner. Socket-owner shutdown is governed exclusively
+/// by the daemon's client reference count, never by this client process.
 pub(crate) struct ConnectedDaemon {
     client: DaemonClient,
     endpoint: cockpit_client::ClientEndpoint,
     owns_daemon: bool,
     socket: PathBuf,
     startup_notice: Option<String>,
-    /// Provisional ownership begins in `probe_or_spawn` immediately after an
-    /// ephemeral child is created. Callers must explicitly take this guard
-    /// when publishing a longer-lived owner; every abandoned/error path drops
-    /// it and reaps the child.
-    owned_daemon_guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
-    owned_in_process_guard: Option<crate::daemon::InProcessDaemonGuard>,
 }
 
-enum OwnedDaemonGuard {
-    Process(crate::daemon::ephemeral_guard::EphemeralDaemonGuard),
-    InProcess(crate::daemon::InProcessDaemonGuard),
-}
-
-impl OwnedDaemonGuard {
-    fn begin_shutdown(&mut self) {
-        if let Self::InProcess(guard) = self {
-            guard.begin_shutdown();
-        }
-    }
-
-    fn shutdown_force_handle(&self) -> Option<crate::daemon::shutdown::ShutdownSignal> {
-        match self {
-            Self::Process(_) => None,
-            Self::InProcess(guard) => Some(guard.shutdown_force_handle()),
-        }
-    }
-
-    async fn shutdown(self) -> Result<()> {
-        match self {
-            Self::Process(guard) => {
-                let (completed, completion) = tokio::sync::oneshot::channel();
-                let owner = std::thread::Builder::new()
-                    .name("cockpit-ephemeral-daemon-owner".to_string())
-                    .spawn(move || {
-                        let result = guard.shutdown();
-                        drop(guard);
-                        let _ = completed.send(result);
-                    })
-                    .context("spawning ephemeral daemon owner teardown")?;
-                crate::daemon::reap_daemon_owner_thread(owner);
-                completion
-                    .await
-                    .context("ephemeral daemon owner teardown stopped")?
-            }
-            Self::InProcess(guard) => guard.shutdown().await,
-        }
-    }
-}
-
-impl ConnectedDaemon {
-    pub(crate) fn take_owned_daemon_guard(
-        &mut self,
-    ) -> Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
-        self.owned_daemon_guard.take()
-    }
-
-    fn take_lifecycle_guard(&mut self) -> Option<OwnedDaemonGuard> {
-        self.owned_daemon_guard
-            .take()
-            .map(OwnedDaemonGuard::Process)
-            .or_else(|| {
-                self.owned_in_process_guard
-                    .take()
-                    .map(OwnedDaemonGuard::InProcess)
-            })
-    }
-}
-
-/// Foreground CLI connection whose ephemeral process ownership cannot be
-/// separated from its client. Construction arms signal cleanup before the
-/// value is published; [`finish`](Self::finish) joins that cleanup and
-/// combines it with the command result.
+/// Foreground CLI connection scoped to one operation.
 struct OwnedDaemonSession {
     client: DaemonClient,
-    guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
-    signal_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Foreground command modes that can only resolve to an attached persistent
-/// daemon or an exactly owned child process. In-process TUI ownership is
-/// intentionally absent because it requires a different async guard.
+/// Foreground command lifecycle preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnedSessionMode {
     AttachOrPersistent,
@@ -155,26 +67,11 @@ impl OwnedSessionMode {
 impl OwnedDaemonSession {
     async fn connect(mode: OwnedSessionMode) -> Result<Self> {
         let mut connected = probe_or_spawn(mode.lifecycle()).await?;
-        let guard = connected.take_owned_daemon_guard();
-        let signal_task =
-            match crate::daemon::ephemeral_guard::spawn_signal_shutdown(guard.as_ref(), true) {
-                Ok(task) => task,
-                Err(error) => {
-                    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-                    drop(guard);
-                    return crate::daemon::ephemeral_guard::aggregate_shutdown_result(
-                        Err::<Self, _>(error.context("arming owned-daemon signal cleanup")),
-                        shutdown,
-                    );
-                }
-            };
         if let Some(notice) = connected.startup_notice.take() {
             eprintln!("{notice}");
         }
         Ok(Self {
             client: connected.client,
-            guard,
-            signal_task,
         })
     }
 
@@ -182,24 +79,12 @@ impl OwnedDaemonSession {
         &self.client
     }
 
-    async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
-        let signal_task = self.signal_task.take();
-        if let Some(task) = &signal_task {
-            task.abort();
-        }
-        let shutdown = self.guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-        self.guard.take();
-        if let Some(task) = signal_task {
-            let _ = task.await;
-        }
-        crate::daemon::ephemeral_guard::aggregate_shutdown_result(result, shutdown)
+    async fn finish<T>(self, result: Result<T>) -> Result<T> {
+        result
     }
 }
 
-/// Run one foreground operation while this module retains inseparable
-/// ownership of any ephemeral daemon it starts. The operation can only borrow
-/// the authority-free client; every return path joins signal cleanup and
-/// aggregates the operation and exact-child shutdown results.
+/// Run one foreground operation with a client that cannot escape its callback.
 #[derive(Debug, thiserror::Error)]
 pub enum OwnedDaemonRunError {
     #[error("connecting to owned daemon: {0:#}")]
@@ -279,16 +164,6 @@ where
         .map_err(OwnedDaemonRunError::OperationOrCleanup)
 }
 
-impl Drop for OwnedDaemonSession {
-    fn drop(&mut self) {
-        if let Some(task) = self.signal_task.take() {
-            task.abort();
-        }
-        // `guard` deliberately remains armed. Its Drop joins the same exact
-        // cleanup used by explicit finish and signal-driven teardown.
-    }
-}
-
 /// Persistent-only daemon connection. It contains no process-ownership guard,
 /// so exposing the client cannot detach an ephemeral child.
 pub struct PersistentDaemonSession {
@@ -317,7 +192,6 @@ pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
 pub async fn serve_lifecycle_requests(
     mut requests: tokio::sync::mpsc::Receiver<cockpit_client::LifecycleRequest>,
 ) -> Result<()> {
-    let mut owned_daemons = Vec::new();
     while let Some(request) = requests.recv().await {
         // A queued request may be cancelled before the lifecycle actor sees
         // it. Never spawn a daemon for a receiver that is already gone.
@@ -333,82 +207,23 @@ pub async fn serve_lifecycle_requests(
             {
                 anyhow::bail!("persistent lifecycle request resolved to an ephemeral daemon");
             }
-            let guard = connected.take_lifecycle_guard();
-            Ok((
-                cockpit_client::LifecycleResolution {
-                    endpoint: connected.endpoint,
-                    owns_daemon: connected.owns_daemon,
-                    socket: connected.socket,
-                    startup_notice: connected.startup_notice,
-                },
-                guard,
-            ))
+            Ok(cockpit_client::LifecycleResolution {
+                endpoint: connected.endpoint,
+                owns_daemon: connected.owns_daemon,
+                socket: connected.socket,
+                startup_notice: connected.startup_notice,
+            })
         });
         match resolved {
-            Ok((resolution, guard)) => {
-                if request.reply.send(Ok(resolution)).is_err() {
-                    // `guard` drops here and reaps an unaccepted ephemeral.
-                    continue;
-                }
-                retain_guard_after_acceptance(guard, request.accepted, &mut owned_daemons).await;
-                // A cancelled/missing acceptance drops the guard here.
+            Ok(resolution) => {
+                let _ = request.reply.send(Ok(resolution));
             }
             Err(error) => {
                 let _ = request.reply.send(Err(error.to_string()));
             }
         }
     }
-    // Start every owned daemon before waiting for any one of them. A single
-    // slow teardown must not consume the grace period of all later owners.
-    for guard in &mut owned_daemons {
-        guard.begin_shutdown();
-    }
-    let force_handles = owned_daemons
-        .iter()
-        .filter_map(OwnedDaemonGuard::shutdown_force_handle)
-        .collect::<Vec<_>>();
-    let mut shutdowns = std::pin::pin!(futures::future::join_all(
-        owned_daemons.into_iter().map(OwnedDaemonGuard::shutdown)
-    ));
-    let graceful_deadline =
-        crate::daemon::shutdown::SHUTDOWN_DRAIN_GRACE + std::time::Duration::from_secs(5);
-    let (outcomes, forced) = match tokio::time::timeout(graceful_deadline, &mut shutdowns).await {
-        Ok(outcomes) => (outcomes, false),
-        Err(_) => {
-            // Each in-process supervisor owns its context on an independent
-            // OS thread. Promote every still-running context to Forced, then
-            // join all supervisors instead of abandoning them with the CLI
-            // runtime. Process stop requests run concurrently in the same
-            // join set and remain bounded independently.
-            for force in &force_handles {
-                force.force();
-            }
-            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdowns).await {
-                Ok(outcomes) => (outcomes, true),
-                Err(_) => {
-                    // Dropping the join set transfers every in-process
-                    // supervisor to the runtime-independent reaper through
-                    // its guard's Drop. Never wait forever or claim clean.
-                    anyhow::bail!(
-                        "owned daemon cleanup remained incomplete after the forced terminal deadline"
-                    )
-                }
-            }
-        }
-    };
-    let mut failures = outcomes
-        .into_iter()
-        .filter_map(Result::err)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-    if forced {
-        failures.push("owned daemon cleanup exceeded its graceful deadline and was forced".into());
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(failures.join("; "))
-    }
+    Ok(())
 }
 
 /// Test-support composition owned below frontends. TUI tests receive only the
@@ -492,8 +307,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
                                 startup_notice,
-                                owned_daemon_guard: None,
-                                owned_in_process_guard: None,
                             });
                         }
                         Err(error) => match after_restart_wait(error) {
@@ -511,8 +324,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                                             owns_daemon: false,
                                             socket: discovered.paths.socket,
                                             startup_notice,
-                                            owned_daemon_guard: None,
-                                            owned_in_process_guard: None,
                                         });
                                     }
                                     Err(_) => {
@@ -566,13 +377,13 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     // only the first owner's lifetime; an existing owner always wins.
     let ephemeral = matches!(mode, LifecycleMode::AttachOrEphemeral);
 
-    let (paths, pid, owned_daemon_guard) = if ephemeral {
+    let (paths, pid, provisional_ephemeral_guard) = if ephemeral {
         let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
         let child = spawn_detached_ephemeral(&paths)?;
         let pid = child.id();
-        // Arm ownership before any await or other cancellation point. From
-        // here onward every early return owns a guard whose Drop stops this
-        // exact canonical ephemeral daemon.
+        // Arm exact-child cleanup before any await or other cancellation
+        // point. Once the daemon has published its verified receipt, its own
+        // client reference count becomes the sole shutdown authority.
         let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), child);
         (paths, pid, Some(guard))
     } else {
@@ -607,8 +418,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                 owns_daemon: false,
                 socket: canonical.socket,
                 startup_notice: None,
-                owned_daemon_guard: None,
-                owned_in_process_guard: None,
             });
         }
         let pid = spawn_detached(false)?;
@@ -620,8 +429,9 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
     // returns above after a registered-owner hello; this wait is only for
     // a spawned child (or an in-process attach that already published).
     let client = wait_for_daemon(&paths.socket).await?;
-    if let Some(guard) = owned_daemon_guard.as_ref() {
+    if let Some(guard) = provisional_ephemeral_guard.as_ref() {
         guard.bind_published_receipt()?;
+        guard.disarm();
     }
 
     Ok(ConnectedDaemon {
@@ -630,8 +440,6 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         owns_daemon: ephemeral,
         socket: paths.socket,
         startup_notice: None,
-        owned_daemon_guard,
-        owned_in_process_guard: None,
     })
 }
 
@@ -646,8 +454,6 @@ async fn connect_shared_running(
         owns_daemon: false,
         socket: paths.socket,
         startup_notice,
-        owned_daemon_guard: None,
-        owned_in_process_guard: None,
     })
 }
 
@@ -668,8 +474,6 @@ async fn attach_running_with_skew_check(
                     Some(reason) => format!("daemon version skew resolved: {reason}"),
                     None => "daemon version skew resolved by restarting the daemon".to_string(),
                 }),
-                owned_daemon_guard: None,
-                owned_in_process_guard: None,
             });
         }
         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {

@@ -6,8 +6,8 @@
 //! the real chokepoint that gates *new* outbound provider requests once a
 //! drain begins — not an advisory per-call-site flag.
 //!
-//! The single graceful path (SIGINT/SIGTERM, explicit `StopDaemon`, the
-//! ephemeral last-client/owner-exit teardown) routes through
+//! The single graceful path (SIGINT/SIGTERM, explicit `StopDaemon`, and
+//! ephemeral last-client teardown) routes through
 //! [`ShutdownSignal::begin_drain`]; a *second* stop request during drain
 //! routes through [`ShutdownSignal::force`], which shortens the wait to an
 //! immediate force-exit. Both transitions are monotonic and idempotent, so

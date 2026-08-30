@@ -1,20 +1,10 @@
-//! Ownership contract for an ephemeral daemon spawned by a foreground
-//! process (`cockpit run` and ephemeral TUI sessions). One owner per
-//! ephemeral daemon; the owner is responsible for reaping it on exit.
+//! Provisional exact-child cleanup for an ephemeral daemon during boot.
 //!
-//! [`EphemeralDaemonGuard`] is the single, shared mechanism — there is
-//! no parallel teardown path. It guarantees the owned daemon is asked to
-//! shut down on **every** exit path:
-//!
-//! - the happy path (an explicit [`EphemeralDaemonGuard::shutdown`]),
-//! - an early `?`-return or a panic/unwind (the RAII `Drop`),
-//! - SIGINT/SIGTERM (the task spawned by [`spawn_signal_shutdown`]).
-//!
-//! The shutdown it requests routes through the daemon's single graceful
-//! drain path (`StopDaemon` → `server::request_shutdown`), so an in-flight
-//! ephemeral daemon drains its work before exiting. A socket ephemeral owner
-//! also observes its client reference count and begins this same teardown
-//! after its final client detaches.
+//! [`EphemeralDaemonGuard`] protects the interval between spawning a child
+//! and verifying its published PID receipt. A failed boot drops the guard and
+//! reaps that exact child. A verified boot disarms it: the daemon's attached-
+//! client reference count is then the exclusive socket-owner shutdown
+//! authority.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -544,20 +534,14 @@ fn retire_late_exact_metadata(
     Ok(())
 }
 
-/// RAII backstop that shuts down an ephemeral daemon the current process
-/// owns, on **every** exit path — early `?` returns, panics/unwinds, and
-/// the normal end of the run/session (Layer A). A process that *attached*
-/// to a pre-existing persistent daemon (`owns_daemon = false`) builds no
-/// guard, so it never shuts anything down.
-///
-/// Drop joins the same process-reaper completion used by explicit and
-/// signal-driven shutdown. Socket-only test guards retain the small blocking
-/// fallback used outside an async runtime.
+/// RAII backstop for a newly spawned ephemeral child before boot completes.
+/// Dropping an armed guard reaps the exact child; dropping a disarmed guard
+/// never asks a running daemon to stop.
 pub(crate) struct EphemeralDaemonGuard {
     socket: PathBuf,
     process: Option<ProcessCleanup>,
-    /// One joinable teardown result shared by explicit shutdown, signal
-    /// handling, and `Drop`. Claiming cleanup is distinct from completing it.
+    /// One joinable teardown result shared by explicit shutdown and `Drop`.
+    /// Claiming cleanup is distinct from completing it.
     cleanup_state: Arc<CleanupState>,
 }
 
@@ -627,9 +611,8 @@ impl EphemeralDaemonGuard {
         Ok(())
     }
 
-    /// Transfer ownership away from this guard without stopping the daemon.
-    /// Until an explicit handoff, dropping a provisional owner remains
-    /// fail-safe and reaps the daemon it spawned.
+    /// Complete the boot handoff without stopping the daemon. Thereafter the
+    /// daemon itself exits only when its final attached client detaches.
     pub(crate) fn disarm(&self) {
         self.cleanup_state.disarm();
     }
@@ -786,20 +769,6 @@ impl Drop for ProvisionalEphemeralChild {
     }
 }
 
-pub(crate) fn aggregate_shutdown_result<T>(
-    command: anyhow::Result<T>,
-    shutdown: anyhow::Result<()>,
-) -> anyhow::Result<T> {
-    match (command, shutdown) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(shutdown)) => Err(shutdown).context("shutting down owned daemon"),
-        (Err(command), Err(shutdown)) => Err(anyhow::anyhow!(
-            "command failed: {command:#}; owned daemon shutdown also failed: {shutdown:#}"
-        )),
-    }
-}
-
 impl Drop for EphemeralDaemonGuard {
     fn drop(&mut self) {
         if let Err(error) = shutdown_shared(&self.cleanup_state, &self.socket, self.process.clone())
@@ -811,8 +780,8 @@ impl Drop for EphemeralDaemonGuard {
 
 /// Best-effort synchronous `StopDaemon`. Connects to the daemon socket with
 /// the blocking std `UnixStream`, writes one NDJSON request, and returns —
-/// usable from `Drop`. Any failure (daemon already gone, socket removed) is
-/// swallowed; the watchdog (Layer C) is the final backstop.
+/// usable from synchronous teardown. Any failure (daemon already gone, socket
+/// removed) is swallowed.
 pub(crate) fn stop_daemon_blocking(socket: &Path) {
     let Ok(envelope) = serde_json::to_string(&Envelope::request(
         uuid::Uuid::new_v4(),
@@ -848,124 +817,6 @@ pub(crate) fn stop_daemon_blocking(socket: &Path) {
     {
         let _ = (socket, envelope);
     }
-}
-
-/// Spawn a task that fires the guard's synchronous shutdown on
-/// SIGINT/SIGTERM (Ctrl-C / console-close on Windows). OS handlers are
-/// installed synchronously before this function returns, so success means
-/// there is no post-spawn registration window. Returns `Ok(None)` when there's
-/// no guard (attached to a persistent daemon). Registration failure is
-/// returned so the caller can immediately perform exact cleanup and fail
-/// closed. `exit_on_signal` controls the post-reap behavior: `cockpit run`
-/// exits the foreground promptly (it has no UI left to run), whereas the
-/// TUI hands control back so its own restore path (leave alt-screen, print
-/// the exit tail) still runs.
-pub(crate) fn spawn_signal_shutdown(
-    guard: Option<&EphemeralDaemonGuard>,
-    exit_on_signal: bool,
-) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
-    let Some(guard) = guard else {
-        return Ok(None);
-    };
-    let signals = register_shutdown_signals()?;
-    let cleanup_state = guard.cleanup_state.clone();
-    let socket = guard.socket.clone();
-    let process = guard.process.clone();
-    Ok(Some(tokio::spawn(async move {
-        if let Err(error) = wait_for_shutdown_signal(signals).await {
-            tracing::error!(%error, "foreground signal watcher stopped without a signal");
-            return;
-        }
-        let cleanup =
-            tokio::task::spawn_blocking(move || shutdown_shared(&cleanup_state, &socket, process));
-        match cleanup.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(%error, "signal-triggered ephemeral cleanup failed"),
-            Err(error) => tracing::error!(%error, "signal-triggered cleanup waiter failed"),
-        }
-        if exit_on_signal {
-            // After reaping, exit the foreground promptly — the user asked
-            // us to stop. The daemon is already (being) torn down.
-            std::process::exit(130);
-        }
-    })))
-}
-
-#[cfg(unix)]
-struct RegisteredShutdownSignals {
-    interrupt: Option<RegisteredSignal>,
-    terminate: Option<RegisteredSignal>,
-}
-
-#[cfg(unix)]
-fn register_shutdown_signals() -> anyhow::Result<RegisteredShutdownSignals> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut interrupt = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    let mut terminate = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    Ok(RegisteredShutdownSignals {
-        interrupt: Some(Box::pin(async move { interrupt.recv().await })),
-        terminate: Some(Box::pin(async move { terminate.recv().await })),
-    })
-}
-
-#[cfg(unix)]
-async fn wait_for_shutdown_signal(signals: RegisteredShutdownSignals) -> anyhow::Result<()> {
-    wait_for_registered_unix_signal(signals.interrupt, signals.terminate).await
-}
-
-#[cfg(unix)]
-type RegisteredSignal =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Option<()>> + Send + 'static>>;
-
-#[cfg(unix)]
-async fn wait_for_registered_unix_signal(
-    mut interrupt: Option<RegisteredSignal>,
-    mut terminate: Option<RegisteredSignal>,
-) -> anyhow::Result<()> {
-    match (&mut interrupt, &mut terminate) {
-        (Some(interrupt), Some(terminate)) => tokio::select! {
-            signal = interrupt => signal.context("SIGINT stream ended"),
-            signal = terminate => signal.context("SIGTERM stream ended"),
-        },
-        (Some(interrupt), None) => interrupt.await.context("SIGINT stream ended"),
-        (None, Some(terminate)) => terminate.await.context("SIGTERM stream ended"),
-        (None, None) => anyhow::bail!("neither SIGINT nor SIGTERM handler could be installed"),
-    }
-}
-
-#[cfg(windows)]
-struct RegisteredShutdownSignals {
-    ctrl_c: tokio::signal::windows::CtrlC,
-}
-
-#[cfg(windows)]
-fn register_shutdown_signals() -> anyhow::Result<RegisteredShutdownSignals> {
-    Ok(RegisteredShutdownSignals {
-        ctrl_c: tokio::signal::windows::ctrl_c().context("installing console shutdown handler")?,
-    })
-}
-
-#[cfg(windows)]
-async fn wait_for_shutdown_signal(mut signals: RegisteredShutdownSignals) -> anyhow::Result<()> {
-    signals
-        .ctrl_c
-        .recv()
-        .await
-        .context("console shutdown signal stream ended")
-}
-
-#[cfg(not(any(unix, windows)))]
-struct RegisteredShutdownSignals;
-
-#[cfg(not(any(unix, windows)))]
-fn register_shutdown_signals() -> anyhow::Result<RegisteredShutdownSignals> {
-    anyhow::bail!("foreground signal cleanup is unsupported on this platform")
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn wait_for_shutdown_signal(_: RegisteredShutdownSignals) -> anyhow::Result<()> {
-    anyhow::bail!("foreground signal cleanup is unsupported on this platform")
 }
 
 #[cfg(test)]
@@ -1086,8 +937,8 @@ mod tests {
         }
     }
 
-    /// Layer A: dropping the guard (the path taken on an early `?` return
-    /// or an unwind) sends a `StopDaemon` request to the daemon socket.
+    /// Dropping an armed provisional guard (an early boot `?` or unwind)
+    /// sends a `StopDaemon` request to the daemon socket.
     #[tokio::test]
     async fn guard_drop_sends_stop_daemon() {
         let dir = tempfile::tempdir().unwrap();
@@ -1116,9 +967,8 @@ mod tests {
         ));
     }
 
-    /// Layer A: an explicit `shutdown()` (the happy path) disarms the
-    /// guard, so the subsequent drop is a no-op and only one `StopDaemon`
-    /// is ever sent. The daemon socket receives exactly one line.
+    /// An explicit `shutdown()` marks cleanup complete, so the subsequent
+    /// drop is a no-op and only one `StopDaemon` is ever sent.
     #[tokio::test]
     async fn guard_shutdown_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1149,6 +999,30 @@ mod tests {
             parse_request(&line),
             Request::StopDaemon { grace_secs: None }
         ));
+    }
+
+    #[tokio::test]
+    async fn boot_handoff_disarms_guard_without_stopping_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut server = tokio::spawn(accept_one_line(listener));
+
+        tokio::task::spawn_blocking(move || {
+            let guard = EphemeralDaemonGuard::new_for_socket(socket);
+            guard.disarm();
+            drop(guard);
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut server)
+                .await
+                .is_err(),
+            "a booted socket owner must leave StopDaemon to client-presence teardown"
+        );
+        server.abort();
     }
 
     #[test]
@@ -1319,19 +1193,6 @@ mod tests {
         assert!(!process_child_retained(&cleanup));
         assert!(!paths.pid_file.exists());
         assert!(!paths.socket.exists());
-    }
-
-    #[tokio::test]
-    async fn one_failed_signal_registration_waits_for_remaining_handler() {
-        let delivered: RegisteredSignal = Box::pin(async { Some(()) });
-        wait_for_registered_unix_signal(None, Some(delivered))
-            .await
-            .expect("remaining handler delivers signal");
-    }
-
-    #[tokio::test]
-    async fn both_failed_signal_registrations_are_not_a_signal() {
-        assert!(wait_for_registered_unix_signal(None, None).await.is_err());
     }
 
     #[test]

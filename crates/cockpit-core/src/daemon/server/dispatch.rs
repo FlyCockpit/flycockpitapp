@@ -25767,7 +25767,7 @@ pub(super) fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str
 // ---- shutdown -------------------------------------------------------------
 
 /// The single entry point every stop trigger (SIGINT/SIGTERM, explicit
-/// `StopDaemon`, the ephemeral last-client/owner-exit teardown) routes
+/// `StopDaemon`, and ephemeral last-client teardown) routes
 /// through (`daemon-graceful-drain-shutdown.md`).
 ///
 /// First call begins the drain: it broadcasts the `DaemonDraining { forced:

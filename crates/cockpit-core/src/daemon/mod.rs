@@ -2883,15 +2883,12 @@ mod tests {
         );
     }
 
-    /// A persisted session must not, by itself, keep an
-    /// **persisted** session must not, by itself, keep an *owned* ephemeral
-    /// daemon alive past its owner's exit. We stand up a real ephemeral
+    /// A persisted session must not, by itself, keep an ephemeral daemon alive
+    /// after an explicit stop. We stand up a real ephemeral
     /// daemon, write a persisted `sessions` row into the very DB the daemon
     /// opened (the exact effect the first user message has via
-    /// `persist_if_needed`), then trigger the owner-exit teardown
-    /// (`StopDaemon`, the same request the `EphemeralDaemonGuard` sends). The
-    /// daemon must drain and reap — removing its socket + pid — within the
-    /// grace.
+    /// `persist_if_needed`), then trigger an explicit `StopDaemon`. The daemon
+    /// must drain and reap — removing its socket + pid — within the grace.
     #[tokio::test]
     async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
         use crate::daemon::ephemeral_guard::stop_daemon_blocking;
@@ -2933,8 +2930,8 @@ mod tests {
             assert!(session.is_persisted(), "row is persisted");
         }
 
-        // Owner exit: the same `StopDaemon` the guard fires synchronously.
-        // Run it off the runtime thread (mirrors the real blocking `Drop`).
+        // Explicit administrative stop. Run it off the runtime thread because
+        // this helper uses a blocking Unix socket.
         let socket = eph.socket.clone();
         tokio::task::spawn_blocking(move || stop_daemon_blocking(&socket))
             .await
@@ -2943,15 +2940,15 @@ mod tests {
         // The daemon must drain and exit — despite the persisted session.
         let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
             .await
-            .expect("owned ephemeral daemon did not reap on StopDaemon with a persisted session");
+            .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
         reaped.expect("join").expect("run_foreground_inner ok");
         assert!(
             !eph.socket.exists(),
-            "ephemeral socket removed on owner-exit teardown"
+            "ephemeral socket removed on explicit teardown"
         );
         assert!(
             !eph.pid_file.exists(),
-            "ephemeral pid removed on owner-exit teardown"
+            "ephemeral pid removed on explicit teardown"
         );
     }
 

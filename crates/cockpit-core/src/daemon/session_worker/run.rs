@@ -6552,6 +6552,8 @@ pub(super) async fn run_worker(
             return;
         }
     };
+    #[cfg(test)]
+    session.record_booted_root_for_test(&root_result);
     let root = Arc::new(root_result);
     let root_is_vnext = root
         .definition

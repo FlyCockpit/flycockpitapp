@@ -72,6 +72,19 @@ pub struct SessionEventLineage {
     pub label: String,
 }
 
+/// Test-only observation of the root that completed worker boot. It exists to
+/// verify construction across the worker's snapshot/rebuild boundary without
+/// making the driver's live root frame externally observable in production.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct BootedRootProfile {
+    pub agent_name: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub tool_names: Vec<String>,
+    pub native_computer: Option<crate::computer::NativeComputerToolConfig>,
+}
+
 pub struct SessionCompactionRecord<'a> {
     pub successor_session_id: Uuid,
     pub successor_short_id: &'a str,
@@ -350,6 +363,11 @@ pub struct Session {
     /// daemon's skill inventory reads this snapshot so conditional Hermes
     /// activation matches execution, including config tools and grants.
     active_tool_names: Mutex<std::collections::HashSet<String>>,
+    /// Final root construction evidence for worker integration tests. This is
+    /// deliberately test-only: production authority remains exclusively on
+    /// the driver's live root frame.
+    #[cfg(test)]
+    booted_root_profile: Mutex<Option<BootedRootProfile>>,
     /// Session-owned image-generation dispatch funnel installed by the daemon
     /// worker before agent turns begin. Isolated/test sessions leave it absent.
     image_generation_dispatch:
@@ -1255,6 +1273,22 @@ impl Session {
             .iter()
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_booted_root_for_test(&self, root: &crate::engine::agent::Agent) {
+        *self.booted_root_profile.lock().unwrap() = Some(BootedRootProfile {
+            agent_name: root.name.clone(),
+            provider_id: root.model.provider_id().to_string(),
+            model_id: root.model.model_id_ref().to_string(),
+            tool_names: root.tools.names().into_iter().map(str::to_string).collect(),
+            native_computer: root.params.native_computer.clone(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn booted_root_profile_for_test(&self) -> Option<BootedRootProfile> {
+        self.booted_root_profile.lock().unwrap().clone()
     }
 
     pub fn model_system_prompt_snapshot(&self) -> Arc<ModelSystemPromptSnapshot> {

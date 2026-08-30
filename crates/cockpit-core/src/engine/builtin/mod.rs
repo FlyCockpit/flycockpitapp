@@ -367,8 +367,17 @@ fn computer_primary_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
     target: crate::computer::DisplayTarget,
+    selected_model: Option<&Model>,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
-    computer_candidate(providers, cwd, false, "Computer", target, true)
+    computer_candidate(
+        providers,
+        cwd,
+        false,
+        "Computer",
+        target,
+        true,
+        selected_model,
+    )
 }
 
 fn computer_subagent_candidate(
@@ -382,6 +391,7 @@ fn computer_subagent_candidate(
         "computer",
         crate::computer::DisplayTarget::Virtual,
         false,
+        None,
     )
 }
 
@@ -392,10 +402,16 @@ fn computer_candidate(
     agent: &str,
     target: crate::computer::DisplayTarget,
     require_backend: bool,
+    selected_model: Option<&Model>,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
         for model in &provider.models {
+            if selected_model.is_some_and(|selected| {
+                selected.provider_id() != provider_id || selected.model_id_ref() != model.id
+            }) {
+                continue;
+            }
             let tier = if require_backend {
                 crate::config::extended::ComputerUseMode::most_restrictive(
                     [
@@ -1851,11 +1867,22 @@ pub fn load_with_tool_surface_override(
 /// through `args`, but edits to the definition itself affect only agents built
 /// after the edit (new children or a newly started root session).
 pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) -> Result<Agent> {
-    let definition = agent.definition.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("running agent `{}` has no pinned definition", agent.name)
-    })?;
-    let mut definition = (**definition).clone();
-    let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
+    // The Computer primary owns construction-time security invariants that are
+    // not expressible in its embedded definition. Rebuilding through the
+    // generic definition path would replace the factory-selected model and
+    // native-computer configuration with ordinary direct-computer params.
+    // Keep the pinned definition requirement for every other role, but route
+    // its factory through the same authority as initial construction.
+    let mut rebuilt = match agent.name.as_str() {
+        "Computer" => computer_primary(args)?,
+        _ => {
+            let definition = agent.definition.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("running agent `{}` has no pinned definition", agent.name)
+            })?;
+            let mut definition = (**definition).clone();
+            load_resolved_def(&agent.name, args, None, &mut definition)?
+        }
+    };
     // A foreground child may already carry the parent's no-widening
     // intersection. Rebuilding from its governing definition must not restore
     // grants removed at admission. `load_resolved_def` only intersects when
@@ -3642,7 +3669,17 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
                 crate::computer::DisplayTarget::RealDesktop
             }
         };
-        computer_primary_candidate(&providers, &args.cwd, target)
+        // A live picker selection is an explicit root-model request.  Do not
+        // silently substitute another computer-capable model: validate the
+        // exact selection through the Computer factory or let the switch fail
+        // before it is persisted. Ordinary startup has no override and still
+        // selects the configured eligible Computer model.
+        computer_primary_candidate(
+            &providers,
+            &args.cwd,
+            target,
+            args.model_override.as_deref(),
+        )
     };
     let Some((provider_id, model_id, native_computer)) = candidate else {
         bail!(
@@ -3679,13 +3716,25 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
         routing = %serde_json::to_string(&resolved.policy.routing_diagnostics()).unwrap_or_default(),
         "computer-use agent custody"
     );
-    let model = Arc::new(crate::engine::model::Model::for_provider_optional_store(
-        &providers,
-        &provider_id,
-        &model_id,
-        session_redact,
-        args.credential_store.clone(),
-    )?);
+    let model = args
+        .model_override
+        .as_ref()
+        .filter(|model| model.provider_id() == provider_id && model.model_id_ref() == model_id)
+        .or_else(|| {
+            Some(&args.model).filter(|model| {
+                model.provider_id() == provider_id && model.model_id_ref() == model_id
+            })
+        })
+        .cloned()
+        .unwrap_or(Arc::new(
+            crate::engine::model::Model::for_provider_optional_store(
+                &providers,
+                &provider_id,
+                &model_id,
+                session_redact,
+                args.credential_store.clone(),
+            )?,
+        ));
     let caps = providers.resolve_effective_model_capabilities(
         model.provider_id(),
         model.model_id_ref(),
@@ -6043,6 +6092,84 @@ pub(crate) mod tests {
         assert_eq!(native.target, crate::computer::DisplayTarget::Virtual);
         assert!(native.require_backend);
         assert!(!native.approval_required);
+    }
+
+    #[test]
+    fn computer_primary_rebuild_retains_its_custody_checked_model_and_native_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            r#"{"computer_target":"virtual"}"#,
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [
+                    {
+                        "id": "vision-a",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    },
+                    {
+                        "id": "vision-b",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+
+        let original = load("Computer", &disk_model_spawn_args(tmp.path(), "vision-a")).unwrap();
+        let mut rebuild_args = disk_model_spawn_args(tmp.path(), "vision-b");
+        rebuild_args.model_override = Some(rebuild_args.model.clone());
+        let rebuilt = rebuild_from_pinned_definition(&original, &rebuild_args).unwrap();
+        let native = rebuilt
+            .params
+            .native_computer
+            .expect("Computer rebuild must retain its native-computer capability");
+
+        assert_eq!(rebuilt.name, "Computer");
+        assert_eq!(rebuilt.model.model_id_ref(), "vision-b");
+        assert_eq!(native.target, crate::computer::DisplayTarget::Virtual);
+        assert!(native.require_backend);
+        assert!(native.approval_required);
+    }
+
+    #[test]
+    fn computer_primary_rebuild_rejects_a_model_without_its_required_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            r#"{"computer_target":"virtual"}"#,
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [
+                    {
+                        "id": "vision",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    },
+                    { "id": "text" }
+                ]
+            }"#,
+        );
+
+        let original = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let mut rebuild_args = disk_model_spawn_args(tmp.path(), "text");
+        rebuild_args.model_override = Some(rebuild_args.model.clone());
+        let error = rebuild_from_pinned_definition(&original, &rebuild_args)
+            .expect_err("Computer model switches must reject non-computer models");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a configured vision-capable model"),
+            "{error:#}"
+        );
     }
 
     #[test]

@@ -254,6 +254,36 @@ impl Db {
         .await
     }
 
+    /// Record a successful manual empty check without moving the scheduler's
+    /// cursor. Manual and scheduled dreams share the displayed timestamp, but
+    /// a user-triggered no-op must not postpone a separately due schedule.
+    pub async fn record_knowledge_dream_manual_empty_check(
+        &self,
+        kb_id: &str,
+        project_root: &str,
+        consumer_id: &str,
+        checked_at_unix_ms: i64,
+    ) -> Result<()> {
+        validate_kb_id(kb_id)?;
+        validate_project_root(project_root)?;
+        validate_consumer_id(consumer_id)?;
+        let kb_id = kb_id.to_owned();
+        let project_root = project_root.to_owned();
+        let consumer_id = consumer_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO knowledge_dream_schedule_state
+                    (kb_id, project_root, consumer_id, last_scheduled_at_unix_ms, last_dreamed_at_unix_ms)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT(kb_id, project_root, consumer_id) DO UPDATE SET
+                    last_dreamed_at_unix_ms = excluded.last_dreamed_at_unix_ms",
+                params![kb_id, project_root, consumer_id, checked_at_unix_ms],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn knowledge_base_last_scheduled_at(
         &self,
         kb_id: &str,
@@ -432,6 +462,30 @@ mod tests {
                 .unwrap(),
             None,
             "each machine keeps an independent schedule display"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_empty_check_advances_displayed_time_without_moving_schedule_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_knowledge_dream_schedule_fire("kb", ROOT_A, "machine-a", 100, Some(100))
+            .await
+            .unwrap();
+        db.record_knowledge_dream_manual_empty_check("kb", ROOT_A, "machine-a", 200)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.knowledge_base_last_scheduled_at("kb", ROOT_A, "machine-a")
+                .await
+                .unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            db.knowledge_base_last_dreamed_at("kb", ROOT_A, "machine-a")
+                .await
+                .unwrap(),
+            Some(200)
         );
     }
 

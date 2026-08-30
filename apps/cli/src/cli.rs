@@ -228,6 +228,9 @@ pub enum Command {
     #[command(subcommand)]
     Knowledge(KnowledgeCommand),
 
+    /// Dream one knowledge base, or every configured knowledge base.
+    Dream(DreamArgs),
+
     /// Manage durable daemon scheduler jobs.
     #[cfg(feature = "extended")]
     #[command(subcommand)]
@@ -413,6 +416,16 @@ pub struct LearnArgs {
     pub ephemeral: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct DreamArgs {
+    /// Knowledge base to dream.
+    #[arg(value_name = "KB", required_unless_present = "all")]
+    pub knowledge_base_id: Option<String>,
+    /// Dream every configured knowledge base in configuration order.
+    #[arg(long, conflicts_with = "knowledge_base_id")]
+    pub all: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum KnowledgeCommand {
     /// Attach a session to a knowledge base as dream input consent.
@@ -428,11 +441,6 @@ pub enum KnowledgeCommand {
         knowledge_base_id: String,
         #[arg(value_name = "SESSION_ID")]
         session_id: uuid::Uuid,
-    },
-    /// Dream all currently attached, undreamed sessions into a KB.
-    Dream {
-        #[arg(value_name = "KB_ID")]
-        knowledge_base_id: String,
     },
 }
 

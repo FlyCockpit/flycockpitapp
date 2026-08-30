@@ -664,6 +664,7 @@ fn single_task(
         write_scope: None,
         workspace_lease: None,
         granted_tools: Vec::new(),
+        seed_reads: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),
@@ -673,6 +674,78 @@ fn single_task(
         execution_surface: None,
         recovery: None,
     }
+}
+
+/// Issue #190 acceptance boundary: seed reads execute locally before the
+/// builder's first provider request, and they retain the builder's ordinary
+/// sandbox policy rather than gaining host authority from explore.
+#[tokio::test]
+async fn seed_reads_precede_builder_inference_and_preserve_builder_sandbox() {
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("builder saw the fresh read".to_string()))
+        .turn(Turn::Text("builder saw the refusal".to_string()))
+        .start()
+        .await;
+    let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
+    std::fs::write(tmp.path().join("seed.txt"), "FRESH_SEED_BODY").unwrap();
+    std::fs::write(
+        tmp.path().join(".env"),
+        "TOP_SECRET_SHOULD_NOT_REACH_BUILDER",
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+
+    seed_task_delegation(&driver, "task-seeded-readable", "default").await;
+    seed_task_payload(&driver, "task-seeded-readable", "default", "builder").await;
+    let mut readable = single_task(&driver, "builder", "task-seeded-readable", None, None);
+    readable.seed_reads = vec![crate::engine::seed_reads::SeedRead {
+        tool: "read".to_string(),
+        args: serde_json::json!({"path": "seed.txt"}),
+    }];
+    driver
+        .execute_single_noninteractive_task(
+            readable,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("seeded builder run completes");
+
+    seed_task_delegation(&driver, "task-seeded-denied", "default").await;
+    seed_task_payload(&driver, "task-seeded-denied", "default", "builder").await;
+    let mut denied = single_task(&driver, "builder", "task-seeded-denied", None, None);
+    denied.seed_reads = vec![crate::engine::seed_reads::SeedRead {
+        tool: "read".to_string(),
+        args: serde_json::json!({"path": ".env"}),
+    }];
+    driver
+        .execute_single_noninteractive_task(denied, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("sandbox-denied seed still continues to the builder inference");
+
+    let requests = provider.captured();
+    assert_eq!(
+        requests.len(),
+        2,
+        "seed dispatch is local; each builder run makes exactly its first inference after its seed"
+    );
+    let readable_wire = requests[0].body.to_string();
+    assert!(
+        readable_wire.contains("FRESH_SEED_BODY"),
+        "the builder's first provider request receives the seed result"
+    );
+    let denied_wire = requests[1].body.to_string();
+    assert!(
+        denied_wire.contains(crate::approval::NONINTERACTIVE_RUN_DENIAL),
+        "the builder's own headless permission boundary rejects the seeded secret read"
+    );
+    assert!(
+        !denied_wire.contains("TOP_SECRET_SHOULD_NOT_REACH_BUILDER"),
+        "a seed may not bypass the builder sandbox and inject secret file content"
+    );
 }
 
 fn batch_entry(

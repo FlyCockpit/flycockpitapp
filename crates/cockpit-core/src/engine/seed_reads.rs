@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
-use crate::engine::message::{Message, collect_tool_calls};
+use crate::engine::message::{AssistantContent, Message, collect_tool_calls};
 
 /// The complete launch allowlist. Keep this closed and name-based: accepting a
 /// newly read-only effect classification here by accident would widen the
@@ -89,6 +89,7 @@ pub async fn select_from_explore_fork(
     let prompt = Message::user(
         "Select only the read-only calls an implementation subagent should rerun before its first inference to avoid rediscovery while keeping results fresh. Call Monty exactly once with a script that invokes mcp.invoke('cockpit', 'seed_reads', {'calls': [...]}); each call is {'tool': one of read/grep/code/graph/search, 'args': {...}}. The script may compute the list programmatically. Do not execute the calls and do not explain.",
     );
+    let call_id = uuid::Uuid::new_v4();
     let completion = model
         .complete_captured_with_sealed_egress(
             system,
@@ -102,9 +103,50 @@ pub async fn select_from_explore_fork(
             Some(sealed_egress.as_ref()),
         )
         .await;
-    let Ok(((_, content, _), _, _)) = completion else {
+    let Ok(((_, content, usage), captured, _)) = completion else {
         return Vec::new();
     };
+    // This is a real provider inference even though its output is consumed
+    // only by the host. Keep the captured request, token cost, and timeline
+    // metadata joined by one call id so `/stats`, context usage, and export do
+    // not under-report the explore → implementation handoff.
+    let session_table = model.session_redact_table();
+    if let Err(error) = session
+        .record_inference_request(
+            call_id,
+            &captured,
+            crate::db::session_log::InferenceRequestStatus::Completed,
+            session_table.as_ref(),
+            model.is_trusted(),
+        )
+        .await
+    {
+        tracing::warn!(%error, "recording seed-read selection request failed");
+    }
+    if let Some(usage) = usage
+        && let Err(error) = session.record_usage_utility(call_id, usage).await
+    {
+        tracing::warn!(%error, "recording seed-read selection usage failed");
+    }
+    if let Err(error) = session
+        .record_event(
+            crate::db::session_log::SessionEventKind::InferenceRequest,
+            Some(agent_name),
+            Some(&call_id.to_string()),
+            &serde_json::json!({
+                "purpose": "seed_read_selection",
+                "usage": usage.map(|usage| serde_json::json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                })),
+            }),
+        )
+        .await
+    {
+        tracing::warn!(%error, "recording seed-read selection completion failed");
+    }
     let Some(script) = collect_tool_calls(&content)
         .into_iter()
         .find(|call| call.function.name == "mcp")
@@ -138,19 +180,57 @@ pub fn append_to_report(mut report: String, seed_reads: &[SeedRead]) -> String {
     report
 }
 
-pub fn history_contains_seed_reads(history: &[Message]) -> bool {
-    history.iter().any(|message| {
-        let Message::Assistant { content, .. } = message else {
-            return false;
-        };
-        content.iter().any(|part| {
-            matches!(
-                part,
-                crate::engine::message::AssistantContent::ToolCall(call)
-                    if call.id.as_ref().starts_with("seed-read-")
-            )
+/// Return only seeds whose synthetic call does not yet have its paired tool
+/// result in recovered history. A declaration is deliberately insufficient:
+/// crashes, cancellation, and dispatch errors can occur after the host writes
+/// the batch declaration but before every call crosses the child's ordinary
+/// dispatch boundary.
+pub fn remaining_seed_reads(history: &[Message], seed_reads: Vec<SeedRead>) -> Vec<SeedRead> {
+    let completed_call_ids = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content),
+            _ => None,
         })
-    })
+        .flatten()
+        .filter_map(|part| match part {
+            rig::message::UserContent::ToolResult(result) => Some(result.call.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut completed = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            AssistantContent::ToolCall(call)
+                if call.id.as_str().starts_with("seed-read-")
+                    && completed_call_ids.contains(call.id.as_str()) =>
+            {
+                SeedRead {
+                    tool: call.function.name.clone(),
+                    args: call.function.arguments.clone(),
+                }
+                .validate()
+                .ok()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    seed_reads
+        .into_iter()
+        .filter(|seed| {
+            if let Some(index) = completed.iter().position(|completed| completed == seed) {
+                completed.remove(index);
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 /// Execute seeds through the same ordinary-call boundary used for model-authored
@@ -236,6 +316,21 @@ pub async fn execute_before_first_inference(
 mod tests {
     use super::*;
 
+    fn synthetic_seed_call(id: &str, seed: &SeedRead) -> crate::engine::message::ToolCall {
+        use rig::message::{ToolCallId, ToolFunction};
+
+        crate::engine::message::ToolCall {
+            id: ToolCallId::new_or_mint(id),
+            provider: None,
+            function: ToolFunction {
+                name: seed.tool.clone(),
+                arguments: seed.args.clone(),
+            },
+            signature: None,
+            additional_params: None,
+        }
+    }
+
     #[test]
     fn rejects_mutating_seed_call() {
         let error = parse_seed_reads(Some(&serde_json::json!([
@@ -254,5 +349,35 @@ mod tests {
             .unwrap();
             assert_eq!(calls[0].tool, *tool);
         }
+    }
+
+    #[test]
+    fn recovery_retries_only_seed_reads_without_a_paired_result() {
+        let first = SeedRead {
+            tool: "read".to_string(),
+            args: serde_json::json!({"path": "already-read.rs"}),
+        };
+        let second = SeedRead {
+            tool: "grep".to_string(),
+            args: serde_json::json!({"pattern": "still-needed", "path": "src"}),
+        };
+        let first_call = synthetic_seed_call("seed-read-first", &first);
+        let second_call = synthetic_seed_call("seed-read-second", &second);
+        let history = vec![
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    AssistantContent::ToolCall(first_call.clone()),
+                    AssistantContent::ToolCall(second_call),
+                ],
+            },
+            crate::engine::message::tool_result_message(&first_call, "fresh result".to_string()),
+        ];
+
+        assert_eq!(
+            remaining_seed_reads(&history, vec![first, second.clone()]),
+            vec![second],
+            "a seed declaration is not completion; only its paired tool result suppresses replay"
+        );
     }
 }

@@ -16,8 +16,8 @@ use super::dto::{DtoError, SessionAdmissionDto, decode_session_new};
 use super::raw_json::{JsonRpcId, RawJsonErrorKind, parse_frame};
 use super::registry::{
     ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1, ACP_OUTBOUND_PERMISSION_MAX_ENTRIES_V1,
-    ApprovalAck, EdgeReason, OutboundPermissionRegistry, PermissionStateName, RecordingAck,
-    RecordingResolve, RegistryError, ResolveCodeRootInterrupt, permission_params,
+    ApprovalAck, CancelTurnError, EdgeReason, OutboundPermissionRegistry, PermissionStateName,
+    RecordingAck, RecordingResolve, RegistryError, ResolveCodeRootInterrupt, permission_params,
 };
 use cockpit_proto::ResolveCodeRootInterruptResultV1;
 use std::io::{Cursor, Read};
@@ -97,6 +97,13 @@ impl ResolveCodeRootInterrupt for BlockingResolve {
         self.started.send(()).unwrap();
         self.resume.recv().unwrap();
         ResolveCodeRootInterruptResultV1::Accepted
+    }
+
+    fn cancel_turn(
+        &mut self,
+        _attachment_capability: cockpit_proto::CodeRootAttachmentCapabilityV1,
+    ) -> Result<(), CancelTurnError> {
+        Ok(())
     }
 }
 
@@ -336,6 +343,46 @@ fn acp_transport_stdio_closed_permission_refusal_is_a_typed_error() {
         assert!(!stdout.contains("\"result\""));
         assert!(stderr.is_empty());
     }
+}
+
+#[test]
+fn acp_transport_stdio_cancelled_permission_without_daemon_settlement_is_a_typed_error() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut adapter = AcpAdapter::new(
+        super::codec::AcpLineWriter::new(&mut stdout),
+        RecordingResolve {
+            cancel_next: Some(CancelTurnError::Unavailable),
+            ..RecordingResolve::default()
+        },
+        RecordingAck::default(),
+    );
+    let request_id = adapter
+        .registry
+        .issue_and_write(
+            "attachment".into(),
+            "delivery".into(),
+            "attention".into(),
+            vec!["allow-once".into()],
+            permission_params("session", &["allow-once"], "call"),
+            &mut adapter.sink,
+            &mut adapter.counters,
+        )
+        .unwrap();
+    let transcript = format!(
+        r#"{{"jsonrpc":"2.0","id":"{request_id}","result":{{"outcome":{{"outcome":"cancelled"}}}}}}"#
+    ) + "\n";
+
+    let error =
+        run_stdio_peer_with_adapter(Cursor::new(transcript.into_bytes()), &mut stderr, adapter)
+            .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    let exit = error
+        .into_inner()
+        .and_then(|source| source.downcast::<AcpPeerExitError>().ok())
+        .expect("failed cancellation has its typed exit error");
+    assert_eq!(*exit, AcpPeerExitError::PermissionCancellationFailed);
+    assert!(stderr.is_empty());
 }
 
 #[test]
@@ -1078,7 +1125,8 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
         (TerminalReserved, Resolving, EdgeReason::ResolveStart),
         (Resolving, Terminal, EdgeReason::DaemonOutcome),
         (Terminal, Released, EdgeReason::AckOrClose),
-        (Issued, Released, EdgeReason::AcpCancelled),
+        (Issued, Cancelling, EdgeReason::AcpCancelled),
+        (Cancelling, Released, EdgeReason::AcpCancelled),
     ];
     let states = [
         Reserved,
@@ -1150,7 +1198,24 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
     assert_eq!(adapter.registry.charged_entries(), 0);
     assert_eq!(adapter.registry.charge_releases(), 1);
     assert_eq!(adapter.resolve.calls.len(), 0);
+    assert_eq!(
+        adapter
+            .resolve
+            .cancelled_attachments
+            .iter()
+            .map(|attachment| attachment.expose_opaque())
+            .collect::<Vec<_>>(),
+        vec!["att"]
+    );
     assert!(adapter.ack.ids.is_empty());
+    send(
+        &mut adapter,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"cancelled"}}}}}}"#
+        ),
+    );
+    assert_eq!(adapter.resolve.cancelled_attachments.len(), 1);
+    assert_eq!(adapter.registry.charge_releases(), 1);
 
     let mut adapter = peer();
     let id = adapter
@@ -1363,6 +1428,38 @@ fn acp_transport_registry_partial_write_late_wrong_and_races() {
 }
 
 #[test]
+fn acp_transport_cancelled_permission_fails_closed_when_daemon_cancel_is_unavailable() {
+    let mut adapter = peer();
+    let id = adapter
+        .registry
+        .issue_and_write(
+            "att-cancel-fails".into(),
+            "delivery-cancel-fails".into(),
+            "attention-cancel-fails".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut adapter.sink,
+            &mut adapter.counters,
+        )
+        .unwrap();
+    adapter.resolve.cancel_next = Some(CancelTurnError::Unavailable);
+
+    send(
+        &mut adapter,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"cancelled"}}}}}}"#
+        ),
+    );
+
+    assert!(adapter.connection_closed);
+    assert!(adapter.registry.connection_closed());
+    assert_eq!(adapter.registry.state_of(&id), Some(Released));
+    assert_eq!(adapter.resolve.calls.len(), 0);
+    assert_eq!(adapter.resolve.cancelled_attachments.len(), 1);
+    assert!(adapter.ack.ids.is_empty());
+}
+
+#[test]
 fn acp_transport_registry_disconnect_during_resolve_and_typed_outcomes() {
     for outcome in [
         ResolveCodeRootInterruptResultV1::Accepted,
@@ -1484,7 +1581,7 @@ fn acp_transport_registry_disconnect_while_resolve_blocks_suppresses_ack() {
     assert_eq!(diagnostics.selected_choice.as_deref(), Some("allow-once"));
     registry.on_disconnect(&mut AcpTransportCounters::default());
     resume_tx.send(()).unwrap();
-    assert!(worker.join().unwrap().is_none());
+    assert!(worker.join().unwrap().is_ok());
     assert_eq!(ack_count.load(Ordering::SeqCst), 0);
     assert_eq!(registry.state_of(&id), Some(PermissionStateName::Released));
     assert_eq!(

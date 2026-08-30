@@ -34,7 +34,7 @@ use super::dispatch::{SessionIngress, SessionIngressError, validate_initialize};
 use super::dto::{SessionAdmissionDto, SessionLoadDto, SessionNewDto};
 use super::envelope::notification;
 use super::envelope::{invalid_params, invalid_request, success_response};
-use super::registry::{ApprovalAck, ResolveCodeRootInterrupt};
+use super::registry::{ApprovalAck, CancelTurnError, ResolveCodeRootInterrupt};
 
 const DISCOVERY_PAGE_SIZE: u16 = 100;
 
@@ -139,9 +139,15 @@ fn run_blocking(handle: &Handle) -> Result<()> {
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    let exit_error = peer
+        .as_ref()
+        .and_then(|peer| peer.adapter.peer_exit_error());
     if let Some(mut peer) = peer {
         peer.close();
         peer.adapter.disconnect();
+    }
+    if let Some(exit_error) = exit_error {
+        return Err(anyhow!(exit_error));
     }
     Ok(())
 }
@@ -913,6 +919,27 @@ impl ResolveCodeRootInterrupt for DaemonResolve {
         {
             Ok(Response::CodeRootInterruptResolved(result)) => result,
             _ => cockpit_proto::ResolveCodeRootInterruptResultV1::Cancelled,
+        }
+    }
+
+    fn cancel_turn(
+        &mut self,
+        attachment_capability: CodeRootAttachmentCapabilityV1,
+    ) -> Result<(), CancelTurnError> {
+        let client = self
+            .state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .values()
+            .find(|attachment| attachment.capability == attachment_capability)
+            .map(|attachment| attachment.client.clone());
+        let Some(client) = client else {
+            return Err(CancelTurnError::Unavailable);
+        };
+        match self.handle.block_on(client.request_ok(Request::CancelTurn)) {
+            Ok(Response::Ack) => Ok(()),
+            _ => Err(CancelTurnError::Unavailable),
         }
     }
 }

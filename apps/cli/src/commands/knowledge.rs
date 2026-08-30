@@ -6,6 +6,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::cli::KnowledgeCommand;
 use crate::daemon::client::OwnedSessionMode;
+use crate::daemon::proto::{Request, Response};
 
 pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
     match command {
@@ -13,24 +14,20 @@ pub async fn run(command: KnowledgeCommand, no_sandbox: bool) -> Result<()> {
             knowledge_base_id,
             session_id,
         } => {
-            mutate_attachment(
-                cockpit_proto::request::Request::AttachKnowledgeBaseSession {
-                    knowledge_base_id,
-                    session_id,
-                },
-            )
+            mutate_attachment(Request::AttachKnowledgeBaseSession {
+                knowledge_base_id,
+                session_id,
+            })
             .await
         }
         KnowledgeCommand::Detach {
             knowledge_base_id,
             session_id,
         } => {
-            mutate_attachment(
-                cockpit_proto::request::Request::DetachKnowledgeBaseSession {
-                    knowledge_base_id,
-                    session_id,
-                },
-            )
+            mutate_attachment(Request::DetachKnowledgeBaseSession {
+                knowledge_base_id,
+                session_id,
+            })
             .await
         }
         KnowledgeCommand::Dream { knowledge_base_id } => {
@@ -102,14 +99,14 @@ async fn dream_status(
     knowledge_base_id: &str,
 ) -> Result<DreamStatus> {
     let response = client
-        .request_ok(cockpit_proto::request::Request::KnowledgeDreamStatus {
+        .request_ok(Request::KnowledgeDreamStatus {
             project_root: cwd.to_string_lossy().into_owned(),
             knowledge_base_id: knowledge_base_id.to_string(),
         })
         .await
         .context("resolving knowledge dream configuration")?;
     match response {
-        cockpit_proto::Response::KnowledgeDreamStatus {
+        Response::KnowledgeDreamStatus {
             model,
             undreamed_session_ids,
         } => Ok(DreamStatus {
@@ -122,7 +119,7 @@ async fn dream_status(
     }
 }
 
-async fn mutate_attachment(request: cockpit_proto::request::Request) -> Result<()> {
+async fn mutate_attachment(request: Request) -> Result<()> {
     crate::daemon::client::run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, |client| {
         Box::pin(async move {
             client
@@ -132,5 +129,6 @@ async fn mutate_attachment(request: cockpit_proto::request::Request) -> Result<(
             Ok(())
         })
     })
-    .await
+    .await?;
+    Ok(())
 }

@@ -112,14 +112,21 @@ impl App {
             AsyncActionPolicy::Replace(export_key),
             move |shutdown| async move {
                 #[cfg(test)]
-                if let Some(barrier) = barrier {
-                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Ok(AsyncActionPayload::Unit);
+                if attached_request.is_none() {
+                    if let Some(barrier) = barrier {
+                        tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        return Ok(AsyncActionPayload::Unit);
+                    }
+                } else {
+                    let _ = barrier;
                 }
+                let attached_request = attached_request.ok_or_else(|| {
+                    format!("{command}: an attached daemon is required for export")
+                })?;
                 export_via_attached_daemon(
-                    attached_request.expect("export dispatch checked attached request"),
+                    attached_request,
                     request,
                     kind,
                     file_stem,
@@ -475,16 +482,20 @@ mod tests {
     }
 
     async fn drain_until_idle(app: &mut App) {
-        while app.async_actions.pending_count() != 0 {
+        for _ in 0..200 {
             let notify = app.async_actions.notifier();
             let notified = notify.notified();
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {
+                app.drain_async_actions();
                 return;
             }
-            notified.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(25), notified).await;
         }
-        app.drain_async_actions();
+        panic!(
+            "export action did not complete; pending={}",
+            app.async_actions.pending_count()
+        );
     }
 
     #[test]
@@ -509,7 +520,7 @@ mod tests {
         assert_eq!(app.async_actions.pending_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn both_exports_send_one_redacted_rpc_then_write_response_extension() {
         let tmp = tempfile::TempDir::new().unwrap();
         let exports_dir = tmp.path().join("exports");
@@ -571,7 +582,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn export_writes_off_the_loop_thread() {
         let event_loop_thread = std::thread::current().id();
         let tmp = tempfile::tempdir().unwrap();
@@ -725,7 +736,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_discards_the_superseded_export_result() {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = uuid::Uuid::new_v4();
@@ -805,7 +816,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_session_error_is_rendered_without_a_file() {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = uuid::Uuid::new_v4();

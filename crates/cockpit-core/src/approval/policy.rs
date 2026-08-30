@@ -240,6 +240,9 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
+        if !self.interrupts.is_interactive_attached() {
+            return Ok(Decision::NoninteractiveDeny);
+        }
         // `wrapper = true` makes the prompt offer only "Yes, once" — the
         // right shape for a non-persistable per-call approval. Nothing is
         // recorded; a later identical call prompts again.

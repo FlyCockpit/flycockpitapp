@@ -34,23 +34,29 @@
 //! handler hold an `Arc` to the same instance. The `Mutex` is held only
 //! for map insert/remove — never across an `.await`.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::sync::lock_or_recover;
 use anyhow::Context as _;
 
-use tokio::sync::oneshot;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
-use crate::daemon::proto::{self, InterruptQuestionSet, ResolveResponse};
-use crate::daemon::{
-    EventSender, SharedRedactionTable, current_redaction, send_current_event, set_current_redaction,
+use crate::{
+    daemon::{
+        EventSender, SharedRedactionTable, current_redaction,
+        proto::{self, InterruptQuestionSet, ResolveResponse},
+        send_current_event, set_current_redaction,
+    },
+    db::needs_attention::InterruptParkPayload,
 };
-use crate::db::needs_attention::InterruptParkPayload;
 
 tokio::task_local! {
     static CURRENT_INTERRUPT_PARK_PAYLOAD: RefCell<InterruptParkPayload>;
@@ -412,9 +418,13 @@ pub(crate) async fn with_host_approval_effect_scope<T, F, S>(
     is_success: S,
 ) -> anyhow::Result<T>
 where
-    F: std::future::Future<Output = anyhow::Result<T>>,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send,
+    T: Send,
     S: Fn(&T) -> Option<bool>,
 {
+    let future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + '_>,
+    > = Box::pin(future);
     // A nested timeout/native-tool wrapper is not a second host effect.  If
     // it installed a fresh task-local scope, an approval raised by the outer
     // pre-dispatch gate would be invisible to the concrete dispatcher and
@@ -654,27 +664,36 @@ async fn recheck_host_approval_effect_boundary_for_generations(
     for handoff in rejected {
         handoff.reject_if_unclaimed().await;
     }
-    CURRENT_HOST_APPROVAL_HANDOFFS
-        .try_with(|slot| slot.borrow_mut().handoffs.extend(retained))
-        .map_err(|_| anyhow::anyhow!("host approval effect scope disappeared during recheck"))?;
     if cancellations
         .iter()
         .any(tokio_util::sync::CancellationToken::is_cancelled)
     {
+        for handoff in retained {
+            handoff.reject_if_unclaimed().await;
+        }
         anyhow::bail!("host approval effect was cancelled before dispatch");
     }
     // If an approval was rejected by the revision/state fence, do not let a
     // mixed scope dispatch another effect under an unrelated handoff.
     if rejected_any {
+        for handoff in retained {
+            handoff.reject_if_unclaimed().await;
+        }
         anyhow::bail!("host approval capability is no longer live at effect boundary");
     }
     // Every concrete boundary needs one exact selected candidate. A live
-    // mismatch is deliberately neither rejected nor treated as authority:
-    // it remains ready for its own boundary, while a mismatched-only scope
-    // fails closed and cannot smuggle that capability into this effect.
+    // mismatch is retained only when a sibling matched this boundary
+    // (connect, then later `tools/call`). A mismatched-only scope fails
+    // closed and terminalizes the unused ready capability.
     if !matched_exact_capability {
+        for handoff in retained {
+            handoff.reject_if_unclaimed().await;
+        }
         anyhow::bail!("no live host approval capability authorizes this effect boundary");
     }
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| slot.borrow_mut().handoffs.extend(retained))
+        .map_err(|_| anyhow::anyhow!("host approval effect scope disappeared during recheck"))?;
     Ok(())
 }
 
@@ -828,8 +847,11 @@ struct PreResolvedInterrupts {
 
 pub async fn with_interrupt_park_payload<F>(payload: InterruptParkPayload, fut: F) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
+    F::Output: Send,
 {
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(fut);
     CURRENT_INTERRUPT_PARK_PAYLOAD
         .scope(RefCell::new(payload), fut)
         .await
@@ -2656,8 +2678,10 @@ mod tests {
     use super::*;
     use std::sync::RwLock;
 
-    use crate::daemon::proto::{InterruptOption, InterruptQuestion};
-    use crate::redact::RedactionTable;
+    use crate::{
+        daemon::proto::{InterruptOption, InterruptQuestion},
+        redact::RedactionTable,
+    };
 
     fn question_set() -> InterruptQuestionSet {
         InterruptQuestionSet {
@@ -2785,8 +2809,8 @@ mod tests {
                 "INSERT INTO agent_host_approval_effect_handoffs (
                      operation_id, session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, selected_candidate_json,
-                     idempotency_key, state
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready')",
+                     idempotency_key, state, dispatch_started_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', 3)",
                 rusqlite::params![
                     operation_id_for_handoff.clone(),
                     session_id.to_string(),

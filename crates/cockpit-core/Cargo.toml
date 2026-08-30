@@ -10,6 +10,7 @@ homepage = "https://github.com/FlyCockpit/flycockpitapp"
 publish = false
 
 [features]
+default = []
 test-support = ["dep:cockpit-test-support"]
 extended = ["cockpit-client/extended", "cockpit-config/extended", "cockpit-db/extended", "cockpit-proto/extended"]
 # Starts FlyCockpit-owned account/sync/relay background work. The public v0.1

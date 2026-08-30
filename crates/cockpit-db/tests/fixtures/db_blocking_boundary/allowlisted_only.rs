@@ -48,6 +48,21 @@ impl Db {
         self.write_blocking_unguarded(|| Ok(()))
     }
 
+    /// Same publication-lock fence with credential staging in the writer transaction.
+    pub fn insert_agent_mutation_journal_with_stage_under_publication_lock<F, T>(
+        &self,
+        _fence: AgentMutationJournalFence,
+        stage: F,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Result<(T, String)>,
+    {
+        self.write_blocking_unguarded(|| {
+            let (value, _) = stage()?;
+            Ok(value)
+        })
+    }
+
     /// Permanent typed editor-intent publication bridge.
     pub fn prepare_agent_editor_publication_under_publication_lock(
         &self,

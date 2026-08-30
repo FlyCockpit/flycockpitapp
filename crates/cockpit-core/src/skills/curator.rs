@@ -735,6 +735,7 @@ mod tests {
         SkillCurator::with_clock(db, cwd.to_path_buf(), cfg, clock)
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn curator_transitions_matrix() {
         let tmp = tempfile::tempdir().unwrap();
@@ -865,6 +866,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn curator_first_run_defers() {
         let db = Db::open_in_memory().unwrap();

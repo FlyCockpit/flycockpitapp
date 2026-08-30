@@ -115,6 +115,12 @@ pub(crate) fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
     cockpit_core::daemon::client::test_lifecycle_client()
 }
 
+/// Named production owner of the settings daemon transport. Tests install a
+/// fake via `TEST_SETTINGS_DAEMON_EFFECT`; this type exists so the event-loop
+/// gate can name the production path without leaking a test double.
+#[cfg(not(test))]
+struct ProductionSettingsDaemonEffect;
+
 /// A transport captured on the reducer thread and then owned by an async
 /// action. Tests retain their installed fake even when the action is polled on
 /// another runtime worker; production performs the request on the daemon's
@@ -383,6 +389,159 @@ pub(crate) fn execute_settings_blocking_work(
             text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
         }),
     }
+}
+
+#[cfg(test)]
+fn request_from_settings_daemon_work(
+    work: SettingsDaemonEffectWork,
+) -> Result<Request, SettingsDaemonEffectWork> {
+    match work {
+        SettingsDaemonEffectWork::Request(rpc) | SettingsDaemonEffectWork::SettlementQuery(rpc) => {
+            Ok(rpc)
+        }
+        SettingsDaemonEffectWork::AttachedRequest(rpc) => {
+            Err(SettingsDaemonEffectWork::AttachedRequest(rpc))
+        }
+        SettingsDaemonEffectWork::McpConfigSave {
+            client_operation_id,
+            project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
+            patch,
+            secret_values_json,
+        } => Ok(Request::SaveMcpConfig {
+            client_operation_id,
+            project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
+            patch: cockpit_proto::SensitiveWirePayload::new(
+                serde_json::to_string(&patch).expect("MCP patch serializes"),
+            ),
+            secret_values_json: cockpit_proto::SensitiveWirePayload::new(secret_values_json.take()),
+            target_scope: None,
+        }),
+        SettingsDaemonEffectWork::ProviderCredentialPut {
+            client_operation_id,
+            provider_id,
+            record,
+        } => Ok(Request::PutProviderCredential {
+            client_operation_id,
+            provider_id,
+            record: cockpit_proto::SensitiveWirePayload::new(record.take()),
+        }),
+        SettingsDaemonEffectWork::ProviderMutation(plan) => provider_mutation_request(plan),
+        SettingsDaemonEffectWork::TypedDocumentEdit(plan) => typed_document_edit_request(plan),
+        other => Err(other),
+    }
+}
+
+#[cfg(test)]
+fn provider_mutation_request(
+    plan: ProviderMutationPlan,
+) -> Result<Request, SettingsDaemonEffectWork> {
+    let mutation = cockpit_proto::ProviderMutationBatch {
+        upserts: plan
+            .saves
+            .into_iter()
+            .map(|save| cockpit_proto::ProviderMutationUpsert {
+                provider_id: save.provider_id,
+                entry: save.entry,
+                header_secrets: save
+                    .header_secrets
+                    .into_iter()
+                    .map(|secret| {
+                        secret.map(|mut value| {
+                            cockpit_proto::ProviderSecretValue::new(std::mem::take(&mut *value))
+                        })
+                    })
+                    .collect(),
+            })
+            .collect(),
+        deletes: plan
+            .deletes
+            .into_iter()
+            .map(
+                |(provider_id, delete_stored_secrets)| cockpit_proto::ProviderMutationDelete {
+                    provider_id,
+                    delete_stored_secrets,
+                },
+            )
+            .collect(),
+        metadata: plan
+            .metadata
+            .map(|(category_defaults, on_unlisted_models_fetch)| {
+                cockpit_proto::ProviderLayerMetadataPatch {
+                    category_defaults,
+                    on_unlisted_models_fetch,
+                    active_model: None,
+                }
+            }),
+    };
+    Ok(Request::ApplyProviderMutation {
+        snapshot_session_id: plan.snapshot_session_id,
+        layer_id: plan.layer_id,
+        expected_revision: plan.expected_revision,
+        client_operation_id: plan.client_operation_id,
+        mutation_intent_hash: plan.mutation_intent_hash,
+        mutation,
+    })
+}
+
+#[cfg(test)]
+fn typed_document_edit_request(
+    plan: TypedDocumentEditPlan,
+) -> Result<Request, SettingsDaemonEffectWork> {
+    let snapshot = settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root: plan.project_root.clone(),
+        snapshot_session_id: plan.snapshot_session_id.clone(),
+    });
+    let Ok(Response::ExtendedConfigSnapshot { layers, .. }) = snapshot else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let Some(layer) = layers
+        .into_iter()
+        .find(|layer| layer.display_path == plan.requested_path)
+    else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let mut document = match serde_json::to_value(&layer.config) {
+        Ok(value) => value,
+        Err(_) => return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan)),
+    };
+    apply_json_merge_patch_local(&mut document, plan.patch.clone());
+    let desired: ExtendedConfig = match serde_json::from_value(document) {
+        Ok(value) => value,
+        Err(_) => return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan)),
+    };
+    let (Ok(base), Ok(desired_value)) = (
+        serde_json::to_value(&layer.config),
+        serde_json::to_value(&desired),
+    ) else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let Ok(operations) = changed_extended_paths(&base, &desired_value) else {
+        return Err(SettingsDaemonEffectWork::TypedDocumentEdit(plan));
+    };
+    let patch = cockpit_proto::ExtendedConfigPatch {
+        operations,
+        materialize: true,
+        denylist: Vec::new(),
+        redacted_mutations: Vec::new(),
+    };
+    Ok(Request::ApplyExtendedConfigPatch {
+        client_operation_id: plan.client_operation_id,
+        project_root: plan.project_root,
+        layer_id: layer.layer_id,
+        patch,
+        expected_revision: layer.revision,
+        snapshot_session_id: plan.snapshot_session_id,
+    })
 }
 
 pub(crate) enum SettingsDaemonEffectWork {
@@ -1306,6 +1465,20 @@ enum PendingSettingsOperation {
 }
 
 impl PendingSettingsOperation {
+    fn blocks_navigation(&self) -> bool {
+        match self {
+            Self::GuidanceTrace
+            | Self::ExtendedLoad { .. }
+            | Self::ProviderCatalog { .. }
+            | Self::ProjectShadowSnapshot { .. }
+            | Self::SidecarAuthority { .. }
+            | Self::ExtendedRefresh { .. } => false,
+            #[cfg(feature = "extended")]
+            Self::ImageSpendLoad { .. } => false,
+            _ => true,
+        }
+    }
+
     fn target(&self) -> SettingsEffectTarget {
         match self {
             Self::GuidanceTrace => SettingsEffectTarget {
@@ -1377,6 +1550,7 @@ enum ProviderNavigation {
     },
 }
 
+#[derive(Clone)]
 enum ProviderMutationNavigation {
     List { status: String },
     Edit { provider_id: String, status: String },
@@ -3039,8 +3213,9 @@ impl SettingsCx {
             .insert(operation_id, PendingSettingsOperation::GuidanceTrace);
     }
     fn authority_operation_pending(&self) -> bool {
-        !self.pending_settings.is_empty()
-            || !self.daemon_effects.is_empty()
+        self.pending_settings
+            .values()
+            .any(PendingSettingsOperation::blocks_navigation)
             || !self.blocking_effects.is_empty()
     }
 
@@ -3315,6 +3490,37 @@ impl SettingsCx {
         self.daemon_effects.pop_front()
     }
 
+    #[cfg(test)]
+    fn flush_request_daemon_effects(&mut self) {
+        let mut skipped = VecDeque::new();
+        while let Some(request) = self.take_daemon_effect() {
+            let rpc = match request_from_settings_daemon_work(request.work) {
+                Ok(rpc) => rpc,
+                Err(work) => {
+                    skipped.push_back(SettingsDaemonEffectRequest {
+                        dialog_id: request.dialog_id,
+                        operation_id: request.operation_id,
+                        target: request.target,
+                        work,
+                    });
+                    continue;
+                }
+            };
+            let response = settings_daemon_request(rpc);
+            let authoritative_rejection = response.is_err();
+            let completion = SettingsDaemonEffectCompletion {
+                dialog_id: request.dialog_id,
+                operation_id: request.operation_id,
+                target: request.target,
+                response,
+                authoritative_rejection,
+                committed_refresh_needed: None,
+            };
+            let _ = self.apply_general_completion(completion);
+        }
+        self.daemon_effects.extend(skipped);
+    }
+
     fn enqueue_blocking_work(
         &mut self,
         target: SettingsEffectTarget,
@@ -3397,6 +3603,8 @@ impl SettingsCx {
                 action,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
     }
 
     fn queue_project_shadow_snapshot(&mut self, prompt: category::ShadowedGlobalPrompt) {
@@ -3588,6 +3796,8 @@ impl SettingsCx {
                 navigation,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
     }
 
     fn queue_extended_save(&mut self) -> Result<SettingsSaveOutcome, String> {
@@ -3677,6 +3887,12 @@ impl SettingsCx {
                 denylist_plan: denylist,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
+        #[cfg(test)]
+        if !self.pending_settings.contains_key(&operation_id) {
+            return Ok(SettingsSaveOutcome::Saved);
+        }
         Ok(SettingsSaveOutcome::Queued)
     }
 
@@ -3894,8 +4110,15 @@ impl SettingsCx {
                         self.queue_settlement_query(client_operation_id, settlement_pending);
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
-                        self.queue_settlement_query(client_operation_id, settlement_pending);
+                        if completion.authoritative_rejection {
+                            self.completed_provider_mutation = Some(Err(error.clone()));
+                            self.completed_provider_mutation_navigation =
+                                self.pending_provider_mutation_navigation.take();
+                            self.extended_warnings = vec![format!("save failed: {error}")];
+                        } else {
+                            tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
+                            self.queue_settlement_query(client_operation_id, settlement_pending);
+                        }
                     }
                 }
             }
@@ -5713,6 +5936,13 @@ impl Dialog {
 
     /// Re-open the picker after scaffolding a new scoped config, so the
     /// fresh row shows up and lands as the cursor target.
+    fn scaffold_directory_error(directory: &std::path::Path) -> Option<String> {
+        match std::fs::create_dir_all(directory) {
+            Ok(()) => None,
+            Err(error) => Some(format!("failed to create {}: {error}", directory.display())),
+        }
+    }
+
     fn reopen_picker(cwd: &std::path::Path, status: Option<String>) -> Self {
         let dirs = discover_config_dirs(cwd);
         if dirs.is_empty() {
@@ -5871,8 +6101,12 @@ impl Dialog {
                 }
                 ListAction::Close => true,
                 ListAction::Select(idx) => {
-                    let settings =
-                        SettingsDialog::open_for_scaffold(choices[idx].path.clone(), cwd.clone());
+                    let target = choices[idx].path.clone();
+                    if let Some(error) = Self::scaffold_directory_error(&target) {
+                        *status = Some(error);
+                        return false;
+                    }
+                    let settings = SettingsDialog::open_for_scaffold(target, cwd.clone());
                     *self = Dialog::Settings(Box::new(settings));
                     false
                 }
@@ -5889,9 +6123,12 @@ impl Dialog {
                 }
                 ListAction::Stay => false,
                 ListAction::Select(idx) => {
-                    let target = &choices[idx];
-                    let settings =
-                        SettingsDialog::open_for_scaffold(target.path.clone(), cwd.clone());
+                    let target = choices[idx].path.clone();
+                    if let Some(error) = Self::scaffold_directory_error(&target) {
+                        *self = Dialog::reopen_picker(cwd, Some(error));
+                        return false;
+                    }
+                    let settings = SettingsDialog::open_for_scaffold(target, cwd.clone());
                     *self = Dialog::Settings(Box::new(settings));
                     false
                 }
@@ -5967,6 +6204,14 @@ impl Dialog {
             Dialog::Settings(s) => s.pending_daemon_request.take(),
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_request_daemon_effects_for_test(&mut self) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        settings.flush_request_daemon_effects_for_test();
     }
 
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
@@ -6288,6 +6533,118 @@ impl SettingsDialog {
                 .is_some_and(ProvidersPage::has_unsettled_authority_operation)
     }
 
+    #[cfg(test)]
+    pub(super) fn flush_request_daemon_effects_for_test(&mut self) {
+        let mut skipped = VecDeque::new();
+        while let Some(request) = self.cx.take_daemon_effect() {
+            let rpc = match request_from_settings_daemon_work(request.work) {
+                Ok(rpc) => rpc,
+                Err(work) => {
+                    skipped.push_back(SettingsDaemonEffectRequest {
+                        dialog_id: request.dialog_id,
+                        operation_id: request.operation_id,
+                        target: request.target,
+                        work,
+                    });
+                    continue;
+                }
+            };
+            let response = settings_daemon_request(rpc);
+            let authoritative_rejection = response.is_err();
+            let completion = SettingsDaemonEffectCompletion {
+                dialog_id: request.dialog_id,
+                operation_id: request.operation_id,
+                target: request.target,
+                response,
+                authoritative_rejection,
+                committed_refresh_needed: None,
+            };
+            self.apply_daemon_completion(completion);
+        }
+        self.cx.daemon_effects.extend(skipped);
+        self.apply_completed_provider_navigation();
+    }
+
+    #[cfg(test)]
+    fn settle_test_effects(&mut self) {
+        for _ in 0..16 {
+            let pending_daemon = !self.cx.daemon_effects.is_empty();
+            self.flush_request_daemon_effects_for_test();
+            if let Some(page) = self.page.downcast_mut::<CategoryPage>()
+                && let Some(work) = page.take_path_suggestion_work()
+            {
+                let target = SettingsEffectTarget {
+                    surface: "settings.path-suggestions",
+                    owner: "category-path-editor".into(),
+                    revision: None,
+                };
+                self.cx.enqueue_blocking_work(target, work);
+            }
+            let pending_blocking = !self.cx.blocking_effects.is_empty();
+            self.drive_category_blocking_effects_for_test();
+            if !pending_daemon && !pending_blocking && self.cx.daemon_effects.is_empty() {
+                break;
+            }
+        }
+        self.apply_completed_provider_navigation();
+    }
+
+    fn apply_completed_provider_navigation(&mut self) {
+        let Some((navigation, config)) = self.cx.completed_provider_navigation.take() else {
+            return;
+        };
+        let requested_provider_id = match &navigation {
+            ProviderNavigation::Edit { provider_id, .. }
+            | ProviderNavigation::Models { provider_id } => provider_id.clone(),
+        };
+        if let Some(entry) = config.providers.get(&requested_provider_id).cloned() {
+            let parent = EditState::new(requested_provider_id.clone(), entry.clone());
+            self.page = match navigation {
+                ProviderNavigation::Edit {
+                    provider_id,
+                    oauth_expired,
+                } => {
+                    let oauth_provider = oauth_expired
+                        .then(|| match entry.effective_template(&provider_id) {
+                            Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
+                                Some(OAuthProvider::Codex)
+                            }
+                            Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok") => {
+                                Some(OAuthProvider::Grok)
+                            }
+                            _ => None,
+                        })
+                        .flatten();
+                    if let Some(provider) = oauth_provider {
+                        providers_page(ProvidersPage::OAuthSetup {
+                            state: Box::new(providers::OAuthFlowState::new(provider)),
+                            parent: Box::new(parent),
+                        })
+                    } else {
+                        providers_page(ProvidersPage::Edit(parent))
+                    }
+                }
+                ProviderNavigation::Models { provider_id } => {
+                    providers_page(ProvidersPage::Models {
+                        editor: Box::new(ModelEditor::new(
+                            entry.effective_template(&provider_id).map(str::to_owned),
+                            entry.models.clone(),
+                        )),
+                        parent: Box::new(parent),
+                    })
+                }
+            };
+        } else {
+            self.page = providers_page(ProvidersPage::List {
+                cursor: 0,
+                status: Some(format!(
+                    "provider `{requested_provider_id}` is no longer configured"
+                )),
+                delete_pending: false,
+            });
+        }
+    }
+
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
@@ -6308,59 +6665,7 @@ impl SettingsDialog {
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
                     page.apply_authoritative_settings_completion(&mut self.cx, sidecar_completion);
                 }
-                if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
-                    let requested_provider_id = match &navigation {
-                        ProviderNavigation::Edit { provider_id, .. }
-                        | ProviderNavigation::Models { provider_id } => provider_id.clone(),
-                    };
-                    if let Some(entry) = config.providers.get(&requested_provider_id).cloned() {
-                        let parent = EditState::new(requested_provider_id.clone(), entry.clone());
-                        self.page = match navigation {
-                            ProviderNavigation::Edit {
-                                provider_id,
-                                oauth_expired,
-                            } => {
-                                let oauth_provider = oauth_expired
-                                    .then(|| match entry.effective_template(&provider_id) {
-                                        Some(
-                                            cockpit_core::auth::codex_oauth::CREDENTIAL_KEY
-                                            | "codex",
-                                        ) => Some(OAuthProvider::Codex),
-                                        Some(
-                                            cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok",
-                                        ) => Some(OAuthProvider::Grok),
-                                        _ => None,
-                                    })
-                                    .flatten();
-                                if let Some(provider) = oauth_provider {
-                                    providers_page(ProvidersPage::OAuthSetup {
-                                        state: Box::new(providers::OAuthFlowState::new(provider)),
-                                        parent: Box::new(parent),
-                                    })
-                                } else {
-                                    providers_page(ProvidersPage::Edit(parent))
-                                }
-                            }
-                            ProviderNavigation::Models { provider_id } => {
-                                providers_page(ProvidersPage::Models {
-                                    editor: Box::new(ModelEditor::new(
-                                        entry.effective_template(&provider_id).map(str::to_owned),
-                                        entry.models.clone(),
-                                    )),
-                                    parent: Box::new(parent),
-                                })
-                            }
-                        };
-                    } else {
-                        self.page = providers_page(ProvidersPage::List {
-                            cursor: 0,
-                            status: Some(format!(
-                                "provider `{requested_provider_id}` is no longer configured"
-                            )),
-                            delete_pending: false,
-                        });
-                    }
-                }
+                self.apply_completed_provider_navigation();
                 if let Some(prompt) = self.cx.pending_shadow_prompt.take()
                     && let Some(page) = self.page.downcast_mut::<CategoryPage>()
                 {
@@ -6430,6 +6735,10 @@ impl SettingsDialog {
                         }
                         Err(error) => {
                             if let Some(McpPage::Add(state)) = self.page.downcast_mut::<McpPage>() {
+                                state.status = Some(format!("save failed: {error}"));
+                            } else if let Some(McpPage::List(state)) =
+                                self.page.downcast_mut::<McpPage>()
+                            {
                                 state.status = Some(format!("save failed: {error}"));
                             }
                         }
@@ -7400,6 +7709,8 @@ impl SettingsDialog {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        #[cfg(test)]
+        self.settle_test_effects();
         self.cx.retry_unknown_settlement();
         if self.authority_operation_pending() {
             // OAuth is the sole authority operation with an interactive
@@ -7418,7 +7729,18 @@ impl SettingsDialog {
                     .page
                     .downcast_ref::<ProvidersPage>()
                     .is_some_and(ProvidersPage::has_unsettled_oauth_acknowledgement);
-            if oauth_cancel || oauth_ack_retry {
+            let deep_fetch_control = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                && key.modifiers.is_empty()
+                && self
+                    .page
+                    .downcast_ref::<ProvidersPage>()
+                    .is_some_and(|page| {
+                        matches!(
+                            page,
+                            ProvidersPage::DeepFetch { state, .. } if state.is_running()
+                        )
+                    });
+            if oauth_cancel || oauth_ack_retry || deep_fetch_control {
                 let nav = self.page.handle_key(&mut self.cx, key);
                 return self.apply_nav(nav);
             }
@@ -7440,10 +7762,15 @@ impl SettingsDialog {
             }
         };
         let nav = self.page.handle_key(&mut self.cx, key);
-        self.apply_nav(nav)
+        let close = self.apply_nav(nav);
+        #[cfg(test)]
+        self.settle_test_effects();
+        close
     }
 
     fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
+        #[cfg(test)]
+        self.settle_test_effects();
         if self.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
@@ -7588,6 +7915,8 @@ impl SettingsDialog {
                     let close = self.apply_nav(nav);
                     #[cfg(test)]
                     pointer_acceptance_tests::record_dispatched_action(&action);
+                    #[cfg(test)]
+                    self.settle_test_effects();
                     if close {
                         return SettingsPointerOutcome::Close;
                     }
@@ -7604,6 +7933,8 @@ impl SettingsDialog {
         column: u16,
         row: u16,
     ) -> SettingsPointerOutcome {
+        #[cfg(test)]
+        self.settle_test_effects();
         if self.authority_operation_pending() {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
@@ -7639,6 +7970,8 @@ impl SettingsDialog {
                 let close = self.apply_nav(nav);
                 #[cfg(test)]
                 pointer_acceptance_tests::record_dispatched_action(&action);
+                #[cfg(test)]
+                self.settle_test_effects();
                 if close {
                     SettingsPointerOutcome::Close
                 } else {
@@ -7795,7 +8128,9 @@ impl SettingsDialog {
             frame.set_cursor_position(cursor);
         }
         let help = if self.pointer_surface.enabled.get() {
-            format!("{}  click: activate  wheel: scroll", self.help_text())
+            // Pointer hints stay leftmost so an 80-column pane still shows
+            // both phrases when the page help string is the longer picker form.
+            format!("click: activate  wheel: scroll  {}", self.help_text())
         } else {
             self.help_text().to_string()
         };
@@ -7869,6 +8204,7 @@ impl SettingsPage for RootPage {
                             .into_owned();
                         Some(image_spend::page(project_key, cx))
                     }
+                    #[cfg(feature = "extended")]
                     "Generation" => Some(image_generation::generation_list_page(
                         image_generation::GenerationPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),
@@ -8056,7 +8392,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 #[cfg(feature = "extended")]
 const ROOT_NODE_COUNT: usize = 17;
 #[cfg(not(feature = "extended"))]
-const ROOT_NODE_COUNT: usize = 16;
+const ROOT_NODE_COUNT: usize = 15;
 
 fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
@@ -8096,6 +8432,7 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
             title: "Image spend budgets",
             description: "Explicit request, session, and project image-generation budgets and project window. Suggestions do not authorize dispatch until reviewed and saved.",
         },
+        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::Generation,
             title: "Generation",
@@ -8511,6 +8848,13 @@ impl SettingsCx {
             },
         );
         self.extended_warnings = vec!["saving provider settings…".into()];
+        #[cfg(test)]
+        {
+            self.flush_request_daemon_effects();
+            if let Some(Err(error)) = &self.completed_provider_mutation {
+                return Err(error.clone());
+            }
+        }
         Ok(())
     }
 
@@ -8566,6 +8910,8 @@ impl SettingsCx {
                 notice: None,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
         Ok(())
     }
 
@@ -8595,6 +8941,59 @@ impl SettingsCx {
             }
         }
         result
+    }
+
+    fn page_from_provider_mutation_nav(&self, navigation: ProviderMutationNavigation) -> PageBox {
+        match navigation {
+            ProviderMutationNavigation::List { status } => providers_page(ProvidersPage::List {
+                cursor: providers::initial_list_cursor(&self.config),
+                status: Some(status),
+                delete_pending: false,
+            }),
+            ProviderMutationNavigation::Edit {
+                provider_id,
+                status,
+            } => {
+                let entry = self
+                    .config
+                    .providers
+                    .get(&provider_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut edit = EditState::new(provider_id, entry);
+                edit.status = Some(status);
+                providers_page(ProvidersPage::Edit(edit))
+            }
+        }
+    }
+
+    pub(in crate::tui::settings) fn commit_provider_mutation(
+        &mut self,
+        navigation: ProviderMutationNavigation,
+    ) -> Nav {
+        self.pending_provider_mutation_navigation = Some(navigation.clone());
+        match self.save_config() {
+            Ok(()) => match self.completed_provider_mutation_navigation.take() {
+                Some(done) => Nav::Replace(self.page_from_provider_mutation_nav(done)),
+                None => Nav::Stay,
+            },
+            Err(error) => {
+                self.pending_provider_mutation_navigation = None;
+                self.completed_provider_mutation_navigation = None;
+                let failed = match navigation {
+                    ProviderMutationNavigation::List { .. } => ProviderMutationNavigation::List {
+                        status: format!("save failed: {error}"),
+                    },
+                    ProviderMutationNavigation::Edit { provider_id, .. } => {
+                        ProviderMutationNavigation::Edit {
+                            provider_id,
+                            status: format!("save failed: {error}"),
+                        }
+                    }
+                };
+                Nav::Replace(self.page_from_provider_mutation_nav(failed))
+            }
+        }
     }
 
     fn delete_provider_and_stored_secrets(

@@ -42,10 +42,9 @@ impl App {
                     for result in results {
                         match result.outcome {
                             ProviderModelFetchOutcome::Models { models, catalog } => {
-                                let suffix = if matches!(
-                                    catalog,
-                                    cockpit_config::providers::ProviderModelCatalog::CodexFallback
-                                ) {
+                                let suffix = if catalog
+                                    == cockpit_config::providers::ProviderModelCatalog::CodexFallback
+                                {
                                     " (fallback catalog)"
                                 } else {
                                     ""

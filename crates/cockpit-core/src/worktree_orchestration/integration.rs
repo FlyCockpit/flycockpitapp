@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
@@ -957,18 +958,22 @@ pub(super) async fn release_exclusive_target_paths(
     }
 }
 
+pub(super) const EXCLUSIVE_HOLD_REFRESH: Duration = Duration::from_secs(30);
+
 /// Exclusive skip-on-conflict claim of a target tree and its affected paths.
 ///
 /// [`Drop`] releases in-memory immediately so write/edit waiters are not stuck
 /// until idle expiry; persist is spawned on the current runtime. Call
 /// [`Self::release`] on the normal return path to persist first, matching the
-/// historical acquire/release pairing.
+/// historical acquire/release pairing. A background refresh keeps `touched`
+/// live against idle sweep for the whole hold, including abort/drop.
 #[must_use]
 pub(super) struct ExclusiveTargetHold {
     locks: Arc<LockManager>,
     lock_identity: String,
     session: Uuid,
     held: Vec<PathBuf>,
+    refresh: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ExclusiveTargetHold {
@@ -980,26 +985,70 @@ impl ExclusiveTargetHold {
         affected: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Self> {
         let lock_identity = lock_identity.into();
-        let held =
-            acquire_exclusive_target_paths(&locks, &lock_identity, session, root, affected).await?;
-        Ok(Self {
+        let root = git::resolve_git_path(root)?;
+        let mut extra = BTreeSet::new();
+        for path in affected {
+            if path != root {
+                extra.insert(path);
+            }
+        }
+        let mut hold = Self {
             locks,
             lock_identity,
             session,
-            held,
-        })
+            held: Vec::new(),
+            refresh: None,
+        };
+        hold.locks
+            .acquire(&root, &hold.lock_identity, hold.session)
+            .await
+            .context("acquiring target workspace lock")?;
+        hold.held.push(root.clone());
+        hold.refresh = Some(spawn_exclusive_hold_refresh(
+            hold.locks.clone(),
+            hold.lock_identity.clone(),
+            hold.session,
+        ));
+        for path in extra {
+            if let Err(error) = hold
+                .locks
+                .acquire(&path, &hold.lock_identity, hold.session)
+                .await
+            {
+                return Err(error).context("acquiring affected-path lock");
+            }
+            hold.held.push(path);
+        }
+        Ok(hold)
     }
 
     pub(super) async fn release(mut self) {
+        if let Some(refresh) = self.refresh.take() {
+            refresh.abort();
+        }
         let held = std::mem::take(&mut self.held);
         release_exclusive_target_paths(&self.locks, &self.lock_identity, self.session, held).await;
     }
 }
 
+fn spawn_exclusive_hold_refresh(
+    locks: Arc<LockManager>,
+    lock_identity: String,
+    session: Uuid,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        locks.touch_holder(&lock_identity, session).await;
+        loop {
+            tokio::time::sleep(EXCLUSIVE_HOLD_REFRESH).await;
+            locks.touch_holder(&lock_identity, session).await;
+        }
+    })
+}
+
 impl Drop for ExclusiveTargetHold {
     fn drop(&mut self) {
-        if self.held.is_empty() {
-            return;
+        if let Some(refresh) = self.refresh.take() {
+            refresh.abort();
         }
         let held = std::mem::take(&mut self.held);
         self.locks

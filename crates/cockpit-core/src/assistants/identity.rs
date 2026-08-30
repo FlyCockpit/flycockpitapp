@@ -182,7 +182,7 @@ fn update_identity_hashes_cas_blocking(
     expected: AssistantRow,
     config_json: String,
 ) -> Result<AssistantRow> {
-    db.write_blocking(move |conn| {
+    db.blocking_write_for_sync_event(move |conn| {
         crate::db::Db::update_assistant_identity_hashes_cas_conn(conn, expected, &config_json)
     })
 }

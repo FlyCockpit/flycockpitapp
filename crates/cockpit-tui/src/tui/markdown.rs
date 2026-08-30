@@ -56,12 +56,16 @@ pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
     let mut after_virama = false;
     for ch in text.chars() {
         let cp = ch as u32;
-        let combining = !ch.is_control() && ch.width().unwrap_or(0) == 0
-            || (0xFE00..=0xFE0F).contains(&cp)
-            || (0x1F3FB..=0x1F3FF).contains(&cp)
-            || (0xE0100..=0xE01EF).contains(&cp);
-        let regional = (0x1F1E6..=0x1F1FF).contains(&cp);
         let hangul = hangul_jamo_class(cp);
+        // Hangul jamo often report width 0; they cluster by Hangul syllable
+        // state (and as a prepend onto the next scalar), not as generic marks.
+        let combining = hangul.is_none()
+            && ((!ch.is_control() && ch.width().unwrap_or(0) == 0)
+                || ch == '\u{200d}'
+                || (0xFE00..=0xFE0F).contains(&cp)
+                || (0x1F3FB..=0x1F3FF).contains(&cp)
+                || (0xE0100..=0xE01EF).contains(&cp));
+        let regional = (0x1F1E6..=0x1F1FF).contains(&cp);
         let joins_hangul = matches!(
             (hangul_state, hangul),
             (Some(HangulJamo::L), Some(HangulJamo::L | HangulJamo::V))
@@ -78,7 +82,7 @@ pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
         } else {
             out.push(ch.to_string());
         }
-        join_next = ch == '\u{200d}';
+        join_next = ch == '\u{200d}' || hangul.is_some();
         after_virama = is_virama(cp);
         hangul_state = hangul;
         regional_in_last = regional && !regional_in_last;

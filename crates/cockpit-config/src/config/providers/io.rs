@@ -1368,6 +1368,11 @@ impl ConfigDoc {
                         original_raw.as_ref().expect("serialized original provider"),
                         &requested_raw,
                     );
+                    for key in PROVIDER_SKIPPED_KEYS {
+                        if !requested_raw.contains_key(*key) {
+                            raw.remove(*key);
+                        }
+                    }
                 }
                 Some(_) => {
                     raw = requested_raw;

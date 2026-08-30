@@ -311,8 +311,7 @@ async fn rename_and_note_errors_surface_from_async_results() {
         async { Err("note failed".to_string()) },
     );
 
-    tokio::task::yield_now().await;
-    app.drain_async_actions();
+    drain_until_idle(&mut app).await;
 
     assert!(app.history.iter().any(|entry| matches!(
         entry,
@@ -344,8 +343,7 @@ async fn leaks_async_drain_pushes_text_and_prefixes_err() {
         async { Err("leaks-err-marker-7c".to_string()) },
     );
 
-    tokio::task::yield_now().await;
-    app.drain_async_actions();
+    drain_until_idle(&mut app).await;
 
     assert!(app.history.iter().any(|entry| matches!(
         entry,

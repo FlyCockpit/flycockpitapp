@@ -97,6 +97,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 snapshot_session_id,
             } => extended_config_snapshot(Path::new(&project_root), &snapshot_session_id),
             Request::ApplyExtendedConfigPatch {
+                client_operation_id,
                 project_root,
                 layer_id,
                 patch,
@@ -109,6 +110,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 patch,
                 &expected_revision,
                 &snapshot_session_id,
+                client_operation_id,
             ),
             Request::GetProviderCatalogSnapshot {
                 project_root,
@@ -190,13 +192,37 @@ impl SettingsDaemonEffect for DiskDaemonFake {
             // than inventing registry rows a test could not have created.
             Request::ListAssistants => Ok(Response::Assistants {
                 assistants: Vec::new(),
-                config_generation: 0,
+                config_generation: current_config_generation(),
+            }),
+            Request::GetGuidanceEnablementTrace => Ok(Response::GuidanceEnablementTrace {
+                global: None,
+                project: None,
+                provider: None,
+                model: None,
+                enabled: false,
+                has_disable_veto: false,
+                config_generation: current_config_generation(),
             }),
             Request::SaveAssistantDefinition { .. }
             | Request::UpsertAssistant { .. }
             | Request::DeleteAssistant { .. } => Err(
                 "assistant registry mutations are unavailable in the disk-backed test daemon fake"
                     .to_string(),
+            ),
+            Request::ApplyProviderMutation {
+                snapshot_session_id,
+                layer_id,
+                expected_revision,
+                client_operation_id,
+                mutation_intent_hash,
+                mutation,
+            } => apply_provider_mutation(
+                snapshot_session_id,
+                layer_id,
+                expected_revision,
+                client_operation_id,
+                mutation_intent_hash,
+                mutation,
             ),
             other => Err(format!(
                 "the disk-backed test daemon fake does not handle `{}`",
@@ -253,6 +279,22 @@ fn editor_leases() -> &'static Mutex<HashMap<String, EditorLease>> {
 fn extra_layer_targets() -> &'static Mutex<BTreeSet<PathBuf>> {
     static TARGETS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
     TARGETS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[derive(Clone)]
+struct ProviderEditCapability {
+    root: PathBuf,
+    session: String,
+    layer_id: String,
+    owner_root: String,
+    target: PathBuf,
+    revision: String,
+    config_generation: u64,
+}
+
+fn provider_edit_capabilities() -> &'static Mutex<HashMap<String, ProviderEditCapability>> {
+    static CAPABILITIES: OnceLock<Mutex<HashMap<String, ProviderEditCapability>>> = OnceLock::new();
+    CAPABILITIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -779,7 +821,18 @@ fn apply_extended_config_patch(
     patch: ExtendedConfigPatch,
     expected_revision: &str,
     session: &str,
+    client_operation_id: String,
 ) -> Result<Response, String> {
+    let mutation_intent_hash = patch
+        .sanitized_intent_hash()
+        .map_err(|error| error.to_string())?;
+    let request_hash = mint(
+        b"settings-patch-request/v1",
+        &[
+            client_operation_id.as_bytes(),
+            mutation_intent_hash.as_bytes(),
+        ],
+    );
     let id = Uuid::parse_str(layer_id).map_err(|_| STALE_SNAPSHOT.to_string())?;
     let capability = {
         let mut capabilities = layer_capabilities()
@@ -890,9 +943,9 @@ fn apply_extended_config_patch(
         current_config_generation()
     };
     Ok(Response::ExtendedConfigSaved {
-        client_operation_id: String::new(),
-        request_hash: String::new(),
-        mutation_intent_hash: String::new(),
+        client_operation_id,
+        request_hash,
+        mutation_intent_hash,
         hash: result_revision.clone(),
         config_generation,
         layer_id: layer_id.to_string(),
@@ -934,16 +987,22 @@ fn provider_catalog_snapshot(
     snapshot_session_id: &str,
 ) -> Result<Response, String> {
     let mut paths = cockpit_config::dirs::config_file_paths_for_load(root);
-    // A fixture target under this root is its most specific layer, so it merges
-    // last and wins — the same precedence the settings snapshot gives it.
+    // A registered target is an explicit isolated fixture. Do not merge the
+    // developer machine's global provider layers into it: fixtures open a
+    // single authoritative config document and must not inherit a developer's
+    // default model, providers, or credentials.
     let registered = extra_layer_targets()
         .lock()
-        .map(|targets| targets.iter().cloned().collect::<Vec<_>>())
+        .map(|targets| {
+            targets
+                .iter()
+                .filter(|target| target.starts_with(root))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
-    for target in registered {
-        if target.starts_with(root) && !paths.contains(&target) {
-            paths.push(target);
-        }
+    if !registered.is_empty() {
+        paths = registered;
     }
     let mut config = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
     if let Some(provider_id) = provider_id {
@@ -981,8 +1040,6 @@ fn provider_catalog_snapshot(
         })
         .collect();
     let mcp_path = mcp_target_path(root);
-    let _mcp_lock = cockpit_config::config::hold_config_mutation_lock(&mcp_path)
-        .map_err(|error| error.to_string())?;
     let mcp_raw_revision = mcp_revision(root);
     // Same owner-view redaction the daemon applies, through the shared
     // helper, so /mcp tests exercise the real sentinel round-trip.
@@ -999,6 +1056,38 @@ fn provider_catalog_snapshot(
         cockpit_core::mcp::config::redact_config_for_owner_view(&mut config);
         serde_json::to_string(&config).ok()
     };
+    let target = provider_config_target(root);
+    let (raw, _) = read_optional_config(&target)?;
+    let revision = mint(
+        b"provider-layer-revision/v1",
+        &[target.as_os_str().as_encoded_bytes(), &raw],
+    );
+    let layer_id = mint(
+        b"provider-layer/v1",
+        &[
+            root.as_os_str().as_encoded_bytes(),
+            target.as_os_str().as_encoded_bytes(),
+        ],
+    );
+    let owner_root = root.display().to_string();
+    let config_generation = current_config_generation();
+    {
+        let mut capabilities = provider_edit_capabilities()
+            .lock()
+            .map_err(|_| poisoned("provider capability"))?;
+        capabilities.insert(
+            snapshot_session_id.to_string(),
+            ProviderEditCapability {
+                root: root.to_path_buf(),
+                session: snapshot_session_id.to_string(),
+                layer_id: layer_id.clone(),
+                owner_root: owner_root.clone(),
+                target,
+                revision: revision.clone(),
+                config_generation,
+            },
+        );
+    }
     Ok(Response::ProviderCatalogSnapshot {
         config: cockpit_proto::ProviderConfigView {
             providers,
@@ -1022,10 +1111,179 @@ fn provider_catalog_snapshot(
             extended_config_json: None,
         },
         snapshot_session_id: snapshot_session_id.to_string(),
-        layer_id: mint(b"mcp-layer/v1", &[root.as_os_str().as_encoded_bytes()]),
-        owner_root: root.display().to_string(),
-        base_revision: mcp_raw_revision,
-        config_generation: current_config_generation(),
+        layer_id,
+        owner_root,
+        base_revision: revision,
+        config_generation,
+    })
+}
+
+fn provider_config_target(root: &Path) -> PathBuf {
+    let registered = extra_layer_targets()
+        .lock()
+        .map(|targets| {
+            targets
+                .iter()
+                .filter(|target| target.starts_with(root))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    registered
+        .into_iter()
+        .next_back()
+        .or_else(|| {
+            cockpit_config::dirs::config_file_paths_for_load(root)
+                .into_iter()
+                .next_back()
+        })
+        .unwrap_or_else(|| root.join(".cockpit").join("config.json"))
+}
+
+fn apply_provider_mutation(
+    snapshot_session_id: String,
+    layer_id: String,
+    expected_revision: String,
+    client_operation_id: String,
+    mutation_intent_hash: String,
+    mut mutation: cockpit_proto::ProviderMutationBatch,
+) -> Result<Response, String> {
+    let observed = mutation
+        .sanitized_intent_hash()
+        .map_err(|error| error.to_string())?;
+    if observed != mutation_intent_hash {
+        return Err("provider mutation intent digest does not match its body".into());
+    }
+    let capability = {
+        let mut capabilities = provider_edit_capabilities()
+            .lock()
+            .map_err(|_| poisoned("provider capability"))?;
+        let capability = capabilities
+            .remove(&snapshot_session_id)
+            .ok_or_else(|| STALE_SNAPSHOT.to_string())?;
+        if capability.layer_id != layer_id
+            || capability.session != snapshot_session_id
+            || capability.revision != expected_revision
+        {
+            return Err(STALE_SNAPSHOT.to_string());
+        }
+        capability
+    };
+    if !capability.target.exists() {
+        if let Some(parent) = capability.target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
+        }
+        cockpit_config::config::write_config_bytes_atomic(&capability.target, b"{}")
+            .map_err(|error| format!("writing {}: {error}", capability.target.display()))?;
+    }
+    let mut doc = cockpit_config::providers::ConfigDoc::load(&capability.target)
+        .map_err(|error| error.to_string())?;
+    let mut desired = doc.providers();
+    for upsert in mutation.upserts.drain(..) {
+        let mut entry = upsert.entry;
+        if upsert.header_secrets.len() != entry.headers.len() {
+            return Err("provider header secret count does not match headers".into());
+        }
+        for (index, secret) in upsert.header_secrets.into_iter().enumerate() {
+            if let Some(_secret) = secret {
+                let slug = upsert
+                    .provider_id
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric())
+                    .take(48)
+                    .collect::<String>();
+                entry.headers[index].value = format!("$secret:provider-{slug}-{index}");
+            }
+        }
+        desired.providers.insert(upsert.provider_id, entry);
+    }
+    for delete in mutation.deletes.drain(..) {
+        desired.providers.remove(&delete.provider_id);
+    }
+    if let Some(metadata) = mutation.metadata.take() {
+        desired.category_defaults = metadata.category_defaults;
+        desired.on_unlisted_models_fetch = Some(metadata.on_unlisted_models_fetch);
+        if let Some(active_model) = metadata.active_model {
+            desired.active_model = Some(active_model);
+        }
+    }
+    doc.write(&desired).map_err(|error| error.to_string())?;
+    let (raw, _) = read_optional_config(&capability.target)?;
+    let result_revision = mint(
+        b"provider-layer-revision/v1",
+        &[capability.target.as_os_str().as_encoded_bytes(), &raw],
+    );
+    let config_generation = publish_config_generation();
+    let mut paths = cockpit_config::dirs::config_file_paths_for_load(&capability.root);
+    if !paths.contains(&capability.target) {
+        paths.push(capability.target.clone());
+    }
+    let projected = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
+    let providers = projected
+        .providers
+        .iter()
+        .map(|(id, entry)| {
+            let headers = entry
+                .headers
+                .iter()
+                .map(|header| cockpit_proto::ProviderHeaderView {
+                    name: header.name.clone(),
+                    value: "[redacted]".to_string(),
+                    redacted: true,
+                })
+                .collect();
+            let credential_configured = entry.credential_ref.is_some() || !entry.headers.is_empty();
+            let mut projected_entry = entry.clone();
+            projected_entry.headers.clear();
+            (
+                id.clone(),
+                cockpit_proto::ProviderEntryView {
+                    entry: projected_entry,
+                    headers,
+                    credential_configured,
+                },
+            )
+        })
+        .collect();
+    {
+        let mut capabilities = provider_edit_capabilities()
+            .lock()
+            .map_err(|_| poisoned("provider capability"))?;
+        capabilities.insert(
+            snapshot_session_id.clone(),
+            ProviderEditCapability {
+                revision: result_revision.clone(),
+                config_generation,
+                ..capability.clone()
+            },
+        );
+    }
+    Ok(Response::ProviderMutationCommitted {
+        client_operation_id,
+        snapshot_session_id,
+        layer_id,
+        owner_root: capability.owner_root,
+        mutation_intent_hash,
+        consumed_revision: expected_revision,
+        result_revision,
+        config_generation,
+        config: cockpit_proto::ProviderConfigView {
+            providers,
+            category_defaults: projected.category_defaults,
+            on_unlisted_models_fetch: projected.on_unlisted_models_fetch,
+            active_model: projected.active_model,
+            mcp_config_json: None,
+            mcp_authored_config_json: None,
+            mcp_owner_root: None,
+            mcp_config_path: None,
+            mcp_edit_capability: None,
+            mcp_revision: None,
+            mcp_scope_revisions: BTreeMap::new(),
+            extended_config_json: None,
+        },
+        status: ConfigCommitStatus::Committed,
+        publication: ConfigPublicationStatus::Published,
     })
 }
 

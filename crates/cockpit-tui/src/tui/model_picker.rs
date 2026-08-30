@@ -822,7 +822,7 @@ impl ModelPickerDialog {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Indexed(178));
         let (filter_before, filter_after) = self.filter.split_at_cursor();
-        let error_height = u16::from(self.error.is_some()) * 2;
+        let error_height = u16::from(self.error.is_some());
         let regions = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(1),
@@ -954,6 +954,15 @@ impl ModelPickerDialog {
                     ));
                 }
                 item_lines.push(Line::from(spans));
+                let visible_pos = visible
+                    .iter()
+                    .position(|&visible_idx| visible_idx == idx)
+                    .unwrap_or(0);
+                if visible_pos + drift_offset == list_cursor(&self.pick) {
+                    for line in &mut item_lines {
+                        line.spans.insert(0, Span::raw("> "));
+                    }
+                }
                 item_heights.push(item_lines.len() as u16);
                 items.push(ListItem::new(item_lines));
             }
@@ -965,7 +974,7 @@ impl ModelPickerDialog {
         }
         let list_area = regions[1];
         let list = List::new(items)
-            .highlight_symbol("▸ ")
+            .highlight_symbol("")
             .highlight_style(
                 Style::default()
                     .fg(Color::Yellow)
@@ -1044,7 +1053,7 @@ impl ModelPickerDialog {
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for (i, m) in modes.iter().enumerate() {
-            let marker = if i == *cursor { "▸ " } else { "  " };
+            let marker = if i == *cursor { "> " } else { "  " };
             let style = if i == *cursor {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1092,7 +1101,7 @@ impl ModelPickerDialog {
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for (i, value) in capability.values.iter().enumerate() {
-            let marker = if i == *cursor { "▸ " } else { "  " };
+            let marker = if i == *cursor { "> " } else { "  " };
             let style = if i == *cursor {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1671,13 +1680,44 @@ mod tests {
         terminal
             .draw(|frame| d.render(frame, Rect::new(0, 0, width, height)))
             .expect("draw");
-        terminal
+        let rendered = terminal
             .backend()
             .buffer()
             .content()
             .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>()
+            .filter_map(|cell| {
+                let symbol = cell.symbol();
+                (!symbol.is_empty()).then_some(symbol)
+            })
+            .collect::<String>();
+        compact_wide_glyph_continuations(&rendered)
+    }
+
+    fn compact_wide_glyph_continuations(rendered: &str) -> String {
+        // Wide CJK glyphs occupy two TestBackend cells; the continuation
+        // cell is sometimes a space. Drop a space only when it sits between
+        // two wide glyphs so "模型" does not become "模 型". Keep a space
+        // after a wide glyph when the next character is narrow — that is
+        // the filter caret ("中 a").
+        let chars: Vec<char> = rendered.chars().collect();
+        let mut compact = String::new();
+        for (index, &ch) in chars.iter().enumerate() {
+            if ch == ' ' {
+                let prev_wide = compact
+                    .chars()
+                    .last()
+                    .is_some_and(|prev| unicode_width::UnicodeWidthChar::width(prev) == Some(2));
+                let next_wide = chars
+                    .get(index + 1)
+                    .copied()
+                    .is_some_and(|next| unicode_width::UnicodeWidthChar::width(next) == Some(2));
+                if prev_wide && next_wide {
+                    continue;
+                }
+            }
+            compact.push(ch);
+        }
+        compact
     }
 
     #[test]
@@ -1824,7 +1864,7 @@ mod tests {
         let rendered = rendered_text(&mut d, 80, 10);
 
         assert!(
-            rendered.contains("▸ p/m12"),
+            rendered.contains("> p/m12"),
             "highlighted row should be visible:\n{rendered}"
         );
     }
@@ -1840,7 +1880,7 @@ mod tests {
         let rendered = rendered_text(&mut d, 80, 10);
 
         assert!(
-            rendered.contains("▸ p/m12"),
+            rendered.contains("> p/m12"),
             "highlighted row should win over error chrome:\n{rendered}"
         );
     }
@@ -2434,7 +2474,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("▸ p/first"));
+        assert!(rendered.contains("> p/first"));
         assert!(rendered.contains("p/active  [untrusted]  [active]"));
     }
 

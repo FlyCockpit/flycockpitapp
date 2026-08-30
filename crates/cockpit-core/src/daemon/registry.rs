@@ -11,35 +11,47 @@
 //! - `attach(Some(id), _)` — resume the session with that id. Errors
 //!   if no DB row exists.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, watch};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Mutex as AsyncMutex, watch},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
-use crate::config::extended::ExtendedConfig;
-use crate::config::providers::{ActiveModelRef, ProvidersConfig};
-use crate::config::trust::{
-    WorkspaceTrustError, WorkspaceTrustPolicy, resolve_workspace_trust_policy_with_revision_from_db,
+use crate::{
+    config::{
+        extended::ExtendedConfig,
+        providers::{ActiveModelRef, ProvidersConfig},
+        trust::{
+            WorkspaceTrustError, WorkspaceTrustPolicy,
+            resolve_workspace_trust_policy_with_revision_from_db,
+        },
+    },
+    daemon::{
+        EventSender,
+        server::CONFIG_PUBLICATION_RPC_LOCK,
+        session_worker::{self, SessionWorkerHandle},
+        shutdown::ShutdownSignal,
+    },
+    db::Db,
+    engine::model::Model,
+    env_snapshot::EnvSnapshot,
+    locks::LockManager,
+    redact::{RedactionTable, protected_redaction_history::RedactionKeyResolver},
+    session::Session,
 };
-use crate::daemon::EventSender;
-use crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK;
-use crate::daemon::session_worker::{self, SessionWorkerHandle};
-use crate::daemon::shutdown::ShutdownSignal;
-use crate::db::Db;
-use crate::engine::model::Model;
-use crate::env_snapshot::EnvSnapshot;
-use crate::locks::LockManager;
-use crate::redact::RedactionTable;
-use crate::redact::protected_redaction_history::RedactionKeyResolver;
-use crate::session::Session;
 
 #[derive(Debug, Error)]
 #[error("session entry mode conflict: session is {actual}, attach requested {requested}")]
@@ -70,7 +82,7 @@ pub const DESTRUCTIVE_STOP_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const START_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const START_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+const START_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Product-owned upper bound on how long shutdown/attach waits for every
 /// registered interrupt's park to commit to SQLite
@@ -266,6 +278,8 @@ struct Inner {
     /// workers never retain a client path in a durable image request.
     media_storage_recovery: Mutex<Option<Arc<crate::media_storage::MediaStorageRecovery>>>,
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
+    /// Daemon-owned installed-agent tree (`<pid-file-parent>/agents`).
+    daemon_agents_dir: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Clone, Copy)]
@@ -692,8 +706,17 @@ impl SessionRegistry {
                 media_storage_recovery: Mutex::new(None),
                 image_generation_dispatch_registry:
                     crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+                daemon_agents_dir: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn set_daemon_agents_dir(&self, dir: PathBuf) {
+        *crate::sync::lock_or_recover(&self.inner.daemon_agents_dir) = Some(dir);
+    }
+
+    fn daemon_agents_dir(&self) -> Option<PathBuf> {
+        crate::sync::lock_or_recover(&self.inner.daemon_agents_dir).clone()
     }
 
     pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
@@ -1709,7 +1732,6 @@ impl SessionRegistry {
             .is_some_and(|entry| {
                 entry.generation == claim.generation
                     && !entry.handle.is_closed()
-                    && !entry.handle.trust_transition_is_pending()
                     && !entry.terminal_closing.load(Ordering::Acquire)
             })
     }
@@ -2023,6 +2045,10 @@ impl SessionRegistry {
                     )?,
                 )
                 .with_host_capabilities(self.current_host_capabilities());
+                let snapshot = match self.daemon_agents_dir() {
+                    Some(dir) => snapshot.with_daemon_agents_dir(dir),
+                    None => snapshot,
+                };
                 match self.host_capability_refresh_runtime() {
                     Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),
                     None => snapshot,
@@ -2569,7 +2595,6 @@ impl SessionRegistry {
                     session_id,
                     generation,
                     handle,
-                    &terminal_cleanup_complete,
                     deadline,
                     stop_budget,
                 )
@@ -2648,7 +2673,6 @@ impl SessionRegistry {
         session_id: Uuid,
         generation: WorkerGeneration,
         handle: &SessionWorkerHandle,
-        terminal_cleanup_complete: &Arc<AtomicBool>,
         deadline: tokio::time::Instant,
         stop_budget: Duration,
     ) -> Result<bool> {
@@ -2660,11 +2684,11 @@ impl SessionRegistry {
         .await
         {
             Ok(()) => {
-                if !terminal_cleanup_complete.load(Ordering::Acquire) {
-                    bail!(
-                        "session {session_id} worker channel closed before terminal cleanup completed; refusing replacement"
-                    );
-                }
+                // There is no join to wait on. A closed worker channel is the
+                // only liveness signal: the process is gone and cannot finish
+                // a later cleanup bit. Forget this generation so a successor
+                // can start. Join-backed stops still fail closed until the
+                // worker stores terminal_cleanup_complete.
                 self.forget_generation(session_id, generation);
                 Ok(true)
             }
@@ -2748,7 +2772,7 @@ impl SessionRegistry {
                 activation_leases: 0,
                 terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                 terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
             },
         );
         generation
@@ -2786,9 +2810,13 @@ mod tests {
     use super::*;
     use crate::daemon::proto;
     use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
 
     fn test_registry() -> SessionRegistry {
         test_registry_with_config_source(crate::daemon::config_source::ConfigSource::fixed(

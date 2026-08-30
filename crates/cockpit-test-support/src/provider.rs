@@ -760,8 +760,8 @@ fn usage_value_for_chat(usage: Option<&Usage>) -> Value {
         })
     } else {
         serde_json::json!({
-            "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
+            "prompt_tokens": usage.prompt_tokens,
             "total_tokens": usage.total_tokens
         })
     }

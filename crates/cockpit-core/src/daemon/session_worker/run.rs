@@ -966,6 +966,7 @@ async fn prepare_installed_root_snapshot_named(
 async fn prepared_root_launch_state(
     session: &std::sync::Arc<crate::session::Session>,
     workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    daemon_agents_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
     let snapshot_row = session.db.agent_profile_snapshot(session.id).await?;
     let Some(snapshot_row) = snapshot_row else {
@@ -973,7 +974,14 @@ async fn prepared_root_launch_state(
     };
     let snapshot = snapshot_row.reconstruct()?;
     let prepared_primary_slot_routes = snapshot_primary_routes(&snapshot)?;
-    let daemon_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+    let owned_agents_dir;
+    let daemon_agents_dir = match daemon_agents_dir {
+        Some(dir) => dir,
+        None => {
+            owned_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+            owned_agents_dir.as_path()
+        }
+    };
     let mut installation_ids = vec![snapshot_row.installation_id];
     if let Some(delegation) = &snapshot.effective_delegation {
         for child in &delegation.allowed_children {
@@ -1140,7 +1148,7 @@ async fn prepare_set_agent_installed_root(
         .await?
         .is_some()
     {
-        let launch = prepared_root_launch_state(session, workspace_root)
+        let launch = prepared_root_launch_state(session, workspace_root, None)
             .await?
             .context("installed-root session lost its prepared launch snapshot")?;
         if launch.root_agent_name == name {
@@ -1208,7 +1216,7 @@ async fn prepare_set_agent_installed_root(
         .rebind_session_root_profile(session.id, Some(snapshot_row.snapshot_id), now)
         .await
         .context("rebinding the live session root to the newly prepared profile")?;
-    let launch = prepared_root_launch_state(session, workspace_root)
+    let launch = prepared_root_launch_state(session, workspace_root, None)
         .await?
         .context("installed root preparation committed no launch snapshot")?;
     ensure!(
@@ -6072,6 +6080,7 @@ pub(super) async fn run_worker(
     // before this task was scheduled, leave before the expensive startup
     // path so `stop_worker` can observe a prompt exit.
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
 
@@ -6097,25 +6106,36 @@ pub(super) async fn run_worker(
         start_config = snapshot.clone();
     }
     let extended_cfg = start_config.extended.clone();
-    let prepared_root_launch =
-        match prepared_root_launch_state(&session, &workspace_root_authority.attached_root).await {
-            Ok(state) => state,
-            Err(error) => {
-                let message =
-                    format!("could not load prepared installed-agent session snapshot: {error:#}");
-                tracing::error!(%message, %session_id, "session startup refused");
-                let mut driver_failed = false;
-                emit_session_driver_failed_once(
-                    &event_tx,
-                    &turn_completions,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                    message,
-                );
-                return;
-            }
-        };
+    let daemon_agents_dir = start_config.daemon_agents_dir.clone().or_else(|| {
+        crate::config::resolve::cockpit_data_dir()
+            .ok()
+            .map(|p| p.join("agents"))
+    });
+    let prepared_root_launch = match prepared_root_launch_state(
+        &session,
+        &workspace_root_authority.attached_root,
+        daemon_agents_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            let message =
+                format!("could not load prepared installed-agent session snapshot: {error:#}");
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            park_commit.report_startup_reconciled();
+            return;
+        }
+    };
     // A resumed installed root must run the model selection already persisted
     // on the session, even when the installed package's current default has
     // since changed. Route that selection through the root-only explicit /
@@ -7514,6 +7534,7 @@ pub(super) async fn run_worker(
         }
     };
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
     let mut durable_lifecycle_ready = session.is_persisted();
@@ -8280,6 +8301,7 @@ pub(super) async fn run_worker(
     }
     // Spawn the driver loop.
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
     let driver_queue_for_loop = driver_input_queue.clone();
@@ -9343,8 +9365,8 @@ pub(super) async fn run_worker(
     // reattached executor may consume persisted pre-crash or newly queued
     // input. Accepted continuation ids therefore reach their owner before
     // any provider handoff, not after gate release.
-    for gate in deferred_recovery_activation_gates {
-        gate.release();
+    for activation_gate in deferred_recovery_activation_gates {
+        activation_gate.release();
     }
     if let Some(gate) = root_activation_gate.as_ref() {
         gate.release();
@@ -12732,6 +12754,7 @@ pub(super) async fn run_worker(
                             let profile_matches_requested = match prepared_root_launch_state(
                                 &session,
                                 &workspace_root_authority.attached_root,
+                                None,
                             )
                             .await
                             {
@@ -13376,10 +13399,34 @@ pub(super) async fn run_worker(
     }
     if graceful_park {
         // Final sweep: the driver task has exited, so no further interrupt can
-        // be registered. Report the shutdown park-commit exactly once, now that
-        // it is sound: every registered-or-registerable interrupt is parked.
+        // be registered. Persist resumable work *before* publishing the
+        // shutdown park-commit: drain waits on that signal to release pid and
+        // socket, and a successor must already see the paused row.
         let sweep = interrupts.park_all_registered_collect().await;
         shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
+        if let WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active,
+            pending_tool_count,
+        } = &stop
+        {
+            let pending = session
+                .db
+                .list_open_interrupts(session_id)
+                .await
+                .map(|rows| rows.len() as i64)
+                .unwrap_or(*pending_tool_count);
+            if *active || pending > 0 {
+                persist_paused_session_work(
+                    &session,
+                    session_id,
+                    &root_agent_name,
+                    &project_root,
+                    pending,
+                )
+                .await;
+            }
+        }
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
     adopted_processes.join_all().await;
@@ -13446,27 +13493,6 @@ pub(super) async fn run_worker(
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
-            active: true,
-            pending_tool_count,
-        } => {
-            if let Err(e) = session
-                .db
-                .upsert_paused_session_work(
-                    session_id,
-                    &root_agent_name,
-                    &project_root.display().to_string(),
-                    "daemon shutdown paused active work",
-                    pending_tool_count,
-                    proto::DAEMON_VERSION,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "persisting paused session work failed");
-            }
-        }
-        WorkerStop::Shutdown {
-            pause_for_resume: true,
-            active: false,
             ..
         } => {}
         _ => {
@@ -13672,6 +13698,29 @@ async fn test_injected_park_delay(_var: &str) {
         {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
+    }
+}
+
+async fn persist_paused_session_work(
+    session: &Session,
+    session_id: Uuid,
+    root_agent_name: &str,
+    project_root: &std::path::Path,
+    pending_tool_count: i64,
+) {
+    if let Err(error) = session
+        .db
+        .upsert_paused_session_work(
+            session_id,
+            root_agent_name,
+            &project_root.display().to_string(),
+            "daemon shutdown paused active work",
+            pending_tool_count,
+            proto::DAEMON_VERSION,
+        )
+        .await
+    {
+        tracing::warn!(%error, "persisting paused session work failed");
     }
 }
 

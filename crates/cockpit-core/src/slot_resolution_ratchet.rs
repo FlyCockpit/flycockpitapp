@@ -58,7 +58,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("");
-            if !name.contains("test") {
+            if !name.contains("test") && !name.contains("ratchet") {
                 out.push(path);
             }
         }
@@ -356,7 +356,7 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
 
     let installations = production_source(&db_src().join("db/agent_installations.rs"));
     let claim_existing = installations
-        .split("PreparationTarget::ClaimExisting")
+        .split("PreparationTarget::ClaimExisting(token) => {")
         .nth(1)
         .expect("ClaimExisting preparation target")
         .split("let snapshot_id")
@@ -481,8 +481,12 @@ fn choice_id_is_not_persisted_on_durable_bindings() {
         .split("CREATE UNIQUE INDEX agent_model_bindings_current_slot")
         .next()
         .expect("agent_model_bindings body");
+    let uncommented = table
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<String>();
     assert!(
-        !table.contains("choice_id"),
+        !uncommented.contains("choice_id"),
         "agent_model_bindings must not persist a choice_id column"
     );
 }

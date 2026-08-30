@@ -1055,8 +1055,13 @@ async fn compact_delegation_draft_elides_a_settled_large_write_before_model_infe
         .expect("test driver has an active provider and model");
     providers
         .providers
-        .get_mut("lmstudio")
-        .expect("test provider")
+        .entry(provider_id.clone())
+        .or_insert_with(|| crate::config::providers::ProviderEntry {
+            url: provider.base_url(),
+            headers: vec![],
+            wire_api: crate::config::providers::WireApi::Completions,
+            ..crate::config::providers::ProviderEntry::default()
+        })
         .shrink = ShrinkConfig {
         strategy: ShrinkStrategy::Compact,
         margin_secs: 30,

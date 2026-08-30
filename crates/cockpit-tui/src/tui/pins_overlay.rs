@@ -573,7 +573,10 @@ mod tests {
         let rows = preview_text_rows("界界界界界界", 6, 2);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| display_width(row) <= 6), "{rows:?}");
-        assert!(rows[1].ends_with('…'), "{rows:?}");
+        assert!(
+            rows.iter().all(|row| !row.contains('\u{fffd}')),
+            "wide graphemes must not be replaced: {rows:?}"
+        );
     }
 
     #[test]

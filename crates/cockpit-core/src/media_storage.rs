@@ -1964,6 +1964,8 @@ impl MediaStorageRecovery {
         storage_name: String,
         max_bytes: usize,
     ) -> std::result::Result<Vec<u8>, ToolRetainedHttpsError> {
+        crate::media_https::preflight_retained_https_url(url)
+            .map_err(|error| ToolRetainedHttpsError::cleaned(error))?;
         let held = match self.owned_root.create_file_exclusive(&storage_name) {
             Ok(held) => held,
             Err(error @ ExternalJournalError::SystemIntegrity(_)) => {

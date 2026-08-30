@@ -1969,7 +1969,7 @@ pub enum GuidanceProposalDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingGuidanceProposal {
     pub proposal_id: Uuid,
     pub rules: Vec<[u8; 3]>,

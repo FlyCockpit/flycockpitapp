@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::render::chat_visible_top;
-use super::{App, HistoryEntryId, MouseGestureInvalidation};
+use super::{App, HistoryEntryId};
 use crate::tui::history::HistoryEntry;
 use crate::tui::pins_overlay::{PIN_YELLOW, preview_text_rows};
 use crate::tui::theme::{MUTED_COLOR_INDEX, TRANSCRIPT_HOVER_BG};
@@ -67,14 +67,9 @@ impl App {
     }
 
     fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
-        let was_visible = self.sticky_header_area.is_some();
-        if was_visible != visible {
-            self.invalidate_mouse_gesture(
-                MouseGestureInvalidation::ViewChange,
-                self.event_loop_monotonic_now,
-            );
-            self.chat_scroll_anchor = None;
-        }
+        // Carving or releasing the two-line header is a layout change, not a
+        // user gesture. Keep the selection grid and offset-from-bottom so a
+        // header flip cannot yank the viewport or empty the copy map.
         self.sticky_header_area = visible.then(|| Rect {
             x: pane.x,
             y: pane.y,
@@ -185,11 +180,18 @@ impl App {
         let Some(idx) = self.history_position_for_id(id) else {
             return;
         };
-        let Some(&rel) = self.msg_abs_line.get(&idx) else {
-            return;
-        };
+        let rel = self.msg_abs_line.get(&idx).copied().unwrap_or_else(|| {
+            self.history_prefix_rows_len() + self.chat_geometry.entry_start_row(idx)
+        });
         let abs = self.chat_banner_lines + rel;
         self.scroll_abs_line_into_view(abs);
+        if self.chat_scroll_offset == 0 {
+            let visible = self.chat_visible_lines.max(1);
+            let total = self.chat_total_lines;
+            if total > visible {
+                self.set_chat_scroll_offset_from_interaction(total - visible);
+            }
+        }
     }
 
     pub(super) fn mouse_in_sticky_header(&self, col: u16, row: u16) -> bool {

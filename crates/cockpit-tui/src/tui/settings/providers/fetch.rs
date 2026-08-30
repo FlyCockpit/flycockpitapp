@@ -335,21 +335,9 @@ impl SettingsCx {
                     self.config.on_unlisted_models_fetch = Some(pick);
                 }
                 let summary = fetch_all_summary(s);
-                match self.save_config() {
-                    Ok(()) => {
-                        self.pending_provider_mutation_navigation =
-                            Some(super::super::ProviderMutationNavigation::List {
-                                status: summary,
-                            });
-                        self.extended_warnings = vec!["saving fetched provider catalogs…".into()];
-                    }
-                    Err(error) => {
-                        self.extended_warnings = vec![format!(
-                            "save failed: {error}; fetched catalog choices remain open for retry"
-                        )];
-                    }
-                }
-                return Nav::Stay;
+                return self.commit_provider_mutation(
+                    super::super::ProviderMutationNavigation::List { status: summary },
+                );
             }
             _ => {}
         }

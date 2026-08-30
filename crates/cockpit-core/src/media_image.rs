@@ -458,7 +458,7 @@ fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         let marker = bytes[offset + 1];
         offset += 2;
         if marker == 0xd9 || marker == 0xda {
-            break;
+            return Ok(exif);
         }
         if matches!(marker, 0x01 | 0xd0..=0xd7) {
             continue;

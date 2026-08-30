@@ -27,6 +27,27 @@ pub const SECURE_KEY_QUEUE_CAPACITY: usize = 32;
 
 type Reply<T> = oneshot::Sender<T>;
 
+/// Startup/sync callers wait on std `mpsc` from a Tokio worker without
+/// `oneshot::Receiver::blocking_recv`. Async callers keep a oneshot so they
+/// never touch Tokio's blocking pool.
+enum ReconcileReply {
+    Async(oneshot::Sender<Result<(), SecureKeyError>>),
+    Sync(mpsc::SyncSender<Result<(), SecureKeyError>>),
+}
+
+impl ReconcileReply {
+    fn send(self, result: Result<(), SecureKeyError>) {
+        match self {
+            Self::Async(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Sync(reply) => {
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
 enum Op {
     CreateOrLoad {
         namespace: Namespace,
@@ -71,7 +92,7 @@ enum Op {
         reply: Reply<Result<(), SecureKeyError>>,
     },
     Reconcile {
-        reply: Reply<Result<(), SecureKeyError>>,
+        reply: ReconcileReply,
     },
     CheckConsistency {
         namespace: Namespace,
@@ -234,7 +255,9 @@ impl SecureKeyHandle {
 
     pub async fn reconcile(&self) -> Result<(), SecureKeyError> {
         let (reply, rx) = oneshot::channel();
-        self.enqueue(Op::Reconcile { reply })?;
+        self.enqueue(Op::Reconcile {
+            reply: ReconcileReply::Async(reply),
+        })?;
         Self::await_reply(rx).await?
     }
 
@@ -415,9 +438,11 @@ impl SecureKeyHandle {
     }
 
     pub fn reconcile_blocking(&self) -> Result<(), SecureKeyError> {
-        let (reply, rx) = oneshot::channel();
-        self.enqueue(Op::Reconcile { reply })?;
-        rx.blocking_recv()
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.enqueue(Op::Reconcile {
+            reply: ReconcileReply::Sync(reply),
+        })?;
+        rx.recv()
             .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
     }
 
@@ -461,8 +486,10 @@ impl SecureKeyHandle {
     }
 
     pub fn enqueue_raw_for_busy_test(&self) -> Result<(), SecureKeyError> {
-        let (reply, _rx) = oneshot::channel();
-        self.enqueue(Op::Reconcile { reply })
+        let (reply, _rx) = mpsc::sync_channel(1);
+        self.enqueue(Op::Reconcile {
+            reply: ReconcileReply::Sync(reply),
+        })
     }
 }
 
@@ -566,7 +593,7 @@ impl SecureKeyActor {
             .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
 
         let (tx, rx) = mpsc::sync_channel::<Op>(SECURE_KEY_QUEUE_CAPACITY);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), SecureKeyError>>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SecureKeyError>>(1);
         let register_on_thread = owns_default_store && injected_store.is_none();
         let join = thread::Builder::new()
             .name("cockpit-secure-key".into())
@@ -597,7 +624,9 @@ impl SecureKeyActor {
             .map_err(|e| SecureKeyError::Internal(format!("spawn secure-key thread: {e}")))?;
 
         // Wait for actor-thread registration/construct before enqueueing.
-        match ready_rx.blocking_recv() {
+        // Use a std channel so this constructor can run from a Tokio worker
+        // (daemon boot and #[tokio::test]) without oneshot::blocking_recv.
+        match ready_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -618,8 +647,13 @@ impl SecureKeyActor {
         }
 
         let handle = SecureKeyHandle { tx: tx.clone() };
-        let (reply, rx_ack) = oneshot::channel();
-        if handle.enqueue(Op::Reconcile { reply }).is_err() {
+        let (reply, rx_ack) = mpsc::sync_channel(1);
+        if handle
+            .enqueue(Op::Reconcile {
+                reply: ReconcileReply::Sync(reply),
+            })
+            .is_err()
+        {
             return Self::fail_after_registration(
                 register_on_thread,
                 &tx,
@@ -627,7 +661,7 @@ impl SecureKeyActor {
                 SecureKeyError::Internal("failed to enqueue startup reconcile".into()),
             );
         }
-        match rx_ack.blocking_recv() {
+        match rx_ack.recv() {
             Ok(Ok(())) => {
                 if owns_default_store {
                     mark_actor_intake_ready();

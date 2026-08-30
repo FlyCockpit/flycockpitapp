@@ -235,10 +235,24 @@ fn key_in_parens(tokens: &[Token], open: usize) -> Key {
     let terms = clauses(&tokens[open + 1..close])
         .into_iter()
         .map(|part| {
-            let column = name(part.first()).expect("key term must start with an identifier");
+            let (column, cursor) = if is(part.first(), "ifnull")
+                && matches!(part.get(1), Some(Token::Mark('(')))
+                && matches!(part.get(3), Some(Token::Mark(',')))
+                && matches!(part.last(), Some(Token::Mark(')')))
+            {
+                (
+                    name(part.get(2)).expect("ifnull key term requires a column"),
+                    part.len(),
+                )
+            } else {
+                (
+                    name(part.first()).expect("key term must start with an identifier"),
+                    1,
+                )
+            };
             let mut collation = None;
             let mut direction = Direction::Asc;
-            let mut cursor = 1;
+            let mut cursor = cursor;
             while cursor < part.len() {
                 if is(part.get(cursor), "collate") {
                     assert!(collation.is_none(), "duplicate key-term COLLATE");
@@ -335,12 +349,47 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
     }
 
     fn grouped_or_comma_from_relation(tokens: &[Token], dot: usize) -> bool {
-        dot >= 3
-            && matches!(
+        if dot < 3
+            || !matches!(
                 tokens.get(dot - 2),
                 Some(Token::Mark('(')) | Some(Token::Mark(','))
             )
-            && source_context_before(tokens, dot - 2)
+        {
+            return false;
+        }
+        // `FROM json_each(new.col)` is a table-valued function argument, not a
+        // grouped `FROM (schema.table)` relation.
+        if matches!(tokens.get(dot - 2), Some(Token::Mark('(')))
+            && matches!(
+                tokens.get(dot - 3),
+                Some(Token::Word(_) | Token::QuotedName(_))
+            )
+            && !is(tokens.get(dot - 3), "from")
+            && !is(tokens.get(dot - 3), "join")
+        {
+            return false;
+        }
+        source_context_before(tokens, dot - 2)
+    }
+
+    /// `ON alias.column` is a join predicate, not a schema-qualified table.
+    /// `CREATE INDEX/TRIGGER ... ON schema.table` remains a relation name.
+    fn on_is_join_predicate(tokens: &[Token], on_index: usize) -> bool {
+        let mut nested = 0_u32;
+        for token in tokens[..on_index].iter().rev() {
+            match token {
+                Token::Mark(')') => nested = nested.checked_add(1).expect("SQL nesting overflow"),
+                Token::Mark('(') if nested > 0 => nested -= 1,
+                Token::Mark(';') if nested == 0 => return false,
+                Token::Word(keyword) if nested == 0 => match keyword.as_str() {
+                    "join" => return true,
+                    "index" | "trigger" | "table" | "view" => return false,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
     }
 
     for (index, token) in tokens.iter().enumerate() {
@@ -384,7 +433,11 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
             }
         }
         if matches!(token, Token::Mark('.')) {
+            let on_join_predicate = index >= 2
+                && is(tokens.get(index - 2), "on")
+                && on_is_join_predicate(tokens, index - 2);
             let direct_schema_context = index >= 2
+                && !on_join_predicate
                 && [
                     "table",
                     "index",
@@ -410,7 +463,14 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
                 !direct_schema_context
                     && !update_conflict_schema_context
                     && !grouped_or_comma_from_relation(tokens, index),
-                "schema-qualified object names are unsupported"
+                "schema-qualified object names are unsupported near {}",
+                tokens
+                    .get(index.saturating_sub(4)..index.saturating_add(5))
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(token_sql)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
         }
         if matches!(word(Some(token)).as_deref(), Some("update" | "insert"))

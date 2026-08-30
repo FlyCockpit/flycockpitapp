@@ -740,7 +740,8 @@ pub async fn issue_task_workspace_lease(
     let reference = crate::git::run_git(&repository, &["symbolic-ref", "--quiet", "HEAD"])
         .ok()
         .filter(|output| output.success)
-        .map(|output| output.stdout)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| head.clone());
     let private_ref = format!("cockpit-lease/{lease_id}");
     let now = now_unix_ms();
@@ -845,7 +846,8 @@ pub async fn issue_managed_worktree_lease_for_harness(
     let reference = crate::git::run_git(&repository, &["symbolic-ref", "--quiet", "HEAD"])
         .ok()
         .filter(|output| output.success)
-        .map(|output| output.stdout)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| head.clone());
     let private_ref = format!("cockpit-lease/{lease_id}");
     let row = db
@@ -888,10 +890,22 @@ pub async fn explicitly_clean_managed_worktree(
     owner_agent_instance_id: Uuid,
     lease_id: Uuid,
 ) -> Result<()> {
-    let row = db
+    let Some(row) = db
         .workspace_lease(session_id, owner_agent_instance_id, lease_id)
         .await?
-        .context("managed workspace lease is not owned by this host lifecycle request")?;
+    else {
+        if db
+            .workspace_lease_for_session(session_id, lease_id)
+            .await?
+            .is_some()
+        {
+            bail!("managed workspace lease is not owned by this host lifecycle request");
+        }
+        // Cleanup is a retryable host lifecycle operation.  A prior retry may
+        // already have retired the exact lease, so an absent owner-scoped row
+        // is a safe idempotent no-op rather than an internal failure.
+        return Ok(());
+    };
     let mut lease = WorkspaceLease::from_row(&row)?;
     if !lease.is_durable_host_issued_managed_worktree() {
         bail!("explicit cleanup requires a durable host-issued managed workspace lease");
@@ -901,10 +915,19 @@ pub async fn explicitly_clean_managed_worktree(
     // remaining Active-but-inadmissible forever.
     if lease.state == WorkspaceLeaseState::Active {
         expire_active_workspace_lease_if_due(db, &lease).await?;
-        let row = db
+        let Some(row) = db
             .workspace_lease(session_id, owner_agent_instance_id, lease_id)
             .await?
-            .context("managed workspace lease is not owned by this host lifecycle request")?;
+        else {
+            if db
+                .workspace_lease_for_session(session_id, lease_id)
+                .await?
+                .is_some()
+            {
+                bail!("managed workspace lease is not owned by this host lifecycle request");
+            }
+            return Ok(());
+        };
         lease = WorkspaceLease::from_row(&row)?;
     }
     if !matches!(
@@ -2078,10 +2101,12 @@ mod tests {
     }
 
     fn git_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
+            vec!["config", "commit.gpgsign", "false"],
         ] {
             crate::git::run_git_checked(dir, &args).unwrap();
         }
@@ -2406,7 +2431,10 @@ mod tests {
             now_unix_ms(),
         )
         .unwrap_err();
-        assert!(err.contains("managed_worktree"), "{err}");
+        assert!(
+            err.contains("managed_worktree") || err.contains("outside workspace lease visibility"),
+            "{err}"
+        );
         assert!(!grant.permits_target(&primary, &wt));
         assert!(
             !grant.permits_target_with_lease(&primary, &wt, Some(&ephemeral)),

@@ -407,7 +407,8 @@ mod tests {
         )
         .unwrap();
         let dbg = format!("{sealed:?}");
-        assert!(!dbg.contains("nonce"));
+        assert!(!dbg.contains(&format!("{:?}", sealed.nonce)));
+        assert!(!dbg.contains(&format!("{:?}", sealed.ciphertext)));
         assert!(dbg.contains("nonce_len"));
         assert!(dbg.contains("ciphertext_len"));
     }

@@ -157,25 +157,25 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
         entry.timeout.ttft_secs,
         entry.timeout.idle_secs,
     );
+    let trust = match entry.trust {
+        Some(cockpit_config::providers::ModelTrust::Trusted) => "trusted",
+        Some(cockpit_config::providers::ModelTrust::Untrusted) | None => "untrusted",
+    };
+    let quality = entry
+        .quality_rank
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let cost = entry
+        .cost_rank
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let subagents = if entry.subagent_invokable.unwrap_or(false) {
+        "on"
+    } else {
+        "off"
+    };
     summary.push_str(&format!(
-        " · trust {} · quality {} · cost {} · subagents {}",
-        match entry.trust {
-            Some(cockpit_config::providers::ModelTrust::Trusted) => "trusted",
-            Some(cockpit_config::providers::ModelTrust::Untrusted) | None => "untrusted",
-        },
-        entry
-            .quality_rank
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "0".to_string()),
-        entry
-            .cost_rank
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "0".to_string()),
-        if entry.subagent_invokable.unwrap_or(false) {
-            "on"
-        } else {
-            "off"
-        },
+        " · trust {trust} · quality {quality} · cost {cost} · subagents {subagents}"
     ));
     match entry.wire_api {
         WireApi::Auto => {}
@@ -2728,22 +2728,10 @@ impl SettingsCx {
                     .get(&s.provider_id)
                     .map(|entry| entry.models.len())
                     .unwrap_or(0);
-                match self.save_config() {
-                    Ok(()) => {
-                        self.pending_provider_mutation_navigation =
-                            Some(super::ProviderMutationNavigation::Edit {
-                                provider_id: s.provider_id.clone(),
-                                status: fetch_success_message(count, s.catalog),
-                            });
-                        self.extended_warnings = vec!["saving fetched provider catalog…".into()];
-                    }
-                    Err(error) => {
-                        self.extended_warnings = vec![format!(
-                            "save failed: {error}; fetched catalog choice remains open for retry"
-                        )];
-                    }
-                }
-                return Nav::Stay;
+                return self.commit_provider_mutation(super::ProviderMutationNavigation::Edit {
+                    provider_id: s.provider_id.clone(),
+                    status: fetch_success_message(count, s.catalog),
+                });
             }
             _ => {}
         }
@@ -2793,22 +2781,12 @@ impl SettingsCx {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
                         entry.mark_model_fetch_failed_kept_existing(s.reason.clone());
                     }
-                    match self.save_config() {
-                        Ok(()) => {
-                            self.pending_provider_mutation_navigation =
-                                Some(super::ProviderMutationNavigation::Edit {
-                                    provider_id: s.provider_id.clone(),
-                                    status: "kept existing catalog after live fetch failure".into(),
-                                });
-                            self.extended_warnings = vec!["saving provider fetch status…".into()];
-                        }
-                        Err(error) => {
-                            self.extended_warnings = vec![format!(
-                                "save failed: {error}; fallback choice remains open for retry"
-                            )];
-                        }
-                    }
-                    return Nav::Stay;
+                    return self.commit_provider_mutation(
+                        super::ProviderMutationNavigation::Edit {
+                            provider_id: s.provider_id.clone(),
+                            status: "kept existing catalog after live fetch failure".into(),
+                        },
+                    );
                 }
                 2 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
@@ -2828,23 +2806,12 @@ impl SettingsCx {
                         .get(&s.provider_id)
                         .map(|entry| entry.models.len())
                         .unwrap_or(0);
-                    match self.save_config() {
-                        Ok(()) => {
-                            self.pending_provider_mutation_navigation =
-                                Some(super::ProviderMutationNavigation::Edit {
-                                    provider_id: s.provider_id.clone(),
-                                    status: fetch_success_message(count, s.catalog),
-                                });
-                            self.extended_warnings =
-                                vec!["saving fallback provider catalog…".into()];
-                        }
-                        Err(error) => {
-                            self.extended_warnings = vec![format!(
-                                "save failed: {error}; fallback choice remains open for retry"
-                            )];
-                        }
-                    }
-                    return Nav::Stay;
+                    return self.commit_provider_mutation(
+                        super::ProviderMutationNavigation::Edit {
+                            provider_id: s.provider_id.clone(),
+                            status: fetch_success_message(count, s.catalog),
+                        },
+                    );
                 }
                 _ => {
                     return Nav::Replace(super::providers_page(ProvidersPage::List {

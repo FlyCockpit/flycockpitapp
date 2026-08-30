@@ -85,7 +85,9 @@ pub fn format_args(v: &serde_json::Value, options: ArgFormatOptions) -> String {
     if let Some(map) = v.as_object() {
         let mut out = String::new();
         let separator = if options.multiline { "\n" } else { ", " };
-        for (key, value) in map {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        for (key, value) in entries {
             if !out.is_empty() {
                 out.push_str(separator);
             }

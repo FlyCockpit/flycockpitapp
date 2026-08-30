@@ -156,7 +156,7 @@ impl DeepFetchState {
         }
     }
 
-    pub(super) fn is_running(&self) -> bool {
+    pub(in crate::tui::settings) fn is_running(&self) -> bool {
         self.phase == DeepFetchPhase::Running
     }
 }

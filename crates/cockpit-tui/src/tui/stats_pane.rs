@@ -435,6 +435,10 @@ impl StatsPane {
         }
         let mut viewport = self.list.clone();
         viewport.select(None);
+        // `ListState::select(None)` resets the list offset. The selected span
+        // above owns follow behavior, while this viewport intentionally hides
+        // the list highlight, so restore the calculated offset afterwards.
+        *viewport.offset_mut() = self.list.offset();
         frame.render_stateful_widget(
             List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
                 .highlight_style(
@@ -442,11 +446,10 @@ impl StatsPane {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )
-                .scroll_padding(1),
+                .scroll_padding(0),
             body,
             &mut viewport,
         );
-        *self.list.offset_mut() = viewport.offset();
         render_scrollbar(
             frame,
             body,

@@ -987,22 +987,24 @@ impl PasteRegistry {
     /// should remove the whole block. Returns the block's full span so the
     /// caller can widen the delete range to a block boundary.
     pub(super) fn block_crossed_by(&self, from: usize, to: usize) -> Option<(usize, usize)> {
-        let (mut lo, mut hi) = if from <= to { (from, to) } else { (to, from) };
-        let mut intersected = false;
+        let motion = if from <= to { (from, to) } else { (to, from) };
+        let mut span: Option<(usize, usize)> = None;
         loop {
-            let before = (lo, hi);
+            let before = span;
+            let (lo, hi) = span.unwrap_or(motion);
             for block in &self.blocks {
                 if block.start < hi && block.end > lo {
-                    intersected = true;
-                    lo = lo.min(block.start);
-                    hi = hi.max(block.end);
+                    span = Some(match span {
+                        None => (block.start, block.end),
+                        Some((start, end)) => (start.min(block.start), end.max(block.end)),
+                    });
                 }
             }
-            if (lo, hi) == before {
+            if span == before {
                 break;
             }
         }
-        intersected.then_some((lo, hi))
+        span
     }
 
     /// If `cursor` is at the right edge (`end`) of a condensed *text*
@@ -1327,7 +1329,7 @@ impl PasteRegistry {
                 let original_nonce = nonce.to_string();
                 let (nonce, number) = match retained_text_numbers.remove(&original_nonce) {
                     Some(number) => (original_nonce, number),
-                    None => (Self::text_nonce(&full), registry.next_text_number()),
+                    None => (original_nonce, registry.next_text_number()),
                 };
                 let (_id, placeholder) = registry.register_text_with_number_and_nonce(
                     at,

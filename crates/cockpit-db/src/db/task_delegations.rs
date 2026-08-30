@@ -648,12 +648,29 @@ impl Db {
         failed: bool,
         snapshot_json: Option<&str>,
     ) -> Result<()> {
+        self.terminalize_task_delegation_child(
+            task_call_id,
+            label,
+            report,
+            if failed {
+                DelegationStatus::Failed
+            } else {
+                DelegationStatus::Completed
+            },
+            snapshot_json,
+        )
+        .await
+    }
+
+    async fn terminalize_task_delegation_child(
+        &self,
+        task_call_id: &str,
+        label: &str,
+        report: &str,
+        status: DelegationStatus,
+        snapshot_json: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
-        let status = if failed {
-            DelegationStatus::Failed
-        } else {
-            DelegationStatus::Completed
-        };
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
         let report = report.to_owned();
@@ -673,7 +690,7 @@ impl Db {
                                 updated_at = ?6
                           WHERE task_call_id = ?1
                             AND label = ?2
-                            AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                            AND status IN ('created', 'running', 'backgrounded', 'paused_pending_tool')",
                         params![
                             task_call_id,
                             label,
@@ -688,7 +705,7 @@ impl Db {
                     let (remaining, failed): (i64, i64) = conn
                         .query_row(
                             "SELECT
-                                COALESCE(SUM(status IN ('running', 'backgrounded', 'paused_pending_tool')), 0),
+                                COALESCE(SUM(status IN ('created', 'running', 'backgrounded', 'paused_pending_tool')), 0),
                                 COALESCE(SUM(status IN ('failed', 'lost')), 0)
                                FROM task_delegation_children
                               WHERE task_call_id = ?1",
@@ -917,14 +934,14 @@ impl Db {
                                     updated_at = ?3
                               WHERE task_call_id = ?1
                                 AND label = ?2
-                                AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                                AND status IN ('created', 'running', 'backgrounded', 'paused_pending_tool')",
                             params![task_call_id, label, now],
                         )
                         .context("cancelling task delegation child")?;
                     let (remaining, failed): (i64, i64) = conn
                         .query_row(
                             "SELECT
-                                COALESCE(SUM(status IN ('running', 'backgrounded', 'paused_pending_tool')), 0),
+                                COALESCE(SUM(status IN ('created', 'running', 'backgrounded', 'paused_pending_tool')), 0),
                                 COALESCE(SUM(status IN ('failed', 'lost')), 0)
                                FROM task_delegation_children
                               WHERE task_call_id = ?1",
@@ -1139,7 +1156,7 @@ fn mark_child_lost(
                     updated_at = ?3
               WHERE task_call_id = ?1
                 AND label = ?2
-                AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                AND status IN ('created', 'running', 'backgrounded', 'paused_pending_tool')",
             params![task_call_id, label, now, LOST_RESTART_REPORT],
         )
         .context("marking task delegation child lost")?;

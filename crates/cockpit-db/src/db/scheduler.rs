@@ -251,19 +251,7 @@ pub fn list_scheduled_jobs_conn(
         return Ok(Vec::new());
     }
     let rows = match owner {
-        Some(owner) => conn
-            .prepare(
-                // schema-hot-query: extended.scheduler.by-owner
-                "SELECT *
-                   FROM scheduled_jobs
-                  WHERE owner = ?1
-                  ORDER BY enabled DESC, next_run_at IS NULL, next_run_at ASC, id ASC",
-            )
-            .context("preparing owner scheduled job list")?
-            .query_map([owner], scheduled_job_from_row)
-            .context("querying scheduled jobs")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("reading scheduled jobs")?,
+        Some(owner) => list_scheduled_jobs_for_owner_conn(conn, owner)?,
         None => conn
             .prepare(
                 "SELECT *
@@ -277,6 +265,24 @@ pub fn list_scheduled_jobs_conn(
             .context("reading scheduled jobs")?,
     };
     Ok(rows)
+}
+
+fn list_scheduled_jobs_for_owner_conn(
+    conn: &rusqlite::Connection,
+    owner: &str,
+) -> Result<Vec<ScheduledJobRow>> {
+    conn.prepare(
+        // schema-hot-query: extended.scheduler.by-owner
+        "SELECT *
+                   FROM scheduled_jobs
+                  WHERE owner = ?1
+                  ORDER BY enabled DESC, next_run_at IS NULL, next_run_at ASC, id ASC",
+    )
+    .context("preparing owner scheduled job list")?
+    .query_map([owner], scheduled_job_from_row)
+    .context("querying scheduled jobs")?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .context("reading scheduled jobs")
 }
 
 pub fn get_scheduled_job_conn(

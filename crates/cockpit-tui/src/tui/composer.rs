@@ -2493,7 +2493,11 @@ mod tests {
             .expect("normalized cluster range");
         assert_eq!(removed, family_start..family_end);
         assert_eq!(composer.register().text, family);
-        assert!(!composer.text().contains("\u{200d}"));
+        assert_eq!(
+            composer.text(),
+            format!("a{combining}b{family}"),
+            "cutting the original family leaves the pasted copy intact"
+        );
 
         let combining_start = composer.text().find(combining).unwrap();
         composer.set_visual_selection(combining_start + 1, combining_start + 1);

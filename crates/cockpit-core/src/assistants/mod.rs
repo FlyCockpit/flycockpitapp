@@ -281,7 +281,7 @@ fn create_assistant_with_installation_id_sync(
     let home_dir = spec.home_dir.to_string_lossy().into_owned();
     let config_for_db = config_json.clone();
     let hash_for_db = content_hash.clone();
-    let row = db.write_blocking(move |conn| {
+    let row = db.blocking_write_for_sync_event(move |conn| {
         crate::db::Db::upsert_assistant_conn(conn, &name, &home_dir, &config_for_db, &hash_for_db)
     })?;
     cockpit_config::config::remove_config_file_atomic(&journal_path)?;
@@ -609,7 +609,7 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
         let home_dir = journal.home_dir.clone();
         let config_json = journal.config_json.clone();
         let content_hash = journal.content_hash.clone();
-        db.write_blocking(move |conn| {
+        db.blocking_write_for_sync_event(move |conn| {
             crate::db::Db::upsert_assistant_conn(
                 conn,
                 &name,
@@ -729,7 +729,7 @@ pub async fn snapshots(db: &Db) -> Result<Vec<AssistantSnapshot>> {
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
         recover_unregister_journals_sync(&db)?;
-        let rows = db.write_blocking(crate::db::Db::list_assistants_conn)?;
+        let rows = db.blocking_write_for_sync_event(crate::db::Db::list_assistants_conn)?;
         if rows.len() > cockpit_proto::MAX_ASSISTANT_SUMMARIES {
             bail!(
                 "assistant inventory exceeds the {}-entry local response limit",
@@ -909,7 +909,7 @@ fn save_definition_cas_sync(
     cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())?;
     let expected = row.clone();
     let next_hash_for_db = next_hash.clone();
-    let updated = match db.write_blocking(move |conn| {
+    let updated = match db.blocking_write_for_sync_event(move |conn| {
         crate::db::Db::update_assistant_content_hash_cas_conn(
             conn,
             &expected.name,
@@ -1184,7 +1184,7 @@ fn restore_unregister_journals(
 
 fn delete_registered_row_cas(db: &Db, journal: &UnregisterJournal) -> Result<bool> {
     let journal = journal.clone();
-    db.write_blocking(move |conn| {
+    db.blocking_write_for_sync_event(move |conn| {
         let changed = conn.execute(
             "DELETE FROM assistants WHERE name=?1 AND created_at_unix_ms=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
             rusqlite::params![journal.name, journal.created_at_unix_ms, journal.home_dir, journal.config_json, journal.content_hash],
@@ -1279,7 +1279,7 @@ fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
 
 fn get_assistant_blocking(db: &Db, name: &str) -> Result<Option<AssistantRow>> {
     let name = name.to_string();
-    db.write_blocking(move |conn| crate::db::Db::get_assistant_conn(conn, &name))
+    db.blocking_write_for_sync_event(move |conn| crate::db::Db::get_assistant_conn(conn, &name))
 }
 
 #[cfg(test)]

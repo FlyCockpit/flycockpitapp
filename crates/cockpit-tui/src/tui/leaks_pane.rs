@@ -716,7 +716,11 @@ impl LeaksPane {
             )));
         }
         footer_lines.push(Line::from(Span::styled(
-            "enter/r reveal · a accept · d dismiss · m rotated · D delete · esc close",
+            "enter/r reveal · a accept · d dismiss · m rotated · D delete",
+            Style::default().fg(Color::DarkGray),
+        )));
+        footer_lines.push(Line::from(Span::styled(
+            "esc close",
             Style::default().fg(Color::DarkGray),
         )));
 

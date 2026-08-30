@@ -2580,8 +2580,24 @@ impl Db {
         only_open: bool,
         limit: u32,
     ) -> Result<Vec<SessionRow>> {
-        let rows = if only_open {
-            conn.prepare(
+        if only_open {
+            Self::list_open_sessions_conn(conn, limit)
+        } else {
+            Ok(conn
+                .prepare(
+                    "SELECT * FROM sessions WHERE ephemeral = 0
+                 ORDER BY last_active_at_unix_ms DESC LIMIT ?1",
+                )
+                .context("preparing session list")?
+                .query_map([limit], SessionRow::from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("querying sessions")?)
+        }
+    }
+
+    fn list_open_sessions_conn(conn: &Connection, limit: u32) -> Result<Vec<SessionRow>> {
+        Ok(conn
+            .prepare(
                 // schema-hot-query: local.sessions.open
                 "SELECT * FROM sessions WHERE ended_at_unix_ms IS NULL AND ephemeral = 0
                  ORDER BY last_active_at_unix_ms DESC LIMIT ?1",
@@ -2589,18 +2605,7 @@ impl Db {
             .context("preparing open session list")?
             .query_map([limit], SessionRow::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .context("querying open sessions")?
-        } else {
-            conn.prepare(
-                "SELECT * FROM sessions WHERE ephemeral = 0
-                 ORDER BY last_active_at_unix_ms DESC LIMIT ?1",
-            )
-            .context("preparing session list")?
-            .query_map([limit], SessionRow::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("querying sessions")?
-        };
-        Ok(rows)
+            .context("querying open sessions")?)
     }
 
     pub async fn list_sessions_for_assistant(

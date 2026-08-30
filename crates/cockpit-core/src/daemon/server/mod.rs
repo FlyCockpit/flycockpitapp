@@ -2544,6 +2544,9 @@ impl DaemonContext {
             resource_scheduler,
             config_source.clone(),
         );
+        if let Some(state) = paths.pid_file.parent() {
+            registry.set_daemon_agents_dir(state.join("agents"));
+        }
         // Production installs the real resolver when the secure-key actor
         // attaches (`attach_secure_key_actor`), which tests skip. Give the
         // registry and this context a real test resolver so session builds and
@@ -2703,7 +2706,7 @@ impl DaemonContext {
         });
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
-        Self {
+        let mut ctx = Self {
             guidance_proposals: registry.guidance_proposals(),
             db,
             media_ledger,
@@ -2765,7 +2768,37 @@ impl DaemonContext {
             redaction_publication_poisoned: AtomicBool::new(false),
             #[cfg(test)]
             redaction_refresh_failure: Arc::new(AtomicBool::new(false)),
+        };
+        #[cfg(test)]
+        {
+            let db = ctx.db.clone();
+            // `start_with_store` performs synchronous bootstrap/reconciliation.
+            // Server fixtures are frequently constructed from a current-thread
+            // Tokio runtime, where a failing startup would otherwise attempt a
+            // `blocking_recv` on the runtime worker.  Keep that sync boundary
+            // off the runtime just as production boot does.
+            let actor = std::thread::spawn(move || {
+                crate::secure_key::SecureKeyActor::start_with_store(
+                    db.clone(),
+                    Box::new(crate::secure_key::fake::FakeNativeStore::new()),
+                    std::sync::Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
+                        crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
+                            db.clone(),
+                        ),
+                        crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db),
+                    )),
+                )
+            })
+            .join();
+            let actor = match actor {
+                Ok(Ok(actor)) => Some(actor),
+                Ok(Err(_)) | Err(_) => None,
+            };
+            if let Some(actor) = actor {
+                ctx.attach_secure_key_actor(actor);
+            }
         }
+        ctx
     }
 
     /// Install the deny-closed remote project resolver consulted by the
@@ -4637,6 +4670,10 @@ pub(super) struct SharedAttachedSession {
 impl SharedAttachedSession {
     pub(super) fn session_id(&self) -> Uuid {
         self.session_id
+    }
+
+    pub(super) fn config_snapshot(&self) -> crate::daemon::session_worker::SessionConfigSnapshot {
+        self.handle.config_snapshot()
     }
 
     pub(super) fn redaction_table(&self) -> Arc<RedactionTable> {

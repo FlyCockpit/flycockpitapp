@@ -13,6 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use cockpit_config::config::media_budget::MediaResourceLimits;
 use cockpit_core::image_sidecar::{
@@ -1432,21 +1433,21 @@ type SidecarBinding = Option<(SidecarAction, bool, Option<&'static str>)>;
 fn sidecar_layout(frame: &mut Frame, area: Rect, mode: SidecarViewportMode) -> Rect {
     match mode {
         SidecarViewportMode::Full => {
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0), Constraint::Length(26)])
+            // Detail rows include audit and grant evidence that must remain
+            // legible as complete records. A narrow side context clipped
+            // those records at the smallest Full viewport, so keep the
+            // context as a compact header and give page data the full width.
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(area);
-            let info = Paragraph::new(vec![
-                Line::from("Layout: Full"),
-                Line::from(""),
-                Line::from("Trust is not consent."),
-                Line::from("Grants: once/session/project."),
-                Line::from("No global option."),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" Context "))
-            .wrap(Wrap { trim: false });
-            frame.render_widget(info, cols[1]);
-            cols[0]
+            frame.render_widget(
+                Paragraph::new(Line::from(
+                    "Layout: Full — trust does not grant egress; grants: once/session/project.",
+                )),
+                rows[0],
+            );
+            rows[1]
         }
         SidecarViewportMode::Compact => {
             let rows = Layout::default()
@@ -1454,7 +1455,7 @@ fn sidecar_layout(frame: &mut Frame, area: Rect, mode: SidecarViewportMode) -> R
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(area);
             frame.render_widget(
-                Paragraph::new(Line::from("Layout: Compact — trust is not consent")),
+                Paragraph::new(Line::from("Layout: Compact — trust does not grant egress")),
                 rows[0],
             );
             rows[1]
@@ -1500,20 +1501,60 @@ fn render_sidecar_page(
     frame.render_widget(block, content);
     let mut lines = Vec::with_capacity(rows.len());
     let mut controls = Vec::with_capacity(rows.len());
-    for row in rows {
-        lines.push(Line::from(row.text.clone()));
-        controls.push(row.binding.clone().map(|(action, enabled, reason)| {
-            (SettingsPointerAction::Sidecar(action), enabled, reason)
-        }));
+    let mut selected_line = None;
+    for (row_index, row) in rows.iter().enumerate() {
+        if selected == Some(row_index) {
+            selected_line = Some(lines.len());
+        }
+        let mut chunks = sidecar_wrapped_chunks(&row.text, inner.width);
+        if chunks.is_empty() {
+            chunks.push(String::new());
+        }
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            lines.push(Line::from(chunk));
+            controls.push(
+                (chunk_index == 0)
+                    .then(|| row.binding.clone())
+                    .flatten()
+                    .map(|(action, enabled, reason)| {
+                        (SettingsPointerAction::Sidecar(action), enabled, reason)
+                    }),
+            );
+        }
     }
     cx.scroll_states.render_control_lines(
         frame,
         inner,
         key,
-        (lines, selected),
+        (lines, selected_line),
         controls,
         (&cx.pointer_surface, SettingsScrollRegionId(key)).into(),
     );
+}
+
+fn sidecar_wrapped_chunks(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 impl SidecarPage {
@@ -2200,6 +2241,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     .find(|i| i.invocation_id == *id)
             }) {
                 rows.push((inv.row_text(), None));
+                rows.push((format!("state={}", inv.state.as_str()), None));
                 rows.push((
                     format!(
                         "timestamps created={} dispatched={} terminal={}",

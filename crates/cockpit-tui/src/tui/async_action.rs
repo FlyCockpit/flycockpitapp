@@ -10,6 +10,71 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+fn test_async_runtime() -> &'static tokio::runtime::Handle {
+    static HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+    HANDLE.get_or_init(|| {
+        // Building a Tokio runtime on a thread that already drives one
+        // (`#[tokio::test]` current-thread) can hang. Own the workers on a
+        // dedicated std thread instead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("cockpit-tui-test-async".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("test async-action runtime");
+                tx.send(runtime.handle().clone())
+                    .expect("test async-action handle");
+                runtime.block_on(std::future::pending::<()>());
+            })
+            .expect("test async-action thread");
+        rx.recv().expect("test async-action runtime started")
+    })
+}
+
+fn spawn_action_task<F>(future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.spawn(future),
+        Err(_) => {
+            #[cfg(test)]
+            {
+                return test_async_runtime().spawn(future);
+            }
+            #[cfg(not(test))]
+            {
+                let _ = future;
+                panic!("async actions require a tokio runtime");
+            }
+        }
+    }
+}
+
+fn spawn_blocking_action_task<F>(work: F) -> JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.spawn_blocking(work),
+        Err(_) => {
+            #[cfg(test)]
+            {
+                return test_async_runtime().spawn_blocking(work);
+            }
+            #[cfg(not(test))]
+            {
+                let _ = work;
+                panic!("blocking async actions require a tokio runtime");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AsyncActionId(u64);
 
@@ -982,8 +1047,9 @@ impl AsyncActionRunner {
             .pending
             .iter()
             .filter_map(|(id, pending)| {
-                (matches!(&pending.kind, AsyncActionKind::Blocking(_))
-                    && pending.kind.authority() == AsyncActionAuthority::ReadOnly
+                (matches!(&pending.kind, AsyncActionKind::Blocking(label)
+                    if pending.kind.authority() == AsyncActionAuthority::ReadOnly
+                        || *label == "mouse.copy")
                     && now.saturating_duration_since(pending.started_at) >= timeout)
                     .then_some((*id, pending.kind.clone()))
             })
@@ -1113,7 +1179,7 @@ impl AsyncActionRunner {
         F: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
     {
         self.start_with(kind, policy, None, |tx, notify, id, generation, kind| {
-            tokio::spawn(async move {
+            spawn_action_task(async move {
                 let payload = future.await;
                 let _ = tx.send(CompletedAction {
                     id,
@@ -1145,7 +1211,7 @@ impl AsyncActionRunner {
             policy,
             Some(cancellation),
             move |tx, notify, id, generation, kind| {
-                tokio::spawn(async move {
+                spawn_action_task(async move {
                     let payload = work(worker_cancellation).await;
                     let _ = tx.send(CompletedAction {
                         id,
@@ -1181,7 +1247,7 @@ impl AsyncActionRunner {
             AsyncActionPolicy::AllowConcurrent,
             None,
             move |tx, notify, id, generation, kind| {
-                tokio::spawn(async move {
+                spawn_action_task(async move {
                     if let Some(predecessor) = predecessor {
                         let _ = predecessor.await;
                     }
@@ -1209,7 +1275,7 @@ impl AsyncActionRunner {
         F: FnOnce() -> Result<AsyncActionPayload, String> + Send + 'static,
     {
         self.start_with(kind, policy, None, |tx, notify, id, generation, kind| {
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_action_task(move || {
                 let payload = work();
                 let _ = tx.send(CompletedAction {
                     id,
@@ -1659,10 +1725,15 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(order.lock().unwrap().is_empty());
         release_first.send(()).unwrap();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            seen = order.lock().unwrap().clone();
+            if seen == [1, 2] {
+                break;
+            }
         }
-        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(seen, [1, 2]);
     }
 
     #[tokio::test]
@@ -2068,15 +2139,13 @@ mod tests {
             AsyncActionPolicy::AllowConcurrent,
             async { Ok(AsyncActionPayload::Bool(true)) },
         );
-        runner.notifier().notified().await;
-        let progress = runner.drain_completed();
+        let progress = wait_for_results(&mut runner).await;
         assert_eq!(progress.len(), 1);
         assert_bool_payload(&progress[0], true);
         assert!(runner.is_pending(parked.id()));
 
         release_tx.send(()).unwrap();
-        runner.notifier().notified().await;
-        assert_eq!(runner.drain_completed().len(), 1);
+        assert_eq!(wait_for_results(&mut runner).await.len(), 1);
 
         let replace_key = AsyncActionKey::new("paste.deadline");
         let (stale_tx, stale_rx) = oneshot::channel::<()>();
@@ -2094,11 +2163,15 @@ mod tests {
             async { Ok(AsyncActionPayload::Text("replacement".into())) },
         );
         assert!(!runner.is_pending(stale.id()));
-        tokio::task::yield_now().await;
-        assert!(
-            stale_tx.send(()).is_err(),
-            "cancelled work cannot settle late"
-        );
+        let mut cancelled = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if stale_tx.is_closed() {
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(cancelled, "cancelled work cannot settle late");
         runner.notifier().notified().await;
         let settled = runner.drain_completed();
         assert_eq!(settled.len(), 1);
@@ -2193,7 +2266,7 @@ mod tests {
             )
             .id();
 
-        first_tx.send(()).unwrap();
+        let _ = first_tx.send(());
         second_tx.send(()).unwrap();
         let results = wait_for_results(&mut runner).await;
 

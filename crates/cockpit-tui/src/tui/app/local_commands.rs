@@ -1069,7 +1069,7 @@ impl App {
     fn start_mcp_settlement(&mut self, pending: PendingMcpLocal, announce: bool) {
         if announce {
             self.push_plain(
-                "/mcp: save response was not observed; checking its durable receipt…".to_string(),
+                "/mcp: save response was not observed; commit status is unknown; checking its durable receipt…".to_string(),
             );
         }
         self.replace_mcp_local_action(

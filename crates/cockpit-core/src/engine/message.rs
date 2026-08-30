@@ -5,15 +5,19 @@
 //! evolves. The aliases give us a single import point if we ever do want
 //! to swap implementations.
 
-pub use rig::completion::ToolDefinition;
-pub use rig::message::{AssistantContent, Message, ToolCall};
 use rig::message::{
     AudioMediaType, ImageMediaType, MimeType as _, ProviderCallId, ToolCallId, UserContent,
     VideoMediaType,
 };
+pub use rig::{
+    completion::ToolDefinition,
+    message::{AssistantContent, Message, ToolCall},
+};
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use base64::Engine as _;
 use tokio::sync::{Mutex, Notify, watch};
@@ -22,10 +26,13 @@ use uuid::Uuid;
 pub use crate::daemon::proto::{
     QueueDeliveryClass, QueueItem as QueuedUserMessage, QueueItemStatus, QueueTarget,
 };
-pub use cockpit_client::image_upload::SubmissionImage;
-pub use cockpit_client::submission::{
-    ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
-    PendingSubmissionTerminalDisposition, SubmissionMedia, SubmissionOrigin, UserSubmissionKind,
+pub use cockpit_client::{
+    image_upload::SubmissionImage,
+    submission::{
+        ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
+        PendingSubmissionTerminalDisposition, SubmissionMedia, SubmissionOrigin,
+        UserSubmissionKind,
+    },
 };
 
 /// Sentinel emitted in wire text by
@@ -1575,13 +1582,9 @@ impl UserSubmissionQueue {
             submission.queue_item_ids.push(item.id);
         }
         submission.queue_target = Some(item.target);
-        submission.delivery_class = if item.send_now {
-            // Retain escalation if durable recording fails and this submission
-            // is requeued after the safe-boundary attempt.
-            QueueDeliveryClass::Steering
-        } else {
-            item.delivery_class
-        };
+        // Keep the stored class. `send_now` is a timing flag restored from
+        // `started_metadata` on requeue; it must not rewrite Held into Steering.
+        submission.delivery_class = item.delivery_class;
         QueuePop::Item(Box::new(submission))
     }
 
@@ -1741,6 +1744,9 @@ impl QueueDrainFilter {
 }
 
 fn snapshot_pending(state: &UserSubmissionQueueState) -> Vec<QueuedUserMessage> {
+    // Staged removals stay visible until the terminal receipt commits.
+    // `pop_one_filtered` already refuses to drain while a hold is live, so
+    // snapshots must not hide the payload that durable commit still owns.
     state
         .pending
         .iter()
@@ -2151,8 +2157,10 @@ mod tests {
 
     #[test]
     fn synthetic_task_result_keeps_task_name_and_provider_identity_on_gemini_wire() {
-        use rig::message::ToolFunction;
-        use rig::providers::gemini::completion::gemini_api_types::{Content, PartKind};
+        use rig::{
+            message::ToolFunction,
+            providers::gemini::completion::gemini_api_types::{Content, PartKind},
+        };
 
         let call = tool_call_with_identity(
             "task-call",
@@ -3278,6 +3286,17 @@ mod tests {
         );
         assert_eq!(
             snapshot
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep child", "drop root"],
+            "staged removals stay visible until the terminal receipt commits"
+        );
+        let committed = queue
+            .commit_staged_removal(staged.expect("live remove staged"))
+            .await;
+        assert_eq!(
+            committed
                 .iter()
                 .map(|item| item.text.as_str())
                 .collect::<Vec<_>>(),

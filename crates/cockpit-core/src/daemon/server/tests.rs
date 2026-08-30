@@ -1,24 +1,25 @@
 #![allow(deprecated)]
 
-use super::attachments::*;
-use super::authz::*;
-use super::dispatch::*;
-use super::sessions::*;
-use super::*;
-use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
-use crate::daemon::shutdown::ShutdownPhase;
-use crate::proto_crate::send_user_message_v2::MessageIngressV2;
-use crate::session::Session;
+use super::{attachments::*, authz::*, dispatch::*, sessions::*, *};
+use crate::{
+    daemon::{
+        session_worker::{SessionWork, SessionWorkerHandle},
+        shutdown::ShutdownPhase,
+    },
+    proto_crate::send_user_message_v2::MessageIngressV2,
+    session::Session,
+};
 use base64::Engine as _;
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
-use std::collections::{BTreeSet, HashMap};
-use std::io;
+use std::{
+    collections::{BTreeSet, HashMap},
+    io,
+};
 // Brings the `Write` trait methods (`write_all`) into scope for the
 // `zip::ZipWriter` calls below without binding a name (so it neither shadows the
 // `use super::*;` glob nor trips `-D warnings` unused-import).
-use std::io::Write as _;
-use std::sync::Mutex as StdMutex;
+use std::{io::Write as _, sync::Mutex as StdMutex};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -879,6 +880,7 @@ fn project_note_identity_groups_nested_git_worktree_paths_without_shelling_out()
     let worktree = parent.path().join("worktree");
     let nested = worktree.join("packages/app");
     std::fs::create_dir_all(worktree.join(".git")).unwrap();
+    std::fs::write(worktree.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
     std::fs::create_dir_all(&nested).unwrap();
 
     assert_eq!(
@@ -7801,8 +7803,10 @@ fn auto_title_config_source(base_url: &str) -> crate::daemon::config_source::Con
 }
 
 async fn auto_title_model_server(content: Option<String>) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -7869,8 +7873,10 @@ async fn auto_title_error_model_server(
     body_sentinel: &'static str,
     request_id: &'static str,
 ) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -10155,8 +10161,10 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -10221,8 +10229,7 @@ async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn clear_credential_finishes_when_local_revoke_server_stalls() {
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
 
     // This is deliberately a loopback-only controlled stall. The clear RPC
     // must complete from its local vault transaction even though the
@@ -12238,8 +12245,11 @@ fn oauth_cancel_candidate_validation_loads_once_and_propagates_storage_errors() 
     ] {
         let body = source
             .split(branch)
-            .nth(1)
-            .and_then(|tail| tail.split(next).next())
+            .skip(1)
+            .find_map(|part| {
+                let body = part.split(next).next()?;
+                body.contains("match candidate {").then_some(body)
+            })
             .unwrap_or_else(|| panic!("missing {branch} handler body"));
         let candidate_validation = body
             .split("match candidate {")
@@ -12712,7 +12722,7 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
 
     let management = include_str!("../agent_management.rs");
     let journal = management
-        .find("insert_agent_mutation_journal_under_publication_lock")
+        .find("insert_agent_mutation_journal_with_stage_under_publication_lock")
         .expect("agent mutation must durably journal its intended projection");
     let publish = management[journal..]
         .find("mutate_sync_locked(")
@@ -12725,7 +12735,7 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
         .expect("agent mutation handler must exist");
     for required in [
         "hold_config_mutation_lock",
-        "insert_agent_mutation_journal_under_publication_lock",
+        "insert_agent_mutation_journal_with_stage_under_publication_lock",
         "mutate_sync_locked",
         "settlement is unknown",
     ] {
@@ -12737,12 +12747,12 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
     assert!(
         mutate.find("hold_config_mutation_lock").unwrap()
             < mutate
-                .find("insert_agent_mutation_journal_under_publication_lock")
+                .find("insert_agent_mutation_journal_with_stage_under_publication_lock")
                 .unwrap()
     );
     assert!(
         mutate
-            .find("insert_agent_mutation_journal_under_publication_lock")
+            .find("insert_agent_mutation_journal_with_stage_under_publication_lock")
             .unwrap()
             < mutate.find("mutate_sync_locked(").unwrap()
     );
@@ -13088,8 +13098,10 @@ async fn store_with_force_replaces_vault_credential() {
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn clear_revokes_from_daemon_vault() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -15659,7 +15671,10 @@ async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
     .expect_err("public bulk ingress must reject an internal origin");
 
     assert_eq!(error.code, ErrorCode::BadRequest);
-    assert_eq!(error.message, "user-message origin must be external_root");
+    assert_eq!(
+        error.message,
+        "invalid send_user_message_bulk request: send_user_message_bulk origin must be external_root; internal provenance is daemon-owned"
+    );
     assert_eq!(
         crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
         source.as_bytes(),
@@ -16303,6 +16318,7 @@ fn dispatch_matrix_class_for_command(
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("get_session_setup_snapshot", "session_row_reader", false)
+        | ("get_guidance_enablement_trace", "session_reader", false)
         | ("daemon_status", "public_read", false)
         | ("get_host_capabilities", "public_read", false)
         | ("guidance_estimate", "project_read", false)
@@ -16359,6 +16375,7 @@ enum ReadonlyDispatchCaseKind {
     GoalDisposition,
     GetInventoryBundle,
     GetSessionSetupSnapshot,
+    GetGuidanceEnablementTrace,
     DaemonStatus,
     GetHostCapabilities,
     GuidanceEstimate,
@@ -16441,6 +16458,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "get_session_setup_snapshot",
             case: ReadonlyDispatchCaseKind::GetSessionSetupSnapshot,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_guidance_enablement_trace",
+            case: ReadonlyDispatchCaseKind::GetGuidanceEnablementTrace,
         },
         ReadonlyDispatchCase {
             kind: "daemon_status",
@@ -17270,6 +17291,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "mark_app_flag_seen"
         | "set_workspace_trust"
         | "guidance_estimate"
+        | "list_guidance_proposals"
+        | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon"
         | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
@@ -17287,6 +17310,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // idempotent paths return their typed responses; generated missing
         // record/action IDs produce BadRequest after authz. These cases must
         // not be mistaken for unavailable-persistence Internal sentinels.
+        "review_guidance_proposal" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "begin_sealed_owner_operation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "apply_sealed_owner_operation" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
@@ -17347,6 +17371,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "lsp_control"
         | "get_inventory_bundle"
         | "get_session_setup_snapshot"
+        | "get_guidance_enablement_trace"
         | "read_agent_tree"
         | "read_agent_attention"
         | "git_review_sources"
@@ -17685,6 +17710,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("delete_session"),
         authz_session_reader("get_inventory_bundle"),
         authz_session_reader("get_session_setup_snapshot"),
+        authz_session_reader("get_guidance_enablement_trace"),
         authz_session_reader("read_agent_tree"),
         authz_session_reader("read_agent_attention"),
         authz_session_reader("get_agent_effective_settings"),
@@ -17737,6 +17763,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("repair_media_reservation"),
         authz_owner_only("get_doctor_snapshot"),
         authz_owner_only("docs_ask"),
+        authz_owner_only("list_guidance_proposals"),
+        authz_owner_only("review_guidance_proposal"),
+        authz_owner_only("clean_managed_workspace_lease"),
         // The command table makes all installation coordinator endpoints
         // owner-only; List/Inspect are concurrent read projections, while
         // Begin/SubmitChoice are serialized mutations.
@@ -18704,8 +18733,14 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
         // at all, so the owner cell exercises the attached dispatch path
         // instead of re-proving the attach gate (which has its own dedicated
         // negative tests).
-        || (matches!(kind, "get_inventory_bundle" | "get_session_setup_snapshot")
-            && level.can_attach())
+        || (matches!(
+            kind,
+            "get_inventory_bundle"
+                | "get_session_setup_snapshot"
+                | "get_guidance_enablement_trace"
+                | "list_guidance_proposals"
+                | "review_guidance_proposal"
+        ) && level.can_attach())
         // Concurrent session-row readers that gate on
         // `require_shared_attached` before doing any work. Without an attach
         // prelude the owner cell would re-prove the attach gate instead of
@@ -19217,6 +19252,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             selected_agent: "Build".into(),
         },
         "get_session_setup_snapshot" => Request::GetSessionSetupSnapshot { session_id },
+        "get_guidance_enablement_trace" => Request::GetGuidanceEnablementTrace,
         "resource_snapshot" => Request::ResourceSnapshot,
         "promote_resource" => Request::PromoteResource {
             request_id: "missing".into(),
@@ -19460,6 +19496,16 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_root: root,
             provider: None,
             model: None,
+        },
+        "list_guidance_proposals" => Request::ListGuidanceProposals,
+        "review_guidance_proposal" => Request::ReviewGuidanceProposal {
+            proposal_id: Uuid::nil(),
+            decision: proto::GuidanceProposalDecision::Reject,
+        },
+        "clean_managed_workspace_lease" => Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id: Uuid::nil(),
+            lease_id: Uuid::nil(),
         },
         "recover_security_blocked_media" => Request::RecoverSecurityBlockedMedia(
             cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {
@@ -20340,6 +20386,18 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(snapshot.session_id, session_id.to_string());
                 assert_eq!(snapshot.dto_version, proto::SESSION_SETUP_DTO_VERSION);
             }
+            Self::GetGuidanceEnablementTrace => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (mut state, _session_id) = attached_state(&ctx, tmp.path()).await;
+                let response =
+                    handle_request(Request::GetGuidanceEnablementTrace, &mut state, &ctx)
+                        .await
+                        .expect("get_guidance_enablement_trace happy");
+                let Response::GuidanceEnablementTrace { .. } = response else {
+                    panic!("expected GuidanceEnablementTrace, got {response:?}");
+                };
+            }
             Self::DaemonStatus => {
                 let ctx = test_ctx();
                 let response = dispatch_matrix_request(&ctx, Request::DaemonStatus)
@@ -20786,6 +20844,13 @@ impl ReadonlyDispatchCaseKind {
                 )
                 .await
                 .expect_err("get_session_setup_snapshot requires attachment");
+                assert_eq!(err.code, ErrorCode::NotAttached);
+            }
+            Self::GetGuidanceEnablementTrace => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(&ctx, Request::GetGuidanceEnablementTrace)
+                    .await
+                    .expect_err("get_guidance_enablement_trace requires attachment");
                 assert_eq!(err.code, ErrorCode::NotAttached);
             }
             Self::DaemonStatus => {
@@ -21443,6 +21508,29 @@ async fn live_worker_with_receiver(
     );
     let (handle, work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(session, ctx.registry.locks());
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            std::path::Path::new(&project_root),
+        )
+        .await
+        .expect("live worker helper seeds the durable workspace trust revision");
+    let (providers, extended) = ctx
+        .config_source()
+        .load_effective_for_daemon(std::path::Path::new(&project_root), &resolved_trust.policy)
+        .unwrap_or_else(|_| {
+            (
+                stub_providers_config(),
+                crate::config::extended::ExtendedConfig::default(),
+            )
+        });
+    handle.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(0, providers, extended)
+            .with_trust_revision(resolved_trust.revision),
+    );
+    let publication = handle.begin_trust_transition(&resolved_trust).await;
+    assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
+    drop(publication);
     let join = tokio::spawn(async move {
         std::future::pending::<()>().await;
     });
@@ -25081,12 +25169,14 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
     .await;
     let error = result.expect_err("explicit refresh must reject invalid config");
     assert_eq!(error.code, proto::ErrorCode::InvalidConfig);
-    // The only ConfigSnapshot delivered is the attach hydration at the last
-    // good generation (0); the malformed re-resolution pushes no new one.
+    // Attach hydrates the first published generation. A malformed re-resolution
+    // must not push anything newer.
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            proto::Event::ConfigSnapshot { snapshot } if snapshot.generation >= 1
+            proto::Event::ConfigSnapshot { snapshot }
+                if snapshot.generation
+                    > crate::daemon::session_worker::FIRST_PUBLISHED_CONFIG_GENERATION
         )),
         "invalid re-resolution must not push a new-generation snapshot, got {events:?}"
     );
@@ -25160,6 +25250,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_image_spend_policy",
         "get_agent_effective_settings",
         "get_session_setup_snapshot",
+        "get_guidance_enablement_trace",
         "image_endpoint_list",
         "image_endpoint_get",
         "image_target_list",
@@ -27911,6 +28002,18 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
     runtime.block_on(Box::pin(image_submission_exact_retry_case()));
 }
 
+async fn attach_fake_secure_key_actor(ctx: &mut Arc<DaemonContext>) {
+    let db = ctx.db.clone();
+    let actor = tokio::task::spawn_blocking(move || {
+        start_fake_tool_media_actor(db, crate::secure_key::fake::FakeNativeStore::new())
+    })
+    .await
+    .expect("spawn fake secure-key actor");
+    Arc::get_mut(ctx)
+        .expect("test context is unique before attach")
+        .attach_secure_key_actor(actor);
+}
+
 fn start_fake_tool_media_actor(
     db: crate::db::Db,
     store: crate::secure_key::fake::FakeNativeStore,
@@ -28322,7 +28425,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             })
             .await
             .unwrap();
-        assert_eq!(released_before_retry, (3, 3));
+        assert_eq!(released_before_retry, (1, 1));
         assert!(
             !ctx.db
                 .terminate_accepted_message(
@@ -28371,6 +28474,7 @@ async fn image_submission_exact_retry_case() {
         )
         .unwrap(),
     ));
+    attach_fake_secure_key_actor(&mut ctx).await;
     let project = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -31960,8 +32064,10 @@ async fn daemon_inventory_model_picker_projection() {
 
 #[tokio::test]
 async fn daemon_inventory_snapshot_atomicity() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     // Per-slot counters prove every collection boundary is reachable. A
     // process-wide token gates counting so concurrent inventory tests cannot
@@ -32042,8 +32148,10 @@ async fn daemon_inventory_bundle_bounds() {
     use crate::daemon::server::inventory::{
         InventorySourceSnapshot, MAX_INVENTORY_MODELS, project_inventory_bundle,
     };
-    use cockpit_config::config::providers::ProvidersConfig;
-    use cockpit_config::config::trust::{WorkspaceTrustPolicy, resolve_trust_root};
+    use cockpit_config::config::{
+        providers::ProvidersConfig,
+        trust::{WorkspaceTrustPolicy, resolve_trust_root},
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let root = resolve_trust_root(tmp.path()).unwrap();
@@ -33665,7 +33773,8 @@ async fn btw_create_rpc_returns_existing_fork_atomically() {
 
 #[tokio::test]
 async fn btw_concurrent_with_parent_turn() {
-    let ctx = test_ctx();
+    let mut ctx = test_ctx();
+    attach_fake_secure_key_actor(&mut ctx).await;
     let tmp = tempfile::tempdir().unwrap();
     let parent_row = ctx
         .db
@@ -35456,8 +35565,15 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
     );
 }
 
-#[tokio::test]
-async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture() {
+#[test]
+fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture() {
+    crate::test_env::run_async_with_large_stack(
+        modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture_inner,
+    );
+}
+
+async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture_inner()
+{
     let home = tempfile::tempdir().expect("isolated Cockpit home");
     let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
     let root = tempfile::tempdir().expect("isolated daemon root");
@@ -36759,10 +36875,12 @@ async fn sealed_session_create_and_rotate_journal_protected_history_through_disp
 /// and persists no sealed row and no extra history row.
 #[tokio::test]
 async fn sealed_session_create_without_resolver_fails_closed() {
-    use crate::sealed::action::OwnerAuthority;
-    use crate::sealed::compartment::{SealedCompartment, SealedLiteral};
-    use crate::sealed::identity::{SealedDescription, SealedName, SealedScopeRef};
-    use crate::sealed::store::{CreateSealedValue, SealedValueDirectory};
+    use crate::sealed::{
+        action::OwnerAuthority,
+        compartment::{SealedCompartment, SealedLiteral},
+        identity::{SealedDescription, SealedName, SealedScopeRef},
+        store::{CreateSealedValue, SealedValueDirectory},
+    };
 
     let ctx = test_ctx();
     let session = ctx

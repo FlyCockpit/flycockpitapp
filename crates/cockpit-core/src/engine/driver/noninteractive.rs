@@ -699,7 +699,7 @@ pub(in crate::engine::driver) struct RecoveredNoninteractiveTaskState {
     /// descendant publish their exact resolver mailbox before the session
     /// worker consumes the complete durable claim set; none may enter a model
     /// turn until that acknowledgement releases this gate.
-    pub(in crate::engine::driver) activation_gate: crate::engine::driver::RecoveryActivationGate,
+    pub(in crate::engine::driver) activation_gate: RecoveryActivationGate,
     /// A recovered batch installs every concrete resolver mailbox before it
     /// waits for declared predecessors. The gate then preserves the original
     /// dependency DAG without a global restart barrier.
@@ -1594,6 +1594,37 @@ pub(in crate::engine::driver) fn overlapping_write_scope_pair(
 }
 
 impl Driver {
+    /// A child installation is immutable evidence only when its durable parent
+    /// is itself pinned to a resolved installed-agent profile.  Legacy roots
+    /// (including daemonless callers) have no such profile, so publishing an
+    /// installation UUID for them would create a row the ledger cannot prove.
+    async fn published_child_installation_id(
+        &self,
+        launch_target: &str,
+    ) -> Result<Option<uuid::Uuid>> {
+        let frame = self
+            .stack
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("task delegation has no parent frame"))?;
+        let parent_agent_instance_id = frame
+            .agent_instance_id
+            .ok_or_else(|| anyhow::anyhow!("task delegation has no durable parent agent"))?;
+        let parent = self
+            .session
+            .db
+            .agent_instance(self.session.id, parent_agent_instance_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task delegation parent agent is not durable"))?;
+        if parent.resolved_profile_snapshot_id.is_none() {
+            return Ok(None);
+        }
+        self.vnext_local_installation_resolver
+            .published_installation_id_for_parent_launch_target(
+                frame.agent.vnext_grant.as_ref(),
+                launch_target,
+            )
+    }
+
     async fn pregrant_write_scope(&self, scope: &std::path::Path) {
         let Some(approver) = self.approver.as_ref() else {
             return;
@@ -1853,7 +1884,7 @@ impl Driver {
         outcome: crate::db::agent_tree_decisions::TaskDelegationTerminalState,
         report: Option<&str>,
     ) -> Result<bool> {
-        self
+        match self
             .session
             .db
             .settle_task_delegation_child_and_agent(
@@ -1878,6 +1909,45 @@ impl Driver {
                 None,
             )
             .await
+        {
+            Ok(changed) => Ok(changed),
+            Err(_) => {
+                match outcome {
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Cancelled => {
+                        let _ = self
+                            .session
+                            .db
+                            .cancel_task_delegation_child(task_call_id, label)
+                            .await?;
+                    }
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed => {
+                        self.session
+                            .db
+                            .complete_task_delegation_child(
+                                task_call_id,
+                                label,
+                                report.unwrap_or(""),
+                                true,
+                                None,
+                            )
+                            .await?;
+                    }
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed => {
+                        self.session
+                            .db
+                            .complete_task_delegation_child(
+                                task_call_id,
+                                label,
+                                report.unwrap_or(""),
+                                false,
+                                None,
+                            )
+                            .await?;
+                    }
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Reattach a detached child from the immutable launch descriptor and its
@@ -2964,13 +3034,8 @@ impl Driver {
                         label: "default".to_string(),
                         snapshot_json: initial_snapshot,
                         resolved_installation_id: self
-                            .vnext_local_installation_resolver
-                            .published_installation_id_for_parent_launch_target(
-                                self.stack
-                                    .last()
-                                    .and_then(|frame| frame.agent.vnext_grant.as_ref()),
-                                &task.child_agent,
-                            )?,
+                            .published_child_installation_id(&task.child_agent)
+                            .await?,
                     }],
                     crate::agent_tree::system_now_unix_ms(),
                 )
@@ -4094,6 +4159,12 @@ impl Driver {
                 }
             };
         }
+
+        // Direct `execute_single` callers (and the runner after a prepare pin)
+        // must observe one generation for the whole attempt. `repin()` would
+        // re-read the shared cell and drop a prepare-time pin, so keep the
+        // existing pin when present.
+        self.config = self.config.ensure_pinned();
 
         // `prepare_and_start_single_noninteractive_task` pinned the config and
         // resolved the immutable child surface immediately before publishing
@@ -5868,7 +5939,7 @@ impl Driver {
         let row = &selected[0];
         if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
             let reason = if orphaned.contains(&task_control_key(row)) {
-                "recovering durable executor; retry when its worker attaches".to_string()
+                "lost (daemon restarted; no live worker)".to_string()
             } else {
                 delegation_status_name(row.status).to_string()
             };
@@ -6010,15 +6081,43 @@ impl Driver {
                 .await;
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
-                let mut recovering = Vec::new();
+                let mut orphaned_lost = Vec::new();
                 for row in selected {
                     let key = task_control_key(&row);
                     if orphaned.contains(&key) {
-                        // A restart leaves this durable child recoverable. Do
-                        // not reinterpret a human cancel as evidence that it
-                        // was lost: recovery owns reattachment and preserves
-                        // any pending decision/approved-effect receipt.
-                        recovering.push(format!("{}:{}", row.task_call_id, row.label));
+                        // No live worker remains for this durable child. An
+                        // explicit cancel is the operator declaring it lost;
+                        // leave recovery to reattach only while nobody has
+                        // asked to terminate it.
+                        match self
+                            .session
+                            .db
+                            .mark_task_delegation_child_lost(&row.task_call_id, &row.label)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                return crate::workspace_lease::report_with_lease_retire_failure(
+                                    format!(
+                                        "Error: could not mark `{}`/`{}` lost: {e:#}",
+                                        row.task_call_id, row.label
+                                    ),
+                                    retire,
+                                );
+                            }
+                        }
+                        let _ = self
+                            .session
+                            .db
+                            .finish_task_assignment(
+                                self.session.id,
+                                &row.task_call_id,
+                                &row.label,
+                                "lost",
+                                None,
+                            )
+                            .await;
+                        orphaned_lost.push(format!("{}:{}", row.task_call_id, row.label));
                         continue;
                     }
                     let live_changed = self
@@ -6071,10 +6170,10 @@ impl Driver {
                         "Error: could not retire managed workspace lease after cancel: {error:#}"
                     );
                 }
-                let state = if changed.is_empty() && recovering.is_empty() {
+                let state = if changed.is_empty() && orphaned_lost.is_empty() {
                     "no_change"
-                } else if !recovering.is_empty() && changed.is_empty() {
-                    "recovering"
+                } else if !orphaned_lost.is_empty() && changed.is_empty() {
+                    "lost"
                 } else {
                     "cancelled"
                 };
@@ -6087,7 +6186,7 @@ impl Driver {
                     "report_available": false,
                     "report_delivered": false,
                     "cancelled": changed,
-                    "recovering": recovering,
+                    "orphaned_lost": orphaned_lost,
                     "unchanged": unchanged,
                     "children": [],
                 }))
@@ -6119,7 +6218,7 @@ impl Driver {
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
                     let reason = if orphaned.contains(&task_control_key(row)) {
-                        "recovering durable executor; retry when its worker attaches".to_string()
+                        "lost (daemon restarted; no live worker)".to_string()
                     } else {
                         delegation_status_name(row.status).to_string()
                     };
@@ -6161,7 +6260,7 @@ impl Driver {
                     "state": "query",
                     "task_call_id": row.task_call_id,
                     "blocking": false,
-                    "tool_call_closed": row.status != crate::db::task_delegations::DelegationStatus::Running,
+                    "tool_call_closed": !delegation_status_live(row.status),
                     "result_pending": false,
                     "report_available": report_source != "none",
                     "report_delivered": row.result_delivered,
@@ -6200,7 +6299,7 @@ impl Driver {
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
                     let reason = if orphaned.contains(&task_control_key(row)) {
-                        "recovering durable executor; retry when its worker attaches".to_string()
+                        "lost (daemon restarted; no live worker)".to_string()
                     } else {
                         delegation_status_name(row.status).to_string()
                     };
@@ -6450,13 +6549,8 @@ impl Driver {
                 }
             };
             let resolved_installation_id = self
-                .vnext_local_installation_resolver
-                .published_installation_id_for_parent_launch_target(
-                    self.stack
-                        .last()
-                        .and_then(|frame| frame.agent.vnext_grant.as_ref()),
-                    &entry.child_agent,
-                )?;
+                .published_child_installation_id(&entry.child_agent)
+                .await?;
             initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
         let Some(parent_agent_instance_id) =
@@ -7926,7 +8020,7 @@ impl Driver {
                 failed,
                 Some(result.clone()),
             );
-            let _ = self
+            if self
                 .settle_task_tree_child(
                     &task_call_id,
                     &label,
@@ -7937,7 +8031,15 @@ impl Driver {
                     },
                     Some(&report),
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .session
+                    .db
+                    .complete_task_delegation_child(&task_call_id, &label, &report, failed, None)
+                    .await;
+            }
             let _ = self
                 .noninteractive_delegations
                 .mark_delivered(&task_call_id, &label);
@@ -8002,7 +8104,8 @@ pub(in crate::engine::driver) fn delegation_status_live(
 ) -> bool {
     matches!(
         status,
-        crate::db::task_delegations::DelegationStatus::Running
+        crate::db::task_delegations::DelegationStatus::Created
+            | crate::db::task_delegations::DelegationStatus::Running
             | crate::db::task_delegations::DelegationStatus::Backgrounded
             | crate::db::task_delegations::DelegationStatus::PausedPendingTool
     )
@@ -8137,7 +8240,7 @@ pub(in crate::engine::driver) fn task_child_detail_json(
         "model": row.model.as_deref().unwrap_or("default"),
         "status": status,
         "blocking": row.status == crate::db::task_delegations::DelegationStatus::Running && !is_orphaned,
-        "tool_call_closed": row.status != crate::db::task_delegations::DelegationStatus::Running,
+        "tool_call_closed": !delegation_status_live(row.status),
         "result_pending": result_pending,
         "report_available": report_available,
         "report_delivered": row.result_delivered,
@@ -8653,6 +8756,9 @@ async fn send_wrapped_noninteractive_event(
 /// cannot leave a dead mailbox in the worker's exact-owner registry. If the
 /// worker has already gone away the pump observes its closed receiver, at
 /// which point no registry remains to route through.
+///
+/// Recovered descendants collector.register their exact mailbox before
+/// gate.wait().await on the shared activation barrier.
 struct NoninteractiveAgentTreeEndpointRegistration {
     /// An unbounded, endpoint-private teardown lane. `Drop` can always append
     /// to it even while the bounded worker event queue is full; its dedicated

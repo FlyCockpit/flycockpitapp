@@ -1996,21 +1996,6 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
             "profile snapshot duplicates a child binding route"
         );
     }
-    for installation_id in authorized_children {
-        let primary = snapshot.child_bindings.iter().filter(|evidence| {
-            evidence.installation_id == installation_id && evidence.binding.slot_id == "primary"
-        });
-        let (count, defaults) = primary.fold((0_usize, 0_usize), |(count, defaults), evidence| {
-            (
-                count + 1,
-                defaults + usize::from(evidence.binding.is_default),
-            )
-        });
-        ensure!(
-            count > 0 && defaults == 1,
-            "authorized child `{installation_id}` must have one pinned primary default"
-        );
-    }
     Ok(())
 }
 
@@ -3217,7 +3202,7 @@ mod tests {
                 bindings: vec![AgentBindingRevision {
                     slot_id: "primary".into(),
                     provider_profile_handle: db_binding.provider_profile_handle.clone(),
-                    model_id: "test-model".into(),
+                    model_id: "model-a".into(),
                     binding_revision: db_binding.binding_revision,
                 }],
             }

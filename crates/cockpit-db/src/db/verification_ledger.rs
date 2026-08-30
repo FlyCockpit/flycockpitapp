@@ -2992,7 +2992,7 @@ mod tests {
             effective_candidate_count: 2,
             total_token_ceiling: 100,
             estimated_cost_ceiling_microunits: 100,
-            collection_deadline_unix_ms: 100,
+            collection_deadline_unix_ms: 10_000,
             collection_duration_ms: 50,
             conservative_token_reservation: 10,
             conservative_cost_reservation_microunits: 10,
@@ -3001,6 +3001,16 @@ mod tests {
             estimate_unavailable_action: None,
             estimate_known: true,
         }
+    }
+
+    fn operation_due_at(
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        collection_deadline_unix_ms: i64,
+    ) -> NewVerificationOperation {
+        let mut input = operation(session_id, agent_instance_id);
+        input.collection_deadline_unix_ms = collection_deadline_unix_ms;
+        input
     }
 
     fn candidate() -> NewVerificationCandidate {
@@ -3437,7 +3447,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected_candidate_id, None);
         assert_eq!(surrogate_kind, "normalized_original");
-        assert_eq!(projection_events, 2);
+        assert_eq!(projection_events, 1);
     }
 
     #[test]
@@ -4309,7 +4319,10 @@ mod tests {
 
         for now in [100_i64, 101_i64] {
             let deadline_operation = db
-                .create_verification_operation(operation(session_id, agent_id), now - 10)
+                .create_verification_operation(
+                    operation_due_at(session_id, agent_id, 100),
+                    now - 10,
+                )
                 .await
                 .unwrap();
             let collecting = db
@@ -4364,7 +4377,10 @@ mod tests {
         let (session_id, agent_id) = owner(&db, "start-deadline-close").await;
         for now in [100_i64, 101_i64] {
             let created = db
-                .create_verification_operation(operation(session_id, agent_id), now - 10)
+                .create_verification_operation(
+                    operation_due_at(session_id, agent_id, 100),
+                    now - 10,
+                )
                 .await
                 .unwrap();
             let closed = db
@@ -4536,7 +4552,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (session_id, agent_id) = owner(&db, "deadline-before-running").await;
         let created = db
-            .create_verification_operation(operation(session_id, agent_id), 3)
+            .create_verification_operation(operation_due_at(session_id, agent_id, 100), 3)
             .await
             .unwrap();
         let collecting = db
@@ -5969,7 +5985,7 @@ mod tests {
         let closer = Db::open(&path).unwrap();
         let (session_id, agent_id) = owner(&closer, "deadline-running-race").await;
         let created = closer
-            .create_verification_operation(operation(session_id, agent_id), 3)
+            .create_verification_operation(operation_due_at(session_id, agent_id, 100), 3)
             .await
             .unwrap();
         let collecting = closer

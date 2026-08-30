@@ -2001,6 +2001,15 @@ impl App {
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
         let y = area.y;
         let mut x = area.x.saturating_add(area.width.saturating_sub(2));
+        let title_reserve = {
+            let title: String = self
+                .queue_box_title()
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            (display_width(&title) as u16).saturating_add(2)
+        };
         let labels = [
             (
                 "cancel",
@@ -2026,7 +2035,7 @@ impl App {
         for (label, id, dispatch) in labels {
             let width = (label.len() as u16).saturating_add(2);
             x = x.saturating_sub(width.saturating_add(1));
-            if x <= area.x.saturating_add(2) {
+            if x <= area.x.saturating_add(title_reserve) {
                 break;
             }
             let _ = self.button_registry.paint(
@@ -2365,13 +2374,38 @@ impl App {
         let max_offset = self
             .chat_total_lines
             .saturating_sub(self.chat_visible_lines.max(1));
-        self.chat_scroll_offset = offset.min(max_offset);
-        if self.chat_scroll_offset == 0 {
+        // A non-zero request means "leave the tail", even when geometry has
+        // not been measured yet. Clamping that request to 0 would pin to
+        // the newest rows and hide the beginning-of-conversation marker.
+        if offset == 0
+            && !(self.chat_total_lines == 0
+                && self.chat_visible_lines == 0
+                && !self.history.is_empty())
+        {
             self.pin_chat_to_tail();
-        } else {
-            self.chat_pinned_to_tail = false;
-            self.capture_chat_scroll_anchor_from_current_offset();
+            return;
         }
+        self.chat_pinned_to_tail = false;
+        if self.chat_total_lines > 0 && offset >= self.chat_total_lines {
+            // A caller uses the current total as an explicit "oldest row"
+            // request. The history page may just have been prepended, so the
+            // cached total cannot safely be clamped until the next layout.
+            self.chat_scroll_offset = usize::MAX;
+            self.chat_scroll_anchor = None;
+            return;
+        }
+        self.chat_scroll_offset = if max_offset == 0 && offset == 0 {
+            // Before the first layout pass, a caller can request the oldest
+            // history row while both cached dimensions are still zero. Keep
+            // that intent until the renderer can clamp it against measured
+            // geometry rather than silently converting it to tail-following.
+            usize::MAX
+        } else if max_offset == 0 {
+            offset
+        } else {
+            offset.min(max_offset)
+        };
+        self.capture_chat_scroll_anchor_from_current_offset();
     }
 
     pub(super) fn restore_chat_scroll_state(
@@ -2461,12 +2495,27 @@ impl App {
         area_h: usize,
         banner_rows: usize,
         message_rows: usize,
+        previous_visible: usize,
     ) {
         let total = banner_rows + message_rows;
         let visible = area_h.max(1);
         if total <= visible {
             self.pin_chat_to_tail();
             return;
+        }
+        if previous_visible > 0 {
+            let delta = previous_visible as isize - visible as isize;
+            if delta.unsigned_abs() == super::sticky_header::STICKY_USER_HEADER_HEIGHT as usize
+                && self.chat_scroll_offset > 0
+            {
+                // Offset-from-bottom is preserved across a sticky-header carve
+                // flip. The header decision uses the uncarved pane height, so
+                // compensating the two carved rows would make appear/disappear
+                // oscillate.
+                self.chat_scroll_offset =
+                    self.chat_scroll_offset.min(total.saturating_sub(visible));
+                return;
+            }
         }
         if self.chat_pinned_to_tail && self.chat_scroll_offset > 0 {
             self.chat_pinned_to_tail = false;
@@ -2887,6 +2936,7 @@ impl App {
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
+        let previous_visible = self.chat_visible_lines;
         // Publish the carved (or full) height before scroll-anchor
         // recapture so a header appear/disappear keeps offset-from-bottom
         // stable instead of compensating with a stale last-frame height.
@@ -3143,7 +3193,7 @@ impl App {
             self.chat_find_lines_query = None;
         }
 
-        self.derive_chat_scroll_offset(area_h, b, m);
+        self.derive_chat_scroll_offset(area_h, b, m, previous_visible);
 
         let (visible, visible_meta): VisibleRows = if b > 0 && b + m <= area_h {
             // Fits with room to spare: messages stay bottom-aligned and
@@ -5321,9 +5371,10 @@ pub(super) fn extract_selection_semantic(
         };
         if meta.copy_target.is_some() {
             if !meta.copy_provenance_present {
-                // Legacy/caller-supplied message rows have substantive
-                // visible plaintext but no authoritative semantic map.
-                return None;
+                // Header chrome such as the narrow-width `↔` indicator is
+                // tagged as part of the message but has no semantic map.
+                // Skip it rather than failing the whole selection.
+                continue;
             }
             saw_semantic_row = true;
         } else if meta.selectable {
@@ -5375,7 +5426,7 @@ pub(super) fn extract_selection_semantic(
             row_table_cell = fragment.table_cell.or(row_table_cell);
         }
         if meta.copy_fallback_if_unmapped {
-            return None;
+            continue;
         }
     }
     // An all-chrome selection inside a Markdown message is still a

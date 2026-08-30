@@ -126,10 +126,10 @@ fn elide_applied_write_edit_args_except(
 /// Reconcile only settled signed assistant turns that could not safely be
 /// repaired at dispatch time, then apply the pure live projection.
 ///
-/// Ordinary live elision is deliberately independent of the audit ledger. A
-/// durable canonical row is needed solely for deferred repair of a signed
-/// turn: if that best-effort read cannot produce a row, its in-memory args are
-/// kept intact rather than aborting a later inference or ordinary dispatch.
+/// Ordinary live elision leaves signed calls intact until this inference
+/// path reads the canonical audit row. If that best-effort read cannot
+/// produce a row, the in-memory args stay rather than aborting later
+/// inference or ordinary dispatch.
 pub async fn reconcile_deferred_signed_turns_and_elide(
     session: &crate::session::Session,
     agent_name: &str,

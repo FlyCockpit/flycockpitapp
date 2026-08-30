@@ -3662,6 +3662,9 @@ fn validate_child_binding_evidence(snapshot: &RedactedAgentProfileSnapshot) -> R
         .iter()
         .map(|evidence| evidence.installation_id)
         .collect::<std::collections::BTreeSet<_>>();
+    if snapshot.child_bindings.is_empty() {
+        return Ok(());
+    }
     ensure!(
         authorized == evidenced,
         "snapshot child binding evidence must exactly cover authorized children"
@@ -4578,7 +4581,7 @@ mod tests {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
                 provider_profile_handle: "local-profile-opaque".into(),
-                model_id: "test-model".into(),
+                model_id: "model-a".into(),
                 binding_revision: 1,
             }],
         })
@@ -4602,7 +4605,7 @@ mod tests {
             expected_bindings: vec![AgentBindingExpectation {
                 slot_id: "primary".into(),
                 provider_profile_handle: "local-profile-opaque".into(),
-                model_id: "test-model".into(),
+                model_id: "model-a".into(),
                 expected_binding_revision: 1,
             }],
             expected_children: Vec::new(),
@@ -6454,7 +6457,7 @@ mod tests {
     async fn release_prepared_root_before_first_message_allows_reprepare_and_refuses_after_user() {
         let db = Db::open_in_memory().unwrap();
         let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
-        let input = prepare_input(session_id, installation_id, definition_digest);
+        let input = prepare_input(session_id, installation_id, definition_digest.clone());
         assert!(matches!(
             db.prepare_agent_session(input).await.unwrap(),
             PrepareAgentSessionOutcome::Prepared(_)
@@ -6491,7 +6494,7 @@ mod tests {
         db.abandon_eligible_preparation_claim(session_id)
             .await
             .unwrap();
-        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let session_id = Uuid::now_v7();
         let input = prepare_input(session_id, installation_id, definition_digest);
         assert!(matches!(
             db.prepare_agent_session(input).await.unwrap(),

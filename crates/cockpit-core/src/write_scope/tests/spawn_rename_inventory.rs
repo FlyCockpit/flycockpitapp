@@ -260,6 +260,10 @@ const ALLOWED_OUTPUT_DIR_FILES: &[(&str, &str)] = &[
         "DelegationChildInit fixture — task-delegation persistence column",
     ),
     (
+        "engine/driver/tests/noninteractive.rs",
+        "DelegationChildInit fixture — task-delegation persistence column",
+    ),
+    (
         "write_scope/tests/spawn_rename_inventory.rs",
         "this inventory test names the forbidden identifier on purpose",
     ),

@@ -2,6 +2,10 @@
 //!
 //! Transition legality lives here so repository reducers and protocol
 //! projections cannot develop separate interpretations of persisted states.
+//! SQL edge registries owned by this module: `image_generation_artifact_transitions`,
+//! `image_generation_component_transitions`, `image_generation_cleanup_transitions`,
+//! `image_generation_late_publication_transitions`, `image_generation_job_transitions`,
+//! `image_generation_slot_transitions`, and `image_generation_attempt_transitions`.
 
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};

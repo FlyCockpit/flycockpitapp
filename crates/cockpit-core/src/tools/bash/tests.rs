@@ -832,7 +832,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
         review_cage: None,
         context_usage: None,
-        available_tools: Arc::new(std::collections::HashSet::new()),
+        available_tools: Arc::new(std::collections::HashSet::from(["escalate".to_string()])),
         mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
             Vec::new(),
         )),
@@ -2715,6 +2715,7 @@ async fn confined_failure_omits_escalate_note_when_escalate_tool_absent() {
     let mut ctx = ctx_with_store(tmp.path());
     // No `escalate` tool registered → the runtime gate omits the note even
     // under verbose steering.
+    ctx.available_tools = Arc::new(std::collections::HashSet::new());
     ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.current_tool_call_id = Some("call-no-escalate".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);

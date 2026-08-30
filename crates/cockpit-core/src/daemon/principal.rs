@@ -773,6 +773,7 @@ mod tests {
             "get_agent_inventory",
             "get_agent_edit_snapshot",
             "get_extended_config_snapshot",
+            "get_guidance_enablement_trace",
             "get_image_sidecar_authority_snapshot",
             "get_agent_editor_lease_settlement",
         ]);

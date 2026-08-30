@@ -4799,11 +4799,26 @@ mod tests {
         _root: tempfile::TempDir,
     }
 
+    const DURABLE_COMPUTER_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn seed_computer_outcome_session(db: &crate::db::Db) {
+        db.blocking_write_for_sync_maintenance(|conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) \
+                 VALUES(?1,'p','/redacted',1,1)",
+                [DURABLE_COMPUTER_SESSION_ID],
+            )?;
+            Ok(())
+        })
+        .expect("seed session for computer_outcome_store foreign key");
+    }
+
     impl PhysicalTestSinks {
         fn new() -> Self {
             let root = tempfile::tempdir().expect("physical test data root");
             let db = crate::db::Db::open(&root.path().join("computer-outcomes.db"))
                 .expect("open physical test outcome database");
+            seed_computer_outcome_session(&db);
             let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
                 Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(
                     db.clone(),
@@ -4836,7 +4851,7 @@ mod tests {
             arbiter: Arc<std::sync::Mutex<HostInputArbiter>>,
         ) -> CoordinatorParams {
             CoordinatorParams {
-                session_id: "session-1".to_string(),
+                session_id: DURABLE_COMPUTER_SESSION_ID.to_string(),
                 delegation_id: DelegationId("delegation-1".to_string()),
                 tier,
                 owner_instance: OwnerInstance(1),
@@ -5690,6 +5705,7 @@ mod tests {
         let key = physical_key();
         let db = crate::db::Db::open(&tmp.path().join("computer-outcomes.db"))
             .expect("open durable outcome database");
+        seed_computer_outcome_session(&db);
         let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> = Arc::new(
             super::super::outcome_store::SqliteOutcomeStore::new(db.clone()),
         );
@@ -5710,7 +5726,7 @@ mod tests {
 
         // First delegation opens and acquires the host lease via a real lock.
         let params_a = CoordinatorParams {
-            session_id: "session-1".to_string(),
+            session_id: DURABLE_COMPUTER_SESSION_ID.to_string(),
             delegation_id: DelegationId("delegation-a".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
@@ -5735,7 +5751,7 @@ mod tests {
         // Second delegation contends: `open` maps it to `HostLockQueued` and
         // must remove the FIFO waiter before returning.
         let params_b = CoordinatorParams {
-            session_id: "session-1".to_string(),
+            session_id: DURABLE_COMPUTER_SESSION_ID.to_string(),
             delegation_id: DelegationId("delegation-b".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
@@ -8856,6 +8872,7 @@ mod tests {
         let root = tempfile::tempdir().expect("durable outcome root");
         let db = crate::db::Db::open(&root.path().join("computer-outcomes.db"))
             .expect("open durable outcome database");
+        seed_computer_outcome_session(&db);
         let store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
             Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(db));
         let actions = vec![OpenAiComputerAction::Move {
@@ -8867,6 +8884,7 @@ mod tests {
         }];
         let mut first_params =
             make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+        first_params.session_id = DURABLE_COMPUTER_SESSION_ID.to_string();
         first_params.outcome_store = Some(store.clone());
         let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
             .await
@@ -8889,6 +8907,7 @@ mod tests {
 
         let mut second_params =
             make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+        second_params.session_id = DURABLE_COMPUTER_SESSION_ID.to_string();
         second_params.outcome_store = Some(store);
         let mut second =
             ComputerActionCoordinator::open(Box::new(FakeBackend::new()), second_params)
@@ -8997,10 +9016,11 @@ mod tests {
         )));
         let db = crate::db::Db::open(&tmp.path().join("computer-outcomes.db"))
             .expect("open durable outcome database");
+        seed_computer_outcome_session(&db);
         let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
             Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(db));
         let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
+            session_id: DURABLE_COMPUTER_SESSION_ID.to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),

@@ -9,11 +9,11 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "f1f8de8efb065171b8103b3f64bc68d95edfca481c2bb3f3bb03324fea255890";
+    "4cc96eb1a1ecda99b42a98071a9792a0456703df22f5f4f69f58eb8d4b3d6585";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
-    "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
+    "17924064e7f641b661f831770b2d0ebadecb978c339bf03f2a8f8d7dc101b2f7";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "a286c4385a4acd8c0e78b1180e4ac0cbfb9b920109b05fd2ed86b384eddb0a1d";
+    "c8908acd258948a6ae5eeb6f528276bd6ca0bfc7483388226ea5293208a91eb5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -977,7 +977,7 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
     "###;
     assert_eq!(
         hot_query_comments(spoofed),
-        vec![(13, "reviewed.shape".to_owned())]
+        vec![(14, "reviewed.shape".to_owned())]
     );
     assert_eq!(
         annotated_sql_literal(spoofed, "reviewed.shape"),
@@ -1058,12 +1058,12 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert_eq!(
         local.objects.len(),
-        552,
+        624,
         "local ordered object inventory drifted"
     );
     assert_eq!(
         extended.objects.len(),
-        757,
+        852,
         "extended ordered object inventory drifted"
     );
     assert!(
@@ -1221,15 +1221,13 @@ fn validate_relationship_inventory(
             table
                 .unique_keys
                 .iter()
-                .any(|key| key.terms.iter().any(|term| term.column == column.as_str()))
+                .any(|key| key.terms.len() == 1 && key.terms[0].column == column.as_str())
         }) || schema.indexes.iter().any(|index| {
             index.table == table_name.as_str()
                 && index.unique
                 && index.predicate.is_none()
-                && index
-                    .terms
-                    .iter()
-                    .any(|term| term.column == column.as_str())
+                && index.terms.len() == 1
+                && index.terms[0].column == column.as_str()
         });
         match class {
             RelationshipClass::Primary if !primary => {
@@ -1615,6 +1613,9 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         .into_iter()
         .flat_map(|owner| {
             let contents = source(root.join(&owner));
+            if !contents.contains("schema-hot-query:") {
+                return Vec::new();
+            }
             hot_query_comments(&contents)
                 .into_iter()
                 .map(|(_, marker)| (marker, portable_relative_path(&owner)))

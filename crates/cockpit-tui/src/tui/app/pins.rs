@@ -1174,6 +1174,7 @@ mod tests {
 
         let mut app = test_app(tmp.path());
         let mut runner = runner();
+        runner.endpoint = cockpit_client::ClientEndpoint::Wire(socket.clone());
         runner.socket = socket;
         let parent_session_id = runner.session_id();
         app.agent_runner = Some(Ok(runner));

@@ -48,9 +48,10 @@ const DELETED_PUBLIC_METHODS: &[&str] = &["read_blocking", "write_blocking"];
 ///
 /// - `blocking_for_sync_cli`: permanent guarded boundary for synchronous CLI one-shots.
 /// - four `blocking_*_for_sync_*` wrappers: temporary; owned by `db-sync-wrapper-migration`.
-/// - three typed agent-publication journal methods: permanent, narrow bridges
+/// - four typed agent-publication journal methods: permanent, narrow bridges
 ///   used only while a caller owns the cross-process filesystem publication
-///   lock; none accepts an arbitrary closure.
+///   lock; the staged-insert variant takes a typed staging closure, not an
+///   arbitrary write callback.
 const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         name: "blocking_for_sync_cli",
@@ -87,6 +88,12 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         kind: AllowlistKind::PermanentPublicationJournal,
         owner: "agent-mutation-journal",
         rationale: "typed recovery fence must be ordered inside the cross-process agent publication lock",
+    },
+    AllowlistEntry {
+        name: "insert_agent_mutation_journal_with_stage_under_publication_lock",
+        kind: AllowlistKind::PermanentPublicationJournal,
+        owner: "agent-mutation-journal",
+        rationale: "same publication lock fence, with credential staging in the identical writer transaction",
     },
     AllowlistEntry {
         name: "prepare_agent_editor_publication_under_publication_lock",
@@ -1410,6 +1417,7 @@ fn db_blocking_boundary_gate_allowlist_is_exact_and_documented() {
             "blocking_write_for_sync_event",
             "blocking_write_for_sync_maintenance",
             "insert_agent_mutation_journal_under_publication_lock",
+            "insert_agent_mutation_journal_with_stage_under_publication_lock",
             "prepare_agent_editor_publication_under_publication_lock",
             "record_agent_editor_publication_under_publication_lock",
         ]

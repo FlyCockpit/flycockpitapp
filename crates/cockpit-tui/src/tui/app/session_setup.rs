@@ -708,7 +708,11 @@ mod tests {
     #[test]
     fn modes_session_setup_fresh_session_shows_inline_until_first_submit() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
+        let mut app = App::new_with_workspace_trust(
+            Some(tmp.path()),
+            false,
+            super::StartupWorkspaceTrust::Decided,
+        );
         assert!(app.session_setup_inline_visible());
         assert!(!app.session_setup_collapsed);
         app.collapse_session_setup_on_first_submit();

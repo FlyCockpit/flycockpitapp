@@ -61,7 +61,7 @@ Workspace trust controls whether project `.cockpit/` config and project approval
 
 Trusted is meant for an endpoint you are content to hold raw content — typically a self-hosted or contractually no-log provider — and raw content reaching such an endpoint is the intended outcome, not a failure. Untrusted is the conservative default and is meant for cloud endpoints. Marking an external provider trusted sends that provider raw secrets and environment values in inference requests; that is permitted, but it is your decision. Trust is only ever set explicitly: neither model locality nor agent-definition posture implies it.
 
-Agent definitions own harness steering, capabilities, prompts, and context policy. Provider/model trust remains an independent data-custody setting. Locality is descriptive and never implies trust — `local`, `remote`, and `private_remote` say where a provider runs, not what it may hold.
+Agent definitions own harness steering, capabilities, prompts, and context policy. Harness mode never changes provider eligibility, data custody, or redaction. Provider/model trust remains an independent data-custody setting. Locality is descriptive and never implies trust — `local`, `remote`, and `private_remote` say where a provider runs, not what it may hold.
 
 Exports and client display stay redacted regardless of trust. Secrets are scrubbed through Cockpit's redaction table before they leave the machine for exports, sync, or client display boundaries, and for inference requests to untrusted models. Redaction is a safety boundary, but it is not a substitute for choosing providers and trust settings deliberately.
 

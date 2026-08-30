@@ -33,12 +33,12 @@ impl Db {
         &self,
         fence: AgentMutationJournalFence,
     ) -> Result<()> {
-        self.insert_agent_mutation_journal_under_publication_lock_with(fence, |_| {
+        self.insert_agent_mutation_journal_with_stage_under_publication_lock(fence, |_| {
             Ok(((), "{}".to_string()))
         })
     }
 
-    pub fn insert_agent_mutation_journal_under_publication_lock_with<F, T>(
+    pub fn insert_agent_mutation_journal_with_stage_under_publication_lock<F, T>(
         &self,
         fence: AgentMutationJournalFence,
         stage: F,

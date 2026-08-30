@@ -865,41 +865,6 @@ impl Db {
         }
     }
 
-    /// Run a writer job to completion from an already-blocking authority
-    /// coordinator.
-    ///
-    /// This is intentionally synchronous: callers use it while holding
-    /// thread-affine filesystem locks whose guards must never cross an
-    /// `.await`. Normal async application paths should use [`Self::write`].
-    pub fn write_blocking<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        if self.read_only {
-            anyhow::bail!("read-only diagnostic database does not permit writes");
-        }
-        if let Some(writer) = &self.writer {
-            let rx = writer.submit(f)?;
-            let boxed = rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
-            boxed
-                .downcast::<T>()
-                .map(|value| *value)
-                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
-        } else {
-            let inner = self
-                .memory
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
-            let guard = inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
-            f(&guard)
-        }
-    }
-
     /// Execute an atomic write transaction on the writer connection.
     ///
     /// Use this instead of composing multiple async accessors when the
@@ -5671,11 +5636,20 @@ mod tests {
             // deleting a session must not erase spend or unblock its scopes.
             // Sidecar intents outlive the session row so boot can delete
             // files that the cascading payload delete can no longer see.
+            // Guidance proposal receipts are content-free audit rows that
+            // may outlive the session during retention (session_id is not a FK).
+            // Image-sidecar grants are project-owned; session_id is an optional
+            // external binding, not a cascading session relationship.
+            // Tool-media authorization epochs treat session_id as identity,
+            // not a cascade: invalidation is an explicit epoch bump.
             if name == "run_invocations"
                 || name == "run_invocation_tombstones"
                 || name == "image_spend_reservations"
                 || name == "task_delegation_sidecar_cleanup_intents"
                 || name == "task_delegation_sidecar_prepare_intents"
+                || name == "guidance_proposal_receipts"
+                || name == "image_sidecar_grants"
+                || name == "tool_media_authorization_epochs"
             {
                 continue;
             }

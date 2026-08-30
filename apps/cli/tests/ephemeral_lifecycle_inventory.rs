@@ -696,6 +696,9 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
                             );
                         }
                     };
+                if let Some(notice) = connected.startup_notice.take() {
+                    eprintln!("{notice}");
+                }
                 Ok(Self {
                     client: connected.client,
                     guard,
@@ -884,20 +887,57 @@ fn core_contract_violations(source: &str) -> Vec<String> {
             _ => continue,
         };
         let expected = syn::parse_str::<syn::ImplItemFn>(expected).unwrap();
-        if compact_tokens(method) != compact_tokens(expected) {
+        let actual_tokens = compact_tokens(method);
+        let expected_tokens = compact_tokens(&expected);
+        if actual_tokens != expected_tokens {
             violations.push(format!(
-                "{} signature or private-client delegation changed",
-                method.sig.ident
+                "{} signature or private-client delegation changed\nactual={}\nexpected={}",
+                method.sig.ident, actual_tokens, expected_tokens
             ));
         }
     }
+    let mut saw_daemon_request_client = false;
     for implementation in implementations {
         if let Some((_, path, _)) = &implementation.trait_ {
+            if path_ends(path, "DaemonRequestClient") {
+                saw_daemon_request_client = true;
+                let trait_methods = implementation
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        syn::ImplItem::Fn(method) => Some(method),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if trait_methods.len() != 1 || trait_methods[0].sig.ident != "request" {
+                    violations.push("DaemonRequestClient impl must expose only request".into());
+                } else {
+                    let expected = syn::parse_str::<syn::ImplItemFn>(
+                        r#"async fn request(&self, request: proto::Request) -> anyhow::Result<std::result::Result<proto::Response, proto::ErrorPayload>> { self.client.request(request).await }"#,
+                    )
+                    .unwrap();
+                    let actual_tokens = compact_tokens(trait_methods[0]);
+                    let expected_tokens = compact_tokens(&expected);
+                    if actual_tokens != expected_tokens {
+                        violations.push(format!(
+                            "DaemonRequestClient::request must delegate to the private client\nactual={}\nexpected={}",
+                            actual_tokens,
+                            expected_tokens
+                        ));
+                    }
+                }
+                continue;
+            }
             violations.push(format!(
                 "ScopedDaemonClient may not implement trait {}",
                 path.segments.last().unwrap().ident
             ));
         }
+    }
+    if !saw_daemon_request_client {
+        violations.push(
+            "ScopedDaemonClient must implement DaemonRequestClient so owned runs can use generic upload helpers without exposing DaemonClient".into(),
+        );
     }
     let runner = file.items.iter().find_map(|item| match item {
         syn::Item::Fn(item) if item.sig.ident == "run_owned_daemon" => Some(item),
@@ -1100,7 +1140,14 @@ fn raw_owner_connect_path_count(source: &str) -> usize {
 }
 
 fn compact_tokens(tokens: impl quote::ToTokens) -> String {
-    tokens.to_token_stream().to_string().replace(' ', "")
+    // rustfmt emits trailing commas on wrapped signatures; the contract is the
+    // typed surface and private-client delegation, not punctuation.
+    tokens
+        .to_token_stream()
+        .to_string()
+        .replace(' ', "")
+        .replace(",)", ")")
+        .replace(",>", ">")
 }
 
 fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
@@ -1147,6 +1194,16 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
             visit::visit_impl_item_fn(self, item);
             self.test_depth -= test;
             self.function = previous;
+        }
+
+        fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+            // Syn now surfaces the implicit receiver type (`&Self`, `Self`,
+            // `&mut Self`). Those are not Self-type leaks; only explicit
+            // `Self` in return types and turbofish constructors is inventoried.
+            match arg {
+                syn::FnArg::Receiver(_) => {}
+                syn::FnArg::Typed(typed) => visit::visit_pat_type(self, typed),
+            }
         }
 
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
@@ -1365,6 +1422,13 @@ fn core_runner_is_the_only_raw_owner() {
     for path in rust_files(&core_root) {
         let relative = path.strip_prefix(&core_root).unwrap();
         if relative == owner_path {
+            continue;
+        }
+        let file_name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name == "tests.rs" || file_name.ends_with("_tests.rs") {
             continue;
         }
         outside_owner_violations.extend(owned_session_occurrences_in_source(

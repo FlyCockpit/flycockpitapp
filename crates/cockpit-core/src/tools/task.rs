@@ -70,7 +70,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`. Separate delegate calls keep separate task IDs and may run concurrently only when each resolved child surface is read-only; `batch` is for explicit grouped/dependency semantics, not required for independent calls. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
+            "Delegate {list}: `intent` plus optional `payload`; separate calls get task IDs, `batch` groups/depends_on work. Use @file/@dir or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
         // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -127,7 +127,7 @@ impl TaskTool {
                 "min_context_tokens": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "omit unless a minimum context size is required"
+                    "description": "omit unless required"
                 }
             },
             "required": ["kind"]
@@ -165,11 +165,11 @@ impl TaskTool {
                 },
                 "write_scope": {
                     "type": "string",
-                    "description": "Hard write-confined subtree; reads stay cwd-wide"
+                    "description": "Write-confined subtree"
                 },
                 "workspace_lease": {
                     "type": "string",
-                    "description": "Requested containment kind (`same_root`, `subdirectory`, or `managed_worktree`) or a live host-issued lease UUID. Kinds are issued by the daemon after grant intersection; this argument cannot mint or widen authority."
+                    "description": "Containment kind or live host-issued lease UUID"
                 },
                 "grant_tools": {
                     "type": "array",
@@ -228,11 +228,11 @@ impl TaskTool {
                 },
                 "write_scope": {
                     "type": "string",
-                    "description": "Required for write-capable entries; hard write-confined subtree"
+                    "description": "Required write-confined subtree"
                 },
                 "workspace_lease": {
                     "type": "string",
-                    "description": "Requested containment kind or a live host-issued lease UUID; the daemon issues and intersects kinds with the parent grant"
+                    "description": "Containment kind or live host-issued lease UUID"
                 },
                 "remaining_depth": {
                     "type": "integer",

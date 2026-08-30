@@ -333,6 +333,11 @@ mod tests {
                 symbol: "assert_preflight_model",
                 reason: "preflight hook swaps COCKPIT_CONFIG under an already-held TestEnvGuard to prove start does not reread the ambient path",
             },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/daemon/session_worker/handle.rs",
+                symbol: "from_disk_for_tests_at_generation",
+                reason: "test helper save/restores COCKPIT_CONFIG so the tempdir project layer loads even when another test left an explicit path set",
+            },
         ];
 
         let mut violations = Vec::new();

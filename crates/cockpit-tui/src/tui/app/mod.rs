@@ -583,6 +583,12 @@ impl App {
             .as_ref()
             .and_then(|runner| runner.as_ref().ok().map(|runner| runner.endpoint.clone()))
             .or_else(|| self.startup_background.daemon_endpoint.clone())
+            .or_else(|| {
+                self.startup_background
+                    .daemon_socket
+                    .clone()
+                    .map(cockpit_client::ClientEndpoint::Wire)
+            })
     }
 
     /// The required startup modal that is both rendered and allowed to
@@ -1846,7 +1852,7 @@ fn providers_from_view(
 
 /// Canonical daemon-owned entry setup. The App uses this only for attach
 /// requests until it adopts the daemon-returned authoritative value.
-pub type SessionMode = cockpit_core::daemon::proto::SessionEntryMode;
+pub type SessionMode = cockpit_proto::SessionEntryMode;
 
 #[allow(private_interfaces)]
 pub struct App {
@@ -3401,14 +3407,28 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(
+        let mut app = Self::new_inner(
             project,
             no_sandbox,
             Some(SessionMode::Code),
             StartupWorkspaceTrust::Decided,
             None,
             None,
-        )
+        );
+        // Unit tests construct App as a composer/history harness. Production
+        // constructors keep the inline session-setup panel expanded; collapsing
+        // it here keeps "Loading session setup" out of history geometry and
+        // stops Tab from toggling setup focus in composer tests. Session-setup
+        // tests that need the expanded panel call a production constructor or
+        // `prepare_session_setup_for_fresh_session`.
+        app.session_setup_collapsed = true;
+        app.session_setup_focused = false;
+        app.daemon_prompt = None;
+        // First-run Add-Provider is a production launch convenience. Opening it
+        // here queues leftover settings.effect work (guidance-trace) that later
+        // steals a fixture attached-request channel when a test drains.
+        app.dialog = Dialog::None;
+        app
     }
 
     pub fn new_with_workspace_trust(
@@ -3726,7 +3746,10 @@ impl App {
                 crate::tui::session_setup::SessionSetupPane::loading_inline(true),
             ),
             session_setup_collapsed: false,
-            session_setup_focused: true,
+            // Production starts on the setup panel so first-run navigation is
+            // reachable. Unit tests construct App as a composer harness and
+            // never Tab away from the panel, so they own the composer.
+            session_setup_focused: !cfg!(test),
             session_setup_collapse_hint: None,
             daemon_prompt: daemon_state.prompt,
             question_dialog: None,

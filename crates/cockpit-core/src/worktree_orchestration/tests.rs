@@ -132,7 +132,7 @@ async fn harness() -> Harness {
         state,
         db,
         orch,
-        now: 10,
+        now: workspace_lease::now_unix_ms(),
     }
 }
 

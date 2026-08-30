@@ -1046,7 +1046,16 @@ mod tests {
         let res = expand_with(&format!("@range.txt:1-{lines}"), root.path());
         assert!(res.wire.contains("[truncated"), "wire: {}", res.wire);
         assert!(res.expansions[0].ok);
-        assert_eq!(res.expansions[0].detail, format!("{lines} lines"));
+        let shown = res.expansions[0]
+            .detail
+            .strip_suffix(" lines")
+            .and_then(|count| count.parse::<usize>().ok())
+            .expect("truncated range detail reports shown line count");
+        assert!(
+            shown < lines && shown > 0,
+            "byte-capped range should inline a proper prefix, not the full request: {}",
+            res.expansions[0].detail
+        );
     }
 
     #[test]

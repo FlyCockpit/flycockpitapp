@@ -162,7 +162,7 @@ impl ResourcesPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
         let body = layout[0];
         let help_area = layout[1];
 
@@ -188,11 +188,21 @@ impl ResourcesPane {
         frame.render_stateful_widget(
             List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-                .scroll_padding(1),
+                .scroll_padding(0),
             body,
             &mut viewport,
         );
-        *self.list.offset_mut() = viewport.offset();
+        let mut offset = self.list.offset().min(max_offset);
+        if self.follow_selection
+            && let Some(row) = selected_row
+        {
+            if row < offset {
+                offset = row;
+            } else if row >= offset.saturating_add(self.last_body_height) {
+                offset = row.saturating_add(1).saturating_sub(self.last_body_height);
+            }
+        }
+        *self.list.offset_mut() = offset.min(max_offset);
         render_scrollbar(
             frame,
             body,
@@ -302,7 +312,6 @@ impl ResourcesPane {
             }
         }
 
-        lines.push(Line::default());
         lines.push(section("Running"));
         if snapshot.running.is_empty() {
             lines.push(muted("  none"));
@@ -312,7 +321,6 @@ impl ResourcesPane {
             }
         }
 
-        lines.push(Line::default());
         lines.push(section("Queued"));
         if snapshot.queued.is_empty() {
             lines.push(muted("  none"));

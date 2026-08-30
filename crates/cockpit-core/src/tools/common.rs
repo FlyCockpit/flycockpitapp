@@ -1,7 +1,9 @@
 //! Shared utilities for the file tools.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 
@@ -330,8 +332,7 @@ fn atomic_write_with(
     before_rename(temp.path())?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::io::AsRawFd;
+        use std::os::unix::{fs::MetadataExt, io::AsRawFd};
         let rc =
             unsafe { libc::fchown(temp.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) };
         if rc != 0 {
@@ -418,7 +419,12 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             review_cage: None,
             context_usage: None,
-            available_tools: Arc::new(std::collections::HashSet::new()),
+            available_tools: Arc::new(
+                ["bash", "escalate", "read", "write", "edit"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
                 Vec::new(),
             )),

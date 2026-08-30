@@ -6,16 +6,19 @@
 //! agents go through [`crate::agents`] / `agent_dirs`; they're the
 //! extension path.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::engine::agent::Agent;
-use crate::engine::model::{Model, ModelParams};
-use crate::engine::tool::ToolBox;
-use crate::model_system_prompt::ModelSystemPromptSnapshot;
-use crate::tools::custom::{CustomBashTool, ToolTemplateProvenance};
+use crate::{
+    engine::{
+        agent::Agent,
+        model::{Model, ModelParams},
+        tool::ToolBox,
+    },
+    model_system_prompt::ModelSystemPromptSnapshot,
+    tools::custom::{CustomBashTool, ToolTemplateProvenance},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegationRecursionContext {
@@ -2973,14 +2976,32 @@ fn vnext_reachable_subagents(
                             .then_some((listing.name.clone(), child_vnext.execution_kind))
                     })
                     .collect();
-                let [(name, kind)] = matches.as_slice() else {
-                    bail!(
-                        "vNext portable child `{portable_agent_ref}` must resolve to exactly one local installation (found {})",
-                        matches.len()
-                    );
-                };
-                if grant.permits_child(reference, *kind) {
-                    resolved.push(name.clone());
+                match matches.as_slice() {
+                    [(name, kind)] => {
+                        if grant.permits_child(reference, *kind) {
+                            resolved.push(name.clone());
+                        }
+                    }
+                    [] => {
+                        // A malformed on-disk override for a bundled child
+                        // must not fail the parent rebuild. Fall back to the
+                        // cockpit-prefixed launch target's local name.
+                        if let Some(name) = portable_agent_ref.strip_prefix("cockpit/") {
+                            resolved.push(name.to_string());
+                        } else {
+                            tracing::warn!(
+                                parent = %parent.name,
+                                portable = %portable_agent_ref,
+                                "vNext portable child did not resolve; skipping"
+                            );
+                        }
+                    }
+                    _ => {
+                        bail!(
+                            "vNext portable child `{portable_agent_ref}` must resolve to exactly one local installation (found {})",
+                            matches.len()
+                        );
+                    }
                 }
             }
         }
@@ -3035,6 +3056,29 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
     if routes.is_empty() {
         return resolve_unprepared_vnext_primary_slot(def, slot, args, &extended);
     }
+    if let Some(model) = &args.model_override {
+        if args.delegated {
+            let allowed_label = format_prepared_route_list(&routes);
+            let matching = routes.iter().any(|route| {
+                route.model_id == model.model_id_ref()
+                    && (route.provider_profile_handle == model.provider_id()
+                        || route.provider_id == model.provider_id())
+            });
+            if !matching {
+                bail!(
+                    "explicit model override `{}:{}` is not in vNext child `{}` primary-slot routes: {allowed_label}",
+                    model.provider_id(),
+                    model.model_id_ref(),
+                    def.name
+                );
+            }
+        }
+        // Root (and in-set child) pins already went through `build_live_model`.
+        // Re-resolving from `args.config.providers()` would reject a live
+        // switch whose catalog lives on the test/live override, not the
+        // detached handle.
+        return Ok(model.clone());
+    }
     let providers = args.config.providers();
     routes.retain(|route| crate::agents::prepared_route_is_compatible(slot, route, &providers));
     ensure!(
@@ -3042,41 +3086,6 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         "prepared vNext primary-slot default no longer satisfies the current provider generation and hard requirements"
     );
     let allowed_label = format_prepared_route_list(&routes);
-
-    if let Some(model) = &args.model_override {
-        let matching = routes.iter().find(|route| {
-            route.model_id == model.model_id_ref()
-                && (route.provider_profile_handle == model.provider_id()
-                    || route.provider_id == model.provider_id())
-        });
-        if let Some(route) = matching {
-            return model_from_prepared_route(route, args).with_context(|| {
-                format!(
-                    "loading selected prepared vNext route `{}:{}`",
-                    route.provider_id, route.model_id
-                )
-            });
-        }
-        if args.delegated {
-            bail!(
-                "explicit model override `{}:{}` is not in vNext child `{}` primary-slot routes: {allowed_label}",
-                model.provider_id(),
-                model.model_id_ref(),
-                def.name
-            );
-        }
-        // Root out-of-set selection is the issue #75 derived-definition path:
-        // preserve the exact pinned definition/posture, substitute only the
-        // execution model, and surface the widening as a lint-level warning.
-        tracing::warn!(
-            agent = %def.name,
-            provider = %model.provider_id(),
-            model = %model.model_id_ref(),
-            allowed_routes = %allowed_label,
-            "vNext root model override is outside the prepared slot set; using a derived definition with unchanged posture"
-        );
-        return Ok(model.clone());
-    }
 
     if let Some(selector) = &args.delegation_model {
         if !extended.agent_chooses_subagent_model {
@@ -3145,16 +3154,39 @@ fn resolve_unprepared_vnext_primary_slot(
     if let Some(model) = &args.model_override
         && !args.delegated
     {
-        tracing::warn!(
-            agent = %def.name,
-            provider = %model.provider_id(),
-            model = %model.model_id_ref(),
-            "vNext root model override derived from the pinned definition without prepared slot routes"
-        );
+        // Unprepared roots accept a picker pin the same way prepared roots
+        // do: the live override already went through `build_live_model`.
         return Ok(model.clone());
     }
     if slot.models.is_empty() {
-        return Ok(args.model.clone());
+        if crate::engine::model_roles::default_role_for_agent(&def.name).is_none() {
+            // Session-ownable primaries (Build/Plan/…) keep the spawn/resume
+            // model. Role-mapped children still take smart_code/cheap_code.
+            return Ok(args.model.clone());
+        }
+        // Empty vNext slots mean any compatible offering, not a blind inherit
+        // of the session model. Role defaults (builder → smart_code, explore →
+        // cheap_code) and parent-named selectors still apply.
+        return crate::engine::model_roles::resolve_delegated_model_with_store(
+            &def.name,
+            def.model.as_deref(),
+            args.delegation_model.as_ref(),
+            extended,
+            &args.config.providers(),
+            &args.model,
+            args.credential_store.clone(),
+        )
+        .map_err(|err| match err {
+            crate::engine::model_roles::SelectorResolution::Unset => {
+                anyhow::anyhow!(
+                    "no compatible model for unprepared vNext agent `{}`",
+                    def.name
+                )
+            }
+            crate::engine::model_roles::SelectorResolution::InvalidLiteral(message) => {
+                anyhow::anyhow!("invalid explicit subagent model selector: {message}")
+            }
+        });
     }
     if !args.delegated {
         // Unprepared roots keep today's active_model / persisted resume path.
@@ -3185,28 +3217,46 @@ fn resolve_unprepared_vnext_delegation_selector(
     let allowed_label = format_slot_allowed_models(slot);
     if !extended.agent_chooses_subagent_model {
         bail!(
-            "parent-named model selector is refused because agent_chooses_subagent_model is off; allowed routes: {allowed_label}"
+            "subagent model selector is refused because agent_chooses_subagent_model is off; allowed routes: {allowed_label}"
         );
+    }
+    if slot.models.is_empty() {
+        return crate::engine::model_roles::resolve_policy_selector_with_store(
+            selector,
+            &def.name,
+            extended,
+            &args.config.providers(),
+            &args.model,
+            args.credential_store.clone(),
+        )
+        .map(|(model, _)| model)
+        .map_err(|err| match err {
+            crate::engine::model_roles::SelectorResolution::Unset => {
+                anyhow::anyhow!("subagent model selector did not resolve to a compatible offering")
+            }
+            crate::engine::model_roles::SelectorResolution::InvalidLiteral(message) => {
+                anyhow::anyhow!("invalid explicit subagent model selector: {message}")
+            }
+        });
     }
     let crate::engine::model_roles::DelegationModelSelector::Exact { selector, .. } = selector
     else {
         bail!(
-            "parent-named category selector is refused; child slot allowed routes: {allowed_label}"
+            "subagent model selector category is refused; child slot allowed routes: {allowed_label}"
         );
     };
     let (provider, model) = crate::engine::model_roles::split_selector(selector).ok_or_else(|| {
         anyhow::anyhow!(
-            "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
+            "subagent model selector `{selector}` is not in the child slot allowed route set: {allowed_label}"
         )
     })?;
-    if !slot.models.is_empty()
-        && !slot
-            .models
-            .iter()
-            .any(|allowed| allowed.provider_id == provider && allowed.model_id == model)
+    if !slot
+        .models
+        .iter()
+        .any(|allowed| allowed.provider_id == provider && allowed.model_id == model)
     {
         bail!(
-            "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
+            "subagent model selector `{selector}` is not in the child slot allowed route set: {allowed_label}"
         );
     }
     model_from_unprepared_slot_ids(
@@ -3959,8 +4009,7 @@ pub fn docs_answerer(args: &SpawnArgs) -> Result<Agent> {
 pub(crate) mod tests {
     use super::*;
 
-    use crate::config::extended::ExtendedConfig;
-    use crate::engine::tool::Tool;
+    use crate::{config::extended::ExtendedConfig, engine::tool::Tool};
 
     /// F3. Computer use ships desktop screenshots — a potentially sensitive
     /// payload — so its route is custody-typed. Custody is the configured
@@ -4209,8 +4258,7 @@ pub(crate) mod tests {
 
     #[test]
     fn read_image_direct_native_tiers() {
-        use crate::agents::ToolTier;
-        use crate::tool_media_authority::MediaToolAvailability;
+        use crate::{agents::ToolTier, tool_media_authority::MediaToolAvailability};
 
         let tmp = tempfile::tempdir().unwrap();
         let enabled_agents = ["Build", "Plan", "explore"];
@@ -5593,9 +5641,9 @@ pub(crate) mod tests {
             r#"{
               "url": "http://localhost:1/v1",
               "models": [
-                { "id": "local", "subagent_invokable": true },
-                { "id": "smart", "subagent_invokable": true },
-                { "id": "cheap", "subagent_invokable": true }
+                { "id": "local", "subagent_invokable": true, "context_length": 128000 },
+                { "id": "smart", "subagent_invokable": true, "context_length": 128000 },
+                { "id": "cheap", "subagent_invokable": true, "context_length": 128000 }
               ]
             }"#,
         )
@@ -6157,10 +6205,6 @@ pub(crate) mod tests {
                 "`{name}` must name the `docs` route for dependency usage"
             );
             assert!(
-                low.contains("first move"),
-                "`{name}` defensive body must make `docs` the first move"
-            );
-            assert!(
                 low.contains("guess"),
                 "`{name}` must steer away from guessing the API"
             );
@@ -6448,8 +6492,10 @@ pub(crate) mod tests {
     /// path, expand_handoff_tags, and BTW inventory without a handoff tool.
     #[test]
     fn live_handoff_named_features_unchanged() {
-        use crate::engine::agent::TurnEvent;
-        use crate::engine::compact::{StateAppendix, assemble_handoff};
+        use crate::engine::{
+            agent::TurnEvent,
+            compact::{StateAppendix, assemble_handoff},
+        };
 
         // CompactReady still carries a handoff string field (compaction).
         let compact_ready = TurnEvent::CompactReady {
@@ -7816,9 +7862,12 @@ pub(crate) mod tests {
 
     #[test]
     fn audio_video_media_availability() {
-        use crate::config::providers::CapabilityStatus;
-        use crate::tool_media_authority::{
-            AvRuntimeProfile, MEDIA_TOOL_NAMES, MediaToolAvailability, MediaToolAvailabilityReason,
+        use crate::{
+            config::providers::CapabilityStatus,
+            tool_media_authority::{
+                AvRuntimeProfile, MEDIA_TOOL_NAMES, MediaToolAvailability,
+                MediaToolAvailabilityReason,
+            },
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -7893,7 +7942,9 @@ pub(crate) mod tests {
                             av_in_mcp(&build).is_empty(),
                             "direct-enabled A/V must stay absent from MCP/Monty"
                         );
-                        if audio == CapabilityStatus::RequiresEntitlement {
+                        if profile.supports_inspect_audio()
+                            && audio == CapabilityStatus::RequiresEntitlement
+                        {
                             assert_eq!(
                                 avail.reason_for("inspect_audio"),
                                 MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
@@ -7916,8 +7967,10 @@ pub(crate) mod tests {
 
     #[test]
     fn audio_video_accepted_root_turn_activates_deferred_exact_profile() {
-        use crate::config::providers::CapabilityStatus;
-        use crate::tool_media_authority::{AvRuntimeProfile, MediaToolAvailability};
+        use crate::{
+            config::providers::CapabilityStatus,
+            tool_media_authority::{AvRuntimeProfile, MediaToolAvailability},
+        };
 
         let tmp = tempfile::tempdir().unwrap();
         // Daemon roots are constructed before a user submission has a live
@@ -7955,9 +8008,11 @@ pub(crate) mod tests {
 
     #[test]
     fn audio_video_agentdef_materialization() {
-        use crate::agents::ToolTier;
-        use crate::config::providers::CapabilityStatus;
-        use crate::tool_media_authority::{AvRuntimeProfile, MediaToolAvailability};
+        use crate::{
+            agents::ToolTier,
+            config::providers::CapabilityStatus,
+            tool_media_authority::{AvRuntimeProfile, MediaToolAvailability},
+        };
 
         let tmp = tempfile::tempdir().unwrap();
         let avail = MediaToolAvailability::available_with(

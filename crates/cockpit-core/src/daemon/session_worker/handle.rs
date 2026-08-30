@@ -1,7 +1,4 @@
-use super::helpers::*;
-use super::lifecycle::*;
-use super::run::run_worker;
-use super::*;
+use super::{helpers::*, lifecycle::*, run::run_worker, *};
 
 /// Handle one or more client tasks hold to drive a session. Cheap to
 /// clone — both channels inside are reference-counted.
@@ -438,6 +435,11 @@ pub struct SessionConfigSnapshot {
     /// snapshot, so a recovered allowed refresh always has the same host-owned
     /// execution seam available.
     pub(crate) host_capability_refresh_runtime: Option<HostCapabilityRefreshRuntime>,
+    /// Daemon-owned installed-agent directory (`<pid-file-parent>/agents`).
+    /// Workers must load prepared roots from this tree, not from process
+    /// `COCKPIT_HOME`, which is a different directory in tests and can
+    /// diverge from the installation service in production.
+    pub(crate) daemon_agents_dir: Option<PathBuf>,
 }
 
 impl SessionConfigSnapshot {
@@ -457,6 +459,7 @@ impl SessionConfigSnapshot {
             hooks: crate::config::extended::hooks::HookRegistry::default(),
             host_capabilities: super::unpublished_host_capability_snapshot(),
             host_capability_refresh_runtime: None,
+            daemon_agents_dir: None,
         }
     }
 
@@ -478,7 +481,13 @@ impl SessionConfigSnapshot {
             hooks,
             host_capabilities: super::unpublished_host_capability_snapshot(),
             host_capability_refresh_runtime: None,
+            daemon_agents_dir: None,
         }
+    }
+
+    pub fn with_daemon_agents_dir(mut self, dir: PathBuf) -> Self {
+        self.daemon_agents_dir = Some(dir);
+        self
     }
 
     pub fn with_guidance_doc_layers(
@@ -622,6 +631,14 @@ impl SessionConfigHandle {
     /// direct disk reads produced.
     #[cfg(test)]
     pub fn from_disk_for_tests(cwd: &std::path::Path) -> Self {
+        Self::from_disk_for_tests_at_generation(cwd, 0)
+    }
+
+    /// Same as [`Self::from_disk_for_tests`], but the snapshot carries
+    /// `generation` so a test refresh can advance the same counter a worker
+    /// re-resolution would.
+    #[cfg(test)]
+    pub fn from_disk_for_tests_at_generation(cwd: &std::path::Path, generation: u64) -> Self {
         // Resolve the layered configs directly (no credential-migration side
         // effect, so widespread test use does not mutate the process-global
         // migration latch and cause cross-test interference), under an explicit
@@ -639,6 +656,12 @@ impl SessionConfigHandle {
             }),
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
+        let saved_explicit = std::env::var_os(crate::config::dirs::COCKPIT_CONFIG_ENV);
+        // This helper must load the tempdir's project layer even when a
+        // process-wide COCKPIT_CONFIG points at an unrelated file.
+        unsafe {
+            std::env::remove_var(crate::config::dirs::COCKPIT_CONFIG_ENV);
+        }
         let (providers, extended, hooks) =
             crate::config::trust::with_workspace_trust_policy(policy, || {
                 (
@@ -647,8 +670,14 @@ impl SessionConfigHandle {
                     crate::config::extended::hooks::resolve_hooks_for_cwd(cwd),
                 )
             });
+        match saved_explicit {
+            Some(value) => unsafe {
+                std::env::set_var(crate::config::dirs::COCKPIT_CONFIG_ENV, value);
+            },
+            None => {}
+        }
         Self::detached(SessionConfigSnapshot::with_hooks(
-            0, providers, extended, hooks,
+            generation, providers, extended, hooks,
         ))
     }
 
@@ -675,6 +704,17 @@ impl SessionConfigHandle {
         Self {
             shared: self.shared.clone(),
             pinned: Some(Arc::new(self.read_shared())),
+        }
+    }
+
+    /// Keep an already-prepared pin. `repin()` always re-reads the shared
+    /// cell, which would drop a prepare-time generation that the child runner
+    /// still has to observe.
+    pub fn ensure_pinned(&self) -> Self {
+        if self.pinned.is_some() {
+            self.clone()
+        } else {
+            self.repin()
         }
     }
 

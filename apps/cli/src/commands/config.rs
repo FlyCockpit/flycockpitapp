@@ -1,8 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 #[cfg(feature = "extended")]
 use crate::cli::ImageSpendArgs;
 use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs};
+#[cfg(feature = "extended")]
+use anyhow::bail;
 
 pub async fn run(cmd: ConfigCommand) -> Result<()> {
     match cmd {
@@ -90,7 +92,7 @@ async fn export_policy(args: ConfigExportPolicyArgs) -> Result<()> {
         .await?
         .map_err(|error| anyhow::anyhow!("daemon rejected policy export: {error}"))?;
     let crate::daemon::proto::Response::PolicyExported { bundle_json: json } = response else {
-        bail!("daemon returned unexpected policy export response: {response:?}");
+        anyhow::bail!("daemon returned unexpected policy export response: {response:?}");
     };
     match args.output {
         Some(path) => {
@@ -130,7 +132,7 @@ async fn import_policy(args: ConfigImportPolicyArgs) -> Result<()> {
         provider_count,
     } = response
     else {
-        bail!("daemon returned unexpected policy import response: {response:?}");
+        anyhow::bail!("daemon returned unexpected policy import response: {response:?}");
     };
 
     let mode = if args.replace { "replaced" } else { "merged" };

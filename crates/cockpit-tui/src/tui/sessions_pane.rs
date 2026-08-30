@@ -1886,7 +1886,11 @@ pub fn card_description(s: &SessionSummary) -> String {
     } else {
         short_id(&s.session_id.to_string())
     };
-    match s.description.as_deref().filter(|description| !description.is_empty()) {
+    match s
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
         Some(description) => format!("{title} — {description}"),
         None => title,
     }

@@ -11626,8 +11626,8 @@ impl Driver {
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
         let (extended, providers) = self.config.configs();
-        let use_session_model_metadata = extended.auto_title_with_session_model
-            || extended.auto_title_model_ref().is_none();
+        let use_session_model_metadata =
+            extended.auto_title_with_session_model || extended.auto_title_model_ref().is_none();
         let (title_action, metadata_action) = if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,
@@ -11640,8 +11640,7 @@ impl Driver {
                 crate::session::MetadataAction::None,
             )
         };
-        if !use_session_model_metadata
-            && !matches!(title_action, crate::session::TitleAction::None)
+        if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {
@@ -11821,8 +11820,7 @@ impl Driver {
                 delivery_class: Default::default(),
             })
         };
-        if self.stack.len() == 1
-            && !matches!(metadata_action, crate::session::MetadataAction::None)
+        if self.stack.len() == 1 && !matches!(metadata_action, crate::session::MetadataAction::None)
         {
             let top = self.stack.last().expect("stack never empty");
             let session = self.session.clone();

@@ -541,6 +541,15 @@ mod tests {
     }
 
     #[test]
+    fn metadata_fork_instruction_prefills_the_combined_monty_call() {
+        let instruction = metadata_fork_instruction(MetadataAction::TitleAndDescribe);
+        assert!(instruction.contains("mcp.invoke"));
+        assert!(instruction.contains("set_session_metadata"));
+        assert!(instruction.contains("\"title\""));
+        assert!(instruction.contains("\"description\""));
+    }
+
+    #[test]
     fn estimate_tokens_delegates_to_tiktoken() {
         assert_eq!(estimate_tokens(""), 0);
         // Real cl100k_base counts; just sanity-check that non-empty

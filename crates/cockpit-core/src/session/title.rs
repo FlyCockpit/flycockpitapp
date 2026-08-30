@@ -267,26 +267,19 @@ impl Session {
     /// itself rather than racing the utility-title path.
     pub fn note_user_content_for_metadata(&self, text: &str) -> MetadataAction {
         let increment = crate::auto_title::estimate_tokens(text);
-        if increment != 0 {
-            self.user_content_tokens
-                .fetch_add(increment, Ordering::Relaxed);
+        if increment == 0 {
+            return MetadataAction::None;
         }
-        let user_turns = if increment == 0 {
-            self.user_content_turns.load(Ordering::Relaxed)
-        } else {
-            self.user_content_turns.fetch_add(1, Ordering::Relaxed) + 1
-        };
+        self.user_content_tokens
+            .fetch_add(increment, Ordering::Relaxed);
+        let user_turns = self.user_content_turns.fetch_add(1, Ordering::Relaxed) + 1;
         if self.user_renamed() {
-            if increment != 0 {
-                self.persist_title_progress();
-            }
+            self.persist_title_progress();
             return MetadataAction::None;
         }
         let last_slot = self.title_stage.load(Ordering::Relaxed);
         let Some(slot) = scheduled_metadata_slot(user_turns, last_slot) else {
-            if increment != 0 {
-                self.persist_title_progress();
-            }
+            self.persist_title_progress();
             return MetadataAction::None;
         };
         self.title_stage.store(slot, Ordering::Relaxed);
@@ -438,5 +431,53 @@ impl Session {
         }
         *last = Some(now);
         Some(format!("[time: {}]", now.to_rfc3339()))
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn metadata_cadence_uses_user_boundaries_and_describes_at_higher_slots() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/metadata-cadence"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        for expected in [
+            MetadataAction::TitleAndDescribe,
+            MetadataAction::TitleAndDescribe,
+            MetadataAction::None,
+            MetadataAction::TitleAndDescribe,
+        ] {
+            assert_eq!(
+                session.note_user_content_for_metadata("user content"),
+                expected
+            );
+        }
+        for _ in 5..=16 {
+            let action = session.note_user_content_for_metadata("user content");
+            if session.user_content_turns() == 8 || session.user_content_turns() == 16 {
+                assert_eq!(action, MetadataAction::TitleAndDescribe);
+            } else {
+                assert_eq!(action, MetadataAction::None);
+            }
+        }
+        for _ in 17..=31 {
+            assert_eq!(
+                session.note_user_content_for_metadata("later user boundary"),
+                MetadataAction::None
+            );
+        }
+        assert_eq!(
+            session.note_user_content_for_metadata("next user boundary"),
+            MetadataAction::Describe
+        );
+        assert_eq!(session.title_stage(), 32);
     }
 }

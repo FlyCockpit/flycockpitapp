@@ -1373,7 +1373,8 @@ fn rename_session_availability(ctx: &HostContext) -> Availability {
 }
 
 fn auto_title_model_configured(ctx: &HostContext) -> bool {
-    ctx.config.extended().auto_title_model_ref().is_some()
+    let extended = ctx.config.extended();
+    extended.auto_title_model_ref().is_some() && !extended.auto_title_with_session_model
 }
 
 fn rename_session<'a>(
@@ -1606,6 +1607,22 @@ mod tests {
         RwLock,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn metadata_function_is_absent_from_the_main_builtin_catalog() {
+        assert!(
+            BuiltinRegistry::default_with(Vec::new())
+                .get("set_session_metadata")
+                .is_none(),
+            "the foreground Monty catalog must not discover fork metadata"
+        );
+        assert!(
+            BuiltinRegistry::metadata_fork()
+                .get("set_session_metadata")
+                .is_some(),
+            "the ephemeral fork catalog owns the metadata function"
+        );
+    }
 
     struct MontyAdapterTool {
         name: String,

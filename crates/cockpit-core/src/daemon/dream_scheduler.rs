@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, oneshot};
 use crate::config::extended::{KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
 use crate::config::providers::ActiveModelRef;
 use crate::daemon::config_source::ConfigSource;
-use crate::daemon::proto::{EnvSnapshotSource, QueueDeliveryClass, SessionEntryMode};
+use crate::daemon::proto::{EnvSnapshotSource, QueueDeliveryClass};
 use crate::daemon::registry::SessionRegistry;
 use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
@@ -296,14 +296,11 @@ pub(crate) async fn run_knowledge_dream(
     let commit_before = local_knowledge_dream_head(knowledge_base, workspace_root);
 
     let handle = registry
-        .attach(
-            None,
-            Some(workspace_root.to_path_buf()),
-            Some(model.clone()),
+        .attach_dream_session(
+            workspace_root.to_path_buf(),
+            model.clone(),
             no_sandbox,
-            Some(&model),
             EnvSnapshot::from_process(EnvSnapshotSource::DaemonStart),
-            SessionEntryMode::Code,
         )
         .await
         .context("starting Dream session")?;

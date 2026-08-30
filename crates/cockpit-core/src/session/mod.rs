@@ -2888,6 +2888,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_dream_session_persists_its_audit_flag() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Dream",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        session.set_deferred_dream_session().unwrap();
+        assert!(session.persist_if_needed().unwrap());
+        assert!(
+            db.get_session(session.id)
+                .await
+                .unwrap()
+                .expect("persisted dream session")
+                .is_dream_session
+        );
+    }
+
+    #[tokio::test]
     async fn persist_if_needed_adopts_collision_retry_short_id() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred_for_test(

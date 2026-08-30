@@ -1036,6 +1036,55 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
     ) -> Result<SessionWorkerHandle> {
+        self.attach_with_creation_flags(
+            session_id,
+            project_root,
+            initial_model,
+            client_no_sandbox,
+            model_override,
+            env_snapshot,
+            session_entry_mode,
+            false,
+        )
+        .await
+    }
+
+    /// Start the one durable session that records a knowledge-dream run. Its
+    /// transcript remains available by explicit session address for audit,
+    /// while the creation-only flag excludes it from ordinary recall and all
+    /// future dream source scans.
+    pub(crate) async fn attach_dream_session(
+        &self,
+        project_root: PathBuf,
+        model: ActiveModelRef,
+        client_no_sandbox: bool,
+        env_snapshot: EnvSnapshot,
+    ) -> Result<SessionWorkerHandle> {
+        self.attach_with_creation_flags(
+            None,
+            Some(project_root),
+            Some(model.clone()),
+            client_no_sandbox,
+            Some(&model),
+            env_snapshot,
+            crate::daemon::proto::SessionEntryMode::Code,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_with_creation_flags(
+        &self,
+        session_id: Option<Uuid>,
+        project_root: Option<PathBuf>,
+        initial_model: Option<ActiveModelRef>,
+        client_no_sandbox: bool,
+        model_override: Option<&ActiveModelRef>,
+        env_snapshot: EnvSnapshot,
+        session_entry_mode: crate::daemon::proto::SessionEntryMode,
+        is_dream_session: bool,
+    ) -> Result<SessionWorkerHandle> {
         // This is deliberately daemon-wide rather than keyed by session id:
         // trust transitions select workers by durable workspace root, while a
         // cold attach does not know that root until it has resolved authority.
@@ -1160,6 +1209,7 @@ impl SessionRegistry {
             model_override,
             env_snapshot,
             session_entry_mode,
+            is_dream_session,
             &worker_publication_permit,
         ))
         .await
@@ -1340,6 +1390,7 @@ impl SessionRegistry {
         model_override: Option<&ActiveModelRef>,
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
+        is_dream_session: bool,
         worker_publication: &WorkerPublicationPermit<'_>,
     ) -> Result<SessionWorkerHandle> {
         // Linearize the full preflight/start handoff with trust decisions and
@@ -1420,6 +1471,9 @@ impl SessionRegistry {
         )
         .context("creating session")?;
         session.set_deferred_entry_mode(session_entry_mode)?;
+        if is_dream_session {
+            session.set_deferred_dream_session()?;
+        }
         session
             .set_active_model_ref(active)
             .context("setting active model on new session")?;

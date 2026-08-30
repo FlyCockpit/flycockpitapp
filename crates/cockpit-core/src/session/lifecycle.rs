@@ -237,6 +237,22 @@ impl Session {
         Ok(())
     }
 
+    /// Mark a newly-created daemon session as a knowledge-dream transcript
+    /// before its deferred row can be persisted. The flag is intentionally
+    /// creation-only: a normal user transcript must never be retroactively
+    /// hidden from default recall.
+    pub(crate) fn set_deferred_dream_session(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_row.lock().unwrap().is_some(),
+            "dream-session flag may only be set before a new session is persisted"
+        );
+        anyhow::ensure!(
+            self.stage_pending_row(|row| row.is_dream_session = true),
+            "deferred session row disappeared while marking dream transcript"
+        );
+        Ok(())
+    }
+
     pub fn session_entry_mode(&self) -> crate::daemon::proto::SessionEntryMode {
         self.session_entry_mode
     }

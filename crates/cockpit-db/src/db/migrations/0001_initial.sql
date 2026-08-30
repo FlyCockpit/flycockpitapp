@@ -133,6 +133,11 @@ CREATE TABLE sessions (
     last_viewed_at_unix_ms INTEGER,
     archived_at_unix_ms    INTEGER,
 
+    -- Dream orchestrator/worker transcripts are retained for auditing, but
+    -- are process noise: default history recall and future dream runs must
+    -- never select them. Explicit session addressing remains available.
+    is_dream_session INTEGER NOT NULL DEFAULT 0 CHECK (is_dream_session IN (0, 1)),
+
     -- live guidance-file diff injection: hash + path of the resolved
     -- agent-guidance body baked into this session's frozen system block,
     -- so a mid-session in-place edit is detected and injected as a

@@ -100,8 +100,9 @@ impl Db {
     ///   * `project_id = Some(p)` confines to that project; `None` is
     ///     global recall across every project.
     ///   * `exclude_session` drops the current live thread.
-    ///   * archived threads (`archived_at_unix_ms IS NOT NULL`) are always
-    ///     excluded — search never surfaces a soft-deleted thread.
+    ///   * archived threads (`archived_at_unix_ms IS NOT NULL`) and knowledge
+    ///     dream transcripts are always excluded — either remains available
+    ///     by explicit session address, but neither is default-recall noise.
     ///   * `since` (epoch seconds) keeps only threads active at/after it.
     pub async fn search_candidates(
         &self,
@@ -383,6 +384,7 @@ fn search_candidates_inner(
                 AND h.session_id = e.session_id
               WHERE session_fts MATCH ?1
                 AND s.archived_at_unix_ms IS NULL
+                AND s.is_dream_session = 0
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
@@ -1186,6 +1188,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(global.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_recall_excludes_dream_transcripts_but_explicit_reads_keep_them_auditable() {
+        let db = Db::open_in_memory().unwrap();
+        let ordinary = db.create_session("p", "/x", "Build").await.unwrap();
+        let dream = db.create_session("p", "/x", "Dream").await.unwrap();
+        let dream_id = dream.session_id;
+        msg(
+            &db,
+            ordinary.session_id,
+            SessionEventKind::UserMessage,
+            "shared audit marker",
+        )
+        .await;
+        msg(
+            &db,
+            dream_id,
+            SessionEventKind::UserMessage,
+            "shared audit marker",
+        )
+        .await;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET is_dream_session = 1 WHERE session_id = ?1",
+                [dream_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let hits = db
+            .search_candidates("shared audit marker", Some("p"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.session_id).collect::<Vec<_>>(),
+            vec![ordinary.session_id]
+        );
+        assert_eq!(
+            db.thread_turns(dream_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|turn| turn.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared audit marker"]
+        );
     }
 
     #[tokio::test]

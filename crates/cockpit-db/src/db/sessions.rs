@@ -198,6 +198,10 @@ pub struct SessionRow {
     /// migration 0010). `None` = live. Archived sessions are hidden from
     /// the browser by default.
     pub archived_at_unix_ms: Option<i64>,
+    /// `true` for a knowledge-dream transcript. These remain auditable by
+    /// explicit session address, but are excluded from default recall and
+    /// future dream source selection.
+    pub is_dream_session: bool,
     /// `true` for a throwaway `/side` side-conversation fork (migration
     /// 0017) and for persistent `/btw` forks. Ephemeral sessions are
     /// excluded from every list query and never auto-titled. Legacy `/side`
@@ -291,6 +295,7 @@ impl SessionRow {
             user_renamed: user_renamed != 0,
             last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
             archived_at_unix_ms: row.get("archived_at_unix_ms")?,
+            is_dream_session: row.get::<_, i64>("is_dream_session")? != 0,
             ephemeral: row.get::<_, i64>("ephemeral")? != 0,
             btw_parent_session_id,
             btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
@@ -448,8 +453,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
-          assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+          assistant_name, created_by_principal, shared_with_collaborators, is_dream_session)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -473,6 +478,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.assistant_name,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
+            row.is_dream_session as i64,
         ],
     )?;
     Ok(())
@@ -513,8 +519,8 @@ fn execute_fork_insert(
           title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
-          model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+          model_system_prompt_snapshot_json, assistant_name, active_model_revision, is_dream_session)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -546,6 +552,7 @@ fn execute_fork_insert(
             row.model_system_prompt_snapshot_json,
             row.assistant_name,
             row.active_model_revision,
+            row.is_dream_session as i64,
         ],
     )?;
     Ok(())
@@ -661,6 +668,7 @@ fn build_session_row(
         user_renamed: false,
         last_viewed_at_unix_ms: None,
         archived_at_unix_ms: None,
+        is_dream_session: false,
         ephemeral: false,
         btw_parent_session_id: None,
         btw_tangent: false,
@@ -1346,6 +1354,7 @@ impl Db {
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
+            is_dream_session: false,
             ephemeral: true,
             btw_parent_session_id: Some(parent_session_id),
             btw_tangent: tangent,
@@ -1503,6 +1512,7 @@ impl Db {
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
+            is_dream_session: parent.is_dream_session,
             ephemeral,
             btw_parent_session_id: None,
             btw_tangent: false,

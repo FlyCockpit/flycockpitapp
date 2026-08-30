@@ -8,7 +8,8 @@
 use std::fmt;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use cockpit_db::db::sealed_scope::SealedScopeKind;
@@ -151,32 +152,36 @@ impl fmt::Display for SealedProjectKey {
     }
 }
 
-/// A validated knowledge-base identity used as the key for KB-scoped sealed
-/// values. This deliberately follows the KB registry grammar, so a symbolic
-/// reference cannot name a different spelling of the same configured KB.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SealedKnowledgeBaseId(String);
+/// The immutable attachment identity of a knowledge base used as the key for
+/// KB-scoped sealed values.
+///
+/// This is deliberately *not* the user-configured registry id. Registry ids
+/// are names and can be reused after a source is removed; attachment ids bind
+/// a capability to the concrete source object that owns its markdown.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SealedKnowledgeBaseId(Uuid);
 
 impl SealedKnowledgeBaseId {
     pub fn parse(raw: &str) -> Result<Self> {
-        if raw.is_empty()
-            || !raw
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        {
-            bail!("knowledge base IDs must be non-empty ASCII alphanumeric, `-`, or `_`");
+        let id = Uuid::parse_str(raw).context("knowledge base attachment ID must be a UUID")?;
+        if id.is_nil() {
+            bail!("knowledge base attachment ID must not be nil");
         }
-        Ok(Self(raw.to_string()))
+        Ok(Self(id))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn from_attachment_id(id: Uuid) -> Result<Self> {
+        Self::parse(&id.to_string())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
     }
 }
 
 impl fmt::Display for SealedKnowledgeBaseId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -224,7 +229,7 @@ impl SealedScopeRef {
             Self::Session(id) => id.to_string(),
             Self::Project(key) => key.as_str().to_string(),
             Self::Global => String::new(),
-            Self::KnowledgeBase(id) => id.as_str().to_string(),
+            Self::KnowledgeBase(id) => id.to_string(),
         }
     }
 }

@@ -124,6 +124,7 @@ pub(crate) struct IndexStats {
 pub(crate) struct AttachedKnowledgeBase {
     entry: KnowledgeBaseRegistryEntry,
     provider: Arc<dyn KbProvider>,
+    sealed_id: crate::sealed::SealedKnowledgeBaseId,
 }
 
 /// The KBs a concrete model may access, plus local KB IDs withheld by the
@@ -1276,6 +1277,10 @@ pub(crate) async fn inject_knowledge_for_turn(
                 embedder,
                 query,
                 DEFAULT_SEARCH_LIMIT,
+                Some(&crate::sealed::LocalVaultResolver::new(
+                    session.secret_vault().clone(),
+                )),
+                executing_model_trusted,
             )
             .await
             {
@@ -1325,6 +1330,8 @@ async fn retrieve_from_knowledge_bases(
     embedder: Arc<dyn Embedder>,
     query: &str,
     limit: usize,
+    resolver: Option<&dyn crate::sealed::SealedResolver>,
+    trusted_reader: bool,
 ) -> Result<Vec<SearchResult>> {
     let mut all = Vec::new();
     let mut available_providers = Vec::new();
@@ -1347,10 +1354,25 @@ async fn retrieve_from_knowledge_bases(
                 });
             }
         }
-        available_providers.push(knowledge_base.provider.with_embedder(embedder.clone()));
+        available_providers.push((
+            knowledge_base.sealed_id.clone(),
+            knowledge_base.provider.with_embedder(embedder.clone()),
+        ));
     }
-    for provider in available_providers {
-        all.extend(provider.retrieve(query, limit).await?);
+    for (kb_id, provider) in available_providers {
+        let mut results = provider.retrieve(query, limit).await?;
+        if let Some(resolver) = resolver {
+            for result in &mut results {
+                result.snippet = crate::sealed::resolve_kb_markdown(
+                    &result.snippet,
+                    &kb_id,
+                    resolver,
+                    trusted_reader,
+                )
+                .await?;
+            }
+        }
+        all.extend(results);
     }
     all.sort_by(|a, b| {
         b.score
@@ -1503,15 +1525,115 @@ pub(crate) async fn attached_bundles(
             denied_knowledge_base_ids.push(entry.id.clone());
             continue;
         }
+        let sealed_id = sealed_knowledge_base_identity(&entry)?;
         let Some(provider) = provider_for(entry.clone(), local)? else {
             continue;
         };
-        knowledge_bases.push(AttachedKnowledgeBase { entry, provider });
+        knowledge_bases.push(AttachedKnowledgeBase {
+            entry,
+            provider,
+            sealed_id,
+        });
     }
     Ok(AttachedKnowledgeBases {
         bundles: knowledge_bases,
         denied_knowledge_base_ids,
     })
+}
+
+/// Resolve a model-visible registry label to the immutable attachment identity
+/// that seals values for that concrete KB source. The label never becomes part
+/// of a token or vault locator, so deleting and recreating a label cannot
+/// inherit the predecessor's sealed namespace.
+pub(crate) async fn sealed_knowledge_base_id_for_tool(
+    ctx: &ToolCtx,
+    registry_id: &str,
+) -> Result<crate::sealed::SealedKnowledgeBaseId> {
+    let extended = ctx.config.extended();
+    validate_dream_models(&extended, &ctx.config.providers())?;
+    let attachments = attached_bundles(
+        &ctx.session,
+        &ctx.cwd,
+        None,
+        &extended,
+        ctx.knowledge_access_trusted,
+    )
+    .await?;
+    if attachments
+        .denied_knowledge_base_ids
+        .iter()
+        .any(|id| id == registry_id)
+    {
+        bail!(knowledge_access_denied_message(&[registry_id.to_string()]));
+    }
+    let entry = attachments
+        .bundles
+        .iter()
+        .find(|bundle| bundle.entry.id == registry_id)
+        .map(|bundle| &bundle.sealed_id)
+        .context("knowledge base is unavailable or not attached")?;
+    Ok(entry.clone())
+}
+
+/// Stable sealed-value identity for one KB source object. Unlike the broader
+/// attachment identity used for dream ordering, this intentionally excludes
+/// markdown content: authoring a new symbolic token changes the source text
+/// but must not strand the token it just created. Replacing the directory or a
+/// symlink target changes the object identity and therefore fails old tokens.
+fn sealed_knowledge_base_identity(
+    entry: &KnowledgeBaseRegistryEntry,
+) -> Result<crate::sealed::SealedKnowledgeBaseId> {
+    let KnowledgeBaseSource::Local { path } = &entry.source else {
+        return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(entry.attachment_id());
+    };
+    let root = match std::fs::canonicalize(path) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(uuid::Uuid::new_v4());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("resolving knowledge base source {}", path.display()));
+        }
+    };
+    let metadata = std::fs::metadata(&root)
+        .with_context(|| format!("reading knowledge base source {}", root.display()))?;
+    if !metadata.is_dir() {
+        bail!(
+            "knowledge base source {} is not a directory",
+            root.display()
+        );
+    }
+    let mut name = b"flycockpit/knowledge-sealed-attachment/v1\0".to_vec();
+    append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        name.extend_from_slice(&metadata.dev().to_le_bytes());
+        name.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        name.extend_from_slice(&metadata.creation_time().to_le_bytes());
+        name.extend_from_slice(&metadata.file_attributes().to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let created = metadata
+            .created()
+            .context("reading knowledge base source creation time")?
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("knowledge base source creation time predates Unix epoch")?;
+        name.extend_from_slice(&created.as_secs().to_le_bytes());
+        name.extend_from_slice(&created.subsec_nanos().to_le_bytes());
+    }
+    crate::sealed::SealedKnowledgeBaseId::from_attachment_id(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        &name,
+    ))
 }
 
 fn validate_dream_models(
@@ -2047,8 +2169,17 @@ impl Tool for KnowledgeRetrieveTool {
                 .await?
             {
                 Some(embedder) => {
-                    retrieve_from_knowledge_bases(&bundles.bundles, embedder, &args.query, limit)
-                        .await?
+                    retrieve_from_knowledge_bases(
+                        &bundles.bundles,
+                        embedder,
+                        &args.query,
+                        limit,
+                        Some(&crate::sealed::LocalVaultResolver::new(
+                            ctx.session.secret_vault().clone(),
+                        )),
+                        ctx.knowledge_access_trusted,
+                    )
+                    .await?
                 }
                 None => Vec::new(),
             };
@@ -2309,8 +2440,17 @@ impl Tool for MemorySearchTool {
             ));
         };
         let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
-        let results =
-            retrieve_from_knowledge_bases(&bundles.bundles, embedder, &args.query, limit).await?;
+        let results = retrieve_from_knowledge_bases(
+            &bundles.bundles,
+            embedder,
+            &args.query,
+            limit,
+            Some(&crate::sealed::LocalVaultResolver::new(
+                ctx.session.secret_vault().clone(),
+            )),
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
         let content = render_tool_results(&results, ctx.redact.as_ref());
         Ok(ToolOutput::text(content))
     }
@@ -2450,6 +2590,10 @@ mod tests {
                 entry: entry.clone(),
             }),
             entry,
+            sealed_id: crate::sealed::SealedKnowledgeBaseId::parse(
+                "4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9",
+            )
+            .unwrap(),
         }];
 
         let freshness = retrieve_undreamed_session_hits(&bundles, "windfall", 6, &ctx)
@@ -2478,6 +2622,10 @@ mod tests {
                 entry: entry.clone(),
             }),
             entry,
+            sealed_id: crate::sealed::SealedKnowledgeBaseId::parse(
+                "4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9",
+            )
+            .unwrap(),
         }];
         let first = ctx
             .session
@@ -3199,6 +3347,8 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             mock_embedder(),
             "release shipping procedure",
             DEFAULT_SEARCH_LIMIT,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -3255,6 +3405,8 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             mock_embedder(),
             "release shipping procedure",
             DEFAULT_SEARCH_LIMIT,
+            None,
+            false,
         )
         .await
         .unwrap_err();

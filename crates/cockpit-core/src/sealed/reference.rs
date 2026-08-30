@@ -5,11 +5,12 @@
 //! A committed concept carries a symbolic token only:
 //!
 //! ```text
-//! {{sealed:v1:knowledge_base:<kb_id>:<record_uuid>}}
+//! {{sealed:v1:knowledge_base:<kb_attachment_uuid>:<record_uuid>}}
 //! ```
 //!
 //! The grammar has no vault locator, ciphertext detail, installation identity,
-//! or resolver name. `v1` fixes the token grammar, not a transport protocol.
+//! or resolver name. The KB field is the immutable attachment identity, never
+//! the reusable registry label. `v1` fixes the token grammar, not a transport protocol.
 //! A future hosted resolver can therefore resolve the exact same token for an
 //! authorized consumer without rewriting committed markdown. Remote reference
 //! travel is deliberately deferred to the hosted server.
@@ -22,11 +23,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use cockpit_db::db::Db;
 use cockpit_db::secret_vault::SecretVaultKind;
 use uuid::Uuid;
 
-use super::compartment::{SealedCompartment, SealedCompartmentKey, SealedLiteral};
+use super::compartment::SealedLiteral;
 use super::identity::{SealedKnowledgeBaseId, SealedRecordId, SealedScopeKind, SealedScopeRef};
 
 const TOKEN_PREFIX: &str = "{{sealed:v1:";
@@ -82,7 +82,7 @@ impl SealedReference {
         Ok([
             TOKEN_PREFIX,
             "knowledge_base:",
-            kb_id.as_str(),
+            &kb_id.to_string(),
             ":",
             &self.record_id.to_string(),
             TOKEN_SUFFIX,
@@ -128,18 +128,17 @@ pub trait SealedResolver: Send + Sync {
     async fn resolve(&self, reference: &SealedReference) -> Result<SealedLiteral>;
 }
 
-/// Local daemon-vault resolver. It performs exact scope/key/id validation
-/// before reading an existing scoped value, and exact vault-item lookup for a
-/// KB value. A missing, mismatched, malformed, or foreign reference fails.
+/// Local daemon-vault resolver. It performs an exact vault-item lookup for a
+/// KB value. Existing session/project/global values are deliberately excluded:
+/// their only resolution path is the authorized sealed runtime.
 #[derive(Clone)]
 pub struct LocalVaultResolver {
-    db: Db,
     vault: Arc<crate::secure_key::SecretVault>,
 }
 
 impl LocalVaultResolver {
-    pub fn new(db: Db, vault: Arc<crate::secure_key::SecretVault>) -> Self {
-        Self { db, vault }
+    pub fn new(vault: Arc<crate::secure_key::SecretVault>) -> Self {
+        Self { vault }
     }
 }
 
@@ -163,43 +162,7 @@ impl SealedResolver for LocalVaultResolver {
                 Ok(SealedLiteral::new(value))
             }
             SealedScopeKind::Session | SealedScopeKind::Project | SealedScopeKind::Global => {
-                let row = self
-                    .db
-                    .sealed_value_record(reference.record_id.to_string())
-                    .await?
-                    .filter(|row| {
-                        row.is_resolvable()
-                            && row.scope == reference.scope
-                            && row.scope_key == reference.scope_key
-                    })
-                    .context("sealed reference is unresolved or foreign")?;
-                match row.scope {
-                    SealedScopeKind::Session => {
-                        let item_id = crate::secure_key::session_sealed_item_id(
-                            &row.scope_key,
-                            &row.name,
-                            row.active_version,
-                        );
-                        let secret = self
-                            .vault
-                            .get_item(SecretVaultKind::SessionSealedValue, &item_id)
-                            .map_err(|_| anyhow::anyhow!("sealed reference is unresolved"))?;
-                        let value = String::from_utf8(secret.as_slice().to_vec())
-                            .context("sealed referenced value is not UTF-8")?;
-                        Ok(SealedLiteral::new(value))
-                    }
-                    SealedScopeKind::Project | SealedScopeKind::Global => {
-                        let locator = row
-                            .compartment_key
-                            .as_deref()
-                            .context("sealed reference has no compartment locator")?;
-                        let key = SealedCompartmentKey::parse(locator)?;
-                        SealedCompartment::from_vault(self.vault.clone())
-                            .get_exact(&key)?
-                            .context("sealed reference is unresolved")
-                    }
-                    SealedScopeKind::KnowledgeBase => unreachable!("matched above"),
-                }
+                bail!("only knowledge-base references resolve through the local KB resolver")
             }
         }
     }
@@ -235,19 +198,6 @@ impl KnowledgeBaseSealedStore {
             )
             .map_err(|error| anyhow::anyhow!("storing knowledge-base sealed value: {error}"))?;
         Ok(reference)
-    }
-
-    /// Copy material from an exact existing scoped reference into an independent
-    /// KB-scoped vault item. The source reference is resolved once through the
-    /// seam; its token is never copied into markdown as a cross-scope alias.
-    pub async fn copy_from(
-        &self,
-        kb_id: SealedKnowledgeBaseId,
-        source: &SealedReference,
-        resolver: &dyn SealedResolver,
-    ) -> Result<SealedReference> {
-        let literal = resolver.resolve(source).await?;
-        self.create(kb_id, literal)
     }
 }
 
@@ -288,8 +238,11 @@ pub async fn resolve_kb_markdown(
     Ok(output)
 }
 
-fn knowledge_base_item_id(kb_id: &SealedKnowledgeBaseId, record_id: SealedRecordId) -> String {
-    format!("kb:{}:{}", kb_id.as_str(), record_id)
+pub(crate) fn knowledge_base_item_id(
+    kb_id: &SealedKnowledgeBaseId,
+    record_id: SealedRecordId,
+) -> String {
+    format!("kb:{kb_id}:{record_id}")
 }
 
 #[cfg(test)]
@@ -310,13 +263,15 @@ mod tests {
     #[test]
     fn kb_token_is_symbolic_and_round_trips() {
         let reference = SealedReference::new(
-            SealedScopeRef::KnowledgeBase(SealedKnowledgeBaseId::parse("prod_docs").unwrap()),
+            SealedScopeRef::KnowledgeBase(
+                SealedKnowledgeBaseId::parse("4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9").unwrap(),
+            ),
             SealedRecordId::from_uuid(Uuid::nil()),
         );
         let token = reference.token().unwrap();
         assert_eq!(
             token,
-            "{{sealed:v1:knowledge_base:prod_docs:00000000-0000-0000-0000-000000000000}}"
+            "{{sealed:v1:knowledge_base:4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9:00000000-0000-0000-0000-000000000000}}"
         );
         assert_eq!(SealedReference::parse_token(&token).unwrap(), reference);
         assert!(!token.contains("ciphertext"));
@@ -335,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_secret_stays_out_of_serialized_markdown_and_untrusted_reads() {
-        let kb_id = SealedKnowledgeBaseId::parse("prod_docs").unwrap();
+        let kb_id = SealedKnowledgeBaseId::parse("4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9").unwrap();
         let reference = SealedReference::new(
             SealedScopeRef::KnowledgeBase(kb_id.clone()),
             SealedRecordId::from_uuid(Uuid::nil()),
@@ -374,8 +329,10 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_kb_reference_fails_closed() {
-        let source_kb = SealedKnowledgeBaseId::parse("source").unwrap();
-        let destination_kb = SealedKnowledgeBaseId::parse("destination").unwrap();
+        let source_kb =
+            SealedKnowledgeBaseId::parse("4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9").unwrap();
+        let destination_kb =
+            SealedKnowledgeBaseId::parse("e7c697b4-c3eb-47b6-8a33-b52dd6d4d282").unwrap();
         let reference = SealedReference::new(
             SealedScopeRef::KnowledgeBase(source_kb),
             SealedRecordId::from_uuid(Uuid::nil()),
@@ -393,41 +350,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_vault_resolves_a_copy_of_an_existing_project_reference() {
-        let db = Db::open_in_memory().unwrap();
+    async fn local_vault_resolves_a_created_knowledge_base_reference() {
+        let db = cockpit_db::db::Db::open_in_memory().unwrap();
         let vault = crate::secure_key::vault_for_db(&db).unwrap();
-        let project = super::super::identity::SealedProjectKey::from_canonical("project-a");
-        let directory = super::super::store::SealedValueDirectory::new(
-            db.clone(),
-            SealedCompartment::from_vault(vault.clone()),
-        );
-        let source = directory
-            .create(
-                super::super::action::OwnerAuthority::for_test("owner"),
-                super::super::store::CreateSealedValue {
-                    scope: SealedScopeRef::Project(project.clone()),
-                    name: super::super::identity::SealedName::canonical("deploy_token").unwrap(),
-                    description: super::super::identity::SealedDescription::parse("deploy token")
-                        .unwrap(),
-                    owner_principal: "owner".to_string(),
-                },
-                SealedLiteral::new(SEEDED_SECRET),
-                1,
-            )
-            .await
-            .unwrap();
-        let local = LocalVaultResolver::new(db, vault.clone());
+        let local = LocalVaultResolver::new(vault.clone());
         let store = KnowledgeBaseSealedStore::new(vault);
-        let kb_id = SealedKnowledgeBaseId::parse("prod_docs").unwrap();
-        let copied = store
-            .copy_from(
-                kb_id.clone(),
-                &SealedReference::new(SealedScopeRef::Project(project), source.record_id),
-                &local,
-            )
-            .await
+        let kb_id = SealedKnowledgeBaseId::parse("4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9").unwrap();
+        let reference = store
+            .create(kb_id.clone(), SealedLiteral::new(SEEDED_SECRET))
             .unwrap();
-        let markdown = copied.token().unwrap();
+        let markdown = reference.token().unwrap();
         assert!(!markdown.contains(SEEDED_SECRET));
         assert_eq!(
             resolve_kb_markdown(&markdown, &kb_id, &local, true)

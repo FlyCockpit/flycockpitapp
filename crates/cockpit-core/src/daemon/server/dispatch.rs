@@ -27399,6 +27399,15 @@ fn resolve_sealed_action_kind(
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
     };
 
+    if kind_id == "knowledge_base_copy" {
+        if projection_id != "none" {
+            anyhow::bail!("knowledge-base copy actions require projection id `none`");
+        }
+        return Ok(SealedActionKind::KnowledgeBaseCopy {
+            knowledge_base_id: crate::sealed::SealedKnowledgeBaseId::parse(origin_id)?,
+        });
+    }
+
     // Closed builtin kind templates. Each entry is a fixed, host-owned template;
     // the wire never supplies an origin URL, header, or path.
     struct KindTemplate {

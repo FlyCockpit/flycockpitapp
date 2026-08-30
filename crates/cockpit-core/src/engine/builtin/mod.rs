@@ -557,6 +557,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "grep",
         "glob",
         "use_sealed_value",
+        "knowledge_sealed_create",
+        "knowledge_sealed_copy",
         "inspect_audio",
         "inspect_video",
         "extract_video_clip",
@@ -825,6 +827,18 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             condition: Some("Requires an Owner-issued sealed-value action grant."),
         },
         BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "knowledge_sealed_create",
+            summary: "Create a vault-backed symbolic sealed reference for an attached KB.",
+            condition: Some("The KB must be attached and accessible to this model."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "knowledge_sealed_copy",
+            summary: "Copy an Owner-granted sealed value into an attached KB.",
+            condition: Some("Requires an exact Owner-issued sealed-value action grant."),
+        },
+        BuiltinToolInventoryItem {
             family: "Media",
             name: "inspect_audio",
             summary: "Inspect bounded audio metadata.",
@@ -989,6 +1003,8 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
+        Arc::new(tools::knowledge_sealed::CreateKnowledgeBaseSealedValueTool),
+        Arc::new(tools::knowledge_sealed::CopyKnowledgeBaseSealedValueTool),
         Arc::new(tools::audio_video::InspectAudioTool::new()),
         Arc::new(tools::audio_video::InspectVideoTool::new()),
         Arc::new(tools::audio_video::ExtractVideoClipTool::new()),
@@ -1038,6 +1054,12 @@ pub(crate) fn materialize_tool_by_name(
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "knowledge_sealed_create" => tb.with(Arc::new(
+            tools::knowledge_sealed::CreateKnowledgeBaseSealedValueTool,
+        )),
+        "knowledge_sealed_copy" => tb.with(Arc::new(
+            tools::knowledge_sealed::CopyKnowledgeBaseSealedValueTool,
+        )),
         "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
         | "extract_audio" | "transcribe_audio"
             if media_forbidden =>

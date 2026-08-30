@@ -30,6 +30,7 @@ pub mod grep;
 pub mod harness;
 pub mod intel;
 pub mod jq_shim;
+pub mod knowledge_sealed;
 mod lock_wait;
 pub mod lsp;
 pub mod mcp_tool;

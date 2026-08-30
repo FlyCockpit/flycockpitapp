@@ -3690,6 +3690,7 @@ pub(crate) async fn with_memory_search_if_attached(
     cwd: &Path,
     definition: Option<&crate::agents::AgentDef>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    executing_model: &str,
 ) -> crate::engine::tool::ToolBox {
     let allowed_knowledge_bases = definition
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
@@ -3709,7 +3710,7 @@ pub(crate) async fn with_memory_search_if_attached(
             .await
             .is_ok_and(|bundles| {
                 bundles.iter().any(|knowledge_base| {
-                    knowledge_base.entry.dream_model.is_some()
+                    knowledge_base.entry.dream_model.as_deref() == Some(executing_model)
                         && matches!(
                             &knowledge_base.entry.source,
                             KnowledgeBaseSource::Local { .. }
@@ -3719,6 +3720,7 @@ pub(crate) async fn with_memory_search_if_attached(
     if dream_writes_enabled {
         toolbox.with(Arc::new(KnowledgeDreamApplyTool {
             allowed_knowledge_bases,
+            executing_model: executing_model.to_string(),
         }))
     } else {
         toolbox.without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
@@ -3736,9 +3738,10 @@ pub(crate) struct MemorySearchTool {
 /// validated OKF projection rather than a filesystem path, and invokes the
 /// registered-provider boundary so local writes always pass through the Git
 /// transaction/fence.  It is advertised only for attached local KBs that
-/// configure a dream model.
+/// configure the model executing this turn.
 pub(crate) struct KnowledgeDreamApplyTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
+    executing_model: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3778,10 +3781,6 @@ impl Tool for KnowledgeDreamApplyTool {
 
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutating
-    }
-
-    fn honors_dispatch_cancel(&self) -> bool {
-        true
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -3861,12 +3860,23 @@ impl Tool for KnowledgeDreamApplyTool {
                 knowledge_base.entry.id
             );
         }
-        let model = knowledge_base.entry.dream_model.clone().with_context(|| {
-            format!(
-                "knowledge base `{}` has no configured dream model",
-                knowledge_base.entry.id
-            )
-        })?;
+        let configured_model = knowledge_base
+            .entry
+            .dream_model
+            .as_deref()
+            .with_context(|| {
+                format!(
+                    "knowledge base `{}` has no configured dream model",
+                    knowledge_base.entry.id
+                )
+            })?;
+        if configured_model != self.executing_model {
+            bail!(
+                "knowledge base `{}` is configured to dream with `{configured_model}`, not the executing model `{}`",
+                knowledge_base.entry.id,
+                self.executing_model
+            );
+        }
         let concepts_written = writes
             .iter()
             .filter(|write| is_knowledge_dream_concept_path(&write.path))
@@ -3874,7 +3884,7 @@ impl Tool for KnowledgeDreamApplyTool {
         let data_files_written = writes.len().saturating_sub(concepts_written);
         let dream = KnowledgeDreamCommit {
             knowledge_base_id: args.knowledge_base_id,
-            model,
+            model: self.executing_model.clone(),
             sessions_dreamed: args.sessions_dreamed,
             concepts_written,
             data_files_written,
@@ -4005,23 +4015,88 @@ fn is_knowledge_dream_concept_path(path: &str) -> bool {
 }
 
 fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<()> {
-    for write in writes {
-        fs::write(root.join(&write.path), &write.content)
-            .with_context(|| format!("writing dream output {}", write.path))?;
-    }
-    // Validate in the transaction callback so malformed model output is
-    // rolled back by the apply-error path rather than left as a dirty,
-    // permanently deferred worktree.
-    let versioned = versioned_knowledge_paths(root)?;
-    for write in writes {
-        if !versioned.contains(&PathBuf::from(&write.path)) {
-            bail!(
-                "dream output {} is not a committed OKF document or referenced data file",
-                write.path
-            );
+    // Git provides the rollback boundary for a tracked KB.  Git is optional,
+    // though, so preserve the exact pre-write file set here as well: a later
+    // write failure or a failed OKF validation must not leave a Git-absent KB
+    // partially projected.
+    let rollback = KnowledgeDreamWriteRollback::capture(root, writes)?;
+    let applied = (|| {
+        for write in writes {
+            fs::write(root.join(&write.path), &write.content)
+                .with_context(|| format!("writing dream output {}", write.path))?;
         }
+        // Validate in the transaction callback so malformed model output is
+        // never retained as a partially applied KB.
+        let versioned = versioned_knowledge_paths(root)?;
+        for write in writes {
+            if !versioned.contains(&PathBuf::from(&write.path)) {
+                bail!(
+                    "dream output {} is not a committed OKF document or referenced data file",
+                    write.path
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = applied {
+        rollback.restore().with_context(|| {
+            format!("dream output apply failed ({error:#}) and restoring the pre-dream write set")
+        })?;
+        return Err(error);
     }
     Ok(())
+}
+
+/// File-level rollback boundary for the production dream-write projection.
+/// `KnowledgeDreamApplyArgs` permits only distinct root-level files, so this
+/// captures precisely the paths the model is allowed to replace and never
+/// touches derived sidecars or unrelated user files.
+struct KnowledgeDreamWriteRollback {
+    root: PathBuf,
+    originals: BTreeMap<PathBuf, Option<Vec<u8>>>,
+}
+
+impl KnowledgeDreamWriteRollback {
+    fn capture(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<Self> {
+        let mut originals = BTreeMap::new();
+        for write in writes {
+            let path = PathBuf::from(&write.path);
+            let target = root.join(&path);
+            let contents = match fs::read(&target) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("capturing pre-dream output {}", write.path));
+                }
+            };
+            originals.insert(path, contents);
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            originals,
+        })
+    }
+
+    fn restore(self) -> Result<()> {
+        for (path, contents) in self.originals {
+            let target = self.root.join(&path);
+            match contents {
+                Some(contents) => fs::write(&target, contents)
+                    .with_context(|| format!("restoring pre-dream output {}", path.display()))?,
+                None => match fs::remove_file(&target) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("removing failed dream output {}", path.display())
+                        });
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
 }
 
 fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutput {
@@ -5178,7 +5253,8 @@ timestamp: 2026-08-29T12:00:00Z
                 None,
                 &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     tmp.path()
-                )
+                ),
+                "openai:gpt-5",
             )
             .await
         );
@@ -5220,11 +5296,27 @@ timestamp: 2026-08-29T12:00:00Z
             tmp.path(),
             None,
             &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            "openai:gpt-5",
         )
         .await;
         let attached = attached_toolbox.names();
         assert!(attached.contains(&"memory_search"));
         assert!(attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME));
+        let mismatched_toolbox = with_memory_search_if_attached(
+            crate::engine::tool::ToolBox::new(),
+            &session,
+            tmp.path(),
+            None,
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            "anthropic:claude",
+        )
+        .await;
+        assert!(mismatched_toolbox.names().contains(&"memory_search"));
+        assert!(
+            !mismatched_toolbox
+                .names()
+                .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -5279,6 +5371,34 @@ timestamp: 2026-08-29T12:00:00Z
             format!("---\ntype: memory\n---\n\n{body}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn invalid_dream_projection_restores_the_prewrite_file_set() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let original_index = fs::read_to_string(tmp.path().join("index.md")).unwrap();
+        let error = apply_knowledge_dream_writes(
+            tmp.path(),
+            &[
+                KnowledgeDreamWrite {
+                    path: "index.md".to_string(),
+                    content: "# Changed index\n".to_string(),
+                },
+                KnowledgeDreamWrite {
+                    path: "orphan.csv".to_string(),
+                    content: "id,value\n1,orphan\n".to_string(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("orphan.csv"));
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("index.md")).unwrap(),
+            original_index
+        );
+        assert!(!tmp.path().join("orphan.csv").exists());
     }
 
     #[test]

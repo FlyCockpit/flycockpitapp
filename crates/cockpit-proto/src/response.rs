@@ -1295,6 +1295,9 @@ impl crate::CodeRootReadV1 {
             history: self.history,
             paused_work: self.paused_work,
             repair_required: self.repair_required,
+            // A Code-root read is an immutable projection, while this offer
+            // is ephemeral authority issued only for an interactive attach.
+            resume_compaction_offer: None,
             daemon_version: self.daemon_version,
             compatible: self.compatible,
             env_baseline: self.env_baseline,

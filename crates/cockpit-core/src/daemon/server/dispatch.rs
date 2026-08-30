@@ -27073,6 +27073,9 @@ async fn code_root_read_from_attached_response(
         history,
         paused_work,
         repair_required,
+        // Code-root reads are immutable projections and must not convey the
+        // one-time authority of an interactive resume-compaction offer.
+        resume_compaction_offer: _,
         daemon_version,
         compatible,
         env_baseline,

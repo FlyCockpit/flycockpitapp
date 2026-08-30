@@ -584,9 +584,11 @@ async fn invoke_forwarded(
         "acp_forwarded_mcp_tools_call",
         &[serde_json::json!({
             "source": super::forwarded::SOURCE_ACP_FORWARDED,
-            "epoch": epoch.epoch(),
-            "server": entry.redacted_display_name(),
-            "tool": tool,
+            "opaque_ids": {
+                "epoch": epoch.epoch(),
+            },
+            "transport": entry.transport_kind(),
+            "server_label": entry.redacted_display_name(),
         })],
     )
     .await?;

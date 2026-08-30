@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::{Item, Visibility};
 
 fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -12,6 +14,157 @@ fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn production_source(path: &Path) -> String {
+    let source = fs::read_to_string(path).expect("read Rust source");
+    strip_test_only_items(&source)
+}
+
+fn strip_test_only_items(source: &str) -> String {
+    let file = syn::parse_file(&source).expect("parse Rust source");
+    let mut stripper = TestOnlyStripper::default();
+    stripper.visit_file(&file);
+    strip_source_ranges(&source, &stripper.ranges)
+}
+
+fn strip_source_ranges(source: &str, ranges: &[SourceRange]) -> String {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|range| (range.start_line, range.start_column));
+    let line_starts = line_starts(source);
+    let mut cursor = 0usize;
+    let mut output = String::with_capacity(source.len());
+    for range in sorted {
+        let start = line_starts[range.start_line - 1] + range.start_column;
+        let end = line_starts[range.end_line - 1] + range.end_column;
+        if start < cursor || end < start || end > source.len() {
+            continue;
+        }
+        output.push_str(&source[cursor..start]);
+        cursor = end;
+    }
+    output.push_str(&source[cursor..]);
+    output
+}
+
+fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    starts.extend(
+        source
+            .match_indices('\n')
+            .map(|(idx, _)| idx + 1)
+            .collect::<Vec<_>>(),
+    );
+    starts
+}
+
+#[derive(Clone, Copy)]
+struct SourceRange {
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+}
+
+#[derive(Default)]
+struct TestOnlyStripper {
+    ranges: Vec<SourceRange>,
+}
+
+impl TestOnlyStripper {
+    fn record_item<T: Spanned>(&mut self, attrs: &[syn::Attribute], item: &T) -> bool {
+        if attrs.iter().any(cfg_mentions_test) {
+            let start = attrs
+                .first()
+                .map(Spanned::span)
+                .unwrap_or_else(|| item.span())
+                .start();
+            let end = item.span().end();
+            self.ranges.push(SourceRange {
+                start_line: start.line,
+                start_column: start.column,
+                end_line: end.line,
+                end_column: end.column,
+            });
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for TestOnlyStripper {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if self.record_item(item_attrs(item), item) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if self.record_item(&item.attrs, item) {
+            return;
+        }
+        syn::visit::visit_impl_item_fn(self, item);
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if self.record_item(&item.attrs, item) {
+            return;
+        }
+        syn::visit::visit_trait_item_fn(self, item);
+    }
+}
+
+fn item_attrs(item: &Item) -> &[syn::Attribute] {
+    match item {
+        Item::Const(item) => &item.attrs,
+        Item::Enum(item) => &item.attrs,
+        Item::ExternCrate(item) => &item.attrs,
+        Item::Fn(item) => &item.attrs,
+        Item::ForeignMod(item) => &item.attrs,
+        Item::Impl(item) => &item.attrs,
+        Item::Macro(item) => &item.attrs,
+        Item::Mod(item) => &item.attrs,
+        Item::Static(item) => &item.attrs,
+        Item::Struct(item) => &item.attrs,
+        Item::Trait(item) => &item.attrs,
+        Item::TraitAlias(item) => &item.attrs,
+        Item::Type(item) => &item.attrs,
+        Item::Union(item) => &item.attrs,
+        Item::Use(item) => &item.attrs,
+        Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn cfg_mentions_test(attr: &syn::Attribute) -> bool {
+    if !attr.path().is_ident("cfg") {
+        return false;
+    }
+    let mut mentions_test = false;
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("test") {
+            mentions_test = true;
+        }
+        Ok(())
+    });
+    mentions_test
+}
+
+#[test]
+fn production_source_strips_each_test_only_item_without_truncating_later_production() {
+    let source = r#"
+        fn before() {}
+        #[cfg(test)]
+        fn test_only_sink() { let _ = "GrantStore"; }
+        fn after() { let _ = "CredentialStore"; }
+    "#;
+    let production = strip_test_only_items(source);
+    assert!(production.contains("fn before"));
+    assert!(!production.contains("test_only_sink"));
+    assert!(production.contains("fn after"));
+    assert!(production.contains("CredentialStore"));
 }
 
 #[test]
@@ -133,8 +286,7 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
     let production = files
         .iter()
         .map(|path| {
-            let source = fs::read_to_string(path).expect("read Rust source");
-            let source = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let source = production_source(path);
             (
                 path.strip_prefix(&source_root)
                     .expect("path below source root"),
@@ -417,8 +569,15 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         .split(")],")
         .next()
         .expect("forwarded tool effect payload");
-    assert!(tool_effect.contains("entry.redacted_display_name()"));
+    assert!(tool_effect.contains("\"source\": super::forwarded::SOURCE_ACP_FORWARDED"));
+    assert!(tool_effect.contains("\"opaque_ids\""));
+    assert!(tool_effect.contains("\"transport\": entry.transport_kind()"));
+    assert!(tool_effect.contains("\"server_label\": entry.redacted_display_name()"));
     assert!(!tool_effect.contains("entry.name()"));
+    assert!(!tool_effect.contains("\"server\": entry.redacted_display_name()"));
+    assert!(!tool_effect.contains("\"tool\": tool"));
+    assert!(!tool_effect.contains("\"tool\":tool"));
+    assert!(!tool_effect.contains("tool: tool"));
     for forbidden in [
         "cache::save",
         "cache::load",
@@ -484,6 +643,10 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
             "forwarded approval must project a redacted server display, not {forbidden}"
         );
     }
+    assert!(
+        !forwarded_invoke.contains("\"tool\": tool") && !forwarded_invoke.contains("\"tool\":tool"),
+        "forwarded external approval/effect payload must not carry a raw tool binding"
+    );
 }
 
 #[test]

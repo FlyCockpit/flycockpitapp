@@ -91,7 +91,11 @@ impl BridgeFacade {
 
 fn opaque_digest(domain: &str, value: &str) -> OpaqueAsciiId128V1 {
     let digest = Sha256::digest([domain.as_bytes(), b"\0", value.as_bytes()].concat());
-    OpaqueAsciiId128V1::new(format!("{domain}-{:x}", digest))
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    OpaqueAsciiId128V1::new(format!("{domain}-{digest}"))
         .expect("SHA-256 based ACP identity is bounded printable ASCII")
 }
 

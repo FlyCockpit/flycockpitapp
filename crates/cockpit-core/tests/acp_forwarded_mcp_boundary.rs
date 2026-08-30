@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use syn::{Fields, Item, ItemEnum, Type, Visibility};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct PublicField {
     name: String,
     ty: Type,
@@ -563,25 +563,23 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
     let mut ingress_types = public_records
         .iter()
         .filter_map(|(name, fields)| {
-            (field_names(fields)
+            ((field_names(fields)
                 == [
                     "version",
                     "declarations",
                     "client_provenance_id",
                     "ingress_request_id",
                 ])
-                && fields
-                    .iter()
-                    .any(|field| {
-                        type_reaches_any_in_module(
-                            &field.ty,
-                            &field.module,
-                            &declaration_types,
-                            &public_records,
-                            &mut HashSet::new(),
-                        )
-                    })
-                    .then(|| name.clone())
+                && fields.iter().any(|field| {
+                    type_reaches_any_in_module(
+                        &field.ty,
+                        &field.module,
+                        &declaration_types,
+                        &public_records,
+                        &mut HashSet::new(),
+                    )
+                }))
+            .then(|| name.clone())
         })
         .collect::<Vec<_>>();
     ingress_types.sort();
@@ -610,17 +608,14 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
     let acp_file = syn::parse_file(&acp_source).expect("parse ACP proto source");
     let mut forwarded_mcp_public_types = Vec::new();
     for item in acp_file.items {
-        let (visibility, ident) = match item {
-            Item::Struct(item) => (&item.vis, item.ident),
-            Item::Enum(item) => (&item.vis, item.ident),
-            Item::Type(item) => (&item.vis, item.ident),
+        let (is_public, ident) = match item {
+            Item::Struct(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
+            Item::Enum(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
+            Item::Type(item) => (matches!(item.vis, Visibility::Public(_)), item.ident),
             _ => continue,
         };
         let name = ident.to_string();
-        if matches!(visibility, Visibility::Public(_))
-            && name.contains("Acp")
-            && name.contains("Mcp")
-        {
+        if is_public && name.contains("Acp") && name.contains("Mcp") {
             forwarded_mcp_public_types.push(name);
         }
     }

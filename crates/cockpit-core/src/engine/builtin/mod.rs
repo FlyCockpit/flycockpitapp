@@ -440,11 +440,7 @@ fn computer_candidate(
             );
             if providers
                 .resolve_sensitive_model_policy_eligibility(
-                    &computer_use_criteria_for_role(
-                        &selector,
-                        require_subagent_invokable,
-                        agent,
-                    ),
+                    &computer_use_criteria_for_role(&selector, require_subagent_invokable, agent),
                     custody,
                 )
                 .is_err()
@@ -3648,8 +3644,7 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
         };
         computer_primary_candidate(&providers, &args.cwd, target)
     };
-    let Some((provider_id, model_id, native_computer)) = candidate
-    else {
+    let Some((provider_id, model_id, native_computer)) = candidate else {
         bail!(
             "{name} requires a configured vision-capable model with a native computer_use contract and computer_use enabled{}",
             if require_subagent_invokable {
@@ -3670,11 +3665,7 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
     );
     let worker_selector = format!("{provider_id}:{model_id}");
     let request = crate::config::providers::SensitiveModelPolicyRequest::new(
-        computer_use_criteria_for_role(
-            &worker_selector,
-            require_subagent_invokable,
-            name,
-        ),
+        computer_use_criteria_for_role(&worker_selector, require_subagent_invokable, name),
         custody,
         crate::engine::model_roles::custody_payload_for(custody, &session_redact),
     )
@@ -5990,6 +5981,68 @@ pub(crate) mod tests {
         assert_eq!(agent.model.provider_id(), "p");
         assert_eq!(agent.model.model_id_ref(), "vision");
         assert!(agent.params.native_computer.is_some());
+    }
+
+    #[test]
+    fn computer_primary_defaults_to_real_desktop_and_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [{
+                    "id": "vision",
+                    "subagent_invokable": false,
+                    "capabilities": {
+                        "image_input": "supported",
+                        "computer_use": { "contract": "open_ai_responses" }
+                    }
+                }]
+            }"#,
+        );
+
+        let agent = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let native = agent
+            .params
+            .native_computer
+            .expect("Computer primary native tool");
+        assert_eq!(agent.name, "Computer");
+        assert_eq!(native.target, crate::computer::DisplayTarget::RealDesktop);
+        assert!(native.require_backend);
+        assert!(native.approval_required);
+        assert!(agent.tools.names().contains(&"read"));
+        assert!(agent.tools.names().contains(&"bash"));
+        assert!(agent.tools.names().contains(&"task"));
+    }
+
+    #[test]
+    fn computer_primary_virtual_target_is_explicit_and_still_strict() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            r#"{"computer_target":"virtual"}"#,
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [{
+                    "id": "vision",
+                    "capabilities": {
+                        "image_input": "supported",
+                        "computer_use": { "contract": "open_ai_responses" }
+                    }
+                }]
+            }"#,
+        );
+
+        let agent = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let native = agent
+            .params
+            .native_computer
+            .expect("Computer primary native tool");
+        assert_eq!(native.target, crate::computer::DisplayTarget::Virtual);
+        assert!(native.require_backend);
+        assert!(!native.approval_required);
     }
 
     #[test]

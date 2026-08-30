@@ -6448,16 +6448,18 @@ pub(super) async fn run_worker(
             .await
             {
                 Ok(agent) => agent,
-                Err(error)
-                    if prepared_root_launch.is_none() && root_agent_name != "Computer" =>
-                {
+                Err(error) if prepared_root_launch.is_none() && root_agent_name != "Computer" => {
                     tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
                     builtin::default_build(&spawn_args)
                 }
                 Err(error) => {
-                    let message = format!(
-                        "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
-                    );
+                    let message = if root_agent_name == "Computer" {
+                        format!("Computer primary could not start: {error:#}")
+                    } else {
+                        format!(
+                            "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                        )
+                    };
                     tracing::error!(%message, %session_id, "session startup refused");
                     let mut driver_failed = false;
                     emit_session_driver_failed_once(
@@ -6477,9 +6479,13 @@ pub(super) async fn run_worker(
             builtin::default_build(&spawn_args)
         }
         Err(error) => {
-            let message = format!(
-                "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
-            );
+            let message = if root_agent_name == "Computer" {
+                format!("Computer primary could not start: {error:#}")
+            } else {
+                format!(
+                    "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                )
+            };
             tracing::error!(%message, %session_id, "session startup refused");
             let mut driver_failed = false;
             emit_session_driver_failed_once(

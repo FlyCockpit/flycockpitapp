@@ -959,7 +959,12 @@ mod tests {
         assert_eq!(worker.mode, AgentMode::Subagent);
         assert_eq!(
             primary.tools,
-            Some(["read", "bash", "task"].into_iter().map(String::from).collect())
+            Some(
+                ["read", "bash", "task"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
         );
         let children = &primary
             .vnext

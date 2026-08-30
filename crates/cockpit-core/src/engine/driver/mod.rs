@@ -14461,6 +14461,7 @@ impl Driver {
             cwd: self.cwd.clone(),
             config: self.config.clone(),
             session_short_id: self.session.short_id(),
+            workspace_scratch_dir: self.session.workspace_scratch_dir(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,

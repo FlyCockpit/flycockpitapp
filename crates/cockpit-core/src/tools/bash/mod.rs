@@ -35,7 +35,10 @@ use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 mod boundary;
-pub use boundary::{command_directory_escape, outside_session_boundary};
+pub use boundary::{
+    command_directory_escape, command_directory_escape_with_workspace_scratch,
+    outside_session_boundary, outside_session_boundary_with_workspace_scratch,
+};
 use boundary::{dynamic_shell_path, outside_cwd_error};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -364,6 +367,7 @@ async fn call_bash_inner(
     ctx: &ToolCtx,
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
+    let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
     {
@@ -392,6 +396,7 @@ async fn call_bash_inner(
 
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && !lease.covers_cwd(&cwd)
+        && !cockpit_host::path_containment::contained_under(&workspace_scratch_dir, &cwd)
     {
         return Err(crate::engine::tool::invalid_input(format!(
             "refused: bash cwd `{}` is outside workspace lease visibility `{}`",
@@ -399,13 +404,23 @@ async fn call_bash_inner(
             lease.visibility_root.display()
         )));
     } else if let Some(outside) =
-        outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+        crate::tools::bash::outside_session_boundary_with_workspace_scratch(
+            &cwd,
+            &ctx.cwd,
+            ctx.session.tmp_dir().as_deref(),
+            Some(&workspace_scratch_dir),
+        )
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
     if ctx.workspace_lease.is_none()
-        && let Some(outside) =
-            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+        && let Some(outside) = crate::tools::bash::command_directory_escape_with_workspace_scratch(
+            command,
+            &cwd,
+            &ctx.cwd,
+            ctx.session.tmp_dir().as_deref(),
+            Some(&workspace_scratch_dir),
+        )
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
@@ -682,9 +697,10 @@ async fn call_bash_inner(
             ctx.write_scope.as_deref(),
         )
     } else {
-        crate::tools::shell_sandbox::sandbox_policy(
+        crate::tools::shell_sandbox::sandbox_policy_with_workspace_scratch(
             sandbox_cwd,
             tmp_dir.as_deref(),
+            Some(&workspace_scratch_dir),
             &session_env,
             &extra_sandbox_paths,
             ctx.write_scope.as_deref(),
@@ -2451,11 +2467,17 @@ async fn run_container_shell(
         Err(reason) => return RunOutcome::SpawnError(std::io::Error::other(reason)),
     };
     let map = crate::container::MountMap::for_current_platform(ctx.cwd.clone());
-    let Some(container_cwd) = map.to_container(cwd) else {
+    let workspace_scratch_map = crate::container::MountMap::workspace_scratch_for_current_platform(
+        ctx.session.workspace_scratch_dir(),
+    );
+    let workspace_scratch_mount = crate::container::workspace_scratch_mount(&workspace_scratch_map);
+    let Some(container_cwd) = workspace_scratch_map
+        .to_container(cwd)
+        .or_else(|| map.to_container(cwd))
+    else {
         return RunOutcome::SpawnError(std::io::Error::other(format!(
-            "working directory {} is outside the container project mount {}",
+            "working directory {} is outside the container project and workspace scratch mounts",
             cwd.display(),
-            ctx.cwd.display()
         )));
     };
     let resolved = match crate::container::resolve_dockerfile_for_session(
@@ -2494,6 +2516,7 @@ async fn run_container_shell(
             &image,
             container_mode,
             &map,
+            &workspace_scratch_mount,
             &profile_mounts,
             ctx.session.container_network_enabled(),
             &runtime,
@@ -2631,6 +2654,7 @@ async fn run_shell(
     }
 
     let mut cmd = if confine {
+        let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
         let visibility_root = ctx
             .workspace_lease
             .as_ref()
@@ -2641,6 +2665,7 @@ async fn run_shell(
             cwd,
             visibility_root,
             tmp_dir,
+            Some(&workspace_scratch_dir),
             scrub,
             session_env,
             extra_sandbox_paths,

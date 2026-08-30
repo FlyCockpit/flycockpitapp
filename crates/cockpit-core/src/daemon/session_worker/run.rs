@@ -6356,6 +6356,7 @@ pub(super) async fn run_worker(
         cwd: project_root.clone(),
         config: SessionConfigHandle::new(config_snapshot.clone()),
         session_short_id: session.short_id(),
+        workspace_scratch_dir: session.workspace_scratch_dir(),
         assistant_identity_prefix,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         // The daemon root is always the user-facing interactive agent —

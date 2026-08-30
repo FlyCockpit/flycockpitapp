@@ -27292,6 +27292,7 @@ async fn run_docs_ask_pipeline(
         cwd: cwd.clone(),
         config: config.clone(),
         session_short_id: session.short_id(),
+        workspace_scratch_dir: session.workspace_scratch_dir(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,

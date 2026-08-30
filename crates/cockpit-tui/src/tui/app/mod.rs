@@ -3421,6 +3421,7 @@ impl App {
     pub fn new_composed(
         project: Option<&Path>,
         no_sandbox: bool,
+        session_mode: SessionMode,
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,

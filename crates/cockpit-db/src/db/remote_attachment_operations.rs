@@ -1666,7 +1666,10 @@ mod tests {
         };
         let applied = db
             .execute_transactional_remote_operation(request(), |conn| {
-                Db::mark_app_flag_seen_versioned_conn(conn, "daemon-autostart", 0)?;
+                conn.execute(
+                    "UPDATE remote_attachment_operations SET updated_at_ms=2 WHERE operation_id=?1",
+                    [operation],
+                )?;
                 Ok(TransactionalRemoteMutation {
                     value: 1_u8,
                     safe_response: b"one".to_vec(),
@@ -1708,8 +1711,8 @@ mod tests {
         assert!(
             db.execute_transactional_remote_operation::<(), _>(failed, |conn| {
                 conn.execute(
-                    "INSERT INTO app_flags(key,seen_at) VALUES ('rollback-test',1)",
-                    [],
+                    "UPDATE remote_attachment_operations SET updated_at_ms=2 WHERE operation_id=?1",
+                    [failed_operation],
                 )?;
                 anyhow::bail!("injected crash")
             })
@@ -1717,17 +1720,24 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            db.read(|conn| Db::app_flag_version_conn(conn, "rollback-test"))
-                .await
-                .unwrap(),
-            0
+            db.read(|conn| {
+                conn.query_row(
+                    "SELECT updated_at_ms FROM remote_attachment_operations WHERE operation_id=?1",
+                    [failed_operation],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap(),
+            None,
+            "the failed transaction must roll back its remote-operation reservation and domain write"
         );
         let mut retry = request();
         retry.operation_id = failed_operation;
         retry.request_hash = [7; 32];
         let retried = db
             .execute_transactional_remote_operation(retry, |conn| {
-                Db::mark_app_flag_seen_versioned_conn(conn, "rollback-test", 0)?;
                 Ok(TransactionalRemoteMutation {
                     value: 2_u8,
                     safe_response: b"two".to_vec(),

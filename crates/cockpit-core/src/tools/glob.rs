@@ -42,7 +42,7 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "List files matching a glob pattern within the current root, gitignore-aware"
+        "List files matching a glob pattern within the current root, or discover `cockpit://history/` pseudofiles"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -90,6 +90,12 @@ impl Tool for GlobTool {
             return Err(invalid_input("`pattern` is required"));
         }
         let pattern = args.pattern;
+
+        if let Some(output) =
+            crate::tools::recall::glob(&pattern, args.path.as_deref(), ctx).await?
+        {
+            return Ok(output);
+        }
 
         let canonical_root = sandbox::canonical_root(&ctx.cwd)?;
         let walk_root = match args.path.as_deref() {

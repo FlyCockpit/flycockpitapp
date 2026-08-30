@@ -4,8 +4,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use rig::message::UserContent;
 use uuid::Uuid;
 
-pub const ARTIFACT_FRAME_GUIDANCE: &str =
-    "Use artifact_read or artifact_search with artifact_id to inspect this retained text.";
+pub const ARTIFACT_FRAME_GUIDANCE: &str = "Use `read` or `grep` on this session's `cockpit://.../artifacts/<artifact_id>` pseudofile to inspect this retained text.";
 
 #[derive(Debug, Clone)]
 pub struct ArtifactFrame<'a> {
@@ -490,7 +489,7 @@ mod tests {
         assert_eq!(payload.0, payload.1.len());
         assert_eq!(
             payload.1,
-            r#"{"version":1,"status":"available","reason":null,"artifact_id":"00000000-0000-0000-0000-000000000001","kind":"tool_result","capture_reason":"display_truncation","provenance":{"agent_id":"Build","tool":"tool\u0026name","call_id":"call-\u003c1\u003e"},"host_captured_bytes":9,"host_original_bytes":11,"host_dropped_bytes":2,"stored_source_bytes":9,"content_bytes":9,"line_count":1,"preview_head":"quote \" slash \\ \u003ctag\u003e\u0026","preview_tail":"tail","guidance":"Use artifact_read or artifact_search with artifact_id to inspect this retained text."}"#
+            r#"{"version":1,"status":"available","reason":null,"artifact_id":"00000000-0000-0000-0000-000000000001","kind":"tool_result","capture_reason":"display_truncation","provenance":{"agent_id":"Build","tool":"tool\u0026name","call_id":"call-\u003c1\u003e"},"host_captured_bytes":9,"host_original_bytes":11,"host_dropped_bytes":2,"stored_source_bytes":9,"content_bytes":9,"line_count":1,"preview_head":"quote \" slash \\ \u003ctag\u003e\u0026","preview_tail":"tail","guidance":"Use `read` or `grep` on this session's `cockpit://.../artifacts/\u003cartifact_id\u003e` pseudofile to inspect this retained text."}"#
         );
     }
 

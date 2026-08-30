@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use super::*;
 
 fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
@@ -321,6 +323,26 @@ enum RepeatCallAuthorization {
     ConfirmationDenied { consecutive: u32 },
 }
 
+/// Verification outcomes after the automatic-projection escalation has been
+/// resolved through the user approval boundary. Keeping this separate from
+/// `VerificationOutcome` makes it impossible for the host-effect dispatch
+/// match below to accidentally bypass an unresolved escalation.
+enum DispatchVerificationOutcome {
+    Skip,
+    DispatchOriginal {
+        plan: crate::engine::verification::intercept::VerificationDispatchPlan,
+    },
+    Block {
+        message: String,
+        operation_id: Option<uuid::Uuid>,
+    },
+    Revise {
+        args: serde_json::Value,
+        disclosure: String,
+        plan: crate::engine::verification::intercept::VerificationDispatchPlan,
+    },
+}
+
 fn verification_host_settlement(
     hard_fail: bool,
     host_effect_unknown: bool,
@@ -334,32 +356,64 @@ fn verification_host_settlement(
     }
 }
 
-async fn cancel_replayed_selected_dispatch(
-    session: &Session,
-    memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
-) {
-    let Some(memo) = memo.filter(|memo| {
-        matches!(
+/// A replayed verification memo owns a live dispatch reservation only for a
+/// selected revision or a durably selected original.  Both must be settled if
+/// replay is refused before entering the host-effect boundary.
+fn replay_memo_has_reserved_dispatch(
+    memo: &crate::db::needs_attention::InterruptVerificationMemo,
+) -> bool {
+    memo.dispatch_attempt_revision >= 0
+        && matches!(
             memo.outcome,
             crate::db::needs_attention::InterruptVerificationOutcome::Revise { .. }
-        ) && memo.dispatch_attempt_revision >= 0
-    }) else {
-        return;
+                | crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal
+        )
+}
+
+async fn cancel_replayed_reserved_dispatch(
+    session: &Session,
+    memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
+) -> Result<()> {
+    let Some(memo) = memo.filter(|memo| replay_memo_has_reserved_dispatch(memo)) else {
+        return Ok(());
     };
-    let _ = session
+    cancel_verification_dispatch_no_submission(
+        session,
+        memo.operation_id,
+        memo.dispatch_attempt_revision,
+        b"verification-selected-replay-authorization-refused",
+    )
+    .await
+}
+
+/// Cancellation occurs before the host-effect boundary, so a failure to
+/// terminalize its durable reservation must fail the live call closed. In
+/// particular, do not report a normal refusal or denial while a CAS or
+/// database failure could have left the dispatch attempt unresolved.
+async fn cancel_verification_dispatch_no_submission(
+    session: &Session,
+    operation_id: uuid::Uuid,
+    attempt_revision: i64,
+    proof: &'static [u8],
+) -> Result<()> {
+    session
         .db
         .cancel_verification_dispatch_no_submission(
             session.id,
-            memo.operation_id,
-            memo.dispatch_attempt_revision,
+            operation_id,
+            attempt_revision,
             crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                crate::db::verification_ledger::VerificationDigest::of(
-                    b"verification-selected-replay-authorization-refused",
-                ),
+                crate::db::verification_ledger::VerificationDigest::of(proof),
             ),
             chrono::Utc::now().timestamp_millis(),
         )
-        .await;
+        .await
+        .with_context(|| {
+            format!(
+                "verification dispatch {operation_id} could not be terminalized safely; recovery must reconcile the reservation"
+            )
+        })?;
+    Ok(())
 }
 
 /// Apply the argument-dependent repeat authorities to one canonical call.
@@ -827,9 +881,8 @@ async fn execute_ordinary_call_unscoped(
     // call short-circuits to a model-readable hard-fail *without*
     // dispatching the tool.
     let schema = env
-        .agent
-        .tools
-        .get(resolved_name)
+        .active_tools
+        .advertised_tool(resolved_name)
         .map(|t| t.parameters())
         .unwrap_or(Value::Null);
     args = crate::engine::model::wire_schema::strip_wire_nulls(&schema, args);
@@ -978,6 +1031,12 @@ async fn execute_ordinary_call_unscoped(
         })
         .await;
 
+    // The provider was told an advertised-but-unavailable tool exists, so its
+    // call must produce that availability result directly. In particular, do
+    // not let a stale repeated-call signature turn an unavailable capability
+    // into an approval prompt or loop-guard refusal.
+    let unavailable_call = env.active_tools.unavailable_call_message(resolved_name);
+
     // Loop guard (GOALS §1/§12): block a back-to-back identical tool
     // call (same name + canonical post-repair `wire_input`) pending
     // approval. Only schema-valid calls are guarded — a malformed call
@@ -998,7 +1057,7 @@ async fn execute_ordinary_call_unscoped(
         env,
         resolved_name,
         &args,
-        repair_outcome.valid && !placeholder_blocked,
+        repair_outcome.valid && !placeholder_blocked && unavailable_call.is_none(),
     )
     .await?;
     let repeated_recoverable_tool_call = match &repeat_authorization {
@@ -1052,7 +1111,8 @@ async fn execute_ordinary_call_unscoped(
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
     let mut gate_block_status = "blocked_safety_gate";
-    let gate_block: Option<String> = if !placeholder_blocked
+    let gate_block: Option<String> = if unavailable_call.is_none()
+        && !placeholder_blocked
         && repair_outcome.valid
         && !loop_guard_reject
         && super::is_gated_tool(resolved_name)
@@ -1089,15 +1149,16 @@ async fn execute_ordinary_call_unscoped(
     ) {
         recheck_result = true;
     }
-    let cage_block: Option<String> = if !placeholder_blocked && repair_outcome.valid {
-        env.ctx
-            .review_cage
-            .as_ref()
-            .and_then(|cage| cage.allow_dispatch(resolved_name).err())
-            .map(|err| err.to_string())
-    } else {
-        None
-    };
+    let cage_block: Option<String> =
+        if unavailable_call.is_none() && !placeholder_blocked && repair_outcome.valid {
+            env.ctx
+                .review_cage
+                .as_ref()
+                .and_then(|cage| cage.allow_dispatch(resolved_name).err())
+                .map(|err| err.to_string())
+        } else {
+            None
+        };
 
     // Dispatch only when validate-then-repair produced a schema-valid
     // call AND the loop guard didn't reject it AND the safety gate didn't
@@ -1153,13 +1214,16 @@ async fn execute_ordinary_call_unscoped(
         } else {
             Some("schema_invalid_unrepairable")
         }
-    } else if env.active_tools.get(resolved_name).is_none() {
+    } else if env.active_tools.call_availability(resolved_name)
+        == crate::engine::tool::ToolCallAvailability::NotAdvertised
+    {
         Some("not_in_advertised_set")
     } else {
         None
     };
     let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
-        && env.active_tools.get(resolved_name).is_some();
+        && env.active_tools.call_availability(resolved_name)
+            != crate::engine::tool::ToolCallAvailability::NotAdvertised;
     // Pin the AUTHORING model's frame inputs ONCE — its `(provider, model)`, the
     // config handle, and the pre-policy session table (captured as one Arc) — at
     // the authoring point, and reuse them for EVERY model-authored event AND the
@@ -1225,7 +1289,7 @@ async fn execute_ordinary_call_unscoped(
     // is the existing deny status string this path already produces (`gate.rs`
     // block status for the gate, the tool-call-completed lifecycle status for
     // the loop guard, and the canonical `review_cage_denied` kind for the cage).
-    let permission_denied_kind: Option<&'static str> =
+    let mut permission_denied_kind: Option<&'static str> =
         // A reserved native-computer name is a structural refusal, never a
         // permission denial — even when the same call would ALSO trip the loop
         // guard or review cage (its reserved-refusal arm wins the `result`
@@ -1262,9 +1326,10 @@ async fn execute_ordinary_call_unscoped(
         || loop_guard_reject
         || gate_blocked
         || cage_block.is_some()
+        || unavailable_call.is_some()
         || !repair_outcome.valid;
     if selected_replay_denied_before_intercept {
-        cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+        cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
     }
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
@@ -1304,13 +1369,19 @@ async fn execute_ordinary_call_unscoped(
         (Err(invalid_input(msg)), 0)
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
+    } else if let Some(message) = unavailable_call {
+        // The provider was told this tool exists, so a call is not a
+        // hallucination. Return a normal call-time availability result without
+        // entering approvals, hooks, verification, or the tool body.
+        (Err(anyhow::anyhow!(message)), 0)
     } else if repair_outcome.valid {
         if let BtwNativeAuthorization::Refused {
             message,
             permission_kind,
         } = authorize_btw_native_call(env, resolved_name, &args).await?
         {
-            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref())
+                .await?;
             // A /btw approval denial early-returns before the common deny-audit
             // site below, so `permissionDenied` must fire here (observe-only /
             // fail-open) with the matching deny kind — otherwise a real
@@ -1361,7 +1432,8 @@ async fn execute_ordinary_call_unscoped(
         )
         .await;
         if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
-            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+            cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref())
+                .await?;
             // The deny is already recorded by `run_pre_tool_hooks` via
             // `record_hook_run`. Return the deterministic model-visible
             // rejected-tool diagnostic; the tool is never executed and no
@@ -1390,8 +1462,90 @@ async fn execute_ordinary_call_unscoped(
             },
         )
         .await;
-        match verification {
+        let verification = match verification {
+            crate::engine::verification::VerificationOutcome::Escalate { plan } => {
+                // A trusted-minimal projection failure must never degrade to
+                // a model-visible refusal that the user cannot act on. Keep
+                // the already-reserved original call in the park payload so
+                // a user-approved replay consumes this durable decision
+                // rather than collecting/adjudicating a second operation.
+                let operation_id = plan.operation_id;
+                payload.verification = Some(
+                    crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        dispatch_attempt_revision: plan.attempt_revision,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
+                    },
+                );
+                let label = format!(
+                    "verification could not safely project this `{resolved_name}` call for automatic approval; approve it manually"
+                );
+                let decision = match env.ctx.approver.as_ref() {
+                    Some(approver) => crate::engine::interrupt::with_interrupt_park_payload(
+                        payload.clone(),
+                        approver.authorize(crate::approval::AuthorizationRequest::NativeTool {
+                            label: &label,
+                            input: &args,
+                        }),
+                    )
+                    .await,
+                    None => Ok(crate::approval::Decision::NoninteractiveDeny),
+                };
+                match decision {
+                    Ok(crate::approval::Decision::Allow { .. }) => {
+                        DispatchVerificationOutcome::DispatchOriginal { plan }
+                    }
+                    Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                        return (Err(crate::engine::interrupt::InterruptParked.into()), 0);
+                    }
+                    Ok(_) | Err(_) => {
+                        if let Err(error) = cancel_verification_dispatch_no_submission(
+                            env.session,
+                            operation_id,
+                            plan.attempt_revision,
+                            b"verification-projection-escalation-declined",
+                        )
+                        .await
+                        {
+                            return (Err(error), 0);
+                        }
+                        verification_blocked = true;
+                        // This is a real user-approval boundary, unlike an
+                        // ordinary verification block. Preserve its observer
+                        // audit after the rejected tool result is durable.
+                        permission_denied_kind = Some("blocked_verification");
+                        DispatchVerificationOutcome::Block {
+                            message: "verification could not safely project this action for automatic approval and the user declined to run it manually; revise and re-emit".into(),
+                            operation_id: Some(operation_id),
+                        }
+                    }
+                }
+            }
+            crate::engine::verification::VerificationOutcome::Skip => {
+                DispatchVerificationOutcome::Skip
+            }
+            crate::engine::verification::VerificationOutcome::DispatchOriginal { plan } => {
+                DispatchVerificationOutcome::DispatchOriginal { plan }
+            }
             crate::engine::verification::VerificationOutcome::Block {
+                message,
+                operation_id,
+            } => DispatchVerificationOutcome::Block {
+                message,
+                operation_id,
+            },
+            crate::engine::verification::VerificationOutcome::Revise {
+                args,
+                disclosure,
+                plan,
+            } => DispatchVerificationOutcome::Revise {
+                args,
+                disclosure,
+                plan,
+            },
+        };
+        match verification {
+            DispatchVerificationOutcome::Block {
                 message,
                 operation_id,
             } => {
@@ -1409,7 +1563,7 @@ async fn execute_ordinary_call_unscoped(
                 }
                 (Err(invalid_input(message)), 0)
             }
-            crate::engine::verification::VerificationOutcome::Revise {
+            DispatchVerificationOutcome::Revise {
                 args: revised_args,
                 disclosure,
                 mut plan,
@@ -1464,22 +1618,17 @@ async fn execute_ordinary_call_unscoped(
                 };
                 match authorization {
                     RevisedCallAuthorization::Refused(message) => {
+                        if let Err(error) = cancel_verification_dispatch_no_submission(
+                            env.session,
+                            operation_id,
+                            plan.attempt_revision,
+                            b"verification-revised-call-authorization-refused",
+                        )
+                        .await
+                        {
+                            return (Err(error), 0);
+                        }
                         verification_blocked = true;
-                        let _ = env
-                            .session
-                            .db
-                            .cancel_verification_dispatch_no_submission(
-                                env.session.id,
-                                operation_id,
-                                plan.attempt_revision,
-                                crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                                    crate::db::verification_ledger::VerificationDigest::of(
-                                        b"verification-revised-call-authorization-refused",
-                                    ),
-                                ),
-                                chrono::Utc::now().timestamp_millis(),
-                            )
-                            .await;
                         (Err(invalid_input(message)), 0)
                     }
                     RevisedCallAuthorization::Ready {
@@ -1519,22 +1668,17 @@ async fn execute_ordinary_call_unscoped(
                             tc.id.as_str(),
                             &authorized_args,
                         ) {
+                            if let Err(error) = cancel_verification_dispatch_no_submission(
+                                env.session,
+                                operation_id,
+                                plan.attempt_revision,
+                                b"verification-provider-signature-rewrite-refused",
+                            )
+                            .await
+                            {
+                                return (Err(error), 0);
+                            }
                             verification_blocked = true;
-                            let _ = env
-                                .session
-                                .db
-                                .cancel_verification_dispatch_no_submission(
-                                    env.session.id,
-                                    operation_id,
-                                    plan.attempt_revision,
-                                    crate::db::verification_ledger::NoSubmissionProof::from_digest(
-                                        crate::db::verification_ledger::VerificationDigest::of(
-                                            b"verification-provider-signature-rewrite-refused",
-                                        ),
-                                    ),
-                                    chrono::Utc::now().timestamp_millis(),
-                                )
-                                .await;
                             let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
                                 .to_string();
                             payload.verification =
@@ -1571,7 +1715,7 @@ async fn execute_ordinary_call_unscoped(
                     }
                 }
             }
-            crate::engine::verification::VerificationOutcome::Skip => {
+            DispatchVerificationOutcome::Skip => {
                 tool_was_dispatched = true;
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                     dispatch_one_timed(
@@ -1585,7 +1729,7 @@ async fn execute_ordinary_call_unscoped(
                 })
                 .await
             }
-            crate::engine::verification::VerificationOutcome::DispatchOriginal { mut plan } => {
+            DispatchVerificationOutcome::DispatchOriginal { mut plan } => {
                 let operation_id = plan.operation_id;
                 let attempt = match env
                     .session
@@ -2807,6 +2951,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replay_refusal_terminalizes_every_reserved_verification_dispatch() {
+        use crate::db::needs_attention::{InterruptVerificationMemo, InterruptVerificationOutcome};
+
+        let memo = |outcome, dispatch_attempt_revision| InterruptVerificationMemo {
+            operation_id: uuid::Uuid::nil(),
+            dispatch_attempt_revision,
+            outcome,
+        };
+
+        assert!(replay_memo_has_reserved_dispatch(&memo(
+            InterruptVerificationOutcome::DispatchOriginal,
+            4,
+        )));
+        assert!(replay_memo_has_reserved_dispatch(&memo(
+            InterruptVerificationOutcome::Revise {
+                args: serde_json::json!({ "path": "output.txt" }),
+                disclosure: "selected revision".to_string(),
+            },
+            4,
+        )));
+        assert!(!replay_memo_has_reserved_dispatch(&memo(
+            InterruptVerificationOutcome::Block {
+                message: "blocked before dispatch".to_string(),
+            },
+            -1,
+        )));
+    }
+
     struct EchoTool;
 
     #[async_trait]
@@ -3242,6 +3415,37 @@ mod tests {
         }
     }
 
+    struct CapabilityUnavailableTool {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for CapabilityUnavailableTool {
+        fn name(&self) -> &str {
+            "capability_unavailable_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Requires a deliberately absent test binary."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+            vec![crate::capabilities::BinaryRequirement::required(
+                "cockpit-test-binary-that-is-deliberately-unavailable-4f59b779",
+                crate::capabilities::CapabilityRemedy::prose("test-only requirement"),
+            )]
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.called.store(true, Ordering::SeqCst);
+            anyhow::bail!("CapabilityUnavailableTool was dispatched")
+        }
+    }
+
     struct IntegerOnlyTool {
         called: Arc<AtomicBool>,
     }
@@ -3408,6 +3612,7 @@ mod tests {
             agent_id: "Build".to_string(),
             executing_model_trusted: false,
             knowledge_access_trusted: false,
+            caller_model: None,
             agent_instance_id: None,
             lock_identity: "Build".to_string().clone(),
             write_scope: None,
@@ -5251,6 +5456,141 @@ mod tests {
             .find(|event| event.kind == "tool_rejected")
             .expect("tool_rejected event");
         assert_eq!(rejected.data["reason"], "not_in_advertised_set");
+    }
+
+    /// Issue #135: an advertised schema stays in the provider prefix even when
+    /// its host capability disappears. A matching model call is therefore a
+    /// call-time availability failure, never a hallucinated-tool rejection.
+    #[tokio::test]
+    async fn advertised_capability_unavailable_tool_returns_availability_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(CapabilityUnavailableTool {
+            called: called.clone(),
+        }));
+        let tools = tools.apply_capabilities(
+            &HashMap::new(),
+            tmp.path(),
+            crate::capabilities::ExecutionTarget::Host,
+        );
+        assert_eq!(
+            tools.call_availability("capability_unavailable_tool"),
+            crate::engine::tool::ToolCallAvailability::AdvertisedUnavailable,
+            "the capability gate changes callability, not provider visibility"
+        );
+        assert!(
+            tools
+                .advertised_definitions(crate::agents::ToolSteering::Terse)
+                .iter()
+                .any(|definition| definition.name == "capability_unavailable_tool"),
+            "the model receives the unavailable tool's stable schema"
+        );
+
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 1,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("capability_unavailable_tool", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "capability_unavailable_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "capability_unavailable_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            history.len(),
+            4,
+            "each unavailable call receives its own result"
+        );
+        assert!(
+            last_tool_result_text(&history).contains("currently unavailable"),
+            "a repeated unavailable call returns availability, not a loop refusal"
+        );
+        assert!(
+            !last_tool_result_text(&history).contains("Loop blocked"),
+            "unavailable calls must not enter the loop-guard approval path"
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "capability_unavailable_tool")
+        );
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(TurnEvent::ToolError { tool, error, kind, .. })
+                    if tool == "capability_unavailable_tool"
+                        && kind == crate::engine::tool::ToolFailKind::Execution
+                        && error.contains("currently unavailable")
+            ),
+            "unavailability is a call-time execution result"
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "capability_unavailable_tool")
+        );
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(TurnEvent::ToolError { tool, error, kind, .. })
+                    if tool == "capability_unavailable_tool"
+                        && kind == crate::engine::tool::ToolFailKind::Execution
+                        && error.contains("currently unavailable")
+            ),
+            "a repeated unavailable call remains a call-time execution result"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "an unavailable tool must not reach its backend"
+        );
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .expect("tool audit rows load");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.hard_fail));
+        assert!(
+            session
+                .db
+                .list_session_events(session.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|event| event.kind != "tool_rejected"),
+            "provider-advertised unavailable calls are not hallucinations"
+        );
     }
 
     /// AC20 (`computer-coordinator-live-loop-and-dispatch-wiring.md` §4):

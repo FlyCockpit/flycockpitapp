@@ -69,6 +69,7 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         turns: 1,
         active_agent: "Build".to_string(),
         title: Some("summary".to_string()),
+        description: None,
         parent_session_id: None,
         created_by_principal: None,
         shared_with_collaborators: false,
@@ -163,7 +164,6 @@ async fn app_with_sessions_preview_pane_async(tmp: &tempfile::TempDir) -> App {
 
 fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
     let dead_socket = tmp.path().join("no-daemon.sock");
-    app.daemon_prompt = None;
     app.daemon_connected = true;
     app.startup_background.daemon_socket = Some(dead_socket.clone());
     let session_id = Uuid::new_v4();

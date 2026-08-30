@@ -208,7 +208,8 @@ async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
     let project_id = args
         .project
         .as_ref()
-        .map(|project| project_id_for(project.as_path()));
+        .map(|project| project_id_for(project.as_path()))
+        .transpose()?;
     let since_epoch = Utc::now().timestamp() - (args.days as i64) * 86_400;
     let probe = discover().await;
     let calls_json = match probe.status {

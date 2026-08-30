@@ -459,6 +459,7 @@ extended	scheduled_jobs	missed_run_policy	non_relationship
 extended	scheduled_jobs	next_run_at	non_relationship
 extended	scheduled_jobs	owner	external
 extended	scheduled_jobs	payload_json	non_relationship
+extended	scheduled_jobs	row_identity	local_identity
 extended	scheduled_jobs	schedule_json	non_relationship
 extended	scheduled_jobs	updated_at	non_relationship
 local	accepted_persistent_guidance_rules	canonical_project_digest	primary
@@ -641,8 +642,6 @@ local	agent_transition_receipts	session_event_seq	foreign
 local	agent_transition_receipts	session_id	foreign
 local	agent_transition_receipts	terminal_revision	non_relationship
 local	agent_transition_receipts	terminal_state	primary
-local	app_flags	key	primary
-local	app_flags	seen_at	non_relationship
 local	approval_grants	access	non_relationship
 local	approval_grants	grant_key	primary
 local	approval_grants	grant_kind	primary

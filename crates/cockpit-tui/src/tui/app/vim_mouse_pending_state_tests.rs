@@ -36,7 +36,6 @@ fn configured_app(tmp: &tempfile::TempDir) -> App {
         super::trusted_workspace_policy_for_tests(tmp.path()),
         || App::new(Some(tmp.path()), false),
     );
-    app.daemon_prompt = None;
     app
 }
 

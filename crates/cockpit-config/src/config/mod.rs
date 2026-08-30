@@ -362,6 +362,17 @@ pub fn read_config_leaf_from_retained_directory_with_identity(
     files::read_leaf_from_directory_handle_with_identity(directory, leaf, max_bytes)
 }
 
+/// Read one bounded regular file below an already-retained directory without
+/// reopening its root by pathname. Every component is opened relative to the
+/// retained capability and must be a normal, non-link path component.
+pub fn read_config_relative_file_from_retained_directory(
+    directory: &std::fs::File,
+    relative: &std::path::Path,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    files::read_relative_file_from_directory_handle(directory, relative, max_bytes)
+}
+
 /// Snapshot every visible Markdown document below an existing directory using
 /// component-relative, no-follow handles. Symlinks/reparse points and identity
 /// ambiguity fail the entire snapshot; callers never mix trusted and untrusted
@@ -395,7 +406,7 @@ pub fn snapshot_markdown_tree_from_retained_directory_nofollow(
     max_file_bytes: usize,
     max_total_bytes: usize,
 ) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
-    files::snapshot_markdown_tree_from_directory_nofollow(
+    files::snapshot_markdown_tree_from_retained_directory_nofollow(
         directory,
         max_files,
         max_entries,

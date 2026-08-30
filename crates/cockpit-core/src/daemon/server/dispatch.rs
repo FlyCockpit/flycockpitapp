@@ -2746,6 +2746,7 @@ impl std::error::Error for GoalMutationRejected {}
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
         proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
+        proto::AppFlagKey::StorageManagementHint => "storage-management-hint",
     }
 }
 
@@ -3537,8 +3538,7 @@ async fn handle_send_user_message_v2(
         Vec::new()
     } else {
         let storage = ctx
-            .media_storage_recovery
-            .as_ref()
+            .active_media_storage_recovery()
             .ok_or_else(|| internal("durable media storage unavailable"))?;
         match storage
             .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
@@ -3908,7 +3908,7 @@ async fn handle_send_user_message(
     // durably accepted both the receipt triple and source reservation.
     if origin == proto::UserMessageOrigin::ExternalRoot
         && artifact_admission.is_none()
-        && let Some(scheduler) = &ctx.scheduler
+        && let Some(scheduler) = ctx.scheduler()
     {
         scheduler.record_user_activity().await;
     }
@@ -5701,7 +5701,14 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             if !state.principal.is_owner() {
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
-                    handle.redaction_table()
+                    let session = handle.session();
+                    let base = handle.redaction_table();
+                    std::sync::Arc::new(
+                        session
+                            .with_machine_scoped_sealed_redactions(&base)
+                            .await
+                            .map_err(internal)?,
+                    )
                 } else {
                     let session = crate::session::Session::resume(
                         ctx.db.clone(),
@@ -5714,15 +5721,18 @@ async fn handle_serialized_request_impl(
                         code: ErrorCode::UnknownSession,
                         message: format!("unknown session {session_id}"),
                     })?;
+                    let table = session
+                        .persisted_redaction_table()
+                        .map_err(internal)?
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "session transcript redaction data is unavailable".to_string(),
+                        })?;
                     std::sync::Arc::new(
                         session
-                            .persisted_redaction_table()
-                            .map_err(internal)?
-                            .ok_or_else(|| ErrorPayload {
-                                code: ErrorCode::Authorization,
-                                message: "session transcript redaction data is unavailable"
-                                    .to_string(),
-                            })?,
+                            .with_machine_scoped_sealed_redactions(&table)
+                            .await
+                            .map_err(internal)?,
                     )
                 };
                 history = scrub_history_for_principal(&state.principal, history, &redact);
@@ -7844,6 +7854,39 @@ async fn handle_serialized_request_impl(
                 config_generation: inventory::current_config_generation(),
             })
         }
+        Request::SetWorkspaceHistoryScope {
+            project_root,
+            outbound,
+            inbound,
+        } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root).map_err(internal)?;
+            ctx.db
+                .set_workspace_history_scope(
+                    &project_id,
+                    crate::db::history_scope::WorkspaceHistoryScope { outbound, inbound },
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope { outbound, inbound })
+        }
+        Request::GetWorkspaceHistoryScope { project_root } => {
+            let root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            let project_id = crate::session::project_id_for(&root.root).map_err(internal)?;
+            let scope = ctx
+                .db
+                .workspace_history_scope(&project_id)
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceHistoryScope {
+                outbound: scope.outbound,
+                inbound: scope.inbound,
+            })
+        }
         Request::GetStartupDisclosures { project_root: _ } => {
             #[cfg(not(feature = "remote"))]
             return Ok(Response::StartupDisclosures {
@@ -7894,39 +7937,94 @@ async fn handle_serialized_request_impl(
             key,
             expected_version,
         } => {
-            // `mark_app_flag_seen` is classified `local_only`: app flags are
-            // daemon-local UI acknowledgements, NOT a remoted owner mutation, so
-            // the request never reserves a transactional remote-operation ledger
-            // row. `admit_remote_operation` already denies a remote non-owner
-            // (the `local_only` class resolves to no remote class) and returns
-            // `None` for the owner, so any `remote_operation` identity is inert
-            // here by construction — persist locally only. See
-            // `mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger`.
-            let db_key = app_flag_db_key(key);
-            let outcome = ctx
-                .db
-                .write(move |conn| {
-                    crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)
-                })
-                .await
-                .map_err(internal)?;
-            let Some((version, changed)) = outcome else {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: "app flag version changed; refresh before retrying".into(),
-                });
-            };
-            Ok(Response::AppFlagSeen {
+            #[cfg(feature = "remote")]
+            let request = Request::MarkAppFlagSeen {
                 key,
-                version,
-                changed,
+                expected_version,
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(remote_operation, ctx, "mark_app_flag_seen", async {
+                let db_key = app_flag_db_key(key);
+                let outcome = ctx
+                    .db
+                    .write(move |conn| {
+                        crate::db::Db::mark_app_flag_seen_versioned_conn(
+                            conn,
+                            db_key,
+                            expected_version,
+                        )
+                    })
+                    .await
+                    .map_err(internal)?;
+                let Some((version, changed)) = outcome else {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "app flag version changed; refresh before retrying".into(),
+                    });
+                };
+                Ok(Response::AppFlagSeen {
+                    key,
+                    version,
+                    changed,
+                })
             })
+        }
+        Request::GetStorageReport => super::storage::report(ctx).await,
+        Request::PreviewStorageCleanup { target } => {
+            #[cfg(feature = "remote")]
+            let request = Request::PreviewStorageCleanup {
+                target: target.clone(),
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "preview_storage_cleanup",
+                super::storage::preview(ctx, target)
+            )
+        }
+        Request::ExecuteStorageCleanup { preview_id } => {
+            #[cfg(feature = "remote")]
+            let request = Request::ExecuteStorageCleanup { preview_id };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "execute_storage_cleanup",
+                super::storage::execute(ctx, preview_id)
+            )
         }
         Request::ResolveAssistantSession {
             assistant_id,
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            if ctx.is_ephemeral_lifetime() {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept assistant sessions; assistant sessions require a persistent daemon owner",
+                ));
+            }
             let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
@@ -7945,6 +8043,9 @@ async fn handle_serialized_request_impl(
             }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
+            let project_id_for_new_session =
+                crate::session::project_id_for(Path::new(&project_root_for_db))
+                    .map_err(internal)?;
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
@@ -7962,11 +8063,9 @@ async fn handle_serialized_request_impl(
                         )? {
                             Some(row) => (row, false),
                             None => {
-                                let project_id =
-                                    crate::session::project_id_for(Path::new(&project_root_for_db));
                                 let row = crate::db::Db::build_new_assistant_session_row_conn(
                                     conn,
-                                    &project_id,
+                                    &project_id_for_new_session,
                                     &project_root_for_db,
                                     &assistant_for_db,
                                     &assistant_for_db,
@@ -8005,7 +8104,7 @@ async fn handle_serialized_request_impl(
                 description: description.clone(),
                 prompt: prompt.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -8049,7 +8148,7 @@ async fn handle_serialized_request_impl(
             expected_revision,
             expected_config_generation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -8285,7 +8384,7 @@ async fn handle_serialized_request_impl(
                 local_path: local_path.clone(),
                 deep,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -8341,7 +8440,7 @@ async fn handle_serialized_request_impl(
                 id: id.clone(),
                 as_path,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -8397,7 +8496,7 @@ async fn handle_serialized_request_impl(
                 days,
                 dry_run,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -8430,7 +8529,7 @@ async fn handle_serialized_request_impl(
             let request = Request::ImportKclPackages {
                 project_root: project_root.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -8464,7 +8563,7 @@ async fn handle_serialized_request_impl(
         Request::PurgeEndedSessions { before } => {
             #[cfg(feature = "remote")]
             let request = Request::PurgeEndedSessions { before };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent session purges",
                 ));
@@ -8477,31 +8576,10 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let session_ids = ctx
-                .db
-                .read(move |conn| {
-                    let mut statement = conn.prepare(
-                        "SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL AND ended_at_unix_ms < ?1",
-                    )?;
-                    statement
-                        .query_map([before], |row| row.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(Into::into)
-                })
-                .await
-                .map_err(internal)?;
-            let mut purged = 0u32;
-            for id in &session_ids {
-                if let Ok(session_id) = Uuid::parse_str(id) {
-                    ctx.db.delete_session(session_id).await.map_err(internal)?;
-                    purged = purged.saturating_add(1);
-                }
-            }
-            let response = Response::EndedSessionsPurged {
-                purged,
-                session_ids_json: serde_json::to_string(&session_ids).map_err(internal)?,
-            };
-            finish_nonrepeatable_response!(remote_operation, ctx, "purge_ended_sessions", response)
+            let _ = before;
+            Err(bad_request(
+                "session purge requires a storage cleanup preview; select sessions and permanently delete them from Settings > Storage",
+            ))
         }
 
         Request::DeleteAssistant {
@@ -8512,7 +8590,7 @@ async fn handle_serialized_request_impl(
             expected_revision,
             expected_config_generation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -8699,7 +8777,7 @@ async fn handle_serialized_request_impl(
                 repair_plan_digest: repair_plan_digest.clone(),
                 idempotency_key: idempotency_key.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept media reservation repairs",
                 ));
@@ -8831,6 +8909,11 @@ async fn handle_serialized_request_impl(
             no_sandbox,
             env_snapshot,
         } => {
+            if ctx.is_ephemeral_lifetime() {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept assistant sessions; assistant sessions require a persistent daemon owner",
+                ));
+            }
             let env_snapshot = env_snapshot.map(EnvSnapshot::from_wire).unwrap_or_else(|| {
                 ctx.env_baseline
                     .read()
@@ -8863,7 +8946,7 @@ async fn handle_serialized_request_impl(
             // A per-run daemon can disappear as soon as its client exits.
             // Assistant create returns a session id the same way attach does,
             // so persist before handing that id back.
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 handle.persist_if_needed().map_err(internal)?;
             }
             Ok(Response::AssistantSessionCreated {
@@ -9067,6 +9150,51 @@ async fn handle_serialized_request_impl(
                 .send_work(SessionWork::Cancel)
                 .await
                 .map_err(session_work_error)?;
+            Ok(Response::Ack)
+        }
+
+        Request::CancelAllSessionWork => {
+            {
+                let att = require_attached(state)?;
+                att.handle
+                    .send_work(SessionWork::CancelAll)
+                    .await
+                    .map_err(session_work_error)?;
+            }
+            ctx.release_exit_guard_reservation(state);
+            Ok(Response::Ack)
+        }
+
+        Request::PromoteToPersistent => {
+            ctx.promote_to_persistent(state.exit_guard_reservation.as_ref())
+                .map_err(internal)?;
+            state.exit_guard_reservation = None;
+            Ok(Response::Ack)
+        }
+
+        Request::ExitGuardStatus => {
+            // Serialize the lifetime classification with promotion and sample
+            // the attached worker directly. Clients must not infer either
+            // half from discovery or their local event projection.
+            let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
+            let (has_schedules, processing, tool_running) = {
+                let attached = require_attached(state)?;
+                attached.handle.live_status()
+            };
+            let has_live_work = has_schedules || processing || tool_running;
+            let ephemeral_owner = ctx.is_ephemeral_lifetime();
+            if ephemeral_owner && has_live_work {
+                ctx.reserve_exit_guard(state).map_err(internal)?;
+            }
+            Ok(Response::ExitGuardStatus {
+                ephemeral_owner,
+                has_live_work,
+            })
+        }
+
+        Request::ReleaseExitGuard => {
+            require_attached(state)?;
+            ctx.release_exit_guard_reservation(state);
             Ok(Response::Ack)
         }
 
@@ -10534,23 +10662,10 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DeleteSession { session_id } => {
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
-                let ledger = build_remote_session_ledger(
-                    ctx,
-                    &authorized_request,
-                    &Request::DeleteSession { session_id },
-                    operation,
-                )?;
-                return sessions_remote::delete_session(
-                    ctx,
-                    session_id,
-                    state.negotiated_protocol_version(),
-                    &ledger,
-                )
-                .await;
-            }
-            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
+            let _ = session_id;
+            Err(bad_request(
+                "direct session deletion is disabled; preview permanent deletion from Settings > Storage first",
+            ))
         }
 
         Request::GetInventoryBundle {
@@ -10591,6 +10706,7 @@ async fn handle_serialized_request_impl(
 
         Request::CreateScheduledJob { job } => {
             let scheduler = require_scheduler(ctx)?;
+            crate::daemon::scheduler::validate_public_job_create(&job).map_err(internal)?;
             let job = scheduler.create_job(job).await.map_err(internal)?;
             Ok(Response::ScheduledJob { job })
         }
@@ -12359,6 +12475,63 @@ async fn handle_serialized_request_impl(
             finish_nonrepeatable_response!(remote_operation, ctx, "compact", Response::Ack)
         }
 
+        Request::ResumeFromCompaction => {
+            // Exactness is rechecked by the worker, but only an interactive
+            // away-resume that was actually offered this branch may request
+            // it. Keep the authorization connection-local so a headless
+            // attach, reattach, or a second request cannot borrow an offer.
+            let handle = {
+                let att = state.attached.as_mut().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::NotAttached,
+                    message: "client has not attached to a session".into(),
+                })?;
+                if !att.resume_compaction_offer_issued {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message:
+                            "resume compaction requires an offered interactive away-resume choice"
+                                .into(),
+                    });
+                }
+                // Consume before sending work. If the worker is unavailable
+                // or the exact snapshot has changed, a new eligible attach
+                // must obtain a fresh offer rather than replaying stale
+                // authority.
+                att.resume_compaction_offer_issued = false;
+                att.handle.clone()
+            };
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::ResumeFromCompaction,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::ResumeFromCompaction { respond_to })
+                .await
+                .map_err(session_work_error)?;
+            response_rx
+                .await
+                .map_err(internal)?
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: error,
+                })?;
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "resume_from_compaction",
+                Response::Ack
+            )
+        }
+
         Request::Pin { text } => {
             let att = require_attached(state)?;
             #[cfg(feature = "remote")]
@@ -12384,7 +12557,7 @@ async fn handle_serialized_request_impl(
                 credential: credential.clone(),
                 force,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
@@ -12456,7 +12629,7 @@ async fn handle_serialized_request_impl(
 
         #[cfg(feature = "remote")]
         Request::ClearFlycockpitCredential => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
@@ -12578,7 +12751,7 @@ async fn handle_serialized_request_impl(
         #[cfg(feature = "remote")]
         Request::SetFlycockpitConnectorEnabled { enabled } => {
             let request = Request::SetFlycockpitConnectorEnabled { enabled };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit connector settings",
                 ));
@@ -12617,7 +12790,7 @@ async fn handle_serialized_request_impl(
         #[cfg(feature = "remote")]
         Request::SyncFlycockpitOrgPolicy => {
             let request = Request::SyncFlycockpitOrgPolicy;
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit org policy sync",
                 ));
@@ -12676,7 +12849,7 @@ async fn handle_serialized_request_impl(
             let request = Request::EnrollFlycockpitOrgSync {
                 org_id: org_id.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit org sync enrollment",
                 ));
@@ -12722,7 +12895,7 @@ async fn handle_serialized_request_impl(
                 name: name.clone(),
                 value: value.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
@@ -12780,7 +12953,7 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent subscription acknowledgement writes",
                 ));
@@ -12894,7 +13067,7 @@ async fn handle_serialized_request_impl(
         Request::DeleteNamedSecret { name } => {
             #[cfg(feature = "remote")]
             let request = Request::DeleteNamedSecret { name: name.clone() };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
@@ -12968,7 +13141,7 @@ async fn handle_serialized_request_impl(
                 provider_id: provider_id.clone(),
                 record: record.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
@@ -13221,7 +13394,7 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
@@ -13503,7 +13676,7 @@ async fn handle_serialized_request_impl(
             flow_id,
             input,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
@@ -14053,7 +14226,7 @@ async fn handle_serialized_request_impl(
             } else {
                 profile
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
@@ -14168,16 +14341,16 @@ async fn handle_serialized_request_impl(
                         .map_err(bad_config)?
                         .ok_or_else(|| bad_request(format!("agent `{agent}` was not found")))?;
                     let catalog = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
-                        &cwd, 0, &def,
+                        &cwd, &def,
                     )
                     .catalog();
-                    let entry = catalog.servers.get(&server).ok_or_else(|| {
+                    let entry = catalog.get(&server).ok_or_else(|| {
                         bad_request(format!("MCP server `{server}` is not available to agent `{agent}`"))
                     })?;
                     if !entry.agent_bound {
                         return Err(bad_request(format!(
                             "MCP OAuth agent selector requires an agent-package server; `{server}` comes from {} scope",
-                            entry.source.as_str()
+                            entry.source().as_str()
                         )));
                     }
                     if entry.profile != profile {
@@ -14186,7 +14359,11 @@ async fn handle_serialized_request_impl(
                             entry.profile
                         )));
                     }
-                    entry.server.clone()
+                    entry.persistent_server().cloned().ok_or_else(|| {
+                        bad_request(format!(
+                            "MCP OAuth cannot authenticate the built-in `{server}` pseudo-server"
+                        ))
+                    })?
                 } else {
                     let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
                     let config = mcp_config_from_paths(&paths)?;
@@ -14557,7 +14734,7 @@ async fn handle_serialized_request_impl(
             flow_id,
             input,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
@@ -15076,7 +15253,7 @@ async fn handle_serialized_request_impl(
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
@@ -15276,7 +15453,7 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             mutation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -15302,7 +15479,7 @@ async fn handle_serialized_request_impl(
             on_unlisted,
             allow_fallback,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider model fetches that persist config",
                 ));
@@ -15361,7 +15538,7 @@ async fn handle_serialized_request_impl(
             provider_id,
             entry,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -15396,7 +15573,7 @@ async fn handle_serialized_request_impl(
             entry,
             header_secrets,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -15484,7 +15661,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.paths.ephemeral {
+                if ctx.is_ephemeral_lifetime() {
                     return Err(bad_request(
                         "ephemeral daemons do not accept Copilot auth setup",
                     ));
@@ -15632,7 +15809,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.paths.ephemeral {
+                if ctx.is_ephemeral_lifetime() {
                     return Err(bad_request(
                         "ephemeral daemons do not accept MCP config writes",
                     ));
@@ -15699,7 +15876,7 @@ async fn handle_serialized_request_impl(
             provider_id,
             delete_stored_secrets,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -15734,7 +15911,7 @@ async fn handle_serialized_request_impl(
             category_defaults_json,
             on_unlisted_models_fetch,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider metadata writes",
                 ));
@@ -16129,8 +16306,7 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
@@ -16193,8 +16369,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
@@ -16251,8 +16426,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(unavailable)?;
             let trust_policy = attached.handle.current_trust_policy();
             let (_, extended) = ctx
@@ -16393,8 +16567,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(unavailable)?;
             let now = chrono::Utc::now().timestamp_millis();
             let lease = storage
@@ -16465,8 +16638,7 @@ async fn handle_serialized_request_impl(
                 .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
                 .map_err(internal)?;
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .begin_media_upload(
@@ -16534,8 +16706,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .append_media_upload_chunk(request, chrono::Utc::now().timestamp_millis())
@@ -16598,8 +16769,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .cancel_media_upload(request, chrono::Utc::now().timestamp_millis())
@@ -16662,8 +16832,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = storage
                 .discard_media_attachment(request, chrono::Utc::now().timestamp_millis())
@@ -16773,8 +16942,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .finalize_media_upload(request, chrono::Utc::now().timestamp_millis())
@@ -17205,7 +17373,14 @@ async fn handle_concurrent_request_impl(
                 .map_err(internal)?;
             if !shared.principal.is_owner() {
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
-                    handle.redaction_table()
+                    let session = handle.session();
+                    let base = handle.redaction_table();
+                    std::sync::Arc::new(
+                        session
+                            .with_machine_scoped_sealed_redactions(&base)
+                            .await
+                            .map_err(internal)?,
+                    )
                 } else {
                     let session = crate::session::Session::resume(
                         ctx.db.clone(),
@@ -17218,15 +17393,18 @@ async fn handle_concurrent_request_impl(
                         code: ErrorCode::UnknownSession,
                         message: format!("unknown session {session_id}"),
                     })?;
+                    let table = session
+                        .persisted_redaction_table()
+                        .map_err(internal)?
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "session transcript redaction data is unavailable".to_string(),
+                        })?;
                     std::sync::Arc::new(
                         session
-                            .persisted_redaction_table()
-                            .map_err(internal)?
-                            .ok_or_else(|| ErrorPayload {
-                                code: ErrorCode::Authorization,
-                                message: "session transcript redaction data is unavailable"
-                                    .to_string(),
-                            })?,
+                            .with_machine_scoped_sealed_redactions(&table)
+                            .await
+                            .map_err(internal)?,
                     )
                 };
                 history = scrub_history_for_principal(&shared.principal, history, &redact);
@@ -20196,13 +20374,12 @@ fn redacted_mcp_config_snapshot(
         crate::mcp::resolver::discover_effective_catalog(cwd)
     });
     let mut shadowed = catalog
-        .shadowed
-        .iter()
+        .shadowed_entries()
         .filter_map(|entry| {
             entry.shadowed_by.map(|shadowed_by| {
                 serde_json::json!({
-                    "server": entry.name,
-                    "source": entry.source.as_str(),
+                    "server": entry.name(),
+                    "source": entry.source().as_str(),
                     "shadowed_by": shadowed_by.as_str(),
                 })
             })
@@ -20213,18 +20390,18 @@ fn redacted_mcp_config_snapshot(
             continue;
         };
         let agent_catalog =
-            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, 0, &def).catalog();
-        shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
+            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, &def).catalog();
+        shadowed.extend(agent_catalog.shadowed_entries().filter_map(|entry| {
             let shadowed_by = entry.shadowed_by?;
-            if entry.source != crate::mcp::resolver::McpScope::Agent
+            if entry.source() != crate::mcp::resolver::McpScope::Agent
                 && shadowed_by != crate::mcp::resolver::McpScope::Agent
             {
                 return None;
             }
             Some(serde_json::json!({
                 "agent": listing.name,
-                "server": entry.name,
-                "source": entry.source.as_str(),
+                "server": entry.name(),
+                "source": entry.source().as_str(),
                 "shadowed_by": shadowed_by.as_str(),
             }))
         }));
@@ -25309,9 +25486,10 @@ async fn finish_session_setup_snapshot(
     session_id: Uuid,
     snapshot: cockpit_proto::SessionSetupSnapshotV1,
 ) -> std::result::Result<cockpit_proto::SessionSetupSnapshotV1, ErrorPayload> {
+    let project_id = crate::session::project_id_for(project_root).map_err(internal)?;
     let last_used = ctx
         .db
-        .last_used_root_agent_for_project(&crate::session::project_id_for(project_root))
+        .last_used_root_agent_for_project(&project_id)
         .await
         .ok()
         .flatten();
@@ -25801,7 +25979,7 @@ pub(super) fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str
 // ---- shutdown -------------------------------------------------------------
 
 /// The single entry point every stop trigger (SIGINT/SIGTERM, explicit
-/// `StopDaemon`, the ephemeral last-client/owner-exit teardown) routes
+/// `StopDaemon`, and ephemeral last-client teardown) routes
 /// through (`daemon-graceful-drain-shutdown.md`).
 ///
 /// First call begins the drain: it broadcasts the `DaemonDraining { forced:
@@ -26133,6 +26311,15 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
+    // A durable Assistant owns background work. Frontends resolve its owner
+    // through PromoteToPersistent before Attach; keep this server boundary as
+    // the final fail-closed fence for any future generic resume path.
+    if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.is_ephemeral_lifetime() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "Assistant sessions require a persistent daemon owner".into(),
+        });
+    }
     // Terminal results for transactions this attach converged. Delivered
     // through the worker below, once a handle exists to stamp the generation.
     let recovered_default_transactions;
@@ -26275,7 +26462,7 @@ pub(super) async fn attach(
     // A per-run daemon can disappear as soon as its client exits. Make the
     // session row durable before returning its id so another daemon process
     // can always find it through the normal DB-backed resume path.
-    if session_id.is_none() && ctx.paths.ephemeral {
+    if session_id.is_none() && ctx.is_ephemeral_lifetime() {
         handle.persist_if_needed().map_err(internal)?;
     }
     if remote_readonly_attach {
@@ -26297,6 +26484,27 @@ pub(super) async fn attach(
     let mut event_rx = handle.subscribe();
     let interactive_guard = if interactive {
         Some(handle.register_interactive_client())
+    } else {
+        None
+    };
+    // Capture the durable activity age before this attach itself updates the
+    // recency marker. Cache timestamps are intentionally in-memory only and
+    // do not survive daemon restart; session activity is the durable resume
+    // clock for the user-configured idle window.
+    let resume_idle_for_secs = if interactive && session_id.is_some() && since_seq.is_none() {
+        let row = ctx
+            .db
+            .get_session(handle.session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {}", handle.session_id),
+            })?;
+        let elapsed_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(row.last_active_at_unix_ms);
+        Some(u64::try_from(elapsed_ms / 1_000).unwrap_or(0))
     } else {
         None
     };
@@ -26336,10 +26544,46 @@ pub(super) async fn attach(
     drain_client_attachment_ownership(state, ctx, "reattach").await?;
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
-        handle,
+        handle: handle.clone(),
         workspace_identity: Some(workspace_identity),
         _interactive_guard: interactive_guard,
+        resume_compaction_offer_issued: false,
     });
+
+    // An interactive away-resume gets its policy from the live driver's
+    // per-model context config. Headless attaches never ask or compact: they
+    // retain full history by construction. Preparing an offer is
+    // non-mutating, and `ask` leaves the retained snapshot available until a
+    // later explicit `ResumeFromCompaction` request.
+    let resume_compaction_offer = if let Some(idle_for_secs) = resume_idle_for_secs {
+        let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(SessionWork::PrepareResumeCompaction {
+                idle_for_secs,
+                respond_to,
+            })
+            .await
+            .map_err(session_work_error)?;
+        let offer = response_rx.await.map_err(internal)?.map_err(internal)?;
+        match offer {
+            Some(offer) if offer.default == proto::ResumeCompactionDefault::Compacted => {
+                let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+                handle
+                    .send_work(SessionWork::ResumeFromCompaction { respond_to })
+                    .await
+                    .map_err(session_work_error)?;
+                response_rx.await.map_err(internal)?.map_err(internal)?;
+                None
+            }
+            Some(offer) if offer.default == proto::ResumeCompactionDefault::Ask => Some(offer),
+            Some(_) | None => None,
+        }
+    } else {
+        None
+    };
+    if let Err(error) = handle.session().touch() {
+        tracing::warn!(%error, %session_id, "marking session active after attach failed");
+    }
 
     // Hydrate the queue and gitignore read-allowlist for this client. The
     // just-subscribed `event_rx` receives both full-list replacements, so a
@@ -26440,7 +26684,18 @@ pub(super) async fn attach(
     effects.session_event_rx = Some(event_rx);
 
     history = if let Some(att) = state.attached.as_ref() {
-        let redact = att.handle.redaction_table();
+        let redact = if state.principal.is_owner() {
+            att.handle.redaction_table()
+        } else {
+            let base = att.handle.redaction_table();
+            std::sync::Arc::new(
+                att.handle
+                    .session()
+                    .with_machine_scoped_sealed_redactions(&base)
+                    .await
+                    .map_err(internal)?,
+            )
+        };
         scrub_history_for_principal(&state.principal, history, &redact)
     } else {
         history
@@ -26467,6 +26722,15 @@ pub(super) async fn attach(
         .map_err(internal)?
         .map(btw_info_to_proto);
 
+    if resume_compaction_offer.is_some()
+        && let Some(att) = state.attached.as_mut()
+    {
+        // All remaining attach work is complete, so this client is about to
+        // receive the explicit `ask` choice. Automatic compacted defaults do
+        // not authorize the public accept request.
+        att.resume_compaction_offer_issued = true;
+    }
+
     Ok(Response::Attached {
         session_id,
         session_entry_mode,
@@ -26485,6 +26749,7 @@ pub(super) async fn attach(
             .as_ref()
             .and_then(|att| att.handle.repair_required())
             .map(Box::new),
+        resume_compaction_offer,
         daemon_version: proto::DAEMON_VERSION.to_string(),
         compatible: proto::is_protocol_compatible(client_protocol_version),
         env_baseline: Some(env_baseline_meta),
@@ -27073,15 +27338,18 @@ async fn run_docs_ask_pipeline(
     let store = session
         .provider_credential_store(&providers)
         .map_err(|error| format!("opening owner-scoped credential store: {error:#}"))?;
-    let redact = Arc::new(
-        crate::redact::RedactionTable::build_with_env_and_credential_store(
-            &extended.redact,
-            &cwd,
-            env_snapshot.vars(),
-            &store,
-        )
-        .map_err(|error| format!("building redaction table: {error:#}"))?,
-    );
+    let redact = crate::redact::RedactionTable::build_with_env_and_credential_store(
+        &extended.redact,
+        &cwd,
+        env_snapshot.vars(),
+        &store,
+    )
+    .map_err(|error| format!("building redaction table: {error:#}"))?;
+    let redact = session
+        .with_machine_scoped_sealed_redactions(&redact)
+        .await
+        .map_err(|error| format!("adding machine-scoped sealed values: {error:#}"))?;
+    let redact = Arc::new(redact);
     let model = Arc::new(
         crate::engine::model::Model::from_config_with_store(
             &providers,
@@ -27126,10 +27394,13 @@ async fn run_docs_ask_pipeline(
         cwd: cwd.clone(),
         config: config.clone(),
         session_short_id: session.short_id(),
+        workspace_scratch_dir: session.workspace_scratch_dir(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
         mcp_parent_reachable: None,
+        mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd.clone())
+            .catalog(),
         model_override: None,
         delegation_model: None,
         delegated: true,
@@ -27959,6 +28230,12 @@ pub(super) async fn auto_title_request(
         };
         std::sync::Arc::new(table)
     };
+    let redact = std::sync::Arc::new(
+        session
+            .with_machine_scoped_sealed_redactions(&redact)
+            .await
+            .map_err(internal)?,
+    );
 
     let title = crate::auto_title::generate_session_title_slug_once(
         &session,

@@ -27,7 +27,6 @@ pub mod chrome;
 pub mod composer;
 pub mod context_menu;
 pub mod context_pane;
-pub mod daemon_prompt;
 pub mod dialog;
 pub mod diff;
 pub mod diff_pane;

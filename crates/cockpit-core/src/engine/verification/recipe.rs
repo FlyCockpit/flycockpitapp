@@ -123,7 +123,7 @@ pub fn proposed_diff(tool_name: &str, args: &Value, cwd: &Path) -> String {
         .map(PathBuf::from)
         .map(|p| if p.is_absolute() { p } else { cwd.join(p) });
     match tool_name {
-        "write" | "plan_write" => {
+        "write" => {
             let new = args
                 .get("content")
                 .and_then(Value::as_str)
@@ -134,7 +134,7 @@ pub fn proposed_diff(tool_name: &str, args: &Value, cwd: &Path) -> String {
                 .unwrap_or_default();
             unified_diff(&old, new)
         }
-        "edit" | "plan_edit" => {
+        "edit" => {
             let old = args
                 .get("old_string")
                 .and_then(Value::as_str)

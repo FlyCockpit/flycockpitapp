@@ -172,12 +172,40 @@ pub struct ContextPolicy {
         skip_serializing_if = "Option::is_none"
     )]
     pub inline_caps: Option<InlineCapsProfile>,
+    /// UTF-8 byte size above which a text tool result or user paste is kept
+    /// behind a `cockpit://` pseudofile instead of being retained inline.
+    #[serde(
+        rename = "artifactSpillBytes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_spill_bytes: Option<usize>,
+    /// Number of leading lines included in the immutable model-facing preview
+    /// for an artifact-backed payload.
+    #[serde(
+        rename = "artifactPreviewLines",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_preview_lines: Option<usize>,
 }
 
 impl ContextPolicy {
     /// The default auto-compact percentage (80) used when the def does not
     /// declare one.
     pub const DEFAULT_AUTO_COMPACT_PCT: u8 = 80;
+    pub const DEFAULT_ARTIFACT_SPILL_BYTES: usize = 8 * 1024;
+    pub const DEFAULT_ARTIFACT_PREVIEW_LINES: usize = 100;
+
+    pub fn artifact_spill_bytes(&self) -> usize {
+        self.artifact_spill_bytes
+            .unwrap_or(Self::DEFAULT_ARTIFACT_SPILL_BYTES)
+    }
+
+    pub fn artifact_preview_lines(&self) -> usize {
+        self.artifact_preview_lines
+            .unwrap_or(Self::DEFAULT_ARTIFACT_PREVIEW_LINES)
+    }
 }
 
 /// The resolved posture of one agent node (issue #75): the single value the

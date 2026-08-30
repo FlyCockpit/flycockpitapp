@@ -453,6 +453,9 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal)?;
     ctx.db.delete_session(session_id).await.map_err(internal)?;
+    if let Err(error) = crate::text_artifact_blob::remove_session(session_id) {
+        tracing::warn!(%error, %session_id, "text artifact blob cleanup remains pending");
+    }
     Ok(Response::Ack)
 }
 

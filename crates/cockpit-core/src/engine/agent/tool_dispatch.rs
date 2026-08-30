@@ -2178,12 +2178,27 @@ async fn execute_ordinary_call_unscoped(
     }
     let mut model_artifact_frame = None;
     let tool_call_seq = if let Some(capture) = artifact_capture.as_ref() {
-        let provenance_json = serde_json::json!({
+        let mut provenance = serde_json::json!({
             "agent_id": &env.agent.name,
             "tool": resolved_name,
             "call_id": &tc.id,
-        })
-        .to_string();
+            "source": "tool_result",
+        });
+        let spill_bytes = env
+            .agent
+            .context_policy
+            .as_ref()
+            .map(crate::agents::ContextPolicy::artifact_spill_bytes)
+            .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
+        if capture.content.len() > spill_bytes {
+            match crate::text_artifact_blob::write(env.session.id, &capture.content) {
+                Ok(path) => provenance["blob_path"] = serde_json::Value::String(path),
+                Err(error) => {
+                    tracing::warn!(%error, tool = %resolved_name, "could not spill tool result to disk; retaining inline artifact")
+                }
+            }
+        }
+        let provenance_json = provenance.to_string();
         let candidate = crate::db::text_artifacts::TextArtifactCandidate {
             relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
             projection_slot: Some(0),
@@ -2220,7 +2235,7 @@ async fn execute_ordinary_call_unscoped(
                             crate::db::text_artifacts::TextArtifactAdmission::Stored(artifact) => {
                                 let (preview_head, preview_tail) =
                                     crate::engine::text_artifact_frame::utf8_preview_pair(
-                                        &artifact.content,
+                                        &candidate.content,
                                     );
                                 model_artifact_frame = Some(
                                     crate::engine::text_artifact_frame::render_artifact_frame(
@@ -2236,7 +2251,7 @@ async fn execute_ordinary_call_unscoped(
                                             host_dropped_bytes: artifact.host_dropped_bytes,
                                             stored_source_bytes: artifact.stored_source_bytes,
                                             content_bytes: artifact.content_bytes,
-                                            line_count: artifact.content.lines().count(),
+                                            line_count: candidate.content.lines().count(),
                                             preview_head,
                                             preview_tail,
                                         },

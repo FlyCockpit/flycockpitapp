@@ -705,14 +705,19 @@ fn render_rehydrated_tool_artifact_frame<'a>(
                     "available tool artifact provenance differs from durable projection state"
                 ));
             }
-            let outbound_content = redaction.scrub(&artifact.content);
+            let artifact_content =
+                match crate::text_artifact_blob::path_from_provenance(&artifact.provenance_json)? {
+                    Some(path) => crate::text_artifact_blob::read(&path)?,
+                    None => artifact.content.clone(),
+                };
+            let outbound_content = redaction.scrub(&artifact_content);
             let (preview_head, preview_tail) =
                 crate::engine::text_artifact_frame::utf8_preview_pair(&outbound_content);
             // Locally captured artifacts have already passed this boundary and
             // retain their durable previews. Imported (or newly matched)
             // content is rendered from the current safe view instead of
             // trusting its representation metadata.
-            if outbound_content == artifact.content
+            if outbound_content == artifact_content
                 && (preview_head != preview("preview_head")?
                     || preview_tail != preview("preview_tail")?)
             {
@@ -3660,6 +3665,7 @@ mod tests {
                 canonical_event_json: json!({"text": source.clone()}).to_string(),
                 model_envelope_json: envelope.to_string(),
                 source_text: source,
+                source_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),
@@ -3768,6 +3774,7 @@ mod tests {
                 canonical_event_json: json!({"text": source.clone()}).to_string(),
                 model_envelope_json: envelope.to_string(),
                 source_text: source,
+                source_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: crate::db::text_artifacts::TextArtifactEventContext::default(),

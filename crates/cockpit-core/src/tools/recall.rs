@@ -322,7 +322,13 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
             .db
             .text_artifact_for_trust(session_id, artifact_id, caller_history_trust(ctx))
             .await?
-            .map(|artifact| artifact.content)),
+            .map(|artifact| {
+                match crate::text_artifact_blob::path_from_provenance(&artifact.provenance_json)? {
+                    Some(path) => crate::text_artifact_blob::read(&path),
+                    None => Ok(artifact.content),
+                }
+            })
+            .transpose()?),
     }
 }
 

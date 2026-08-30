@@ -243,6 +243,19 @@ fn validate_context_policy(policy: &ContextPolicy) -> Result<()> {
             bail!("contextPolicy.autoCompactPct must be between 10 and 95 (got `{pct}`)");
         }
     }
+    if let Some(bytes) = policy.artifact_spill_bytes
+        && !(1024..=crate::db::text_artifacts::MAX_ARTIFACT_CONTENT_BYTES).contains(&bytes)
+    {
+        bail!(
+            "contextPolicy.artifactSpillBytes must be between 1024 and {}",
+            crate::db::text_artifacts::MAX_ARTIFACT_CONTENT_BYTES
+        );
+    }
+    if let Some(lines) = policy.artifact_preview_lines
+        && !(1..=1_000).contains(&lines)
+    {
+        bail!("contextPolicy.artifactPreviewLines must be between 1 and 1000");
+    }
     Ok(())
 }
 

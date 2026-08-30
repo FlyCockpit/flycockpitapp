@@ -2807,6 +2807,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source.clone(),
+                source_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: Default::default(),

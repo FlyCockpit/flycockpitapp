@@ -3742,7 +3742,7 @@ CREATE TABLE session_text_artifacts (
     CHECK(host_original_bytes >= host_captured_bytes),
     CHECK(host_dropped_bytes = host_original_bytes - host_captured_bytes),
     CHECK(stored_source_bytes <= host_captured_bytes),
-    CHECK(content_bytes = length(CAST(content AS BLOB))),
+    CHECK(json_extract(provenance_json, '$.blob_path') IS NOT NULL OR content_bytes = length(CAST(content AS BLOB))),
     CHECK(content_bytes = stored_source_bytes),
     CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
     CHECK((owner_relation = 'source_user_input' AND owner_slot = -1) OR (owner_relation <> 'source_user_input' AND owner_slot >= 0)),

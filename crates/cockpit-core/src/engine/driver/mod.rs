@@ -11236,6 +11236,28 @@ impl Driver {
                             &user_text,
                         ).expect("accepted oversized composition is constructed from closed host parts"),
                         source_text: oversized.source_text.clone(),
+                        source_blob_path: {
+                            let spill_bytes = self
+                                .stack
+                                .last()
+                                .and_then(|frame| frame.agent.context_policy.as_ref())
+                                .map(crate::agents::ContextPolicy::artifact_spill_bytes)
+                                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_SPILL_BYTES);
+                            if oversized.source_text.len() > spill_bytes {
+                                match crate::text_artifact_blob::write(
+                                    self.session.id,
+                                    &oversized.source_text,
+                                ) {
+                                    Ok(path) => Some(path),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "could not spill oversized user paste to disk; retaining inline artifact");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        },
                         model_projection: (user_text != oversized.source_text)
                             .then_some(user_text.clone()),
                         agent: Some(active_agent.clone()),
@@ -11316,7 +11338,29 @@ impl Driver {
                         .await;
                     }
                     let effective = projection_artifact.as_ref().unwrap_or(&source_artifact);
-                    let outbound_content = self.redact.scrub(&effective.content);
+                    let effective_content = match crate::text_artifact_blob::path_from_provenance(
+                        &effective.provenance_json,
+                    ) {
+                        Ok(Some(path)) => match crate::text_artifact_blob::read(&path) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                tracing::error!(%error, event_seq, "materialized user artifact blob is unavailable");
+                                let _ = tx
+                                    .send(TurnEvent::Notice {
+                                        text: "Oversized message was stored but its pseudofile is unavailable; no provider was called."
+                                            .to_owned(),
+                                    })
+                                    .await;
+                                return Ok(());
+                            }
+                        },
+                        Ok(None) => effective.content.clone(),
+                        Err(error) => {
+                            tracing::error!(%error, event_seq, "materialized user artifact blob reference is invalid");
+                            return Ok(());
+                        }
+                    };
+                    let outbound_content = self.redact.scrub(&effective_content);
                     match crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content(
                         effective,
                         &outbound_content,

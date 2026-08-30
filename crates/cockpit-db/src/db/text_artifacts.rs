@@ -393,6 +393,9 @@ pub struct ReservedUserArtifactMaterialization {
     /// artifact on both the live and resumed paths.
     pub model_envelope_json: String,
     pub source_text: String,
+    /// Daemon-owned relative blob path for the immutable source body. The DB
+    /// validates and persists only metadata and the inline preview.
+    pub source_blob_path: Option<String>,
     pub model_projection: Option<String>,
     pub agent: Option<String>,
     pub context: TextArtifactEventContext,
@@ -1740,6 +1743,11 @@ fn insert_artifact_conn(
     }
 
     let artifact_id = Uuid::new_v4();
+    let stored_content = if has_blob_path(&candidate.provenance_json)? {
+        artifact_inline_preview(&candidate.content)
+    } else {
+        candidate.content.clone()
+    };
     conn.execute(
         "INSERT INTO session_text_artifacts (
              session_id,artifact_id,kind,capture_reason,content_representation,archive_import_id,
@@ -1757,7 +1765,7 @@ fn insert_artifact_conn(
             event_seq,
             candidate.relation.as_str(),
             candidate.projection_slot.unwrap_or(-1),
-            &candidate.content,
+            &stored_content,
             as_i64(candidate.host_captured_bytes)?,
             as_i64(candidate.host_original_bytes)?,
             as_i64(candidate.host_dropped_bytes)?,
@@ -1787,7 +1795,7 @@ fn insert_artifact_conn(
         kind: candidate.kind,
         capture_reason: candidate.capture_reason,
         representation,
-        content: candidate.content.clone(),
+        content: stored_content,
         host_captured_bytes: candidate.host_captured_bytes,
         host_original_bytes: candidate.host_original_bytes,
         host_dropped_bytes: candidate.host_dropped_bytes,
@@ -1846,7 +1854,8 @@ fn validate_candidate(
         "stored source exceeds host capture"
     );
     ensure!(
-        candidate.stored_source_bytes == candidate.content.len(),
+        has_blob_path(&candidate.provenance_json)?
+            || candidate.stored_source_bytes == candidate.content.len(),
         "stored source byte accounting differs from UTF-8 body"
     );
     ensure!(
@@ -1875,7 +1884,7 @@ fn validate_candidate(
             None,
         ) => {
             ensure!(
-                candidate.content.len() > 64 * 1024,
+                candidate.content.len() > 8 * 1024,
                 "user input source must cross the oversized threshold"
             );
             validate_source_provenance(&provenance)?;
@@ -1953,7 +1962,7 @@ fn bounded_provenance_text(
 }
 
 fn validate_tool_provenance(provenance: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-    only_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
+    only_provenance_keys_with_optional(provenance, &["agent_id", "tool", "call_id"], "blob_path")?;
     if let Some(agent_id) = provenance.get("agent_id") {
         ensure!(
             agent_id.is_null()
@@ -1970,7 +1979,7 @@ fn validate_tool_provenance(provenance: &serde_json::Map<String, serde_json::Val
 fn validate_source_provenance(
     provenance: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
-    only_provenance_keys(provenance, &["event_seq"])?;
+    only_provenance_keys_with_optional(provenance, &["event_seq"], "blob_path")?;
     ensure!(
         provenance
             .get("event_seq")
@@ -1979,6 +1988,72 @@ fn validate_source_provenance(
         "source artifact provenance event_seq is invalid"
     );
     Ok(())
+}
+
+fn only_provenance_keys_with_optional(
+    provenance: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    optional: &str,
+) -> Result<()> {
+    let expected_len = expected.len()
+        + usize::from(provenance.contains_key(optional))
+        + usize::from(provenance.contains_key("source"));
+    ensure!(
+        provenance.len() == expected_len
+            && expected.iter().all(|key| provenance.contains_key(*key))
+            && provenance
+                .keys()
+                .all(|key| expected.contains(&key.as_str()) || key == optional || key == "source"),
+        "text artifact provenance has an invalid shape"
+    );
+    if let Some(path) = provenance.get(optional) {
+        let path = path
+            .as_str()
+            .ok_or_else(|| anyhow!("text artifact blob path is invalid"))?;
+        ensure!(
+            path.starts_with("text-artifacts/")
+                && !path.contains("..")
+                && !path.bytes().any(|byte| byte.is_ascii_control()),
+            "text artifact blob path is invalid"
+        );
+    }
+    if let Some(source) = provenance.get("source") {
+        ensure!(
+            matches!(source.as_str(), Some("tool_result") | Some("user_paste")),
+            "text artifact source is invalid"
+        );
+    }
+    Ok(())
+}
+
+fn has_blob_path(provenance_json: &str) -> Result<bool> {
+    Ok(serde_json::from_str::<serde_json::Value>(provenance_json)
+        .context("parsing text artifact provenance")?
+        .get("blob_path")
+        .is_some())
+}
+
+fn artifact_inline_preview(content: &str) -> String {
+    const MAX_LINES: usize = 100;
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut preview = String::new();
+    for line in content.lines().take(MAX_LINES) {
+        if preview.len().saturating_add(line.len()).saturating_add(1) > MAX_BYTES {
+            break;
+        }
+        preview.push_str(line);
+        preview.push('\n');
+    }
+    if preview.is_empty() {
+        let end = content
+            .char_indices()
+            .take_while(|(index, _)| *index < MAX_BYTES)
+            .map(|(index, character)| index + character.len_utf8())
+            .last()
+            .unwrap_or(0);
+        preview.push_str(&content[..end]);
+    }
+    preview
 }
 
 fn validate_projection_provenance(
@@ -2854,7 +2929,10 @@ fn materialize_reserved_user_artifacts_conn(
         host_original_bytes: input.source_text.len(),
         host_dropped_bytes: 0,
         stored_source_bytes: input.source_text.len(),
-        provenance_json: serde_json::json!({"event_seq": event_seq}).to_string(),
+        provenance_json: match &input.source_blob_path {
+            Some(path) => serde_json::json!({"event_seq": event_seq, "source": "user_paste", "blob_path": path}).to_string(),
+            None => serde_json::json!({"event_seq": event_seq, "source": "user_paste"}).to_string(),
+        },
         created_at: input.now_ms,
     };
     let TextArtifactAdmission::Stored(source_artifact) = insert_artifact_conn(
@@ -3816,6 +3894,7 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
+                source_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4293,6 +4372,7 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
+                source_blob_path: None,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -4346,6 +4426,7 @@ mod tests {
                 model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
+                source_blob_path: None,
                 model_projection: Some("different model projection".to_owned()),
                 agent: Some("Build".to_owned()),
                 context: TextArtifactEventContext::default(),
@@ -5051,6 +5132,7 @@ mod tests {
             // any owner/event row durable.
             model_envelope_json: r#"{"version":3,"prelude":[{"type":"forced_skill","call_id":"forced-fault","name":"review","args":{"name":"review"},"body":"FORCED","hard_fail":false}],"parts":[{"type":"text","text":"AUTO\nTAG\n"},{"type":"authored_text_slot"}]}"#.to_owned(),
             source_text: source,
+            source_blob_path: None,
             model_projection: Some("rewritten model body".to_owned()),
             agent: Some("Build".to_owned()),
             context: TextArtifactEventContext::default(),

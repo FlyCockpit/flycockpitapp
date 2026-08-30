@@ -377,7 +377,7 @@ pub fn render_user_input_artifact_frame_with_outbound_content(
         host_dropped_bytes: artifact.host_dropped_bytes,
         stored_source_bytes: artifact.stored_source_bytes,
         content_bytes: artifact.content_bytes,
-        line_count: artifact.content.lines().count(),
+        line_count: outbound_content.lines().count(),
         preview_head,
         preview_tail,
     }))

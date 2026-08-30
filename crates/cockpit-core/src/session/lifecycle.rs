@@ -678,15 +678,20 @@ impl Session {
     /// is an error rather than a reason to return target content unredacted.
     pub(crate) async fn persisted_redaction_table_for_session(
         &self,
+        reader_project: &str,
         session_id: uuid::Uuid,
     ) -> Result<Option<crate::redact::RedactionTable>> {
         if session_id == self.id {
             return self.persisted_redaction_table();
         }
-        let Some(row) = self.db.get_session(session_id).await? else {
+        let Some(redaction_table_json) = self
+            .db
+            .session_redaction_table_json_for_reader_project(reader_project, session_id)
+            .await?
+        else {
             return Ok(None);
         };
-        let json = match row.redaction_table_json.filter(|json| !json.is_empty()) {
+        let json = match redaction_table_json.filter(|json| !json.is_empty()) {
             Some(json) => Some(json),
             None => load_redaction_table_from_vault(&self.secret_vault, session_id)?,
         };

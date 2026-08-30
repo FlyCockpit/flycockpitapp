@@ -279,14 +279,9 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
         return Ok(ctx.session.id);
     }
     if let Ok(id) = Uuid::parse_str(id) {
-        let allowed = ctx
-            .session
-            .db
-            .session_access_allowed(&ctx.session.project_id, id)
-            .await?;
-        if !allowed {
-            return Err(invalid_input("no accessible session with that id"));
-        }
+        // UUIDs intentionally do not perform a preliminary access read. The
+        // content accessor below carries the consent predicate in its own
+        // data query, so revocation cannot race an authorization preflight.
         return Ok(id);
     }
     ctx.session
@@ -304,7 +299,11 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
             let turns = ctx
                 .session
                 .db
-                .thread_turns_for_trust(session_id, caller_history_trust(ctx))
+                .thread_turns_for_reader_project_and_trust(
+                    &ctx.session.project_id,
+                    session_id,
+                    caller_history_trust(ctx),
+                )
                 .await?;
             Ok(Some(
                 turns
@@ -328,13 +327,22 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
         RecallPath::Compaction(session_id, n) => {
             ctx.session
                 .db
-                .compaction_text_for_trust(session_id, n, caller_history_trust(ctx))
+                .compaction_text_for_reader_project_and_trust(
+                    &ctx.session.project_id,
+                    session_id,
+                    n,
+                    caller_history_trust(ctx),
+                )
                 .await
         }
         RecallPath::Plan(session_id) => Ok(Some(
             ctx.session
                 .db
-                .get_session_plan_doc_for_trust(session_id, caller_history_trust(ctx))
+                .get_session_plan_doc_for_reader_project_and_trust(
+                    &ctx.session.project_id,
+                    session_id,
+                    caller_history_trust(ctx),
+                )
                 .await?
                 .map(|doc| format!("[revision={}]\n{}", doc.revision, doc.content))
                 .unwrap_or_else(|| "[revision=0]\n".to_string()),
@@ -342,7 +350,12 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
         RecallPath::Artifact(session_id, artifact_id) => Ok(ctx
             .session
             .db
-            .text_artifact_for_trust(session_id, artifact_id, caller_history_trust(ctx))
+            .text_artifact_for_reader_project_and_trust(
+                &ctx.session.project_id,
+                session_id,
+                artifact_id,
+                caller_history_trust(ctx),
+            )
             .await?
             .map(|artifact| crate::text_artifact_blob::read_artifact_content(&artifact))
             .transpose()?),
@@ -362,7 +375,7 @@ async fn redactor_for_target(
     };
     let Some(target_table) = ctx
         .session
-        .persisted_redaction_table_for_session(session_id)
+        .persisted_redaction_table_for_session(&ctx.session.project_id, session_id)
         .await?
     else {
         return Ok(ctx.redact.as_ref().clone());

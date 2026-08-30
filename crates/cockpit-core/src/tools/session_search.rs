@@ -172,22 +172,15 @@ impl Tool for HistorySearchTool {
                     .compaction_lineage_sessions(ctx.session.id)
                     .await
                     .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
-                let mut permitted_lineage = Vec::with_capacity(lineage.len());
-                for session_id in lineage {
-                    if ctx
-                        .session
-                        .db
-                        .session_access_allowed(&ctx.session.project_id, session_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("history_search history scope: {e:#}"))?
-                    {
-                        permitted_lineage.push(session_id);
-                    }
-                }
                 let hits = ctx
                     .session
                     .db
-                    .search_lineage_candidates_in_sessions(query, &permitted_lineage, trust)
+                    .search_lineage_candidates_in_sessions(
+                        query,
+                        &ctx.session.project_id,
+                        &lineage,
+                        trust,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
                 let include_tool_events = args
@@ -200,7 +193,8 @@ impl Tool for HistorySearchTool {
                             .db
                             .scan_tool_events_in_sessions(
                                 query,
-                                &permitted_lineage,
+                                &ctx.session.project_id,
+                                &lineage,
                                 trust,
                                 TOOL_SCAN_MAX_SESSIONS,
                                 TOOL_SCAN_MAX_ROWS_PER_SESSION,
@@ -355,7 +349,7 @@ async fn render_lineage(
 async fn redact_target_text(ctx: &ToolCtx, session_id: uuid::Uuid, text: &str) -> Result<String> {
     let Some(target_table) = ctx
         .session
-        .persisted_redaction_table_for_session(session_id)
+        .persisted_redaction_table_for_session(&ctx.session.project_id, session_id)
         .await?
     else {
         return Ok(ctx.redact.scrub(text));

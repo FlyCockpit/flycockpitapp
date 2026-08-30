@@ -83,17 +83,36 @@ impl Db {
         .await
     }
 
-    /// Resolve a session only if it is visible to the requesting workspace.
-    /// This does not reveal cross-workspace session existence on denial.
-    pub async fn session_access_allowed(
+    /// Fetch a target session's legacy redaction projection only when the
+    /// reader can access that session in this statement's consent snapshot.
+    /// The outer option distinguishes an inaccessible/nonexistent session
+    /// from an accessible session whose legacy projection is absent.
+    pub async fn session_redaction_table_json_for_reader_project(
         &self,
         reader_project: &str,
         session_id: Uuid,
-    ) -> Result<bool> {
+    ) -> Result<Option<Option<String>>> {
         validate_project_id(reader_project)?;
         let reader_project = reader_project.to_string();
-        self.read(move |conn| session_access_allowed_conn(conn, &reader_project, session_id))
-            .await
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT s.redaction_table_json
+                   FROM sessions AS s
+                  WHERE s.session_id = ?1
+                    AND (s.project_id = ?2
+                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                     WHERE reader.project_id = ?2
+                                       AND reader.outbound_enabled = 1)
+                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                         WHERE target.project_id = s.project_id
+                                           AND target.inbound_enabled = 1)))",
+                params![session_id.to_string(), reader_project],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading consent-scoped session redaction projection")
+        })
+        .await
     }
 }
 
@@ -123,28 +142,6 @@ fn workspace_history_scope_conn(
     .optional()
     .context("querying workspace history scope")
     .map(|scope| scope.unwrap_or(WorkspaceHistoryScope::CURRENT_WORKSPACE_ONLY))
-}
-
-fn session_access_allowed_conn(
-    conn: &Connection,
-    reader_project: &str,
-    session_id: Uuid,
-) -> Result<bool> {
-    let allowed: Option<i64> = conn
-        .query_row(
-            "SELECT s.project_id = ?1 OR (
-                EXISTS (SELECT 1 FROM workspace_history_scopes reader
-                        WHERE reader.project_id = ?1 AND reader.outbound_enabled = 1)
-                AND EXISTS (SELECT 1 FROM workspace_history_scopes target
-                            WHERE target.project_id = s.project_id AND target.inbound_enabled = 1)
-             )
-             FROM sessions s WHERE s.session_id = ?2",
-            params![reader_project, session_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("querying session workspace for history scope")?;
-    Ok(allowed == Some(1))
 }
 
 #[cfg(test)]

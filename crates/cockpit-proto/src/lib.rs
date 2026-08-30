@@ -4604,6 +4604,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "agent_tree_page",
         "user_message_queued",
         "workspace_trust_set",
+        "workspace_history_scope",
     ];
 
     #[test]

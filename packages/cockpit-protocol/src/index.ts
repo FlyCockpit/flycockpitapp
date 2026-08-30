@@ -1269,6 +1269,7 @@ export const responseNameSchema = z.enum([
   "bulk_transfer_chunk_accepted",
   "bulk_transfer_chunk",
   "workspace_trust_set",
+  "workspace_history_scope",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -1638,6 +1639,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         live_application_pending: z.array(uuidSchema).optional(),
       })
       .strict(),
+  ),
+  responseVariant(
+    "workspace_history_scope",
+    z.object({ outbound: z.boolean(), inbound: z.boolean() }).strict(),
   ),
   responseVariant(
     "config_refreshed",

@@ -316,7 +316,7 @@
           "preflight": {
             "enabled": false
           },
-          "project_knowledge": false,
+          "knowledgeBases": [],
           "prompt_injection_guard": {
             "resultAction": "block",
             "threshold": "off"

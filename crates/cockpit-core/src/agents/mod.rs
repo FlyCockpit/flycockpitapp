@@ -953,6 +953,17 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
+    /// The knowledge-base restriction authored in this exact definition.
+    ///
+    /// Running agents retain an [`AgentDef`] snapshot, so callers that govern
+    /// knowledge access must take this value from that snapshot rather than
+    /// resolve a same-named definition again.
+    pub(crate) fn allowed_knowledge_bases(&self) -> Option<&BTreeSet<String>> {
+        self.vnext
+            .as_ref()
+            .and_then(|vnext| vnext.allowed_knowledge_bases.as_ref())
+    }
+
     /// Non-fatal diagnostics emitted by the local definition loader. Keeping
     /// these separate from invariant errors lets loading warn without silently
     /// changing the definition's grants.
@@ -1230,6 +1241,12 @@ impl AgentDef {
         if let Some(verification) = &vnext.verification {
             fm.insert("verification".into(), serde_yaml::to_value(verification)?);
         }
+        if let Some(knowledge_bases) = &vnext.allowed_knowledge_bases {
+            fm.insert(
+                "allowedKnowledgeBases".into(),
+                serde_yaml::to_value(knowledge_bases)?,
+            );
+        }
         if let Some(capabilities) = &self.capabilities {
             fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
         }
@@ -1362,6 +1379,8 @@ fn parse_agent_with_scope(
         questions: Option<QuestionPolicy>,
         #[serde(default)]
         verification: Option<VerificationPolicy>,
+        #[serde(rename = "allowedKnowledgeBases", default)]
+        allowed_knowledge_bases: Option<BTreeSet<String>>,
         #[serde(default)]
         description: String,
         #[serde(default)]
@@ -1506,6 +1525,7 @@ fn parse_agent_with_scope(
                 delegation: fm.delegation.unwrap_or_default(),
                 questions: fm.questions,
                 verification: fm.verification,
+                allowed_knowledge_bases: fm.allowed_knowledge_bases,
             };
             definition.validate_for_scope(scope).map_err(|error| {
                 anyhow::anyhow!(

@@ -3479,6 +3479,7 @@ impl App {
     pub fn new_composed(
         project: Option<&Path>,
         no_sandbox: bool,
+        session_mode: SessionMode,
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
         lifecycle: cockpit_client::LifecycleClient,
@@ -3486,7 +3487,7 @@ impl App {
         Self::new_inner(
             project,
             no_sandbox,
-            Some(SessionMode::Code),
+            Some(session_mode),
             trust,
             launch_start,
             Some(lifecycle),

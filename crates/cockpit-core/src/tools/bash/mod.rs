@@ -35,7 +35,10 @@ use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 mod boundary;
-pub use boundary::{command_directory_escape, outside_session_boundary};
+pub use boundary::{
+    command_directory_escape, command_directory_escape_with_workspace_scratch,
+    outside_session_boundary, outside_session_boundary_with_workspace_scratch,
+};
 use boundary::{dynamic_shell_path, outside_cwd_error};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;

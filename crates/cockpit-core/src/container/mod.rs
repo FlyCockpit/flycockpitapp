@@ -1307,7 +1307,9 @@ mod tests {
         assert!(rendered.contains(&"none".into()));
         assert!(rendered.contains(&"--userns=keep-id".into()));
         assert!(rendered.iter().any(|s| s.ends_with(":ro")));
-        assert!(rendered.contains(&scratch_mount.volume_arg().to_string_lossy().into_owned()));
+        let scratch_arg = scratch_mount.volume_arg();
+        let scratch_arg = scratch_arg.to_string_lossy();
+        assert!(rendered.contains(&scratch_arg));
 
         let env = BTreeMap::from([("KEEP".to_string(), "ok".to_string())]);
         let exec = build_exec_args("cockpit-sess", Path::new("/workspace"), &env, "echo hi");

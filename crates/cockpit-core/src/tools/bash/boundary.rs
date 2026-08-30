@@ -106,7 +106,7 @@ pub fn command_directory_escape_with_workspace_scratch(
                             directory_change_target(&tokens, i + 1, word == "pushd")
                     {
                         let resolved = crate::tools::common::resolve(&target, command_cwd);
-                        if let Some(outside) = outside_session_boundary(
+                        if let Some(outside) = outside_session_boundary_with_workspace_scratch(
                             &resolved,
                             root,
                             tmp_dir,
@@ -520,7 +520,7 @@ fn path_word_escape(
         return None;
     }
     let resolved = crate::tools::common::resolve(word, command_cwd);
-    outside_session_boundary(&resolved, root, tmp_dir, workspace_scratch_dir)
+    outside_session_boundary_with_workspace_scratch(&resolved, root, tmp_dir, workspace_scratch_dir)
 }
 
 fn directory_change_target(tokens: &[ShellToken], mut i: usize, pushd: bool) -> Option<String> {
@@ -756,6 +756,33 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::write(&outside, "secret").unwrap();
         (tmp, root, cwd, outside)
+    }
+
+    #[test]
+    fn workspace_scratch_is_inside_the_boundary() {
+        let (tmp, root, cwd, _outside) = boundary_fixture();
+        let workspace_scratch = tmp.path().join("workspace-scratch");
+        let scratch_file = workspace_scratch.join("sessions/session-a/note.txt");
+
+        assert!(
+            outside_session_boundary_with_workspace_scratch(
+                &scratch_file,
+                &root,
+                None,
+                Some(&workspace_scratch),
+            )
+            .is_none()
+        );
+        assert!(
+            command_directory_escape_with_workspace_scratch(
+                &format!("cat {}", scratch_file.display()),
+                &cwd,
+                &root,
+                None,
+                Some(&workspace_scratch),
+            )
+            .is_none()
+        );
     }
 
     // Vectors that were previously NOT boundary-checked because the command

@@ -65,11 +65,7 @@ impl BackgroundLaunch {
         }
     }
 
-    pub fn confined(tmp_dir: Option<PathBuf>, session_env: HashMap<String, String>) -> Self {
-        Self::confined_with_workspace_scratch(tmp_dir, None, session_env)
-    }
-
-    pub fn confined_with_workspace_scratch(
+    pub fn confined(
         tmp_dir: Option<PathBuf>,
         workspace_scratch_dir: PathBuf,
         session_env: HashMap<String, String>,
@@ -994,10 +990,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
-        let launch = BackgroundLaunch::confined(Some(tmp.path().join("tmp")), HashMap::new())
-            .with_test_sandbox_build(TestSandboxBuild::ShellSuccess {
-                calls: calls.clone(),
-            });
+        let launch = BackgroundLaunch::confined(
+            Some(tmp.path().join("tmp")),
+            tmp.path().join("workspace-scratch"),
+            HashMap::new(),
+        )
+        .with_test_sandbox_build(TestSandboxBuild::ShellSuccess {
+            calls: calls.clone(),
+        });
         let (turn_tx, _turn_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let (_handle, task) = spawn_test_job(
@@ -1031,8 +1031,12 @@ mod tests {
         let cfg = crate::config::extended::RedactConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
-        let launch = BackgroundLaunch::confined(Some(tmp.path().join("tmp")), HashMap::new())
-            .with_test_sandbox_build(TestSandboxBuild::Error("sandbox build failed".to_string()));
+        let launch = BackgroundLaunch::confined(
+            Some(tmp.path().join("tmp")),
+            tmp.path().join("workspace-scratch"),
+            HashMap::new(),
+        )
+        .with_test_sandbox_build(TestSandboxBuild::Error("sandbox build failed".to_string()));
         let (turn_tx, _turn_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let (_handle, task) = spawn_test_job(

@@ -14,6 +14,47 @@ fn event_harness() -> (
     (queue, turn_tx, turn_rx)
 }
 
+async fn insert_pending_assistant_inbox_item(driver: &Driver, delivery: &str, summary: &str) {
+    let db = driver.session.db.clone();
+    db.upsert_assistant("inbox-source", "/tmp/inbox-source", "{}", &"0".repeat(64))
+        .await
+        .unwrap();
+    let source = db
+        .create_assistant_session(
+            "inbox-source-project",
+            "/tmp/inbox-source-project",
+            "Build",
+            "inbox-source",
+        )
+        .await
+        .unwrap();
+    let main_session_id = driver.session.id;
+    let source_session_id = source.session_id;
+    let delivery = delivery.to_owned();
+    let summary = summary.to_owned();
+    db.write(move |conn| {
+        conn.execute(
+            "INSERT INTO assistant_inbox_items(
+                inbox_item_id, assistant_name, main_session_id,
+                raising_session_id, operation_id, summary, delivery,
+                created_at_unix_ms
+             ) VALUES(?1, 'inbox-source', ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                main_session_id.to_string(),
+                source_session_id.to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                summary,
+                delivery,
+                1_000_i64,
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 struct AllowOversizedTextArtifactJoin;
 
 impl crate::db::db::message_attachments::MessageAcceptanceJoin for AllowOversizedTextArtifactJoin {
@@ -395,6 +436,94 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn assistant_inbox_timer_yields_to_ready_human_input() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    insert_pending_assistant_inbox_item(&driver, "immediate", "INBOX_TIMER_MARKER").await;
+
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let run_queue = queue.clone();
+    let run_tx = tx.clone();
+    let run =
+        tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(250)).await;
+    queue
+        .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
+        .await;
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let posts = provider_posts(&provider);
+    assert_eq!(posts.len(), 1, "the ready human turn starts first");
+    let prompt = chat_messages(&posts[0])
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("HUMAN_TIMER_MARKER"));
+    assert!(
+        prompt.contains("INBOX_TIMER_MARKER"),
+        "the inbox is folded at the human turn boundary instead of starting a timer turn"
+    );
+
+    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    let result = run.await.expect("driver task joins");
+    assert!(
+        result
+            .expect_err("test abort terminates the driver")
+            .to_string()
+            .contains("driver abort requested for test")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn assistant_inbox_timer_yields_to_ready_control() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("inbox turn must not run".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    insert_pending_assistant_inbox_item(&driver, "immediate", "INBOX_CONTROL_MARKER").await;
+
+    let (queue, tx, _rx) = event_harness();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let run_queue = queue.clone();
+    let run_tx = tx.clone();
+    let run =
+        tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(250)).await;
+    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+
+    let result = run.await.expect("driver task joins");
+    assert!(
+        result
+            .expect_err("ready control terminates the driver")
+            .to_string()
+            .contains("driver abort requested for test")
+    );
+    assert_eq!(
+        provider_posts(&provider).len(),
+        0,
+        "a ready control request wins before an inbox timer can start inference"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() {
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -406,53 +535,8 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let (mut driver, _tmp) = scripted_driver(&provider);
     let main_session_id = driver.session.id;
     let inbox_db = driver.session.db.clone();
-    driver
-        .session
-        .db
-        .upsert_assistant("inbox-source", "/tmp/inbox-source", "{}", &"0".repeat(64))
-        .await
-        .unwrap();
-    let source = driver
-        .session
-        .db
-        .create_assistant_session(
-            "inbox-source-project",
-            "/tmp/inbox-source-project",
-            "Build",
-            "inbox-source",
-        )
-        .await
-        .unwrap();
-    let source_session_id = source.session_id;
-    driver
-        .session
-        .db
-        .write(move |conn| {
-            for (offset, delivery, summary) in [
-                (0_i64, "immediate", "IMMEDIATE_INBOX_MARKER"),
-                (1_i64, "defer", "DEFERRED_INBOX_MARKER"),
-            ] {
-                conn.execute(
-                    "INSERT INTO assistant_inbox_items(
-                        inbox_item_id, assistant_name, main_session_id,
-                        raising_session_id, operation_id, summary, delivery,
-                        created_at_unix_ms
-                     ) VALUES(?1, 'inbox-source', ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![
-                        uuid::Uuid::new_v4().to_string(),
-                        main_session_id.to_string(),
-                        source_session_id.to_string(),
-                        format!("boundary-{offset}"),
-                        summary,
-                        delivery,
-                        1_000 + offset,
-                    ],
-                )?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
+    insert_pending_assistant_inbox_item(&driver, "immediate", "IMMEDIATE_INBOX_MARKER").await;
+    insert_pending_assistant_inbox_item(&driver, "defer", "DEFERRED_INBOX_MARKER").await;
 
     let (queue, tx, _rx) = event_harness();
     let target = driver.active_queue_target();

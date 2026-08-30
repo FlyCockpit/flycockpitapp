@@ -23,12 +23,12 @@ impl Tool for RaiseTool {
     }
 
     fn description(&self) -> &str {
-        "Raise a concise structured item from this assistant thread to the main thread inbox. Choose immediate to wake main at its next idle boundary, defer to prepend it to the next human turn, or notify to alert the human without agent work."
+        "Raise a concise structured item from this assistant thread to the main thread inbox. Choose immediate to wake main at its next idle boundary, defer to wait for its next human turn or periodic heartbeat, or notify to alert the human without agent work."
     }
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Use this only when the main thread needs a self-contained update, decision, or escalation from this persistent assistant thread. State the useful result in `summary`; Cockpit records the raising thread/session backlink automatically. `immediate` never interrupts a user turn and is injected only at the next idle turn start. `defer` is visible in the inbox immediately but enters agent context only by being prepended to the next human message. `notify` is for a human alert and does not wake or inject the agent."
+            "Use this only when the main thread needs a self-contained update, decision, or escalation from this persistent assistant thread. State the useful result in `summary`; Cockpit records the raising thread/session backlink automatically. `immediate` never interrupts a user turn and is injected only at the next idle turn start. `defer` is visible in the inbox immediately, does not wake main early, and enters agent context at its next human turn or periodic heartbeat. `notify` is for a human alert and does not wake or inject the agent."
                 .to_string(),
         )
     }
@@ -103,7 +103,7 @@ impl Tool for RaiseTool {
                 "queued for the main thread's next idle turn boundary"
             }
             AssistantInboxDelivery::Defer => {
-                "visible in the inbox and queued for the main thread's next human turn"
+                "visible in the inbox and waiting for the main thread's next human turn or periodic heartbeat"
             }
             AssistantInboxDelivery::Notify => {
                 // TODO(remote): publish this durable notify item through the

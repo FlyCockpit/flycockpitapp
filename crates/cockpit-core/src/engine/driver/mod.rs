@@ -5223,9 +5223,8 @@ impl Driver {
             // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
-            // The interval can also become ready while a foreground turn is
-            // busy.  On re-entry, do not let that stale tick beat a human
-            // submission that is already waiting for this target.
+            // Pending human input takes priority over a previously completed
+            // noninteractive result before the boundary select runs.
             let human_input_already_pending =
                 input_queue.has_pending_for(Some(&active_target_id)).await;
             if !waiting_for_keep_parked_siblings
@@ -5260,46 +5259,6 @@ impl Driver {
             // must not bypass it.
             tokio::select! {
                 biased;
-                _ = assistant_inbox_defer_heartbeat.tick(),
-                    if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
-                    match self.claim_assistant_inbox_text(true).await {
-                        Ok(Some((text, inbox_item_ids))) => {
-                            self.preempt_shadow_brief_for_foreground().await;
-                            let mut submission =
-                                crate::engine::message::UserSubmission::text(text);
-                            submission.origin =
-                                crate::engine::message::SubmissionOrigin::Internal;
-                            self.run_user_input(
-                                submission,
-                                &input_queue,
-                                tx,
-                            ).await?;
-                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
-                    }
-                }
-                _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
-                    match self.claim_assistant_inbox_text(false).await {
-                        Ok(Some((text, inbox_item_ids))) => {
-                            self.preempt_shadow_brief_for_foreground().await;
-                            let mut submission =
-                                crate::engine::message::UserSubmission::text(text);
-                            submission.origin =
-                                crate::engine::message::SubmissionOrigin::Internal;
-                            self.run_user_input(
-                                submission,
-                                &input_queue,
-                                tx,
-                            ).await?;
-                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(%error, "assistant inbox immediate delivery failed"),
-                    }
-                }
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
                     if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
@@ -5391,6 +5350,42 @@ impl Driver {
                                 .await
                         }
                         None => break,
+                    }
+                }
+                // Inbox timers deliberately follow foreground input and
+                // control. In a biased select, a timer that became ready
+                // while another turn was running must not start inference
+                // ahead of either already-ready boundary request.
+                _ = assistant_inbox_defer_heartbeat.tick(),
+                    if !waiting_for_keep_parked_siblings => {
+                    match self.claim_assistant_inbox_text(true).await {
+                        Ok(Some((text, inbox_item_ids))) => {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission =
+                                crate::engine::message::UserSubmission::text(text);
+                            submission.origin =
+                                crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(submission, &input_queue, tx).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
+                    }
+                }
+                _ = assistant_inbox_idle_poll.tick(),
+                    if !waiting_for_keep_parked_siblings => {
+                    match self.claim_assistant_inbox_text(false).await {
+                        Ok(Some((text, inbox_item_ids))) => {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission =
+                                crate::engine::message::UserSubmission::text(text);
+                            submission.origin =
+                                crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(submission, &input_queue, tx).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "assistant inbox immediate delivery failed"),
                     }
                 }
                 ev = self.job_event_rx.recv(),

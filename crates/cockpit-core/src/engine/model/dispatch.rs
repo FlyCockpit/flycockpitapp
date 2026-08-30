@@ -538,8 +538,7 @@ impl Model {
     )> {
         let params = self.with_resolved_model_params(params);
         let prepared = self.prepare_completion_request(
-            system,
-            history,
+            AgentPromptParts::new(system, history),
             &prompt,
             tools,
             &params,

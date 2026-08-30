@@ -193,8 +193,7 @@ async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_
         .expect("foreground request");
     let without_recovery = model
         .prepare_completion_request(
-            "shared system prompt",
-            &history,
+            AgentPromptParts::new("shared system prompt", &history),
             &foreground_prompt,
             &tools,
             &params,

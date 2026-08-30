@@ -1799,6 +1799,34 @@ impl ToolBox {
         self
     }
 
+    /// Keep only built-in operations whose declared effect is read-only.
+    ///
+    /// This is a capability boundary, not a scheduling hint: an unregistered
+    /// or user-authored tool is excluded even when it claims `ReadOnly`, since
+    /// a custom shell template can make that claim while executing arbitrary
+    /// code. Callers that need a constrained non-read-only escape hatch must
+    /// add that tool back explicitly and own its effect accounting.
+    pub(crate) fn registered_read_only_operations(mut self) -> Self {
+        let is_safe = |tool: &Arc<dyn Tool>| {
+            tool.is_registered_ordinary_operation() && tool.effect() == ToolEffect::ReadOnly
+        };
+        self.tools.retain(|_, tool| is_safe(tool));
+        self.dormant_direct_native_media
+            .retain(|_, tool| is_safe(tool));
+        self.mcp_builtin_tools
+            .retain(|_, entry| is_safe(&entry.tool));
+        self.overrides
+            .retain(|name, _| self.tools.contains_key(name));
+        self.capability_unavailable
+            .retain(|name, _| self.tools.contains_key(name));
+        self.capability_description_suffixes
+            .retain(|name, _| self.tools.contains_key(name));
+        self.direct_native_media_unavailable
+            .retain(|name, _| self.dormant_direct_native_media.contains_key(name));
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
     pub fn with_discoverable_mcp(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.name().to_string();
         if is_monty_builtin_adaptable(&name) {

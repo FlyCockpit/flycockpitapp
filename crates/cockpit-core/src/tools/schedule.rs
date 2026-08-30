@@ -193,13 +193,6 @@ impl ForkScheduleState {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Called by an idle fork when its project-local mutation probe observes a
-    /// real workspace change, even if the model did not emit a `note`.
-    pub fn mark_persistent_action(&self) {
-        self.persistent_action
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Drain accumulated notes (called once at termination).
     pub fn take_notes(&self) -> Vec<String> {
         std::mem::take(&mut *self.notes.lock().unwrap())

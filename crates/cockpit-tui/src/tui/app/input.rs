@@ -594,9 +594,7 @@ impl App {
         }
         if self.pending_resume_compaction_confirm && !is_modifier_only(&key) {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.commit_resume_compaction()
-                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.commit_resume_compaction(),
                 _ => self.cancel_resume_compaction(),
             }
             return false;

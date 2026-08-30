@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 21 as const;
+export const PROTOCOL_VERSION = 22 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -835,6 +835,7 @@ const requestParamSchemas = {
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
   restart_if_idle: z.undefined(),
+  resume_from_compaction: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
@@ -1108,6 +1109,7 @@ const clientRequestVariants = [
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("restart_if_idle"),
+  requestVariantNoParams("resume_from_compaction"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("send_user_message_bulk", requestParamSchemas.send_user_message_bulk),

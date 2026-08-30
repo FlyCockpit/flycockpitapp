@@ -99,8 +99,8 @@ impl App {
     }
 
     /// Present the exact rolling-summary choice returned by an interactive
-    /// away-resume attach. Full context is the default: any non-confirm key
-    /// retains it and the daemon keeps the rolling snapshot banked.
+    /// away-resume attach. Full context is the default: Enter and any
+    /// non-confirm key retain it, while `y` selects compaction.
     pub(super) fn arm_resume_compaction_confirm(
         &mut self,
         offer: cockpit_proto::ResumeCompactionOffer,
@@ -110,7 +110,7 @@ impl App {
                 .unwrap_or_default()
         };
         self.push_plain(format!(
-            "Session was idle. Resume full conversation: {} tokens{} (default), or resume from compaction: {} tokens{}. Press y or Enter for compaction; any other key keeps full context.",
+            "Session was idle. Resume full conversation: {} tokens{} (default), or resume from compaction: {} tokens{}. Press y for compaction; Enter or any other key keeps full context.",
             offer.full_input_tokens,
             context(offer.full_ctx_pct),
             offer.compacted_input_tokens,

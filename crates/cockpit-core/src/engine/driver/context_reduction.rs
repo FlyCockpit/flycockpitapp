@@ -1337,6 +1337,13 @@ impl Driver {
         idle_for_secs: u64,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<Option<crate::daemon::proto::ResumeCompactionOffer>, PrepareCompactionError> {
+        // Keep-park idle is not a resume-compaction boundary. Persist-on-re-entry
+        // owns each started-but-unsettled sibling until its paired terminal
+        // result CAS-commits; preparing an offer would make that owned history
+        // appear eligible for replacement.
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return Ok(None);
+        }
         let context = self.resolve_context_config();
         if context.idle_window_secs == 0 || idle_for_secs < context.idle_window_secs {
             return Ok(None);
@@ -1378,6 +1385,15 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<(), String> {
+        // `at_safe_boundary` can be true while keep-park persist-on-re-entry
+        // still owns started siblings. Applying swaps root history, so it must
+        // use the same ownership fence as every other history rewriter.
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return Err(
+                "resume compaction is unavailable while persist-on-re-entry owns sibling results"
+                    .to_string(),
+            );
+        }
         if !self.at_safe_boundary() || self.stack.len() != 1 {
             return Err("resume compaction is unavailable while the session is active".to_string());
         }

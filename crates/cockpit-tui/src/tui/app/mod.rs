@@ -2538,8 +2538,9 @@ pub struct App {
     /// else cancels). `Some` holds nothing meaningful — its presence is
     /// the armed flag; the numbers were already pushed to history.
     pub(super) pending_prune_confirm: bool,
-    /// Exact rolling compaction was offered on an away-resume. `y`/Enter
-    /// accepts the compacted branch; any other key retains full history.
+    /// Exact rolling compaction was offered on an away-resume. Only `y`
+    /// accepts the compacted branch; Enter and every other key retain full
+    /// history.
     pub(super) pending_resume_compaction_confirm: bool,
     /// Bare `/stop` confirm armed: the user ran `/stop` with no id, saw
     /// the `Stop N job(s) in this session? [y/N]` prompt, and the next

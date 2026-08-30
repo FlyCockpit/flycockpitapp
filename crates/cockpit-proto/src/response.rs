@@ -58,6 +58,9 @@ pub enum Response {
     CodeRootCreated(crate::CreateCodeRootV1Result),
     CodeRootAttached(crate::AttachExistingCodeRootV1Result),
     CodeRootAttachmentClosed(crate::CloseCodeRootAttachmentV1Result),
+    CodeRootWithAcpIngressCreated(crate::CreateCodeRootWithAcpIngressV1Result),
+    CodeRootWithAcpIngressAttached(crate::AttachExistingCodeRootWithAcpIngressV1Result),
+    AcpCodeRootAttachmentClosed(crate::CloseAcpCodeRootAttachmentV1Result),
     CodeRootsDiscovered(crate::DiscoverCodeRootsV1Result),
     CodeRootRead(crate::ReadCodeRootV1Result),
     CodeRootDeliveries(crate::ReadCodeRootDeliveriesV1Result),
@@ -1314,6 +1317,12 @@ impl Response {
         match self {
             Self::CodeRootCreated(result) => result.root.into_attached_response(),
             Self::CodeRootAttached(result) => result.root.into_attached_response(),
+            Self::CodeRootWithAcpIngressCreated(result) => {
+                result.base.root.into_attached_response()
+            }
+            Self::CodeRootWithAcpIngressAttached(result) => {
+                result.base.root.into_attached_response()
+            }
             response => response,
         }
     }
@@ -1537,6 +1546,9 @@ macro_rules! response_variants {
             (Response::CodeRootCreated(..), "code_root_created");
             (Response::CodeRootAttached(..), "code_root_attached");
             (Response::CodeRootAttachmentClosed(..), "code_root_attachment_closed");
+            (Response::CodeRootWithAcpIngressCreated(..), "code_root_with_acp_ingress_created");
+            (Response::CodeRootWithAcpIngressAttached(..), "code_root_with_acp_ingress_attached");
+            (Response::AcpCodeRootAttachmentClosed(..), "acp_code_root_attachment_closed");
             (Response::CodeRootsDiscovered(..), "code_roots_discovered");
             (Response::CodeRootRead(..), "code_root_read");
             (Response::CodeRootDeliveries(..), "code_root_deliveries");

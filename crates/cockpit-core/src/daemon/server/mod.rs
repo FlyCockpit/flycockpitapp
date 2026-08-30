@@ -217,6 +217,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::Ack => {}
         proto::Response::CodeRootCreated(result) => scrub_code_root_read(&mut result.root, redact),
         proto::Response::CodeRootAttached(result) => scrub_code_root_read(&mut result.root, redact),
+        proto::Response::CodeRootWithAcpIngressCreated(result) => {
+            scrub_code_root_read(&mut result.base.root, redact)
+        }
+        proto::Response::CodeRootWithAcpIngressAttached(result) => {
+            scrub_code_root_read(&mut result.base.root, redact)
+        }
         proto::Response::CodeRootRead(result) => scrub_code_root_read(&mut result.root, redact),
         proto::Response::CodeRootsDiscovered(result) => {
             for root in &mut result.roots {
@@ -241,6 +247,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::CodeRootAttachmentClosed(_)
+        | proto::Response::AcpCodeRootAttachmentClosed(_)
         | proto::Response::CodeRootDeliveriesAcked(_)
         | proto::Response::CodeRootInterruptResolved(_) => {}
         // Metadata-only owner-remoted CLI-surface responses: package registry
@@ -2466,6 +2473,11 @@ pub struct DaemonContext {
     /// Boot-local Code-root capabilities, frozen discovery snapshots, and
     /// bounded idempotency receipts. Durable replay/ACK state lives in Db.
     pub(crate) code_root_authority: Arc<StdMutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
+    /// Atomic Code-root/forwarded-catalog composition supplied by the Monty
+    /// bridge. Absence keeps the additive routes closed without mutating base
+    /// Code-root state.
+    pub(crate) acp_catalog_composition:
+        Option<Arc<dyn crate::daemon::acp_catalog_composition::AcpCatalogCompositionServiceV1>>,
     pub paths: DaemonPaths,
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.
@@ -3147,6 +3159,9 @@ impl DaemonContext {
             code_root_authority: Arc::new(StdMutex::new(
                 crate::daemon::code_roots::CodeRootAuthorityV1::default(),
             )),
+            // TODO(acp-session-scoped-monty-mcp-bridge): install the atomic
+            // catalog composition implementation during daemon construction.
+            acp_catalog_composition: None,
             paths,
             canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
@@ -5574,6 +5589,8 @@ async fn run_in_process_client(
                         Ok(Response::Attached { .. })
                             | Ok(Response::CodeRootCreated(..))
                             | Ok(Response::CodeRootAttached(..))
+                            | Ok(Response::CodeRootWithAcpIngressCreated(..))
+                            | Ok(Response::CodeRootWithAcpIngressAttached(..))
                     );
                     if attached || state.attached.is_none() {
                         shared = state.shared_snapshot();
@@ -6367,6 +6384,8 @@ async fn handle_envelope(
                 Request::Attach { .. }
                     | Request::CreateCodeRootV1(..)
                     | Request::AttachExistingCodeRootV1(..)
+                    | Request::CreateCodeRootWithAcpIngressV1(..)
+                    | Request::AttachExistingCodeRootWithAcpIngressV1(..)
             );
             let mut effects = ClientRequestEffects::default();
             #[cfg(feature = "remote")]
@@ -6397,6 +6416,8 @@ async fn handle_envelope(
                 Ok(Response::Attached { .. })
                     | Ok(Response::CodeRootCreated(..))
                     | Ok(Response::CodeRootAttached(..))
+                    | Ok(Response::CodeRootWithAcpIngressCreated(..))
+                    | Ok(Response::CodeRootWithAcpIngressAttached(..))
             );
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();

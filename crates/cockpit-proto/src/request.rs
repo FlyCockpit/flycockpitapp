@@ -422,6 +422,9 @@ pub enum Request {
     CreateCodeRootV1(crate::CreateCodeRootV1Request),
     AttachExistingCodeRootV1(crate::AttachExistingCodeRootV1Request),
     CloseCodeRootAttachmentV1(crate::CloseCodeRootAttachmentV1Request),
+    CreateCodeRootWithAcpIngressV1(crate::CreateCodeRootWithAcpIngressV1Request),
+    AttachExistingCodeRootWithAcpIngressV1(crate::AttachExistingCodeRootWithAcpIngressV1Request),
+    CloseAcpCodeRootAttachmentV1(crate::CloseAcpCodeRootAttachmentV1Request),
     DiscoverCodeRootsV1(crate::DiscoverCodeRootsV1Request),
     ReadCodeRootV1(crate::ReadCodeRootV1Request),
     ReadCodeRootDeliveriesV1(crate::ReadCodeRootDeliveriesV1Request),
@@ -2786,6 +2789,20 @@ impl Request {
                     validate_selection("model_override", selection)?;
                 }
             }
+            Self::CreateCodeRootWithAcpIngressV1(request) => {
+                if request.base.workspace_selector.path.is_empty()
+                    || request.base.workspace_selector.path.len() > 32_768
+                {
+                    return Err("workspace selector path must contain 1..=32768 bytes".to_string());
+                }
+                if let Some(selection) = &request.base.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.base.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+                request.ingress.validate()?;
+            }
             Self::AttachExistingCodeRootV1(request) => {
                 if request.root_id.0.is_nil() {
                     return Err("Code root id must not be nil".to_string());
@@ -2796,6 +2813,18 @@ impl Request {
                 if let Some(selection) = &request.options.model_override {
                     validate_selection("model_override", selection)?;
                 }
+            }
+            Self::AttachExistingCodeRootWithAcpIngressV1(request) => {
+                if request.base.root_id.0.is_nil() {
+                    return Err("Code root id must not be nil".to_string());
+                }
+                if let Some(selection) = &request.base.options.initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = &request.base.options.model_override {
+                    validate_selection("model_override", selection)?;
+                }
+                request.ingress.validate()?;
             }
             Self::DiscoverCodeRootsV1(request) => {
                 if request.workspace_selector.path.is_empty()
@@ -4129,6 +4158,9 @@ macro_rules! request_variants {
             (Request::CreateCodeRootV1(..), "create_code_root_v1");
             (Request::AttachExistingCodeRootV1(..), "attach_existing_code_root_v1");
             (Request::CloseCodeRootAttachmentV1(..), "close_code_root_attachment_v1");
+            (Request::CreateCodeRootWithAcpIngressV1(..), "create_code_root_with_acp_ingress_v1");
+            (Request::AttachExistingCodeRootWithAcpIngressV1(..), "attach_existing_code_root_with_acp_ingress_v1");
+            (Request::CloseAcpCodeRootAttachmentV1(..), "close_acp_code_root_attachment_v1");
             (Request::DiscoverCodeRootsV1(..), "discover_code_roots_v1");
             (Request::ReadCodeRootV1(..), "read_code_root_v1");
             (Request::ReadCodeRootDeliveriesV1(..), "read_code_root_deliveries_v1");
@@ -4457,6 +4489,9 @@ macro_rules! command {
             (Request::CreateCodeRootV1(request), "create_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootV1Request", [request: $crate::CreateCodeRootV1Request => param]);
             (Request::AttachExistingCodeRootV1(request), "attach_existing_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AttachExistingCodeRootV1Request", [request: $crate::AttachExistingCodeRootV1Request => param]);
             (Request::CloseCodeRootAttachmentV1(request), "close_code_root_attachment_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CloseCodeRootAttachmentV1Request", [request: $crate::CloseCodeRootAttachmentV1Request => param]);
+            (Request::CreateCodeRootWithAcpIngressV1(request), "create_code_root_with_acp_ingress_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootWithAcpIngressV1Request", [request: $crate::CreateCodeRootWithAcpIngressV1Request => param]);
+            (Request::AttachExistingCodeRootWithAcpIngressV1(request), "attach_existing_code_root_with_acp_ingress_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AttachExistingCodeRootWithAcpIngressV1Request", [request: $crate::AttachExistingCodeRootWithAcpIngressV1Request => param]);
+            (Request::CloseAcpCodeRootAttachmentV1(request), "close_acp_code_root_attachment_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CloseAcpCodeRootAttachmentV1Request", [request: $crate::CloseAcpCodeRootAttachmentV1Request => param]);
             (Request::DiscoverCodeRootsV1(request), "discover_code_roots_v1", owner_only, none, false, read_only, none, serialized, none, "request:DiscoverCodeRootsV1Request", [request: $crate::DiscoverCodeRootsV1Request => param]);
             (Request::ReadCodeRootV1(request), "read_code_root_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootV1Request", [request: $crate::ReadCodeRootV1Request => param]);
             (Request::ReadCodeRootDeliveriesV1(request), "read_code_root_deliveries_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootDeliveriesV1Request", [request: $crate::ReadCodeRootDeliveriesV1Request => param]);

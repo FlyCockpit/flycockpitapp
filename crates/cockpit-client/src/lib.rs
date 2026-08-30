@@ -1020,6 +1020,12 @@ async fn run_io(
                                         Response::CodeRootAttached(result) => {
                                             attached_session = Some(result.root.root_id.0);
                                         }
+                                        Response::CodeRootWithAcpIngressCreated(result) => {
+                                            attached_session = Some(result.base.root.root_id.0);
+                                        }
+                                        Response::CodeRootWithAcpIngressAttached(result) => {
+                                            attached_session = Some(result.base.root.root_id.0);
+                                        }
                                         _ => {}
                                     }
                                     let _ = tx.send(Ok(response));

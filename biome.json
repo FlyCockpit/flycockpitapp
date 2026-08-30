@@ -5,6 +5,7 @@
     "includes": [
       "!!**/fixtures/remote/attempt-grants-v1.json",
       "!!packages/cockpit-protocol/fixtures/remote-transport-selection/vocabulary.json",
+      "!!crates/cockpit-proto/tests/fixtures/acp_forwarded_mcp_v1/routes_max.json",
       "!!crates/**/fuzz/corpus/**"
     ]
   }

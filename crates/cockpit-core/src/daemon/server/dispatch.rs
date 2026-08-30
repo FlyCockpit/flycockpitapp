@@ -5518,6 +5518,97 @@ async fn dispatch_image_control_read(
     Ok(Response::ImageControlRead(response))
 }
 
+/// Dispatch-owned commit adapter for a composed connection attachment.
+///
+/// The composition route keeps this port behind a side-effect-free pending
+/// stage while the service is running.  Only a successful result whose
+/// capability matches that stage reaches this method, so this is the sole
+/// point that can mutate `state.attached` for an ACP composition.
+struct AcpCatalogConnectionAttachmentPort<'a> {
+    state: &'a mut MutableClientState,
+    ctx: &'a DaemonContext,
+    effects: &'a mut ClientRequestEffects,
+}
+
+#[async_trait::async_trait]
+impl crate::daemon::acp_catalog_composition::AcpCatalogConnectionAttachmentCommitV1
+    for AcpCatalogConnectionAttachmentPort<'_>
+{
+    async fn commit_code_root_attachment(
+        &mut self,
+        attachment: &proto::CodeRootAttachmentV1,
+        options: &proto::CodeRootAttachOptionsV1,
+        since_seq: Option<i64>,
+        disposition: crate::daemon::acp_catalog_composition::AcpCatalogAttachmentDispositionV1,
+    ) -> Result<(), ErrorPayload> {
+        let root_id = attachment.root_id.0;
+        let exact_replay_of_current_attachment =
+            matches!(
+                disposition,
+                crate::daemon::acp_catalog_composition::AcpCatalogAttachmentDispositionV1::Replayed
+            ) && self.state.attached.as_ref().is_some_and(|attached| {
+                attached.handle.session_id == root_id
+                    && attached.code_root_capability.as_ref()
+                        == Some(&attachment.attachment_capability)
+            });
+        if !exact_replay_of_current_attachment {
+            let principal = self.state.principal.clone();
+            let attach_result = Box::pin(attach(
+                self.state,
+                self.ctx,
+                None,
+                Some(root_id),
+                since_seq,
+                None,
+                options.initial_model.clone(),
+                options.no_sandbox,
+                options.interactive,
+                Some(proto::SessionEntryMode::Code),
+                options.model_override.clone(),
+                options.client_protocol_version,
+                options.env_snapshot.clone(),
+                options.env_policy,
+                &principal,
+                self.effects,
+            ))
+            .await;
+            if let Err(error) = attach_result {
+                // `attach` installs the connection state before completing
+                // its fallible projections. This ACP transaction has not
+                // committed yet, so an error must leave no connection-local
+                // attachment or receiver for rollback-on-drop to race with
+                // on a later request.
+                if let Err(cleanup_error) =
+                    drain_client_attachment_ownership(self.state, self.ctx, "ACP attach failure")
+                        .await
+                {
+                    tracing::warn!(
+                        message = %cleanup_error.message,
+                        "ACP attach failure cleanup could not fully release attachment ownership"
+                    );
+                }
+                self.state.attached = None;
+                self.state.pending_replay.clear();
+                self.effects.session_event_rx = None;
+                return Err(error);
+            }
+        }
+
+        let attached = self.state.attached.as_mut().ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "ACP composition did not establish a client attachment".to_string(),
+        })?;
+        if attached.handle.session_id != root_id {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "client attachment changed during ACP composition".to_string(),
+            });
+        }
+        attached.code_root_capability = Some(attachment.attachment_capability.clone());
+        Ok(())
+    }
+}
+
 async fn handle_serialized_request_impl(
     request_id: Uuid,
     request: Request,
@@ -5638,6 +5729,86 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::CreateCodeRootWithAcpIngressV1(request) => {
+            let service = ctx
+                .acp_catalog_composition
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Unavailable,
+                    message: "ACP forwarded-MCP catalog composition is not available".to_string(),
+                })?;
+            let principal = state.principal.clone();
+            let result = {
+                let mut connection = AcpCatalogConnectionAttachmentPort {
+                    state,
+                    ctx: ctx.as_ref(),
+                    effects,
+                };
+                crate::daemon::acp_catalog_composition::create_route(
+                    service.as_ref(),
+                    &principal,
+                    request,
+                    &mut connection,
+                )
+                .await?
+            };
+            Ok(Response::CodeRootWithAcpIngressCreated(result))
+        }
+
+        Request::AttachExistingCodeRootWithAcpIngressV1(request) => {
+            let service = ctx
+                .acp_catalog_composition
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Unavailable,
+                    message: "ACP forwarded-MCP catalog composition is not available".to_string(),
+                })?;
+            let principal = state.principal.clone();
+            let result = {
+                let mut connection = AcpCatalogConnectionAttachmentPort {
+                    state,
+                    ctx: ctx.as_ref(),
+                    effects,
+                };
+                crate::daemon::acp_catalog_composition::attach_route(
+                    service.as_ref(),
+                    &principal,
+                    request,
+                    &mut connection,
+                )
+                .await?
+            };
+            Ok(Response::CodeRootWithAcpIngressAttached(result))
+        }
+
+        Request::CloseAcpCodeRootAttachmentV1(request) => {
+            let service = ctx
+                .acp_catalog_composition
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Unavailable,
+                    message: "ACP forwarded-MCP catalog composition is not available".to_string(),
+                })?;
+            let attachment_capability = request.attachment_capability.clone();
+            let result = crate::daemon::acp_catalog_composition::close_route(
+                service.as_ref(),
+                &state.principal,
+                request,
+            )
+            .await?;
+            // Mirror the base close route: a successful ACP close releases
+            // this connection only when it still owns precisely the closed
+            // capability.  This also clears an exact replay of an already
+            // closed capability instead of leaving it installed locally.
+            if state.attached.as_ref().is_some_and(|attached| {
+                attached.code_root_capability.as_ref() == Some(&attachment_capability)
+            }) {
+                drain_client_attachment_ownership(state, ctx, "ACP Code-root attachment close")
+                    .await?;
+            }
+            Ok(Response::AcpCodeRootAttachmentClosed(result))
+        }
+
         Request::CreateCodeRootV1(request) => {
             let create_start = {
                 let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);

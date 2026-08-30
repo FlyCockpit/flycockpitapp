@@ -154,14 +154,13 @@ pub struct HeldWorkspaceDirectoryAuthority {
     identity: String,
 }
 
-/// A Windows-only lifetime lease for using a retained workspace as a child
-/// process current directory. Windows' `CreateProcess` takes a path rather
-/// than an open directory object, so the lease keeps every component from the
-/// drive root through the workspace open without `FILE_SHARE_DELETE`.  That
-/// makes a rename/delete substitution impossible from the final identity
-/// verification until the child has exited.
+/// A Windows-only lifetime lease for using a retained directory through a
+/// pathname-consuming operation. The lease keeps every component from the
+/// drive root through the retained directory open without `FILE_SHARE_DELETE`.
+/// That makes a rename/delete substitution impossible from the final identity
+/// verification until the lease is dropped.
 #[cfg(windows)]
-pub(crate) struct WindowsWorkspaceExecutionLease {
+pub struct WindowsWorkspaceExecutionLease {
     chain: Vec<File>,
     canonical_path: PathBuf,
     expected_identity: String,
@@ -373,12 +372,14 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.directory_handle_clone()
     }
 
-    /// Acquire a Windows lease only at hook launch, not while the hook
-    /// registry is loaded. That keeps attach and watcher refresh available
-    /// when another process temporarily prevents a safe cwd lease, while the
-    /// actual launch still fails closed rather than using a mutable path.
+    /// Retain a no-delete lease for this directory's canonical spelling.
+    ///
+    /// Callers that must subsequently use a pathname (rather than a Windows
+    /// handle) keep the returned lease alive for the entire operation. The
+    /// lease verifies that the spelling still names this authority before it
+    /// blocks replacement of every mutable ancestor.
     #[cfg(windows)]
-    pub(crate) fn acquire_windows_execution_lease(
+    pub fn acquire_windows_execution_lease(
         &self,
         canonical_path: &Path,
     ) -> Result<WindowsWorkspaceExecutionLease> {

@@ -223,14 +223,17 @@ fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
 /// replaceable KB directory. Generated files and the entire KB root may be
 /// replaced while an embedding request is in flight. The Unix fence is a
 /// stable, private lock outside the KB, keyed by its canonical pathname; the
-/// retained directory descriptor separately anchors every Unix sidecar read
-/// and publish to the root that was present when ownership began. Windows uses
-/// a named kernel mutex derived from the canonical pathname.
+/// retained directory descriptor separately anchors every sidecar read and
+/// publish to the root that was present when ownership began. On Windows a
+/// no-delete lease additionally keeps that root and its ancestors from being
+/// replaced while path-based sidecar operations are in flight. Windows also
+/// uses a named kernel mutex derived from the canonical pathname.
 struct SidecarProcessLock {
-    #[cfg(unix)]
     directory: fs::File,
     #[cfg(unix)]
     fence: fs::File,
+    #[cfg(windows)]
+    _directory_lease: cockpit_host::private_fs::held_directory::WindowsWorkspaceExecutionLease,
     #[cfg(windows)]
     mutex: std::os::windows::io::OwnedHandle,
 }
@@ -308,12 +311,50 @@ impl SidecarProcessLock {
         // SAFETY: mutex is a valid mutex handle. A zero timeout makes this
         // acquisition polling-compatible without blocking the Tokio runtime.
         match unsafe { WaitForSingleObject(mutex.as_raw_handle() as _, 0) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(Self { mutex })),
+            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                // A named mutex serializes callers by stable KB spelling, but
+                // does not itself retain the directory object. Take the
+                // retained authority and its no-delete lease only after the
+                // mutex is owned, so the snapshot and every later path-based
+                // sidecar operation refer to one unreplaceable root identity.
+                let authority = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(sidecars.root())
+                    .with_context(|| {
+                        format!(
+                            "retaining knowledge base directory for process lock {}",
+                            sidecars.root().display()
+                        )
+                    })?;
+                let directory_lease = authority
+                    .acquire_windows_execution_lease(sidecars.root())
+                    .with_context(|| {
+                        format!(
+                            "leasing knowledge base directory for process lock {}",
+                            sidecars.root().display()
+                        )
+                    })?;
+                let directory = authority
+                    .retained_directory_handle()
+                    .context("cloning retained knowledge base directory")?;
+                Ok(Some(Self {
+                    directory,
+                    _directory_lease: directory_lease,
+                    mutex,
+                }))
+            }
             WAIT_TIMEOUT => Ok(None),
             result => Err(io::Error::last_os_error()).with_context(|| {
                 format!("waiting for knowledge sidecar mutex failed with result {result}")
             }),
         }
+    }
+}
+
+impl SidecarProcessLock {
+    /// Return the root capability selected while the process fence was
+    /// acquired. Source snapshots and generated sidecars must use this exact
+    /// directory rather than reopen its diagnostic path spelling.
+    fn directory(&self) -> &fs::File {
+        &self.directory
     }
 }
 
@@ -344,6 +385,19 @@ async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarPr
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// Acquire the cross-process fence before reading source bytes. Returning both
+/// values makes it impossible for callers to discard the directory capability
+/// that selected the snapshot and later publish into a separately reopened KB
+/// pathname.
+async fn snapshot_bundle_with_sidecar_fence(
+    sidecars: &KbSidecars,
+) -> Result<(KnowledgeBundle, SidecarProcessLock)> {
+    let process_lock = acquire_process_sidecar_lock(sidecars).await?;
+    let bundle =
+        parse_bundle_from_retained_root(sidecars.root().to_path_buf(), process_lock.directory())?;
+    Ok((bundle, process_lock))
 }
 
 #[cfg(unix)]
@@ -637,25 +691,30 @@ impl KbProvider for LocalKb {
         }
         // A missing KB remains reportable as unavailable. Once it exists,
         // canonicalize its sidecars immediately before locking so aliases in
-        // registry entries converge on one in-process identity.
+        // registry entries converge on one in-process identity. The process
+        // fence must be acquired before reading markdown: it retains the KB
+        // object that will receive the derived sidecars.
         let sidecars = self.sidecars.canonicalized()?;
         let sidecar_lock = sidecar_lock(&sidecars);
         let _sidecar_guard = sidecar_lock.lock().await;
         let (index, _) = match &self.snapshot {
             Some(snapshot) => {
+                let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
                 KnowledgeIndex::open_snapshot_locked(
                     snapshot.clone(),
                     sidecars.clone(),
+                    &process_lock,
                     embedder,
                     Some(query_vector.len()),
                 )
                 .await?
             }
             None => {
-                let bundle = parse_bundle(&self.root)?;
+                let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
                 KnowledgeIndex::open_snapshot_locked(
                     bundle,
                     sidecars,
+                    &process_lock,
                     embedder,
                     Some(query_vector.len()),
                 )
@@ -702,16 +761,24 @@ impl KbProvider for RemoteKb {
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
     let handle = cockpit_config::config::open_config_directory_nofollow(&root)?;
+    parse_bundle_from_retained_root(root, &handle)
+}
+
+/// Parse a bundle from a retained root capability. The path is retained for
+/// diagnostics only; every markdown and sibling-resource read is anchored to
+/// `handle`, so callers can carry one KB object identity from snapshot through
+/// sidecar publication.
+fn parse_bundle_from_retained_root(root: PathBuf, handle: &fs::File) -> Result<KnowledgeBundle> {
     let documents =
         cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
-            &handle,
+            handle,
             MAX_KNOWLEDGE_FILES,
             MAX_KNOWLEDGE_ENTRIES,
             MAX_KNOWLEDGE_DEPTH,
             MAX_KNOWLEDGE_FILE_BYTES,
             MAX_KNOWLEDGE_TOTAL_BYTES,
         )?;
-    parse_bundle_snapshot(root, documents, &handle)
+    parse_bundle_snapshot(root, documents, handle)
 }
 
 fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Result<()> {
@@ -1054,45 +1121,52 @@ impl KnowledgeIndex {
         query_dimensions: Option<usize>,
     ) -> Result<(Self, IndexStats)> {
         let root = root.as_ref().to_path_buf();
-        let bundle = parse_bundle(&root)?;
-        let sidecars = KbSidecars::in_root(&bundle.root).canonicalized()?;
+        let sidecars = KbSidecars::in_root(&root).canonicalized()?;
         let lock = sidecar_lock(&sidecars);
         let _guard = lock.lock().await;
-        Self::open_snapshot_locked(bundle, sidecars, embedder, query_dimensions).await
+        // Selecting the process fence before the source snapshot makes the
+        // retained directory capability the sole identity for this rebuild.
+        // A replacement of the root can therefore only be observed by the
+        // next rebuild; it cannot receive this rebuild's old projection.
+        let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
+        Self::open_snapshot_locked(bundle, sidecars, &process_lock, embedder, query_dimensions)
+            .await
     }
 
-    /// Caller must hold the per-KB sidecar lock. SQLite receives only verified
+    /// Caller must hold the per-KB sidecar lock and the process fence that was
+    /// acquired before snapshotting the source. SQLite receives only verified
     /// sidecar bytes and runs in memory; no SQLite connection crosses the
     /// await in `sync_embeddings`, so this remains valid in KbProvider's
     /// required Send future.
     async fn open_snapshot_locked(
         bundle: KnowledgeBundle,
         sidecars: KbSidecars,
+        process_lock: &SidecarProcessLock,
         embedder: Arc<dyn Embedder>,
         query_dimensions: Option<usize>,
     ) -> Result<(Self, IndexStats)> {
-        // This process-level lock is retained across the provider await in
-        // `sync_embeddings`. It complements the in-process Tokio mutex held
-        // by the caller and makes different daemon data directories serialize
-        // their paid work against the same external KB. It also serializes the
-        // Git exclusion update before either sidecar can be opened.
-        let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        // The process-level lock is acquired before the source snapshot and
+        // retained across the provider await in `sync_embeddings`. It
+        // complements the in-process Tokio mutex held by the caller and makes
+        // different daemon data directories serialize their paid work against
+        // the same external KB. It also serializes the Git exclusion update
+        // before either sidecar can be opened.
         ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
-        let index = open_index_connection(&sidecars.index, &process_lock)?;
+        let index = open_index_connection(&sidecars.index, process_lock)?;
         ensure_index_schema(&index)?;
         rebuild_index(&index, &bundle)?;
-        persist_private_sidecar_connection(&index, &sidecars.index, &process_lock)?;
+        persist_private_sidecar_connection(&index, &sidecars.index, process_lock)?;
         let stats = sync_embeddings(
             &sidecars.embeddings,
-            &process_lock,
+            process_lock,
             &bundle,
             embedder.as_ref(),
             query_dimensions,
         )
         .await?;
-        let embeddings = open_embeddings_connection(&sidecars.embeddings, &process_lock)?;
+        let embeddings = open_embeddings_connection(&sidecars.embeddings, process_lock)?;
         ensure_embeddings_schema(&embeddings)?;
-        persist_private_sidecar_connection(&embeddings, &sidecars.embeddings, &process_lock)?;
+        persist_private_sidecar_connection(&embeddings, &sidecars.embeddings, process_lock)?;
         Ok((
             Self {
                 bundle,
@@ -3172,6 +3246,39 @@ timestamp: 2026-08-29T12:00:00Z
             SidecarProcessLock::try_acquire(&replacement)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fenced_snapshot_publishes_only_to_its_retained_knowledge_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        fs::create_dir(&root).unwrap();
+        write_bundle(&root);
+        let sidecars = KbSidecars::in_root(&root).canonicalized().unwrap();
+
+        // This is the production ordering: acquire the stable fence and
+        // retained root first, then take the source snapshot through that
+        // capability. Replacing the pathname after this point must not move
+        // either the snapshot or its derived sidecar publication.
+        let (bundle, lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await.unwrap();
+        assert!(bundle.concepts.iter().any(|concept| concept.id == "deploy"));
+
+        let displaced = tmp.path().join("knowledge-displaced");
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        write_bundle(&root);
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE retained_snapshot_identity (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        persist_private_sidecar_connection(&conn, &sidecars.index, &lock).unwrap();
+
+        assert!(displaced.join(INDEX_FILE).is_file());
+        assert!(
+            !root.join(INDEX_FILE).exists(),
+            "a replacement KB must never receive the prior root's projection"
         );
     }
 

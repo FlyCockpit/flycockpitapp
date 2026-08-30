@@ -2608,9 +2608,6 @@ mod steering_tests {
             ("write", &["read", "edit"]),
             ("edit", &["read", "write"]),
             ("unlock", &["write", "edit"]),
-            ("plan_read", &["plan_edit", "plan_write", "todo"]),
-            ("plan_write", &["plan_edit", "todo"]),
-            ("plan_edit", &["plan_read", "plan_write"]),
             ("todo", &["task"]),
         ];
         for (name, siblings) in cases {
@@ -3142,9 +3139,6 @@ mod steering_tests {
             ("lsp", ToolEffect::ReadOnly),
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),
-            ("plan_edit", ToolEffect::Dynamic),
-            ("plan_read", ToolEffect::Dynamic),
-            ("plan_write", ToolEffect::Dynamic),
             ("question", ToolEffect::Dynamic),
             ("read", ToolEffect::ReadOnly),
             ("return", ToolEffect::Dynamic),

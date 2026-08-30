@@ -877,7 +877,12 @@ impl Db {
         self.read(move |conn| {
             let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
             conn.query_row(
-                "SELECT COALESCE(h.payload_json, e.data_json)
+                "SELECT COALESCE(
+                            json_extract(e.data_json, '$.handoff_text'),
+                            json_extract(h.payload_json, '$.handoff_text'),
+                            json_extract(e.data_json, '$.brief_text'),
+                            json_extract(h.payload_json, '$.brief_text')
+                        )
                    FROM session_events e
               LEFT JOIN compaction_handoffs h
                      ON h.handoff_id=json_extract(e.data_json, '$.handoff_ref')
@@ -4005,6 +4010,37 @@ mod tests {
         assert_eq!(page.events[0].seq, compacted);
         assert_eq!(page.events[0].data, payload);
         assert_session_event_rows_eq(&page.events, &full);
+    }
+
+    #[tokio::test]
+    async fn compaction_recall_returns_canonical_text_not_payload_json() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let handoff_id = Uuid::new_v4();
+        db.store_compaction_payload(
+            handoff_id,
+            session.session_id,
+            &json!({ "handoff_text": "stored handoff" }).to_string(),
+        )
+        .await
+        .unwrap();
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::SessionCompacted,
+            Some("builder"),
+            None,
+            &json!({ "handoff_ref": handoff_id.to_string(), "brief_text": "inline brief" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.compaction_text_for_trust(session.session_id, 1, HistoryCallerTrust::Trusted,)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("stored handoff")
+        );
     }
 
     #[tokio::test]

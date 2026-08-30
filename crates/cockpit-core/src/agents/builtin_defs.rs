@@ -566,13 +566,13 @@ fn scout_def() -> AgentDef {
     )
 }
 
-/// `Plan` — the user-facing read-only planning agent. It investigates,
+/// `Plan` — the user-facing planning agent. It investigates,
 /// maintains a virtual session plan document, and hands it to `Build`.
 /// Tool surface mirrors [`crate::engine::builtin::plan`].
 fn plan_def() -> AgentDef {
     def_with_normal(
         "Plan",
-        "Read-only planning agent; maintains a virtual plan document and hands it to Build.",
+        "Planning agent; maintains a virtual plan document and hands it to Build.",
         AgentMode::Primary,
         &[
             "read",

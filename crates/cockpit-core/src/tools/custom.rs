@@ -189,6 +189,15 @@ impl Tool for CustomBashTool {
 
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
+        let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots(ctx)
+            .await?
+            .into_iter()
+            .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+                kind: "attached_knowledge_base".to_string(),
+                path,
+                access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            })
+            .collect::<Vec<_>>();
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
         let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
             &ctx.session,
@@ -265,7 +274,7 @@ impl Tool for CustomBashTool {
                 Some(&workspace_scratch_dir),
                 &scrub,
                 &session_env,
-                &[],
+                &attached_knowledge_paths,
                 ctx.write_scope.as_deref(),
                 &denied_knowledge_paths,
                 &write_denied_knowledge_paths,

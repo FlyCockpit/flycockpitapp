@@ -49,9 +49,11 @@ pub struct BackgroundLaunch {
     pub tmp_dir: Option<PathBuf>,
     pub workspace_scratch_dir: Option<PathBuf>,
     pub session_env: HashMap<String, String>,
-    /// Protected local-KB roots carved out of the shell sandbox. A launch
-    /// carrying these paths must always be confined; driver construction owns
-    /// that invariant.
+    /// Local-KB filesystem policy. Attached roots are read-only capabilities;
+    /// denied roots are removed from both read and write access. Driver
+    /// construction owns the confinement invariant for denied/write-fenced
+    /// roots.
+    attached_knowledge_paths: Vec<PathBuf>,
     denied_knowledge_paths: Vec<PathBuf>,
     write_denied_knowledge_paths: Vec<PathBuf>,
     #[cfg(test)]
@@ -65,6 +67,7 @@ impl BackgroundLaunch {
             tmp_dir: None,
             workspace_scratch_dir: None,
             session_env,
+            attached_knowledge_paths: Vec::new(),
             denied_knowledge_paths: Vec::new(),
             write_denied_knowledge_paths: Vec::new(),
             #[cfg(test)]
@@ -77,19 +80,21 @@ impl BackgroundLaunch {
         workspace_scratch_dir: PathBuf,
         session_env: HashMap<String, String>,
     ) -> Self {
-        Self::confined_with_denied_knowledge_paths(
+        Self::confined_with_knowledge_paths(
             tmp_dir,
             workspace_scratch_dir,
             session_env,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
     }
 
-    pub fn confined_with_denied_knowledge_paths(
+    pub fn confined_with_knowledge_paths(
         tmp_dir: Option<PathBuf>,
         workspace_scratch_dir: PathBuf,
         session_env: HashMap<String, String>,
+        attached_knowledge_paths: Vec<PathBuf>,
         denied_knowledge_paths: Vec<PathBuf>,
         write_denied_knowledge_paths: Vec<PathBuf>,
     ) -> Self {
@@ -98,6 +103,7 @@ impl BackgroundLaunch {
             tmp_dir,
             workspace_scratch_dir: Some(workspace_scratch_dir),
             session_env,
+            attached_knowledge_paths,
             denied_knowledge_paths,
             write_denied_knowledge_paths,
             #[cfg(test)]
@@ -683,6 +689,16 @@ async fn build_confined_background_command(
         }
     }
 
+    let attached_knowledge_paths = launch
+        .attached_knowledge_paths
+        .iter()
+        .cloned()
+        .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+            kind: "attached_knowledge_base".to_string(),
+            path,
+            access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        })
+        .collect::<Vec<_>>();
     crate::tools::shell_sandbox::build_sandboxed_command_with_sandbox_roots(
         command,
         cwd,
@@ -690,7 +706,7 @@ async fn build_confined_background_command(
         launch.workspace_scratch_dir.as_deref(),
         &scrub_overrides(&launch.session_env),
         &launch.session_env,
-        &[],
+        &attached_knowledge_paths,
         None,
         &launch.denied_knowledge_paths,
         &launch.write_denied_knowledge_paths,

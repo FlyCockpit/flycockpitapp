@@ -4316,22 +4316,56 @@ fn native_knowledge_base_permitted(
     ctx: &ToolCtx,
     knowledge_base: &ResolvedLocalKnowledgeBase,
 ) -> bool {
+    native_knowledge_base_permitted_for_model(
+        knowledge_base,
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
+    )
+}
+
+fn native_knowledge_base_permitted_for_model(
+    knowledge_base: &ResolvedLocalKnowledgeBase,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
+) -> bool {
     !knowledge_base.policy_denied
         && !knowledge_base.registry_id_conflicted
-        && !ctx
-            .allowed_knowledge_bases
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
-        && (!knowledge_base.trust_required || ctx.executing_model_trusted)
+        && !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        && (!knowledge_base.trust_required || executing_model_trusted)
 }
 
 /// Return the registry-resolved local roots that the calling agent may read.
 /// This is intentionally a read-only capability: native writes continue
 /// through the ordinary path-approval and write gates.
 pub(crate) async fn attached_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    attached_local_knowledge_roots_for_model(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
+    )
+    .await
+}
+
+/// Return registry-resolved local roots that are native read capabilities for
+/// a model without requiring a full tool context. Driver-owned execution
+/// paths use this before a [`ToolCtx`] exists so their shell sandbox has the
+/// same read authority as the native tools.
+pub(crate) async fn attached_local_knowledge_roots_for_model(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
+) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
-    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
-        if !native_knowledge_base_permitted(ctx, &knowledge_base) {
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        if !native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
             continue;
         }
         if !roots.iter().any(|root| root == &knowledge_base.root) {
@@ -4450,11 +4484,11 @@ pub(crate) async fn denied_local_knowledge_roots_for_model(
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
-        if !knowledge_base.policy_denied
-            && !knowledge_base.registry_id_conflicted
-            && !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
-            && (!knowledge_base.trust_required || executing_model_trusted)
-        {
+        if native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
             continue;
         }
         let root = knowledge_base.root;
@@ -4508,9 +4542,9 @@ pub(crate) async fn ensure_local_knowledge_media_path_access(
 
 /// Workspace-wide inspection and opaque host-proxy tools cannot safely prove
 /// which files a model-authored request will touch before it executes. Deny
-/// their entire operation whenever that root contains a trust-required local
-/// KB. Targeted native tools use [`ensure_local_knowledge_path_access`]
-/// instead.
+/// their entire operation whenever a local KB root is withheld from the
+/// model. Native `glob` and `grep` prove their requested root and filter each
+/// discovered entry, so they remain available to browse attached roots.
 pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
     const UNBOUNDED_HOST_ACCESS_TOOLS: &[&str] = &[
         "code",
@@ -4518,9 +4552,7 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "change_impact",
         "circular",
         "deps",
-        "glob",
         "graph",
-        "grep",
         "hot",
         "harness_invoke",
         // An MCP script can invoke any configured third-party server. The
@@ -7479,6 +7511,19 @@ timestamp: 2026-08-29T12:00:00Z
         .unwrap();
         assert_eq!(attached.bundles.len(), 1);
         assert_eq!(attached.bundles[0].entry.id, "project");
+        assert_eq!(
+            attached_local_knowledge_roots_for_model(
+                &session,
+                tmp.path(),
+                &extended,
+                agent.allowed_knowledge_bases(),
+                true,
+            )
+            .await
+            .unwrap(),
+            vec![tmp.path().join(".cockpit/knowledge")],
+            "driver-owned shell launches receive only this agent's attached local KB roots"
+        );
     }
 
     #[tokio::test]

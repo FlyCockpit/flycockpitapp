@@ -699,6 +699,47 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn dispatcher_allows_grep_when_a_sibling_local_kb_is_withheld() {
+        let (workspace, mut ctx) = test_ctx();
+        let attached = workspace.path().join("attached");
+        let withheld = workspace.path().join("withheld");
+        ctx.allowed_knowledge_bases = Some(BTreeSet::from(["attached".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        for (id, path) in [("attached", attached), ("withheld", withheld)] {
+            extended.knowledge_bases.push(
+                crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    id.to_string(),
+                    id.to_string(),
+                    format!("{id} local knowledge"),
+                    crate::config::extended::KnowledgeBaseSource::Local { path },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                ),
+            );
+        }
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let output = run_test_tool(
+            TimedTestTool::new("grep", Some(Duration::ZERO), Arc::new(AtomicUsize::new(0))),
+            &ctx,
+            &policy_with_default(Duration::from_secs(1)),
+        )
+        .await
+        .expect("the dispatcher must let native grep apply its per-entry KB fence");
+
+        assert_eq!(output.content, "finished");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn tool_timeout_cancels_cancel_aware_call_and_waits_for_cleanup() {
         let (_dir, ctx) = test_ctx();

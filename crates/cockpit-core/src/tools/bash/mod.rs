@@ -385,6 +385,15 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
+    let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots(ctx)
+        .await?
+        .into_iter()
+        .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+            kind: "attached_knowledge_base".to_string(),
+            path,
+            access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        })
+        .collect::<Vec<_>>();
     let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
     let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
         &ctx.session,
@@ -710,8 +719,9 @@ async fn call_bash_inner(
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
-    let extra_sandbox_paths =
+    let mut extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
+    extra_sandbox_paths.extend(attached_knowledge_paths);
     let sandbox_cwd = ctx
         .workspace_lease
         .as_ref()

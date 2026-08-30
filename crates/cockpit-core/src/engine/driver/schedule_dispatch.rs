@@ -440,6 +440,20 @@ impl Driver {
         .map_err(|error| {
             format!("Error: cannot resolve local knowledge-base access policy: {error}")
         })?;
+        let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots_for_model(
+            &self.session,
+            &self.cwd,
+            &self.config.extended(),
+            agent
+                .definition
+                .as_ref()
+                .and_then(crate::agents::AgentDef::allowed_knowledge_bases),
+            !agent.delegated && agent.model.is_trusted(),
+        )
+        .await
+        .map_err(|error| {
+            format!("Error: cannot resolve local knowledge-base access policy: {error}")
+        })?;
         let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
             &self.session,
             &self.cwd,
@@ -463,10 +477,11 @@ impl Driver {
                 Ok(crate::engine::schedule::background::BackgroundLaunch::unconfined(session_env))
             }
             crate::tools::shell_sandbox::SandboxGate::Confine => Ok(
-                crate::engine::schedule::background::BackgroundLaunch::confined_with_denied_knowledge_paths(
+                crate::engine::schedule::background::BackgroundLaunch::confined_with_knowledge_paths(
                     self.session.tmp_dir(),
                     self.session.workspace_scratch_dir(),
                     session_env,
+                    attached_knowledge_paths,
                     denied_knowledge_paths,
                     write_denied_knowledge_paths,
                 ),

@@ -101,22 +101,22 @@ impl AcpForwardedMcpEntryV1 {
 }
 
 impl AcpForwardedStdioV1 {
-    pub(crate) fn command(&self) -> &Path {
+    pub(crate) fn forwarded_command(&self) -> &Path {
         &self.command
     }
-    pub(crate) fn args(&self) -> &[String] {
+    pub(crate) fn forwarded_args(&self) -> &[String] {
         &self.args
     }
-    pub(crate) fn env(&self) -> &BTreeMap<String, String> {
+    pub(crate) fn forwarded_env(&self) -> &BTreeMap<String, String> {
         &self.env
     }
 }
 
 impl AcpForwardedRemoteV1 {
-    pub(crate) fn url(&self) -> &str {
+    pub(crate) fn forwarded_url(&self) -> &str {
         &self.url
     }
-    pub(crate) fn headers(&self) -> &BTreeMap<String, String> {
+    pub(crate) fn forwarded_headers(&self) -> &BTreeMap<String, String> {
         &self.headers
     }
 }

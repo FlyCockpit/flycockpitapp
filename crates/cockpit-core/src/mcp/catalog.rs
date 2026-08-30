@@ -585,7 +585,7 @@ async fn invoke_forwarded(
         &[serde_json::json!({
             "source": super::forwarded::SOURCE_ACP_FORWARDED,
             "epoch": epoch.epoch(),
-            "server": entry.name(),
+            "server": entry.redacted_display_name(),
             "tool": tool,
         })],
     )

@@ -144,9 +144,12 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         .collect::<Vec<_>>();
 
     // This is the complete production capability graph for editor-provided
-    // values.  A new helper, trait implementation, or renamed sink must first
-    // become a declared graph member; the test then subjects that member to
-    // the sink checks below instead of relying on a spelling next to ingress.
+    // values. A forwarded entry's private credential-bearing fields can leave
+    // `mcp/forwarded.rs` only through the typed constructors below: catalog
+    // dispatches `connect_forwarded`, which selects the typed stdio, HTTP, or
+    // SSE constructor. A new helper or transport must therefore name a
+    // forwarded type and become a declared graph member before it can receive
+    // those values.
     let allowed_capability_files = [
         Path::new("approval/mod.rs"),
         Path::new("approval/policy.rs"),
@@ -155,6 +158,9 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         Path::new("mcp/catalog.rs"),
         Path::new("mcp/client.rs"),
         Path::new("mcp/forwarded.rs"),
+        Path::new("mcp/transport/http.rs"),
+        Path::new("mcp/transport/sse.rs"),
+        Path::new("mcp/transport/stdio.rs"),
         Path::new("session/lifecycle.rs"),
         Path::new("session/mod.rs"),
     ];
@@ -184,6 +190,127 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
             "unreviewed forwarded capability consumer {} could bypass the audited funnel",
             path.display()
         );
+    }
+    let mut actual_capability_files = capability_paths
+        .iter()
+        .map(|(path, _)| *path)
+        .collect::<Vec<_>>();
+    actual_capability_files.sort();
+    let mut expected_capability_files = allowed_capability_files.to_vec();
+    expected_capability_files.sort();
+    assert_eq!(
+        actual_capability_files, expected_capability_files,
+        "the complete forwarded capability graph changed; audit every new or removed consumer"
+    );
+
+    // Keep the whole transitive transport set explicit. These constructors
+    // are the only typed hand-offs of the endpoint/header and stdio
+    // command/argument/environment values; ordinary persistent MCP calls use
+    // the untagged constructors elsewhere in `mcp/client.rs`.
+    let forwarded_connect = production
+        .iter()
+        .find_map(|(path, source)| (*path == Path::new("mcp/client.rs")).then_some(*source))
+        .expect("MCP client is a production capability member")
+        .split("pub async fn connect_forwarded(")
+        .nth(1)
+        .expect("forwarded connection function")
+        .split("fn server_requires_secret_store")
+        .next()
+        .expect("forwarded connection boundary");
+    for (path, constructor) in [
+        (
+            Path::new("mcp/transport/stdio.rs"),
+            "StdioClient::spawn_forwarded",
+        ),
+        (
+            Path::new("mcp/transport/http.rs"),
+            "HttpClient::new_forwarded",
+        ),
+        (
+            Path::new("mcp/transport/sse.rs"),
+            "SseClient::new_forwarded",
+        ),
+    ] {
+        let source = production
+            .iter()
+            .find_map(|(candidate, source)| (*candidate == path).then_some(*source))
+            .unwrap_or_else(|| panic!("missing forwarded transport consumer {}", path.display()));
+        assert!(
+            capability_paths
+                .iter()
+                .any(|(candidate, _)| *candidate == path),
+            "forwarded transport consumer {} is not marked by a forwarded type",
+            path.display()
+        );
+        assert!(
+            forwarded_connect.contains(constructor),
+            "forwarded connection bypasses typed transport consumer {constructor}"
+        );
+        assert!(
+            source.contains("AcpForwarded"),
+            "typed forwarded transport consumer {} lost its closed source boundary",
+            path.display()
+        );
+        for forbidden in [
+            "cache::save",
+            "cache::load",
+            "CredentialStore",
+            "SecretVault",
+            "GrantStore",
+            "serde::Serialize",
+            "derive(Serialize",
+            "insert_session_event",
+            "write_session",
+            "session_log",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "forwarded transport consumer {} can retain values in {forbidden}",
+                path.display()
+            );
+        }
+    }
+    // The forwarding-specific accessors are the only raw-value escape hatches
+    // from their private fields. They may be called only by the typed
+    // transport constructors above; an unmarked string/map helper would fail
+    // this assertion instead of silently falling outside the graph.
+    for (accessor, allowed_paths) in [
+        (
+            ".forwarded_command()",
+            &[Path::new("mcp/transport/stdio.rs")][..],
+        ),
+        (
+            ".forwarded_args()",
+            &[Path::new("mcp/transport/stdio.rs")][..],
+        ),
+        (
+            ".forwarded_env()",
+            &[Path::new("mcp/transport/stdio.rs")][..],
+        ),
+        (
+            ".forwarded_url()",
+            &[
+                Path::new("mcp/transport/http.rs"),
+                Path::new("mcp/transport/sse.rs"),
+            ][..],
+        ),
+        (
+            ".forwarded_headers()",
+            &[
+                Path::new("mcp/transport/http.rs"),
+                Path::new("mcp/transport/sse.rs"),
+            ][..],
+        ),
+    ] {
+        for (path, source) in &production {
+            if source.contains(accessor) {
+                assert!(
+                    allowed_paths.contains(path),
+                    "forwarded raw-value accessor {accessor} escaped the typed transport graph in {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     // Raw ingress is confined to conversion/validation and composition.  No
@@ -228,13 +355,6 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
 
     let client =
         fs::read_to_string(manifest.join("src/mcp/client.rs")).expect("read MCP client source");
-    let forwarded_connect = client
-        .split("pub async fn connect_forwarded(")
-        .nth(1)
-        .expect("forwarded connection function")
-        .split("fn server_requires_secret_store")
-        .next()
-        .expect("forwarded connection boundary");
     let forwarded_connect_approval = client
         .split("async fn authorize_forwarded_connect(")
         .nth(1)
@@ -255,6 +375,25 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         );
     }
 
+    // Host approval/effect audit fields must never receive an
+    // editor-controlled declaration name. Transport internals still use the
+    // name as an in-memory lookup key, but the external-effect payloads use
+    // the bounded host-owned display label.
+    for boundary in [
+        "acp_forwarded_mcp_stdio_spawn",
+        "acp_forwarded_mcp_initialize",
+    ] {
+        let effect = forwarded_connect
+            .split(boundary)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing forwarded effect boundary {boundary}"))
+            .split(")],")
+            .next()
+            .expect("forwarded effect payload");
+        assert!(effect.contains("entry.redacted_display_name()"));
+        assert!(!effect.contains("entry.name()"));
+    }
+
     let catalog =
         fs::read_to_string(manifest.join("src/mcp/catalog.rs")).expect("read MCP catalog source");
     let forwarded_catalog = catalog
@@ -271,6 +410,15 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
         .split("pub(crate) fn connect_context")
         .next()
         .expect("forwarded invoke boundary");
+    let tool_effect = forwarded_invoke
+        .split("acp_forwarded_mcp_tools_call")
+        .nth(1)
+        .expect("forwarded tool effect boundary")
+        .split(")],")
+        .next()
+        .expect("forwarded tool effect payload");
+    assert!(tool_effect.contains("entry.redacted_display_name()"));
+    assert!(!tool_effect.contains("entry.name()"));
     for forbidden in [
         "cache::save",
         "cache::load",

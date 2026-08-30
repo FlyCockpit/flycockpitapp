@@ -77,6 +77,29 @@ pub(crate) struct StdioRuntimeContext {
 }
 
 impl StdioClient {
+    /// The sole launcher for editor-forwarded stdio declarations. Keeping the
+    /// closed declaration type at this boundary makes its environment and
+    /// process arguments explicit members of the forwarded consumer graph.
+    pub(crate) fn spawn_forwarded(
+        server_name: &str,
+        stdio: &crate::mcp::forwarded::AcpForwardedStdioV1,
+        timeouts: McpTimeouts,
+        runtime: StdioRuntimeContext,
+    ) -> Result<Self> {
+        let command = stdio
+            .forwarded_command()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("acp_mcp_stdio_command_not_utf8"))?;
+        Self::spawn(
+            server_name,
+            command,
+            stdio.forwarded_args(),
+            stdio.forwarded_env(),
+            timeouts,
+            runtime,
+        )
+    }
+
     pub(crate) fn spawn(
         server_name: &str,
         command: &str,

@@ -122,7 +122,8 @@ async fn list_tools_for_forwarded(
     epoch.recheck_effect_gate()?;
     let tools = connection
         .list_tools()
-        .await?
+        .await
+        .map_err(|_| anyhow::anyhow!("editor-forwarded MCP tool discovery failed"))?
         .into_iter()
         .map(sanitize_tool_descriptor)
         .collect::<Vec<_>>();
@@ -163,7 +164,8 @@ pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<Sea
     }
     if let Some(epoch) = forwarded_catalog(host) {
         for (name, entry) in epoch.entries() {
-            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await {
+            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await
+            {
                 Ok(tools) => tools,
                 Err(_) => continue,
             };
@@ -217,7 +219,8 @@ pub async fn grep_tool_names(
     }
     if let Some(epoch) = forwarded_catalog(host) {
         for (name, entry) in epoch.entries() {
-            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await {
+            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await
+            {
                 Ok(tools) => tools,
                 Err(_) => continue,
             };
@@ -259,7 +262,8 @@ pub async fn grep_tool_definitions(
     }
     if let Some(epoch) = forwarded_catalog(host) {
         for (name, entry) in epoch.entries() {
-            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await {
+            let tools = match list_tools_for_forwarded(&epoch, &entry, connect_context(host)).await
+            {
                 Ok(tools) => tools,
                 Err(_) => continue,
             };
@@ -585,7 +589,10 @@ async fn invoke_forwarded(
     )
     .await?;
     epoch.recheck_effect_gate()?;
-    connection.call_tool(tool, args).await
+    connection
+        .call_tool(tool, args)
+        .await
+        .map_err(|_| anyhow::anyhow!("editor-forwarded MCP tool call failed"))
 }
 
 pub(crate) fn connect_context(host: &HostContext) -> McpConnectContext {

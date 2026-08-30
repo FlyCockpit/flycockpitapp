@@ -23,20 +23,20 @@ use super::protocol::ToolDescriptor;
 
 pub const SOURCE_ACP_FORWARDED: &str = "acp_forwarded";
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpForwardedStdioV1 {
     command: PathBuf,
     args: Vec<String>,
     env: BTreeMap<String, String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpForwardedRemoteV1 {
     url: String,
     headers: BTreeMap<String, String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpForwardedTransportV1 {
     Stdio(AcpForwardedStdioV1),
     Http(AcpForwardedRemoteV1),
@@ -44,7 +44,7 @@ pub enum AcpForwardedTransportV1 {
 }
 
 /// One normalized, memory-only catalog entry.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpForwardedMcpEntryV1 {
     name: String,
     transport: AcpForwardedTransportV1,
@@ -78,14 +78,15 @@ impl AcpForwardedMcpEntryV1 {
                 .chars()
                 .take(128)
                 .collect(),
-            AcpForwardedTransportV1::Http(remote)
-            | AcpForwardedTransportV1::Sse(remote) => url::Url::parse(&remote.url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_else(|| "https endpoint".to_string())
-                .chars()
-                .take(128)
-                .collect(),
+            AcpForwardedTransportV1::Http(remote) | AcpForwardedTransportV1::Sse(remote) => {
+                url::Url::parse(&remote.url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .unwrap_or_else(|| "https endpoint".to_string())
+                    .chars()
+                    .take(128)
+                    .collect()
+            }
         }
     }
 }
@@ -452,7 +453,7 @@ fn validate_remote(
     for pair in headers {
         let name = HeaderName::from_bytes(pair.name.as_bytes())
             .map_err(|_| anyhow::anyhow!("acp_mcp_invalid_header"))?;
-        HeaderValue::from_str(&pair.value)
+        HeaderValue::from_bytes(pair.value.as_bytes())
             .map_err(|_| anyhow::anyhow!("acp_mcp_invalid_header"))?;
         let lower = name.as_str().to_ascii_lowercase();
         if is_hop_by_hop(&lower) || !normalized.insert(lower) {
@@ -461,7 +462,7 @@ fn validate_remote(
         validated.insert(name.as_str().to_string(), pair.value.clone());
     }
     Ok(AcpForwardedRemoteV1 {
-        url: url.into(),
+        url: url.to_string(),
         headers: validated,
     })
 }
@@ -526,11 +527,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(shared.epoch(), epoch.epoch());
-        assert!(registry
+        let conflict = registry
             .bind(root, &second, &ingress(vec![]), Vec::new(), slot.clone())
-            .unwrap_err()
-            .to_string()
-            .contains("acp_mcp_catalog_conflict"));
+            .err()
+            .expect("active epoch rejects an empty vector");
+        assert!(conflict.to_string().contains("acp_mcp_catalog_conflict"));
         assert!(registry.release_attachment(root, &first));
         assert!(!epoch.is_released());
         assert!(registry.release_attachment(root, &second));
@@ -560,11 +561,13 @@ mod tests {
             assert!(!rendered.contains("secret"));
             assert!(!rendered.contains("password"));
         }
-        assert!(validate_and_convert(
-            &[remote("persistent", "https://example.com/mcp")],
-            ["persistent".to_string()]
-        )
-        .is_err());
+        assert!(
+            validate_and_convert(
+                &[remote("persistent", "https://example.com/mcp")],
+                ["persistent".to_string()]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -582,7 +585,10 @@ mod tests {
             "GrantStore",
             "session_log",
         ] {
-            assert!(!production.contains(forbidden), "forbidden sink {forbidden}");
+            assert!(
+                !production.contains(forbidden),
+                "forbidden sink {forbidden}"
+            );
         }
     }
 }

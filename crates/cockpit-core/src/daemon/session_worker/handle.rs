@@ -1156,9 +1156,7 @@ pub(super) fn build_resume_repair_state(
 }
 
 impl SessionWorkerHandle {
-    pub(crate) fn forwarded_mcp_slot(
-        &self,
-    ) -> Arc<crate::mcp::forwarded::ForwardedCatalogSlot> {
+    pub(crate) fn forwarded_mcp_slot(&self) -> Arc<crate::mcp::forwarded::ForwardedCatalogSlot> {
         self.session.forwarded_mcp_slot()
     }
 

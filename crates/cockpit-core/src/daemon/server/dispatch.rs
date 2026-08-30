@@ -5675,12 +5675,10 @@ async fn handle_serialized_request_impl(
             ) {
                 let _ = Box::pin(handle_serialized_request_impl(
                     request_id,
-                    Request::CloseCodeRootAttachmentV1(
-                        proto::CloseCodeRootAttachmentV1Request {
-                            attachment_capability: capability,
-                            client_request_id: request.ingress.ingress_request_id.clone(),
-                        },
-                    ),
+                    Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
+                        attachment_capability: capability,
+                        client_request_id: request.ingress.ingress_request_id.clone(),
+                    }),
                     state,
                     shared,
                     ctx,
@@ -5748,12 +5746,10 @@ async fn handle_serialized_request_impl(
             ) {
                 let _ = Box::pin(handle_serialized_request_impl(
                     request_id,
-                    Request::CloseCodeRootAttachmentV1(
-                        proto::CloseCodeRootAttachmentV1Request {
-                            attachment_capability: capability,
-                            client_request_id: request.ingress.ingress_request_id.clone(),
-                        },
-                    ),
+                    Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
+                        attachment_capability: capability,
+                        client_request_id: request.ingress.ingress_request_id.clone(),
+                    }),
                     state,
                     shared,
                     ctx,

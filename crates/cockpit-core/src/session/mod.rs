@@ -533,9 +533,7 @@ impl Session {
         self.external_journal.lock().unwrap().clone()
     }
 
-    pub(crate) fn forwarded_mcp_slot(
-        &self,
-    ) -> Arc<crate::mcp::forwarded::ForwardedCatalogSlot> {
+    pub(crate) fn forwarded_mcp_slot(&self) -> Arc<crate::mcp::forwarded::ForwardedCatalogSlot> {
         self.forwarded_mcp_catalog.clone()
     }
 

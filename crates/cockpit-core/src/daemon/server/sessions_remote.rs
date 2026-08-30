@@ -332,7 +332,7 @@ pub(super) async fn archive_session(
     // Stop occurs only after the exclusive identity reservation, replay/hash
     // conflict lookup, and target resolution.
     stop_subtree(ctx, session_id, cascade).await?;
-    commit_session_remote_mutation(ctx, ledger, "archive_session", move |conn| {
+    let response = commit_session_remote_mutation(ctx, ledger, "archive_session", move |conn| {
         let existed = crate::db::Db::archive_existing_session_conn(
             conn,
             session_id,
@@ -342,7 +342,11 @@ pub(super) async fn archive_session(
         require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
-    .await
+    .await?;
+    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+        service.revoke_root(session_id);
+    }
+    Ok(response)
 }
 
 pub(super) async fn unarchive_session(
@@ -434,6 +438,9 @@ pub(super) async fn delete_session(
         Ok(Response::Ack)
     })
     .await?;
+    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+        service.revoke_root(session_id);
+    }
     if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
         tracing::warn!(%error, %session_id, "post-commit delegation sidecar cleanup failed; ledgered delete stands");
     }

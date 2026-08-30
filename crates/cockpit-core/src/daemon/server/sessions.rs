@@ -442,6 +442,9 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal)?;
     ctx.db.delete_session(session_id).await.map_err(internal)?;
+    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+        service.revoke_root(session_id);
+    }
     Ok(Response::Ack)
 }
 
@@ -536,6 +539,9 @@ pub(super) async fn archive_session(
         .archive_session(session_id, cascade)
         .await
         .map_err(internal)?;
+    if let Some(service) = ctx.acp_catalog_composition.as_ref() {
+        service.revoke_root(session_id);
+    }
     Ok(Response::Ack)
 }
 

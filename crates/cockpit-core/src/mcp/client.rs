@@ -197,41 +197,55 @@ pub async fn connect_forwarded(
     context.authorize_forwarded_connect(entry, epoch).await?;
     epoch.recheck_effect_gate()?;
     let timeouts = McpTimeouts::from_secs(10, 120);
-    let mut client: Box<dyn McpClient> = match entry.transport() {
-        crate::mcp::forwarded::AcpForwardedTransportV1::Stdio(stdio) => {
-            crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
-                "acp_forwarded_mcp_stdio_spawn",
-                &[serde_json::json!({
-                    "source": crate::mcp::forwarded::SOURCE_ACP_FORWARDED,
-                    "epoch": epoch.epoch(),
-                    "server": entry.name(),
-                    "transport": "stdio",
-                })],
-            )
-            .await?;
-            epoch.recheck_effect_gate()?;
-            Box::new(StdioClient::spawn(
-                entry.name(),
-                stdio.command().to_str().ok_or_else(|| {
-                    anyhow::anyhow!("acp_mcp_stdio_command_not_utf8")
-                })?,
-                stdio.args(),
-                stdio.env(),
-                timeouts,
-                context.stdio_runtime(),
-            )?)
-        }
-        crate::mcp::forwarded::AcpForwardedTransportV1::Http(remote) => Box::new(
-            HttpClient::new(remote.url(), remote.headers().clone(), timeouts)?,
-        ),
-        crate::mcp::forwarded::AcpForwardedTransportV1::Sse(remote) => Box::new(
-            SseClient::new(remote.url(), remote.headers().clone(), timeouts)?,
-        ),
-    };
+    let mut client: Box<dyn McpClient> =
+        match entry.transport() {
+            crate::mcp::forwarded::AcpForwardedTransportV1::Stdio(stdio) => {
+                crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "acp_forwarded_mcp_stdio_spawn",
+                    &[serde_json::json!({
+                        "source": crate::mcp::forwarded::SOURCE_ACP_FORWARDED,
+                        "epoch": epoch.epoch(),
+                        "server": entry.name(),
+                        "transport": "stdio",
+                    })],
+                )
+                .await?;
+                epoch.recheck_effect_gate()?;
+                Box::new(StdioClient::spawn(
+                    entry.name(),
+                    stdio
+                        .command()
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("acp_mcp_stdio_command_not_utf8"))?,
+                    stdio.args(),
+                    stdio.env(),
+                    timeouts,
+                    context.stdio_runtime(),
+                )?)
+            }
+            crate::mcp::forwarded::AcpForwardedTransportV1::Http(remote) => Box::new(
+                HttpClient::new(remote.url(), remote.headers().clone(), timeouts)?,
+            ),
+            crate::mcp::forwarded::AcpForwardedTransportV1::Sse(remote) => Box::new(
+                SseClient::new(remote.url(), remote.headers().clone(), timeouts)?,
+            ),
+        };
+    epoch.recheck_effect_gate()?;
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "acp_forwarded_mcp_initialize",
+        &[serde_json::json!({
+            "source": crate::mcp::forwarded::SOURCE_ACP_FORWARDED,
+            "epoch": epoch.epoch(),
+            "server": entry.name(),
+            "transport": entry.transport_kind(),
+        })],
+    )
+    .await?;
     epoch.recheck_effect_gate()?;
     tokio::time::timeout(timeouts.connect, client.initialize())
         .await
-        .map_err(|_| anyhow::anyhow!("editor-forwarded MCP initialize timed out"))??;
+        .map_err(|_| anyhow::anyhow!("editor-forwarded MCP initialize timed out"))?
+        .map_err(|_| anyhow::anyhow!("editor-forwarded MCP initialize failed"))?;
     epoch.recheck_effect_gate()?;
     Ok(client)
 }

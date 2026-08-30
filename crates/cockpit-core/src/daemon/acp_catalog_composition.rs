@@ -27,6 +27,8 @@ pub(crate) trait AcpCatalogCompositionServiceV1: Send + Sync {
         root_id: uuid::Uuid,
         attachment: &proto::CodeRootAttachmentCapabilityV1,
     );
+
+    fn revoke_root(&self, root_id: uuid::Uuid);
 }
 
 #[derive(Default)]
@@ -93,6 +95,10 @@ impl AcpCatalogCompositionServiceV1 for DaemonAcpCatalogCompositionV1 {
     ) {
         self.registry.release_attachment(root_id, attachment);
     }
+
+    fn revoke_root(&self, root_id: uuid::Uuid) {
+        self.registry.revoke_root(root_id);
+    }
 }
 
 #[cfg(test)]
@@ -118,19 +124,12 @@ mod tests {
             ingress_request_id: proto::OpaqueAsciiId128V1::new("request").unwrap(),
         };
         let root = uuid::Uuid::new_v4();
-        let attachment =
-            proto::CodeRootAttachmentCapabilityV1::new_opaque("attachment").unwrap();
+        let attachment = proto::CodeRootAttachmentCapabilityV1::new_opaque("attachment").unwrap();
         let slot = Arc::new(crate::mcp::forwarded::ForwardedCatalogSlot::default());
 
         service.validate_ingress(temp.path(), &ingress).unwrap();
         service
-            .bind_catalog(
-                root,
-                &attachment,
-                temp.path(),
-                &ingress,
-                slot.clone(),
-            )
+            .bind_catalog(root, &attachment, temp.path(), &ingress, slot.clone())
             .unwrap();
         let epoch = slot.active().expect("published epoch");
         assert_eq!(epoch.root_id(), root);

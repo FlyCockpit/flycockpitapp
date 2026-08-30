@@ -123,3 +123,71 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
          {public_catalog_lifecycle_routes:?}"
     );
 }
+
+#[test]
+fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let forwarded = fs::read_to_string(manifest.join("src/mcp/forwarded.rs"))
+        .expect("read forwarded catalog source");
+    let composition = fs::read_to_string(manifest.join("src/daemon/acp_catalog_composition.rs"))
+        .expect("read catalog composition source");
+    let inspected = format!("{forwarded}\n{composition}");
+    for forbidden in [
+        "McpConfig::write_private",
+        "McpConfig::discover(",
+        "cache::save",
+        "cache::load",
+        "CredentialStore",
+        "SecretVault",
+        "GrantStore",
+        "record_mcp_tool_key",
+        "record_mcp_server_connect_key",
+        "insert_session_event",
+        "write_session",
+        "session_log",
+        "serde::Serialize",
+        "derive(Serialize",
+    ] {
+        assert!(
+            !inspected.contains(forbidden),
+            "ACP-forwarded declarations must not reach {forbidden}"
+        );
+    }
+
+    let client =
+        fs::read_to_string(manifest.join("src/mcp/client.rs")).expect("read MCP client source");
+    let forwarded_connect = client
+        .split("pub async fn connect_forwarded(")
+        .nth(1)
+        .expect("forwarded connection function")
+        .split("fn server_requires_secret_store")
+        .next()
+        .expect("forwarded connection boundary");
+    for forbidden in [
+        "CredentialStore",
+        "SecretVault",
+        "oauth_bearer",
+        "resolve_static_for_server",
+        "server_requires_secret_store",
+    ] {
+        assert!(
+            !forwarded_connect.contains(forbidden),
+            "forwarded connection must bypass credential path {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn forwarded_catalog_is_reachable_only_from_tool_context_session_and_monty_catalog() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let session = fs::read_to_string(manifest.join("src/session/mod.rs")).expect("session source");
+    let catalog = fs::read_to_string(manifest.join("src/mcp/catalog.rs")).expect("catalog source");
+    let mcp_tool =
+        fs::read_to_string(manifest.join("src/tools/mcp_tool.rs")).expect("MCP tool source");
+    assert!(session.contains("forwarded_mcp_catalog"));
+    assert!(catalog.contains("ctx.session.forwarded_mcp_catalog()"));
+    assert!(catalog.contains("invoke_forwarded"));
+    assert!(catalog.contains("client::connect_forwarded"));
+    assert!(!mcp_tool.contains("AcpForwardedMcp"));
+    assert!(!mcp_tool.contains("connect_forwarded"));
+}

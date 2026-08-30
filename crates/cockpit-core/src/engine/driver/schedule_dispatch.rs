@@ -435,6 +435,7 @@ impl Driver {
             crate::tools::shell_sandbox::SandboxGate::Confine => Ok(
                 crate::engine::schedule::background::BackgroundLaunch::confined(
                     self.session.tmp_dir(),
+                    self.session.workspace_scratch_dir(),
                     session_env,
                 ),
             ),

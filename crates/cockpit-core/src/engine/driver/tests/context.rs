@@ -425,7 +425,7 @@ async fn shadow_brief_predrafts() {
     wait_for_shadow_brief(&mut driver).await;
     assert_eq!(
         compact_inference_purposes(&driver).await,
-        ["compact_shadow_brief"]
+        ["rolling_compaction_rebuild"]
     );
     assert!(
         driver
@@ -436,6 +436,180 @@ async fn shadow_brief_predrafts() {
             .unwrap()
             .is_some(),
         "ready shadow brief is persisted eagerly"
+    );
+}
+
+#[tokio::test]
+async fn rolling_precompaction_survives_legacy_shadow_killswitch_and_rebuilds_on_cadence() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        rolling_precompaction_rebuild_turns: 2,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "rolling state persists even when the legacy pressure shadow is disabled"
+    );
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+
+    assert_eq!(
+        compact_inference_purposes(&driver).await,
+        [
+            "rolling_compaction_rebuild",
+            "rolling_compaction_delta",
+            "rolling_compaction_rebuild",
+        ],
+        "the cadence accumulates delta revisions rather than comparing only the latest turn"
+    );
+}
+
+#[tokio::test]
+async fn rolling_precompaction_keeps_warm_turns_incremental_until_cadence() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        rolling_precompaction_rebuild_turns: 24,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    driver
+        .session
+        .set_last_usage_estimate(crate::tokens::TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 100,
+            cached_input_tokens: 1_900,
+            cache_creation_input_tokens: 0,
+        });
+
+    append_complete_test_turns(&mut driver, 1);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+
+    assert_eq!(
+        compact_inference_purposes(&driver).await,
+        ["rolling_compaction_rebuild", "rolling_compaction_delta"],
+        "a warm cache report must not turn each completed turn into a full-history rebuild"
+    );
+}
+
+#[tokio::test]
+async fn rolling_partial_snapshot_is_rebuilt_not_delta_promoted() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        rolling_precompaction_rebuild_turns: 24,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+    append_complete_test_turns(&mut driver, 2);
+    let snapshot = driver.compact_brief_history(&driver.stack[0].history);
+    driver.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
+        generation: 1,
+        snapshot_history: snapshot,
+        snapshot_turns: 2,
+        snapshot_tail_turns: 1,
+        turns_since_rebuild: 1,
+        brief: "fitted rolling brief".to_string(),
+        fit_rung: CompactFitRung::HistorySelected,
+        input_coverage: CompactInputCoverage::Partial,
+    }));
+    append_complete_test_turns(&mut driver, 1);
+
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    let calls = crate::sync::lock_or_recover(
+        driver
+            .test_compact_brief_calls
+            .as_ref()
+            .expect("fake compact seam"),
+    );
+    assert_eq!(
+        calls.last().expect("rolling call").purpose,
+        "rolling_compaction_rebuild"
+    );
+    assert_eq!(
+        crate::engine::compact::complete_exchange_count(
+            &calls.last().expect("rolling call").history
+        ),
+        3,
+        "a partial prior snapshot must be rebuilt from full current history"
+    );
+}
+
+#[tokio::test]
+async fn exact_resume_offer_retains_snapshot_and_apply_uses_no_inference() {
+    use crate::config::providers::{CacheMode, ContextConfig, ResumeDefault};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cfg = ContextConfig {
+        compact_shadow: false,
+        rolling_precompaction: true,
+        idle_window_secs: 1,
+        resume_default: ResumeDefault::Ask,
+        ..ContextConfig::default()
+    };
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+    append_complete_test_turns(&mut driver, 2);
+    assert!(driver.maybe_shadow_brief(&tx).await);
+    wait_for_shadow_brief(&mut driver).await;
+    let before = compact_inference_purposes(&driver).await;
+
+    let offer = driver
+        .prepare_resume_compaction_offer(1, &tx)
+        .await
+        .expect("resume offer preparation succeeds")
+        .expect("exact rolling snapshot is offered after idle window");
+    assert!(offer.compacted_input_tokens <= offer.full_input_tokens);
+    assert!(matches!(
+        driver.shadow_brief,
+        Some(ShadowBriefState::Ready(_))
+    ));
+    assert_eq!(compact_inference_purposes(&driver).await, before);
+
+    driver
+        .apply_exact_rolling_compaction(&tx)
+        .await
+        .expect("accepted exact offer applies");
+    assert_eq!(compact_inference_purposes(&driver).await, before);
+    assert!(
+        driver.shadow_brief.is_none(),
+        "applied snapshot is discarded"
     );
 }
 
@@ -463,7 +637,7 @@ async fn compact_uses_shadow_delta() {
     assert_eq!(
         purposes
             .iter()
-            .filter(|p| p.as_str() == "compact_shadow_brief")
+            .filter(|p| p.as_str() == "rolling_compaction_rebuild")
             .count(),
         1,
         "the shadow/full draft runs exactly once"
@@ -484,7 +658,7 @@ async fn compact_uses_shadow_delta() {
             .expect("fake compact seam"),
     );
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].purpose, "compact_shadow_brief");
+    assert_eq!(calls[0].purpose, "rolling_compaction_rebuild");
     assert_eq!(calls[1].purpose, "compact_brief_delta");
     assert!(calls[1].prompt.contains("<existing_shadow_brief>"));
     assert_eq!(
@@ -543,7 +717,7 @@ async fn ready_brief_survives_driver_drop() {
     assert_eq!(
         purposes
             .iter()
-            .filter(|purpose| purpose.as_str() == "compact_shadow_brief")
+            .filter(|purpose| purpose.as_str() == "rolling_compaction_rebuild")
             .count(),
         1
     );
@@ -610,6 +784,7 @@ async fn load_without_row_clears_memory_view() {
         snapshot_history: vec![Message::user("memory only")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "memory only".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -631,6 +806,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         snapshot_history: vec![Message::user("snapshot"), Message::assistant("briefed")],
         snapshot_turns: 1,
         snapshot_tail_turns: 1,
+        turns_since_rebuild: 0,
         brief: "stored brief".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -662,6 +838,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         snapshot_history: vec![Message::user("older")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "older brief".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -729,6 +906,7 @@ async fn stale_loaded_brief_is_discarded() {
         snapshot_history: vec![Message::user("old")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "too old".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -767,6 +945,7 @@ async fn killswitch_writes_no_rows() {
         snapshot_history: vec![Message::user("delete me")],
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "delete me".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -1550,6 +1729,7 @@ async fn manual_compact_cancels_shadow() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         cancel,
         handle: tokio::spawn(std::future::pending::<
             crate::engine::compact_draft::CompactDraftOutcome,
@@ -1570,6 +1750,7 @@ async fn manual_compact_cancels_shadow() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         cancel: ending_cancel,
         handle: tokio::spawn(std::future::pending::<
             crate::engine::compact_draft::CompactDraftOutcome,
@@ -1596,6 +1777,7 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         cancel,
         handle: tokio::spawn(std::future::pending::<
             crate::engine::compact_draft::CompactDraftOutcome,
@@ -1620,6 +1802,7 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         snapshot_history: Vec::new(),
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
         brief: "ready".to_string(),
         fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
@@ -3176,6 +3359,291 @@ async fn ineffective_prunes_escalate_to_compaction_below_compact_line() {
     while rx.recv().await.is_some() {}
 }
 
+/// Keep-warm is a background control, so a user already queued at dispatch
+/// wins before the provider future is polled. The cancellation token is the
+/// same slot the worker exposes for ctrl+c and scheduler callback expiry.
+#[tokio::test]
+async fn keep_warm_yields_to_queued_user_reentry() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 60;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver.session.note_send();
+    driver.session.note_cache_hit_for_endpoint(
+        "lmstudio",
+        "local",
+        crate::tokens::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 1,
+            cached_input_tokens: 90,
+            cache_creation_input_tokens: 0,
+        },
+    );
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    queue
+        .push(
+            crate::engine::message::UserSubmission::text("I'm back"),
+            driver.active_queue_target(),
+        )
+        .await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let result = driver
+        .run_keep_warm(
+            driver.session.last_send_identity().unwrap(),
+            0,
+            60,
+            cancel.clone(),
+            &queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "skipped: user re-entered");
+    assert!(cancel.is_cancelled());
+    assert!(
+        queue.has_pending_for(None).await,
+        "re-entry stays queued for normal dispatch"
+    );
+}
+
+#[tokio::test]
+async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let result = driver
+        .run_keep_warm(
+            crate::session::InferenceSendIdentity {
+                unix_millis: chrono::Utc::now().timestamp_millis(),
+                send_id: uuid::Uuid::new_v4(),
+            },
+            30,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "skipped: before keep-warm deadline");
+
+    driver
+        .session
+        .note_send_at_for_test(std::time::Duration::from_secs(120));
+    let expired_send_identity = driver.session.last_send_identity().unwrap();
+    let result = driver
+        .run_keep_warm(
+            expired_send_identity,
+            0,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "skipped: idle window elapsed");
+}
+
+#[test]
+fn keep_warm_idle_deadline_overflow_fails_closed() {
+    assert!(
+        keep_warm_idle_deadline(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(u64::MAX),
+        )
+        .is_none(),
+        "a valid u64 idle window must not panic or permit dispatch when it cannot fit an instant"
+    );
+}
+
+#[tokio::test]
+async fn keep_warm_uses_the_cache_producing_send_for_its_original_deadline() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 60;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver
+        .session
+        .note_send_at_for_test(std::time::Duration::from_secs(61));
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+
+    let result = driver
+        .run_keep_warm(
+            cache_send_identity,
+            0,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, "skipped: idle window elapsed");
+}
+
+#[tokio::test]
+async fn keep_warm_rejects_a_later_send_with_the_same_millisecond_timestamp() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver
+        .session
+        .note_send_at_for_test(std::time::Duration::from_secs(30));
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    driver
+        .session
+        .note_send_with_unix_millis_for_test(cache_send_identity.unix_millis);
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+
+    let result = driver
+        .run_keep_warm(
+            cache_send_identity,
+            0,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, "skipped: newer session activity");
+}
+
+#[tokio::test]
+async fn keep_warm_fences_a_live_idle_window_reduction() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 10;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver
+        .session
+        .note_send_at_for_test(std::time::Duration::from_secs(20));
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+
+    let result = driver
+        .run_keep_warm(
+            cache_send_identity,
+            0,
+            60,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, "skipped: idle window elapsed");
+}
+
+/// Preparation time belongs to the cache-producing send's idle window. The
+/// test seam elapses time after the fixed deadline is captured but before the
+/// provider future is constructed; the refresh must still be skipped instead
+/// of starting a new relative idle timer.
+#[tokio::test(start_paused = true)]
+async fn keep_warm_does_not_extend_the_idle_window_during_preparation() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 1;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver.session.note_send();
+    driver.session.note_cache_hit_for_endpoint(
+        "lmstudio",
+        "local",
+        crate::tokens::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 1,
+            cached_input_tokens: 90,
+            cache_creation_input_tokens: 0,
+        },
+    );
+    driver.keep_warm_pre_dispatch_delay = Some(std::time::Duration::from_secs(2));
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+
+    let result = driver
+        .run_keep_warm(
+            cache_send_identity,
+            0,
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            &queue,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, "skipped: idle window elapsed");
+}
+
+/// The idle window remains a hard boundary after the provider handoff: a
+/// parked provider proves that the in-flight refresh is cancelled at the
+/// deadline rather than being left to the generic background timeout.
+#[tokio::test]
+async fn keep_warm_cancels_an_in_flight_refresh_at_the_idle_deadline() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind parked keep-warm provider");
+    let address = listener.local_addr().expect("parked provider address");
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let provider_server = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.expect("accept keep-warm request");
+        let _ = accepted_tx.send(());
+        std::future::pending::<()>().await;
+    });
+
+    let (mut driver, _tmp) = test_driver_with_url(8, format!("http://{address}/v1"));
+    let mut context = ContextConfig::default();
+    context.idle_window_secs = 1;
+    install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
+    driver.session.note_send();
+    driver.session.note_cache_hit_for_endpoint(
+        "lmstudio",
+        "local",
+        crate::tokens::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 1,
+            cached_input_tokens: 90,
+            cache_creation_input_tokens: 0,
+        },
+    );
+    let cache_send_identity = driver.session.last_send_identity().unwrap();
+    let (updates, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let refresh = driver.run_keep_warm(cache_send_identity, 0, 1, cancel.clone(), &queue);
+    tokio::pin!(refresh);
+
+    tokio::select! {
+        accepted = tokio::time::timeout(std::time::Duration::from_secs(1), accepted_rx) => {
+            assert!(accepted.is_ok(), "keep-warm must reach the parked provider");
+            assert!(accepted.unwrap().is_ok(), "parked provider must observe the refresh");
+        }
+        result = &mut refresh => panic!("keep-warm ended before provider dispatch: {result:?}"),
+    }
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh)
+        .await
+        .expect("idle-window fence must beat the 30-second background timeout")
+        .unwrap();
+    assert_eq!(result, "skipped: idle window elapsed");
+    assert!(
+        cancel.is_cancelled(),
+        "idle-window expiry cancels the provider call"
+    );
+    provider_server.abort();
+}
+
 /// No `context_length` known → the ctx%-gated paths are inert: the
 /// threshold auto-prune branch and auto-compact both skip, but the
 /// cache-cold auto-prune branch still fires.
@@ -3411,6 +3879,7 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
         snapshot_history: snapshot_history.clone(),
         snapshot_turns: 2,
         snapshot_tail_turns: 1,
+        turns_since_rebuild: 0,
         cancel: tokio_util::sync::CancellationToken::new(),
         handle: tokio::spawn(async {
             crate::engine::compact_draft::CompactDraftOutcome::Success(
@@ -3504,6 +3973,76 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
         calls[0].history, snapshot_history,
         "a partial shadow delta must include every source exchange, not only the old tail"
     );
+}
+
+/// A completed rolling summary must be published before the idle driver
+/// returns on control-channel closure.  The shutdown boundary is the only
+/// time no subsequent turn/control event is available to settle the task.
+#[tokio::test]
+async fn completed_rolling_shadow_persists_before_idle_driver_shutdown() {
+    use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let session = driver.session.clone();
+    let snapshot_history = driver.stack[0].history.clone();
+    driver.shadow_brief_generation = 7;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 7,
+        snapshot_history,
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        handle: tokio::spawn(async {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(
+                crate::engine::compact_draft::CompactDraftSuccess {
+                    brief: "summary completed before shutdown".to_string(),
+                    fit_rung: CompactFitRung::Verbatim,
+                    input_coverage: CompactInputCoverage::Full,
+                    attempts: 1,
+                },
+            )
+        }),
+    }));
+
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let (control_tx, control_rx) = mpsc::channel(1);
+    drop(control_tx);
+
+    driver
+        .run_main_loop(queue, control_rx, &tx)
+        .await
+        .expect("idle control closure exits cleanly");
+
+    let stored = session
+        .db
+        .compaction_shadow(session.id)
+        .await
+        .unwrap()
+        .expect("shutdown must persist the completed rolling summary");
+    let DurableCompactionShadow::ReadyBrief(ready) =
+        serde_json::from_str::<DurableCompactionShadow>(&stored.payload_json).unwrap()
+    else {
+        panic!("shutdown must retain a ready rolling summary");
+    };
+    assert_eq!(ready.generation, 7);
+    assert_eq!(ready.brief, "summary completed before shutdown");
+
+    let mut restored = Driver::new(
+        session,
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.stack[0].agent.clone(),
+    );
+    restored.load_compaction_shadow_from_store().await;
+    assert!(matches!(
+        &restored.shadow_brief,
+        Some(ShadowBriefState::Ready(ready)) if ready.generation == 7
+            && ready.brief == "summary completed before shutdown"
+    ));
 }
 
 /// Manual `/compact` bypasses the auto-compaction gate: even when the gate

@@ -81,7 +81,7 @@ use crate::{
 };
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
-use crate::session::Session;
+use crate::session::{InferenceSendIdentity, Session};
 
 /// Out-of-band control requests routed to the driver from the daemon
 /// worker — `/prune`, `/compact`, `/pin`. Drained on the same boundary
@@ -90,6 +90,16 @@ use crate::session::Session;
 #[derive(Debug)]
 pub enum DriverControl {
     WakeGoal,
+    /// Send one non-mutating prompt-cache refresh while the session remains in
+    /// the idle window. This is cost-only and carries no resume semantics.
+    KeepWarm {
+        cache_send_at_unix_millis: i64,
+        cache_send_id: uuid::Uuid,
+        after_secs: u64,
+        idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
     /// Deliver an already-durable late user steer to the exact live executor
     /// that originally owned the automatic decision. The worker acknowledges
     /// the DB claim only after that continuation completes, so a crash before
@@ -178,6 +188,19 @@ pub enum DriverControl {
     /// deterministic appendix, derive context tags, create a fresh session,
     /// and emit `CompactReady`.
     Compact,
+    /// Inspect an away-resume without mutating history, so an interactive
+    /// client can retain the full conversation after seeing the offer.
+    PrepareResumeCompaction {
+        idle_for_secs: u64,
+        respond_to: tokio::sync::oneshot::Sender<
+            std::result::Result<Option<crate::daemon::proto::ResumeCompactionOffer>, String>,
+        >,
+    },
+    /// Apply the compacted branch of an away-resume from the retained exact
+    /// rolling snapshot. This is deterministic and performs no inference.
+    ResumeFromCompaction {
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin {
         text: String,
@@ -1193,6 +1216,13 @@ pub struct Driver {
     /// no stale completion can publish after session teardown.
     shadow_brief: Option<ShadowBriefState>,
     shadow_brief_generation: u64,
+    /// One one-shot keep-warm may be armed for each accepted user idle window.
+    keep_warm_armed_for_idle_window: bool,
+    /// Test-only elapsed preparation injected after the fixed keep-warm
+    /// deadline is captured. This makes the deadline fence observable without
+    /// making production dispatch yield during prompt preparation.
+    #[cfg(test)]
+    keep_warm_pre_dispatch_delay: Option<Duration>,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
     goal_progress_last_seq: i64,
@@ -1505,15 +1535,22 @@ struct ShadowBriefInFlight {
     snapshot_history: Vec<Message>,
     snapshot_turns: usize,
     snapshot_tail_turns: usize,
+    /// Number of turns incrementally summarized since the last full rebuild.
+    /// This is independent of the current snapshot size: each delta revision
+    /// advances the ready snapshot, so deriving cadence from snapshot deltas
+    /// would otherwise observe only the most recent boundary.
+    turns_since_rebuild: usize,
     cancel: tokio_util::sync::CancellationToken,
     handle: tokio::task::JoinHandle<crate::engine::compact_draft::CompactDraftOutcome>,
 }
 
+#[derive(Clone)]
 struct ShadowBriefReady {
     generation: u64,
     snapshot_history: Vec<Message>,
     snapshot_turns: usize,
     snapshot_tail_turns: usize,
+    turns_since_rebuild: usize,
     brief: String,
     fit_rung: crate::engine::compact_draft::CompactFitRung,
     input_coverage: crate::engine::compact_draft::CompactInputCoverage,
@@ -2210,6 +2247,9 @@ impl Driver {
             prune_effectiveness: self.prune_effectiveness.clone(),
             shadow_brief: None,
             shadow_brief_generation: 0,
+            keep_warm_armed_for_idle_window: false,
+            #[cfg(test)]
+            keep_warm_pre_dispatch_delay: None,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
@@ -2578,6 +2618,9 @@ impl Driver {
             prune_effectiveness: std::collections::VecDeque::new(),
             shadow_brief: None,
             shadow_brief_generation: 0,
+            keep_warm_armed_for_idle_window: false,
+            #[cfg(test)]
+            keep_warm_pre_dispatch_delay: None,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
@@ -2958,6 +3001,22 @@ impl Driver {
         .await
         {
             Ok(Ok(new_table)) => {
+                let new_table = match self
+                    .session
+                    .with_machine_scoped_sealed_redactions(&new_table)
+                    .await
+                {
+                    Ok(table) => table,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "adding machine-scoped sealed redactions failed");
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: format!("Redaction refresh failed: {error:#}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
                 // J2: route the per-turn refresh through the hub so it unions the
                 // disk scan onto the LATEST shared table under the same
                 // `redaction_table_write_lock` as sealed adoption. `self.redact`
@@ -4383,6 +4442,9 @@ impl Driver {
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
             agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
             lock_identity: agent.name.clone().clone(),
             write_scope: agent.write_scope.clone(),
@@ -4444,12 +4506,7 @@ impl Driver {
             },
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
-            mcp_resolver: {
-                agent
-                    .mcp_resolver
-                    .observe_config_generation(self.config.snapshot().generation);
-                agent.mcp_resolver.clone()
-            },
+            mcp_resolver: agent.mcp_resolver.clone(),
         };
         let call = crate::engine::message::ToolCall {
             id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -5083,6 +5140,21 @@ impl Driver {
     pub async fn run_main_loop(
         &mut self,
         input_queue: crate::engine::message::UserSubmissionQueue,
+        control_rx: mpsc::Receiver<DriverControl>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        let outcome = self.run_main_loop_inner(input_queue, control_rx, tx).await;
+        // A rolling summary is utility work, but once it has completed it is
+        // the durable resume candidate.  Do not let the driver return (and
+        // subsequently drop/abort the task) until that result has either been
+        // persisted or classified as non-successful.
+        self.drain_shadow_brief_on_shutdown().await;
+        outcome
+    }
+
+    async fn run_main_loop_inner(
+        &mut self,
+        input_queue: crate::engine::message::UserSubmissionQueue,
         mut control_rx: mpsc::Receiver<DriverControl>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
@@ -5352,6 +5424,7 @@ impl Driver {
             if !waiting_for_keep_parked_siblings {
                 self.maybe_shadow_brief(tx).await;
                 self.maybe_auto_compact(tx).await;
+                self.maybe_schedule_keep_warm().await;
             }
             // Refresh the "% prunable" projection from the now-settled
             // foreground history. AgentIdle is turn-boundary chrome, not a
@@ -5694,6 +5767,28 @@ impl Driver {
                     tracing::warn!(%error, "waking supervised goal failed");
                 }
             }
+            DriverControl::KeepWarm {
+                cache_send_at_unix_millis,
+                cache_send_id,
+                after_secs,
+                idle_window_secs,
+                cancel,
+                respond_to,
+            } => {
+                let _ = respond_to.send(
+                    self.run_keep_warm(
+                        InferenceSendIdentity {
+                            unix_millis: cache_send_at_unix_millis,
+                            send_id: cache_send_id,
+                        },
+                        after_secs,
+                        idle_window_secs,
+                        cancel,
+                        input_queue,
+                    )
+                    .await,
+                );
+            }
             DriverControl::FlushSendNow => {
                 // The live bash path observes the queue's send-now revision
                 // while it owns the child process. If this control reaches us,
@@ -5915,6 +6010,19 @@ impl Driver {
                     return;
                 }
                 self.do_compact(tx).await;
+            }
+            DriverControl::PrepareResumeCompaction {
+                idle_for_secs,
+                respond_to,
+            } => {
+                let result = self
+                    .prepare_resume_compaction_offer(idle_for_secs, tx)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ResumeFromCompaction { respond_to } => {
+                let _ = respond_to.send(self.apply_exact_rolling_compaction(tx).await);
             }
             DriverControl::Pin { text } => {
                 self.session.pin_message(&text);
@@ -7802,6 +7910,9 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
@@ -9311,6 +9422,304 @@ impl Driver {
     /// can't be loaded (implementation note).
     fn resolve_context_config(&self) -> crate::config::providers::ContextConfig {
         Self::context_config_from(self.active_providers_config().as_ref())
+    }
+
+    /// Evaluate one observed-hit-gated keep-warm opportunity at an idle root
+    /// boundary. The scheduler owns the later one-shot execution; this method
+    /// only records the decision and never changes user activity.
+    async fn maybe_schedule_keep_warm(&mut self) {
+        if self.keep_warm_armed_for_idle_window || !self.at_safe_boundary() || self.stack.len() != 1
+        {
+            return;
+        }
+        let Some((providers, provider, model)) = self.active_providers_config() else {
+            return;
+        };
+        let context = providers.resolve_context(&provider, &model);
+        let profile = providers.resolve_cache_retention_profile(&provider, &model);
+        let observed_cache_hit = self
+            .session
+            .has_observed_cache_hit_for_endpoint(&provider, &model);
+        let decision = crate::keep_warm::decide(
+            context.keep_warm,
+            context.idle_window_secs,
+            profile,
+            observed_cache_hit,
+        );
+        self.keep_warm_armed_for_idle_window = true;
+
+        let agent = self.active_agent().to_string();
+        match decision {
+            crate::keep_warm::KeepWarmDecision::Skip(reason) => {
+                if let Err(error) = self
+                    .session
+                    .record_event(
+                        crate::db::session_log::SessionEventKind::InferenceRequest,
+                        Some(&agent),
+                        None,
+                        &serde_json::json!({
+                            "purpose": "keep_warm",
+                            "outcome": "skipped",
+                            "reason": reason.as_str(),
+                            "provider": provider,
+                            "model": model,
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "recording keep-warm skip failed");
+                }
+            }
+            crate::keep_warm::KeepWarmDecision::Schedule(schedule) => {
+                let Some(scheduler) = self.daemon_scheduler_handle() else {
+                    tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
+                    return;
+                };
+                let Some(cache_send_identity) = self.session.last_send_identity() else {
+                    // An observed cache hit necessarily follows a foreground
+                    // send in production. If that in-memory send marker is
+                    // absent (for example after a worker restart), fail
+                    // closed rather than inventing a later idle origin.
+                    return;
+                };
+                let job = crate::daemon::proto::ScheduledJobCreate {
+                    id: crate::keep_warm::format_job_id(
+                        self.session.id,
+                        cache_send_identity,
+                        schedule.after_secs,
+                        schedule.idle_window_secs,
+                    ),
+                    owner: "system:keep_warm".to_string(),
+                    schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
+                        at: cache_send_identity
+                            .unix_millis
+                            .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
+                            .saturating_add(999)
+                            .div_euclid(1_000),
+                    },
+                    payload: crate::daemon::proto::ScheduledJobPayload::Callback {
+                        subsystem: "keep_warm".to_string(),
+                    },
+                    enabled: true,
+                    missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
+                };
+                match scheduler.create_system_callback_job(job).await {
+                    Ok(_) => {
+                        if let Err(error) = self
+                            .session
+                            .record_event(
+                                crate::db::session_log::SessionEventKind::InferenceRequest,
+                                Some(&agent),
+                                None,
+                                &serde_json::json!({
+                                    "purpose": "keep_warm",
+                                    "outcome": "scheduled",
+                                    "after_secs": schedule.after_secs,
+                                    "idle_window_secs": schedule.idle_window_secs,
+                                    "provider": provider,
+                                    "model": model,
+                                    "aggregator_guidance": schedule.aggregator_route.then_some(
+                                        "pin upstream provider routing/ordering to preserve cache locality"
+                                    ),
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, "recording keep-warm schedule failed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, session_id = %self.session.id, "scheduling keep-warm failed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute the one-shot cache refresh without appending a user or
+    /// assistant message. A stale job fails closed: it cannot run before its
+    /// delay from the cache-producing inference send, after either the
+    /// original or live idle window, or after a later inference has reset the
+    /// cache activity clock.
+    async fn run_keep_warm(
+        &mut self,
+        cache_send_identity: InferenceSendIdentity,
+        after_secs: u64,
+        idle_window_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        input_queue: &crate::engine::message::UserSubmissionQueue,
+    ) -> std::result::Result<String, String> {
+        let elapsed = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(cache_send_identity.unix_millis)
+            .max(0) as u64;
+        let elapsed = std::time::Duration::from_millis(elapsed);
+        let original_delay = std::time::Duration::from_secs(after_secs);
+        let original_idle_window = std::time::Duration::from_secs(idle_window_secs);
+        if elapsed < original_delay {
+            return Ok("skipped: before keep-warm deadline".to_string());
+        }
+        let Some((last_send_identity, last_send_origin)) =
+            self.session.last_send_identity_and_origin()
+        else {
+            return Ok("skipped: cache-producing send unavailable".to_string());
+        };
+        let last_send_elapsed = last_send_origin.elapsed();
+        if last_send_identity != cache_send_identity || last_send_elapsed < original_delay {
+            return Ok("skipped: newer session activity".to_string());
+        }
+        if elapsed >= original_idle_window || last_send_elapsed >= original_idle_window {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
+        let Some((providers, provider, model_id)) = self.active_providers_config() else {
+            return Ok("skipped: active endpoint unavailable".to_string());
+        };
+        let context = providers.resolve_context(&provider, &model_id);
+        let live_idle_window = std::time::Duration::from_secs(context.idle_window_secs);
+        let idle_window = original_idle_window.min(live_idle_window);
+        if elapsed >= live_idle_window || last_send_elapsed >= idle_window {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
+
+        // Refresh the identity guard after synchronous endpoint/config work,
+        // but derive the deadline from the Session's original monotonic send
+        // origin. Reconstructing it as `Instant::now() + remaining` leaves a
+        // sampling gap in which preparation can extend the idle window.
+        let elapsed = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(cache_send_identity.unix_millis)
+            .max(0) as u64;
+        let elapsed = std::time::Duration::from_millis(elapsed);
+        let Some((last_send_identity, last_send_origin)) =
+            self.session.last_send_identity_and_origin()
+        else {
+            return Ok("skipped: cache-producing send unavailable".to_string());
+        };
+        let last_send_elapsed = last_send_origin.elapsed();
+        if last_send_identity != cache_send_identity || last_send_elapsed < original_delay {
+            return Ok("skipped: newer session activity".to_string());
+        }
+        if elapsed >= original_idle_window || last_send_elapsed >= idle_window {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
+        let Some(idle_deadline_at) = keep_warm_idle_deadline(last_send_origin, idle_window) else {
+            // Configuration accepts the full `u64` seconds domain. A window
+            // too distant for the platform's monotonic instant must not turn
+            // a best-effort refresh into a daemon panic or an unbounded send.
+            return Ok("skipped: idle window elapsed".to_string());
+        };
+
+        #[cfg(test)]
+        if let Some(delay) = self.keep_warm_pre_dispatch_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        let decision = crate::keep_warm::decide(
+            context.keep_warm,
+            context.idle_window_secs,
+            providers.resolve_cache_retention_profile(&provider, &model_id),
+            self.session
+                .has_observed_cache_hit_for_endpoint(&provider, &model_id),
+        );
+        if let crate::keep_warm::KeepWarmDecision::Skip(reason) = decision {
+            return Ok(format!("skipped: {}", reason.as_str()));
+        }
+
+        let Some(root) = self.stack.first() else {
+            return Ok("skipped: root context unavailable".to_string());
+        };
+        let model = root.agent.model.clone();
+        let params = root.agent.params.clone();
+        let system = root.agent.system.clone();
+        let history = root.history.clone();
+        let agent = root.agent.name.clone();
+        // Keep-warm is the current cancellable activity while it runs. The
+        // scheduler owns this token too, so its callback timeout/drop aborts
+        // the provider call instead of merely abandoning the response waiter.
+        let _cancel_guard = {
+            *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
+            CancelSlotGuard {
+                slot: self.cancel_current.clone(),
+            }
+        };
+        let active_target_id = self.active_queue_target_id();
+        let call_id = uuid::Uuid::new_v4();
+        // This is a hard execution fence, not just a pre-dispatch check. The
+        // provider receives `cancel`, so winning either deadline branch drops
+        // the in-flight future and aborts its request/stream immediately.
+        let refresh = model.complete_captured_with_dispatch_deadline(
+            &system,
+            &history,
+            Message::user("Respond only with OK."),
+            &[],
+            params,
+            &agent,
+            None,
+            &cancel,
+            None,
+            idle_deadline_at,
+        );
+        tokio::pin!(refresh);
+        let idle_deadline = tokio::time::sleep_until(idle_deadline_at);
+        tokio::pin!(idle_deadline);
+        let utility_deadline =
+            tokio::time::sleep(crate::engine::model::UtilityCallSite::KeepWarm.timeout());
+        tokio::pin!(utility_deadline);
+        let refresh = tokio::select! {
+            biased;
+            has_user = input_queue.wait_for_pending_for(Some(&active_target_id)) => {
+                if has_user {
+                    cancel.cancel();
+                    return Ok("skipped: user re-entered".to_string());
+                }
+                return Ok("skipped: input queue closed".to_string());
+            }
+            _ = cancel.cancelled() => return Ok("skipped: keep-warm cancelled".to_string()),
+            _ = &mut idle_deadline => {
+                cancel.cancel();
+                return Ok("skipped: idle window elapsed".to_string());
+            }
+            _ = &mut utility_deadline => {
+                cancel.cancel();
+                return Err("keep-warm request timed out".to_string());
+            }
+            result = &mut refresh => result,
+        }
+        .map_err(|error| format!("keep-warm request failed: {error:#}"))?;
+        let ((_, _, usage), captured, _) = refresh;
+        let session_table = model.session_redact_table();
+        if let Err(error) = self
+            .session
+            .record_inference_request(
+                call_id,
+                &captured,
+                crate::db::session_log::InferenceRequestStatus::Completed,
+                session_table.as_ref(),
+                model.is_trusted(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "recording keep-warm request failed");
+        }
+        if let Some(usage) = usage
+            && let Err(error) = self.session.record_usage_utility(call_id, usage).await
+        {
+            tracing::warn!(%error, "recording keep-warm usage failed");
+        }
+        let call_id_text = call_id.to_string();
+        if let Err(error) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some(&agent),
+                Some(&call_id_text),
+                &serde_json::json!({ "purpose": "keep_warm", "outcome": "completed" }),
+            )
+            .await
+        {
+            tracing::warn!(%error, "recording keep-warm completion failed");
+        }
+        Ok("keep-warm completed".to_string())
     }
 
     fn root_can_self_compact(&self) -> bool {
@@ -11625,8 +12034,25 @@ impl Driver {
         // The title accounting is based on the exact authored source, while
         // the detached utility request gets only a bounded prefix. In
         // particular it must not independently expand an 8MiB artifact.
-        let title_action = self.session.note_user_content(&canonical_user_text);
-        if !matches!(title_action, crate::session::TitleAction::None) {
+        // The same-model path is the fallback with no utility title model and
+        // an explicit preference when both are available. It is launched only
+        // after the foreground prompt is assembled below, so its prefix is the
+        // foreground history plus that exact prompt and it remains invisible to
+        // the main conversation.
+        let (extended, providers) = self.config.configs();
+        let use_session_model_metadata =
+            extended.auto_title_with_session_model || extended.auto_title_model_ref().is_none();
+        let (title_action, mut metadata_work) = if use_session_model_metadata {
+            (
+                crate::session::TitleAction::None,
+                self.session
+                    .note_user_content_for_metadata(&canonical_user_text),
+            )
+        } else {
+            (self.session.note_user_content(&canonical_user_text), None)
+        };
+        if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
+        {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {
                 crate::engine::text_artifact_frame::bounded_utf8_prefix(
@@ -11637,10 +12063,8 @@ impl Driver {
             } else {
                 user_text.clone()
             };
-            // Resolve auto-title config from the turn-pinned snapshot before the
-            // detached task spawns, rather than re-reading disk inside it
-            // (`engine-config-snapshot-adoption`).
-            let (extended, providers) = self.config.configs();
+            // Config was resolved from the turn-pinned snapshot before the
+            // detached task spawned (`engine-config-snapshot-adoption`).
             // Thread the session's effective redaction table so the detached
             // auto-title call routes through the same non-bypassable scrub
             // chokepoint as the foreground turn (GOALS §7).
@@ -12021,6 +12445,13 @@ impl Driver {
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                if is_root && let Some(work) = metadata_work.take() {
+                    // The turn phase consumes this only after it has assembled
+                    // and successfully dispatched the foreground request. That
+                    // gives the fork the exact post-prune prefix and a real
+                    // cache-warming ordering edge.
+                    self.session.queue_metadata_fork(work);
+                }
                 let foreground_queue = crate::engine::agent::ForegroundQueueBridge {
                     queue: input_rx.clone(),
                     target: self.active_queue_target(),
@@ -14030,10 +14461,12 @@ impl Driver {
             cwd: self.cwd.clone(),
             config: self.config.clone(),
             session_short_id: self.session.short_id(),
+            workspace_scratch_dir: self.session.workspace_scratch_dir(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
             mcp_parent_reachable: None,
+            mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),
             // Root construction may consume explicit/resumed selection
             // provenance or a legacy plan-level override. vNext children
             // discard it at the delegated-spawn boundary and resolve their own
@@ -14128,7 +14561,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             ..self.spawn_args(interactive)
         }
     }
@@ -14203,7 +14636,7 @@ impl Driver {
             mcp_parent_reachable: self
                 .stack
                 .last()
-                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
+                .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
             ..self.spawn_args(interactive)
         }
@@ -14437,6 +14870,15 @@ pub(crate) async fn restore_retained_turn_media_authority(session: &Session) {
     };
     let authority = runtime.authority_for_retained_turn(session).await;
     session.set_tool_media_authority(authority);
+}
+
+/// Build the absolute keep-warm idle fence without assuming every valid
+/// duration can be represented by the platform's monotonic instant.
+fn keep_warm_idle_deadline(
+    origin: std::time::Instant,
+    idle_window: std::time::Duration,
+) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::from_std(origin).checked_add(idle_window)
 }
 
 fn driver_spawn_media_availability(

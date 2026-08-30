@@ -17,6 +17,7 @@ use crate::db::message_attachments::{
 use crate::db::session_log::{
     ClientSubmissionTerminalReceipt, SessionEventContext, SessionEventKind,
 };
+use crate::db::session_search::HistoryCallerTrust;
 
 pub const MAX_ARTIFACT_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SESSION_ARTIFACT_CONTENT_BYTES: usize = 64 * 1024 * 1024;
@@ -459,6 +460,35 @@ impl Db {
             .await
     }
 
+    /// Recall-provider lookup. Artifact bodies inherit the trust of their
+    /// owning event; untrusted callers never learn that a trusted row exists.
+    pub async fn text_artifact_for_trust(
+        &self,
+        session_id: Uuid,
+        artifact_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Option<TextArtifact>> {
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            conn.query_row(
+                "SELECT a.session_id,a.artifact_id,r.event_seq,r.relation,r.projection_slot,a.kind,a.capture_reason,
+                        a.content_representation,a.content,a.host_captured_bytes,a.host_original_bytes,a.host_dropped_bytes,
+                        a.stored_source_bytes,a.content_bytes,a.provenance_json,a.created_at,a.archive_import_id
+                   FROM session_text_artifacts a
+                   JOIN session_text_artifact_event_refs r
+                     ON r.session_id=a.session_id AND r.artifact_id=a.artifact_id
+                   JOIN session_events e ON e.seq=r.event_seq
+                  WHERE a.session_id=?1 AND a.artifact_id=?2
+                    AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')",
+                params![session_id.to_string(), artifact_id.to_string(), permitted],
+                decode_artifact,
+            )
+            .optional()
+            .context("looking up trusted text artifact")
+        })
+        .await
+    }
+
     pub async fn session_has_text_artifacts(&self, session_id: Uuid) -> Result<bool> {
         self.read(move |conn| {
             Ok(conn.query_row(
@@ -492,6 +522,33 @@ impl Db {
     pub async fn list_text_artifacts(&self, session_id: Uuid) -> Result<Vec<TextArtifact>> {
         self.read(move |conn| list_text_artifacts_conn(conn, session_id))
             .await
+    }
+
+    /// Directory-listing variant of [`Self::text_artifact_for_trust`].
+    pub async fn list_text_artifacts_for_trust(
+        &self,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<TextArtifact>> {
+        self.read(move |conn| {
+            let permitted = matches!(caller_trust, HistoryCallerTrust::Trusted);
+            let mut stmt = conn.prepare(
+                "SELECT a.session_id,a.artifact_id,r.event_seq,r.relation,r.projection_slot,a.kind,a.capture_reason,
+                        a.content_representation,a.content,a.host_captured_bytes,a.host_original_bytes,a.host_dropped_bytes,
+                        a.stored_source_bytes,a.content_bytes,a.provenance_json,a.created_at,a.archive_import_id
+                   FROM session_text_artifacts a
+                   JOIN session_text_artifact_event_refs r
+                     ON r.session_id=a.session_id AND r.artifact_id=a.artifact_id
+                   JOIN session_events e ON e.seq=r.event_seq
+                  WHERE a.session_id=?1
+                    AND (?2 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                  ORDER BY a.created_at,a.artifact_id",
+            )?;
+            stmt.query_map(params![session_id.to_string(), permitted], decode_artifact)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("listing trusted text artifacts")
+        })
+        .await
     }
 
     pub async fn session_text_artifact_bytes(&self, session_id: Uuid) -> Result<usize> {

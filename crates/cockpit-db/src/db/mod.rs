@@ -56,6 +56,7 @@ mod files;
 pub mod filesystem_identity;
 pub mod guidance;
 pub mod guidance_proposals;
+pub mod history_scope;
 pub mod image_generation;
 pub mod image_generation_plan;
 pub mod image_sidecar;
@@ -428,6 +429,19 @@ pub struct Db {
     _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
     _diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
     read_only: bool,
+    /// Process-local revocation fence for history disclosure. A reader keeps
+    /// the shared permit until its tool call returns; a consent mutation takes
+    /// the exclusive side before its SQLite write can commit.
+    history_scope_gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// Shared side of the history-scope revocation fence.
+///
+/// This is deliberately opaque: callers may hold it only while producing one
+/// already-authorized history response. Dropping it is the disclosure
+/// linearization point, after which a pending consent revocation may commit.
+pub struct HistoryScopeDisclosurePermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// Read-only physical storage accounting for diagnostics and retention UX.
@@ -622,6 +636,7 @@ impl Db {
             _owner_lock: owner_lock,
             _diagnostic_lock: None,
             read_only: false,
+            history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
         timer.done();
         Ok(db)
@@ -642,6 +657,7 @@ impl Db {
             _owner_lock: None,
             _diagnostic_lock: None,
             read_only: false,
+            history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
         Ok(db)
     }
@@ -736,6 +752,7 @@ impl Db {
             _owner_lock: None,
             _diagnostic_lock: diagnostic_lock,
             read_only: true,
+            history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -750,6 +767,16 @@ impl Db {
     /// File path the database is backed by, or `None` for in-memory.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Acquire the shared history-disclosure fence. The permit must be held
+    /// from the final authorization check through construction and return of
+    /// the response. `set_workspace_history_scope` takes the exclusive fence
+    /// before committing a consent mutation.
+    pub async fn history_scope_disclosure_permit(&self) -> HistoryScopeDisclosurePermit {
+        HistoryScopeDisclosurePermit {
+            _guard: self.history_scope_gate.clone().read_owned().await,
+        }
     }
 
     /// Stable identity for cache partitioning across cloned handles.

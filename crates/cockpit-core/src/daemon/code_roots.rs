@@ -58,7 +58,18 @@ struct IdempotencyReceipt {
 pub(crate) enum CodeRootRequestStart<T> {
     Started,
     Replayed(T),
+    /// A create request installed its session worker before the response
+    /// receipt was completed.  Retrying this exact request must finish that
+    /// root, never manufacture another one.
+    Recovering(proto::CodeRootIdV1),
     InFlight,
+}
+
+#[derive(Debug, Clone)]
+struct CodeRootRequestInFlight {
+    fingerprint: [u8; 32],
+    created_root_id: Option<proto::CodeRootIdV1>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +87,7 @@ pub(crate) struct CodeRootAuthorityV1 {
     idempotency: HashMap<(String, String, &'static str), IdempotencyReceipt>,
     discovery: HashMap<String, DiscoverySnapshot>,
     attachment_reservations: HashSet<String>,
-    code_root_requests_in_flight: HashMap<(String, String, &'static str), [u8; 32]>,
+    code_root_requests_in_flight: HashMap<(String, String, &'static str), CodeRootRequestInFlight>,
     interrupt_resolutions_in_flight: HashSet<(String, String)>,
 }
 
@@ -90,6 +101,8 @@ impl CodeRootAuthorityV1 {
         });
         self.idempotency
             .retain(|_, receipt| now.duration_since(receipt.recorded_at) < IDEMPOTENCY_RECEIPT_TTL);
+        self.code_root_requests_in_flight
+            .retain(|_, request| now.duration_since(request.started_at) < IDEMPOTENCY_RECEIPT_TTL);
         self.discovery
             .retain(|_, snapshot| now < snapshot.expires_at);
     }
@@ -135,13 +148,23 @@ impl CodeRootAuthorityV1 {
             client_request_id.as_str().to_owned(),
             route,
         );
-        if let Some(in_flight_fingerprint) = self.code_root_requests_in_flight.get(&key) {
-            if *in_flight_fingerprint != fingerprint {
+        if let Some(in_flight) = self.code_root_requests_in_flight.get(&key) {
+            if in_flight.fingerprint != fingerprint {
                 bail!("Code-root idempotency conflict");
+            }
+            if let Some(root_id) = in_flight.created_root_id {
+                return Ok(CodeRootRequestStart::Recovering(root_id));
             }
             return Ok(CodeRootRequestStart::InFlight);
         }
-        self.code_root_requests_in_flight.insert(key, fingerprint);
+        self.code_root_requests_in_flight.insert(
+            key,
+            CodeRootRequestInFlight {
+                fingerprint,
+                created_root_id: None,
+                started_at: Instant::now(),
+            },
+        );
         Ok(CodeRootRequestStart::Started)
     }
 
@@ -157,9 +180,11 @@ impl CodeRootAuthorityV1 {
         )? {
             CodeRootRequestStart::Started => Ok(CodeRootRequestStart::Started),
             CodeRootRequestStart::InFlight => Ok(CodeRootRequestStart::InFlight),
-            CodeRootRequestStart::Replayed(IdempotencyResult::Create(result)) => {
-                self.authenticate(&result.attachment.attachment_capability)?;
-                Ok(CodeRootRequestStart::Replayed(result))
+            CodeRootRequestStart::Replayed(IdempotencyResult::Create(result)) => Ok(
+                CodeRootRequestStart::Replayed(self.refresh_replayed_create(request, result)?),
+            ),
+            CodeRootRequestStart::Recovering(root_id) => {
+                Ok(CodeRootRequestStart::Recovering(root_id))
             }
             CodeRootRequestStart::Replayed(_) => bail!("invalid Code-root idempotency receipt"),
         }
@@ -177,9 +202,11 @@ impl CodeRootAuthorityV1 {
         )? {
             CodeRootRequestStart::Started => Ok(CodeRootRequestStart::Started),
             CodeRootRequestStart::InFlight => Ok(CodeRootRequestStart::InFlight),
-            CodeRootRequestStart::Replayed(IdempotencyResult::Attach(result)) => {
-                self.authenticate(&result.attachment.attachment_capability)?;
-                Ok(CodeRootRequestStart::Replayed(result))
+            CodeRootRequestStart::Replayed(IdempotencyResult::Attach(result)) => Ok(
+                CodeRootRequestStart::Replayed(self.refresh_replayed_attach(request, result)?),
+            ),
+            CodeRootRequestStart::Recovering(_) => {
+                bail!("invalid recovered Code-root attach request")
             }
             CodeRootRequestStart::Replayed(_) => bail!("invalid Code-root idempotency receipt"),
         }
@@ -196,6 +223,56 @@ impl CodeRootAuthorityV1 {
             client_request_id.as_str().to_owned(),
             route,
         ));
+    }
+
+    /// An unbound request has not created a root, so it is safe to let an
+    /// error/cancellation relinquish its identity.  Once `created_root_id` is
+    /// bound, keep the fence until its receipt is completed (or expires): an
+    /// exact retry will recover that root rather than create a second one.
+    pub fn abandon_unbound_code_root_request(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+        route: &'static str,
+    ) {
+        let key = (
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+            route,
+        );
+        if self
+            .code_root_requests_in_flight
+            .get(&key)
+            .is_some_and(|request| request.created_root_id.is_none())
+        {
+            self.code_root_requests_in_flight.remove(&key);
+        }
+    }
+
+    pub fn bind_created_root(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+        root_id: proto::CodeRootIdV1,
+    ) -> Result<()> {
+        let key = (
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+            "create",
+        );
+        let request = self
+            .code_root_requests_in_flight
+            .get_mut(&key)
+            .context("Code-root create request is no longer in flight")?;
+        if let Some(existing) = request.created_root_id {
+            anyhow::ensure!(
+                existing == root_id,
+                "Code-root create request recovered a different root"
+            );
+        } else {
+            request.created_root_id = Some(root_id);
+        }
+        Ok(())
     }
 
     /// Serializes one logical interrupt resolution until its durable receipt
@@ -277,6 +354,86 @@ impl CodeRootAuthorityV1 {
             capture_generation,
             replay_cursor,
         })
+    }
+
+    fn refresh_replayed_create(
+        &mut self,
+        request: &proto::CreateCodeRootV1Request,
+        mut result: proto::CreateCodeRootV1Result,
+    ) -> Result<proto::CreateCodeRootV1Result> {
+        self.reissue_receipt_attachment(&request.logical_client_id, &mut result.attachment)?;
+        self.replace_replay_result(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "create",
+            IdempotencyResult::Create(result.clone()),
+        )?;
+        Ok(result)
+    }
+
+    fn refresh_replayed_attach(
+        &mut self,
+        request: &proto::AttachExistingCodeRootV1Request,
+        mut result: proto::AttachExistingCodeRootV1Result,
+    ) -> Result<proto::AttachExistingCodeRootV1Result> {
+        self.reissue_receipt_attachment(&request.logical_client_id, &mut result.attachment)?;
+        self.replace_replay_result(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "attach",
+            IdempotencyResult::Attach(result.clone()),
+        )?;
+        Ok(result)
+    }
+
+    /// Replays must never share an attachment capability with an uncertain
+    /// original transport. Reissue one for the authenticated logical client,
+    /// preserving the root and frozen response; this makes an ambiguous
+    /// disconnect exactly replayable even before its teardown has drained.
+    fn reissue_receipt_attachment(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        attachment: &mut proto::CodeRootAttachmentV1,
+    ) -> Result<()> {
+        let old = self
+            .attachments
+            .get(attachment.attachment_capability.expose_opaque())
+            .cloned()
+            .context("Code-root idempotency receipt has an unknown attachment capability")?;
+        anyhow::ensure!(
+            old.logical_client_id == *logical_client_id,
+            "Code-root idempotency receipt belongs to a different logical client"
+        );
+        if old.open {
+            let record = self
+                .attachments
+                .get_mut(attachment.attachment_capability.expose_opaque())
+                .expect("cloned Code-root attachment record must still exist");
+            record.open = false;
+            record.closed_at = Some(Instant::now());
+        }
+        let open_attachments = self
+            .attachments
+            .values()
+            .filter(|record| record.open)
+            .count();
+        if open_attachments >= MAX_ATTACHMENTS {
+            bail!("Code-root attachment capacity exhausted");
+        }
+        let capability = proto::CodeRootAttachmentCapabilityV1::from_daemon_random(Uuid::new_v4());
+        self.attachments.insert(
+            capability.expose_opaque().to_owned(),
+            CodeRootAttachmentRecord {
+                root_id: old.root_id,
+                logical_client_id: old.logical_client_id,
+                capture_generation: old.capture_generation,
+                replay_cursor: old.replay_cursor,
+                open: true,
+                closed_at: None,
+            },
+        );
+        attachment.attachment_capability = capability;
+        Ok(())
     }
 
     pub fn authenticate(
@@ -435,6 +592,25 @@ impl CodeRootAuthorityV1 {
                 recorded_at: Instant::now(),
             },
         );
+        Ok(())
+    }
+
+    fn replace_replay_result(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+        route: &'static str,
+        result: IdempotencyResult,
+    ) -> Result<()> {
+        let key = (
+            logical_client_id.as_str().to_owned(),
+            client_request_id.as_str().to_owned(),
+            route,
+        );
+        self.idempotency
+            .get_mut(&key)
+            .context("Code-root idempotency receipt disappeared during replay")?
+            .result = result;
         Ok(())
     }
 
@@ -651,5 +827,115 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
     ) -> Result<proto::CodeRootDeliveryV1> {
         self.write(root_id, proto::CodeRootDeliveryPayloadV1::RootStateChanged)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_request() -> proto::CreateCodeRootV1Request {
+        proto::CreateCodeRootV1Request {
+            workspace_selector: proto::CodeRootWorkspaceSelectorV1 {
+                path: "/workspace".to_string(),
+            },
+            logical_client_id: proto::OpaqueAsciiId128V1::new("client").unwrap(),
+            client_request_id: proto::OpaqueAsciiId128V1::new("request").unwrap(),
+            options: proto::CodeRootAttachOptionsV1 {
+                initial_model: None,
+                model_override: None,
+                no_sandbox: false,
+                interactive: false,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: proto::EnvDriftPolicy::Daemon,
+            },
+        }
+    }
+
+    fn create_result(attachment: proto::CodeRootAttachmentV1) -> proto::CreateCodeRootV1Result {
+        let root_id = attachment.root_id.0;
+        serde_json::from_value(serde_json::json!({
+            "attachment": attachment,
+            "root": {
+                "root_id": root_id,
+                "workspace_path": "/workspace",
+                "title": null,
+                "short_id": "root",
+                "project_id": "project",
+                "active_agent": "agent",
+                "active_agent_path": ["agent"],
+                "history": [],
+                "daemon_version": "test",
+                "compatible": true,
+                "attention": []
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bound_create_request_recovers_the_original_root_after_cancellation() {
+        let request = create_request();
+        let root_id = proto::CodeRootIdV1(Uuid::new_v4());
+        let mut authority = CodeRootAuthorityV1::default();
+
+        assert!(matches!(
+            authority.start_create(&request).unwrap(),
+            CodeRootRequestStart::Started
+        ));
+        authority
+            .bind_created_root(
+                &request.logical_client_id,
+                &request.client_request_id,
+                root_id,
+            )
+            .unwrap();
+        authority.abandon_unbound_code_root_request(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "create",
+        );
+
+        assert!(matches!(
+            authority.start_create(&request).unwrap(),
+            CodeRootRequestStart::Recovering(recovered) if recovered == root_id
+        ));
+    }
+
+    #[test]
+    fn receipt_replay_reissues_its_attachment_before_transport_teardown() {
+        let request = create_request();
+        let root_id = proto::CodeRootIdV1(Uuid::new_v4());
+        let mut authority = CodeRootAuthorityV1::default();
+        let reservation = authority.reserve_new_attachment().unwrap();
+        let original = authority
+            .mint_attachment(
+                root_id,
+                request.logical_client_id.clone(),
+                root_id.capture_generation(),
+                proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::new_v4()),
+                &reservation,
+            )
+            .unwrap();
+        authority
+            .record_create(&request, create_result(original.clone()))
+            .unwrap();
+        let CodeRootRequestStart::Replayed(replayed) = authority.start_create(&request).unwrap()
+        else {
+            panic!("receipt did not replay");
+        };
+        assert_ne!(
+            replayed.attachment.attachment_capability,
+            original.attachment_capability
+        );
+        authority
+            .authenticate(&replayed.attachment.attachment_capability)
+            .unwrap();
+        assert!(
+            authority
+                .authenticate(&original.attachment_capability)
+                .is_err()
+        );
     }
 }

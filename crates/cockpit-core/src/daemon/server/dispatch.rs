@@ -5634,7 +5634,7 @@ async fn handle_serialized_request_impl(
     require_compiled_product_domain(&request)?;
     match request {
         Request::CreateCodeRootV1(request) => {
-            match crate::sync::lock_or_recover(&ctx.code_root_authority)
+            let recovering_root_id = match crate::sync::lock_or_recover(&ctx.code_root_authority)
                 .start_create(&request)
                 .map_err(code_root_contract_error)?
             {
@@ -5647,6 +5647,7 @@ async fn handle_serialized_request_impl(
                         Box::pin(attach(
                             state,
                             ctx,
+                            None,
                             Some(result.attachment.root_id.0),
                             None,
                             None,
@@ -5669,6 +5670,9 @@ async fn handle_serialized_request_impl(
                     }
                     return Ok(Response::CodeRootCreated(result));
                 }
+                crate::daemon::code_roots::CodeRootRequestStart::Recovering(root_id) => {
+                    Some(root_id)
+                }
                 crate::daemon::code_roots::CodeRootRequestStart::InFlight => {
                     return Err(ErrorPayload {
                         code: ErrorCode::Conflict,
@@ -5677,8 +5681,8 @@ async fn handle_serialized_request_impl(
                                 .into(),
                     });
                 }
-                crate::daemon::code_roots::CodeRootRequestStart::Started => {}
-            }
+                crate::daemon::code_roots::CodeRootRequestStart::Started => None,
+            };
             let _request_guard = CodeRootRequestGuard::new(
                 &ctx.code_root_authority,
                 request.logical_client_id.clone(),
@@ -5687,6 +5691,13 @@ async fn handle_serialized_request_impl(
             );
             let canonical =
                 crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?;
+            let create_identity =
+                recovering_root_id
+                    .is_none()
+                    .then(|| CodeRootCreateRequestIdentity {
+                        logical_client_id: request.logical_client_id.clone(),
+                        client_request_id: request.client_request_id.clone(),
+                    });
             // Reserve before any async session or durable-projection work.
             // The reservation covers both the open capability and its
             // idempotency receipt, so concurrent clients cannot all perform
@@ -5703,9 +5714,12 @@ async fn handle_serialized_request_impl(
             let attached = match Box::pin(attach(
                 state,
                 ctx,
+                create_identity.as_ref(),
+                recovering_root_id.map(|root_id| root_id.0),
                 None,
-                None,
-                Some(canonical.to_string_lossy().into_owned()),
+                recovering_root_id
+                    .is_none()
+                    .then(|| canonical.to_string_lossy().into_owned()),
                 options.initial_model,
                 options.no_sandbox,
                 options.interactive,
@@ -5770,6 +5784,11 @@ async fn handle_serialized_request_impl(
                 authority
                     .record_create(&request, result.clone())
                     .map_err(code_root_contract_error)?;
+                authority.finish_code_root_request(
+                    &request.logical_client_id,
+                    &request.client_request_id,
+                    "create",
+                );
                 result
             };
             if let Some(attached) = state.attached.as_mut() {
@@ -5793,6 +5812,7 @@ async fn handle_serialized_request_impl(
                         Box::pin(attach(
                             state,
                             ctx,
+                            None,
                             Some(result.attachment.root_id.0),
                             request.since_seq,
                             None,
@@ -5822,6 +5842,11 @@ async fn handle_serialized_request_impl(
                             "Code-root attach request is already in progress; retry the same request"
                                 .into(),
                     });
+                }
+                crate::daemon::code_roots::CodeRootRequestStart::Recovering(_) => {
+                    return Err(code_root_contract_error(anyhow::anyhow!(
+                        "invalid recovered Code-root attach request"
+                    )));
                 }
                 crate::daemon::code_roots::CodeRootRequestStart::Started => {}
             }
@@ -5858,6 +5883,7 @@ async fn handle_serialized_request_impl(
             let attached = match Box::pin(attach(
                 state,
                 ctx,
+                None,
                 Some(request.root_id.0),
                 request.since_seq,
                 None,
@@ -5946,6 +5972,11 @@ async fn handle_serialized_request_impl(
                 authority
                     .record_attach(&request, result.clone())
                     .map_err(code_root_contract_error)?;
+                authority.finish_code_root_request(
+                    &request.logical_client_id,
+                    &request.client_request_id,
+                    "attach",
+                );
                 result
             };
             if let Some(attached) = state.attached.as_mut() {
@@ -5977,11 +6008,11 @@ async fn handle_serialized_request_impl(
                 authority
                     .record_close(&record.logical_client_id, &request, outcome)
                     .map_err(code_root_contract_error)?;
-                if state
-                    .attached
-                    .as_ref()
-                    .is_none_or(|attached| attached.handle.session_id != root_id.0)
-                {
+                if state.attached.as_ref().is_none_or(|attached| {
+                    attached.handle.session_id != root_id.0
+                        || attached.code_root_capability.as_ref()
+                            != Some(&request.attachment_capability)
+                }) {
                     return Ok(Response::CodeRootAttachmentClosed(outcome));
                 }
                 (root_id, outcome)
@@ -6291,6 +6322,7 @@ async fn handle_serialized_request_impl(
             Box::pin(attach(
                 state,
                 ctx,
+                None,
                 session_id,
                 since_seq,
                 project_root,
@@ -26664,15 +26696,20 @@ impl Drop for CodeRootAttachmentReservationGuard<'_> {
     }
 }
 
-/// Owns a create/attach idempotency fence until the route has returned or its
-/// connection-owned dispatch future is cancelled.  The fence is separate from
-/// attachment capacity: it serializes request identity while the reservation
-/// accounts for the resulting open attachment.
+/// Owns a create/attach idempotency fence while no Code root has been bound.
+/// Once create has bound a newly-created root, cancellation deliberately
+/// retains the fence so an exact retry resumes that root; a successful receipt
+/// explicitly finishes it. The fence is separate from attachment capacity.
 struct CodeRootRequestGuard<'a> {
     authority: &'a std::sync::Arc<std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
     logical_client_id: proto::OpaqueAsciiId128V1,
     client_request_id: proto::OpaqueAsciiId128V1,
     route: &'static str,
+}
+
+struct CodeRootCreateRequestIdentity {
+    logical_client_id: proto::OpaqueAsciiId128V1,
+    client_request_id: proto::OpaqueAsciiId128V1,
 }
 
 impl<'a> CodeRootRequestGuard<'a> {
@@ -26695,7 +26732,7 @@ impl<'a> CodeRootRequestGuard<'a> {
 
 impl Drop for CodeRootRequestGuard<'_> {
     fn drop(&mut self) {
-        crate::sync::lock_or_recover(self.authority).finish_code_root_request(
+        crate::sync::lock_or_recover(self.authority).abandon_unbound_code_root_request(
             &self.logical_client_id,
             &self.client_request_id,
             self.route,
@@ -26936,6 +26973,7 @@ async fn code_root_read_snapshot(
 pub(super) async fn attach(
     state: &mut MutableClientState,
     ctx: &DaemonContext,
+    code_root_create: Option<&CodeRootCreateRequestIdentity>,
     session_id: Option<Uuid>,
     since_seq: Option<i64>,
     project_root: Option<String>,
@@ -27164,6 +27202,19 @@ pub(super) async fn attach(
                 }
             })?
     };
+    // Bind a newly-created Code root to its request identity as soon as the
+    // worker exists.  Everything below this point may hydrate projections or
+    // be cancelled by the transport, but an exact retry can now resume this
+    // root instead of creating another one.
+    if let Some(pending) = code_root_create {
+        crate::sync::lock_or_recover(&ctx.code_root_authority)
+            .bind_created_root(
+                &pending.logical_client_id,
+                &pending.client_request_id,
+                proto::CodeRootIdV1(handle.session_id),
+            )
+            .map_err(code_root_contract_error)?;
+    }
     // Attach-only projections use the policy snapshot of the handle that the
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have

@@ -598,10 +598,8 @@ fn with_tiered_recall_tools(
     if !args.interactive {
         return Ok(tb);
     }
-    let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
     for name in ["history_search", "todo"] {
         if is_assistant
-            && !grant_has_mcp
             && !grant.iter().any(|tool| tool == name)
             && default_assistant_discoverable_tools().contains(&name)
         {
@@ -1279,24 +1277,18 @@ pub(crate) fn materialize_tool_by_name(
 fn mcp_resolver_for(
     args: &SpawnArgs,
     def: &crate::agents::AgentDef,
+    external_mcp_servers_allowed: bool,
 ) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    crate::mcp::resolver::EffectiveCatalogResolver::for_agent_from_root_catalog(
+    crate::mcp::resolver::EffectiveCatalogResolver::for_agent_from_root_catalog_with_external_servers_allowed(
         args.mcp_root_catalog.clone(),
         def,
         args.mcp_parent_reachable.clone(),
+        external_mcp_servers_allowed,
     )
 }
 
-fn mcp_resolver_for_cwd(
-    args: &SpawnArgs,
-) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
-    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::from_root_catalog(
-        args.mcp_root_catalog.clone(),
-    );
-    match args.mcp_parent_reachable.clone() {
-        Some(parent) => resolver.with_parent_reachable(parent),
-        None => resolver,
-    }
+fn grant_allows_external_mcp_servers(grant: &[String], args: &SpawnArgs) -> bool {
+    grant.iter().any(|tool| tool == "mcp") || args.granted_tools.iter().any(|tool| tool == "mcp")
 }
 
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
@@ -1886,17 +1878,13 @@ fn add_discoverable_tool_by_name(
     Ok(tb.with_discoverable_mcp(tool))
 }
 
-fn validate_discoverable_mcp_reachable(def: &crate::agents::AgentDef, tb: &ToolBox) -> Result<()> {
-    let discoverable = tb.discoverable_mcp_tool_names();
-    if discoverable.is_empty() || tb.names().contains(&"mcp") {
-        return Ok(());
-    }
-
-    bail!(
-        "agent `{}` has discoverable MCP tools [{}] but does not grant `mcp`, so they are unreachable; grant `mcp` or tier them `enabled`",
-        def.name,
-        discoverable.join(", ")
-    );
+fn validate_discoverable_mcp_reachable(
+    _def: &crate::agents::AgentDef,
+    _tb: &ToolBox,
+) -> Result<()> {
+    // Every non-deepthink agent receives Monty, so native discoverable tools
+    // remain reachable without the external-MCP capability.
+    Ok(())
 }
 
 /// Build an agent by name. Resolution order (overlay model, prompt
@@ -2646,7 +2634,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             env_overlay: args.env_overlay.clone(),
             definition: Some(Arc::new(def.clone())),
             assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-            mcp_resolver: mcp_resolver_for(args, def),
+            mcp_resolver: mcp_resolver_for(args, def, false),
         });
     }
 
@@ -2713,6 +2701,12 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             }
             crate::agents::ToolTier::Disabled => tb,
         };
+    }
+    // Monty is the universal scripting runtime for real agents. The legacy
+    // `mcp` grant above now controls only external server access; it no
+    // longer controls whether native cockpit tools are scriptable.
+    if !tb.names().contains(&"mcp") {
+        tb = tb.with(Arc::new(crate::tools::mcp_tool::McpTool));
     }
     // vNext deliberately has no `tools:` authority field.  Delegation is the
     // sole declarative request that can cause the host to expose the
@@ -2821,7 +2815,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def.clone())),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for(args, def),
+        mcp_resolver: mcp_resolver_for(args, def, grant_allows_external_mcp_servers(&grant, args)),
     })
 }
 
@@ -3658,9 +3652,9 @@ pub fn build(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, true),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3731,9 +3725,9 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         },
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, false),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3868,7 +3862,7 @@ fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool
 
 /// `scout` — read-only recursive review worker. Its base surface mirrors
 /// `explore` plus `spawn` and `return`; it holds no write/lock tools, no
-/// `task`, no MCP, and no docs-only grep/glob. Used by the hidden
+/// `task`, no external-MCP grant, and no docs-only grep/glob. Used by the hidden
 /// `Multireview` primary and by deeper scout recursion.
 pub fn scout(args: &SpawnArgs) -> Agent {
     let def = crate::agents::embedded_default("scout").expect("scout has an embedded definition");
@@ -3882,7 +3876,8 @@ pub fn scout(args: &SpawnArgs) -> Agent {
             .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(
                 args.swarm_depth,
                 args.swarm_max_depth,
-            ))),
+            )))
+            .with(Arc::new(crate::tools::mcp_tool::McpTool)),
             &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
@@ -3917,9 +3912,9 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, false),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3988,9 +3983,9 @@ pub fn goal_control(
         },
         vnext_grant: None,
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, false),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -4049,9 +4044,9 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, true),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -4110,9 +4105,9 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, true),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -4124,8 +4119,8 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
 /// `task→docs`), plus the recursive `spawn` tool. Its writes go through the
 /// **single lock authority** (`crate::locks`, keyed by `(session, agent)`):
 /// disjoint scopes run in parallel, a same-path write is serialized/rejected.
-/// It has **no base MCP/browser** — those are granted per-task by its parent
-/// (implementation note). It finishes via the structured-return
+/// It has the universal Monty runtime but no external-MCP grant/browser. It
+/// finishes via the structured-return
 /// envelope (`return`). The recursive-spawn description carries the per-task
 /// effective depth (`args.swarm_depth`) + ceiling so the model self-limits;
 /// a spawn over the ceiling is refused and the branch does the slice itself.
@@ -4145,11 +4140,12 @@ pub fn bee(args: &SpawnArgs) -> Agent {
             with_task_for_targets(base_tools, args, &recursive_refs)
                 // The recursive fan-out tool (GOALS §24): a `bee` may fan out
                 // deeper `bee` workers, routed back to the single async-job
-                // authority. Holds no base MCP — parent-granted per task.
+                // authority.
                 .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(
                     args.swarm_depth,
                     args.swarm_max_depth,
-                ))),
+                )))
+                .with(Arc::new(crate::tools::mcp_tool::McpTool)),
             &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
@@ -4187,9 +4183,9 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        mcp_resolver: mcp_resolver_for(args, &def, false),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
-        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -4610,6 +4606,7 @@ pub(crate) mod tests {
     fn host_for_agent(agent: &Agent, cwd: &Path) -> crate::mcp::builtin::HostContext {
         let mut ctx = crate::tools::common::test_ctx(cwd);
         ctx.mcp_builtin_registry = agent.tools.mcp_builtin_registry();
+        ctx.mcp_resolver = agent.mcp_resolver.clone();
         crate::mcp::builtin::HostContext::from_tool_ctx(&ctx)
     }
 
@@ -4948,9 +4945,16 @@ pub(crate) mod tests {
         let mut parent_def = def.clone();
         parent_def.mcp_bindings.truncate(1);
         args.mcp_parent_reachable = Some(
-            mcp_resolver_for(&args, &parent_def)
-                .catalog()
-                .admitted_entries(),
+            mcp_resolver_for(
+                &args,
+                &parent_def,
+                grant_allows_external_mcp_servers(
+                    parent_def.tools.as_deref().unwrap_or_default(),
+                    &args,
+                ),
+            )
+            .catalog()
+            .admitted_entries(),
         );
 
         let agent = agent_from_def(&def, &args).expect("child constructs");
@@ -5383,7 +5387,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn assistant_explicit_grant_without_mcp_is_rejected_at_spawn() {
+    fn assistant_discoverable_native_tools_do_not_require_external_mcp_grant() {
         use crate::agents::{AgentDef, AgentMode};
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());
@@ -5412,13 +5416,13 @@ pub(crate) mod tests {
             source: tmp.path().join("helper.md"),
         };
 
-        let err = match agent_from_def(&def, &args) {
-            Ok(_) => panic!("assistant explicit grant without mcp unexpectedly succeeded"),
-            Err(err) => err,
-        };
-        let msg = format!("{err}");
-        assert!(msg.contains("history_search"), "{msg}");
-        assert!(msg.contains("mcp"), "{msg}");
+        let without_external_grant = agent_from_def(&def, &args).unwrap();
+        assert!(without_external_grant.tools.names().contains(&"mcp"));
+        assert!(
+            !without_external_grant
+                .mcp_resolver
+                .external_servers_allowed()
+        );
 
         def.tools = Some(vec!["read".to_string()]);
         let no_discoverable = agent_from_def(&def, &args).unwrap();
@@ -5592,7 +5596,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn discoverable_tier_requires_mcp_on_every_builtin_agent() {
+    fn discoverable_tier_has_universal_monty_runtime_on_every_builtin_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
 
@@ -5606,6 +5610,71 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn native_mcp_runtime_needs_no_external_grant_but_external_servers_do() {
+        use crate::agents::{AgentDef, AgentMode, ToolTier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("sample.txt"), "native Monty access").unwrap();
+        let args = test_spawn_args(tmp.path());
+        let mut tool_tiers = std::collections::BTreeMap::new();
+        tool_tiers.insert("code".to_string(), ToolTier::Discoverable);
+        let def = AgentDef {
+            name: "native-only".to_string(),
+            description: "native only".to_string(),
+            mode: AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["read".to_string(), "code".to_string()]),
+            tool_tiers,
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
+            vnext: None,
+            prompt: "body".to_string(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            mcp_bindings: Vec::new(),
+            private_subagents: std::collections::BTreeMap::new(),
+            source: tmp.path().join("native-only.md"),
+        };
+
+        let agent = agent_from_def(&def, &args).unwrap();
+        assert!(agent.tools.names().contains(&"mcp"));
+        assert!(
+            agent
+                .tools
+                .discoverable_mcp_tool_names()
+                .contains(&"code".to_string())
+        );
+        assert!(!agent.mcp_resolver.external_servers_allowed());
+        let host = host_for_agent(&agent, tmp.path());
+        let out = crate::mcp::sandbox::run_with_host(
+            "mcp.invoke('cockpit', 'read', {'path': 'sample.txt'})",
+            &crate::mcp::config::McpConfig::default(),
+            &host,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("native Monty access"), "{out}");
+
+        let err = crate::mcp::sandbox::run_with_host(
+            "mcp.invoke('external', 'echo', {})",
+            &crate::mcp::config::McpConfig::default(),
+            &host,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("requires the `mcp` grant"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -5686,10 +5755,9 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
 
-        // These read workers do not grant `mcp`, so the discoverable-tail
-        // invariant would make `graph`/`change_impact` unreachable if they
-        // were tiered behind monty here. Keep them direct until their grant
-        // model changes.
+        // These read workers keep this intelligence tail direct by role
+        // design; their universal Monty runtime remains available for other
+        // native scripting.
         for name in ["explore", "scout", "bee"] {
             let agent = load(name, &args).unwrap();
             let names = agent.tools.names();
@@ -6665,9 +6733,10 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = test_spawn_args(tmp.path());
 
-        // No MCP in `explore`'s base surface.
+        // `explore` gets the universal Monty runtime without an external-MCP grant.
         let plain = load("explore", &base).unwrap();
-        assert!(!plain.tools.names().contains(&"mcp"));
+        assert!(plain.tools.names().contains(&"mcp"));
+        assert!(!plain.mcp_resolver.external_servers_allowed());
 
         // A vNext delegation must use the typed effective-grant path instead
         // of the legacy per-tool authority list.
@@ -6689,7 +6758,8 @@ pub(crate) mod tests {
 
         // The rejected legacy grant does not mutate another spawn.
         let after = load("explore", &test_spawn_args(tmp.path())).unwrap();
-        assert!(!after.tools.names().contains(&"mcp"));
+        assert!(after.tools.names().contains(&"mcp"));
+        assert!(!after.mcp_resolver.external_servers_allowed());
     }
 
     #[test]
@@ -7723,10 +7793,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn bee_factory_is_write_capable_worker_with_spawn_no_base_mcp() {
+    fn bee_factory_is_write_capable_worker_with_universal_monty_runtime() {
         // `bee` (GOALS §24/§26): the recursive parallel worker. Write-capable
         // (lock/write tools), full intel, `task→docs` only, recursive `spawn`,
-        // structured `return`, NO base MCP (parent-grantable). Noninteractive.
+        // structured `return`, and the universal native-only Monty runtime. Noninteractive.
         let tmp = tempfile::tempdir().unwrap();
         let agent = bee(&test_spawn_args(tmp.path()));
         assert_eq!(agent.name, "bee");
@@ -7737,8 +7807,8 @@ pub(crate) mod tests {
         ] {
             assert!(names.contains(&t), "bee missing `{t}`: {names:?}");
         }
-        // No base MCP — granted per task by the parent.
-        assert!(!names.contains(&"mcp"), "bee must not hold base `mcp`");
+        assert!(names.contains(&"mcp"), "bee must hold the Monty runtime");
+        assert!(!agent.mcp_resolver.external_servers_allowed());
         // `bee` is write-capable and noninteractive by default.
         assert!(is_write_capable(&agent));
         assert!(is_noninteractive("bee"));

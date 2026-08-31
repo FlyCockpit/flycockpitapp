@@ -319,6 +319,9 @@ async fn dispatch(
         "invoke" => {
             let server = str_arg(args, 0, "server", "mcp.invoke")?;
             let tool = str_arg(args, 1, "tool", "mcp.invoke")?;
+            if let Err(error) = super::catalog::ensure_external_server_access(host, &server) {
+                return Err(format!("mcp.invoke failed: {error}"));
+            }
             let mut call_args = match args.get(2) {
                 None | Some(MontyObject::None) => Value::Object(Default::default()),
                 Some(obj) => monty_to_json(obj),
@@ -357,6 +360,11 @@ async fn dispatch(
                 #[cfg(not(test))]
                 let skip_prepare_for_stub = false;
                 if !skip_prepare_for_stub {
+                    if let Err(error) =
+                        super::catalog::ensure_external_server_host_access(host).await
+                    {
+                        return Err(format!("mcp.invoke failed: {error}"));
+                    }
                     let prepared = entry
                         .persistent_server()
                         .expect("external catalog entries always have persistent server configuration")
@@ -1082,6 +1090,65 @@ mod tests {
         assert_eq!(value["server"], "external");
         assert_eq!(value["tool"], "echo");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_known_entry_prepare_checks_host_access_before_cache_or_stub_invoke() {
+        let tmp = fake_stdio_server();
+        let script = tmp.path().join("fake-mcp.py");
+        let cfg = monty_stdio_cfg(script.to_str().unwrap());
+        crate::mcp::catalog::list_tools_cached_with_context(
+            "fake",
+            cfg.servers.get("fake").unwrap(),
+            crate::mcp::client::McpConnectContext::yolo_for_tests(),
+        )
+        .await
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let knowledge = root.path().join(".cockpit/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(root.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![
+                        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                            "private".to_string(),
+                            "Private".to_string(),
+                            "Private local knowledge".to_string(),
+                            crate::config::extended::KnowledgeBaseSource::Local {
+                                path: std::path::PathBuf::from(".cockpit/knowledge"),
+                            },
+                            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                            None,
+                            None,
+                            false,
+                            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+        );
+        let host = HostContext::from_tool_ctx(&ctx);
+
+        let error = run_with_host("mcp.invoke('fake', 'count', {})", &cfg, &host)
+            .await
+            .expect_err("known external entry should fail the local-KB fence before prepare");
+
+        assert!(
+            error
+                .to_string()
+                .contains("contains a local knowledge base with a filesystem fence"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("count"),
+            "host-access fence must run before schema repair on the cached descriptor: {error}"
+        );
     }
 
     #[tokio::test]

@@ -596,6 +596,16 @@ pub struct NewTaskDelegationAgent {
     pub resolved_installation_id: Option<Uuid>,
 }
 
+/// The durable agent identities published with one task delegation.
+///
+/// Keeping the child rows in a named publication result leaves room for
+/// publication metadata without making callers treat the transaction result
+/// as an arbitrary collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDelegationPublication {
+    pub children: Vec<AgentInstanceRow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionRequestRow {
     pub decision_request_id: Uuid,
@@ -1402,7 +1412,7 @@ impl Db {
         task_call_id: String,
         children: Vec<NewTaskDelegationAgent>,
         now_unix_ms: i64,
-    ) -> Result<Vec<AgentInstanceRow>> {
+    ) -> Result<TaskDelegationPublication> {
         ensure!(
             !children.is_empty(),
             "task delegation publication requires at least one child"
@@ -1560,7 +1570,7 @@ impl Db {
                 .await?;
             }
         }
-        Ok(rows)
+        Ok(TaskDelegationPublication { children: rows })
     }
 
     /// Allocate a distinct durable node for a recursive vNext executor. The
@@ -15878,8 +15888,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(children.len(), 1);
-        let child = children.into_iter().next().unwrap();
+        assert_eq!(children.children.len(), 1);
+        let child = children.children.into_iter().next().unwrap();
         let descriptor = db
             .task_delegation_recovery_descriptor(session.session_id, child.agent_instance_id)
             .await
@@ -15973,7 +15983,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.children.len(), 2);
         let (published_children, mapped_agents): (i64, i64) = db
             .read(move |conn| {
                 Ok((

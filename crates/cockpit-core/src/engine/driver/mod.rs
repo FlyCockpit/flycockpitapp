@@ -13464,9 +13464,11 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(mut children) if children.len() == 1 => {
-                            children
-                                .pop()
+                        Ok(publication) if publication.children.len() == 1 => {
+                            publication
+                                .children
+                                .into_iter()
+                                .next()
                                 .expect("one published interactive child")
                                 .agent_instance_id
                         }

@@ -593,6 +593,10 @@ async fn swarm_child_stop_continuation(
         return None;
     }
     let snapshot = pinned.snapshot();
+    let extended = snapshot.extended.clone();
+    let local_knowledge_write_fence_active =
+        crate::knowledge::local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &extended)
+            .await;
     let outcome = crate::engine::agent::hooks::run_stop_hooks(
         &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
             ctx.session.process_containment(),
@@ -607,6 +611,7 @@ async fn swarm_child_stop_continuation(
         Some(spec.worker.agent_name()),
         Some(job_id),
         Some("completed"),
+        local_knowledge_write_fence_active,
         stop_gate,
     )
     .await;

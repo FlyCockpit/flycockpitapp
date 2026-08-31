@@ -6081,6 +6081,7 @@ pub(super) async fn run_worker(
     trust_transition_pending: Arc<std::sync::atomic::AtomicI64>,
     authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
+    initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
@@ -6127,6 +6128,22 @@ pub(super) async fn run_worker(
         start_config = snapshot.clone();
     }
     let extended_cfg = start_config.extended.clone();
+    // Production startup hands this guard over from the registry after it
+    // publishes the local-KB policy but before the worker becomes live. The
+    // standalone path retains its own publication for direct worker tests.
+    // In either case this binding owns the policy until worker teardown.
+    let lsp_session_protection = match initial_lsp_session_protection {
+        Some(protection) => protection,
+        None => {
+            let protected_lsp_roots = crate::knowledge::configured_local_knowledge_roots(
+                &session,
+                &project_root,
+                &extended_cfg,
+            )
+            .await;
+            lsp.protect_session(session_id, protected_lsp_roots).await
+        }
+    };
     let daemon_agents_dir = start_config.daemon_agents_dir.clone().or_else(|| {
         crate::config::resolve::cockpit_data_dir()
             .ok()
@@ -6893,7 +6910,7 @@ pub(super) async fn run_worker(
         crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
     );
-    driver.set_lsp_manager(lsp);
+    driver.set_lsp_manager(lsp.clone());
     if let Some(scheduler) = resource_scheduler {
         driver.set_resource_scheduler(scheduler);
     }
@@ -7244,6 +7261,18 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let extended = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &session,
+                &project_root,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 session.process_containment(),
@@ -7263,6 +7292,7 @@ pub(super) async fn run_worker(
                 start_source: Some(start_source),
                 ..Default::default()
             },
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -12615,6 +12645,38 @@ pub(super) async fn run_worker(
                     expected_trust_revision,
                     respond_to,
                 } => {
+                    let previous_config = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let previously_protected_lsp_roots =
+                        crate::knowledge::configured_local_knowledge_roots(
+                            &session,
+                            &project_root,
+                            &previous_config.extended,
+                        )
+                        .await;
+                    // Publish the union before the snapshot CAS. A turn that
+                    // captured the old no-KB config can otherwise resume
+                    // after publication and start an opaque workspace LSP
+                    // host. Keep removed roots through the CAS too: a short
+                    // conservative fence is safer than prematurely loosening
+                    // an old turn's authority.
+                    let replacement_protected_lsp_roots =
+                        crate::knowledge::configured_local_knowledge_roots(
+                            &session,
+                            &project_root,
+                            &snapshot.extended,
+                        )
+                        .await;
+                    let mut provisional_lsp_roots = previously_protected_lsp_roots.clone();
+                    for root in &replacement_protected_lsp_roots {
+                        if !provisional_lsp_roots.contains(root) {
+                            provisional_lsp_roots.push(root.clone());
+                        }
+                    }
+                    lsp.set_session_protected_roots(session_id, provisional_lsp_roots)
+                        .await;
                     let result = replace_config_snapshot_if_current(
                         &config_snapshot,
                         *snapshot,
@@ -12622,7 +12684,17 @@ pub(super) async fn run_worker(
                         expected_trust_revision,
                     );
                     let changed = result.changed;
-                    if changed {
+                    if !changed {
+                        lsp.set_session_protected_roots(session_id, previously_protected_lsp_roots)
+                            .await;
+                    } else {
+                        // The new snapshot is now authoritative, so release
+                        // any root it removed while retaining its additions.
+                        lsp.set_session_protected_roots(
+                            session_id,
+                            replacement_protected_lsp_roots,
+                        )
+                        .await;
                         let refreshed = config_snapshot
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -13701,6 +13773,18 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let extended = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &session,
+                &project_root,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 session.process_containment(),
@@ -13720,6 +13804,7 @@ pub(super) async fn run_worker(
                 end_reason: Some(end_matcher),
                 ..Default::default()
             },
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -13808,6 +13893,10 @@ pub(super) async fn run_worker(
             }
         }
     }
+    // Clear the worker's registry-wide contribution before reporting the
+    // terminal session event. Early startup returns are covered by the same
+    // guard's `Drop` implementation.
+    drop(lsp_session_protection);
     send_current_event(
         &event_tx,
         &redaction,

@@ -506,11 +506,11 @@ impl App {
         self.fork_at_seq(idx, seq);
     }
 
-    pub(super) fn fork_at_seq(&mut self, idx: usize, seq: i64) {
-        let seed_composer = match self.history.get(idx) {
-            Some(HistoryEntry::User { text, .. }) => Some(text.clone()),
-            _ => None,
-        };
+    pub(super) fn fork_at_seq(&mut self, _idx: usize, seq: i64) {
+        // Threads retain an anchor reference, not a copied message body. Leave
+        // the new composer empty so opening one does not silently recreate the
+        // parent turn in its fresh transcript.
+        let seed_composer = None;
         let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => (
                 runner.session_id(),
@@ -535,6 +535,7 @@ impl App {
                     parent_session_id,
                     fork_point_turn_id,
                     false,
+                    true,
                 )?;
                 Ok(super::AsyncActionPayload::ForkCreated {
                     parent_session_id,
@@ -1200,10 +1201,12 @@ mod tests {
                 parent_session_id: got_parent,
                 fork_point_turn_id,
                 ephemeral,
+                fresh_thread,
             } => {
                 assert_eq!(got_parent, parent_session_id);
                 assert_eq!(fork_point_turn_id, Some("77".to_string()));
                 assert!(!ephemeral);
+                assert!(fresh_thread);
             }
             other => panic!("expected fork request, got {other:?}"),
         }

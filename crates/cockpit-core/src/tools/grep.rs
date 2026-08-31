@@ -1,13 +1,12 @@
-//! `grep` — sandboxed regex content search (prompt `docs-agent.md`
-//! components B + decision 2). Assigned **only** to the `docs` answerer
-//! (Docs.2).
+//! `grep` — native regex content search.
 //!
 //! Implemented with the ripgrep library crates (`grep-regex` +
 //! `grep-searcher`), never by shelling out to `rg` — shelling would
 //! defeat the sandbox the whole `docs` design rests on. Every file
-//! searched is confined to the tool's cwd root via
-//! [`crate::tools::sandbox`]; output is budgeted (whole `file:line`
-//! records dropped atomically under a token cap) via
+//! searched is admitted through the native read boundary via
+//! [`crate::tools::sandbox`], including the caller's attached local knowledge
+//! bases; output is budgeted (whole `file:line` records dropped atomically
+//! under a token cap) via
 //! [`crate::intel::budget::BudgetedWriter`].
 
 use anyhow::Result;
@@ -38,7 +37,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Literal or regex content search confined to the current root or one `cockpit://` pseudofile; `cockpit://history/` uses bounded FTS discovery"
+        "Literal or regex content search in the current root, an attached local knowledge base, or one `cockpit://` pseudofile; `cockpit://history/` uses bounded FTS discovery"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -47,7 +46,7 @@ impl Tool for GrepTool {
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search file contents for literal text or a regular expression within the current root and get back \
+            "Search file contents for literal text or a regular expression within the current root or an attached local knowledge base and get back \
              budgeted file:line matches. Use it to locate where a symbol, string, or pattern \
              appears. The search is hard-confined to the root — you cannot reach outside it. \
              Narrow with `path` to one subdirectory or file when you can, then `read` the \
@@ -63,7 +62,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "Text or regular expression to search for" },
                 "mode":             { "type": "string", "enum": ["literal", "regex"], "description": "Interpret `pattern` as literal text or a regular expression (default: regex)" },
-                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "`path` subdirectory or file under the root (default: whole root)" },
+                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "A subdirectory or file under the current root or an attached local knowledge base (default: current root)" },
                 "case_insensitive": { "type": "boolean", "description": "Case-insensitive match (default false)" }
             },
             "required": ["pattern"]
@@ -77,7 +76,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "The literal text or regular expression to search file contents for" },
                 "mode":             { "type": "string", "enum": ["literal", "regex"], "description": "Interpret `pattern` as literal text or a regular expression (default: regex)" },
-                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Optional `path` subdirectory or file under the package root to restrict the search to; omit to search the whole package. Cannot point outside the root" },
+                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Optional subdirectory or file under the current root or an attached local knowledge base to restrict the search to; omit to search the current root" },
                 "case_insensitive": { "type": "boolean", "description": "When true, match case-insensitively; defaults to case-sensitive" }
             },
             "required": ["pattern"]
@@ -103,22 +102,36 @@ impl Tool for GrepTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        // Resolve + confine the search root. A `path` arg narrows the
-        // search; absence searches the whole package root.
-        let canonical_root = sandbox::canonical_root(&ctx.cwd)?;
-        let search_root = match args.get("path").and_then(Value::as_str) {
-            Some(p) if !p.is_empty() => sandbox::confine(&ctx.cwd, p)?,
-            _ => canonical_root.clone(),
+        // A requested root is admitted by the native read boundary. Attached
+        // local KB roots are implicit read capabilities; a configured but
+        // non-attached KB is refused there before the walk starts.
+        let requested_root = match args.get("path").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => crate::tools::common::resolve(p, &ctx.cwd),
+            _ => ctx.cwd.clone(),
         };
+        let search_root = sandbox::check_native_access(
+            ctx,
+            &requested_root,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
+        let canonical_root = sandbox::canonical_root(&search_root)?;
 
         if let Some(refusal) = sandbox::check_gitignore_read(ctx, &search_root).await? {
             return Ok(refusal);
         }
+        sandbox::recheck_native_access_effect_boundary(
+            &search_root,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
 
         let secret_paths = ctx
             .session
             .secret_path_matcher(&ctx.config.extended().redact)
             .clone();
+        let denied_knowledge_roots =
+            crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
         let display_root = canonical_root.clone();
         let guard_root = canonical_root.clone();
         let query = pattern.clone();
@@ -138,7 +151,11 @@ impl Tool for GrepTool {
         };
         let out = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
-                sandbox::within_root(&guard_root, path) && !secret_paths.is_secret_path(path)
+                sandbox::within_root(&guard_root, path)
+                    && !secret_paths.is_secret_path(path)
+                    && !denied_knowledge_roots
+                        .iter()
+                        .any(|root| cockpit_host::path_containment::contained_under(root, path))
             })
             .map(|outcome| render_search_outcome(outcome, &query))
         })
@@ -257,6 +274,106 @@ mod tests {
             )
             .await;
         assert!(out.is_err(), "path-escape must be refused");
+    }
+
+    #[tokio::test]
+    async fn searches_an_attached_local_knowledge_base() {
+        let workspace = tempfile::tempdir().unwrap();
+        let knowledge = tempfile::tempdir().unwrap();
+        write(knowledge.path(), "concept.md", "durable decision\n");
+        let mut ctx = test_ctx(workspace.path());
+        ctx.allowed_knowledge_bases =
+            Some(std::collections::BTreeSet::from(["team-notes".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended
+            .knowledge_bases
+            .push(crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                "team-notes".to_string(),
+                "Team notes".to_string(),
+                "Local team knowledge".to_string(),
+                crate::config::extended::KnowledgeBaseSource::Local {
+                    path: knowledge.path().to_path_buf(),
+                },
+                crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                None,
+                None,
+                false,
+                crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+            ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let out = GrepTool
+            .call(
+                serde_json::json!({
+                    "pattern": "durable decision",
+                    "path": knowledge.path().display().to_string(),
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("concept.md:1:"),
+            "got: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_a_nested_local_knowledge_base_not_attached_to_the_agent() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(workspace.path(), "visible.md", "needle visible\n");
+        write(workspace.path(), "private/hidden.md", "needle hidden\n");
+        let mut ctx = test_ctx(workspace.path());
+        ctx.allowed_knowledge_bases =
+            Some(std::collections::BTreeSet::from(["workspace".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        for (id, path) in [
+            ("workspace", workspace.path().to_path_buf()),
+            ("private", workspace.path().join("private")),
+        ] {
+            extended.knowledge_bases.push(
+                crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    id.to_string(),
+                    id.to_string(),
+                    format!("{id} local knowledge"),
+                    crate::config::extended::KnowledgeBaseSource::Local { path },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                ),
+            );
+        }
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let out = GrepTool
+            .call(serde_json::json!({ "pattern": "needle" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("visible.md:1:"),
+            "got: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("private/hidden.md"),
+            "got: {}",
+            out.content
+        );
     }
 
     #[tokio::test]

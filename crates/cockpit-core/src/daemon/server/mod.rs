@@ -1742,6 +1742,8 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         title,
         description,
         parent_session_id: _,
+        fork_point_turn_id: _,
+        is_assistant_thread: _,
         created_by_principal: _,
         shared_with_collaborators: _,
         fork_count: _,

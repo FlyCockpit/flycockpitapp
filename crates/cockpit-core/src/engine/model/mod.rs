@@ -184,7 +184,8 @@ pub(crate) struct PreparedCompletionRequest {
 /// `stable_prefix` is constructed when an agent is spawned and must remain
 /// byte-identical until that agent is rebuilt or re-postured for model
 /// failover. `volatile_messages` is the complete per-turn history, including
-/// host-injected time, knowledge, guidance, skill-catalog, and nudge messages.
+/// host-injected time, guidance, skill-catalog, and nudge messages, plus
+/// tool-result history such as explicit knowledge searches.
 /// Keeping the pair at the request boundary prevents a future injector from
 /// accidentally folding volatile state back into the provider preamble.
 #[derive(Debug, Clone, Copy)]

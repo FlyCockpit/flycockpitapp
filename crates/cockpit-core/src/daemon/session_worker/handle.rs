@@ -2448,7 +2448,7 @@ pub enum SessionWork {
 /// sessions it creates to be unsandboxed. The session-spawn default is
 /// resolved here by the precedence daemon-flag → client-flag → ON.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn(
+pub(crate) fn spawn(
     session: Arc<Session>,
     guidance_proposals: Arc<
         tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
@@ -2469,6 +2469,7 @@ pub fn spawn(
     daemon_no_sandbox: bool,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     lsp: Arc<crate::daemon::lsp::LspManager>,
+    initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
@@ -2681,6 +2682,7 @@ pub fn spawn(
             trust_transition_pending,
             authoritative_active_model_state,
             lsp,
+            initial_lsp_session_protection,
             resource_scheduler,
             scheduler,
             write_scope,

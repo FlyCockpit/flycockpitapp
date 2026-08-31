@@ -189,18 +189,36 @@ impl Tool for CustomBashTool {
 
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
-        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
-        let sandbox_on = ctx.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
-        let confine = match crate::tools::shell_sandbox::gate_decision(
+        let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots(ctx)
+            .await?
+            .into_iter()
+            .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+                kind: "attached_knowledge_base".to_string(),
+                path,
+                access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+            })
+            .collect::<Vec<_>>();
+        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
+        let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+            &ctx.session,
+            &ctx.cwd,
+            &ctx.config.extended(),
+        )
+        .await;
+        let sandbox_on = ctx.session.sandbox_enabled()
+            || !denied_knowledge_paths.is_empty()
+            || !write_denied_knowledge_paths.is_empty();
+        let confine = match crate::tools::shell_sandbox::gate_decision_requiring_confinement(
             sandbox_on,
+            !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
             crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
         ) {
             crate::tools::shell_sandbox::SandboxGate::Confine => true,
             crate::tools::shell_sandbox::SandboxGate::Unconfined => false,
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
-                if !denied_knowledge_paths.is_empty() {
+                if !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty() {
                     return Ok(ToolOutput::text(format!(
-                        "Access denied: custom tools cannot run because the required shell confinement is unavailable ({reason}) while a local knowledge base requires a trusted model."
+                        "Access denied: custom tools cannot run because the required shell confinement is unavailable ({reason}) while a local knowledge-base filesystem fence is required."
                     )));
                 }
                 return Ok(ToolOutput::text(format!(
@@ -256,9 +274,10 @@ impl Tool for CustomBashTool {
                 Some(&workspace_scratch_dir),
                 &scrub,
                 &session_env,
-                &[],
+                &attached_knowledge_paths,
                 ctx.write_scope.as_deref(),
                 &denied_knowledge_paths,
+                &write_denied_knowledge_paths,
             )
             .await?
         } else {

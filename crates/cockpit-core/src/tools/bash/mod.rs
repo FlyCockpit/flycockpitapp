@@ -425,7 +425,22 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
-    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+    let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots(ctx)
+        .await?
+        .into_iter()
+        .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+            kind: "attached_knowledge_base".to_string(),
+            path,
+            access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        })
+        .collect::<Vec<_>>();
+    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
+    let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+    )
+    .await;
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -510,14 +525,17 @@ async fn call_bash_inner(
             "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    if !denied_knowledge_paths.is_empty() && options.force_unconfined {
+    if (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+        && options.force_unconfined
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash cannot run unconfined while a local knowledge base requires a trusted model.",
+            "Access denied: bash cannot run unconfined while a local knowledge base is configured.",
         ));
     }
     let sandbox_on = if ctx.write_scope.is_some()
         || ctx.workspace_lease.is_some()
         || !denied_knowledge_paths.is_empty()
+        || !write_denied_knowledge_paths.is_empty()
     {
         true
     } else {
@@ -535,9 +553,11 @@ async fn call_bash_inner(
     let is_container_run = !options.force_unconfined
         && ctx.workspace_lease.is_none()
         && ctx.session.sandbox_mode().is_container();
-    if is_container_run && !denied_knowledge_paths.is_empty() {
+    if is_container_run
+        && (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash is unavailable for this model because container execution cannot exclude a local knowledge base that requires a trusted model.",
+            "Access denied: bash is unavailable because container execution cannot enforce the local knowledge-base filesystem fence.",
         ));
     }
     // Reject legacy sealed binding fields before any lookup or spawn.
@@ -613,7 +633,11 @@ async fn call_bash_inner(
         // Not consulted on these paths; the gate ignores it.
         crate::tools::shell_sandbox::SandboxAvailability::Available
     };
-    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability);
+    let gate = crate::tools::shell_sandbox::gate_decision_requiring_confinement(
+        sandbox_on,
+        !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+        &availability,
+    );
 
     if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
         // Sandbox enabled but cannot initialize: record the accurate
@@ -735,8 +759,9 @@ async fn call_bash_inner(
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
-    let extra_sandbox_paths =
+    let mut extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
+    extra_sandbox_paths.extend(attached_knowledge_paths);
     let sandbox_cwd = ctx
         .workspace_lease
         .as_ref()
@@ -771,6 +796,7 @@ async fn call_bash_inner(
         &session_env,
         &extra_sandbox_paths,
         &denied_knowledge_paths,
+        &write_denied_knowledge_paths,
         ctx,
         timeout_ms,
         &mut resource_lease,
@@ -846,6 +872,7 @@ async fn call_bash_inner(
     if confine
         && !options.escalated
         && denied_knowledge_paths.is_empty()
+        && write_denied_knowledge_paths.is_empty()
         && ctx.write_scope.is_none()
         && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
@@ -914,6 +941,7 @@ async fn call_bash_inner(
                 &session_env,
                 &extra_sandbox_paths,
                 &denied_knowledge_paths,
+                &write_denied_knowledge_paths,
                 ctx,
                 timeout_ms,
                 &mut resource_lease,
@@ -2695,6 +2723,7 @@ async fn run_shell(
     session_env: &std::collections::HashMap<String, String>,
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     denied_knowledge_paths: &[PathBuf],
+    write_denied_knowledge_paths: &[PathBuf],
     ctx: &ToolCtx,
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
@@ -2734,6 +2763,7 @@ async fn run_shell(
                 .map(|lease| lease.allows_write())
                 .unwrap_or(true),
             denied_knowledge_paths,
+            write_denied_knowledge_paths,
         )
         .await
         {

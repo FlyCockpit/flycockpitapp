@@ -162,9 +162,22 @@ impl Tool for ReadTool {
             if attached_knowledge_read {
                 let original = output.content.model_text();
                 let fenced = crate::knowledge::fence_knowledge_content_if_needed(original);
-                if fenced != original {
+                let retained_injection = output
+                    .text_artifact_capture
+                    .as_ref()
+                    .is_some_and(|capture| {
+                        crate::knowledge::knowledge_content_has_injection(&capture.content)
+                    });
+                if fenced != original || retained_injection {
+                    let delivered = if fenced != original {
+                        fenced
+                    } else {
+                        format!(
+                            "{original}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible read limit; the retained artifact was withheld.]"
+                        )
+                    };
                     output.content =
-                        crate::engine::tool::CanonicalToolResultContents::text(fenced);
+                        crate::engine::tool::CanonicalToolResultContents::text(delivered);
                     // The artifact capture holds the unfenced source body. Do
                     // not retain a second retrieval path around this boundary.
                     output.text_artifact_capture = None;

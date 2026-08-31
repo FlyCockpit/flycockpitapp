@@ -215,8 +215,16 @@ fn render_search_outcome(
     if attached_knowledge_read {
         let original = output.content.model_text();
         let fenced = crate::knowledge::fence_knowledge_content_if_needed(original);
-        if fenced != original {
-            output.content = crate::engine::tool::CanonicalToolResultContents::text(fenced);
+        let retained_injection = crate::knowledge::knowledge_content_has_injection(&raw);
+        if fenced != original || retained_injection {
+            let delivered = if fenced != original {
+                fenced
+            } else {
+                format!(
+                    "{original}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible search limit; the retained artifact was withheld.]"
+                )
+            };
+            output.content = crate::engine::tool::CanonicalToolResultContents::text(delivered);
             output.text_artifact_capture = None;
         }
     }

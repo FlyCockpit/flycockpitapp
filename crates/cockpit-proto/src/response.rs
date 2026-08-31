@@ -784,6 +784,10 @@ pub enum Response {
         config_generation: u64,
     },
 
+    PrimaryAssistantSoulEditMode {
+        soul_edit_mode: String,
+    },
+
     AssistantUpserted {
         assistant: AssistantSummary,
     },
@@ -1717,6 +1721,7 @@ macro_rules! response_variants {
             (Response::StorageCleanupCompleted { .. }, "storage_cleanup_completed");
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
+            (Response::PrimaryAssistantSoulEditMode { .. }, "primary_assistant_soul_edit_mode");
             (Response::AssistantUpserted { .. }, "assistant_upserted");
             (Response::AssistantDefinitionSaved { .. }, "assistant_definition_saved");
             (Response::AssistantSessionCreated { .. }, "assistant_session_created");

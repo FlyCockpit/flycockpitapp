@@ -71,7 +71,12 @@ fn attach_state(session_gen: u64) -> (InventoryState, Uuid, Uuid) {
 fn tui_inventory_matches_prechange_parity_fixture() {
     // Captures the pre-change visible projection shape and proves a daemon
     // bundle with the same rows satisfies picker parity fields.
-    let agents = vec![agent("Plan"), agent("Build"), agent("Careful")];
+    let agents = vec![
+        agent("Assistant"),
+        agent("Plan"),
+        agent("Build"),
+        agent("Careful"),
+    ];
     let models = vec![
         model("openai", "gpt-a", true),
         model("openai", "gpt-b", false),
@@ -91,7 +96,7 @@ fn tui_inventory_matches_prechange_parity_fixture() {
             .iter()
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Plan", "Build", "Careful"]
+        vec!["Assistant", "Plan", "Build", "Careful"]
     );
     assert!(snap.models[0].favorite);
     assert_eq!(snap.models[0].trust, ModelTrust::Untrusted);

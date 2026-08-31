@@ -880,6 +880,7 @@ impl Session {
             secret_vault: vault,
             external_journal: Mutex::new(None),
             forwarded_mcp_catalog: Arc::new(crate::mcp::forwarded::ForwardedCatalogSlot::default()),
+            seed_read_receipts: Mutex::new(std::collections::HashMap::new()),
             transcription_dispatch: Mutex::new(std::collections::HashMap::new()),
             message_media_authority: Mutex::new(None),
             #[cfg(test)]
@@ -912,6 +913,7 @@ impl Session {
             knowledge_base_prompt_snapshot_captured: AtomicBool::new(
                 row.knowledge_base_prompt_snapshot_captured,
             ),
+            knowledge_read_snapshots: Mutex::new(super::KnowledgeReadSnapshotStore::default()),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),
@@ -947,6 +949,8 @@ impl Session {
             // Default ON until the spawn path applies the config default.
             shell_compression_enabled: AtomicBool::new(true),
             active_tool_names: Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            booted_root_profile: Mutex::new(None),
             image_generation_dispatch: Mutex::new(None),
             active_sandbox_escalate_eligible: AtomicBool::new(false),
             last_tool_call: Mutex::new(None),

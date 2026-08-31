@@ -164,7 +164,10 @@ pub fn files_changed_from_history(history: &[Message]) -> Vec<FileEdit> {
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
-            if !matches!(tc.function.name.as_str(), "write" | "edit" | "unlock") {
+            if !matches!(
+                tc.function.name.as_str(),
+                "write" | "edit" | "delete" | "unlock"
+            ) {
                 continue;
             }
             let Some(path) = super::compact::arg_path(&tc.function.arguments) else {

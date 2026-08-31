@@ -58,6 +58,87 @@ pub enum IdentityWriteGate {
     Refuse(String),
 }
 
+/// Authorization result for an arbitrary shell invocation in an
+/// identity-bearing assistant session. Shell syntax cannot soundly enumerate
+/// every process-level writer, so restrictive identity modes gate the complete
+/// invocation instead of trusting a best-effort redirect parser.
+#[derive(Debug, Clone)]
+pub enum IdentityShellGate {
+    NotAnAssistantSession,
+    /// Shell work remains available in human-only mode, but it must execute
+    /// with the identity files denied by filesystem confinement.  Parsing
+    /// shell text is not a security boundary: redirects, substitutions, and
+    /// child processes can all reach these files without a useful lexical
+    /// pathname.
+    Protect {
+        denied_paths: Vec<PathBuf>,
+    },
+    Allow {
+        note: Option<String>,
+        accounting: IdentityShellAccounting,
+    },
+    Refuse(String),
+}
+
+/// Ownership token for one authorized shell attempt. The caller must publish
+/// both identity hashes after every attempt that crossed process creation. If
+/// the process is adopted after the tool returns, this token moves with that
+/// process and publishes only after its terminal wait/kill, so a later session
+/// load cannot misclassify a model-owned edit as an external one.
+#[derive(Debug, Clone)]
+pub struct IdentityShellAccounting {
+    db: Db,
+    row: AssistantRow,
+    home: PathBuf,
+}
+
+impl IdentityShellAccounting {
+    pub async fn publish(self) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            record_identity_shell_write_sync(&self.db, self.row, &self.home)
+        })
+        .await
+        .context("assistant shell identity coordinator joined")?
+    }
+}
+
+/// Abort-safe owner for identity accounting after an opaque host capability
+/// has been authorized. Dropping the calling future cannot discard the hash
+/// refresh after the external capability may already have produced effects.
+pub struct IdentityAccountingGuard(Option<IdentityShellAccounting>);
+
+impl IdentityAccountingGuard {
+    pub fn new(accounting: Option<IdentityShellAccounting>) -> Self {
+        Self(accounting)
+    }
+
+    pub async fn publish(mut self) -> Result<()> {
+        let Some(accounting) = self.0.take() else {
+            return Ok(());
+        };
+        accounting.publish().await
+    }
+}
+
+impl Drop for IdentityAccountingGuard {
+    fn drop(&mut self) {
+        let Some(accounting) = self.0.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = accounting.publish().await {
+                    tracing::error!(%error, "abort-time assistant identity accounting failed");
+                }
+            });
+        } else {
+            tracing::error!(
+                "assistant identity accounting dropped outside a Tokio runtime; identity hashes require reconciliation"
+            );
+        }
+    }
+}
+
 pub fn soul_path(home_dir: &Path) -> PathBuf {
     home_dir.join(SOUL_FILE)
 }
@@ -114,10 +195,12 @@ fn load_for_session_sync(db: &Db, requested: &AssistantRow) -> Result<IdentityLo
     let row = super::get_assistant_blocking(db, &requested.name)?
         .with_context(|| format!("assistant `{}` disappeared", requested.name))?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     super::recover_definition_journal_locked(db, &row)?;
     let row = super::get_assistant_blocking(db, &row.name)?
         .with_context(|| format!("assistant `{}` disappeared during recovery", row.name))?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     let original_config: crate::assistants::AssistantConfig =
         serde_json::from_str(&row.config_json)
             .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
@@ -355,6 +438,136 @@ pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<Identity
     }
 }
 
+/// Gate an arbitrary bash invocation for an assistant that owns SOUL/USER
+/// identity files. This is intentionally broader than [`check_identity_write`]:
+/// an external command, variable expansion, command substitution, glob, or
+/// unrecognized shell syntax can all write a known identity file without
+/// yielding a concrete lexical path.
+pub async fn check_identity_shell(ctx: &ToolCtx) -> Result<IdentityShellGate> {
+    let Some((row, home)) = assistant_identity(ctx).await? else {
+        return Ok(IdentityShellGate::NotAnAssistantSession);
+    };
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| {
+            format!(
+                "assistant `{}` has malformed durable configuration; refusing shell execution",
+                row.name
+            )
+        })?;
+    match config.soul_edit_mode {
+        SoulEditMode::HumanOnly => Ok(IdentityShellGate::Protect {
+            denied_paths: vec![soul_path(&home), user_path(&home)],
+        }),
+        SoulEditMode::ApproveProposals => {
+            let Some(approver) = ctx.approver.as_ref() else {
+                return Ok(IdentityShellGate::Refuse(
+                    crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                ));
+            };
+            let decision = approver
+                .approve_path(
+                    &home,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await?;
+            if decision.is_allowed() {
+                Ok(IdentityShellGate::Allow {
+                    note: Some(
+                        " assistant shell invocation approved for identity-bearing session; identity hashes will be refreshed."
+                            .to_string(),
+                    ),
+                    accounting: IdentityShellAccounting { db: ctx.session.db.clone(), row, home },
+                })
+            } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+                Ok(IdentityShellGate::Refuse(
+                    crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                ))
+            } else {
+                Ok(IdentityShellGate::Refuse(format!(
+                    "Refused: user declined shell execution for assistant identity `{}`.",
+                    row.name
+                )))
+            }
+        }
+        SoulEditMode::Autonomous => Ok(IdentityShellGate::Allow {
+            note: Some(
+                " assistant shell invocation allowed by soul_edit_mode=autonomous; identity hashes will be refreshed."
+                    .to_string(),
+            ),
+            accounting: IdentityShellAccounting { db: ctx.session.db.clone(), row, home },
+        }),
+    }
+}
+
+/// Gate an opaque host capability such as an external MCP tool. Unlike a
+/// native file tool, Cockpit cannot inspect the capability's eventual file
+/// targets; unlike a confined shell, it cannot impose deny mounts on the
+/// third-party process. Treat it as a potential identity writer.
+///
+/// The returned accounting must be published after the capability completes,
+/// including an error result, because the external process may have written
+/// before reporting failure.
+pub async fn check_identity_opaque_host_effect(
+    ctx: &ToolCtx,
+    capability: &str,
+) -> Result<Option<IdentityShellAccounting>> {
+    check_identity_opaque_session_effect(&ctx.session, ctx.approver.as_ref(), capability).await
+}
+
+/// Gate an opaque host effect that is dispatched outside the ordinary tool
+/// dispatcher (notably provider-native computer actions).
+pub async fn check_identity_opaque_session_effect(
+    session: &crate::session::Session,
+    approver: Option<&std::sync::Arc<crate::approval::Approver>>,
+    capability: &str,
+) -> Result<Option<IdentityShellAccounting>> {
+    let Some((row, home)) = assistant_identity_for_session(session).await? else {
+        return Ok(None);
+    };
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| {
+            format!(
+                "assistant `{}` has malformed durable configuration; refusing {capability}",
+                row.name
+            )
+        })?;
+    match config.soul_edit_mode {
+        SoulEditMode::HumanOnly => anyhow::bail!(
+            "Refused: {capability} is unavailable while soul_edit_mode=human_only because an opaque external capability cannot be prevented from modifying the assistant's SOUL.md/USER.md. The human must edit those files outside model tools."
+        ),
+        SoulEditMode::ApproveProposals => {
+            let Some(approver) = approver else {
+                anyhow::bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL);
+            };
+            let decision = approver
+                .approve_path(
+                    &home,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await?;
+            if decision.is_allowed() {
+                Ok(Some(IdentityShellAccounting {
+                    db: session.db.clone(),
+                    row,
+                    home,
+                }))
+            } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+                anyhow::bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+            } else {
+                anyhow::bail!(
+                    "Refused: user declined {capability} for assistant identity `{}`.",
+                    row.name
+                )
+            }
+        }
+        SoulEditMode::Autonomous => Ok(Some(IdentityShellAccounting {
+            db: session.db.clone(),
+            row,
+            home,
+        })),
+    }
+}
+
 pub fn tool_refusal(message: String) -> ToolOutput {
     ToolOutput::text(message)
 }
@@ -370,6 +583,32 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
         .context("assistant identity write coordinator joined")?
 }
 
+fn record_identity_shell_write_sync(db: &Db, requested: AssistantRow, home: &Path) -> Result<()> {
+    let validated_home = crate::assistants::validate_row_home(&requested)?;
+    anyhow::ensure!(
+        validated_home == home,
+        "assistant identity home changed during shell execution"
+    );
+    let definition = crate::assistants::assistant_definition_path(home);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    super::recover_creation_journal_locked(db, home)?;
+    let row = super::get_assistant_blocking(db, &requested.name)?
+        .context("assistant disappeared while recording shell identity writes")?;
+    crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
+    super::recover_definition_journal_locked(db, &row)?;
+    let row = super::get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during shell identity recovery")?;
+    ensure_same_authorized_installation(&requested, &row)?;
+    let mut config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
+    config.soul_hash = hash_optional_file(&soul_path(home))?;
+    config.user_hash = hash_optional_file(&user_path(home))?;
+    let config_json = serde_json::to_string(&config)?;
+    update_identity_hashes_cas_blocking(db, row, config_json)?;
+    Ok(())
+}
+
 fn record_identity_write_sync(
     db: &Db,
     requested: AssistantRow,
@@ -383,10 +622,12 @@ fn record_identity_write_sync(
     let row = super::get_assistant_blocking(db, &requested.name)?
         .context("assistant disappeared while recording identity write")?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     super::recover_definition_journal_locked(db, &row)?;
     let row = super::get_assistant_blocking(db, &row.name)?
         .context("assistant disappeared during identity recovery")?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     let expected_path = match identity_file {
         SOUL_FILE => soul_path(&home),
         USER_FILE => user_path(&home),
@@ -404,6 +645,43 @@ fn record_identity_write_sync(
     }
     let config_json = serde_json::to_string(&config)?;
     update_identity_hashes_cas_blocking(db, row, config_json)?;
+    Ok(())
+}
+
+/// A shell authorization belongs to the exact assistant installation that was
+/// loaded before process creation, not merely to a reusable name/home pair.
+/// The registry's daemon-minted installation UUID is immutable provenance for
+/// a normal assistant; the row-generation fields additionally fence the
+/// daemon-owned primary, whose installation UUID is intentionally stable.
+fn ensure_same_authorized_installation(
+    authorized: &AssistantRow,
+    current: &AssistantRow,
+) -> Result<()> {
+    anyhow::ensure!(
+        authorized.name == current.name
+            && authorized.home_dir == current.home_dir
+            && authorized.created_at_unix_ms == current.created_at_unix_ms,
+        "assistant installation changed before identity hash publication"
+    );
+    let authorized_config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&authorized.config_json).with_context(|| {
+            format!(
+                "parsing authorized assistant configuration for `{}`",
+                authorized.name
+            )
+        })?;
+    let current_config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&current.config_json).with_context(|| {
+            format!(
+                "parsing current assistant configuration for `{}`",
+                current.name
+            )
+        })?;
+    anyhow::ensure!(
+        !authorized_config.installation_id.is_nil()
+            && authorized_config.installation_id == current_config.installation_id,
+        "assistant installation changed before identity hash publication"
+    );
     Ok(())
 }
 
@@ -427,6 +705,24 @@ async fn identity_target(
     } else {
         Ok(None)
     }
+}
+
+async fn assistant_identity(ctx: &ToolCtx) -> Result<Option<(AssistantRow, PathBuf)>> {
+    assistant_identity_for_session(&ctx.session).await
+}
+
+async fn assistant_identity_for_session(
+    session: &crate::session::Session,
+) -> Result<Option<(AssistantRow, PathBuf)>> {
+    let Some(name) = session.assistant_name.as_deref() else {
+        return Ok(None);
+    };
+    let row =
+        session.db.get_assistant(name).await?.with_context(|| {
+            format!("assistant `{name}` disappeared before identity authorization")
+        })?;
+    let home = crate::assistants::validate_row_home(&row)?;
+    Ok(Some((row, home)))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -458,7 +754,43 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::tool::Tool;
+
     use crate::test_env::TestEnvGuard;
+
+    #[test]
+    fn new_named_assistants_default_to_human_only_soul_edits() {
+        assert_eq!(SoulEditMode::default(), SoulEditMode::HumanOnly);
+        assert_eq!(
+            crate::assistants::AssistantConfig::default().soul_edit_mode,
+            SoulEditMode::HumanOnly
+        );
+    }
+
+    #[test]
+    fn identity_publication_rejects_a_replaced_assistant_installation() {
+        let installation_id = uuid::Uuid::new_v4();
+        let config = crate::assistants::AssistantConfig {
+            installation_id,
+            ..crate::assistants::AssistantConfig::default()
+        };
+        let authorized = AssistantRow {
+            name: "helper".to_string(),
+            created_at_unix_ms: 1,
+            home_dir: "/private/helper".to_string(),
+            config_json: serde_json::to_string(&config).unwrap(),
+            content_hash: "0".repeat(64),
+        };
+        let replacement_config = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
+            ..config
+        };
+        let replacement = AssistantRow {
+            config_json: serde_json::to_string(&replacement_config).unwrap(),
+            ..authorized.clone()
+        };
+
+        assert!(ensure_same_authorized_installation(&authorized, &replacement).is_err());
+    }
 
     /// Build a tool context for the `helper` assistant inside an isolated
     /// cockpit home. `validate_row_home` requires the canonical
@@ -475,6 +807,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed_identity_files(&home).unwrap();
         let cfg = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
             agent_source: home.join("assistant.md").display().to_string(),
             soul_edit_mode: mode,
             soul_hash: hash_optional_file(&soul_path(&home)).unwrap(),
@@ -525,6 +858,7 @@ mod tests {
         (
             ToolCtx {
                 agent_id: "helper".to_string(),
+                allowed_knowledge_bases: None,
                 executing_model_trusted: false,
                 knowledge_access_trusted: false,
                 caller_model: None,
@@ -622,6 +956,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed_identity_files(&home).unwrap();
         let cfg = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
             agent_source: home.join("assistant.md").display().to_string(),
             soul_hash: hash_optional_file(&soul_path(&home)).unwrap(),
             user_hash: hash_optional_file(&user_path(&home)).unwrap(),
@@ -685,6 +1020,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_only_never_allows_dynamic_shell_identity_writes() {
+        let project = tempfile::tempdir().unwrap();
+        let (ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::HumanOnly).await;
+        let original = std::fs::read_to_string(soul_path(&home)).unwrap();
+        let gate = check_identity_shell(&ctx).await.unwrap();
+        assert!(matches!(
+            gate,
+            IdentityShellGate::Protect { denied_paths }
+                if denied_paths == vec![soul_path(&home), user_path(&home)]
+        ));
+        let command = format!(
+            "target={}; printf 'model rewrite\\n' > \"$target\"",
+            soul_path(&home).display()
+        );
+
+        let out = crate::tools::bash::BashTool::new()
+            .call(serde_json::json!({ "command": command }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.sandbox.is_some(), "{out:?}");
+        assert_eq!(std::fs::read_to_string(soul_path(&home)).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn soul_edit_modes_approve_proposals_requires_approval() {
         let project = tempfile::tempdir().unwrap();
         let (ctx, _, home, _env) =
@@ -707,6 +1068,31 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn approve_proposals_blocks_dynamic_shell_writes_without_approval() {
+        let project = tempfile::tempdir().unwrap();
+        let (ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::ApproveProposals).await;
+        let original = std::fs::read_to_string(soul_path(&home)).unwrap();
+        let command = format!(
+            "target={}; printf 'model rewrite\\n' > \"$target\"",
+            soul_path(&home).display()
+        );
+
+        let out = crate::tools::bash::BashTool::new()
+            .call(serde_json::json!({ "command": command }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            out.content
+                .contains("noninteractive run: approval auto-denied"),
+            "{}",
+            out.content
+        );
+        assert_eq!(std::fs::read_to_string(soul_path(&home)).unwrap(), original);
     }
 
     #[tokio::test]

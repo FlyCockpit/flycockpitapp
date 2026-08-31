@@ -811,6 +811,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     ));
     ToolCtx {
         agent_id: "builder".to_string(),
+        allowed_knowledge_bases: None,
         executing_model_trusted: false,
         knowledge_access_trusted: false,
         caller_model: None,
@@ -1661,6 +1662,90 @@ async fn shell_write_targets_do_not_fabricate_dynamic_paths() {
     assert_eq!(
         shell_write_targets("printf x > logs/*.txt", root),
         ShellWriteTargets::Dynamic
+    );
+}
+
+#[tokio::test]
+async fn bash_refuses_shell_redirection_into_local_knowledge_bases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let knowledge = tmp.path().join(".cockpit/knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.config.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            1,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig {
+                knowledge_bases: vec![crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    "project".to_string(),
+                    "Project".to_string(),
+                    "Project knowledge".to_string(),
+                    crate::config::extended::KnowledgeBaseSource::Local {
+                        path: PathBuf::from(".cockpit/knowledge"),
+                    },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                )],
+                ..Default::default()
+            },
+        ),
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf blocked > .cockpit/knowledge/manual.md" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("cannot write"), "{}", out.content);
+    assert!(!knowledge.join("manual.md").exists());
+}
+
+#[tokio::test]
+async fn bash_refuses_dynamic_shell_write_targets_when_local_knowledge_is_attached() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge")).unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.config.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            1,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig {
+                knowledge_bases: vec![crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    "project".to_string(),
+                    "Project".to_string(),
+                    "Project knowledge".to_string(),
+                    crate::config::extended::KnowledgeBaseSource::Local {
+                        path: PathBuf::from(".cockpit/knowledge"),
+                    },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                )],
+                ..Default::default()
+            },
+        ),
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": r#"printf blocked > "$OUT""# }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("dynamic file targets"),
+        "{}",
+        out.content
     );
 }
 

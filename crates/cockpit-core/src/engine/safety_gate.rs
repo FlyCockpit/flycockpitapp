@@ -123,6 +123,7 @@ pub(crate) fn trusted_minimal_projection(
         "bash" => shell_action_projection(args)?,
         "write" => file_write_projection(args, false)?,
         "edit" => file_write_projection(args, true)?,
+        "delete" => file_delete_projection(args)?,
         "plan_write" => plan_document_projection(args, false)?,
         "plan_edit" => plan_document_projection(args, true)?,
         "mcp" => mcp_action_projection(args)?,
@@ -230,6 +231,22 @@ fn file_write_projection(args: &Value, edit: bool) -> Result<(Value, Value)> {
     }
     Ok((
         action,
+        json!({ "tier": "mutating", "source": "artifact_write_boundary" }),
+    ))
+}
+
+fn file_delete_projection(args: &Value) -> Result<(Value, Value)> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("file delete has no path"))?;
+    Ok((
+        json!({
+            "tool": "delete",
+            "kind": "artifact_delete",
+            "untrusted_action_data": { "path": path },
+        }),
         json!({ "tier": "mutating", "source": "artifact_write_boundary" }),
     ))
 }

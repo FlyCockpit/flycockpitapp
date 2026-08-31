@@ -22,6 +22,7 @@ pub mod custom;
 pub mod data_syntax;
 pub mod defer;
 pub mod delegation_payload_retrieve;
+pub mod delete;
 pub mod docs;
 pub mod edit;
 pub mod escalate;

@@ -181,6 +181,13 @@ fn describe_mouse(app: &App, _: &SlashCommand) -> String {
     )
 }
 
+fn describe_tool_calls(app: &App, _: &SlashCommand) -> String {
+    format!(
+        "{} Hide model tool-call rows in this main assistant view (arg: hide/show; bare = toggle)",
+        on_off(app.hide_tool_calls)
+    )
+}
+
 fn describe_mcp(app: &App, _: &SlashCommand) -> String {
     let Some(cfg) = app.mcp_snapshot() else {
         return "Manage MCP servers (status unavailable) (arg: settings/list/on/off/toggle [id]; \
@@ -558,6 +565,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         run: run_tools,
         available: available_always,
         describe: describe_static,
+    },
+    SlashCommand {
+        name: "tool-calls",
+        description: "Hide model tool-call rows in this main assistant view (arg: hide/show; bare = toggle)",
+        takes_args: true,
+        run: run_tool_calls,
+        available: available_always,
+        describe: describe_tool_calls,
     },
     SlashCommand {
         name: "pin",
@@ -1355,6 +1370,11 @@ fn run_tools(app: &mut App, _: &str) -> bool {
     false
 }
 
+fn run_tool_calls(app: &mut App, args: &str) -> bool {
+    app.handle_tool_calls_command(args);
+    false
+}
+
 fn run_goal_settings(app: &mut App, _: &str) -> bool {
     let agent = app
         .agent_path
@@ -2072,6 +2092,47 @@ impl App {
             "/preflight",
             cockpit_proto::Request::SetPreflight { enabled },
             ControlApplied::None,
+        );
+    }
+
+    /// `/tool-calls [hide|show]` filters model tool-call rows from the main
+    /// assistant transcript. This is an in-memory, per-view presentation
+    /// setting: it never changes model context, daemon history, or storage.
+    pub(super) fn handle_tool_calls_command(&mut self, args: &str) {
+        if !matches!(self.transcript_view, TranscriptViewMeta::Main) {
+            self.show_toast(
+                "/tool-calls is available in the main assistant view",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let hide = match args.trim().to_ascii_lowercase().as_str() {
+            "" | "toggle" => !self.hide_tool_calls,
+            "hide" | "on" => true,
+            "show" | "off" => false,
+            other => {
+                self.show_toast(
+                    format!("/tool-calls: unknown arg `{other}` — use `hide`, `show`, or no arg to toggle"),
+                    ToastKind::Info,
+                );
+                return;
+            }
+        };
+        if self.hide_tool_calls == hide {
+            return;
+        }
+        self.hide_tool_calls = hide;
+        self.history_render_cache_clear();
+        self.mark_chat_geometry_dirty_from(0);
+        self.hovered_affordance = None;
+        self.hovered_control_chip = None;
+        self.show_toast(
+            if hide {
+                "Tool-call rows hidden in this view"
+            } else {
+                "Tool-call rows shown in this view"
+            },
+            ToastKind::Info,
         );
     }
 

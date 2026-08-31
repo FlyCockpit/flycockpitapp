@@ -109,6 +109,14 @@ pub struct LoopStartArgs {
     /// Only meaningful when `keep_in_context == false`: fresh fork per
     /// iteration (true) vs. accumulate-in-fork (false, default).
     pub independent: bool,
+    /// Reset the next wake whenever this thread accepts a user message. Idle
+    /// wakes always run in an ephemeral fork so a no-op cannot enter the main
+    /// thread transcript.
+    pub idle: bool,
+    /// Optional project-relative paths whose metadata forms the local-change
+    /// digest. While the digest is unchanged an idle wake skips inference and
+    /// only advances its local backoff.
+    pub watch_paths: Vec<String>,
 }
 
 impl LoopStartArgs {
@@ -224,6 +232,38 @@ pub fn parse_loop_start(args: &Value) -> anyhow::Result<LoopStartArgs> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let idle = args.get("idle").and_then(Value::as_bool).unwrap_or(false);
+    let watch_paths = args
+        .get("watch_paths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| {
+                    let path = path
+                        .as_str()
+                        .ok_or_else(|| invalid_input("`watch_paths` must contain only strings"))?;
+                    if path.is_empty()
+                        || std::path::Path::new(path).is_absolute()
+                        || path.split('/').any(|part| part == "..")
+                    {
+                        return Err(invalid_input(
+                            "`watch_paths` entries must be non-empty project-relative paths",
+                        ));
+                    }
+                    Ok(path.to_string())
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    if idle && limit.is_none() {
+        return Err(invalid_input(
+            "idle timers must have a finite `limit`; omit it for the bounded default or provide a positive integer",
+        ));
+    }
+
     Ok(LoopStartArgs {
         interval_secs,
         prompt,
@@ -232,6 +272,8 @@ pub fn parse_loop_start(args: &Value) -> anyhow::Result<LoopStartArgs> {
         limit_defaulted,
         keep_in_context,
         independent,
+        idle,
+        watch_paths,
     })
 }
 
@@ -394,6 +436,8 @@ mod tests {
         assert!(a.keep_in_context);
         assert!(!a.independent);
         assert!(!a.backoff);
+        assert!(!a.idle);
+        assert!(a.watch_paths.is_empty());
         assert!(!a.is_timer());
         assert_eq!(a.kind(), ScheduleKind::Loop);
     }
@@ -456,6 +500,42 @@ mod tests {
     fn loop_start_limit_zero_is_unlimited() {
         let a = parse_loop_start(&json!({ "interval": 10, "prompt": "p", "limit": 0 })).unwrap();
         assert_eq!(a.limit, None);
+    }
+
+    #[test]
+    fn idle_loop_requires_a_finite_limit_and_validates_watch_paths() {
+        let defaulted = parse_loop_start(&json!({
+            "interval": "2m",
+            "prompt": "check the build",
+            "idle": true,
+            "watch_paths": ["target/status", "README.md"]
+        }))
+        .unwrap();
+        assert_eq!(defaulted.limit, Some(DEFAULT_LOOP_LIMIT));
+        assert!(defaulted.idle);
+        assert_eq!(
+            defaulted.watch_paths,
+            vec!["target/status".to_string(), "README.md".to_string()]
+        );
+
+        assert!(
+            parse_loop_start(&json!({
+                "interval": 60,
+                "prompt": "check",
+                "idle": true,
+                "limit": 0
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_loop_start(&json!({
+                "interval": 60,
+                "prompt": "check",
+                "idle": true,
+                "watch_paths": ["../outside"]
+            }))
+            .is_err()
+        );
     }
 
     #[test]

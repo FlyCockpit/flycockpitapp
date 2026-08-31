@@ -849,10 +849,10 @@ async fn background_gate_refuse_starts_no_job() {
 }
 
 #[tokio::test]
-async fn untrusted_background_start_requires_a_sandbox_for_a_trust_required_kb() {
+async fn background_start_requires_shell_confinement_for_local_knowledge_even_for_trusted_models() {
     let (mut driver, tmp) = schedule_journaling_driver(
         "test-token",
-        false,
+        true,
         crate::session::test_redaction_key_resolver(),
     );
     let knowledge = tmp.path().join(".cockpit/knowledge");
@@ -860,7 +860,7 @@ async fn untrusted_background_start_requires_a_sandbox_for_a_trust_required_kb()
     std::fs::write(knowledge.join("private.md"), "private knowledge").unwrap();
     std::fs::write(
         tmp.path().join(".cockpit/config.json"),
-        r#"{"knowledgeBases":[{"id":"private","name":"Private","description":"Private local knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+        r#"{"knowledgeBases":[{"id":"private","name":"Private","description":"Private local knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"}]}"#,
     )
     .unwrap();
     driver.refresh_config_from_disk_for_tests();
@@ -880,7 +880,10 @@ async fn untrusted_background_start_requires_a_sandbox_for_a_trust_required_kb()
     .unwrap();
 
     assert!(out.contains("Access denied"), "got {out}");
-    assert!(out.contains("requires a trusted model"), "got {out}");
+    assert!(
+        out.contains("local knowledge bases are attached"),
+        "got {out}"
+    );
     assert!(!out.contains("/sandbox off"), "got {out}");
     assert!(driver.schedule.snapshot().is_empty());
 }

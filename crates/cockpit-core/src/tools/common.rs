@@ -311,6 +311,21 @@ pub async fn write_and_release(
     Ok(WriteReleaseOutcome { persist_ok })
 }
 
+/// Finish bookkeeping after a knowledge-base transaction performed the actual
+/// mutation. The transaction owns the filesystem/Git rollback boundary, while
+/// the native file tools still own their normal lock lifecycle.
+pub async fn release_after_external_write(
+    ctx: &ToolCtx,
+    path: &Path,
+    guard: crate::locks::WriteGuard<'_>,
+) -> WriteReleaseOutcome {
+    let persist_ok = guard.release_after_write().await;
+    ctx.locks
+        .note_read(path, &ctx.lock_identity, ctx.session.id)
+        .await;
+    WriteReleaseOutcome { persist_ok }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_with(path, bytes, |_| Ok(()))
 }
@@ -398,6 +413,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     (
         ToolCtx {
             agent_id: "builder".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,
@@ -432,7 +448,8 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
                     "write",
                     "edit",
                     "history_search",
-                    "knowledge_retrieve",
+                    "semantic_search",
+                    "structured_search",
                 ]
                 .into_iter()
                 .map(str::to_string)

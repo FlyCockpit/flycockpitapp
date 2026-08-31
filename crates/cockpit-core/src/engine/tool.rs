@@ -24,6 +24,271 @@ use crate::engine::message::ToolDefinition;
 
 pub use crate::daemon::proto::ToolFailKind;
 
+/// JSON Schema extension marking a persisted tool field as display-only.
+///
+/// Values under a marked field stay in the durable timeline, but are removed
+/// from the model-wire projection before that projection is stored.  The same
+/// projection is used by the live turn and session rehydration, so a marked
+/// value cannot enter a later model request.
+pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
+
+/// Production consumer inventory for the marker contract:
+///
+/// - ordinary built-in and native/custom argument schemas are projected in
+///   `agent::tool_dispatch` before `wire_input_json` is stored; the provider
+///   choice and interrupted scheduler-continuation record are projected at
+///   their own model-history insertion boundaries in `agent::turn_phases`;
+/// - structured built-in and native/custom results are projected at the same
+///   boundary and the projected canonical result is the restart authority;
+/// - MCP dispatch is deliberately unchanged because MCP schemas/results do not
+///   participate in this host-owned marker contract;
+/// - the existing `ToolOutput` sandbox, exit-code, resource, and output-sidecar
+///   exclusions are expressed by `ToolOutput::result_metadata_schema` below.
+///
+/// This is an ownership/type bound over every production `wire_input_json`
+/// consumer. Deferred write/edit reconciliation reads that already-projected
+/// row before applying its separate lifecycle elision; verification recipes and
+/// compaction consume the same projected row. Escalation reads a prior `bash`
+/// row only (the built-in `bash` schema declares no marker), and schedule
+/// dispatch only copies scheduler-owned structural rows, whose fixed schemas
+/// are outside `Tool`. None of these later consumers reintroduces a display
+/// projection into model history.
+
+/// Strip fields declared with [`MODEL_EPHEMERAL_SCHEMA_KEY`] from a JSON value.
+///
+/// The extension is intentionally a storage concern, not JSON-Schema
+/// validation vocabulary: providers still receive the complete input schema
+/// and may emit the field. Local refs, definitions, compositions, object
+/// property selectors, and tuple/list arrays are followed recursively.
+/// Malformed or unresolvable projection schema fails closed by removing the
+/// value governed by that fragment.
+pub fn strip_model_ephemeral_fields(value: &Value, schema: &Value) -> Value {
+    project_model_value(value, schema, schema, "#", 0, true).unwrap_or(Value::Null)
+}
+
+const MAX_MODEL_EPHEMERAL_SCHEMA_DEPTH: usize = 64;
+
+fn project_model_value(
+    value: &Value,
+    schema: &Value,
+    root: &Value,
+    schema_pointer: &str,
+    depth: usize,
+    follow_reference: bool,
+) -> Option<Value> {
+    if depth > MAX_MODEL_EPHEMERAL_SCHEMA_DEPTH {
+        return None;
+    }
+    match schema {
+        Value::Bool(true) => return Some(value.clone()),
+        Value::Bool(false) => return None,
+        Value::Object(_) => {}
+        _ => return None,
+    }
+    if schema
+        .get(MODEL_EPHEMERAL_SCHEMA_KEY)
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
+
+    // JSON Schema permits sibling constraints next to `$ref`. Apply the
+    // target first, then the local siblings, so a marker in either location
+    // cannot be hidden by reference resolution.
+    if follow_reference && let Some(reference) = schema.get("$ref") {
+        let reference = reference.as_str()?;
+        let pointer = reference.strip_prefix('#')?;
+        let target = root.pointer(pointer)?;
+        let projected = project_model_value(value, target, root, reference, depth + 1, true)?;
+        // JSON Schema permits sibling constraints next to `$ref`. Revisit this
+        // schema without following the reference so those siblings use their
+        // original root-relative location for composition matching.
+        return project_model_value(&projected, schema, root, schema_pointer, depth + 1, false);
+    }
+
+    let mut projected = value.clone();
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword) {
+            let branches = branches.as_array()?;
+            if matches!(keyword, "anyOf" | "oneOf") && branches.is_empty() {
+                return None;
+            }
+            let branch_indexes: Vec<usize> = match keyword {
+                "allOf" => (0..branches.len()).collect(),
+                "anyOf" | "oneOf" => matching_composition_branches(
+                    value,
+                    root,
+                    schema_pointer,
+                    keyword,
+                    branches.len(),
+                )?,
+                _ => unreachable!("composition keywords are fixed above"),
+            };
+            if keyword == "oneOf" && branch_indexes.len() != 1 {
+                return None;
+            }
+            if matches!(keyword, "anyOf" | "oneOf") && branch_indexes.is_empty() {
+                return None;
+            }
+            for index in branch_indexes {
+                let branch_pointer = schema_pointer_child(
+                    &schema_pointer_child(schema_pointer, keyword),
+                    &index.to_string(),
+                );
+                projected = project_model_value(
+                    &projected,
+                    &branches[index],
+                    root,
+                    &branch_pointer,
+                    depth + 1,
+                    true,
+                )?;
+            }
+        }
+    }
+
+    match &projected {
+        Value::Object(object) => {
+            let properties = match schema.get("properties") {
+                Some(value) => Some(value.as_object()?),
+                None => None,
+            };
+            let patterns = match schema.get("patternProperties") {
+                Some(value) => Some(value.as_object()?),
+                None => None,
+            };
+            let additional = schema.get("additionalProperties");
+            let mut projected = serde_json::Map::with_capacity(object.len());
+            for (name, field) in object {
+                let mut field_value = Some(field.clone());
+                let mut matched = false;
+                if let Some(field_schema) = properties.and_then(|properties| properties.get(name)) {
+                    matched = true;
+                    field_value = field_value.and_then(|value| {
+                        project_model_value(
+                            &value,
+                            field_schema,
+                            root,
+                            &schema_pointer_child(
+                                &schema_pointer_child(schema_pointer, "properties"),
+                                name,
+                            ),
+                            depth + 1,
+                            true,
+                        )
+                    });
+                }
+                if let Some(patterns) = patterns {
+                    for (pattern, field_schema) in patterns {
+                        let regex = regex::Regex::new(pattern).ok()?;
+                        if regex.is_match(name) {
+                            matched = true;
+                            field_value = field_value.and_then(|value| {
+                                project_model_value(
+                                    &value,
+                                    field_schema,
+                                    root,
+                                    &schema_pointer_child(
+                                        &schema_pointer_child(schema_pointer, "patternProperties"),
+                                        pattern,
+                                    ),
+                                    depth + 1,
+                                    true,
+                                )
+                            });
+                        }
+                    }
+                }
+                if !matched && let Some(additional) = additional {
+                    field_value = match additional {
+                        Value::Bool(false) => None,
+                        Value::Bool(true) => field_value,
+                        schema => field_value.and_then(|value| {
+                            project_model_value(
+                                &value,
+                                schema,
+                                root,
+                                &schema_pointer_child(schema_pointer, "additionalProperties"),
+                                depth + 1,
+                                true,
+                            )
+                        }),
+                    };
+                }
+                if let Some(field_value) = field_value {
+                    projected.insert(name.clone(), field_value);
+                }
+            }
+            Some(Value::Object(projected))
+        }
+        Value::Array(items) => {
+            let prefix = match schema.get("prefixItems") {
+                Some(value) => Some(value.as_array()?),
+                None => None,
+            };
+            let item_schema = schema.get("items");
+            let mut output = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let schema = prefix.and_then(|prefix| prefix.get(index)).or(item_schema);
+                let item_pointer = if prefix.is_some_and(|prefix| index < prefix.len()) {
+                    schema_pointer_child(
+                        &schema_pointer_child(schema_pointer, "prefixItems"),
+                        &index.to_string(),
+                    )
+                } else {
+                    schema_pointer_child(schema_pointer, "items")
+                };
+                let projected = match schema {
+                    Some(Value::Bool(false)) => None,
+                    Some(schema) => {
+                        project_model_value(item, schema, root, &item_pointer, depth + 1, true)
+                    }
+                    None => Some(item.clone()),
+                };
+                if let Some(projected) = projected {
+                    output.push(projected);
+                }
+            }
+            Some(Value::Array(output))
+        }
+        _ => Some(projected),
+    }
+}
+
+/// Return the `anyOf`/`oneOf` branches that validate the source instance.
+///
+/// Validators are addressed by their JSON pointer within the original schema
+/// document, rather than compiled from an isolated branch. This keeps local
+/// references and embedded resource scopes rooted exactly as authored.
+fn matching_composition_branches(
+    value: &Value,
+    root: &Value,
+    schema_pointer: &str,
+    keyword: &str,
+    branch_count: usize,
+) -> Option<Vec<usize>> {
+    let validators = jsonschema::validator_map_for(root).ok()?;
+    let mut matching = Vec::new();
+    for index in 0..branch_count {
+        let branch_pointer = schema_pointer_child(
+            &schema_pointer_child(schema_pointer, keyword),
+            &index.to_string(),
+        );
+        let validator = validators.get(&branch_pointer)?;
+        if validator.is_valid(value) {
+            matching.push(index);
+        }
+    }
+    Some(matching)
+}
+
+/// Add one URI-fragment JSON-Pointer segment.
+fn schema_pointer_child(pointer: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    format!("{pointer}/{escaped}")
+}
+
 /// Marker error a tool returns when the *arguments* were the problem
 /// (see [`ToolFailKind::Invocation`]). The dispatcher downcasts to this
 /// to classify the failure; build it with [`invalid_input`].
@@ -173,6 +438,7 @@ pub fn known_tool_presentation(tool: &str, args: &Value) -> ToolPresentation {
         "unlock" => tools::unlock::UnlockTool.presentation(args),
         "write" => tools::write::WriteTool.presentation(args),
         "edit" => tools::edit::EditTool.presentation(args),
+        "delete" => tools::delete::DeleteTool.presentation(args),
         "websearch" => tools::web::WebSearchTool.presentation(args),
         "webfetch" => tools::web::WebFetchTool.presentation(args),
         _ => ToolPresentation::default_for(tool, args),
@@ -341,6 +607,247 @@ fn lexical_normalize(path: impl AsRef<Path>) -> PathBuf {
 }
 
 #[cfg(test)]
+mod model_ephemeral_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strips_marked_args_and_structured_results_without_touching_display_value() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "visible": { "type": "string" },
+                "ephemeral": { "x-cockpit-model-ephemeral": true },
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "keep": { "type": "string" },
+                        "drop": { "x-cockpit-model-ephemeral": true }
+                    }
+                }
+            }
+        });
+        let display = json!({
+            "visible": "shown",
+            "ephemeral": "timeline-only",
+            "nested": { "keep": "also shown", "drop": "never replayed" }
+        });
+
+        assert_eq!(
+            strip_model_ephemeral_fields(&display, &schema),
+            json!({ "visible": "shown", "nested": { "keep": "also shown" } })
+        );
+        assert_eq!(
+            display["ephemeral"], "timeline-only",
+            "the durable/display projection remains complete"
+        );
+
+        let contents = CanonicalToolResultContents::new(vec![
+            crate::typed_media_result::CanonicalToolResultContent::Json { value: display },
+        ])
+        .unwrap();
+        let projected = contents.strip_model_ephemeral_fields(&schema).unwrap();
+        assert_eq!(
+            projected.parts(),
+            &[
+                crate::typed_media_result::CanonicalToolResultContent::Json {
+                    value: json!({ "visible": "shown", "nested": { "keep": "also shown" } })
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn result_metadata_schema_marks_existing_output_metadata() {
+        let metadata = json!({
+            "sandbox": { "enabled": true },
+            "resource": { "cpu": 1 },
+            "exit_code": 1,
+            "output_sidecar": { "stdout": "full" }
+        });
+        assert_eq!(
+            strip_model_ephemeral_fields(&metadata, &ToolOutput::result_metadata_schema()),
+            json!({}),
+            "ToolOutput audit metadata remains model-ephemeral"
+        );
+    }
+
+    #[test]
+    fn native_result_schema_keeps_its_own_ref_root_and_field_namespace() {
+        let native_schema = json!({
+            "$defs": {
+                "result": {
+                    "type": "object",
+                    "properties": {
+                        "visible": { "type": "string" },
+                        "secret": { "x-cockpit-model-ephemeral": true },
+                        "sandbox": { "type": "string" },
+                        "resource": { "type": "string" },
+                        "exit_code": { "type": "integer" },
+                        "output_sidecar": { "type": "string" }
+                    }
+                }
+            },
+            "$ref": "#/$defs/result"
+        });
+        let result = json!({
+            "visible": "shown",
+            "secret": "never replayed",
+            "sandbox": "ordinary result field",
+            "resource": "ordinary result field",
+            "exit_code": 0,
+            "output_sidecar": "ordinary result field"
+        });
+
+        assert_eq!(
+            strip_model_ephemeral_fields(&result, &native_schema),
+            json!({
+                "visible": "shown",
+                "sandbox": "ordinary result field",
+                "resource": "ordinary result field",
+                "exit_code": 0,
+                "output_sidecar": "ordinary result field"
+            }),
+            "native schemas retain local $ref resolution and do not inherit ToolOutput metadata markers"
+        );
+
+        let native_schema = json!({
+            "type": "object",
+            "properties": {
+                "visible": { "type": "string" },
+                "secret": { "x-cockpit-model-ephemeral": true }
+            }
+        });
+        assert_eq!(
+            strip_model_ephemeral_fields(
+                &json!({"visible": "shown", "secret": "never replayed"}),
+                &native_schema,
+            ),
+            json!({"visible": "shown"}),
+            "the native schema's own result-field markers remain active"
+        );
+    }
+
+    #[test]
+    fn traverses_refs_compositions_defs_tuples_patterns_and_additional_fields() {
+        let schema = json!({
+            "$defs": {
+                "secret": { "x-cockpit-model-ephemeral": true },
+                "entry": {
+                    "allOf": [{
+                        "type": "object",
+                        "patternProperties": { "^private_": { "$ref": "#/$defs/secret" } },
+                        "additionalProperties": { "type": "string" }
+                    }]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "direct": { "$ref": "#/$defs/secret" },
+                "ref_sibling": {
+                    "$ref": "#/$defs/entry",
+                    "x-cockpit-model-ephemeral": true
+                },
+                "composed": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "$ref": "#/$defs/secret" }
+                    ]
+                },
+                "tuple": {
+                    "type": "array",
+                    "prefixItems": [
+                        { "type": "string" },
+                        { "$ref": "#/$defs/secret" }
+                    ],
+                    "items": { "$ref": "#/$defs/entry" }
+                }
+            },
+            "additionalProperties": { "$ref": "#/$defs/secret" }
+        });
+        assert_eq!(
+            strip_model_ephemeral_fields(
+                &json!({
+                    "direct": "drop",
+                    "ref_sibling": {"public": "drop"},
+                    "composed": "drop",
+                    "tuple": ["keep", "drop", {"public": "keep", "private_token": "drop"}],
+                    "unknown": "drop"
+                }),
+                &schema
+            ),
+            json!({"tuple": ["keep", {"public": "keep"}]})
+        );
+        assert_eq!(
+            strip_model_ephemeral_fields(
+                &json!({"secret": "drop"}),
+                &json!({"$ref": "#/$defs/missing"})
+            ),
+            Value::Null,
+            "an unresolved projection reference fails closed"
+        );
+        assert_eq!(
+            strip_model_ephemeral_fields(&json!({"secret": "drop"}), &json!({"properties": []})),
+            Value::Null,
+            "a malformed projection fragment fails closed"
+        );
+    }
+
+    #[test]
+    fn composition_markers_only_project_the_matching_discriminated_variant() {
+        for keyword in ["anyOf", "oneOf"] {
+            let mut variant_schema = json!({
+                "$defs": {
+                    "ephemeral_payload": { "x-cockpit-model-ephemeral": true },
+                    "public": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "public" },
+                            "payload": { "type": "string" }
+                        },
+                        "required": ["kind", "payload"],
+                        "additionalProperties": false
+                    },
+                    "private": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "private" },
+                            "payload": { "$ref": "#/$defs/ephemeral_payload" }
+                        },
+                        "required": ["kind", "payload"],
+                        "additionalProperties": false
+                    }
+                }
+            });
+            variant_schema.as_object_mut().unwrap().insert(
+                keyword.to_string(),
+                json!([
+                    { "$ref": "#/$defs/public" },
+                    { "$ref": "#/$defs/private" }
+                ]),
+            );
+
+            assert_eq!(
+                strip_model_ephemeral_fields(
+                    &json!({ "kind": "public", "payload": "keep this" }),
+                    &variant_schema,
+                ),
+                json!({ "kind": "public", "payload": "keep this" }),
+                "a nonmatching {keyword} branch must not remove a shared field"
+            );
+            assert_eq!(
+                strip_model_ephemeral_fields(
+                    &json!({ "kind": "private", "payload": "timeline-only" }),
+                    &variant_schema,
+                ),
+                json!({ "kind": "private" }),
+                "the matching {keyword} branch must still remove its marked field"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod typed_args_tests {
     use super::*;
     use serde::Deserialize;
@@ -486,6 +993,15 @@ pub trait Tool: Send + Sync {
         ToolEffect::Dynamic
     }
 
+    /// Call-specific effect classification used by ephemeral idle wakes after
+    /// a call has completed. `Dynamic` remains the conservative default: a
+    /// tool that can prove this exact successful invocation was read-only
+    /// overrides this method. This is deliberately separate from [`Self::effect`],
+    /// whose capability/approval meaning must stay conservative before a call.
+    fn completed_call_effect(&self, _args: &Value, _output: &ToolOutput) -> ToolEffect {
+        self.effect()
+    }
+
     /// Whether the tool owns a narrower, composite authorization chokepoint
     /// inside its implementation. Such a tool still advertises its real effect
     /// and remains subject to review-cage and loop controls, but ordinary-tool
@@ -529,6 +1045,16 @@ pub trait Tool: Send + Sync {
     /// here must match.
     fn verbose_parameters(&self) -> Option<Value> {
         None
+    }
+
+    /// JSON Schema for structured tool-result fields. This is deliberately
+    /// separate from the provider-visible argument schema: result fields are
+    /// produced by the host, persisted for the transcript, and then projected
+    /// into model history at store time. This schema governs canonical result
+    /// contents only; [`ToolOutput`] audit metadata is projected independently
+    /// with its own schema. The default carries no result-field markers.
+    fn result_schema(&self) -> Value {
+        serde_json::json!({})
     }
 
     /// Run the tool. The args have already passed through §12 repair (or
@@ -720,6 +1246,25 @@ impl CanonicalToolResultContents {
                 crate::typed_media_result::CanonicalToolResultContent::Text { .. }
             )
         })
+    }
+
+    /// Return the model-wire form of a structured result. Text and media are
+    /// not field-addressable JSON and therefore pass through unchanged; JSON
+    /// parts are projected by the tool's declared result schema.
+    pub fn strip_model_ephemeral_fields(&self, schema: &Value) -> anyhow::Result<Self> {
+        let parts = self
+            .parts
+            .iter()
+            .map(|part| match part {
+                crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    crate::typed_media_result::CanonicalToolResultContent::Json {
+                        value: crate::engine::tool::strip_model_ephemeral_fields(value, schema),
+                    }
+                }
+                _ => part.clone(),
+            })
+            .collect();
+        Self::new(parts)
     }
 
     pub fn push_str(&mut self, value: &str) {
@@ -948,6 +1493,48 @@ mod context_usage_snapshot_tests {
 }
 
 impl ToolOutput {
+    /// Schema for the structured, timeline-only metadata every tool output may
+    /// carry. Keeping this marker list beside the output shape replaces the
+    /// dispatcher's former hand-maintained model-exclusion list.
+    pub fn result_metadata_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "sandbox": { "x-cockpit-model-ephemeral": true },
+                "resource": { "x-cockpit-model-ephemeral": true },
+                "exit_code": { "x-cockpit-model-ephemeral": true },
+                "output_sidecar": { "x-cockpit-model-ephemeral": true }
+            }
+        })
+    }
+
+    /// Durable structured metadata, retained for the timeline/export surface.
+    /// Its model projection is derived at dispatch through
+    /// [`Self::result_metadata_schema`]. This is intentionally distinct from
+    /// a native tool's result-content schema: the two describe different JSON
+    /// object namespaces, and native schemas must retain their own `$ref`
+    /// root.
+    pub fn result_metadata(&self) -> serde_json::Map<String, Value> {
+        let mut metadata = serde_json::Map::new();
+        if let Some(sandbox) = &self.sandbox
+            && let Ok(value) = serde_json::to_value(sandbox)
+        {
+            metadata.insert("sandbox".to_string(), value);
+        }
+        if let Some(resource) = &self.resource
+            && let Ok(value) = serde_json::to_value(resource)
+        {
+            metadata.insert("resource".to_string(), value);
+        }
+        if let Some(exit_code) = self.exit_code {
+            metadata.insert("exit_code".to_string(), Value::from(exit_code));
+        }
+        if let Some(sidecar) = &self.output_sidecar {
+            metadata.insert("output_sidecar".to_string(), sidecar.payload.clone());
+        }
+        metadata
+    }
+
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
@@ -1062,6 +1649,9 @@ impl ToolOutput {
 /// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
     pub(crate) agent_id: String,
+    /// Local knowledge bases this concrete agent definition may access. `None`
+    /// inherits the workspace registry; an empty set permits none.
+    pub(crate) allowed_knowledge_bases: Option<std::collections::BTreeSet<String>>,
     /// History-read trust of the concrete tool frame. This is carried from the
     /// agent frame rather than inferred from the session's active model;
     /// delegated frames remain untrusted even when a host-selected fallback
@@ -1282,6 +1872,7 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            allowed_knowledge_bases: self.allowed_knowledge_bases.clone(),
             executing_model_trusted: self.executing_model_trusted,
             knowledge_access_trusted: self.knowledge_access_trusted,
             caller_model: self.caller_model.clone(),
@@ -1802,6 +2393,63 @@ impl ToolBox {
         self.overrides.remove(name);
         self.capability_unavailable.remove(name);
         self.capability_description_suffixes.remove(name);
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    /// Keep only built-in operations whose declared effect is read-only.
+    ///
+    /// This is a capability boundary, not a scheduling hint: an unregistered
+    /// or user-authored tool is excluded even when it claims `ReadOnly`, since
+    /// a custom shell template can make that claim while executing arbitrary
+    /// code. Callers that need a constrained non-read-only escape hatch must
+    /// add that tool back explicitly and own its effect accounting.
+    pub(crate) fn registered_read_only_operations(mut self) -> Self {
+        let is_safe = |tool: &Arc<dyn Tool>| {
+            tool.is_registered_ordinary_operation() && tool.effect() == ToolEffect::ReadOnly
+        };
+        self.tools.retain(|_, tool| is_safe(tool));
+        self.dormant_direct_native_media
+            .retain(|_, tool| is_safe(tool));
+        self.mcp_builtin_tools
+            .retain(|_, entry| is_safe(&entry.tool));
+        self.overrides
+            .retain(|name, _| self.tools.contains_key(name));
+        self.capability_unavailable
+            .retain(|name, _| self.tools.contains_key(name));
+        self.capability_description_suffixes
+            .retain(|name, _| self.tools.contains_key(name));
+        self.direct_native_media_unavailable
+            .retain(|name, _| self.dormant_direct_native_media.contains_key(name));
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    /// Wrap every non-read-only callable operation on this toolbox.
+    ///
+    /// Background fork callers use this to retain the parent capability
+    /// surface while making every possible effect cross their own durable
+    /// accounting boundary. Direct-native media is normally stripped before
+    /// this method is used, but keep the dormant registry coherent too.
+    pub(crate) fn map_non_read_only_operations(
+        mut self,
+        map: impl Fn(Arc<dyn Tool>) -> Arc<dyn Tool>,
+    ) -> Self {
+        for tool in self.tools.values_mut() {
+            if tool.effect() != ToolEffect::ReadOnly {
+                *tool = map(tool.clone());
+            }
+        }
+        for tool in self.dormant_direct_native_media.values_mut() {
+            if tool.effect() != ToolEffect::ReadOnly {
+                *tool = map(tool.clone());
+            }
+        }
+        for entry in self.mcp_builtin_tools.values_mut() {
+            if entry.tool.effect() != ToolEffect::ReadOnly {
+                entry.tool = map(entry.tool.clone());
+            }
+        }
         self.definition_cache.lock().unwrap().clear();
         self
     }

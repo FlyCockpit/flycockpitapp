@@ -2704,8 +2704,11 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     }
     // Monty is the universal scripting runtime for real agents. The legacy
     // `mcp` grant above now controls only external server access; it no
-    // longer controls whether native cockpit tools are scriptable.
-    if !tb.names().contains(&"mcp") {
+    // longer controls whether native cockpit tools are scriptable. The docs
+    // pipeline is deliberately not a general agent surface: its answerer is
+    // confined to read/grep/glob and its resolver has only its fixed package
+    // lookup surface, so neither stage may receive the scripting escape hatch.
+    if !is_docs_pipeline(&def.name) && !tb.names().contains(&"mcp") {
         tb = tb.with(Arc::new(crate::tools::mcp_tool::McpTool));
     }
     // vNext deliberately has no `tools:` authority field.  Delegation is the

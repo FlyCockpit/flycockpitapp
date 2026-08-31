@@ -75,7 +75,7 @@ impl App {
             // An in-progress drag must still be cancelled: its pointer
             // coordinates can no longer describe a valid gesture.
             let completed_selection = self.selection.filter(|selection| !selection.active);
-            let completed_spans = completed_selection.map(|_| self.selection_spans.clone());
+            let completed_spans = completed_selection.and_then(|_| self.selection_spans.clone());
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,
                 self.event_loop_monotonic_now,

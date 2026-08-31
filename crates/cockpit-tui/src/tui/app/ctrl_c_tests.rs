@@ -6,7 +6,7 @@ fn install_ephemeral_runner(
     app: &mut super::App,
 ) -> tokio::sync::mpsc::Receiver<crate::tui::agent_runner::ControlRequest> {
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
-    let mut runner = AgentRunner::test_fixture(TestRunnerOverrides {
+    let runner = AgentRunner::test_fixture(TestRunnerOverrides {
         control_tx: Some(control_tx),
         ..Default::default()
     });
@@ -362,7 +362,7 @@ fn exit_guard_stop_all_cancels_only_the_attached_session() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
-    let mut runner = AgentRunner::test_fixture(TestRunnerOverrides {
+    let runner = AgentRunner::test_fixture(TestRunnerOverrides {
         control_tx: Some(control_tx),
         ..Default::default()
     });

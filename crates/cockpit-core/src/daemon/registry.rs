@@ -757,7 +757,7 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.persistent_service_transition)
     }
 
-    pub fn set_media_storage_recovery(
+    pub(crate) fn set_media_storage_recovery(
         &self,
         recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     ) {

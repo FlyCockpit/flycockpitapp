@@ -241,7 +241,10 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
             _ => continue,
         };
         let name = ident.to_string();
-        if is_public && name.contains("Acp") && name.contains("Mcp") {
+        if is_public
+            && name.contains("Acp")
+            && (name.contains("Mcp") || name == "AcpNameValuePairV1")
+        {
             forwarded_mcp_public_types.push(name);
         }
     }

@@ -5605,8 +5605,8 @@ mod tests {
     fn computer_native_host_arbiter_process_local_fifo() {
         let os_lock = Box::new(InMemoryOsAdvisoryLock::new());
         let mut arbiter = HostInputArbiter::new(os_lock, OwnerInstance(1));
-
         let key = physical_key();
+
         let delegation_a = DelegationId("delegation-a".to_string());
         let delegation_b = DelegationId("delegation-b".to_string());
 
@@ -6062,6 +6062,13 @@ mod tests {
         )
         .await
         .expect("first open acquires the host lease");
+        // X11 input injection is serialized per X server/session rather than
+        // per RandR output. Inspect the lease's effective arbitration key,
+        // not the monitor-sensitive evidence key used to create it.
+        let key = coordinator_a
+            .host_lease()
+            .expect("physical coordinator lease")
+            .arbitration_key;
         assert!(arbiter.lock().unwrap().is_held(&key));
 
         // Second delegation contends and remains queued until A releases.
@@ -6537,7 +6544,6 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let key = physical_key();
 
         // Open a coordinator with the arbiter and a physical target adapter;
         // open() acquires the host lease for the target's physical key.
@@ -6555,6 +6561,10 @@ mod tests {
         )
         .await
         .expect("coordinator open");
+        let key = coordinator
+            .host_lease()
+            .expect("physical coordinator lease")
+            .arbitration_key;
         events.lock().expect("event log").clear();
 
         // Simulate OS lock loss by externally releasing the OS-level lock for
@@ -6944,6 +6954,10 @@ mod tests {
         )
         .await
         .expect("open first physical coordinator");
+        let arbitration_key = first
+            .host_lease()
+            .expect("first physical lease")
+            .arbitration_key;
         events.lock().expect("event log").clear();
 
         let mut second_params =
@@ -6967,7 +6981,7 @@ mod tests {
             if arbiter
                 .lock()
                 .expect("arbiter")
-                .waiter_count(&physical_key())
+                .waiter_count(&arbitration_key)
                 == 1
             {
                 break;
@@ -6978,7 +6992,7 @@ mod tests {
             arbiter
                 .lock()
                 .expect("arbiter")
-                .waiter_count(&physical_key()),
+                .waiter_count(&arbitration_key),
             1
         );
 

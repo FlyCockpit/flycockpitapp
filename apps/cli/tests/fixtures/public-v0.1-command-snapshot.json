@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "profile": "local-v0.1",
   "commands": [
+    "acp",
     "ask",
     "run",
     "agent",

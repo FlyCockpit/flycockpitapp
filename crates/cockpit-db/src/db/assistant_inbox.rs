@@ -671,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn raise_spawn_raise_amplification_is_bounded_per_assistant() {
         let db = Db::open_in_memory().unwrap();
-        let (_, mut thread) = assistant_with_thread(&db).await;
+        let (main, mut thread) = assistant_with_thread(&db).await;
         for index in 0..MAX_RAISES_PER_ASSISTANT_PER_HOUR {
             db.raise_assistant_inbox_item(
                 thread.session_id,
@@ -684,7 +684,7 @@ mod tests {
             .unwrap();
             let anchor = db
                 .insert_session_event(
-                    thread.session_id,
+                    main.session_id,
                     SessionEventKind::AssistantMessage,
                     Some("Build"),
                     None,
@@ -693,7 +693,10 @@ mod tests {
                 .await
                 .unwrap();
             thread = db
-                .create_thread(thread.session_id, anchor.to_string())
+                // Each spawn is a fresh assistant thread rooted at the main
+                // session. The inbox limit is assistant-wide, while nested
+                // threads remain separately bounded by their ancestry rule.
+                .create_thread(main.session_id, anchor.to_string())
                 .await
                 .unwrap();
         }

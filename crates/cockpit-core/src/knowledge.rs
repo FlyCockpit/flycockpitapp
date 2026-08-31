@@ -955,6 +955,14 @@ fn has_git_marker_in_ancestors(root: &Path) -> bool {
 }
 
 fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
+    // A local KB does not have to be a Git worktree.  In that case there is
+    // no index to protect and no repository-local exclude file to maintain.
+    // Check this before invoking Git: `rev-parse --show-prefix` can inherit
+    // discovery from the process environment in ways that are irrelevant to
+    // a standalone KB directory.
+    if !has_git_marker_in_ancestors(root) {
+        return Ok(());
+    }
     // Sidecars were canonicalized for lock identity. Resolve the KB root the
     // same way before deciding which artifacts are inside a Git worktree.
     // Assistant snapshot roots are synthetic (`assistant://...`) and simply
@@ -972,13 +980,11 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     }
     let prefix = match crate::git::run_git(root, &["rev-parse", "--show-prefix"]) {
         Ok(output) if output.success => output.stdout,
-        Ok(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
         Ok(output) => bail!(
             "checking Git ignore rules for local knowledge base {} failed: {}",
             root.display(),
             output.stderr.trim()
         ),
-        Err(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
         Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
     };
     let exclude = crate::git::run_git(root, &["rev-parse", "--git-path", "info/exclude"])

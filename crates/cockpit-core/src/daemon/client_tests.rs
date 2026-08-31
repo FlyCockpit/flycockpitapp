@@ -381,7 +381,7 @@ async fn connect_uses_registered_in_process_context_without_socket() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn one_shot_daemon_uses_an_in_process_owner_without_socket_metadata() {
+async fn one_shot_daemon_uses_the_ephemeral_socket_owner_and_reaps_metadata() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let runtime = env.path().expect("isolated runtime root").join("runtime");
     env.set_var("XDG_RUNTIME_DIR", &runtime);
@@ -394,14 +394,16 @@ async fn one_shot_daemon_uses_an_in_process_owner_without_socket_metadata() {
     assert!(matches!(response, Response::DaemonStatus { .. }));
 
     let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
-    assert!(
-        !paths.socket.exists(),
-        "one-shot in-process owner must not bind {}",
-        paths.socket.display()
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while paths.socket.exists() || paths.pid_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ephemeral socket owner must reap after its last one-shot client disconnects");
     assert!(
         !paths.pid_file.exists(),
-        "one-shot in-process owner must not publish a pid record"
+        "ephemeral socket owner must retire its pid record"
     );
 }
 

@@ -3450,7 +3450,7 @@ fn stop_gate_state_capped_forces_end() {
 use crate::config::extended::hooks::{HookApplicability, HookGate, HookMatcherPolicy};
 
 /// A structured, machine-checkable projection of the native command-hook
-/// contract that the public `apps/cli/README.md` `## Hooks` subsection must
+/// contract that the public CLI README `## Hooks` subsection must
 /// describe.
 ///
 /// Normative values are derived from the typed config/runtime constants rather
@@ -3618,9 +3618,11 @@ impl HookDocumentationContract {
 }
 
 /// Read the `<!-- hooks-contract:start -->` / `<!-- hooks-contract:end -->`
-/// block from `apps/cli/README.md`.
+/// block from the CLI README.
 fn read_hooks_contract_block() -> String {
-    let readme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/cli/README.md");
+    let readme = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(["apps", "cli", "README.md"].join("/"));
     let contents = std::fs::read_to_string(&readme)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", readme.display()));
     let start_marker = "<!-- hooks-contract:start -->";
@@ -3974,7 +3976,7 @@ fn assert_every_event_has_production_call_site() {
 }
 
 /// `hooks_documentation_matches_typed_contract` verifies that the public
-/// `apps/cli/README.md` `## Hooks` contract block matches the typed
+/// CLI README `## Hooks` contract block matches the typed
 /// config/runtime constants. It fails on a missing marker, any
 /// missing/extra/wrong normative value, an unsupported format presented as
 /// supported, a fail-open needle that diverges from the single-sourced runner

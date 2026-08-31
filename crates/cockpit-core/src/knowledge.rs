@@ -945,15 +945,6 @@ impl SidecarProcessLock {
     }
 }
 
-fn has_git_marker_in_ancestors(root: &Path) -> bool {
-    let contains_git_marker = |path: &Path| {
-        path.ancestors()
-            .any(|ancestor| ancestor.join(".git").exists())
-    };
-    contains_git_marker(root)
-        || fs::canonicalize(root).is_ok_and(|canonical_root| contains_git_marker(&canonical_root))
-}
-
 fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
     // Sidecars were canonicalized for lock identity. Resolve the KB root the
     // same way before deciding which artifacts are inside a Git worktree.
@@ -972,13 +963,12 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     }
     let prefix = match crate::git::run_git(root, &["rev-parse", "--show-prefix"]) {
         Ok(output) if output.success => output.stdout,
-        Ok(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
-        Ok(output) => bail!(
-            "checking Git ignore rules for local knowledge base {} failed: {}",
-            root.display(),
-            output.stderr.trim()
-        ),
-        Err(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
+        // Git is the authority on whether this path belongs to a worktree.
+        // Looking for a `.git` marker in arbitrary ancestors is both racy and
+        // wrong: a host-level marker (for example `/tmp/.git`) does not make
+        // every child path a usable worktree.  A successful `rev-parse` is
+        // still required before any mutable sidecar exclusion is touched.
+        Ok(_) => return Ok(()),
         Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
     };
     let exclude = crate::git::run_git(root, &["rev-parse", "--git-path", "info/exclude"])

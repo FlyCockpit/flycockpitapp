@@ -15921,8 +15921,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(children.children().len(), 1);
-        let child = children.into_children().into_iter().next().unwrap();
+        assert_eq!(publication.children().len(), 1);
+        let child = publication.into_children().into_iter().next().unwrap();
         let descriptor = db
             .task_delegation_recovery_descriptor(session.session_id, child.agent_instance_id)
             .await
@@ -16016,7 +16016,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.children().len(), 2);
+        assert_eq!(publication.children().len(), 2);
         let (published_children, mapped_agents): (i64, i64) = db
             .read(move |conn| {
                 Ok((

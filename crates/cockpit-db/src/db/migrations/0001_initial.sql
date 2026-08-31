@@ -34,6 +34,46 @@ CREATE TABLE assistants (
     )
 );
 
+-- ---- per-assistant thread inbox ------------------------------------------
+
+-- Structured upward communication from a persistent assistant thread to its
+-- assistant's main session.  This is intentionally not a generic
+-- thread-to-thread transport: both backlinks are durable and delivery is
+-- claimed only by the resolved main session at a turn boundary.
+CREATE TABLE assistant_inbox_items (
+    inbox_item_id      TEXT PRIMARY KEY CHECK (
+        length(inbox_item_id) = 36 AND inbox_item_id = lower(inbox_item_id)
+        AND substr(inbox_item_id, 9, 1) = '-' AND substr(inbox_item_id, 14, 1) = '-'
+        AND substr(inbox_item_id, 19, 1) = '-' AND substr(inbox_item_id, 24, 1) = '-'
+        AND length(replace(inbox_item_id, '-', '')) = 32
+        AND replace(inbox_item_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE,
+    main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    -- Daemon-owned inference/replay scope. Provider tool-call IDs are only
+    -- idempotency correlations, not globally unique operation identities.
+    operation_scope    TEXT NOT NULL CHECK (length(CAST(operation_scope AS BLOB)) BETWEEN 1 AND 128),
+    operation_id       TEXT NOT NULL CHECK (length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 1024),
+    summary            TEXT NOT NULL CHECK (length(CAST(summary AS BLOB)) BETWEEN 1 AND 4000),
+    delivery           TEXT NOT NULL CHECK (delivery IN ('immediate', 'defer', 'notify')),
+    created_at_unix_ms INTEGER NOT NULL,
+    delivered_at_unix_ms INTEGER CHECK (delivered_at_unix_ms IS NULL OR delivered_at_unix_ms >= created_at_unix_ms),
+    -- Human visibility is independent of agent delivery. A delivery can be
+    -- consumed at a main-turn boundary while the item remains unread in the
+    -- user's inbox; notify entries have no agent delivery at all.
+    human_read_at_unix_ms INTEGER CHECK (human_read_at_unix_ms IS NULL OR human_read_at_unix_ms >= created_at_unix_ms),
+    CHECK (main_session_id <> raising_session_id)
+);
+CREATE UNIQUE INDEX assistant_inbox_items_raise_operation_idx
+    ON assistant_inbox_items(raising_session_id, operation_scope, operation_id);
+CREATE INDEX assistant_inbox_items_main_pending_idx
+    ON assistant_inbox_items(main_session_id, delivered_at_unix_ms, created_at_unix_ms);
+CREATE INDEX assistant_inbox_items_main_unread_idx
+    ON assistant_inbox_items(main_session_id, human_read_at_unix_ms, created_at_unix_ms);
+CREATE INDEX assistant_inbox_items_assistant_rate_idx
+    ON assistant_inbox_items(assistant_name, created_at_unix_ms);
+
 -- ---- projects / sessions ---------------------------------------------------
 
 -- Private durable identity for a project. `project_id` remains the host-facing
@@ -115,6 +155,10 @@ CREATE TABLE sessions (
     -- [relationship:foreign] Optional historical event sequence in that exact
     -- parent session. NULL means the parent's durable tail at fork time.
     fork_point_turn_id TEXT,
+    -- First-class assistant thread marker. A thread is a persistent,
+    -- message-anchored child; ordinary forks and `/btw` children must never
+    -- enter the assistant thread surface merely because they have a parent.
+    is_assistant_thread INTEGER NOT NULL DEFAULT 0 CHECK (is_assistant_thread IN (0, 1)),
     title              TEXT,                     -- utility-model-generated label (§17d)
     description        TEXT CHECK (
         description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
@@ -255,6 +299,14 @@ CREATE TABLE sessions (
         AND length(fork_point_turn_id) > 0
         AND fork_point_turn_id NOT GLOB '*[^0-9]*'
         AND fork_point_turn_id = CAST(CAST(fork_point_turn_id AS INTEGER) AS TEXT)
+    )),
+    CHECK (is_assistant_thread = 0 OR (
+        parent_session_id IS NOT NULL
+        AND fork_point_turn_id IS NOT NULL
+        AND ephemeral = 0
+        AND btw_parent_session_id IS NULL
+        AND assistant_name IS NOT NULL
+        AND is_dream_session = 0
     )),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
     CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
@@ -1109,6 +1161,12 @@ CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_
   WHERE shared_with_collaborators = 1;
 CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_unix_ms DESC)
   WHERE assistant_name IS NOT NULL;
+CREATE INDEX idx_sessions_assistant_threads
+    ON sessions (assistant_name, project_id, last_active_at_unix_ms DESC)
+    WHERE is_assistant_thread = 1
+      AND ephemeral = 0
+      AND archived_at_unix_ms IS NULL
+      AND is_dream_session = 0;
 
 -- ---- knowledge dream scope + completion ledger ----------------------------
 -- Attachment is the explicit consent boundary for cross-session dream reads.
@@ -2774,7 +2832,8 @@ CREATE TABLE session_events (
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
         'goal_progress_diagnostic', 'resource_promotion', 'notice',
-        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree'
+        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree',
+        'thread_anchor'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

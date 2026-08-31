@@ -634,6 +634,17 @@ local	approval_grants	granted_at	non_relationship
 local	approval_grants	risk_tier	non_relationship
 local	approval_grants	session_id	foreign
 local	approval_grants	verdict	non_relationship
+local	assistant_inbox_items	assistant_name	foreign
+local	assistant_inbox_items	created_at_unix_ms	non_relationship
+local	assistant_inbox_items	delivered_at_unix_ms	non_relationship
+local	assistant_inbox_items	delivery	non_relationship
+local	assistant_inbox_items	human_read_at_unix_ms	non_relationship
+local	assistant_inbox_items	inbox_item_id	primary
+local	assistant_inbox_items	main_session_id	foreign
+local	assistant_inbox_items	operation_id	local_identity
+local	assistant_inbox_items	operation_scope	local_identity
+local	assistant_inbox_items	raising_session_id	foreign
+local	assistant_inbox_items	summary	non_relationship
 local	assistant_mutation_journals	action	non_relationship
 local	assistant_mutation_journals	assistant_name	denormalized
 local	assistant_mutation_journals	client_operation_id	foreign
@@ -1910,6 +1921,7 @@ local	sessions	fork_point_turn_id	foreign
 local	sessions	goal_settings_override_json	non_relationship
 local	sessions	guidance_baseline_hash	non_relationship
 local	sessions	guidance_baseline_path	non_relationship
+local	sessions	is_assistant_thread	non_relationship
 local	sessions	last_active_at_unix_ms	non_relationship
 local	sessions	last_viewed_at_unix_ms	non_relationship
 local	sessions	lifecycle	non_relationship

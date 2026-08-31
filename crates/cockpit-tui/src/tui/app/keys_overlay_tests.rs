@@ -71,6 +71,8 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         title: Some("summary".to_string()),
         description: None,
         parent_session_id: None,
+        fork_point_turn_id: None,
+        is_assistant_thread: false,
         created_by_principal: None,
         shared_with_collaborators: false,
         fork_count: 0,
@@ -81,6 +83,8 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         activity_state: None,
         archived_at_unix_ms: None,
         pin_count: 0,
+        assistant_inbox_unread: 0,
+        assistant_inbox_latest_source_session_id: None,
     }
 }
 

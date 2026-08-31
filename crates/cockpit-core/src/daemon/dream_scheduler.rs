@@ -24,9 +24,10 @@ use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::session_search::HistoryCallerTrust;
 use crate::env_snapshot::EnvSnapshot;
+#[cfg(test)]
+use crate::knowledge::dream::knowledge_dream_run_lock_for_root;
 use crate::knowledge::dream::{
-    CanonicalDreamProjectRoot, history_caller_trust, knowledge_dream_run_lock_for_root,
-    resolve_dream_model,
+    CanonicalDreamProjectRoot, history_caller_trust, resolve_dream_model,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);

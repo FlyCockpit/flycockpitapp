@@ -3592,6 +3592,7 @@ pub fn fork_session_blocking(
     parent_session_id: uuid::Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
+    fresh_thread: bool,
 ) -> Result<(uuid::Uuid, String), String> {
     match request_on_endpoint(
         endpoint,
@@ -3599,6 +3600,7 @@ pub fn fork_session_blocking(
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
+            fresh_thread,
         },
     )? {
         Response::Forked {
@@ -3665,6 +3667,50 @@ pub fn read_session_messages_blocking(
         } if got == session_id => Ok((messages, has_more)),
         other => Err(format!(
             "unexpected read_session_messages response: {other:?}"
+        )),
+    }
+}
+
+pub fn read_assistant_inbox_blocking(
+    endpoint: &ClientEndpoint,
+    main_session_id: uuid::Uuid,
+) -> Result<Vec<proto::AssistantInboxItemWire>, String> {
+    let response = daemon_request_at_blocking(
+        endpoint,
+        Request::ReadAssistantInbox {
+            main_session_id,
+            // Inbox delivery into agent context must not erase the human's
+            // durable history view.
+            include_delivered: true,
+            limit: 100,
+        },
+    )?;
+    match response {
+        Response::AssistantInbox {
+            main_session_id: got,
+            items,
+        } if got == main_session_id => {
+            let inbox_item_ids: Vec<Uuid> = items.iter().map(|item| item.inbox_item_id).collect();
+            if !inbox_item_ids.is_empty() {
+                match daemon_request_at_blocking(
+                    endpoint,
+                    Request::AcknowledgeAssistantInboxHumanRead {
+                        main_session_id,
+                        inbox_item_ids,
+                    },
+                )? {
+                    Response::Ack => {}
+                    other => {
+                        return Err(format!(
+                            "unexpected acknowledge_assistant_inbox_human_read response: {other:?}"
+                        ));
+                    }
+                }
+            }
+            Ok(items)
+        }
+        other => Err(format!(
+            "unexpected read_assistant_inbox response: {other:?}"
         )),
     }
 }

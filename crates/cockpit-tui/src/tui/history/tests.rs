@@ -3292,3 +3292,64 @@ fn modes_session_setup_tool_row_verifying_shows_no_duplicate_or_hidden_content()
     assert_eq!(text.matches("echo hello").count(), 1);
     assert_eq!(text.matches("Verifying").count(), 1);
 }
+
+#[test]
+fn tool_call_view_filter_classifies_only_model_tool_presentations() {
+    fn subagent(outcome: Option<SubagentOutcome>) -> HistoryEntry {
+        HistoryEntry::Subagent {
+            parent: "Build".to_string(),
+            child: "explore".to_string(),
+            task_call_id: "task-1".to_string(),
+            label: "default".to_string(),
+            model_trusted: true,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: std::time::Instant::now(),
+            outcome,
+            expanded: false,
+        }
+    }
+
+    assert!(
+        HistoryEntry::ToolBox {
+            calls: Vec::new(),
+            view_offset: 0,
+            follow: true,
+        }
+        .is_tool_call_entry()
+    );
+    assert!(
+        HistoryEntry::ToolLine {
+            call_id: "call-1".to_string(),
+            tool: "write".to_string(),
+            summary: "src/lib.rs".to_string(),
+            icon_path: None,
+            state: ToolCallState::Success,
+        }
+        .is_tool_call_entry()
+    );
+    assert!(
+        HistoryEntry::Diff {
+            tool: "edit".to_string(),
+            path: "src/lib.rs".to_string(),
+            old: "old".to_string(),
+            new: "new".to_string(),
+        }
+        .is_tool_call_entry()
+    );
+    assert!(subagent(None).is_tool_call_entry());
+    assert!(
+        subagent(Some(SubagentOutcome {
+            report: "completed task report".to_string(),
+            failed: false,
+            duration: std::time::Duration::from_secs(1),
+            status: None,
+        }))
+        .is_tool_call_entry()
+    );
+    assert!(
+        !HistoryEntry::Plain {
+            line: "assistant message remains visible".to_string(),
+        }
+        .is_tool_call_entry()
+    );
+}

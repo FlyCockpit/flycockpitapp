@@ -440,10 +440,11 @@ impl Tool for IdleWakeActionTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // A dynamic capability is not proof that this invocation mutated
         // anything. Reserve an action only for calls that are not proven
-        // read-only, then retract it on ordinary failure. If cancellation
-        // drops the in-flight future, the reservation deliberately survives:
-        // the host call may already have changed state and the authority must
-        // not turn that uncertain result into a false no-op.
+        // read-only. A normal error is not proof of the converse: a dynamic
+        // host call can mutate before reporting an error. If cancellation
+        // drops the in-flight future, or the call returns an error, the
+        // reservation deliberately survives so the authority never turns an
+        // uncertain host effect into a false no-op.
         let action = if self.inner.effect() == ToolEffect::ReadOnly {
             None
         } else {
@@ -464,12 +465,7 @@ impl Tool for IdleWakeActionTool {
                 }
                 Ok(output)
             }
-            Err(error) => {
-                if let Some(action) = action {
-                    self.state.discard_action(action);
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -946,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_dynamic_tool_failure_retracts_its_provisional_action() {
+    async fn idle_dynamic_tool_failure_preserves_its_provisional_action() {
         let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
         let tool = IdleWakeActionTool::new(
             Arc::new(DynamicTestTool {
@@ -959,8 +955,8 @@ mod tests {
 
         assert!(tool.call(Value::Null, &ctx).await.is_err());
         assert!(
-            !state.has_persistent_action(),
-            "a failed dynamic call must leave an idle wake ephemeral"
+            state.has_persistent_action(),
+            "a failed dynamic call can mutate before returning its error"
         );
     }
 

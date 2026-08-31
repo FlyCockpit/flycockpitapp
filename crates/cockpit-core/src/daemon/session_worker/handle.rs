@@ -681,9 +681,12 @@ impl SessionConfigHandle {
             },
             None => {}
         }
-        Self::detached(SessionConfigSnapshot::with_hooks(
+        // Test contexts sometimes replace this snapshot to exercise a
+        // config-dependent tool decision. Keep their handle live over its
+        // isolated cell; production turn handles remain pinned by `repin`.
+        Self::new(Arc::new(RwLock::new(SessionConfigSnapshot::with_hooks(
             generation, providers, extended, hooks,
-        ))
+        ))))
     }
 
     fn read_shared(&self) -> SessionConfigSnapshot {
@@ -691,6 +694,15 @@ impl SessionConfigHandle {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Replace the isolated live snapshot used by a tool/replay test.
+    #[cfg(test)]
+    pub(crate) fn set_full_config_snapshot_for_tests(&self, snapshot: SessionConfigSnapshot) {
+        *self
+            .shared
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
     }
 
     /// The snapshot this handle reads: the pinned view if pinned, else the
@@ -2448,7 +2460,7 @@ pub enum SessionWork {
 /// sessions it creates to be unsandboxed. The session-spawn default is
 /// resolved here by the precedence daemon-flag → client-flag → ON.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn(
+pub(crate) fn spawn(
     session: Arc<Session>,
     guidance_proposals: Arc<
         tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
@@ -2469,6 +2481,7 @@ pub fn spawn(
     daemon_no_sandbox: bool,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     lsp: Arc<crate::daemon::lsp::LspManager>,
+    initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
@@ -2495,19 +2508,24 @@ pub fn spawn(
     // it uses the session's in-memory active agent, which is hydrated from the
     // persisted row or the deferred row built on new-session creation. The
     // worker still re-resolves async at startup for stale removed primaries.
-    let initial_agent = match session.assistant_name.clone() {
-        Some(name) => name,
-        None => {
-            let active = session.active_agent();
-            if crate::agents::is_builtin_primary(&active)
-                || crate::agents::is_removed_primary(&active)
-            {
-                crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
-            } else if !active.trim().is_empty() {
-                active
-            } else {
-                initial_active_agent(extended_cfg).to_string()
-            }
+    // `assistant_name` identifies SOUL/USER and knowledge ownership; it is
+    // not the active root. In particular, the built-in `Assistant` primary
+    // uses a lowercase durable identity key and must still open as `Assistant`.
+    // Computer mode, conversely, owns a dedicated root regardless of any
+    // identity attached to the session.
+    let initial_agent = if session.session_entry_mode()
+        == crate::daemon::proto::SessionEntryMode::Computer
+    {
+        "Computer".to_string()
+    } else {
+        let active = session.active_agent();
+        if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active)
+        {
+            crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
+        } else if !active.trim().is_empty() {
+            active
+        } else {
+            initial_active_agent(extended_cfg).to_string()
         }
     };
     // Resolve the new-session sandbox default (highest wins):
@@ -2534,6 +2552,10 @@ pub fn spawn(
     session.set_shell_compression(extended_cfg.shell_compression);
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let idle_activity_gate = crate::sync::lock_or_recover(&scheduler)
+        .as_ref()
+        .map(crate::daemon::scheduler::DaemonSchedulerHandle::activity_gate)
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
     let legacy_disk_origins = match session.persisted_disk_redaction_origins() {
@@ -2663,6 +2685,7 @@ pub fn spawn(
             worker_trust_policy,
             work_rx,
             idle_activity_tx.clone(),
+            idle_activity_gate,
             event_tx,
             turn_completions,
             redaction,
@@ -2676,6 +2699,7 @@ pub fn spawn(
             trust_transition_pending,
             authoritative_active_model_state,
             lsp,
+            initial_lsp_session_protection,
             resource_scheduler,
             scheduler,
             write_scope,

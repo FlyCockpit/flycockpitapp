@@ -52,7 +52,7 @@
   ],
   "counts": {
     "event": 84,
-    "request": 234,
+    "request": 235,
     "response": 157
   },
   "messages": {
@@ -868,6 +868,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "list_assistants"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_primary_assistant_soul_edit_mode"
       },
       {
         "class": "bounded_request_response",

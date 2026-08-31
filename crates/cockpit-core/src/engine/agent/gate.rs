@@ -560,6 +560,7 @@ mod safety_gate_tests {
         };
         ToolCtx {
             agent_id: "builder".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,
@@ -569,6 +570,7 @@ mod safety_gate_tests {
             dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
+            current_tool_call_scope: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),

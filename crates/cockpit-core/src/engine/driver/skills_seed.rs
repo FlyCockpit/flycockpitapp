@@ -304,6 +304,11 @@ impl Driver {
         let args = serde_json::json!({ "name": skill_name });
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
             executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
             knowledge_access_trusted: agent.model.is_trusted(),
             caller_model: Some(crate::engine::tool::CallerModel::from_model(
@@ -315,6 +320,7 @@ impl Driver {
             dream_read_scope: self.session.dream_read_scope(),
             workspace_lease: None,
             current_tool_call_id: None,
+            current_tool_call_scope: None,
             tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),

@@ -152,13 +152,11 @@ impl Tool for BashTool {
         Self::declared_binary_requirements()
     }
 
-    fn completed_call_effect(&self, args: &Value, output: &ToolOutput) -> ToolEffect {
-        // A non-zero shell exit is a failed invocation for idle-wake
-        // persistence. A timeout/cancellation with an unknown host effect is
-        // intentionally conservative: the wrapper retains its reservation.
-        if !output.host_effect_unknown && output.exit_code.is_none_or(|exit_code| exit_code != 0) {
-            return ToolEffect::ReadOnly;
-        }
+    fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {
+        // A non-zero shell exit says nothing about effects that occurred
+        // before it (for example, `touch marker && false`). A timeout or
+        // cancellation with an unknown host effect is likewise conservative.
+        // Only the lexical read-only proof may discard an idle wake action.
         if bash_command_is_proven_read_only(args.get("command").and_then(Value::as_str)) {
             ToolEffect::ReadOnly
         } else {
@@ -427,7 +425,23 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
-    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+    let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots(ctx)
+        .await?
+        .into_iter()
+        .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+            kind: "attached_knowledge_base".to_string(),
+            path,
+            access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        })
+        .collect::<Vec<_>>();
+    let attached_knowledge_read = !attached_knowledge_paths.is_empty();
+    let mut denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
+    let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+    )
+    .await;
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -467,22 +481,23 @@ async fn call_bash_inner(
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
-    let mut identity_write_targets = Vec::new();
-    if let ShellWriteTargets::Concrete(targets) = shell_write_targets(command, &cwd) {
-        for target in targets {
-            match crate::assistants::identity::check_identity_write(ctx, &target).await? {
-                crate::assistants::identity::IdentityWriteGate::Allow { note, .. } => {
-                    if let Some(note) = note {
-                        tracing::info!(%note, path = %target.display(), "assistant identity bash write allowed");
-                        identity_write_targets.push(target);
-                    }
-                }
-                crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
-                    return Ok(crate::assistants::identity::tool_refusal(message));
-                }
-            }
+    let mut identity_denied_paths = Vec::new();
+    let identity_accounting = match crate::assistants::identity::check_identity_shell(ctx).await? {
+        crate::assistants::identity::IdentityShellGate::NotAnAssistantSession => None,
+        crate::assistants::identity::IdentityShellGate::Protect { denied_paths } => {
+            identity_denied_paths = denied_paths;
+            None
         }
-    }
+        crate::assistants::identity::IdentityShellGate::Allow { note, accounting } => {
+            if let Some(note) = note {
+                tracing::info!(%note, "assistant identity shell invocation allowed");
+            }
+            Some(accounting)
+        }
+        crate::assistants::identity::IdentityShellGate::Refuse(message) => {
+            return Ok(crate::assistants::identity::tool_refusal(message));
+        }
+    };
 
     tracing::debug!(command, timeout_ms, "bash: spawning");
 
@@ -512,18 +527,25 @@ async fn call_bash_inner(
             "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    if !denied_knowledge_paths.is_empty() && options.force_unconfined {
+    // SOUL/USER and untrusted knowledge bases use the same hard read fence.
+    // Keep the identity list separately for diagnostics, then include it in
+    // the sandbox policy passed to the process launcher.
+    denied_knowledge_paths.extend(identity_denied_paths.iter().cloned());
+    if (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+        && options.force_unconfined
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash cannot run unconfined while a local knowledge base requires a trusted model.",
+            "Access denied: bash cannot run unconfined while protected local files require filesystem confinement.",
         ));
     }
     let sandbox_on = if ctx.write_scope.is_some()
         || ctx.workspace_lease.is_some()
         || !denied_knowledge_paths.is_empty()
+        || !write_denied_knowledge_paths.is_empty()
     {
         true
     } else {
-        sandbox_enabled && !options.force_unconfined
+        (sandbox_enabled || !identity_denied_paths.is_empty()) && !options.force_unconfined
     };
 
     let escalation_preauthorized_scope =
@@ -536,10 +558,13 @@ async fn call_bash_inner(
 
     let is_container_run = !options.force_unconfined
         && ctx.workspace_lease.is_none()
+        && identity_denied_paths.is_empty()
         && ctx.session.sandbox_mode().is_container();
-    if is_container_run && !denied_knowledge_paths.is_empty() {
+    if is_container_run
+        && (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash is unavailable for this model because container execution cannot exclude a local knowledge base that requires a trusted model.",
+            "Access denied: bash is unavailable because container execution cannot enforce the local knowledge-base filesystem fence.",
         ));
     }
     // Reject legacy sealed binding fields before any lookup or spawn.
@@ -598,6 +623,7 @@ async fn call_bash_inner(
             &resource_plan,
             ctx,
             timeout_note,
+            identity_accounting,
         )
         .await;
     }
@@ -615,7 +641,11 @@ async fn call_bash_inner(
         // Not consulted on these paths; the gate ignores it.
         crate::tools::shell_sandbox::SandboxAvailability::Available
     };
-    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability);
+    let gate = crate::tools::shell_sandbox::gate_decision_requiring_confinement(
+        sandbox_on,
+        !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+        &availability,
+    );
 
     if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
         // Sandbox enabled but cannot initialize: record the accurate
@@ -641,6 +671,12 @@ async fn call_bash_inner(
             unavailable_reason: Some(reason.clone()),
             resource_profiles: command_resource_plan.metas.clone(),
         };
+        if !identity_denied_paths.is_empty() {
+            return Ok(ToolOutput::text(format!(
+                "Error: `bash` needs filesystem confinement while soul_edit_mode=human_only so SOUL.md/USER.md remain protected, but the shell sandbox cannot start here ({reason}). Keep the identity files human-only or use native file tools for other work."
+            ))
+            .with_sandbox(meta));
+        }
         if !options.escalated
             && ctx.tool_steering == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
@@ -737,8 +773,9 @@ async fn call_bash_inner(
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
-    let extra_sandbox_paths =
+    let mut extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
+    extra_sandbox_paths.extend(attached_knowledge_paths);
     let sandbox_cwd = ctx
         .workspace_lease
         .as_ref()
@@ -773,9 +810,11 @@ async fn call_bash_inner(
         &session_env,
         &extra_sandbox_paths,
         &denied_knowledge_paths,
+        &write_denied_knowledge_paths,
         ctx,
         timeout_ms,
         &mut resource_lease,
+        identity_accounting.clone(),
     )
     .await;
     let outcome = match attempt {
@@ -848,6 +887,7 @@ async fn call_bash_inner(
     if confine
         && !options.escalated
         && denied_knowledge_paths.is_empty()
+        && write_denied_knowledge_paths.is_empty()
         && ctx.write_scope.is_none()
         && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
@@ -916,9 +956,11 @@ async fn call_bash_inner(
                 &session_env,
                 &extra_sandbox_paths,
                 &denied_knowledge_paths,
+                &write_denied_knowledge_paths,
                 ctx,
                 timeout_ms,
                 &mut resource_lease,
+                identity_accounting.clone(),
             )
             .await;
             match rerun {
@@ -1002,10 +1044,6 @@ async fn call_bash_inner(
         final_outcome.stderr.push(b'\n');
     }
 
-    for target in &identity_write_targets {
-        crate::assistants::identity::record_identity_write(ctx, target).await?;
-    }
-
     // Native shell-output compression (implementation note):
     // when the session has the `shell compression` setting enabled, run
     // each stream through cockpit's rtk-native filter (generic noise strip
@@ -1066,7 +1104,8 @@ async fn call_bash_inner(
     };
     let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
     let sidecar = bash_output_sidecar(command, &cwd, &final_outcome, &body, truncated_for_display);
-    if truncated_for_display {
+    let knowledge_source = attached_knowledge_read.then(|| body.clone());
+    let mut out = if truncated_for_display {
         // Head+tail so the `exit:` line and any stderr at the tail
         // survive — the failure signal usually lives there.
         let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
@@ -1075,20 +1114,24 @@ async fn call_bash_inner(
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
         }
-        Ok(match exit_field {
+        match exit_field {
             Some(code) => out.with_exit_code(code),
             None => out,
-        })
+        }
     } else {
         let mut out = ToolOutput::text(body).with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
         }
-        Ok(match exit_field {
+        match exit_field {
             Some(code) => out.with_exit_code(code),
             None => out,
-        })
+        }
+    };
+    if let Some(knowledge_source) = knowledge_source {
+        crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &knowledge_source);
     }
+    Ok(out)
 }
 
 async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result<()> {
@@ -2421,6 +2464,7 @@ async fn run_container_bash(
     resource_plan: &ResourcePlan,
     ctx: &ToolCtx,
     timeout_note: Option<&str>,
+    identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) -> Result<ToolOutput> {
     let mode = ctx.session.sandbox_mode();
     let mut meta = crate::engine::tool::SandboxMeta {
@@ -2448,6 +2492,7 @@ async fn run_container_bash(
         ctx,
         timeout_ms,
         &mut resource_lease,
+        identity_accounting,
     )
     .await;
     let final_outcome = match attempt {
@@ -2516,6 +2561,7 @@ async fn run_container_shell(
     ctx: &ToolCtx,
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
+    identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) -> RunOutcome {
     let manager = crate::container::container_manager()
         .get_or_init(|| async { crate::container::ContainerManager::detect() })
@@ -2596,6 +2642,8 @@ async fn run_container_shell(
         timeout_ms,
         vec![serde_json::json!({"execute": {"command": command}})],
         resource_lease,
+        false,
+        identity_accounting,
     )
     .await
 }
@@ -2697,10 +2745,15 @@ async fn run_shell(
     session_env: &std::collections::HashMap<String, String>,
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     denied_knowledge_paths: &[PathBuf],
+    write_denied_knowledge_paths: &[PathBuf],
     ctx: &ToolCtx,
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
+    identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) -> RunOutcome {
+    let attached_knowledge_read = extra_sandbox_paths
+        .iter()
+        .any(|path| path.kind == "attached_knowledge_base");
     #[cfg(test)]
     if let Some(scripted) = TEST_RUN_SHELL_OUTCOMES.with(|slot| slot.borrow_mut().pop_front()) {
         let (expected_confine, outcome) = scripted;
@@ -2736,6 +2789,7 @@ async fn run_shell(
                 .map(|lease| lease.allows_write())
                 .unwrap_or(true),
             denied_knowledge_paths,
+            write_denied_knowledge_paths,
         )
         .await
         {
@@ -2791,7 +2845,16 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
-    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects, resource_lease).await
+    run_prepared_command(
+        cmd,
+        ctx,
+        timeout_ms,
+        concrete_effects,
+        resource_lease,
+        attached_knowledge_read,
+        identity_accounting,
+    )
+    .await
 }
 
 async fn run_prepared_command(
@@ -2800,6 +2863,8 @@ async fn run_prepared_command(
     timeout_ms: u64,
     concrete_effects: Vec<serde_json::Value>,
     resource_lease: &mut Option<ResourceLeaseGuard>,
+    attached_knowledge_read: bool,
+    identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2850,17 +2915,43 @@ async fn run_prepared_command(
             stderr_task.abort();
             let _ = stdout_task.join().await;
             let _ = stderr_task.join().await;
+            if let Some(accounting) = identity_accounting.clone() {
+                if let Err(error) = accounting.publish().await {
+                    return RunOutcome::WaitError(std::io::Error::other(error.to_string()));
+                }
+            }
             return RunOutcome::Cancelled;
         }
         res = tokio::time::timeout_at(deadline, child.wait()) => match res {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return RunOutcome::WaitError(e),
+            Ok(Err(e)) => {
+                // A failed wait leaves the child state unknown. Reclaim the
+                // process group and drains before publishing identity hashes;
+                // otherwise a surviving shell could write after accounting
+                // has declared its final state.
+                kill_child(&mut child, child_pid).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.join().await;
+                let _ = stderr_task.join().await;
+                if let Some(accounting) = identity_accounting.clone() {
+                    if let Err(error) = accounting.publish().await {
+                        return RunOutcome::WaitError(std::io::Error::other(error.to_string()));
+                    }
+                }
+                return RunOutcome::WaitError(e);
+            }
             Err(_) => {
                 kill_child(&mut child, child_pid).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 let _ = stdout_task.join().await;
                 let _ = stderr_task.join().await;
+                if let Some(accounting) = identity_accounting.clone() {
+                    if let Err(error) = accounting.publish().await {
+                        return RunOutcome::WaitError(std::io::Error::other(error.to_string()));
+                    }
+                }
                 return RunOutcome::TimedOut;
             }
         },
@@ -2898,6 +2989,8 @@ async fn run_prepared_command(
                 bridge,
                 job_id.clone(),
                 resource_lease.take(),
+                attached_knowledge_read,
+                identity_accounting,
             )
             .await;
             return RunOutcome::Backgrounded(job_id);
@@ -2908,6 +3001,12 @@ async fn run_prepared_command(
     let stderr = stderr_task.join().await.bytes;
     let exit = status.code().unwrap_or(-1);
     let signaled = !status.success() && status.code().is_none();
+
+    if let Some(accounting) = identity_accounting
+        && let Err(error) = accounting.publish().await
+    {
+        return RunOutcome::WaitError(std::io::Error::other(error.to_string()));
+    }
 
     RunOutcome::Done(ShellOutcome {
         stdout,
@@ -2928,6 +3027,8 @@ async fn spawn_adopted_shell_completion(
     bridge: crate::engine::agent::ForegroundQueueBridge,
     job_id: String,
     resource_lease: Option<ResourceLeaseGuard>,
+    attached_knowledge_read: bool,
+    identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) {
     let adopted_cancel = cancel.child_token();
     let waiter_cancel = adopted_cancel.clone();
@@ -2955,6 +3056,11 @@ async fn spawn_adopted_shell_completion(
                     kill_child(&mut child, child_pid).await;
                     let _ = stdout_task.join().await;
                     let _ = stderr_task.join().await;
+                    if let Some(accounting) = identity_accounting {
+                        if let Err(error) = accounting.publish().await {
+                            tracing::error!(%error, "publishing cancelled adopted bash identity hashes failed");
+                        }
+                    }
                     return;
                 };
                 let outcome = match wait_result {
@@ -2971,6 +3077,11 @@ async fn spawn_adopted_shell_completion(
                         )
                     }
                     Ok(Err(error)) => {
+                        // A failed wait leaves adopted-process ownership
+                        // unresolved. Reclaim it before publishing identity
+                        // hashes so a survivor cannot write after accounting
+                        // has recorded a terminal state.
+                        kill_child(&mut child, child_pid).await;
                         stdout_task.abort();
                         stderr_task.abort();
                         let _ = stdout_task.join().await;
@@ -2985,6 +3096,18 @@ async fn spawn_adopted_shell_completion(
                         let _ = stderr_task.join().await;
                         "Error: adopted bash process timed out".to_string()
                     }
+                };
+                let outcome = if attached_knowledge_read {
+                    crate::knowledge::fence_knowledge_content_if_needed(&outcome)
+                } else {
+                    outcome
+                };
+                let outcome = if let Some(accounting) = identity_accounting
+                    && let Err(error) = accounting.publish().await
+                {
+                    format!("{outcome}\nError: assistant identity hash publication failed: {error:#}")
+                } else {
+                    outcome
                 };
                 let bounded = if outcome.len() > OUTPUT_BYTE_CAP {
                     truncate_head_tail(&outcome, OUTPUT_BYTE_CAP)
@@ -3101,7 +3224,9 @@ fn scrub_overrides(
 
 #[cfg(test)]
 mod idle_wake_effect_tests {
-    use super::bash_command_is_proven_read_only;
+    use super::{BashTool, bash_command_is_proven_read_only};
+    use crate::engine::tool::{Tool, ToolEffect, ToolOutput};
+    use serde_json::json;
 
     #[test]
     fn only_simple_read_only_shell_forms_are_proven_read_only() {
@@ -3120,6 +3245,17 @@ mod idle_wake_effect_tests {
                 "{command} must retain the dynamic effect"
             );
         }
+    }
+
+    #[test]
+    fn nonzero_dynamic_shell_completion_remains_stateful() {
+        let tool = BashTool::new();
+        let output = ToolOutput::text("exit: 1\n").with_exit_code(1);
+
+        assert_eq!(
+            tool.completed_call_effect(&json!({ "command": "touch marker && false" }), &output),
+            ToolEffect::Dynamic
+        );
     }
 }
 

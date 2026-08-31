@@ -92,6 +92,29 @@ fn knowledge_base_registry_round_trips_through_extended_config_doc() {
 }
 
 #[test]
+fn duplicate_knowledge_base_ids_are_rejected_before_config_can_grant_them() {
+    let local = |path| {
+        KnowledgeBaseRegistryEntry::new(
+            "shared".to_string(),
+            "Shared knowledge".to_string(),
+            "A local knowledge source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from(path),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        )
+    };
+
+    let error = validate_knowledge_base_local_policy(&[local("one"), local("two")])
+        .expect_err("a registry label must name exactly one retrieval authority");
+    assert!(error.to_string().contains("duplicate ID `shared`"));
+}
+
+#[test]
 fn configured_knowledge_attachment_provisional_identity_follows_its_source() {
     let entry = KnowledgeBaseRegistryEntry::new(
         "project".to_string(),
@@ -134,6 +157,85 @@ fn configured_knowledge_attachment_id_is_not_accepted_from_workspace_config() {
     .unwrap_err();
 
     assert!(error.to_string().contains("attachmentId"));
+}
+
+#[test]
+fn overlapping_local_knowledge_roots_are_rejected() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge/nested")).unwrap();
+    std::fs::write(
+        tmp.path().join("config.json"),
+        r#"{
+          "knowledgeBases": [
+            {
+              "id": "outer",
+              "name": "Outer",
+              "description": "Outer",
+              "source": {"kind": "local", "path": ".cockpit/knowledge"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            },
+            {
+              "id": "inner",
+              "name": "Inner",
+              "description": "Inner",
+              "source": {"kind": "local", "path": ".cockpit/knowledge/nested"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let _trust = enter_trusted_workspace(tmp.path());
+    let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
+    assert!(error.to_string().contains("overlapping roots"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_local_knowledge_roots_fail_closed_when_a_symlinked_child_root_is_not_yet_materialized()
+ {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("knowledge");
+    std::fs::create_dir_all(real.join("nested")).unwrap();
+    symlink(&real, tmp.path().join("alias")).unwrap();
+    std::fs::write(
+        tmp.path().join("config.json"),
+        r#"{
+          "knowledgeBases": [
+            {
+              "id": "outer",
+              "name": "Outer",
+              "description": "Outer",
+              "source": {"kind": "local", "path": "knowledge"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            },
+            {
+              "id": "inner",
+              "name": "Inner",
+              "description": "Inner",
+              "source": {"kind": "local", "path": "alias/nested/future-child"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let _trust = enter_trusted_workspace(tmp.path());
+    let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
+    assert!(error.to_string().contains("overlapping roots"), "{error}");
+    assert!(error.to_string().contains("future-child"), "{error}");
 }
 
 #[test]
@@ -3613,4 +3715,18 @@ fn extended_config_has_no_image_spend_field() {
             .is_none(),
         "a loaded config must never round-trip an image_spend policy"
     );
+}
+
+#[test]
+fn computer_primary_target_defaults_real_and_allows_virtual_opt_in() {
+    assert_eq!(
+        ExtendedConfig::default().computer_target,
+        ComputerTarget::RealDesktop
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, br#"{"computer_target":"virtual"}"#).unwrap();
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert_eq!(cfg.computer_target, ComputerTarget::Virtual);
 }

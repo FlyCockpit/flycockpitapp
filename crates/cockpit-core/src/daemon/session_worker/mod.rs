@@ -589,11 +589,12 @@ pub use effective_sandbox::{
     evaluate_set_sandbox, sandbox_capability_snapshot, sandbox_capability_snapshot_with_reasons,
     sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
 };
+pub(crate) use handle::spawn;
 pub use handle::{
     FIRST_PUBLISHED_CONFIG_GENERATION, InteractiveClientGuard, OversizedRunInvocationAdmission,
     OversizedTextArtifactAdmission, ReplaceConfigSnapshotAck, ReplaceConfigSnapshotResult,
     SessionConfigHandle, SessionConfigSnapshot, SessionWork, SessionWorkTrustReconciling,
-    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
+    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
 };
 pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use helpers::DAEMON_NO_SANDBOX_ENV;

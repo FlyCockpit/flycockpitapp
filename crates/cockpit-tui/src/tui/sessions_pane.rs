@@ -298,6 +298,8 @@ pub enum SessionsOutcome {
         session_id: Uuid,
         before_seq: Option<i64>,
     },
+    /// Load the highlighted main session's durable project inbox.
+    LoadInbox { main_session_id: Uuid },
     /// Execute a daemon-owned archive/delete/unarchive mutation without
     /// waiting in the input reducer, then reload this browser level.
     Mutate(SessionsMutationEffect),
@@ -484,6 +486,16 @@ impl SessionsPane {
                     key: "Enter",
                     action: "resume",
                     desc: "resume the highlighted session",
+                },
+                KeyBinding {
+                    key: "i",
+                    action: "inbox source",
+                    desc: "open the latest assistant inbox source thread",
+                },
+                KeyBinding {
+                    key: "n",
+                    action: "inbox",
+                    desc: "show notify and pending assistant inbox entries",
                 },
                 KeyBinding {
                     key: "→/l",
@@ -699,6 +711,10 @@ impl SessionsPane {
         self.selected().map(|summary| summary.session_id)
     }
 
+    pub(crate) fn selected_session_id_for_action(&self) -> Option<Uuid> {
+        self.selected_id()
+    }
+
     pub fn take_preview_load(&mut self) -> Option<(Uuid, Option<i64>)> {
         let preview = self.preview.as_ref()?;
         (self.daemon_connected && preview.loading)
@@ -878,6 +894,29 @@ impl SessionsPane {
                     return Some(SessionsOutcome::Resume(s.session_id));
                 }
             }
+            KeyCode::Char('i') => {
+                if !self.daemon_connected {
+                    self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
+                } else if let Some(source_session_id) = self
+                    .selected()
+                    .and_then(|session| session.assistant_inbox_latest_source_session_id)
+                {
+                    // Reuse App's daemon-owned attach/resume path. The source
+                    // identity is durable data from ListSessions, not a local
+                    // database lookup or display-only short id.
+                    return Some(SessionsOutcome::Resume(source_session_id));
+                } else {
+                    self.notice = Some("No assistant inbox source for this session.".to_string());
+                }
+            }
+            KeyCode::Char('n') => {
+                if !self.daemon_connected {
+                    self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
+                } else if let Some(main_session_id) = self.selected_id() {
+                    self.notice = Some("Loading assistant inbox...".to_string());
+                    return Some(SessionsOutcome::LoadInbox { main_session_id });
+                }
+            }
             // Drill into the highlighted session's forks.
             KeyCode::Right | KeyCode::Char('l') => {
                 let before_depth = self.levels.len();
@@ -927,6 +966,32 @@ impl SessionsPane {
             _ => {}
         }
         None
+    }
+
+    pub fn apply_inbox_result(
+        &mut self,
+        main_session_id: Uuid,
+        result: Result<Vec<cockpit_proto::AssistantInboxItemWire>, String>,
+    ) {
+        if self.selected_id() != Some(main_session_id) {
+            return;
+        }
+        self.notice = Some(match result {
+            Ok(items) if items.is_empty() => "Assistant inbox is empty.".to_string(),
+            Ok(items) => items
+                .into_iter()
+                .map(|item| {
+                    format!(
+                        "{} ← {}: {}",
+                        item.delivery,
+                        short_id(&item.raising_session_id.to_string()),
+                        item.summary
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  •  "),
+            Err(error) => format!("Assistant inbox: {error}"),
+        });
     }
 
     fn move_cursor(&mut self, delta: isize) -> bool {
@@ -1978,6 +2043,17 @@ pub fn card_lines(
         };
         meta.push(Span::styled(pin, Style::default().fg(Color::Yellow)));
     }
+    if s.assistant_inbox_unread > 0 {
+        meta.push(Span::raw("  "));
+        let source = s
+            .assistant_inbox_latest_source_session_id
+            .map(|id| short_id(&id.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        meta.push(Span::styled(
+            format!("inbox {} ← {source}", s.assistant_inbox_unread),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     out.push(boxed_row(meta, inner_w, border_style));
 
     // Row 3 (only when forks exist): fork hint.
@@ -2245,6 +2321,8 @@ mod tests {
             title: None,
             description: None,
             parent_session_id: None,
+            fork_point_turn_id: None,
+            is_assistant_thread: false,
             fork_count: 0,
             descendant_count: 0,
             last_viewed_at_unix_ms: None,
@@ -2255,6 +2333,8 @@ mod tests {
             created_by_principal: None,
             shared_with_collaborators: false,
             pin_count: 0,
+            assistant_inbox_unread: 0,
+            assistant_inbox_latest_source_session_id: None,
         }
     }
 
@@ -2752,6 +2832,70 @@ mod tests {
         let mut s = summary(Uuid::new_v4(), 0);
         s.title = Some("fix-redact-allowlist".into());
         assert_eq!(card_description(&s), "fix-redact-allowlist");
+    }
+
+    #[test]
+    fn assistant_inbox_badge_includes_source_thread_backlink() {
+        let mut session = summary(Uuid::new_v4(), 0);
+        let source = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        session.assistant_inbox_unread = 2;
+        session.assistant_inbox_latest_source_session_id = Some(source);
+        let rendered = card_lines(&session, Tier::Idle, false, false, 80, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(rendered.contains("inbox 2"));
+        assert!(rendered.contains("12345678"));
+    }
+
+    #[test]
+    fn assistant_inbox_key_navigates_to_source_thread() {
+        let main = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let mut session = summary(main, 0);
+        session.assistant_inbox_unread = 1;
+        session.assistant_inbox_latest_source_session_id = Some(source);
+        let mut pane =
+            SessionsPane::open(None, std::path::Path::new("/project"), true, None, false);
+        pane.apply_sessions_result(Ok(vec![session]));
+
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Char('i'))),
+            Some(SessionsOutcome::Resume(id)) if id == source
+        ));
+    }
+
+    #[test]
+    fn assistant_inbox_notify_action_requests_and_renders_durable_rows() {
+        let main = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let mut pane =
+            SessionsPane::open(None, std::path::Path::new("/project"), true, None, false);
+        pane.apply_sessions_result(Ok(vec![summary(main, 0)]));
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Char('n'))),
+            Some(SessionsOutcome::LoadInbox { main_session_id }) if main_session_id == main
+        ));
+
+        pane.apply_inbox_result(
+            main,
+            Ok(vec![cockpit_proto::AssistantInboxItemWire {
+                inbox_item_id: Uuid::new_v4(),
+                assistant_name: "helper".into(),
+                main_session_id: main,
+                raising_session_id: source,
+                operation_id: "notify-1".into(),
+                summary: "Please review the local result".into(),
+                delivery: "notify".into(),
+                created_at_unix_ms: 1,
+                delivered_at_unix_ms: None,
+                human_read_at_unix_ms: None,
+            }]),
+        );
+        let notice = pane.notice.as_deref().unwrap();
+        assert!(notice.contains("notify"));
+        assert!(notice.contains("Please review the local result"));
+        assert!(notice.contains(&short_id(&source.to_string())));
     }
 
     /// Per-session pin count renders on the card only when non-zero

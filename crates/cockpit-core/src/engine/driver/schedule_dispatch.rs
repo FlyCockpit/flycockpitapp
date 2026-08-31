@@ -479,34 +479,67 @@ impl Driver {
         // boundary: protected roots force zerobox confinement even when the
         // ordinary session sandbox is disabled.
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots_for_model(
+            &self.session,
             &self.cwd,
             &self.config.extended(),
-            agent.model.is_trusted(),
+            agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases()),
+            !agent.delegated && agent.model.is_trusted(),
         )
+        .await
         .map_err(|error| {
             format!("Error: cannot resolve local knowledge-base access policy: {error}")
         })?;
-        let sandbox_on = self.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
+        let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots_for_model(
+            &self.session,
+            &self.cwd,
+            &self.config.extended(),
+            agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases()),
+            !agent.delegated && agent.model.is_trusted(),
+        )
+        .await
+        .map_err(|error| {
+            format!("Error: cannot resolve local knowledge-base access policy: {error}")
+        })?;
+        let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+            &self.session,
+            &self.cwd,
+            &self.config.extended(),
+        )
+        .await;
+        let sandbox_on = self.session.sandbox_enabled()
+            || !denied_knowledge_paths.is_empty()
+            || !write_denied_knowledge_paths.is_empty();
         let availability = if sandbox_on {
             background_sandbox_availability(cwd).await
         } else {
             crate::tools::shell_sandbox::SandboxAvailability::Available
         };
-        match crate::engine::schedule::background::background_launch_gate(sandbox_on, &availability)
-        {
+        match crate::engine::schedule::background::background_launch_gate(
+            sandbox_on,
+            !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+            &availability,
+        ) {
             crate::tools::shell_sandbox::SandboxGate::Unconfined => {
                 Ok(crate::engine::schedule::background::BackgroundLaunch::unconfined(session_env))
             }
             crate::tools::shell_sandbox::SandboxGate::Confine => Ok(
-                crate::engine::schedule::background::BackgroundLaunch::confined_with_denied_knowledge_paths(
+                crate::engine::schedule::background::BackgroundLaunch::confined_with_knowledge_paths(
                     self.session.tmp_dir(),
                     self.session.workspace_scratch_dir(),
                     session_env,
+                    attached_knowledge_paths,
                     denied_knowledge_paths,
+                    write_denied_knowledge_paths,
                 ),
             ),
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
-                if denied_knowledge_paths.is_empty() {
+                if denied_knowledge_paths.is_empty() && write_denied_knowledge_paths.is_empty() {
                     Err(background_sandbox_unavailable_refusal(&reason))
                 } else {
                     Err(background_knowledge_sandbox_unavailable_refusal(&reason))

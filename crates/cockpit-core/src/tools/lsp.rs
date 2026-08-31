@@ -84,6 +84,11 @@ impl Tool for LspTool {
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
         .await?;
+        // `Tool::call` is also used by private verification investigation,
+        // which deliberately bypasses the normal tool dispatcher.  Keep the
+        // opaque LSP host boundary fenced here as well: an LSP server rooted
+        // in the workspace can write outside this read-only navigation API.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name()).await?;
         let out = lsp
             .navigate(
                 &ctx.cwd,
@@ -114,4 +119,53 @@ fn optional_u32(args: &Value, key: &str) -> Result<Option<u32>> {
         )));
     }
     Ok(Some(n as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::extended::{
+        ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
+        KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
+    };
+
+    #[tokio::test]
+    async fn direct_lsp_call_keeps_local_knowledge_host_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let mut ctx = crate::tools::common::test_ctx(workspace.path());
+        ctx.lsp = Some(std::sync::Arc::new(crate::daemon::lsp::LspManager::new()));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                ExtendedConfig {
+                    knowledge_bases: vec![KnowledgeBaseRegistryEntry::new(
+                        "private".to_string(),
+                        "Private".to_string(),
+                        "Private local knowledge".to_string(),
+                        KnowledgeBaseSource::Local {
+                            path: workspace.path().join("knowledge"),
+                        },
+                        KnowledgeBaseEmbeddingOwnership::Local,
+                        None,
+                        None,
+                        false,
+                        KnowledgeBaseMergePolicy::Auto,
+                    )],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let error = LspTool
+            .call(
+                serde_json::json!({"operation": "hover", "file": "src.rs"}),
+                &ctx,
+            )
+            .await
+            .expect_err("direct LSP calls must not reach the host with a local KB");
+        assert!(error.to_string().contains("knowledge bases are read-only"));
+    }
 }

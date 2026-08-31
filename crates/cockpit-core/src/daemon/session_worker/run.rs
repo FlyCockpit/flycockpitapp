@@ -6067,6 +6067,7 @@ pub(super) async fn run_worker(
     trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
     idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
+    idle_activity_gate: Arc<tokio::sync::Mutex<()>>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
@@ -6080,6 +6081,7 @@ pub(super) async fn run_worker(
     trust_transition_pending: Arc<std::sync::atomic::AtomicI64>,
     authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
+    initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
@@ -6126,6 +6128,22 @@ pub(super) async fn run_worker(
         start_config = snapshot.clone();
     }
     let extended_cfg = start_config.extended.clone();
+    // Production startup hands this guard over from the registry after it
+    // publishes the local-KB policy but before the worker becomes live. The
+    // standalone path retains its own publication for direct worker tests.
+    // In either case this binding owns the policy until worker teardown.
+    let lsp_session_protection = match initial_lsp_session_protection {
+        Some(protection) => protection,
+        None => {
+            let protected_lsp_roots = crate::knowledge::configured_local_knowledge_roots(
+                &session,
+                &project_root,
+                &extended_cfg,
+            )
+            .await;
+            lsp.protect_session(session_id, protected_lsp_roots).await
+        }
+    };
     let daemon_agents_dir = start_config.daemon_agents_dir.clone().or_else(|| {
         crate::config::resolve::cockpit_data_dir()
             .ok()
@@ -6168,17 +6186,20 @@ pub(super) async fn run_worker(
         prepared_root_launch.is_some(),
         session.is_freshly_created(),
     );
-    // Root primary: the session's stored active agent (so a resume restarts
+    // Root primary: Computer entry-mode owns a dedicated root; other sessions
+    // use the stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
-    // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`). Issue #75: the mode axis no longer
-    // selects the primary — `defaultPrimaryAgent` governs.
-    let root_agent_name = match session.assistant_name.clone() {
-        Some(name) => name,
-        None => match prepared_root_launch.as_ref() {
+    // configured default when it's unset/unknown. `assistant_name` carries
+    // identity/knowledge ownership only; it must not replace a built-in root
+    // such as `Assistant`. Computer mode is the one explicit mode-owned root.
+    // Removed stored primaries force the release default (`Build`).
+    let root_agent_name = if session.session_entry_mode() == proto::SessionEntryMode::Computer {
+        "Computer".to_string()
+    } else {
+        match prepared_root_launch.as_ref() {
             Some(prepared) => prepared.root_agent_name.clone(),
             None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
-        },
+        }
     };
     if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
@@ -6445,14 +6466,18 @@ pub(super) async fn run_worker(
             .await
             {
                 Ok(agent) => agent,
-                Err(error) if prepared_root_launch.is_none() => {
+                Err(error) if prepared_root_launch.is_none() && root_agent_name != "Computer" => {
                     tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
                     builtin::default_build(&spawn_args)
                 }
                 Err(error) => {
-                    let message = format!(
-                        "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
-                    );
+                    let message = if root_agent_name == "Computer" {
+                        format!("Computer primary could not start: {error:#}")
+                    } else {
+                        format!(
+                            "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                        )
+                    };
                     tracing::error!(%message, %session_id, "session startup refused");
                     let mut driver_failed = false;
                     emit_session_driver_failed_once(
@@ -6467,14 +6492,18 @@ pub(super) async fn run_worker(
                 }
             }
         }
-        Err(error) if prepared_root_launch.is_none() => {
+        Err(error) if prepared_root_launch.is_none() && root_agent_name != "Computer" => {
             tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
             builtin::default_build(&spawn_args)
         }
         Err(error) => {
-            let message = format!(
-                "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
-            );
+            let message = if root_agent_name == "Computer" {
+                format!("Computer primary could not start: {error:#}")
+            } else {
+                format!(
+                    "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                )
+            };
             tracing::error!(%message, %session_id, "session startup refused");
             let mut driver_failed = false;
             emit_session_driver_failed_once(
@@ -6541,6 +6570,8 @@ pub(super) async fn run_worker(
             return;
         }
     };
+    #[cfg(test)]
+    session.record_booted_root_for_test(&root_result);
     let root = Arc::new(root_result);
     let root_is_vnext = root
         .definition
@@ -6864,7 +6895,7 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
-    driver.set_idle_activity_sender(idle_activity_tx.clone());
+    driver.set_idle_activity_sender(idle_activity_tx.clone(), idle_activity_gate.clone());
     driver.bind_enqueue_target(foreground_input_target.clone());
     let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
     driver.set_adopted_process_registry(adopted_processes.clone());
@@ -6892,7 +6923,7 @@ pub(super) async fn run_worker(
         crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
     );
-    driver.set_lsp_manager(lsp);
+    driver.set_lsp_manager(lsp.clone());
     if let Some(scheduler) = resource_scheduler {
         driver.set_resource_scheduler(scheduler);
     }
@@ -7243,6 +7274,18 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let extended = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &session,
+                &project_root,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 session.process_containment(),
@@ -7262,6 +7305,7 @@ pub(super) async fn run_worker(
                 start_source: Some(start_source),
                 ..Default::default()
             },
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -11022,6 +11066,16 @@ pub(super) async fn run_worker(
                     // stack-last transition can adopt between that clone and
                     // this insert; using it here would strand the item on a
                     // dead id (AC2).
+                    // The gate starts before the queue mutation and remains
+                    // held through both activity publications. A due idle
+                    // wake therefore either commits before this acceptance or
+                    // observes its reset; it cannot run in the inserted-but-
+                    // unannounced gap.
+                    let _idle_activity_admission = if reset_idle_timer {
+                        Some(idle_activity_gate.lock().await)
+                    } else {
+                        None
+                    };
                     let (id, snapshot, outcome) = driver_input_queue
                         .push_idempotent_on_live_target(
                             receipt,
@@ -11051,19 +11105,16 @@ pub(super) async fn run_worker(
                     if reset_idle_timer
                         && matches!(outcome, crate::engine::message::IdempotentPush::Inserted)
                     {
-                        // `push_idempotent_on_live_target` returns without a
-                        // further await. Publish the in-process epoch before
-                        // any later await, so a due idle timer cannot run in
-                        // the accepted-message gap. The scheduler updates its
-                        // persistent idle timeline before its own
-                        // wake/rebuild await as well.
+                        // The admission gate is still held, so a due idle
+                        // timer cannot commit until it can observe this epoch
+                        // and the durable scheduler's rebuilt timeline.
                         let _ = idle_activity_tx.send(tokio::time::Instant::now());
                         let scheduler = ingress_scheduler
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
                         if let Some(scheduler) = scheduler {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
                     }
                     let queue: Vec<proto::QueueItem> =
@@ -12607,6 +12658,38 @@ pub(super) async fn run_worker(
                     expected_trust_revision,
                     respond_to,
                 } => {
+                    let previous_config = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let previously_protected_lsp_roots =
+                        crate::knowledge::configured_local_knowledge_roots(
+                            &session,
+                            &project_root,
+                            &previous_config.extended,
+                        )
+                        .await;
+                    // Publish the union before the snapshot CAS. A turn that
+                    // captured the old no-KB config can otherwise resume
+                    // after publication and start an opaque workspace LSP
+                    // host. Keep removed roots through the CAS too: a short
+                    // conservative fence is safer than prematurely loosening
+                    // an old turn's authority.
+                    let replacement_protected_lsp_roots =
+                        crate::knowledge::configured_local_knowledge_roots(
+                            &session,
+                            &project_root,
+                            &snapshot.extended,
+                        )
+                        .await;
+                    let mut provisional_lsp_roots = previously_protected_lsp_roots.clone();
+                    for root in &replacement_protected_lsp_roots {
+                        if !provisional_lsp_roots.contains(root) {
+                            provisional_lsp_roots.push(root.clone());
+                        }
+                    }
+                    lsp.set_session_protected_roots(session_id, provisional_lsp_roots)
+                        .await;
                     let result = replace_config_snapshot_if_current(
                         &config_snapshot,
                         *snapshot,
@@ -12614,7 +12697,17 @@ pub(super) async fn run_worker(
                         expected_trust_revision,
                     );
                     let changed = result.changed;
-                    if changed {
+                    if !changed {
+                        lsp.set_session_protected_roots(session_id, previously_protected_lsp_roots)
+                            .await;
+                    } else {
+                        // The new snapshot is now authoritative, so release
+                        // any root it removed while retaining its additions.
+                        lsp.set_session_protected_roots(
+                            session_id,
+                            replacement_protected_lsp_roots,
+                        )
+                        .await;
                         let refreshed = config_snapshot
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -13693,6 +13786,18 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let extended = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &session,
+                &project_root,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 session.process_containment(),
@@ -13712,6 +13817,7 @@ pub(super) async fn run_worker(
                 end_reason: Some(end_matcher),
                 ..Default::default()
             },
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -13800,6 +13906,10 @@ pub(super) async fn run_worker(
             }
         }
     }
+    // Clear the worker's registry-wide contribution before reporting the
+    // terminal session event. Early startup returns are covered by the same
+    // guard's `Drop` implementation.
+    drop(lsp_session_protection);
     send_current_event(
         &event_tx,
         &redaction,

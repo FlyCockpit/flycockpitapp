@@ -69,10 +69,41 @@ impl App {
     fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
         let was_visible = self.sticky_header_area.is_some();
         if was_visible != visible {
+            // A completed selection belongs to transcript content, not to a
+            // particular viewport origin. Keep it attached to that content
+            // while the sticky header carves (or restores) its two rows.
+            // An in-progress drag must still be cancelled: its pointer
+            // coordinates can no longer describe a valid gesture.
+            let completed_selection = self.selection.filter(|selection| !selection.active);
+            let completed_spans = completed_selection.map(|_| self.selection_spans.clone());
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,
                 self.event_loop_monotonic_now,
             );
+            if let Some(mut selection) = completed_selection {
+                let shift = STICKY_USER_HEADER_HEIGHT;
+                if visible {
+                    selection.anchor.1 = selection.anchor.1.saturating_add(shift);
+                    selection.focus.1 = selection.focus.1.saturating_add(shift);
+                } else {
+                    selection.anchor.1 = selection.anchor.1.saturating_sub(shift);
+                    selection.focus.1 = selection.focus.1.saturating_sub(shift);
+                }
+                self.selection = Some(selection);
+                self.selection_spans = completed_spans.map(|spans| {
+                    spans
+                        .into_iter()
+                        .map(|mut span| {
+                            span.row = if visible {
+                                span.row.saturating_add(shift)
+                            } else {
+                                span.row.saturating_sub(shift)
+                            };
+                            span
+                        })
+                        .collect()
+                });
+            }
             self.chat_scroll_anchor = None;
         }
         self.sticky_header_area = visible.then(|| Rect {

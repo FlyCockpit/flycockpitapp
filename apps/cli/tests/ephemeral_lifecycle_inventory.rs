@@ -11,16 +11,17 @@ const RAW_AUTHORITY: &[&str] = &[
 ];
 const EXPECTED_RUNNERS: &[(&str, &str)] = &[
     ("commands/doctor.rs", "run"),
+    ("commands/dream.rs", "run"),
     ("commands/init.rs", "run"),
     ("commands/invocation.rs", "cancel"),
     ("commands/invocation.rs", "status"),
+    ("commands/knowledge.rs", "mutate_attachment"),
     ("commands/learn.rs", "run"),
     ("commands/run.rs", "run"),
     ("commands/schedule.rs", "create"),
     ("commands/schedule.rs", "list"),
     ("commands/schedule.rs", "run_now"),
     ("commands/schedule.rs", "set_enabled"),
-    ("commands/session.rs", "answer_inner"),
 ];
 
 fn rust_files(root: &Path) -> Vec<PathBuf> {

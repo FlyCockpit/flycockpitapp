@@ -2300,10 +2300,28 @@ fn workspace_scratch_dir_for_session(
             let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing `{}`", marker_path.display()))?;
             anyhow::ensure!(
-                marker.project_id == project_id && marker.canonical_root == canonical_root,
-                "workspace marker does not match this project identity"
+                marker.project_id == project_id,
+                "workspace marker project id does not match directory"
             );
-            marker.created_at_unix_ms
+
+            if marker.canonical_root == canonical_root {
+                marker.created_at_unix_ms
+            } else if project_id_for(Path::new(&marker.canonical_root))
+                .ok()
+                .as_deref()
+                == Some(project_id)
+            {
+                // A live directory object with this identity is already
+                // bound to a different canonical root. Never retarget its
+                // durable scratch by accepting an alternate pathname.
+                anyhow::bail!("workspace marker does not match this project identity");
+            } else {
+                // Project IDs are derived from directory-object identity.
+                // Filesystems may reuse that identity after a workspace is
+                // removed, leaving a marker whose old root no longer proves
+                // the current project. Replace only that stale reverse map.
+                now
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => now,
         Err(error) => {

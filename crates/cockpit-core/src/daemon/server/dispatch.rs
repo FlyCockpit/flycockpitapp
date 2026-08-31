@@ -6643,7 +6643,11 @@ async fn handle_serialized_request_impl(
                 })?;
             let decision = ctx
                 .db
-                .decision_attention_page(record.root_id.0, None, 256)
+                .decision_attention_page(
+                    record.root_id.0,
+                    None,
+                    crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+                )
                 .await
                 .map_err(internal)?
                 .entries
@@ -27461,7 +27465,11 @@ async fn code_root_read_from_attached_response(
         .and_then(|row| row.title);
     let attention = ctx
         .db
-        .decision_attention_page(session_id, None, 256)
+        .decision_attention_page(
+            session_id,
+            None,
+            crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+        )
         .await
         .map_err(internal)?
         .entries
@@ -27533,7 +27541,11 @@ async fn code_root_read_snapshot(
         .map_err(internal)?;
     let attention = ctx
         .db
-        .decision_attention_page(root_id.0, None, 256)
+        .decision_attention_page(
+            root_id.0,
+            None,
+            crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+        )
         .await
         .map_err(internal)?
         .entries

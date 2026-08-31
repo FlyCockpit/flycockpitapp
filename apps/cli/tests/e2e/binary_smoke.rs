@@ -38,7 +38,7 @@ fn daemon_status_is_isolated_to_test_home() {
         .args(["daemon", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("canonical daemon not running"));
+        .stdout(predicate::str::contains("daemon: not running"));
 }
 
 #[test]

@@ -26,6 +26,8 @@ pub const ASSISTANT_WIZARD_ID: &str = "assistant";
 /// The lower-case name is an internal persistence key; the user-facing root
 /// agent remains the built-in `Assistant` definition.
 pub const PRIMARY_ASSISTANT_IDENTITY_NAME: &str = "assistant";
+const PRIMARY_ASSISTANT_INSTALLATION_ID: Uuid =
+    Uuid::from_u128(0xa551_57a0_0000_4000_8000_0000_0000_0181);
 #[cfg(test)]
 pub(crate) const VALID_ASSISTANT_CONTENT_HASH_FIXTURE: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -119,6 +121,17 @@ pub fn validate_assistant_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a user-managed named assistant. The daemon-owned identity for the
+/// built-in primary is deliberately excluded from every ordinary CRUD/chat
+/// entry point.
+pub fn validate_named_assistant_name(name: &str) -> Result<()> {
+    validate_assistant_name(name)?;
+    if name == PRIMARY_ASSISTANT_IDENTITY_NAME {
+        bail!("assistant name `{name}` is reserved for Cockpit's built-in Assistant primary");
+    }
+    Ok(())
+}
+
 pub fn default_home_dir(name: &str) -> Result<PathBuf> {
     Ok(crate::config::resolve::cockpit_data_dir()?
         .join("assistants")
@@ -191,6 +204,7 @@ pub async fn create_assistant_with_installation_id(
     spec: CreateAssistantSpec,
     installation_id: Uuid,
 ) -> Result<AssistantRow> {
+    validate_named_assistant_name(&spec.name)?;
     create_assistant_with_installation_id_and_soul_edit_mode(
         db,
         spec,
@@ -324,7 +338,7 @@ fn create_assistant_with_installation_id_sync(
 /// the standard assistant knowledge attachment.
 pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
     if let Some(row) = db.get_assistant(PRIMARY_ASSISTANT_IDENTITY_NAME).await? {
-        return Ok(row);
+        return validate_primary_assistant(db, row).await;
     }
 
     let home_dir = default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?;
@@ -339,7 +353,7 @@ pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
     match create_assistant_with_installation_id_and_soul_edit_mode(
         db,
         spec,
-        Uuid::new_v4(),
+        PRIMARY_ASSISTANT_INSTALLATION_ID,
         identity::SoulEditMode::Autonomous,
     )
     .await
@@ -349,10 +363,49 @@ pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
             // Another daemon/bootstrap race provisioned the same durable
             // identity. Use the stored row; no error-string matching or
             // duplicate home initialization is needed.
-            Some(row) => Ok(row),
+            Some(row) => validate_primary_assistant(db, row).await,
             None => Err(create_error).context("provisioning built-in Assistant identity"),
         },
     }
+}
+
+async fn validate_primary_assistant(db: &Db, row: AssistantRow) -> Result<AssistantRow> {
+    anyhow::ensure!(
+        row.name == PRIMARY_ASSISTANT_IDENTITY_NAME,
+        "built-in Assistant identity has an invalid registry name"
+    );
+    let home = validate_row_home(&row)?;
+    anyhow::ensure!(
+        home == default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?,
+        "built-in Assistant identity has an invalid daemon-owned home"
+    );
+    let config: AssistantConfig = serde_json::from_str(&row.config_json)
+        .context("parsing built-in Assistant identity configuration")?;
+    anyhow::ensure!(
+        config.installation_id == PRIMARY_ASSISTANT_INSTALLATION_ID,
+        "reserved assistant identity is not the daemon-owned built-in Assistant installation"
+    );
+    anyhow::ensure!(
+        config.agent_source == assistant_definition_path(&home).to_string_lossy(),
+        "built-in Assistant identity has invalid definition provenance"
+    );
+    anyhow::ensure!(
+        config.soul_edit_mode == identity::SoulEditMode::Autonomous,
+        "built-in Assistant identity must default to autonomous SOUL editing"
+    );
+    let definition = load_verified(db, PRIMARY_ASSISTANT_IDENTITY_NAME)
+        .await?
+        .context("built-in Assistant identity definition is missing")?;
+    let vnext = definition
+        .agent
+        .vnext
+        .context("built-in Assistant identity definition has no vNext provenance")?;
+    anyhow::ensure!(
+        vnext.agent_id == format!("local/{PRIMARY_ASSISTANT_INSTALLATION_ID}")
+            && vnext.execution_kind == ExecutionKind::Assistant,
+        "built-in Assistant identity definition provenance does not match its daemon installation"
+    );
+    Ok(row)
 }
 
 /// The sole daemon-owned v2 template for private assistants.  CLI-side
@@ -489,7 +542,7 @@ pub fn spec_from_wizard(
     home_dir: PathBuf,
     run: &WizardRun,
 ) -> Result<CreateAssistantSpec> {
-    validate_assistant_name(name)?;
+    validate_named_assistant_name(name)?;
     let description = text_answer(run, "description").context("assistant description missing")?;
     let prompt = text_answer(run, "prompt").context("assistant prompt missing")?;
     Ok(CreateAssistantSpec {
@@ -1015,7 +1068,7 @@ pub async fn delete_registration(db: &Db, name: &str, expected_revision: &str) -
 
 fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Result<bool> {
     recover_unregister_journals_sync(db)?;
-    validate_assistant_name(name)?;
+    validate_named_assistant_name(name)?;
     let Some(row) = get_assistant_blocking(db, name)? else {
         return Ok(false);
     };
@@ -1406,12 +1459,40 @@ mod tests {
 
         assert_eq!(first.name, PRIMARY_ASSISTANT_IDENTITY_NAME);
         assert_eq!(second.name, PRIMARY_ASSISTANT_IDENTITY_NAME);
+        assert_eq!(config.installation_id, PRIMARY_ASSISTANT_INSTALLATION_ID);
         assert_eq!(config.soul_edit_mode, identity::SoulEditMode::Autonomous);
         assert!(
             default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)
                 .unwrap()
                 .join("knowledge")
                 .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_creation_cannot_claim_reserved_primary_identity() {
+        let env = crate::test_env::lock_async().await;
+        let temp = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", temp.path());
+        let db = Db::open_in_memory().unwrap();
+        let error = create_assistant(
+            &db,
+            CreateAssistantSpec {
+                name: PRIMARY_ASSISTANT_IDENTITY_NAME.into(),
+                description: "ordinary assistant".into(),
+                prompt: "ordinary prompt".into(),
+                home_dir: default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME).unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("reserved"), "{error:#}");
+        assert!(
+            db.get_assistant(PRIMARY_ASSISTANT_IDENTITY_NAME)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

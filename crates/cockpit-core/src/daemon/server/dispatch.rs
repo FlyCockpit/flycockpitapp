@@ -9078,6 +9078,8 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            crate::assistants::validate_named_assistant_name(&assistant_id)
+                .map_err(|error| bad_request(error.to_string()))?;
             let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
@@ -9206,7 +9208,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
             }
-            crate::assistants::validate_assistant_name(&name)
+            crate::assistants::validate_named_assistant_name(&name)
                 .map_err(|error| bad_request(error.to_string()))?;
             if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request("assistant markdown exceeds maximum length"));

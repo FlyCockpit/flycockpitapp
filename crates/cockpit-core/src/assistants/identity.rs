@@ -62,11 +62,36 @@ pub enum IdentityWriteGate {
 /// identity-bearing assistant session. Shell syntax cannot soundly enumerate
 /// every process-level writer, so restrictive identity modes gate the complete
 /// invocation instead of trusting a best-effort redirect parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum IdentityShellGate {
     NotAnAssistantSession,
-    Allow { note: Option<String> },
+    Allow {
+        note: Option<String>,
+        accounting: IdentityShellAccounting,
+    },
     Refuse(String),
+}
+
+/// Ownership token for one authorized shell attempt. The caller must publish
+/// both identity hashes after every attempt that crossed process creation. If
+/// the process is adopted after the tool returns, this token moves with that
+/// process and publishes only after its terminal wait/kill, so a later session
+/// load cannot misclassify a model-owned edit as an external one.
+#[derive(Debug, Clone)]
+pub struct IdentityShellAccounting {
+    db: Db,
+    row: AssistantRow,
+    home: PathBuf,
+}
+
+impl IdentityShellAccounting {
+    pub async fn publish(self) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            record_identity_shell_write_sync(&self.db, self.row, &self.home)
+        })
+        .await
+        .context("assistant shell identity coordinator joined")?
+    }
 }
 
 pub fn soul_path(home_dir: &Path) -> PathBuf {
@@ -404,6 +429,7 @@ pub async fn check_identity_shell(ctx: &ToolCtx) -> Result<IdentityShellGate> {
                         " assistant shell invocation approved for identity-bearing session; identity hashes will be refreshed."
                             .to_string(),
                     ),
+                    accounting: IdentityShellAccounting { db: ctx.session.db.clone(), row, home },
                 })
             } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
                 Ok(IdentityShellGate::Refuse(
@@ -421,6 +447,7 @@ pub async fn check_identity_shell(ctx: &ToolCtx) -> Result<IdentityShellGate> {
                 " assistant shell invocation allowed by soul_edit_mode=autonomous; identity hashes will be refreshed."
                     .to_string(),
             ),
+            accounting: IdentityShellAccounting { db: ctx.session.db.clone(), row, home },
         }),
     }
 }
@@ -440,16 +467,28 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
         .context("assistant identity write coordinator joined")?
 }
 
-/// Rehash both identity files after an allowed arbitrary shell invocation.
-/// Unlike direct write/edit tools, shell commands need not expose their target
-/// paths, so refreshing the complete two-file identity state is the only
-/// sound postcondition.
-pub async fn record_identity_shell_write(ctx: &ToolCtx) -> Result<()> {
-    let Some((_row, home)) = assistant_identity(ctx).await? else {
-        return Ok(());
-    };
-    record_identity_write(ctx, &soul_path(&home)).await?;
-    record_identity_write(ctx, &user_path(&home)).await
+fn record_identity_shell_write_sync(db: &Db, requested: AssistantRow, home: &Path) -> Result<()> {
+    let validated_home = crate::assistants::validate_row_home(&requested)?;
+    anyhow::ensure!(
+        validated_home == home,
+        "assistant identity home changed during shell execution"
+    );
+    let definition = crate::assistants::assistant_definition_path(home);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    super::recover_creation_journal_locked(db, home)?;
+    let row = super::get_assistant_blocking(db, &requested.name)?
+        .context("assistant disappeared while recording shell identity writes")?;
+    crate::assistants::validate_row_home(&row)?;
+    super::recover_definition_journal_locked(db, &row)?;
+    let row = super::get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during shell identity recovery")?;
+    let mut config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
+    config.soul_hash = hash_optional_file(&soul_path(home))?;
+    config.user_hash = hash_optional_file(&user_path(home))?;
+    let config_json = serde_json::to_string(&config)?;
+    update_identity_hashes_cas_blocking(db, row, config_json)?;
+    Ok(())
 }
 
 fn record_identity_write_sync(

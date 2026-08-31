@@ -3636,6 +3636,34 @@ async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
 }
 
 #[tokio::test]
+async fn resolve_root_agent_builtin_assistant_uses_persisted_primary_not_identity_key() {
+    use crate::config::extended::DefaultPrimaryAgent as D;
+    let db = crate::db::Db::open_in_memory().unwrap();
+    db.upsert_assistant(
+        crate::assistants::PRIMARY_ASSISTANT_IDENTITY_NAME,
+        "/tmp/assistant",
+        "{}",
+        crate::assistants::VALID_ASSISTANT_CONTENT_HASH_FIXTURE,
+    )
+    .await
+    .unwrap();
+    let row = db
+        .create_assistant_session(
+            "proj",
+            "/proj",
+            "Assistant",
+            crate::assistants::PRIMARY_ASSISTANT_IDENTITY_NAME,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        "Assistant"
+    );
+}
+
+#[tokio::test]
 async fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();

@@ -119,7 +119,7 @@ fn media_repair_request(
 }
 
 async fn new(args: AssistantNewArgs) -> Result<()> {
-    crate::assistants::validate_assistant_name(&args.name)?;
+    crate::assistants::validate_named_assistant_name(&args.name)?;
     let home_dir = default_home_dir(&args.name)?;
     let descriptor = crate::assistants::descriptor();
     let mut io = StdTerminalIo;
@@ -319,6 +319,7 @@ fn verified_assistant_definition(
 }
 
 async fn delete(args: AssistantDeleteArgs) -> Result<()> {
+    crate::assistants::validate_named_assistant_name(&args.name)?;
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant delete")?;
@@ -464,7 +465,7 @@ async fn fetch_assistant(
 }
 
 async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
-    crate::assistants::validate_assistant_name(name)?;
+    crate::assistants::validate_named_assistant_name(name)?;
     let project_root = std::env::current_dir().context("resolving cwd")?;
     let project_root_str = project_root.to_string_lossy().into_owned();
     let daemon = ensure_assistant_persistent_daemon()

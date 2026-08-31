@@ -1686,7 +1686,7 @@ impl SessionRegistry {
             _guard: &worker_publication_guard,
         };
         let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-        crate::assistants::validate_assistant_name(assistant_name)?;
+        crate::assistants::validate_named_assistant_name(assistant_name)?;
         crate::assistants::load_verified(&self.inner.db, assistant_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;

@@ -1552,6 +1552,33 @@ fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
     session
 }
 
+fn sidecar_grantable_pointer_session() -> image_sidecar::SidecarSession {
+    let mut session = sidecar_pointer_session();
+    session.reducer.resolution = Some(image_sidecar::SidecarEffectiveTrace {
+        primary: Some(image_sidecar::SidecarPrimaryTrace {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            trust: "trusted".into(),
+            location: "public_cloud".into(),
+            credential_fingerprint: "fixture".into(),
+        }),
+        matched_source: "fixture".into(),
+        sidecar_provider: Some("openai".into()),
+        sidecar_model: Some("gpt-4o".into()),
+        origin: Some("https://api.example".into()),
+        capability_source: "configured".into(),
+        capability_freshness: "fresh".into(),
+        config_generation: 1,
+        mode: pointer_actions::SidecarModeChoice::Automatic,
+        available: true,
+        fallback_outcome: None,
+        reason: "selected".into(),
+    });
+    session.reducer.grant_candidate_id = Some("fixture-candidate".into());
+    session.selected_invocation = Some("inv-1".into());
+    session
+}
+
 #[test]
 fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
     use pointer_actions::{SettingsPointerAction, SidecarAction, SidecarModeChoice};
@@ -1588,7 +1615,7 @@ fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
 fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
     use pointer_actions::SettingsPointerAction;
 
-    let builders: [fn(&TempDir) -> SettingsDialog; 11] = [
+    let builders: [fn(&TempDir) -> SettingsDialog; 14] = [
         |tmp| {
             dialog_with_sidecar_page(
                 tmp,
@@ -1596,12 +1623,11 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
             )
         },
         |tmp| {
+            let mut session = sidecar_pointer_session();
+            session.form.local_edits_preserved = true;
             dialog_with_sidecar_page(
                 tmp,
-                image_sidecar::sidecar_page(
-                    image_sidecar::SidecarPageKind::ModeEditor,
-                    sidecar_pointer_session(),
-                ),
+                image_sidecar::sidecar_page(image_sidecar::SidecarPageKind::ModeEditor, session),
             )
         },
         |tmp| {
@@ -1611,6 +1637,14 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
                     image_sidecar::SidecarPageKind::DefaultEditor,
                     sidecar_pointer_session(),
                 ),
+            )
+        },
+        |tmp| {
+            let mut session = sidecar_pointer_session();
+            session.conflict = Some("fixture conflict".into());
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(image_sidecar::SidecarPageKind::ModeEditor, session),
             )
         },
         |tmp| {
@@ -1628,6 +1662,17 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
                 image_sidecar::sidecar_page(
                     image_sidecar::SidecarPageKind::CentralPolicyEditor,
                     sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            let mut session = sidecar_pointer_session();
+            session.form.local_edits_preserved = true;
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::CentralPolicyEditor,
+                    session,
                 ),
             )
         },
@@ -1674,6 +1719,15 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
                 image_sidecar::sidecar_page(
                     image_sidecar::SidecarPageKind::GrantEditor,
                     sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::GrantEditor,
+                    sidecar_grantable_pointer_session(),
                 ),
             )
         },

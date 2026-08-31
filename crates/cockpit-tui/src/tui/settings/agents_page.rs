@@ -2207,7 +2207,7 @@ impl AgentsPage {
                 }
                 self.editing = draft.take();
                 self.status = Some(format!(
-                    "daemon authoritatively rejected editor settlement: {}",
+                    "failed to atomically commit external edit: {}",
                     error.message
                 ));
             }

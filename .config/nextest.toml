@@ -48,6 +48,14 @@ slow-timeout = { period = "90s", terminate-after = 3 }
 filter = "test(=commands::setup::tests::baseten_provider_wizard_materializes_secret_reference)"
 slow-timeout = { period = "90s", terminate-after = 3 }
 
+# The pointer action registry opens a fresh settings dialog for every rendered
+# category descriptor. Its exhaustive inventory grew beyond the default 120s
+# wall-clock budget; keep all coverage active with an explicit contract-test
+# timeout.
+[[profile.default.overrides]]
+filter = "test(=tui::settings::pointer_acceptance_tests::settings_pointer_action_registry_is_exhaustive_and_operable)"
+slow-timeout = { period = "90s", terminate-after = 4 }
+
 # Inner-loop profile for iterative agent runs. Skips only apps/cli's
 # integration-test binary (`kind(test)`), which spawns the real `cockpit`
 # binary and live daemons — the most expensive link + runtime in the

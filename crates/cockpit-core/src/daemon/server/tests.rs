@@ -16341,6 +16341,7 @@ fn dispatch_matrix_class_for_command(
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
         | ("pinned_message_state", "session_row_reader", false)
+        | ("read_assistant_inbox", "session_row_reader", false)
         | ("read_agent_tree", "session_row_reader", false)
         | ("read_agent_attention", "session_row_reader", false)
         | ("get_agent_effective_settings", "session_row_reader", false)
@@ -17269,6 +17270,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_write"
         | "fs_create_dir"
         | "read_session_messages"
+        | "read_assistant_inbox"
         | "read_client_submission_receipt"
         | "read_history_page"
         | "read_subagent_history_page"
@@ -17700,6 +17702,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_terminal("lsp_control"),
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
+        authz_session_reader("read_assistant_inbox"),
         authz_session_reader("read_client_submission_receipt"),
         authz_session_reader("read_history_page"),
         authz_session_reader("read_subagent_history_page"),
@@ -19179,6 +19182,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "read_session_messages" => Request::ReadSessionMessages {
             session_id,
             before_seq: None,
+            limit: 20,
+        },
+        "read_assistant_inbox" => Request::ReadAssistantInbox {
+            main_session_id: session_id,
+            include_delivered: false,
             limit: 20,
         },
         "read_client_submission_receipt" => Request::ReadClientSubmissionReceipt {
@@ -25331,6 +25339,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "pinned_message_state",
         "read_agent_attention",
         "read_agent_tree",
+        "read_assistant_inbox",
         "read_bulk_transfer_chunk",
         "read_redacted_export_chunk",
         "read_client_submission_receipt",
@@ -25557,6 +25566,17 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 limit: 20,
             },
             kind: "read_session_messages",
+            session_id: Some(transcript_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReadAssistantInbox {
+                main_session_id: transcript_session_id,
+                include_delivered: false,
+                limit: 20,
+            },
+            kind: "read_assistant_inbox",
             session_id: Some(transcript_session_id),
             audit_path: None,
             mutating: false,

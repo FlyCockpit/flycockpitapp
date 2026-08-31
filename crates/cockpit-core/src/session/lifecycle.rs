@@ -798,6 +798,23 @@ impl Session {
             // through a production workspace marker.
             std::fs::canonicalize(&project_root).unwrap_or(project_root)
         };
+        #[cfg(any(test, feature = "test-support"))]
+        let initialize_workspace_scratch = {
+            // Test-support rows intentionally use a separate project-id
+            // namespace so they cannot publish a process-global workspace
+            // marker. Those rows can still flow through the ordinary daemon
+            // resume path, which otherwise has no caller-side indication that
+            // the persisted row is synthetic. The durable project id is the
+            // discriminator: never downgrade an unrecognised production row.
+            let synthetic_id = Self::project_id_for_session_root(&project_root, false)?;
+            if row.project_id == synthetic_id {
+                false
+            } else if project_id_for(&project_root).ok().as_deref() == Some(&row.project_id) {
+                true
+            } else {
+                initialize_workspace_scratch
+            }
+        };
         anyhow::ensure!(
             Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
                 == row.project_id,

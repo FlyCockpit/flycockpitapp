@@ -68,13 +68,10 @@ impl App {
 
     fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
         // Carving or releasing the two-line header is a layout change, not a
-        // user gesture. Keep the offset-from-bottom and copy map so a header
-        // flip cannot yank the viewport, but clear the live screen-coordinate
-        // selection: its rows would otherwise point at different transcript
-        // content after the carve changes the viewport origin.
-        if self.sticky_header_area.is_some() != visible {
-            self.selection = None;
-        }
+        // user gesture. Keep the selection grid and offset-from-bottom so a
+        // header flip cannot yank the viewport or discard an active copy
+        // selection. `render_history` rebuilds the grid against the carved
+        // chat rectangle in this same frame.
         self.sticky_header_area = visible.then(|| Rect {
             x: pane.x,
             y: pane.y,

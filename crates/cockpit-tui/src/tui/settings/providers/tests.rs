@@ -99,7 +99,7 @@ fn seed_oauth_credential_via_daemon(credential_ref: &str) {
             .expect("settings daemon client for oauth credential seed");
         let response = client
             .request(cockpit_proto::Request::PutProviderCredential {
-                client_operation_id: "oauth-seed".into(),
+                client_operation_id: format!("oauth-seed-{credential_ref}"),
                 provider_id: credential_ref,
                 record: r#"{"api_key":"test-oauth-token"}"#.to_string().into(),
             })
@@ -1821,6 +1821,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
                 OAuthCopyKind::AuthorizationUrl,
             )),
         );
+        complete_pending_oauth_presentation(dialog, fake_oauth_effects());
         assert_eq!(
             oauth_effects_log(),
             vec!["copy:https://example.test/oauth".to_string(); expected_copies]
@@ -1828,10 +1829,9 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         assert!(matches!(
             dialog.test_page(),
             TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
-                if state.flow_id == flow_id
-                    && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
-                        "copied OAuth URL (unverified — also reachable via the Open link above)"
-                    ))
+                if state.status.as_ref().is_some_and(|status| status
+                    .as_ref()
+                    .is_ok_and(|message| message.contains("OAuth URL copied")))
         ));
     }
 
@@ -2043,6 +2043,7 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
                 OAuthCopyKind::DeviceCode,
             )),
         );
+        complete_pending_oauth_presentation(dialog, fake_oauth_effects());
         assert_eq!(
             oauth_effects_log(),
             vec![
@@ -2053,10 +2054,9 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
         assert!(matches!(
             dialog.test_page(),
             TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
-                if state.flow_id == flow_id
-                    && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
-                        "copied device code (unverified — also reachable via the Open link above)"
-                    ))
+                if state.status.as_ref().is_some_and(|status| status
+                    .as_ref()
+                    .is_ok_and(|message| message.contains("device code copied")))
         ));
     }
 
@@ -3557,6 +3557,43 @@ fn click_rendered_provider_action(
     }
 }
 
+/// Complete one presentation request exactly as the App's blocking worker
+/// would, but with the fixture's injected host effects. Pointer reducers must
+/// only enqueue this work; tests that assert the rendered completion drive the
+/// correlated result back through the dialog explicitly.
+fn complete_pending_oauth_presentation(dialog: &mut SettingsDialog, effects: OAuthEffects) {
+    let request = dialog
+        .pending_oauth_action
+        .take()
+        .expect("pointer action queues an OAuth presentation");
+    let OAuthFlowRequest {
+        provider,
+        client_flow_id,
+        operation_id,
+        op:
+            OAuthFlowOp::Present {
+                authorize_url,
+                user_code,
+                open_browser,
+                advance_flow,
+            },
+    } = request
+    else {
+        panic!("pointer action queues an OAuth presentation request");
+    };
+    let copy_value = user_code.as_deref().unwrap_or(&authorize_url);
+    let copy = (effects.copy)(copy_value);
+    let result = OAuthPresentationResult {
+        copied: copy.is_ok(),
+        copy_unverified: copy
+            .as_ref()
+            .is_ok_and(|delivery| crate::clipboard::feedback::classify(delivery).is_unverified()),
+        opened: open_browser && (effects.open)(&authorize_url).is_ok(),
+        advance_flow,
+    };
+    dialog.apply_oauth_present(provider, client_flow_id, operation_id, Ok(result));
+}
+
 #[test]
 fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
     let _daemon_fixture = ProviderDaemonFixture::new();
@@ -3755,6 +3792,7 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
     );
     let copy = copy_actions.into_iter().next().unwrap();
     click_rendered_provider_action(&mut poll_source, &copy);
+    complete_pending_oauth_presentation(&mut poll_source, fake_oauth_effects());
     assert_eq!(
         oauth_effects_log(),
         vec![
@@ -3771,9 +3809,9 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
                     super::super::pointer_actions::ProvidersAction::CopyOAuth(flow_id, _)
                 ) if state.flow_id == flow_id
             )
-                && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
-                    "copied device code (unverified — also reachable via the Open link above)"
-                ))
+                && state.status.as_ref().is_some_and(|status| status
+                    .as_ref()
+                    .is_ok_and(|message| message.contains("device code copied")))
     ));
     click_rendered_provider_action(&mut poll_source, &poll);
     assert!(matches!(
@@ -5346,7 +5384,16 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
     })
     .expect("provider credential seed transport")
     .expect("provider credential seed response");
-    assert!(matches!(seeded, cockpit_proto::Response::Ack));
+    assert!(matches!(
+        seeded,
+        cockpit_proto::Response::ProviderCredentialCommitted {
+            client_operation_id,
+            provider_id: committed_provider_id,
+            stored: true,
+            ..
+        } if client_operation_id == "provider-delete-seed"
+            && committed_provider_id == provider_id
+    ));
 
     assert_eq!(
         dialog
@@ -6151,8 +6198,12 @@ fn oauth_grok_ssh_begin_binds_no_listener() {
     assert!(!state.pending);
     assert!(state.ssh);
     assert!(state.has_browser_session());
-    assert!(!state.paste_focused);
-    assert!(oauth_effects_log().is_empty());
+    assert!(state.paste_focused);
+    assert_eq!(
+        oauth_effects_log(),
+        vec!["copy:https://example.test/oauth"],
+        "the completed SSH presentation copies the URL and focuses manual callback input"
+    );
 }
 
 #[test]

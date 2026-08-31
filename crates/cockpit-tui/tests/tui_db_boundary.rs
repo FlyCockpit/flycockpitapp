@@ -2692,8 +2692,11 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         "in-process shutdown must retain and join the supervisor thread"
     );
     let lifecycle_source = production_source(&read("crates/cockpit-core/src/daemon/client.rs"));
-    assert!(lifecycle_source.contains("futures::future::join_all"));
-    assert!(lifecycle_source.contains("for force in &force_handles"));
+    assert!(
+        lifecycle_source.contains("in_process_owner: Option<crate::daemon::InProcessDaemonGuard>")
+    );
+    assert!(lifecycle_source.contains("drop(client);"));
+    assert!(lifecycle_source.contains("owner.shutdown().await"));
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(!settings.contains("serve_lifecycle_requests"));
     assert!(!settings.contains("LifecycleClient::channel"));

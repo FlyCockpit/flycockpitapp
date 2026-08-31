@@ -659,7 +659,11 @@ impl DaemonIngress {
             .context("opening an independent ACP Code-root attachment")
     }
 
-    fn install(&self, attachment: cockpit_proto::CodeRootAttachmentV1, client: DaemonClient) {
+    fn register_attachment(
+        &self,
+        attachment: cockpit_proto::CodeRootAttachmentV1,
+        client: DaemonClient,
+    ) {
         self.state.lock().expect("ACP state").attachments.insert(
             attachment.root_id.0.to_string(),
             Attachment {
@@ -770,7 +774,7 @@ impl SessionIngress for DaemonIngress {
             }
         };
         let session_id = attachment.root_id.0.to_string();
-        self.install(attachment, client);
+        self.register_attachment(attachment, client);
         counters.daemon_mutations += 1;
         Ok(json!({ "sessionId": session_id }))
     }

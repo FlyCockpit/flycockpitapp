@@ -434,6 +434,7 @@ async fn call_bash_inner(
             access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
         })
         .collect::<Vec<_>>();
+    let attached_knowledge_read = !attached_knowledge_paths.is_empty();
     let mut denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
     let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
         &ctx.session,
@@ -1103,7 +1104,8 @@ async fn call_bash_inner(
     };
     let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
     let sidecar = bash_output_sidecar(command, &cwd, &final_outcome, &body, truncated_for_display);
-    if truncated_for_display {
+    let knowledge_source = attached_knowledge_read.then(|| body.clone());
+    let mut out = if truncated_for_display {
         // Head+tail so the `exit:` line and any stderr at the tail
         // survive — the failure signal usually lives there.
         let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
@@ -1112,20 +1114,24 @@ async fn call_bash_inner(
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
         }
-        Ok(match exit_field {
+        match exit_field {
             Some(code) => out.with_exit_code(code),
             None => out,
-        })
+        }
     } else {
         let mut out = ToolOutput::text(body).with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
         }
-        Ok(match exit_field {
+        match exit_field {
             Some(code) => out.with_exit_code(code),
             None => out,
-        })
+        }
+    };
+    if let Some(knowledge_source) = knowledge_source {
+        crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &knowledge_source);
     }
+    Ok(out)
 }
 
 async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result<()> {
@@ -2636,6 +2642,7 @@ async fn run_container_shell(
         timeout_ms,
         vec![serde_json::json!({"execute": {"command": command}})],
         resource_lease,
+        false,
         identity_accounting,
     )
     .await
@@ -2744,6 +2751,9 @@ async fn run_shell(
     resource_lease: &mut Option<ResourceLeaseGuard>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) -> RunOutcome {
+    let attached_knowledge_read = extra_sandbox_paths
+        .iter()
+        .any(|path| path.kind == "attached_knowledge_base");
     #[cfg(test)]
     if let Some(scripted) = TEST_RUN_SHELL_OUTCOMES.with(|slot| slot.borrow_mut().pop_front()) {
         let (expected_confine, outcome) = scripted;
@@ -2841,6 +2851,7 @@ async fn run_shell(
         timeout_ms,
         concrete_effects,
         resource_lease,
+        attached_knowledge_read,
         identity_accounting,
     )
     .await
@@ -2852,6 +2863,7 @@ async fn run_prepared_command(
     timeout_ms: u64,
     concrete_effects: Vec<serde_json::Value>,
     resource_lease: &mut Option<ResourceLeaseGuard>,
+    attached_knowledge_read: bool,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null())
@@ -2977,6 +2989,7 @@ async fn run_prepared_command(
                 bridge,
                 job_id.clone(),
                 resource_lease.take(),
+                attached_knowledge_read,
                 identity_accounting,
             )
             .await;
@@ -3014,6 +3027,7 @@ async fn spawn_adopted_shell_completion(
     bridge: crate::engine::agent::ForegroundQueueBridge,
     job_id: String,
     resource_lease: Option<ResourceLeaseGuard>,
+    attached_knowledge_read: bool,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
 ) {
     let adopted_cancel = cancel.child_token();
@@ -3082,6 +3096,11 @@ async fn spawn_adopted_shell_completion(
                         let _ = stderr_task.join().await;
                         "Error: adopted bash process timed out".to_string()
                     }
+                };
+                let outcome = if attached_knowledge_read {
+                    crate::knowledge::fence_knowledge_content_if_needed(&outcome)
+                } else {
+                    outcome
                 };
                 let outcome = if let Some(accounting) = identity_accounting
                     && let Err(error) = accounting.publish().await

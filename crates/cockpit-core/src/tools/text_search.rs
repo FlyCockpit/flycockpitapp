@@ -11,6 +11,9 @@ use crate::engine::tool::invalid_input;
 
 #[derive(Debug, Clone)]
 pub struct SearchRecord {
+    /// Canonical source identity used by callers that must apply a
+    /// path-sensitive content boundary after this blocking walker returns.
+    pub source_path: PathBuf,
     pub path: String,
     pub line_number: u64,
     pub column: Option<usize>,
@@ -116,6 +119,7 @@ where
             .after_context(options.context.unwrap_or(0))
             .build();
         let mut sink = RecordSink {
+            path,
             rel,
             matcher: &matcher,
             columns: options.columns,
@@ -151,6 +155,7 @@ fn display_path(path: &Path, display_root: &Path) -> String {
 }
 
 struct RecordSink<'a> {
+    path: &'a Path,
     rel: String,
     matcher: &'a RegexMatcher,
     columns: bool,
@@ -169,6 +174,7 @@ impl RecordSink<'_> {
             .then(|| first_match_column(self.matcher, text.as_bytes()))
             .flatten();
         self.records.push(SearchRecord {
+            source_path: self.path.to_path_buf(),
             path: self.rel.clone(),
             line_number,
             column,
@@ -185,6 +191,7 @@ impl RecordSink<'_> {
 
     fn push_context(&mut self, context: &SinkContext<'_>) -> bool {
         self.records.push(SearchRecord {
+            source_path: self.path.to_path_buf(),
             path: self.rel.clone(),
             line_number: context.line_number().unwrap_or(0),
             column: None,

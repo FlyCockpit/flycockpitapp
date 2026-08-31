@@ -2113,6 +2113,50 @@ async fn apply_runs_no_inference() {
 }
 
 #[tokio::test]
+async fn compaction_preserves_bounded_idle_timer_and_activity_anchor() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let args = crate::engine::schedule::parse_loop_start(&serde_json::json!({
+        "interval": 60,
+        "prompt": "check for a completed deploy",
+        "limit": 1,
+        "idle": true,
+    }))
+    .expect("bounded idle timer arguments are valid");
+    let job_id = driver.schedule.start_loop_forked(args);
+    let before = driver.schedule.snapshot();
+    let activity_anchor = driver.schedule.idle_activity_anchor_for_tests();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].job_id, job_id);
+    assert_eq!(before[0].limit, Some(1));
+
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    driver
+        .apply_prepared_compaction(prepared, &tx)
+        .await
+        .expect("apply succeeds");
+
+    let after = driver.schedule.snapshot();
+    assert_eq!(after.len(), 1, "compaction must not duplicate timers");
+    assert_eq!(after[0].job_id, job_id, "the live timer is retained");
+    assert_eq!(after[0].limit, Some(1), "the timer bound is retained");
+    assert_eq!(
+        driver.schedule.idle_activity_anchor_for_tests(),
+        activity_anchor,
+        "compaction must not restart an idle timer from a new activity anchor"
+    );
+
+    assert!(driver.schedule.cancel(&job_id), "one live timer remains");
+    assert!(
+        driver.schedule.snapshot().is_empty(),
+        "the migrated timer is the only authority-owned registration"
+    );
+}
+
+#[tokio::test]
 async fn apply_rejects_stale_prepared_compaction() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);

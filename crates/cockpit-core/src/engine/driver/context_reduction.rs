@@ -1918,6 +1918,29 @@ impl Driver {
         // 5. Reset the foreground model context in place.
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
         self.drop_stale_owner_ledgers().await;
+        // Keep the one live schedule authority attached to the compacted
+        // thread. Its registry and idle-activity sender are the timer/wake
+        // state, so compaction must rebind the live context rather than
+        // recreate the authority (which would duplicate or orphan timers).
+        self.schedule.migrate_to_live_context(
+            crate::engine::schedule::authority::ScheduleContext {
+                session: self.session.clone(),
+                locks: self.locks.clone(),
+                redact: self.redact.clone(),
+                cwd: self.cwd.clone(),
+                config: self.config.clone(),
+                guidance_compiler: self.guidance_compiler.clone(),
+                local_installations: self.vnext_local_installation_resolver.clone(),
+                agent: self
+                    .stack
+                    .first()
+                    .expect("root frame remains live during compaction")
+                    .agent
+                    .clone(),
+                write_scope: self.write_scope.clone(),
+                dream_read_scope: self.dream_read_scope.clone(),
+            },
+        );
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 

@@ -485,3 +485,20 @@ fn control_request_outcome_has_three_terminal_states() {
     ];
     assert_eq!(outcomes.len(), 3);
 }
+
+#[test]
+fn tool_call_view_toggle_is_local_and_preserves_history() {
+    let mut app = app();
+    app.history.push(HistoryEntry::Plain {
+        line: "assistant message".to_string(),
+    });
+    let history_len = app.history.len();
+
+    app.handle_tool_calls_command("hide");
+    assert!(app.hide_tool_calls);
+    assert_eq!(app.history.len(), history_len);
+
+    app.handle_tool_calls_command("show");
+    assert!(!app.hide_tool_calls);
+    assert_eq!(app.history.len(), history_len);
+}

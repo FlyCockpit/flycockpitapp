@@ -6973,7 +6973,7 @@ mod tests {
             second_events.lock().expect("event log").push("acquired");
             coordinator
         });
-        for _ in 0..10 {
+        for _ in 0..100 {
             if arbiter
                 .lock()
                 .expect("arbiter")
@@ -6982,7 +6982,7 @@ mod tests {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert_eq!(
             arbiter

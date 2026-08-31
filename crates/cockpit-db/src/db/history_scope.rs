@@ -25,6 +25,26 @@ impl WorkspaceHistoryScope {
 }
 
 impl Db {
+    /// Read the machine onboarding preference stored in
+    /// `machine_history_scope_default`. This is presentation-only: callers
+    /// must still create explicit per-workspace consent rows before any
+    /// cross-workspace disclosure is allowed.
+    pub async fn machine_history_scope_default(&self) -> Result<bool> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT cross_workspace_recall_enabled
+                   FROM machine_history_scope_default
+                  WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .context("reading machine history scope default")
+        })
+        .await
+    }
+
     /// Persist this workspace's independent cross-workspace recall consents.
     /// The onboarding-owned machine default is intentionally not consumed
     /// here yet; absent rows are the safe current-workspace-only default.

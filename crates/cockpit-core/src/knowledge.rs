@@ -4643,7 +4643,7 @@ pub(crate) async fn attached_bundles(
         // already carry their installation identity and intentionally retain it.
         if let Some(local) = &mut local {
             if !entry.has_bound_attachment_identity() {
-                match local_source_attachment_identity(&local.root)? {
+                match local_source_attachment_identity(&local.root, &entry.id)? {
                     Some((root, attachment_id)) => {
                         // Workspace-local sidecars live beside the source and
                         // must follow a canonicalized root. Assistant-owned
@@ -4768,7 +4768,9 @@ fn prompt_snapshot_entries_from_registry(
                 cwd.join(local.root)
             };
             if !entry.has_bound_attachment_identity() {
-                let Some((root, attachment_id)) = local_source_attachment_identity(&root)? else {
+                let Some((root, attachment_id)) =
+                    local_source_attachment_identity(&root, &entry.id)?
+                else {
                     continue;
                 };
                 entry = entry.with_bound_attachment_identity(attachment_id);
@@ -5722,7 +5724,10 @@ pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String>
 /// the directory, changes a symlink target, or rewrites the source in place,
 /// therefore cannot inherit the predecessor's boundary. A missing root is
 /// unavailable rather than a ledger lookup candidate.
-fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid::Uuid)>> {
+fn local_source_attachment_identity(
+    root: &Path,
+    registry_id: &str,
+) -> Result<Option<(PathBuf, uuid::Uuid)>> {
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5750,12 +5755,20 @@ fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid
         );
     }
 
-    let mut name = b"flycockpit/knowledge-local-attachment/v2\0".to_vec();
+    let mut name = b"flycockpit/knowledge-local-attachment/v3\0".to_vec();
     append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
+    // A registry entry is an explicit attachment authorization boundary. Two
+    // entries may intentionally expose the same local source under different
+    // trust policies, so their ledger identities must never collapse.
+    append_attachment_identity_component(&mut name, registry_id.as_bytes());
 
     let source_identity = sealed_marker_object_identity(&source)?;
     name.extend_from_slice(&source_identity.volume.to_le_bytes());
     name.extend_from_slice(&source_identity.file.to_le_bytes());
+    // Filesystems may reuse an inode immediately after a replacement at the
+    // same path. The directory change timestamp distinguishes that successor
+    // object even when both its contents and low-level object number match.
+    append_attachment_identity_component(&mut name, &source_directory_change_identity(&metadata));
     let mut documents =
         cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
             &source,
@@ -5788,6 +5801,28 @@ fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid
         root,
         uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &name),
     )))
+}
+
+fn source_directory_change_identity(metadata: &std::fs::Metadata) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut identity = Vec::with_capacity(16);
+        identity.extend_from_slice(&metadata.ctime().to_le_bytes());
+        identity.extend_from_slice(&metadata.ctime_nsec().to_le_bytes());
+        return identity;
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(
+                || 0_u128.to_le_bytes().to_vec(),
+                |duration| duration.as_nanos().to_le_bytes().to_vec(),
+            )
+    }
 }
 
 fn append_attachment_identity_component(name: &mut Vec<u8>, component: &[u8]) {
@@ -8635,7 +8670,7 @@ mod tests {
     fn rewritten_local_kb_source_has_a_new_attachment_identity() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
-        let (_, first) = local_source_attachment_identity(tmp.path())
+        let (_, first) = local_source_attachment_identity(tmp.path(), "project")
             .unwrap()
             .unwrap();
 
@@ -8644,7 +8679,7 @@ mod tests {
             "---\ntype: decision\n---\n\nA replacement knowledge source.",
         )
         .unwrap();
-        let (_, second) = local_source_attachment_identity(tmp.path())
+        let (_, second) = local_source_attachment_identity(tmp.path(), "project")
             .unwrap()
             .unwrap();
 
@@ -10699,6 +10734,9 @@ Inventory facts for warehouse operations.
             |root, _| {
                 for name in KB_MACHINE_STATE_GITIGNORE {
                     let path = root.join(name.trim_end_matches('/'));
+                    if path.exists() {
+                        continue;
+                    }
                     if name.ends_with('/') {
                         fs::create_dir_all(path).unwrap();
                     } else {

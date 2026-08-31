@@ -1788,6 +1788,9 @@ impl Driver {
             return false;
         }
         let mut args = self.spawn_args(true);
+        // The primary is about to adopt the durable session selection. Never
+        // carry the outgoing foreground vNext model pin into that resolution.
+        args.model_override = None;
         args.vnext_host_policy = Some(host_policy);
         if let Some(selection) = self.session.active_model_ref().filter(|selection| {
             let running = &self.stack[0].agent.model;

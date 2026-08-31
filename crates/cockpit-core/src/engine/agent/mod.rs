@@ -1542,6 +1542,7 @@ mod redaction_placeholder_guard_tests {
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,

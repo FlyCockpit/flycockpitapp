@@ -2128,9 +2128,27 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        // Publish the initial local-KB LSP policy before this worker is made
+        // externally live. The guard moves into the worker task below: a
+        // failed spawn drops it here, a cancelled start permit drops it in the
+        // task, and a running worker retains it through normal teardown.
+        let protected_lsp_roots = crate::knowledge::configured_local_knowledge_roots(
+            &session,
+            &project_root,
+            &extended_cfg,
+        )
+        .await;
+        let initial_lsp_session_protection = self
+            .inner
+            .lsp
+            .protect_session(session_id, protected_lsp_roots)
+            .await;
+
         // A concurrent promotion either finishes its complete service bundle
         // before this snapshot, or this new session keeps the coherent
         // pre-promotion bundle. It can never retain an intermediate mix.
+        // Everything after acquiring this synchronous guard is synchronous,
+        // so session startup remains `Send` when spawned by the daemon.
         let _persistent_service_transition = self.lock_persistent_service_transition();
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
@@ -2173,6 +2191,7 @@ impl SessionRegistry {
             daemon_no_sandbox,
             &extended_cfg,
             self.inner.lsp.clone(),
+            Some(initial_lsp_session_protection),
             crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone(),
             self.scheduler_source(),
             self.write_scope_source(),

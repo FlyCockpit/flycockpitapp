@@ -239,7 +239,13 @@ impl Tool for WriteTool {
             message.push('\n');
             message.push_str(&created);
         }
-        if let Some(lsp) = &ctx.lsp {
+        // Diagnostics can spawn or reuse an opaque LSP host.  A completed
+        // native write does not make an attached KB writable to that host.
+        if let Some(lsp) = &ctx.lsp
+            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
+                .await
+                .is_empty()
+        {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
         if let Some(note) =
@@ -1766,6 +1772,7 @@ mod tests {
         );
         let ctx = ToolCtx {
             agent_id: "helper".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,

@@ -36,7 +36,7 @@ pub struct McpConnectContext {
     credential_profile: String,
     agent_id: String,
     agent_bound: bool,
-    /// A trusted-KB policy decision captured from the live tool context. It
+    /// A local-KB filesystem-fence decision captured from the live tool context. It
     /// is checked before any configured MCP connection can initialize a
     /// server, enumerate its tools, or issue a tools/call request.
     host_access_denial: Option<String>,
@@ -76,9 +76,11 @@ impl McpConnectContext {
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
             agent_id: ctx.agent_id.clone(),
             agent_bound: false,
-            host_access_denial: crate::knowledge::ensure_mcp_host_access(ctx)
-                .err()
-                .map(|error| error.to_string()),
+            // The complete KB registry includes the asynchronously resolved
+            // assistant source. Assistant sessions are conservatively fenced
+            // here too, while the async dispatcher adds the exact root before
+            // any host process is reached.
+            host_access_denial: crate::knowledge::configured_mcp_host_access_denial(ctx),
         }
     }
 

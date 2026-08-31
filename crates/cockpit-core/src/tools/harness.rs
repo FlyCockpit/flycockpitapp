@@ -98,6 +98,13 @@ impl Tool for HarnessListTool {
             .as_deref()
             .map(|raw| normalize_harness_selector(raw, &ctx.config))
             .transpose()?;
+        // Listing can launch each configured harness's auth probe, and a
+        // refresh launches its model-list command. Keep direct callers from
+        // bypassing the dispatcher fence and handing an ambient filesystem
+        // write path to either subprocess.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
         require_workspace_trust_for_harness_spawn()?;
         let env_overlay = ctx
             .env_overlay
@@ -327,6 +334,11 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
+        // The dispatcher normally applies this fence, but direct tool callers
+        // must not be able to hand ambient filesystem access to a harness.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
         // An external harness is an OS subprocess, not a Cockpit native tool.
         // We do not yet have an OS confinement primitive that can prove every
         // configured harness operation stays within a workspace lease's
@@ -729,6 +741,37 @@ mod tests {
         (ctx, approver, db, hub)
     }
 
+    fn ctx_with_attached_local_knowledge_base(
+        root: &std::path::Path,
+    ) -> crate::engine::tool::ToolCtx {
+        let mut ctx = crate::tools::common::test_ctx(root);
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![
+                        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                            "private".to_string(),
+                            "Private".to_string(),
+                            "Private local knowledge".to_string(),
+                            crate::config::extended::KnowledgeBaseSource::Local {
+                                path: root.join("knowledge"),
+                            },
+                            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                            None,
+                            None,
+                            false,
+                            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+        );
+        ctx
+    }
+
     fn resolve_next_interrupt(
         db: crate::db::Db,
         session_id: uuid::Uuid,
@@ -760,6 +803,32 @@ mod tests {
             .call(invoke_args(), ctx)
             .await
             .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn direct_invoke_keeps_local_knowledge_host_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_attached_local_knowledge_base(workspace.path());
+
+        let error = HarnessInvokeTool
+            .call(invoke_args(), &ctx)
+            .await
+            .expect_err("direct harness calls must not receive a local KB host path");
+        assert!(error.to_string().contains("knowledge bases are read-only"));
+    }
+
+    #[tokio::test]
+    async fn direct_list_keeps_local_knowledge_host_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_attached_local_knowledge_base(workspace.path());
+
+        let error = HarnessListTool
+            .call(serde_json::json!({}), &ctx)
+            .await
+            .expect_err(
+                "direct harness listings must not launch probes with local KB write access",
+            );
+        assert!(error.to_string().contains("knowledge bases are read-only"));
     }
 
     #[test]

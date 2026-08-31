@@ -4396,47 +4396,326 @@ fn validate_dream_models(
     )
 }
 
-/// Return canonical local KB roots withheld from this model. The result is
-/// shared by native-path and shell confinement gates so trust-required source
-/// Markdown cannot be reached through an ordinary filesystem surface.
-pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
-    denied_local_knowledge_roots_for_model(
+#[derive(Debug)]
+struct ResolvedLocalKnowledgeBase {
+    id: String,
+    root: PathBuf,
+    trust_required: bool,
+    /// A duplicate registry label has no single retrieval authority. Keep
+    /// every affected root in the filesystem policy, but never let a label
+    /// grant access to any of them.
+    registry_id_conflicted: bool,
+    /// The source identity could not be validated. Its known daemon-owned
+    /// root remains fenced, but it cannot grant any read capability.
+    policy_denied: bool,
+}
+
+/// Resolve the local portion of the effective registry for a native tool
+/// frame. Remote knowledge bases intentionally contribute no filesystem
+/// capability: they remain available only through retrieval tools.
+async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLocalKnowledgeBase>> {
+    Ok(effective_local_knowledge_bases(&ctx.session, &ctx.cwd, &ctx.config.extended()).await)
+}
+
+/// Resolve every local KB root that can currently contribute to a native or
+/// shell filesystem policy. This deliberately shares the live assistant
+/// registry with native reads: assistant KBs are not merely retrieval inputs.
+/// If resolving an assistant snapshot fails, retain its daemon-owned knowledge
+/// root as a conservative denied policy entry. That preserves the filesystem
+/// fence without making unrelated workspace paths fail merely because the
+/// assistant registry is temporarily unavailable.
+async fn effective_local_knowledge_bases(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Vec<ResolvedLocalKnowledgeBase> {
+    let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
+    match assistant_knowledge_registry_entry(session).await {
+        Ok(Some(assistant)) => registry.push((assistant.entry, false)),
+        Ok(None) => {}
+        Err(error) => match conservative_assistant_knowledge_policy_entry(session) {
+            Ok(assistant) => {
+                tracing::warn!(%error, "retaining unavailable assistant knowledge source as a denied filesystem policy entry");
+                registry.push((assistant, true));
+            }
+            Err(fallback_error) => tracing::warn!(
+                %error,
+                %fallback_error,
+                "assistant knowledge source is unavailable and its conservative filesystem policy root could not be derived"
+            ),
+        },
+    }
+    registry.extend(
+        extended
+            .knowledge_bases
+            .iter()
+            .cloned()
+            .map(|entry| (entry, false)),
+    );
+
+    // IDs name retrieval authorities across the complete effective registry,
+    // not merely its local subset. A remote entry sharing an assistant or
+    // configured local entry's ID makes that label ambiguous, so the local
+    // root must remain a denied fence rather than inheriting native access.
+    let duplicate_ids: BTreeSet<_> = registry
+        .iter()
+        .map(|(entry, _)| entry.id.as_str())
+        .fold(BTreeMap::new(), |mut counts, id| {
+            *counts.entry(id).or_insert(0_usize) += 1;
+            counts
+        })
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id.to_owned()))
+        .collect();
+    if !duplicate_ids.is_empty() {
+        tracing::warn!(ids = ?duplicate_ids, "denying duplicate knowledge-base registry IDs in filesystem policy");
+    }
+
+    let mut local = Vec::new();
+    for (entry, policy_denied) in registry {
+        let KnowledgeBaseSource::Local { path } = entry.source else {
+            continue;
+        };
+        let registry_id_conflicted = duplicate_ids.contains(&entry.id);
+        let root = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        // Keep a dangling source's lexical root fenced. A source that cannot
+        // be resolved cannot grant filesystem authority, but neither can a
+        // later shell write turn that spelling into an unfenced target.
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
+        local.push(ResolvedLocalKnowledgeBase {
+            id: entry.id,
+            root,
+            trust_required: entry.trust_required,
+            registry_id_conflicted,
+            policy_denied,
+        });
+    }
+    local
+}
+
+/// Fall back to the assistant's daemon-owned home when a live assistant
+/// snapshot cannot be acquired. The caller records it as policy-denied, so it
+/// can only shrink native capabilities even for a broad allowlist or trusted
+/// executor.
+fn conservative_assistant_knowledge_policy_entry(
+    session: &Session,
+) -> Result<KnowledgeBaseRegistryEntry> {
+    let name = session
+        .assistant_name
+        .as_deref()
+        .context("session has no assistant knowledge source")?;
+    crate::assistants::validate_assistant_name(name)?;
+    let root = crate::assistants::default_home_dir(name)?.join("knowledge");
+    Ok(KnowledgeBaseRegistryEntry::new(
+        format!("assistant-policy-unavailable-{name}"),
+        "Unavailable assistant knowledge".to_string(),
+        "Assistant knowledge source could not be validated.".to_string(),
+        KnowledgeBaseSource::Local { path: root },
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    ))
+}
+
+fn native_knowledge_base_permitted(
+    ctx: &ToolCtx,
+    knowledge_base: &ResolvedLocalKnowledgeBase,
+) -> bool {
+    native_knowledge_base_permitted_for_model(
+        knowledge_base,
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
+    )
+}
+
+fn native_knowledge_base_permitted_for_model(
+    knowledge_base: &ResolvedLocalKnowledgeBase,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
+) -> bool {
+    !knowledge_base.policy_denied
+        && !knowledge_base.registry_id_conflicted
+        && !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        && (!knowledge_base.trust_required || executing_model_trusted)
+}
+
+/// Return the registry-resolved local roots that the calling agent may read.
+/// This is intentionally a read-only capability: native writes continue
+/// through the ordinary path-approval and write gates.
+pub(crate) async fn attached_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    attached_local_knowledge_roots_for_model(
+        &ctx.session,
         &ctx.cwd,
         &ctx.config.extended(),
-        ctx.knowledge_access_trusted,
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
     )
+    .await
+}
+
+/// Return registry-resolved local roots that are native read capabilities for
+/// a model without requiring a full tool context. Driver-owned execution
+/// paths use this before a [`ToolCtx`] exists so their shell sandbox has the
+/// same read authority as the native tools.
+pub(crate) async fn attached_local_knowledge_roots_for_model(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        if !native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
+            continue;
+        }
+        if !roots.iter().any(|root| root == &knowledge_base.root) {
+            roots.push(knowledge_base.root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Return every registry-resolved local root that is not a native read
+/// capability for this frame. Recursive native tools use this to keep a walk
+/// rooted in the workspace from crossing into a nested, withheld KB.
+pub(crate) async fn denied_native_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if !native_knowledge_base_permitted(ctx, &knowledge_base)
+            && !roots.iter().any(|root| root == &knowledge_base.root)
+        {
+            roots.push(knowledge_base.root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Validate a native path that falls under a configured local KB. Returns
+/// whether the path is in an attached local KB so the native sandbox can add
+/// that root to its implicit read set. A configured but non-attached KB is a
+/// hard refusal and therefore cannot be reached through a path approval.
+pub(crate) async fn check_native_local_knowledge_path_access(
+    ctx: &ToolCtx,
+    path: &Path,
+) -> Result<bool> {
+    let mut attached = false;
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if !cockpit_host::path_containment::contained_under(&knowledge_base.root, path) {
+            continue;
+        }
+        if knowledge_base.policy_denied {
+            bail!(
+                "access denied: `{}` is in an assistant knowledge base whose source could not be validated",
+                path.display()
+            );
+        }
+        if knowledge_base.registry_id_conflicted {
+            bail!(
+                "access denied: `{}` is in a local knowledge base with a duplicate registry ID",
+                path.display()
+            );
+        }
+        if ctx
+            .allowed_knowledge_bases
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        {
+            bail!(
+                "access denied: `{}` is in local knowledge base `{}` which is not attached to this agent",
+                path.display(),
+                knowledge_base.id
+            );
+        }
+        if knowledge_base.trust_required && !ctx.executing_model_trusted {
+            bail!(
+                "access denied: `{}` is in a local knowledge base that requires a trusted model",
+                path.display()
+            );
+        }
+        // Overlapping KB roots are an intersection of capabilities. A later
+        // containing root may be restricted even when an earlier one is not.
+        attached = true;
+    }
+    Ok(attached)
+}
+
+/// Return local KB roots withheld from this native/shell frame. The result is
+/// shared by opaque-host and shell confinement gates so a source that is not
+/// attached to this agent (or requires a trusted executor) cannot be reached
+/// through an ordinary filesystem surface.
+pub(crate) async fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    denied_local_knowledge_roots_for_model(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
+    )
+    .await
+}
+
+/// Return every configured local KB root. Shell execution uses this separate
+/// write fence: an attached source may be readable there, but generic shell
+/// writes must never mutate a KB outside the dream/human-owned paths.
+pub(crate) async fn configured_local_knowledge_roots(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        let root = knowledge_base.root;
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Whether an opaque host process must be denied because a configured local
+/// knowledge base is present. An attached KB grants bounded read access; it
+/// never grants an ambient process authority to write that source.
+pub(crate) async fn local_knowledge_write_fence_active(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> bool {
+    !configured_local_knowledge_roots(session, cwd, extended)
+        .await
+        .is_empty()
 }
 
 /// Return canonical local KB roots withheld from a model without requiring a
 /// full tool context. Driver-owned execution paths (for example scheduled
 /// shell jobs) use this before a [`ToolCtx`] exists.
-pub(crate) fn denied_local_knowledge_roots_for_model(
+pub(crate) async fn denied_local_knowledge_roots_for_model(
+    session: &Session,
     cwd: &Path,
     extended: &ExtendedConfig,
-    knowledge_access_trusted: bool,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
 ) -> Result<Vec<PathBuf>> {
-    if knowledge_access_trusted {
-        return Ok(Vec::new());
-    }
     let mut roots = Vec::new();
-    for entry in &extended.knowledge_bases {
-        if !entry.trust_required {
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        if native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
             continue;
         }
-        let KnowledgeBaseSource::Local { path } = &entry.source else {
-            continue;
-        };
-        let root = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
-        let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
-            anyhow::anyhow!(
-                "cannot resolve trust-required knowledge base `{}` source: {error}",
-                entry.id
-            )
-        })?;
+        let root = knowledge_base.root;
         if !roots.iter().any(|existing| existing == &root) {
             roots.push(root);
         }
@@ -4445,8 +4724,8 @@ pub(crate) fn denied_local_knowledge_roots_for_model(
 }
 
 /// Reject a direct native filesystem operation on a protected KB source.
-pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> Result<()> {
-    for root in denied_local_knowledge_roots(ctx)? {
+pub(crate) async fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> Result<()> {
+    for root in denied_local_knowledge_roots(ctx).await? {
         if cockpit_host::path_containment::contained_under(&root, path) {
             bail!(
                 "access denied: `{}` is in a local knowledge base that requires a trusted model",
@@ -4461,7 +4740,10 @@ pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> 
 /// media authority opens its held descriptor. Media path sources are always
 /// relative to the session project root; unlike ordinary native tools, they do
 /// not pass through `check_native_access`.
-pub(crate) fn ensure_local_knowledge_media_path_access(ctx: &ToolCtx, path: &str) -> Result<()> {
+pub(crate) async fn ensure_local_knowledge_media_path_access(
+    ctx: &ToolCtx,
+    path: &str,
+) -> Result<()> {
     let path = Path::new(path);
     // Match the local media authority's lexical policy. It rejects absolute,
     // dot, and parent components itself, so leave those invalid spellings to
@@ -4479,30 +4761,35 @@ pub(crate) fn ensure_local_knowledge_media_path_access(ctx: &ToolCtx, path: &str
             path.display()
         )
     })?;
-    ensure_local_knowledge_path_access(ctx, &effective)
+    ensure_local_knowledge_path_access(ctx, &effective).await
 }
 
 /// Workspace-wide inspection and opaque host-proxy tools cannot safely prove
 /// which files a model-authored request will touch before it executes. Deny
-/// their entire operation whenever that root contains a trust-required local
-/// KB. Targeted native tools use [`ensure_local_knowledge_path_access`]
-/// instead.
-pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
+/// their entire operation whenever a local KB root is withheld from the
+/// model. Native `glob` and `grep` prove their requested root and filter each
+/// discovered entry, so they remain available to browse attached roots.
+///
+/// A smaller set of opaque host tools can mutate through an ambient process
+/// even when their own Cockpit-facing interface is advisory or read-only.
+/// Those tools are unavailable whenever *any* local KB is attached: attached
+/// KBs are a read-only capability, not an ambient host write capability.
+pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
     const UNBOUNDED_HOST_ACCESS_TOOLS: &[&str] = &[
         "code",
         "context_pack",
         "change_impact",
         "circular",
         "deps",
-        "glob",
         "graph",
-        "grep",
         "hot",
         "harness_invoke",
+        "harness_list",
         // An MCP script can invoke any configured third-party server. The
         // server's runtime capability is not knowable from the outer script,
-        // so this is an opaque host-filesystem proxy just like a workspace
-        // walker when a local KB requires a trusted model.
+        // so this is an opaque host-filesystem proxy. The dedicated MCP gate
+        // below additionally fences every configured local KB, including
+        // attached sources that are readable through native tools.
         "mcp",
         "search",
         "symbol_find",
@@ -4510,8 +4797,22 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
         "word",
         "worktree_orchestrate",
     ];
+    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &[
+        "harness_invoke",
+        "harness_list",
+        "lsp",
+        "worktree_orchestrate",
+    ];
+
+    if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
+        && local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
+    {
+        bail!(
+            "access denied: `{tool_name}` is unavailable because attached local knowledge bases are read-only"
+        );
+    }
     if UNBOUNDED_HOST_ACCESS_TOOLS.contains(&tool_name)
-        && !denied_local_knowledge_roots(ctx)?.is_empty()
+        && !denied_local_knowledge_roots(ctx).await?.is_empty()
     {
         bail!(
             "access denied: `{tool_name}` cannot inspect this workspace because it contains a local knowledge base that requires a trusted model"
@@ -4520,17 +4821,38 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
     Ok(())
 }
 
-/// Reject MCP server access for an untrusted model when a configured local KB
-/// requires a trusted model. A configured server is arbitrary host code: its
-/// initialization, discovery, and tool calls can all inspect the filesystem,
-/// so this must fence the connection boundary rather than only named tools.
-pub(crate) fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
-    if denied_local_knowledge_roots(ctx)?.is_empty() {
+/// Reject MCP server access whenever a local KB is configured. A configured
+/// server is arbitrary host code and an opaque tool call cannot prove that it
+/// will not mutate an attached KB, so this fences the connection boundary
+/// rather than only trust-withheld roots or named tools.
+pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    if configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
+        .await
+        .is_empty()
+    {
         return Ok(());
     }
     bail!(
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base that requires a trusted model"
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
     );
+}
+
+/// Synchronous conservative subset used while constructing an MCP connection
+/// context. An assistant session itself is sufficient to deny: its
+/// daemon-owned KB root remains fenced even if its live snapshot is currently
+/// unavailable. The async dispatcher adds the exact assistant root before any
+/// host process is reached.
+pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String> {
+    let fenced = ctx.session.assistant_name.is_some()
+        || ctx
+            .config
+            .extended()
+            .knowledge_bases
+            .iter()
+            .any(|entry| matches!(&entry.source, KnowledgeBaseSource::Local { .. }));
+    fenced.then(|| {
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence".to_string()
+    })
 }
 
 /// Resolve a workspace-local KB to the filesystem object that owns it.
@@ -7662,6 +7984,49 @@ Inventory facts for warehouse operations.
         .unwrap();
         assert_eq!(attached.bundles.len(), 1);
         assert_eq!(attached.bundles[0].entry.id, "project");
+        assert_eq!(
+            attached_local_knowledge_roots_for_model(
+                &session,
+                tmp.path(),
+                &extended,
+                agent.allowed_knowledge_bases(),
+                true,
+            )
+            .await
+            .unwrap(),
+            vec![tmp.path().join(".cockpit/knowledge")],
+            "driver-owned shell launches receive only this agent's attached local KB roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_effective_registry_ids_are_retained_only_as_denied_fences() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let mut first = project_knowledge_registry_entry();
+        first.trust_required = false;
+        first.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("first"),
+        };
+        let mut second = first.clone();
+        second.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("second"),
+        };
+
+        let resolved = effective_local_knowledge_bases(
+            &session,
+            tmp.path(),
+            &ExtendedConfig {
+                knowledge_bases: vec![first, second],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(resolved.len(), 2, "both conflicting roots stay fenced");
+        assert!(resolved.iter().all(|entry| entry.registry_id_conflicted));
+        assert!(resolved.iter().all(|entry| !entry.policy_denied));
     }
 
     #[test]
@@ -7750,6 +8115,12 @@ Inventory facts for warehouse operations.
             format!("assistant-{installation_id}")
         );
         assert!(attached.bundles[0].provider.is_available().await.unwrap());
+        assert_eq!(
+            configured_local_knowledge_roots(&session, tmp.path(), &ExtendedConfig::default())
+                .await,
+            vec![home.join("knowledge")],
+            "assistant-owned KBs must be in the shell write fence"
+        );
 
         fs::remove_dir_all(home.join("knowledge")).unwrap();
         fs::create_dir_all(home.join("knowledge")).unwrap();
@@ -7770,6 +8141,131 @@ Inventory facts for warehouse operations.
                 .iter()
                 .any(|result| result.concept_id == "replacement")
         );
+    }
+
+    #[tokio::test]
+    async fn remote_duplicate_of_assistant_id_denies_only_assistant_native_root() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        env.set_var("XDG_DATA_HOME", tmp.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let home = crate::assistants::default_home_dir("helper-bot").unwrap();
+        let installation_id = uuid::Uuid::from_u128(43);
+        crate::assistants::create_assistant_with_installation_id(
+            &db,
+            crate::assistants::CreateAssistantSpec {
+                name: "helper-bot".to_string(),
+                description: "Helper bot".to_string(),
+                prompt: "Help with tests.".to_string(),
+                home_dir: home.clone(),
+            },
+            installation_id,
+        )
+        .await
+        .unwrap();
+        write_bundle(&home.join("knowledge"));
+        let ordinary_root = tmp.path().join("ordinary");
+        write_bundle(&ordinary_root);
+        let session = crate::session::Session::create_assistant_deferred_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "helper-bot",
+            "helper-bot",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let remote_duplicate = KnowledgeBaseRegistryEntry::new(
+            format!("assistant-{installation_id}"),
+            "Remote duplicate".to_string(),
+            "A remote source with the assistant's registry ID.".to_string(),
+            KnowledgeBaseSource::Remote {
+                url: "https://knowledge.example.test".to_string(),
+            },
+            KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let ordinary = KnowledgeBaseRegistryEntry::new(
+            "ordinary".to_string(),
+            "Ordinary".to_string(),
+            "An unrelated local source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("ordinary"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![remote_duplicate, ordinary],
+            ..Default::default()
+        };
+
+        let resolved = effective_local_knowledge_bases(&session, tmp.path(), &extended).await;
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved.iter().any(|entry| {
+                entry.root == home.join("knowledge") && entry.registry_id_conflicted
+            })
+        );
+        assert!(resolved.iter().any(|entry| {
+            entry.root == ordinary_root && !entry.registry_id_conflicted && !entry.policy_denied
+        }));
+
+        let denied =
+            denied_local_knowledge_roots_for_model(&session, tmp.path(), &extended, None, true)
+                .await
+                .unwrap();
+        assert_eq!(denied, vec![home.join("knowledge")]);
+    }
+
+    #[tokio::test]
+    async fn opaque_write_capable_host_tools_preserve_attached_kb_read_only_policy() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let knowledge_root = tmp.path().join("knowledge");
+        write_bundle(&knowledge_root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "ordinary".to_string(),
+            "Ordinary".to_string(),
+            "An attached read-only local source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                ExtendedConfig {
+                    knowledge_bases: vec![entry],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        // An ordinary attached KB remains readable through bounded inspection
+        // tools, but opaque host processes must not inherit a write path.
+        ensure_workspace_tool_access(&ctx, "code").await.unwrap();
+        for tool in ["harness_invoke", "lsp", "worktree_orchestrate"] {
+            let error = ensure_workspace_tool_access(&ctx, tool)
+                .await
+                .expect_err("opaque host tool must not receive ambient KB write access");
+            assert!(
+                error.to_string().contains("knowledge bases are read-only"),
+                "unexpected {tool} error: {error:#}"
+            );
+        }
     }
 
     #[tokio::test]

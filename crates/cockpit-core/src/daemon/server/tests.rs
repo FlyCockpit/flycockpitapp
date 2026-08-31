@@ -24940,6 +24940,47 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
     }
 }
 
+#[tokio::test]
+async fn lsp_control_is_denied_for_an_attached_session_with_a_local_knowledge_base() {
+    let ctx = test_ctx();
+    let workspace = tempfile::tempdir().unwrap();
+    let knowledge = workspace.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    let (mut state, _) = attached_state(&ctx, workspace.path()).await;
+    let handle = state.attached.as_ref().unwrap().handle.clone();
+    let mut snapshot = handle.config_snapshot();
+    snapshot.extended.knowledge_bases.push(
+        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+            "local-kb".into(),
+            "Local KB".into(),
+            "test local knowledge".into(),
+            crate::config::extended::KnowledgeBaseSource::Local { path: knowledge },
+            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+        ),
+    );
+    handle.set_full_config_snapshot_for_tests(snapshot);
+
+    let error = handle_request(
+        Request::LspControl {
+            // The selected session's snapshot, not this path, owns the fence.
+            project_root: workspace.path().to_string_lossy().into_owned(),
+            server_id: "rust-analyzer".into(),
+            action: proto::LspControlAction::Check,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("local knowledge base blocks every LSP control action");
+
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert!(error.message.contains("local knowledge base"));
+}
+
 fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
     Request::Attach {
         session_id: Some(session_id),

@@ -287,6 +287,25 @@ pub(crate) fn knowledge_content_has_injection(body: &str) -> bool {
     !knowledge_injection_findings(body).is_empty()
 }
 
+/// Apply the deterministic KB boundary to model-facing text. `source` must
+/// include every KB-derived record retained or displayed by the caller; it can
+/// therefore detect a finding beyond the visible budget and withhold any
+/// separate artifact through the caller's companion output helper.
+pub(crate) fn fence_knowledge_model_text_if_needed(model_text: &str, source: &str) -> String {
+    if !knowledge_content_has_injection(source) {
+        return model_text.to_string();
+    }
+
+    let fenced = fence_knowledge_content_if_needed(model_text);
+    if fenced != model_text {
+        fenced
+    } else {
+        format!(
+            "{model_text}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible result limit; the retained artifact was withheld.]"
+        )
+    }
+}
+
 /// Apply the deterministic KB boundary to a model-facing tool result.  The
 /// caller supplies the complete KB-derived source, rather than only the
 /// displayed prefix, so a finding past a tool's display cap cannot survive in
@@ -296,15 +315,8 @@ pub(crate) fn fence_knowledge_tool_output_if_needed(output: &mut ToolOutput, sou
         return;
     }
     let original = output.content.model_text();
-    let fenced = fence_knowledge_content_if_needed(original);
     output.content = crate::engine::tool::CanonicalToolResultContents::text(
-        if fenced != original {
-            fenced
-        } else {
-            format!(
-                "{original}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible result limit; the retained artifact was withheld.]"
-            )
-        },
+        fence_knowledge_model_text_if_needed(original, source),
     );
     // A text artifact stores the raw producer body and would otherwise be a
     // second, unfenced retrieval path around this content boundary.

@@ -67,14 +67,11 @@ impl App {
     }
 
     fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
-        // A selection is expressed in the live terminal-cell grid. Carving
-        // or releasing the header changes that grid, so retaining a selection
-        // would make its coordinates point at different transcript content.
-        // Preserve the scroll offset, but invalidate the coordinate-based
-        // selection whenever visibility flips.
-        if self.sticky_header_area.is_some() != visible {
-            self.selection = None;
-        }
+        // Carving or releasing the two-line header is a layout change, not a
+        // user gesture. Keep the selection grid and offset-from-bottom so a
+        // header flip cannot yank the viewport or discard an active copy
+        // selection. `render_history` rebuilds the grid against the carved
+        // chat rectangle in this same frame.
         self.sticky_header_area = visible.then(|| Rect {
             x: pane.x,
             y: pane.y,

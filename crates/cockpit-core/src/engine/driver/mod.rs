@@ -1980,6 +1980,8 @@ impl Driver {
             coordinator,
             contract,
             action_items,
+            &self.session,
+            self.approver.as_ref(),
         )
         .await;
         if wire.is_empty() && proposal_result.is_none() {

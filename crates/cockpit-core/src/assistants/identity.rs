@@ -102,6 +102,43 @@ impl IdentityShellAccounting {
     }
 }
 
+/// Abort-safe owner for identity accounting after an opaque host capability
+/// has been authorized. Dropping the calling future cannot discard the hash
+/// refresh after the external capability may already have produced effects.
+pub struct IdentityAccountingGuard(Option<IdentityShellAccounting>);
+
+impl IdentityAccountingGuard {
+    pub fn new(accounting: Option<IdentityShellAccounting>) -> Self {
+        Self(accounting)
+    }
+
+    pub async fn publish(mut self) -> Result<()> {
+        let Some(accounting) = self.0.take() else {
+            return Ok(());
+        };
+        accounting.publish().await
+    }
+}
+
+impl Drop for IdentityAccountingGuard {
+    fn drop(&mut self) {
+        let Some(accounting) = self.0.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = accounting.publish().await {
+                    tracing::error!(%error, "abort-time assistant identity accounting failed");
+                }
+            });
+        } else {
+            tracing::error!(
+                "assistant identity accounting dropped outside a Tokio runtime; identity hashes require reconciliation"
+            );
+        }
+    }
+}
+
 pub fn soul_path(home_dir: &Path) -> PathBuf {
     home_dir.join(SOUL_FILE)
 }
@@ -474,7 +511,17 @@ pub async fn check_identity_opaque_host_effect(
     ctx: &ToolCtx,
     capability: &str,
 ) -> Result<Option<IdentityShellAccounting>> {
-    let Some((row, home)) = assistant_identity(ctx).await? else {
+    check_identity_opaque_session_effect(&ctx.session, ctx.approver.as_ref(), capability).await
+}
+
+/// Gate an opaque host effect that is dispatched outside the ordinary tool
+/// dispatcher (notably provider-native computer actions).
+pub async fn check_identity_opaque_session_effect(
+    session: &crate::session::Session,
+    approver: Option<&std::sync::Arc<crate::approval::Approver>>,
+    capability: &str,
+) -> Result<Option<IdentityShellAccounting>> {
+    let Some((row, home)) = assistant_identity_for_session(session).await? else {
         return Ok(None);
     };
     let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
@@ -489,7 +536,7 @@ pub async fn check_identity_opaque_host_effect(
             "Refused: {capability} is unavailable while soul_edit_mode=human_only because an opaque external capability cannot be prevented from modifying the assistant's SOUL.md/USER.md. The human must edit those files outside model tools."
         ),
         SoulEditMode::ApproveProposals => {
-            let Some(approver) = ctx.approver.as_ref() else {
+            let Some(approver) = approver else {
                 anyhow::bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL);
             };
             let decision = approver
@@ -500,7 +547,7 @@ pub async fn check_identity_opaque_host_effect(
                 .await?;
             if decision.is_allowed() {
                 Ok(Some(IdentityShellAccounting {
-                    db: ctx.session.db.clone(),
+                    db: session.db.clone(),
                     row,
                     home,
                 }))
@@ -514,7 +561,7 @@ pub async fn check_identity_opaque_host_effect(
             }
         }
         SoulEditMode::Autonomous => Ok(Some(IdentityShellAccounting {
-            db: ctx.session.db.clone(),
+            db: session.db.clone(),
             row,
             home,
         })),
@@ -661,12 +708,19 @@ async fn identity_target(
 }
 
 async fn assistant_identity(ctx: &ToolCtx) -> Result<Option<(AssistantRow, PathBuf)>> {
-    let Some(name) = ctx.session.assistant_name.as_deref() else {
+    assistant_identity_for_session(&ctx.session).await
+}
+
+async fn assistant_identity_for_session(
+    session: &crate::session::Session,
+) -> Result<Option<(AssistantRow, PathBuf)>> {
+    let Some(name) = session.assistant_name.as_deref() else {
         return Ok(None);
     };
-    let Some(row) = ctx.session.db.get_assistant(name).await? else {
-        return Ok(None);
-    };
+    let row =
+        session.db.get_assistant(name).await?.with_context(|| {
+            format!("assistant `{name}` disappeared before identity authorization")
+        })?;
     let home = crate::assistants::validate_row_home(&row)?;
     Ok(Some((row, home)))
 }

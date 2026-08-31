@@ -10858,6 +10858,11 @@ pub(crate) async fn run_noninteractive_resumable(
             crate::engine::agent::turn_toolbox(&agent, &session, &cwd, &config).await;
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
             executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
             knowledge_access_trusted: agent.model.is_trusted(),
             caller_model: Some(crate::engine::tool::CallerModel::from_model(

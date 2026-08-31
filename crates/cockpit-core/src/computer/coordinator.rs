@@ -1200,21 +1200,25 @@ impl HostInputArbiter {
 
     /// Returns true if the given physical key currently has an active lease.
     pub fn is_held(&self, target_key: &PhysicalTargetKey) -> bool {
-        let key_str = Self::key_string(target_key);
-        self.current_lease.contains_key(&key_str)
+        // X11 arbitrates all monitors in one server/session domain, so the
+        // map key can differ from the monitor-specific evidence key carried
+        // by the lease. Introspection is expressed in terms of that evidence
+        // key, not the internal arbitration bucket.
+        self.current_lease
+            .values()
+            .any(|lease| lease.target_key == *target_key)
     }
 
     /// Returns the number of waiters queued for the given physical key.
     pub fn waiter_count(&self, target_key: &PhysicalTargetKey) -> usize {
-        let key_str = Self::key_string(target_key);
         self.queues
-            .get(&key_str)
-            .map(|q| {
-                q.iter()
-                    .filter(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
-                    .count()
+            .values()
+            .flat_map(|waiters| waiters.iter())
+            .filter(|waiter| {
+                waiter.target_key == *target_key
+                    && !waiter.cancelled.load(std::sync::atomic::Ordering::Acquire)
             })
-            .unwrap_or(0)
+            .count()
     }
 
     /// Simulate owner death: release all leases held by the given owner
@@ -6558,10 +6562,19 @@ mod tests {
         events.lock().expect("event log").clear();
 
         // Simulate OS lock loss by externally releasing the OS-level lock for
-        // the coordinator's key while the arbiter still records it as holder.
+        // the coordinator's X11 server/session arbitration key while the
+        // arbiter still records the monitor-specific evidence lease.
         {
             let mut external = shared_os.shared_clone();
-            external.release(&key);
+            let x11_arbitration_key = PhysicalTargetKey::new(
+                key.host_installation_id,
+                key.platform_session_or_seat_id,
+                crate::computer::host_identity::domain_hash(
+                    b"cockpit.x11.input-arbiter.v1",
+                    &[&key.platform_session_or_seat_id],
+                ),
+            );
+            external.release(&x11_arbitration_key);
         }
 
         // Detection must not emit stale-owner cleanup. A competing process can

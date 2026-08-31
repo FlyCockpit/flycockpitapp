@@ -686,14 +686,59 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
                 }
                 Ok(Self {
                     client: connected.client,
+                    in_process_owner: None,
                 })
+            }
+        "#
+        }
+        "connect_one_shot" => {
+            r#"
+            async fn connect_one_shot() -> Result<Self> {
+                use crate::daemon::{DaemonPaths, discover};
+                let discovered = discover().await;
+                match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
+                    DiscoverAttachPlan::AttachRunning => {
+                        let connected = attach_running_with_skew_check(discovered.paths, None).await?;
+                        return Ok(Self { client: connected.client, in_process_owner: None });
+                    }
+                    DiscoverAttachPlan::WaitForRestart => {
+                        let observed_pid = cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
+                        match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
+                            Ok(client) => return Ok(Self { client, in_process_owner: None }),
+                            Err(SharedWaitError::Released) => {}
+                            Err(SharedWaitError::Wedged) => anyhow::bail!("shared daemon pid is live but socket never became ready: {}", discovered.paths.socket.display()),
+                        }
+                    }
+                    DiscoverAttachPlan::Spawn => {}
+                    DiscoverAttachPlan::FailIncompatible | DiscoverAttachPlan::FailUnreachable => {
+                        if let Some(hello) = discovered.hello.as_ref() {
+                            anyhow::bail!("{}", proto::incompatible_daemon_protocol_message(hello.protocol_version));
+                        }
+                        anyhow::bail!("shared daemon pid is live but socket is unreachable: {}", discovered.paths.socket.display());
+                    }
+                }
+                let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
+                let (endpoint, in_process_owner) = crate::daemon::boot_in_process(paths, crate::daemon::terminal::default_host_factory()).await?;
+                let client = DaemonClient::connect_endpoint(&cockpit_client::ClientEndpoint::InProcess(endpoint)).await?;
+                Ok(Self { client, in_process_owner })
             }
         "#
         }
         "finish" => {
             r#"
             async fn finish<T>(self, result: Result<T>) -> Result<T> {
-                result
+                let Self { client, in_process_owner } = self;
+                drop(client);
+                let shutdown = match in_process_owner {
+                    Some(owner) => owner.shutdown().await,
+                    None => Ok(()),
+                };
+                match (result, shutdown) {
+                    (Ok(value), Ok(())) => Ok(value),
+                    (Ok(_), Err(error)) => Err(error).context("shutting down one-shot in-process daemon"),
+                    (Err(error), Ok(())) => Err(error),
+                    (Err(error), Err(shutdown_error)) => Err(error).context(format!("one-shot operation failed and in-process daemon shutdown also failed: {shutdown_error:#}")),
+                }
             }
         "#
         }
@@ -949,7 +994,7 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         }
         _ => None,
     });
-    for name in ["connect", "client", "finish"] {
+    for name in ["connect", "connect_one_shot", "client", "finish"] {
         let method = owned_impl.and_then(|implementation| {
             implementation.items.iter().find_map(|item| match item {
                 syn::ImplItem::Fn(method) if method.sig.ident == name => Some(method),
@@ -1166,7 +1211,7 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
                     })
                     .collect::<Vec<_>>();
                 let canonical = match &item.trait_ {
-                    None => methods == ["connect", "client", "finish"],
+                    None => methods == ["connect", "connect_one_shot", "client", "finish"],
                     Some(_) => false,
                 };
                 if !canonical || methods.len() != item.items.len() {
@@ -1189,10 +1234,21 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
 
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             let canonical_connect = self.test_depth == 0
-                && self.function.as_deref() == Some("run_owned_daemon")
-                && matches!(&*call.func, syn::Expr::Path(path)
-                    if path.path.segments.iter().map(|segment| segment.ident.to_string())
-                        .eq(["OwnedDaemonSession", "connect"]));
+                && match (self.function.as_deref(), &*call.func) {
+                    (Some("run_owned_daemon"), syn::Expr::Path(path)) => path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .eq(["OwnedDaemonSession", "connect"]),
+                    (Some("run_one_shot_daemon"), syn::Expr::Path(path)) => path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .eq(["OwnedDaemonSession", "connect_one_shot"]),
+                    _ => false,
+                };
             self.allowed_connect_callee_depth += usize::from(canonical_connect);
             self.visit_expr(&call.func);
             self.allowed_connect_callee_depth -= usize::from(canonical_connect);
@@ -1268,7 +1324,16 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
         violations: Vec::new(),
     };
     visitor.visit_file(&file);
-    if visitor.canonical_self_types != ["connect", "connect"] {
+    if visitor.canonical_self_types
+        != [
+            "connect",
+            "connect",
+            "connect_one_shot",
+            "connect_one_shot",
+            "connect_one_shot",
+            "connect_one_shot",
+        ]
+    {
         visitor.violations.push(format!(
             "OwnedDaemonSession Self type inventory changed: {:?}",
             visitor.canonical_self_types
@@ -1395,7 +1460,15 @@ fn core_runner_is_the_only_raw_owner() {
     );
     assert_eq!(raw_owner_acquisitions(&source), ["run_owned_daemon"]);
     assert_eq!(raw_owner_connect_path_count(&source), 1);
-    assert_eq!(raw_owner_struct_literals(&source), ["connect"]);
+    assert_eq!(
+        raw_owner_struct_literals(&source),
+        [
+            "connect",
+            "connect_one_shot",
+            "connect_one_shot",
+            "connect_one_shot"
+        ]
+    );
     assert!(raw_owner_aliases(&source).is_empty());
     assert!(
         raw_owner_occurrence_violations(&source).is_empty(),
@@ -1424,7 +1497,7 @@ fn core_runner_is_the_only_raw_owner() {
             _ => None,
         })
         .unwrap();
-    for name in ["connect", "client", "finish"] {
+    for name in ["connect", "connect_one_shot", "client", "finish"] {
         let method = implementation
             .items
             .iter()
@@ -1582,7 +1655,13 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
     );
     assert_eq!(
         raw_owner_struct_literals(&literal),
-        ["connect", "run_owned_daemon"]
+        [
+            "connect",
+            "connect_one_shot",
+            "connect_one_shot",
+            "connect_one_shot",
+            "run_owned_daemon",
+        ]
     );
     let alias = source.replacen(
         "impl OwnedDaemonSession {",

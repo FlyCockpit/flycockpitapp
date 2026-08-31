@@ -174,6 +174,13 @@ fn cockpit_core_has_no_cli_or_acp_transport_schema_dependency() {
     collect_rust_files(&root, &mut files);
     assert!(!files.is_empty());
     for path in files {
+        // `engine/**/tests.rs` files are included only by a `#[cfg(test)]`
+        // module in their production sibling. They do not take part in the
+        // production core dependency graph, even though they are standalone
+        // Rust files for the test compiler.
+        if path.file_name().is_some_and(|name| name == "tests.rs") {
+            continue;
+        }
         // This is a dependency-boundary ratchet, not a documentation
         // ratchet: core may describe the CLI host in comments and test-only
         // contracts without depending on its transport schema.
@@ -241,7 +248,10 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
             _ => continue,
         };
         let name = ident.to_string();
-        if is_public && name.contains("Acp") && name.contains("Mcp") {
+        if is_public
+            && name.contains("Acp")
+            && (name.contains("Mcp") || name == "AcpNameValuePairV1")
+        {
             forwarded_mcp_public_types.push(name);
         }
     }

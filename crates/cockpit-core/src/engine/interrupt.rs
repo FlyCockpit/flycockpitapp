@@ -673,9 +673,17 @@ async fn recheck_host_approval_effect_boundary_for_generations(
         }
         anyhow::bail!("host approval effect was cancelled before dispatch");
     }
-    // If an approval was rejected by the revision/state fence, do not let a
-    // mixed scope dispatch another effect under an unrelated handoff.
-    if rejected_any {
+    // A scope can legitimately retain an earlier approval for a preceding
+    // sub-gate (for example a path grant followed by the exact command
+    // grant). Resolving that later gate advances the agent revision, so the
+    // older handoff is no longer live by the time the command reaches its
+    // shell boundary. It must be terminalized, but it must not veto the
+    // distinct handoff that exactly matched and claimed this boundary.
+    //
+    // Conversely, if no exact candidate survived, a `NotLive` result still
+    // fails closed: a stale capability can never authorize an effect merely
+    // because another unrelated handoff shares the task-local scope.
+    if rejected_any && !matched_exact_capability {
         for handoff in retained {
             handoff.reject_if_unclaimed().await;
         }

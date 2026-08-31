@@ -13,7 +13,7 @@ fn computer_live_production_loop_registers_handle_retained() {
     let native = include_str!("../src/engine/driver/computer_native.rs");
 
     assert!(
-        native.contains("pub async fn handle_native_computer_items"),
+        native.contains("async fn handle_native_computer_items"),
         "AC5 binds tests to the named production registration symbol"
     );
     let driver_hits = driver

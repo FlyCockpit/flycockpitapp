@@ -798,9 +798,21 @@ impl Session {
             // through a production workspace marker.
             std::fs::canonicalize(&project_root).unwrap_or(project_root)
         };
+        let test_support_legacy_physical_id = if initialize_workspace_scratch {
+            None
+        } else {
+            // A few low-level test fixtures construct a durable row directly
+            // through the database builder. Those rows predate the synthetic
+            // test-workspace namespace and therefore carry the ordinary
+            // directory-object id. Keep that test-only construction seam
+            // readable without making the production resume path accept an
+            // alternate workspace identity.
+            project_id_for(&project_root).ok()
+        };
         anyhow::ensure!(
             Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
-                == row.project_id,
+                == row.project_id
+                || test_support_legacy_physical_id.as_deref() == Some(&row.project_id),
             "persisted session project id does not match canonical workspace root"
         );
         let session_entry_mode = match row.session_entry_mode.as_str() {

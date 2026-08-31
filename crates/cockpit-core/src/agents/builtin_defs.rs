@@ -276,6 +276,12 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
 fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     let execution_kind = if matches!(name, "Computer" | "computer") {
         ExecutionKind::Computer
+    } else if name == "Dream" {
+        // Dream is a daemon-owned maintenance root, not a chat-owning
+        // assistant. Keeping it on the coding path prevents the Assistant
+        // default from demoting its required history_search tool to an
+        // unreachable discoverable MCP entry.
+        ExecutionKind::Coding
     } else if mode.is_chat_ownable() {
         ExecutionKind::Assistant
     } else {

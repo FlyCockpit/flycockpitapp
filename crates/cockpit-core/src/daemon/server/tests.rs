@@ -16548,6 +16548,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "knowledge-base attachment row is removed from later Dream source selection",
         },
         MutatingDispatchCase {
+            kind: "run_knowledge_dream",
+            effect_class: Durable,
+            observation: "typed ordered per-knowledge-base Dream run receipts",
+        },
+        MutatingDispatchCase {
             kind: "send_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::UserMessage delivered to attached worker",
@@ -17281,7 +17286,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "attach"
         | "attach_knowledge_base_session"
         | "detach_knowledge_base_session"
-        | "acknowledge_assistant_inbox_human_read"
         | "subagent_transcript"
         | "cancel_attachment_upload"
         | "goal_status"
@@ -17632,9 +17636,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_all_session_work"
         | "exit_guard_status"
         | "release_exit_guard" => AuthzAllowedOutcome::Response,
-        "knowledge_dream_status" | "promote_to_persistent" => {
-            AuthzAllowedOutcome::Error(ErrorCode::Unavailable)
+        // The authz probe intentionally uses an unknown inbox item. Reaching
+        // the writer handler must therefore fail after authorization rather
+        // than manufacture a durable acknowledgement.
+        "acknowledge_assistant_inbox_human_read" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Internal)
         }
+        "knowledge_dream_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "promote_to_persistent" => AuthzAllowedOutcome::Error(ErrorCode::Unavailable),
+        "run_knowledge_dream" => AuthzAllowedOutcome::Response,
         // `docs_ask` is authorized for the owner but then resolves workspace
         // trust for its (project_root:None ⇒ daemon canonical cwd) workspace,
         // which the ephemeral matrix daemon never trusts — so it fails closed
@@ -17957,6 +17967,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("ack_code_root_deliveries_v1"),
         authz_owner_only("resolve_code_root_interrupt_v1"),
         authz_owner_only("knowledge_dream_status"),
+        authz_owner_only("run_knowledge_dream"),
         authz_owner_only("set_workspace_history_scope"),
         authz_owner_only("get_workspace_history_scope"),
         authz_owner_only("get_storage_report"),
@@ -19070,6 +19081,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "knowledge_dream_status" => Request::KnowledgeDreamStatus {
             project_root: root,
             knowledge_base_id: "missing-kb".into(),
+        },
+        "run_knowledge_dream" => Request::RunKnowledgeDream {
+            project_root: root,
+            knowledge_base_id: None,
+            no_sandbox: false,
         },
         "set_workspace_history_scope" => Request::SetWorkspaceHistoryScope {
             project_root: root,
@@ -21270,6 +21286,23 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "attach_knowledge_base_session" | "detach_knowledge_base_session" => {
             assert_knowledge_base_session_mutating_happy(case.kind).await;
         }
+        "run_knowledge_dream" => {
+            let ctx = test_ctx();
+            let project = tempfile::tempdir().unwrap();
+            let response = dispatch_matrix_request(
+                &ctx,
+                Request::RunKnowledgeDream {
+                    project_root: project.path().to_string_lossy().into_owned(),
+                    knowledge_base_id: None,
+                    no_sandbox: false,
+                },
+            )
+            .await
+            .expect("empty Dream configuration returns ordered receipts");
+            assert!(
+                matches!(response, Response::KnowledgeDreamRuns { results } if results.is_empty())
+            );
+        }
         "acknowledge_assistant_inbox_human_read" => {
             assert_assistant_inbox_human_read_happy().await;
         }
@@ -21525,6 +21558,20 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
                 .await
                 .expect_err("unknown knowledge-base attachment session is rejected");
             assert_eq!(err.code, ErrorCode::UnknownSession);
+        }
+        "run_knowledge_dream" => {
+            let ctx = test_ctx();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::RunKnowledgeDream {
+                    project_root: String::new(),
+                    knowledge_base_id: Some("missing-kb".into()),
+                    no_sandbox: true,
+                },
+            )
+            .await
+            .expect_err("unknown Dream knowledge base is rejected");
+            assert_eq!(err.code, ErrorCode::BadRequest);
         }
         "acknowledge_assistant_inbox_human_read" => {
             let ctx = test_ctx();

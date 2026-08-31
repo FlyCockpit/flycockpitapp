@@ -21,6 +21,11 @@ use crate::wizard::{
 };
 
 pub const ASSISTANT_WIZARD_ID: &str = "assistant";
+/// Daemon-owned identity backing the built-in `Assistant` primary.
+///
+/// The lower-case name is an internal persistence key; the user-facing root
+/// agent remains the built-in `Assistant` definition.
+pub const PRIMARY_ASSISTANT_IDENTITY_NAME: &str = "assistant";
 #[cfg(test)]
 pub(crate) const VALID_ASSISTANT_CONTENT_HASH_FIXTURE: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -186,9 +191,24 @@ pub async fn create_assistant_with_installation_id(
     spec: CreateAssistantSpec,
     installation_id: Uuid,
 ) -> Result<AssistantRow> {
+    create_assistant_with_installation_id_and_soul_edit_mode(
+        db,
+        spec,
+        installation_id,
+        identity::SoulEditMode::default(),
+    )
+    .await
+}
+
+async fn create_assistant_with_installation_id_and_soul_edit_mode(
+    db: &Db,
+    spec: CreateAssistantSpec,
+    installation_id: Uuid,
+    soul_edit_mode: identity::SoulEditMode,
+) -> Result<AssistantRow> {
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
-        create_assistant_with_installation_id_sync(&db, spec, installation_id)
+        create_assistant_with_installation_id_sync(&db, spec, installation_id, soul_edit_mode)
     })
     .await
     .context("assistant creation coordinator joined")?
@@ -198,6 +218,7 @@ fn create_assistant_with_installation_id_sync(
     db: &Db,
     spec: CreateAssistantSpec,
     installation_id: Uuid,
+    soul_edit_mode: identity::SoulEditMode,
 ) -> Result<AssistantRow> {
     validate_assistant_name(&spec.name)?;
     if spec.description.trim().is_empty() {
@@ -253,9 +274,18 @@ fn create_assistant_with_installation_id_sync(
     crate::agents::validate_invariants(&agent)?;
     let markdown = agent.to_markdown()?;
     identity::seed_identity_files(&spec.home_dir)?;
+    cockpit_host::private_fs::ensure_private_dir(&spec.home_dir.join("knowledge")).with_context(
+        || {
+            format!(
+                "creating assistant knowledge base {}",
+                spec.home_dir.join("knowledge").display()
+            )
+        },
+    )?;
     let config = AssistantConfig {
         installation_id,
         agent_source: path.to_string_lossy().into_owned(),
+        soul_edit_mode,
         soul_hash: identity::hash_optional_file(&identity::soul_path(&spec.home_dir))?,
         user_hash: identity::hash_optional_file(&identity::user_path(&spec.home_dir))?,
         ..AssistantConfig::default()
@@ -286,6 +316,43 @@ fn create_assistant_with_installation_id_sync(
     })?;
     cockpit_config::config::remove_config_file_atomic(&journal_path)?;
     Ok(row)
+}
+
+/// Provision the identity and normal assistant-owned knowledge base used by
+/// the built-in `Assistant` primary. The assistant session keeps its built-in
+/// root definition; this durable identity supplies only SOUL/USER state and
+/// the standard assistant knowledge attachment.
+pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
+    if let Some(row) = db.get_assistant(PRIMARY_ASSISTANT_IDENTITY_NAME).await? {
+        return Ok(row);
+    }
+
+    let home_dir = default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?;
+    let spec = CreateAssistantSpec {
+        name: PRIMARY_ASSISTANT_IDENTITY_NAME.to_string(),
+        description: "Identity and knowledge base for Cockpit's built-in Assistant primary."
+            .to_string(),
+        prompt: "This daemon-owned assistant identity supplies personal context to Cockpit's built-in Assistant primary."
+            .to_string(),
+        home_dir,
+    };
+    match create_assistant_with_installation_id_and_soul_edit_mode(
+        db,
+        spec,
+        Uuid::new_v4(),
+        identity::SoulEditMode::Autonomous,
+    )
+    .await
+    {
+        Ok(row) => Ok(row),
+        Err(create_error) => match db.get_assistant(PRIMARY_ASSISTANT_IDENTITY_NAME).await? {
+            // Another daemon/bootstrap race provisioned the same durable
+            // identity. Use the stored row; no error-string matching or
+            // duplicate home initialization is needed.
+            Some(row) => Ok(row),
+            None => Err(create_error).context("provisioning built-in Assistant identity"),
+        },
+    }
 }
 
 /// The sole daemon-owned v2 template for private assistants.  CLI-side
@@ -1324,5 +1391,27 @@ mod tests {
         assert!(def.tools.is_none());
         assert!(snapshot.definition_revision.is_some());
         assert!(snapshot.definition_diagnostic.is_none());
+    }
+
+    #[tokio::test]
+    async fn primary_assistant_identity_is_provisioned_with_autonomous_soul_edits() {
+        let env = crate::test_env::lock_async().await;
+        let temp = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", temp.path());
+        let db = Db::open_in_memory().unwrap();
+
+        let first = ensure_primary_assistant(&db).await.unwrap();
+        let second = ensure_primary_assistant(&db).await.unwrap();
+        let config: AssistantConfig = serde_json::from_str(&first.config_json).unwrap();
+
+        assert_eq!(first.name, PRIMARY_ASSISTANT_IDENTITY_NAME);
+        assert_eq!(second.name, PRIMARY_ASSISTANT_IDENTITY_NAME);
+        assert_eq!(config.soul_edit_mode, identity::SoulEditMode::Autonomous);
+        assert!(
+            default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)
+                .unwrap()
+                .join("knowledge")
+                .is_dir()
+        );
     }
 }

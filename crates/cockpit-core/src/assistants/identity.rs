@@ -30,18 +30,13 @@ to inject nothing.
 -->
 ";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SoulEditMode {
+    #[default]
     HumanOnly,
     ApproveProposals,
     Autonomous,
-}
-
-impl Default for SoulEditMode {
-    fn default() -> Self {
-        Self::Autonomous
-    }
 }
 
 pub fn default_identity_max_tokens() -> usize {
@@ -60,6 +55,17 @@ pub enum IdentityWriteGate {
         note: Option<String>,
         preauthorized: bool,
     },
+    Refuse(String),
+}
+
+/// Authorization result for an arbitrary shell invocation in an
+/// identity-bearing assistant session. Shell syntax cannot soundly enumerate
+/// every process-level writer, so restrictive identity modes gate the complete
+/// invocation instead of trusting a best-effort redirect parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityShellGate {
+    NotAnAssistantSession,
+    Allow { note: Option<String> },
     Refuse(String),
 }
 
@@ -360,6 +366,65 @@ pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<Identity
     }
 }
 
+/// Gate an arbitrary bash invocation for an assistant that owns SOUL/USER
+/// identity files. This is intentionally broader than [`check_identity_write`]:
+/// an external command, variable expansion, command substitution, glob, or
+/// unrecognized shell syntax can all write a known identity file without
+/// yielding a concrete lexical path.
+pub async fn check_identity_shell(ctx: &ToolCtx) -> Result<IdentityShellGate> {
+    let Some((row, home)) = assistant_identity(ctx).await? else {
+        return Ok(IdentityShellGate::NotAnAssistantSession);
+    };
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| {
+            format!(
+                "assistant `{}` has malformed durable configuration; refusing shell execution",
+                row.name
+            )
+        })?;
+    match config.soul_edit_mode {
+        SoulEditMode::HumanOnly => Ok(IdentityShellGate::Refuse(
+            "Refused: bash is unavailable while soul_edit_mode=human_only because arbitrary shell commands cannot be proven not to modify the assistant's SOUL.md/USER.md. The human must edit those files outside model tools.".to_string(),
+        )),
+        SoulEditMode::ApproveProposals => {
+            let Some(approver) = ctx.approver.as_ref() else {
+                return Ok(IdentityShellGate::Refuse(
+                    crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                ));
+            };
+            let decision = approver
+                .approve_path(
+                    &home,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await?;
+            if decision.is_allowed() {
+                Ok(IdentityShellGate::Allow {
+                    note: Some(
+                        " assistant shell invocation approved for identity-bearing session; identity hashes will be refreshed."
+                            .to_string(),
+                    ),
+                })
+            } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+                Ok(IdentityShellGate::Refuse(
+                    crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                ))
+            } else {
+                Ok(IdentityShellGate::Refuse(format!(
+                    "Refused: user declined shell execution for assistant identity `{}`.",
+                    row.name
+                )))
+            }
+        }
+        SoulEditMode::Autonomous => Ok(IdentityShellGate::Allow {
+            note: Some(
+                " assistant shell invocation allowed by soul_edit_mode=autonomous; identity hashes will be refreshed."
+                    .to_string(),
+            ),
+        }),
+    }
+}
+
 pub fn tool_refusal(message: String) -> ToolOutput {
     ToolOutput::text(message)
 }
@@ -373,6 +438,18 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
     tokio::task::spawn_blocking(move || record_identity_write_sync(&db, row, identity_file, &path))
         .await
         .context("assistant identity write coordinator joined")?
+}
+
+/// Rehash both identity files after an allowed arbitrary shell invocation.
+/// Unlike direct write/edit tools, shell commands need not expose their target
+/// paths, so refreshing the complete two-file identity state is the only
+/// sound postcondition.
+pub async fn record_identity_shell_write(ctx: &ToolCtx) -> Result<()> {
+    let Some((_row, home)) = assistant_identity(ctx).await? else {
+        return Ok(());
+    };
+    record_identity_write(ctx, &soul_path(&home)).await?;
+    record_identity_write(ctx, &user_path(&home)).await
 }
 
 fn record_identity_write_sync(
@@ -434,6 +511,17 @@ async fn identity_target(
     }
 }
 
+async fn assistant_identity(ctx: &ToolCtx) -> Result<Option<(AssistantRow, PathBuf)>> {
+    let Some(name) = ctx.session.assistant_name.as_deref() else {
+        return Ok(None);
+    };
+    let Some(row) = ctx.session.db.get_assistant(name).await? else {
+        return Ok(None);
+    };
+    let home = crate::assistants::validate_row_home(&row)?;
+    Ok(Some((row, home)))
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
@@ -467,11 +555,11 @@ mod tests {
     use crate::test_env::TestEnvGuard;
 
     #[test]
-    fn new_assistants_default_to_autonomous_soul_edits() {
-        assert_eq!(SoulEditMode::default(), SoulEditMode::Autonomous);
+    fn new_named_assistants_default_to_human_only_soul_edits() {
+        assert_eq!(SoulEditMode::default(), SoulEditMode::HumanOnly);
         assert_eq!(
             crate::assistants::AssistantConfig::default().soul_edit_mode,
-            SoulEditMode::Autonomous
+            SoulEditMode::HumanOnly
         );
     }
 
@@ -699,6 +787,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_only_blocks_dynamic_shell_writes_before_execution() {
+        let project = tempfile::tempdir().unwrap();
+        let (ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::HumanOnly).await;
+        let original = std::fs::read_to_string(soul_path(&home)).unwrap();
+        let command = format!(
+            "target={}; printf 'model rewrite\\n' > \"$target\"",
+            soul_path(&home).display()
+        );
+
+        let out = crate::tools::bash::BashTool::new()
+            .call(serde_json::json!({ "command": command }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("soul_edit_mode=human_only"), "{out:?}");
+        assert_eq!(std::fs::read_to_string(soul_path(&home)).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn soul_edit_modes_approve_proposals_requires_approval() {
         let project = tempfile::tempdir().unwrap();
         let (ctx, _, home, _env) =
@@ -721,6 +829,31 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn approve_proposals_blocks_dynamic_shell_writes_without_approval() {
+        let project = tempfile::tempdir().unwrap();
+        let (ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::ApproveProposals).await;
+        let original = std::fs::read_to_string(soul_path(&home)).unwrap();
+        let command = format!(
+            "target={}; printf 'model rewrite\\n' > \"$target\"",
+            soul_path(&home).display()
+        );
+
+        let out = crate::tools::bash::BashTool::new()
+            .call(serde_json::json!({ "command": command }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            out.content
+                .contains("noninteractive run: approval auto-denied"),
+            "{}",
+            out.content
+        );
+        assert_eq!(std::fs::read_to_string(soul_path(&home)).unwrap(), original);
     }
 
     #[tokio::test]

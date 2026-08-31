@@ -278,6 +278,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     let children: &[&str] = match name {
         "Assistant" => &[
             "builder",
+            "Build",
             "explore",
             "history",
             "knowledge",
@@ -306,7 +307,15 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
             allowed_children: children
                 .iter()
                 .map(|child| AllowedChild::PortableRef {
-                    portable_agent_ref: format!("cockpit/{child}"),
+                    // Built-in agent IDs are lowercase, while `Build` is the
+                    // public primary launch target. Keep the portable identity
+                    // canonical so vNext resolution can surface `Build` as a
+                    // reachable task target.
+                    portable_agent_ref: if *child == "Build" {
+                        "cockpit/build".to_string()
+                    } else {
+                        format!("cockpit/{child}")
+                    },
                 })
                 .collect(),
             max_descendant_depth: Some(1),
@@ -353,8 +362,7 @@ fn assistant_def() -> AgentDef {
             "write",
             "edit",
             "unlock",
-            "semantic_search",
-            "structured_search",
+            "knowledge_retrieve",
             "history_search",
             "skill_manage",
             "task",
@@ -366,7 +374,7 @@ fn assistant_def() -> AgentDef {
     def.tool_descriptions.insert(
         "task".to_string(),
         ToolDescriptionSpec::WithVerbose {
-            text: "Delegate coding and computer work by default: use `builder` for code changes, `explore` for repository investigation, `knowledge` for cited KB synthesis, and `computer` for display work. Keep the brief self-contained and report the result.".to_string(),
+            text: "Delegate coding and computer work by default: use `builder` or `Build` for code changes, `explore` for repository investigation, `knowledge` for cited KB synthesis, and `computer` for display work. Keep the brief self-contained and report the result.".to_string(),
             verbose_text: Some(
                 "You are a general-purpose personal assistant, not the coding specialist. For code changes, delegate a self-contained implementation brief to `builder` (or `Build` when a primary coding conversation is needed) instead of editing code yourself by default. Use `explore` for repository investigation, `knowledge` for a cited synthesis of KB findings, and `computer` for display work. You retain normal file access for personal artifacts, scratch work, KB maintenance, and small direct changes when that is the clearest way to help; this is guidance, not a prohibition on editing code files. Each delegation brief must state the goal, constraints, relevant paths, and what done looks like. If a task backgrounds, use its task_call_id or await the async result rather than duplicate it.".to_string(),
             ),
@@ -1000,8 +1008,7 @@ mod tests {
             "write",
             "edit",
             "unlock",
-            "semantic_search",
-            "structured_search",
+            "knowledge_retrieve",
             "history_search",
             "mcp",
             "skill_manage",
@@ -1014,7 +1021,9 @@ mod tests {
             .tool_descriptions
             .get("task")
             .expect("Assistant task steering");
-        assert!(format!("{task:?}").contains("builder"));
+        let task_description = format!("{task:?}");
+        assert!(task_description.contains("builder"));
+        assert!(task_description.contains("Build"));
         assert!(def
             .vnext
             .as_ref()
@@ -1023,6 +1032,20 @@ mod tests {
             .allowed_children
             .iter()
             .any(|child| matches!(child, AllowedChild::PortableRef { portable_agent_ref } if portable_agent_ref == "cockpit/computer")));
+        assert!(def
+            .vnext
+            .as_ref()
+            .expect("Assistant vNext declaration")
+            .delegation
+            .allowed_children
+            .iter()
+            .any(|child| matches!(child, AllowedChild::PortableRef { portable_agent_ref } if portable_agent_ref == "cockpit/build")));
+        for tool in tools {
+            assert!(
+                crate::engine::builtin::known_agent_tool_names().contains(&tool.as_str()),
+                "Assistant grants unknown tool `{tool}`"
+            );
+        }
     }
 
     #[test]

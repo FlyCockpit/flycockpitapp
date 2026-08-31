@@ -2479,20 +2479,18 @@ pub fn spawn(
     // it uses the session's in-memory active agent, which is hydrated from the
     // persisted row or the deferred row built on new-session creation. The
     // worker still re-resolves async at startup for stale removed primaries.
-    let initial_agent = match session.assistant_name.clone() {
-        Some(name) => name,
-        None => {
-            let active = session.active_agent();
-            if crate::agents::is_builtin_primary(&active)
-                || crate::agents::is_removed_primary(&active)
-            {
-                crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
-            } else if !active.trim().is_empty() {
-                active
-            } else {
-                initial_active_agent(extended_cfg).to_string()
-            }
-        }
+    // `assistant_name` identifies SOUL/USER and knowledge ownership; it is
+    // not the active root. In particular, the built-in `Assistant` primary
+    // uses a lowercase durable identity key and must still open as `Assistant`.
+    let active = session.active_agent();
+    let initial_agent = if crate::agents::is_builtin_primary(&active)
+        || crate::agents::is_removed_primary(&active)
+    {
+        crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
+    } else if !active.trim().is_empty() {
+        active
+    } else {
+        initial_active_agent(extended_cfg).to_string()
     };
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.

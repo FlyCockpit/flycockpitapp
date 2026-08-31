@@ -1560,18 +1560,37 @@ impl SessionRegistry {
                     session_worker::initial_active_agent(&extended_cfg),
                 )
             };
+        let assistant_identity_name =
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant {
+                crate::assistants::ensure_primary_assistant(&self.inner.db)
+                    .await
+                    .context("provisioning built-in Assistant identity")?;
+                Some(crate::assistants::PRIMARY_ASSISTANT_IDENTITY_NAME)
+            } else {
+                None
+            };
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
         // durable lifecycle rows (agent-tree, write-scope) that foreign-key
         // to `sessions`.
-        let mut session = Session::create_deferred(
-            self.inner.db.clone(),
-            project_root,
-            &initial_agent,
-            self.redaction_key_resolver()?,
-            self.secret_vault()?,
-        )
+        let mut session = match assistant_identity_name {
+            Some(name) => Session::create_assistant_deferred(
+                self.inner.db.clone(),
+                project_root,
+                &initial_agent,
+                name,
+                self.redaction_key_resolver()?,
+                self.secret_vault()?,
+            ),
+            None => Session::create_deferred(
+                self.inner.db.clone(),
+                project_root,
+                &initial_agent,
+                self.redaction_key_resolver()?,
+                self.secret_vault()?,
+            ),
+        }
         .context("creating session")?;
         session.set_deferred_entry_mode(session_entry_mode)?;
         if is_dream_session {

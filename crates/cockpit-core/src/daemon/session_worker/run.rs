@@ -6169,15 +6169,14 @@ pub(super) async fn run_worker(
     );
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
-    // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`). Issue #75: the mode axis no longer
-    // selects the primary — `defaultPrimaryAgent` governs.
-    let root_agent_name = match session.assistant_name.clone() {
-        Some(name) => name,
-        None => match prepared_root_launch.as_ref() {
-            Some(prepared) => prepared.root_agent_name.clone(),
-            None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
-        },
+    // configured default when it's unset/unknown. `assistant_name` carries
+    // identity/knowledge ownership only; it must not replace a built-in root
+    // such as `Assistant` with the lower-case durable identity key. Removed
+    // stored primaries force the release default (`Build`). Issue #75: the
+    // mode axis no longer selects the primary — `defaultPrimaryAgent` governs.
+    let root_agent_name = match prepared_root_launch.as_ref() {
+        Some(prepared) => prepared.root_agent_name.clone(),
+        None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
     };
     if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {

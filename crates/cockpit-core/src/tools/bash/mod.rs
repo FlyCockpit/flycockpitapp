@@ -425,22 +425,19 @@ async fn call_bash_inner(
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
-    let mut identity_write_targets = Vec::new();
-    if let ShellWriteTargets::Concrete(targets) = shell_write_targets(command, &cwd) {
-        for target in targets {
-            match crate::assistants::identity::check_identity_write(ctx, &target).await? {
-                crate::assistants::identity::IdentityWriteGate::Allow { note, .. } => {
-                    if let Some(note) = note {
-                        tracing::info!(%note, path = %target.display(), "assistant identity bash write allowed");
-                        identity_write_targets.push(target);
-                    }
+    let refresh_identity_after_shell =
+        match crate::assistants::identity::check_identity_shell(ctx).await? {
+            crate::assistants::identity::IdentityShellGate::NotAnAssistantSession => false,
+            crate::assistants::identity::IdentityShellGate::Allow { note } => {
+                if let Some(note) = note {
+                    tracing::info!(%note, "assistant identity shell invocation allowed");
                 }
-                crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
-                    return Ok(crate::assistants::identity::tool_refusal(message));
-                }
+                true
             }
-        }
-    }
+            crate::assistants::identity::IdentityShellGate::Refuse(message) => {
+                return Ok(crate::assistants::identity::tool_refusal(message));
+            }
+        };
 
     tracing::debug!(command, timeout_ms, "bash: spawning");
 
@@ -960,8 +957,8 @@ async fn call_bash_inner(
         final_outcome.stderr.push(b'\n');
     }
 
-    for target in &identity_write_targets {
-        crate::assistants::identity::record_identity_write(ctx, target).await?;
+    if refresh_identity_after_shell {
+        crate::assistants::identity::record_identity_shell_write(ctx).await?;
     }
 
     // Native shell-output compression (implementation note):

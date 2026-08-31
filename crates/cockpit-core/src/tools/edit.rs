@@ -120,6 +120,7 @@ impl Tool for EditTool {
         crate::tools::write::enforce_requested_write_scope(ctx, &requested_path, self.name())?;
         let human_knowledge_target =
             crate::knowledge::human_knowledge_concept_target(ctx, &requested_path)?;
+        let is_human_knowledge_target = human_knowledge_target.is_some();
         // Native-tool boundary check (sandboxing part 2) before the
         // write-permitted check — a denied out-of-cwd path never edits.
         let path = match human_knowledge_target.as_ref() {
@@ -187,6 +188,16 @@ impl Tool for EditTool {
             crate::knowledge::normalize_human_knowledge_concept(target, &updated)?
         } else {
             updated
+        };
+        let normalized = if human_knowledge_target.is_some() {
+            let redacted = ctx.redact.scrub(&normalized);
+            if let Some(target) = human_knowledge_target.as_ref() {
+                crate::knowledge::normalize_human_knowledge_concept(target, &redacted)?
+            } else {
+                redacted
+            }
+        } else {
+            normalized
         };
         let normalized = normalize_line_endings(&normalized, want_crlf);
         let config = ctx.config.extended();
@@ -260,6 +271,7 @@ impl Tool for EditTool {
             let knowledge_outcome = crate::knowledge::apply_human_knowledge_concept_edit(
                 target,
                 normalized.clone(),
+                Some(existing.clone()),
                 ctx.cancel.clone(),
             )
             .await?;
@@ -278,12 +290,19 @@ impl Tool for EditTool {
             crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
         }
 
-        let mut message = format!(
-            "edited `{}` ({}; {} bytes)",
-            path.display(),
-            stage,
-            normalized.len()
-        );
+        let mut message = if human_knowledge_outcome
+            .as_ref()
+            .is_some_and(|outcome| !outcome.applied)
+        {
+            format!("did not edit `{}`", path.display())
+        } else {
+            format!(
+                "edited `{}` ({}; {} bytes)",
+                path.display(),
+                stage,
+                normalized.len()
+            )
+        };
         if let Some(outcome) = human_knowledge_outcome {
             message.push('\n');
             message.push_str(&crate::knowledge::human_knowledge_edit_outcome_note(
@@ -293,9 +312,7 @@ impl Tool for EditTool {
         // Diagnostics can spawn or reuse an opaque LSP host. A completed
         // native knowledge write does not grant that host KB write access.
         if let Some(lsp) = &ctx.lsp
-            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
-                .await
-                .is_empty()
+            && !is_human_knowledge_target
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }

@@ -426,20 +426,36 @@ impl Driver {
         // a shell directly. Recreate the KB trust fence at this authority
         // boundary: protected roots force zerobox confinement even when the
         // ordinary session sandbox is disabled.
-        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots_for_model(
+        let denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots_for_model(
             &self.cwd,
             &self.config.extended(),
-            agent.model.is_trusted(),
         )
-        .map_err(|error| {
-            format!("Error: cannot resolve local knowledge-base access policy: {error}")
-        })?;
+        .map_err(|error| error.to_string())?;
         let sandbox_on = self.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
         let availability = if sandbox_on {
             background_sandbox_availability(cwd).await
         } else {
             crate::tools::shell_sandbox::SandboxAvailability::Available
         };
+        if !denied_knowledge_paths.is_empty()
+            && !matches!(
+                availability,
+                crate::tools::shell_sandbox::SandboxAvailability::Available
+            )
+        {
+            let reason = match &availability {
+                crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+                    reason, ..
+                }
+                | crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
+                    reason,
+                } => reason,
+                crate::tools::shell_sandbox::SandboxAvailability::Available => unreachable!(),
+            };
+            return Err(format!(
+                "Access denied: background shell cannot run because shell confinement is unavailable ({reason}) while local knowledge bases are attached."
+            ));
+        }
         match crate::engine::schedule::background::background_launch_gate(sandbox_on, &availability)
         {
             crate::tools::shell_sandbox::SandboxGate::Unconfined => {
@@ -457,7 +473,9 @@ impl Driver {
                 if denied_knowledge_paths.is_empty() {
                     Err(background_sandbox_unavailable_refusal(&reason))
                 } else {
-                    Err(background_knowledge_sandbox_unavailable_refusal(&reason))
+                    Err(format!(
+                        "Access denied: background shell cannot run because shell confinement is unavailable ({reason}) while local knowledge bases are attached."
+                    ))
                 }
             }
         }
@@ -597,12 +615,6 @@ impl Driver {
 fn background_sandbox_unavailable_refusal(reason: &str) -> String {
     format!(
         "Error: the shell sandbox cannot start here ({reason}); `background.start` will fail until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
-    )
-}
-
-fn background_knowledge_sandbox_unavailable_refusal(reason: &str) -> String {
-    format!(
-        "Access denied: `background.start` is unavailable for this model because a local knowledge base requires a trusted model and the shell sandbox cannot start here ({reason}). A background command must remain confined so it cannot read or write that knowledge base."
     )
 }
 

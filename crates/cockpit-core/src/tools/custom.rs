@@ -13,6 +13,8 @@
 //! web tools are the exception: their model-facing descriptions stay
 //! backend-neutral even when their runtime command is Firecrawl/TinyFish/etc.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
 
@@ -189,18 +191,38 @@ impl Tool for CustomBashTool {
 
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
-        let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+        let denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots_for_model(
+            &ctx.cwd,
+            &ctx.config.extended(),
+        )?;
         let sandbox_on = ctx.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
-        let confine = match crate::tools::shell_sandbox::gate_decision(
-            sandbox_on,
-            crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
-        ) {
+        let availability = custom_tool_sandbox_availability(&ctx.cwd).await;
+        if !denied_knowledge_paths.is_empty()
+            && !matches!(
+                availability,
+                crate::tools::shell_sandbox::SandboxAvailability::Available
+            )
+        {
+            let reason = match &availability {
+                crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+                    reason, ..
+                }
+                | crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
+                    reason,
+                } => reason,
+                crate::tools::shell_sandbox::SandboxAvailability::Available => unreachable!(),
+            };
+            return Ok(ToolOutput::text(format!(
+                "Access denied: custom tools cannot run because shell confinement is unavailable ({reason}) while local knowledge bases are attached."
+            )));
+        }
+        let confine = match crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability) {
             crate::tools::shell_sandbox::SandboxGate::Confine => true,
             crate::tools::shell_sandbox::SandboxGate::Unconfined => false,
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
                 if !denied_knowledge_paths.is_empty() {
                     return Ok(ToolOutput::text(format!(
-                        "Access denied: custom tools cannot run because the required shell confinement is unavailable ({reason}) while a local knowledge base requires a trusted model."
+                        "Access denied: custom tools cannot run because shell confinement is unavailable ({reason}) while local knowledge bases are attached."
                     )));
                 }
                 return Ok(ToolOutput::text(format!(
@@ -408,6 +430,26 @@ impl Tool for CustomBashTool {
             )),
         )
     }
+}
+
+async fn custom_tool_sandbox_availability(
+    cwd: &std::path::Path,
+) -> crate::tools::shell_sandbox::SandboxAvailability {
+    #[cfg(test)]
+    if let Some(availability) =
+        TEST_CUSTOM_TOOL_SANDBOX_AVAILABILITY.with(|slot| slot.borrow().clone())
+    {
+        return availability;
+    }
+    crate::tools::shell_sandbox::sandbox_available(cwd)
+        .await
+        .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CUSTOM_TOOL_SANDBOX_AVAILABILITY: RefCell<Option<crate::tools::shell_sandbox::SandboxAvailability>> =
+        const { RefCell::new(None) };
 }
 
 impl CustomBashTool {
@@ -704,6 +746,66 @@ mod tests {
         let error = tool.call(serde_json::json!({}), &ctx).await.unwrap_err();
 
         assert!(error.to_string().contains("shell execution is disabled"));
+    }
+
+    #[tokio::test]
+    async fn local_knowledge_roots_refuse_custom_shell_when_confinement_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".cockpit/knowledge")).unwrap();
+        let template = ToolCommandTemplate {
+            enabled: true,
+            command: "printf hi".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "custom_echo",
+            &template,
+            ToolTemplateProvenance::Configured {
+                source: "test".into(),
+            },
+        );
+        let mut ctx = crate::tools::common::test_ctx(temp.path());
+        ctx.config.set_full_config_snapshot_for_tests(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                1,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![
+                        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                            "project".to_string(),
+                            "Project".to_string(),
+                            "Project knowledge".to_string(),
+                            crate::config::extended::KnowledgeBaseSource::Local {
+                                path: std::path::PathBuf::from(".cockpit/knowledge"),
+                            },
+                            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                            None,
+                            None,
+                            false,
+                            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+        );
+        TEST_CUSTOM_TOOL_SANDBOX_AVAILABILITY.with(|slot| {
+            *slot.borrow_mut() = Some(
+                crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
+                    reason: "platform sandbox unavailable".to_string(),
+                },
+            );
+        });
+
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        TEST_CUSTOM_TOOL_SANDBOX_AVAILABILITY.with(|slot| *slot.borrow_mut() = None);
+        assert!(out.content.contains("Access denied"), "{}", out.content);
+        assert!(
+            out.content.contains("local knowledge bases are attached"),
+            "{}",
+            out.content
+        );
     }
 
     #[test]

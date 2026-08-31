@@ -8,6 +8,7 @@
 //! (defaults apply).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -2097,6 +2098,8 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     let config = resolve_loaded_docs(&docs);
     validate_knowledge_base_registry(&config.knowledge_bases, &providers)
         .context("invalid knowledge-base trust configuration")?;
+    validate_local_knowledge_root_overlaps(cwd, &config.knowledge_bases)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
         config,
@@ -2151,12 +2154,101 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     let config = resolve_loaded_docs(&docs);
     validate_knowledge_base_registry(&config.knowledge_bases, &providers)
         .context("invalid knowledge-base trust configuration")?;
+    validate_local_knowledge_root_overlaps(cwd, &config.knowledge_bases)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
         config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
     })
+}
+
+fn validate_local_knowledge_root_overlaps(
+    cwd: &Path,
+    entries: &[KnowledgeBaseRegistryEntry],
+) -> Result<()> {
+    let mut roots = Vec::new();
+    for entry in entries {
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let root = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let root = resolve_effective_local_knowledge_root(&root).with_context(|| {
+            format!(
+                "resolving configured local knowledge base `{}` root `{}` for overlap validation",
+                entry.id,
+                root.display()
+            )
+        })?;
+        for (existing_id, existing_root) in &roots {
+            if cockpit_host::path_containment::contained_under(existing_root, &root)
+                || cockpit_host::path_containment::contained_under(&root, existing_root)
+            {
+                anyhow::bail!(
+                    "local knowledge bases `{}` and `{}` resolve to overlapping roots (`{}` and `{}`)",
+                    existing_id,
+                    entry.id,
+                    existing_root.display(),
+                    root.display()
+                );
+            }
+        }
+        roots.push((entry.id.as_str(), root));
+    }
+    Ok(())
+}
+
+fn resolve_effective_local_knowledge_root(path: &Path) -> Result<PathBuf> {
+    let mut current = path;
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(base) => return append_unresolved_tail(base, path, current),
+            Err(err) => {
+                if std::fs::symlink_metadata(current)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!("symlink `{}` cannot be resolved: {err}", current.display());
+                }
+                let Some(parent) = current.parent() else {
+                    anyhow::bail!("no existing parent for `{}`", path.display());
+                };
+                if parent == current {
+                    anyhow::bail!("no existing parent for `{}`", path.display());
+                }
+                current = parent;
+            }
+        }
+    }
+}
+
+fn append_unresolved_tail(
+    mut base: PathBuf,
+    original: &Path,
+    existing_prefix: &Path,
+) -> Result<PathBuf> {
+    let tail = original
+        .strip_prefix(existing_prefix)
+        .unwrap_or_else(|_| Path::new(""));
+    for component in tail.components() {
+        match component {
+            std::path::Component::Normal(part) => base.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::bail!("unresolved parent traversal in `{}`", original.display());
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if base.file_name() == Some(OsStr::new("..")) {
+        anyhow::bail!("unresolved parent traversal in `{}`", original.display());
+    }
+    Ok(base)
 }
 
 #[derive(Debug)]

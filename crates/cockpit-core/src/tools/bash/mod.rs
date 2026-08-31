@@ -385,7 +385,13 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
-    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+    let denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+    )
+    .await?;
+    let local_knowledge_roots = denied_knowledge_paths.clone();
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -425,21 +431,63 @@ async fn call_bash_inner(
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
+    if local_knowledge_roots
+        .iter()
+        .any(|root| cockpit_host::path_containment::contained_under(root, &cwd))
+    {
+        return Ok(ToolOutput::text(format!(
+            "Access denied: shell execution cannot run with cwd `{}` inside a local knowledge base; use native `write` or `edit` for explicit human KB edits.",
+            cwd.display()
+        )));
+    }
+    if let Some(outside) = crate::tools::bash::command_directory_escape_with_workspace_scratch(
+        command,
+        &cwd,
+        &ctx.cwd,
+        ctx.session.tmp_dir().as_deref(),
+        Some(&workspace_scratch_dir),
+    ) && local_knowledge_roots
+        .iter()
+        .any(|root| cockpit_host::path_containment::contained_under(root, &outside))
+    {
+        return Ok(ToolOutput::text(format!(
+            "Access denied: shell execution cannot enter local knowledge base `{}`; use native `write` or `edit` for explicit human KB edits.",
+            outside.display()
+        )));
+    }
     let mut identity_write_targets = Vec::new();
-    if let ShellWriteTargets::Concrete(targets) = shell_write_targets(command, &cwd) {
-        for target in targets {
-            match crate::assistants::identity::check_identity_write(ctx, &target).await? {
-                crate::assistants::identity::IdentityWriteGate::Allow { note, .. } => {
-                    if let Some(note) = note {
-                        tracing::info!(%note, path = %target.display(), "assistant identity bash write allowed");
-                        identity_write_targets.push(target);
-                    }
+    match shell_write_targets(command, &cwd) {
+        ShellWriteTargets::Concrete(targets) => {
+            for target in targets {
+                if local_knowledge_roots
+                    .iter()
+                    .any(|root| cockpit_host::path_containment::contained_under(root, &target))
+                {
+                    return Ok(ToolOutput::text(format!(
+                        "Access denied: shell execution cannot write `{}` inside a local knowledge base; use native `write` or `edit` for explicit human KB edits.",
+                        target.display()
+                    )));
                 }
-                crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
-                    return Ok(crate::assistants::identity::tool_refusal(message));
+                match crate::assistants::identity::check_identity_write(ctx, &target).await? {
+                    crate::assistants::identity::IdentityWriteGate::Allow { note, .. } => {
+                        if let Some(note) = note {
+                            tracing::info!(%note, path = %target.display(), "assistant identity bash write allowed");
+                            identity_write_targets.push(target);
+                        }
+                    }
+                    crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
+                        return Ok(crate::assistants::identity::tool_refusal(message));
+                    }
                 }
             }
         }
+        ShellWriteTargets::Dynamic if !local_knowledge_roots.is_empty() => {
+            return Ok(ToolOutput::text(
+                "Access denied: shell execution with dynamic file targets is unavailable while local knowledge bases are attached; use native `write` or `edit` for explicit human KB edits."
+                    .to_string(),
+            ));
+        }
+        ShellWriteTargets::None | ShellWriteTargets::Dynamic => {}
     }
 
     tracing::debug!(command, timeout_ms, "bash: spawning");
@@ -472,7 +520,7 @@ async fn call_bash_inner(
     }
     if !denied_knowledge_paths.is_empty() && options.force_unconfined {
         return Ok(ToolOutput::text(
-            "Access denied: bash cannot run unconfined while a local knowledge base requires a trusted model.",
+            "Access denied: bash cannot run unconfined while local knowledge bases are attached.",
         ));
     }
     let sandbox_on = if ctx.write_scope.is_some()
@@ -497,7 +545,7 @@ async fn call_bash_inner(
         && ctx.session.sandbox_mode().is_container();
     if is_container_run && !denied_knowledge_paths.is_empty() {
         return Ok(ToolOutput::text(
-            "Access denied: bash is unavailable for this model because container execution cannot exclude a local knowledge base that requires a trusted model.",
+            "Access denied: bash is unavailable because container execution cannot exclude attached local knowledge bases.",
         ));
     }
     // Reject legacy sealed binding fields before any lookup or spawn.
@@ -573,6 +621,33 @@ async fn call_bash_inner(
         // Not consulted on these paths; the gate ignores it.
         crate::tools::shell_sandbox::SandboxAvailability::Available
     };
+    if !denied_knowledge_paths.is_empty()
+        && !matches!(
+            availability,
+            crate::tools::shell_sandbox::SandboxAvailability::Available
+        )
+    {
+        let reason = match &availability {
+            crate::tools::shell_sandbox::SandboxAvailability::Unavailable { reason, .. }
+            | crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform { reason } => {
+                reason.clone()
+            }
+            crate::tools::shell_sandbox::SandboxAvailability::Available => unreachable!(),
+        };
+        let meta = crate::engine::tool::SandboxMeta {
+            enabled: sandbox_enabled,
+            confined: false,
+            escalated: options.escalated,
+            escalation_preauthorized,
+            approval_scope_recorded: options.approval_scope_recorded.clone(),
+            unavailable_reason: Some(reason.clone()),
+            resource_profiles: command_resource_plan.metas.clone(),
+        };
+        return Ok(ToolOutput::text(format!(
+            "Access denied: bash cannot run because shell confinement is unavailable ({reason}) while local knowledge bases are attached; use native `write` or `edit` for explicit human KB edits."
+        ))
+        .with_sandbox(meta));
+    }
     let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability);
 
     if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {

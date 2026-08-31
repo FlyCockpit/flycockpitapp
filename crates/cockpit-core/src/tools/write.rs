@@ -103,6 +103,7 @@ impl Tool for WriteTool {
         enforce_requested_write_scope(ctx, &requested_path, self.name())?;
         let human_knowledge_target =
             crate::knowledge::human_knowledge_concept_target(ctx, &requested_path)?;
+        let is_human_knowledge_target = human_knowledge_target.is_some();
 
         // Native-tool boundary check (sandboxing part 2): an out-of-cwd
         // write target escalates (naming the path) before we touch disk.
@@ -157,6 +158,16 @@ impl Tool for WriteTool {
             crate::knowledge::normalize_human_knowledge_concept(target, content)?
         } else {
             content.to_string()
+        };
+        let normalized = if human_knowledge_target.is_some() {
+            let redacted = ctx.redact.scrub(&normalized);
+            if let Some(target) = human_knowledge_target.as_ref() {
+                crate::knowledge::normalize_human_knowledge_concept(target, &redacted)?
+            } else {
+                redacted
+            }
+        } else {
+            normalized
         };
         let normalized = normalize_line_endings(&normalized, want_crlf);
         if !identity_write_preauthorized
@@ -241,6 +252,7 @@ impl Tool for WriteTool {
             let knowledge_outcome = crate::knowledge::apply_human_knowledge_concept_edit(
                 target,
                 normalized.clone(),
+                existing_before.clone(),
                 ctx.cancel.clone(),
             )
             .await?;
@@ -265,12 +277,19 @@ impl Tool for WriteTool {
             crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
         }
 
-        let mut message = format!(
-            "wrote `{}` ({} bytes, {})",
-            path.display(),
-            normalized.len(),
-            if want_crlf { "CRLF" } else { "LF" }
-        );
+        let mut message = if human_knowledge_outcome
+            .as_ref()
+            .is_some_and(|outcome| !outcome.applied)
+        {
+            format!("did not write `{}`", path.display())
+        } else {
+            format!(
+                "wrote `{}` ({} bytes, {})",
+                path.display(),
+                normalized.len(),
+                if want_crlf { "CRLF" } else { "LF" }
+            )
+        };
         if let Some(created) = created_directories {
             message.push('\n');
             message.push_str(&created);
@@ -284,9 +303,7 @@ impl Tool for WriteTool {
         // Diagnostics can spawn or reuse an opaque LSP host. A completed
         // native knowledge write does not grant that host KB write access.
         if let Some(lsp) = &ctx.lsp
-            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
-                .await
-                .is_empty()
+            && !is_human_knowledge_target
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }

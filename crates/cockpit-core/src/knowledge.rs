@@ -985,6 +985,24 @@ enum PreparedKnowledgeGit {
     Deferred(String),
 }
 
+/// Selects how a validated mutation reaches Git's index. Dream writes retain
+/// their existing path-based projection. A human edit instead supplies the
+/// exact bytes that passed the descriptor-bound validation, so Git never
+/// reopens the concept pathname after that validation boundary.
+enum KnowledgeGitStaging {
+    Worktree,
+    ExactFile {
+        relative_path: PathBuf,
+        content: Vec<u8>,
+    },
+}
+
+impl KnowledgeGitStaging {
+    fn requires_git(&self) -> bool {
+        matches!(self, Self::ExactFile { .. })
+    }
+}
+
 /// Wait for the write fence without pinning an async executor worker.  The
 /// caller supplies the turn/shutdown cancellation token, which is consulted
 /// between non-blocking lock attempts.  Once the fence is acquired, the
@@ -1038,6 +1056,27 @@ fn apply_knowledge_dream_cancellable<F>(
 where
     F: FnOnce(&Path, &fs::File) -> Result<()>,
 {
+    apply_knowledge_dream_cancellable_with_staging(
+        root,
+        merge_policy,
+        dream,
+        cancel,
+        KnowledgeGitStaging::Worktree,
+        apply,
+    )
+}
+
+fn apply_knowledge_dream_cancellable_with_staging<F>(
+    root: &Path,
+    merge_policy: KnowledgeBaseMergePolicy,
+    dream: &KnowledgeDreamCommit,
+    cancel: &CancellationToken,
+    staging: KnowledgeGitStaging,
+    apply: F,
+) -> Result<KnowledgeDreamGitOutcome>
+where
+    F: FnOnce(&Path, &fs::File) -> Result<()>,
+{
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
     // The model mutation itself is fenced, not just Git. Losing the private
@@ -1061,25 +1100,36 @@ where
         });
     }
 
+    if let PreparedKnowledgeGit::Skipped(reason) = &prepared
+        && staging.requires_git()
+    {
+        bail!("human knowledge edits require an available Git fence before mutation: {reason}");
+    }
+
     let before_paths = match &prepared {
-        PreparedKnowledgeGit::Active { .. } => match versioned_knowledge_paths(&mutation_root) {
-            Ok(paths) => Some(paths),
-            Err(error) => {
-                // Parsing the pre-write bundle is required to record deletions
-                if let PreparedKnowledgeGit::Active {
-                    restore_branch: Some(restore_branch),
-                    ..
-                } = &prepared
-                {
-                    let _ = restore_knowledge_branch(&mutation_root, restore_branch);
+        PreparedKnowledgeGit::Active { .. }
+            if matches!(&staging, KnowledgeGitStaging::Worktree) =>
+        {
+            match versioned_knowledge_paths(&mutation_root) {
+                Ok(paths) => Some(paths),
+                Err(error) => {
+                    // Parsing the pre-write bundle is required to record deletions
+                    if let PreparedKnowledgeGit::Active {
+                        restore_branch: Some(restore_branch),
+                        ..
+                    } = &prepared
+                    {
+                        let _ = restore_knowledge_branch(&mutation_root, restore_branch);
+                    }
+                    return Ok(KnowledgeDreamGitOutcome::Deferred {
+                        branch: None,
+                        commit: None,
+                        reason: format!("validating existing knowledge for Git failed: {error}"),
+                    });
                 }
-                return Ok(KnowledgeDreamGitOutcome::Deferred {
-                    branch: None,
-                    commit: None,
-                    reason: format!("validating existing knowledge for Git failed: {error}"),
-                });
             }
-        },
+        }
+        PreparedKnowledgeGit::Active { .. } => None,
         PreparedKnowledgeGit::Skipped(_) => None,
         PreparedKnowledgeGit::Deferred(_) => unreachable!("deferred preparation returned early"),
     };
@@ -1132,9 +1182,8 @@ where
                 &branch,
                 remote.as_deref(),
                 dream,
-                before_paths
-                    .as_ref()
-                    .expect("active Git preparation has a baseline"),
+                before_paths.as_ref(),
+                &staging,
             ) {
                 Ok(outcome) => Ok(outcome),
                 Err(error) => Ok(KnowledgeDreamGitOutcome::Deferred {
@@ -1353,8 +1402,17 @@ fn commit_knowledge_dream(
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
-    before_paths: &BTreeSet<PathBuf>,
+    before_paths: Option<&BTreeSet<PathBuf>>,
+    staging: &KnowledgeGitStaging,
 ) -> Result<KnowledgeDreamGitOutcome> {
+    if let KnowledgeGitStaging::ExactFile {
+        relative_path,
+        content,
+    } = staging
+    {
+        return commit_exact_knowledge_file(root, branch, remote, dream, relative_path, content);
+    }
+
     let paths = match versioned_knowledge_paths(root) {
         Ok(paths) => paths,
         Err(error) => {
@@ -1365,7 +1423,10 @@ fn commit_knowledge_dream(
             });
         }
     };
-    let paths: BTreeSet<_> = paths.union(before_paths).cloned().collect();
+    let paths: BTreeSet<_> = paths
+        .union(before_paths.expect("worktree Git staging has a pre-mutation baseline"))
+        .cloned()
+        .collect();
     if paths.is_empty() {
         return Ok(KnowledgeDreamGitOutcome::NoChanges {
             branch: branch.to_string(),
@@ -1395,6 +1456,84 @@ fn commit_knowledge_dream(
         );
     }
 
+    commit_staged_knowledge_dream(root, branch, remote, dream, &paths, true)
+}
+
+/// Stage a validated human concept from its exact bytes, rather than asking
+/// Git to reopen its pathname. This keeps the Git object and commit bound to
+/// the descriptor-validated publication even when an unrelated process races
+/// the working tree after validation.
+fn commit_exact_knowledge_file(
+    root: &Path,
+    branch: &str,
+    remote: Option<&str>,
+    dream: &KnowledgeDreamCommit,
+    relative_path: &Path,
+    content: &[u8],
+) -> Result<KnowledgeDreamGitOutcome> {
+    let blob = match crate::git::run_git_checked_with_input(
+        root,
+        &["hash-object", "-w", "--stdin"],
+        content,
+    ) {
+        Ok(blob) => blob,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "hashing validated human output",
+                error.to_string(),
+            );
+        }
+    };
+    let blob = std::str::from_utf8(&blob)
+        .context("Git returned a non-UTF-8 object ID for validated human output")?
+        .trim();
+    ensure!(
+        !blob.is_empty() && blob.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Git returned an invalid object ID for validated human output"
+    );
+    let cacheinfo = format!("100644,{blob},{}", rel_string(relative_path));
+    let staged = match knowledge_git(root, &["update-index", "--add", "--cacheinfo", &cacheinfo]) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "staging validated human output",
+                error.to_string(),
+            );
+        }
+    };
+    if !staged.success {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "staging validated human output",
+            staged.stderr.trim().to_string(),
+        );
+    }
+    commit_staged_knowledge_dream(
+        root,
+        branch,
+        remote,
+        dream,
+        &[relative_path.to_path_buf()],
+        false,
+    )
+}
+
+/// Commit the selected index entries. Exact-byte staging must not use
+/// `commit --only`: that option refreshes the index by reopening worktree
+/// paths, which would discard the validated-byte boundary above.
+fn commit_staged_knowledge_dream(
+    root: &Path,
+    branch: &str,
+    remote: Option<&str>,
+    dream: &KnowledgeDreamCommit,
+    paths: &[PathBuf],
+    refresh_worktree_paths: bool,
+) -> Result<KnowledgeDreamGitOutcome> {
     let mut cached_args = vec![
         "diff".to_string(),
         "--cached".to_string(),
@@ -1441,12 +1580,14 @@ fn commit_knowledge_dream(
         "-c".to_string(),
         "commit.gpgSign=false".to_string(),
         "commit".to_string(),
-        "--only".to_string(),
         "-m".to_string(),
         message,
     ];
-    commit_args.push("--".to_string());
-    commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    if refresh_worktree_paths {
+        commit_args.push("--only".to_string());
+        commit_args.push("--".to_string());
+        commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    }
     let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
     let committed = match knowledge_git(root, &commit_refs) {
         Ok(committed) => committed,
@@ -4889,11 +5030,16 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
             concepts_written: 1,
             data_files_written: 0,
         };
-        let git = apply_knowledge_dream_cancellable(
+        let staging = KnowledgeGitStaging::ExactFile {
+            relative_path: target.relative_path.clone(),
+            content: content.as_bytes().to_vec(),
+        };
+        let git = apply_knowledge_dream_cancellable_with_staging(
             &target.root,
             target.merge_policy,
             &commit,
             &cancel,
+            staging,
             |root, directory| {
                 let mutation = write_human_knowledge_concept_nofollow(
                     directory,
@@ -4927,6 +5073,12 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
                     }
                     return Err(error);
                 }
+                verify_human_knowledge_concept_published_content(
+                    directory,
+                    &target.relative_path,
+                    &mutation,
+                    content.as_bytes(),
+                )?;
                 Ok(())
             },
         )?;
@@ -4938,7 +5090,6 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
         let applied = matches!(
             &git,
             KnowledgeDreamGitOutcome::Committed { .. }
-                | KnowledgeDreamGitOutcome::Skipped { .. }
                 | KnowledgeDreamGitOutcome::NoChanges { .. }
                 | KnowledgeDreamGitOutcome::Deferred {
                     commit: Some(_),
@@ -4988,6 +5139,53 @@ fn write_human_knowledge_concept_nofollow(
         written_device,
         written_inode,
     })
+}
+
+/// Prove that the path validated as an OKF bundle is still the exact leaf we
+/// published, and that it still contains the bytes about to be staged from
+/// memory. After this check, Git receives only `expected`, never a path it
+/// could reopen and race.
+#[cfg(unix)]
+fn verify_human_knowledge_concept_published_content(
+    root: &fs::File,
+    relative_path: &Path,
+    mutation: &HumanKnowledgeConceptMutation,
+    expected: &[u8],
+) -> Result<()> {
+    let (parent, leaf) = human_knowledge_concept_parent_nofollow(root, relative_path)?;
+    if !human_knowledge_concept_matches(
+        &parent,
+        &leaf,
+        mutation.written_device,
+        mutation.written_inode,
+    )? {
+        bail!(
+            "human knowledge concept `{}` changed after validation; refusing Git commit",
+            relative_path.display()
+        );
+    }
+    let actual = read_human_knowledge_concept_nofollow(&parent, &leaf)?.with_context(|| {
+        format!(
+            "human knowledge concept `{}` disappeared after validation",
+            relative_path.display()
+        )
+    })?;
+    ensure!(
+        actual.as_slice() == expected,
+        "human knowledge concept `{}` changed after validation; refusing Git commit",
+        relative_path.display()
+    );
+    ensure!(
+        human_knowledge_concept_matches(
+            &parent,
+            &leaf,
+            mutation.written_device,
+            mutation.written_inode,
+        )?,
+        "human knowledge concept `{}` changed while verifying its validated bytes; refusing Git commit",
+        relative_path.display()
+    );
+    Ok(())
 }
 
 /// Restore a failed human edit only when its published inode is still the
@@ -5260,6 +5458,16 @@ fn write_human_knowledge_concept_nofollow(
 }
 
 #[cfg(not(unix))]
+fn verify_human_knowledge_concept_published_content(
+    _root: &fs::File,
+    _relative_path: &Path,
+    _mutation: &HumanKnowledgeConceptMutation,
+    _expected: &[u8],
+) -> Result<()> {
+    unreachable!("unsupported human knowledge edit cannot publish a mutation")
+}
+
+#[cfg(not(unix))]
 fn rollback_human_knowledge_concept_nofollow(
     _root: &fs::File,
     _relative_path: &Path,
@@ -5282,11 +5490,7 @@ pub(crate) fn human_knowledge_edit_outcome_note(outcome: &HumanKnowledgeEditOutc
             format!("human knowledge concept is unchanged on `{branch}`")
         }
         KnowledgeDreamGitOutcome::Skipped { reason } => {
-            if outcome.applied {
-                format!("human knowledge concept applied; Git history was skipped: {reason}")
-            } else {
-                format!("human knowledge concept was not applied: {reason}")
-            }
+            format!("human knowledge concept was not applied: {reason}")
         }
         KnowledgeDreamGitOutcome::Deferred { reason, .. } => {
             if outcome.applied {
@@ -9239,6 +9443,52 @@ Inventory facts for warehouse operations.
         let subject =
             crate::git::run_git_checked(tmp.path(), &["log", "-1", "--format=%s"]).unwrap();
         assert!(subject.starts_with("human(kb=personal):"), "{subject}");
+    }
+
+    #[test]
+    fn exact_human_git_staging_commits_validated_bytes_not_a_reopened_path() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |_root, _| Ok(()),
+        )
+        .unwrap();
+
+        let target = PathBuf::from("manual.md");
+        let expected = b"---\nid: manual\ntype: memory\nprovenance: human\n---\n\nValidated human correction.\n";
+        fs::write(
+            tmp.path().join(&target),
+            "---\nid: manual\ntype: memory\n---\n\nUnvalidated replacement.\n",
+        )
+        .unwrap();
+        let human = KnowledgeDreamCommit {
+            knowledge_base_id: "personal".to_string(),
+            origin: KnowledgeCommitOrigin::Human,
+            model: "human".to_string(),
+            sessions_dreamed: 0,
+            concepts_written: 1,
+            data_files_written: 0,
+        };
+
+        let outcome =
+            commit_exact_knowledge_file(tmp.path(), "main", None, &human, &target, expected)
+                .unwrap();
+
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        let committed =
+            crate::git::run_git_checked(tmp.path(), &["show", "HEAD:manual.md"]).unwrap();
+        assert_eq!(committed.as_bytes(), expected);
+        assert_ne!(
+            fs::read(tmp.path().join(target)).unwrap(),
+            expected,
+            "the assertion is meaningful only if Git did not reopen the worktree path"
+        );
     }
 
     #[cfg(unix)]

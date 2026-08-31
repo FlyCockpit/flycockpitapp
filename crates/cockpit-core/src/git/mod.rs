@@ -4,8 +4,9 @@
 //! than depending on `git2`/`libgit2`. Reasons: smaller binary, respects
 //! the user's git config and SSH keys, no version-skew breakage.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -226,6 +227,46 @@ pub(crate) fn run_git_checked_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>
         .current_dir(dir)
         .output()
         .with_context(|| format!("launching `git {}`", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// Run Git with an exact byte stream on standard input. Callers use this when
+/// the Git object must be derived from already-validated bytes rather than a
+/// path Git would reopen later.
+pub(crate) fn run_git_checked_with_input(
+    dir: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        dir,
+    )
+    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("launching `git {}`", args.join(" ")))?;
+    child
+        .stdin
+        .as_mut()
+        .context("opening Git standard input")?
+        .write_all(input)
+        .with_context(|| format!("writing input to `git {}`", args.join(" ")))?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for `git {}`", args.join(" ")))?;
     if !output.status.success() {
         anyhow::bail!(
             "`git {}` failed: {}",

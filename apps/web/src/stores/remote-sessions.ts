@@ -2374,7 +2374,10 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     }
   },
   forkSession: async (instanceId, sessionId) => {
-    await get().clients[instanceId]?.forkSession({ parent_session_id: sessionId });
+    await get().clients[instanceId]?.forkSession({
+      parent_session_id: sessionId,
+      fresh_thread: false,
+    });
   },
   resumePausedWork: async (instanceId, sessionId) => {
     const client = attachedWebClient(get(), instanceId, sessionId);

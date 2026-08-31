@@ -3909,15 +3909,6 @@ async fn handle_send_user_message(
     } else {
         None
     };
-    // Legacy-sized/media messages retain their existing admission behavior.
-    // Oversized FCM2 messages record activity only after the worker has
-    // durably accepted both the receipt triple and source reservation.
-    if origin == proto::UserMessageOrigin::ExternalRoot
-        && artifact_admission.is_none()
-        && let Some(scheduler) = &ctx.scheduler
-    {
-        scheduler.record_user_activity().await;
-    }
     let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
         origin,
         &text,
@@ -4061,9 +4052,10 @@ async fn handle_send_user_message(
         Ok(result) => result,
         Err(error) => return Err(error),
     };
-    // Oversized activity is advanced by the driver only after phase-two
-    // materialization. The dispatch path must not create an accepted-turn
-    // side effect merely because phase one reserved a lease.
+    // The worker publishes inline/media activity at its fresh-insert boundary,
+    // before it resolves this acknowledgement. Replays intentionally never
+    // reach that publication. Oversized FCM2 still advances activity only at
+    // its phase-two materialization boundary in the driver.
     Ok(Response::UserMessageQueued { item, queue })
 }
 
@@ -9078,6 +9070,8 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            crate::assistants::validate_named_assistant_name(&assistant_id)
+                .map_err(|error| bad_request(error.to_string()))?;
             let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
@@ -9146,6 +9140,28 @@ async fn handle_serialized_request_impl(
             code: ErrorCode::Internal,
             message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
         }),
+        Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept built-in Assistant settings writes",
+                ));
+            }
+            let soul_edit_mode = match soul_edit_mode.as_str() {
+                "human_only" => crate::assistants::identity::SoulEditMode::HumanOnly,
+                "approve_proposals" => crate::assistants::identity::SoulEditMode::ApproveProposals,
+                "autonomous" => crate::assistants::identity::SoulEditMode::Autonomous,
+                _ => return Err(bad_request("invalid built-in Assistant soul_edit_mode")),
+            };
+            crate::assistants::ensure_primary_assistant(&ctx.db)
+                .await
+                .map_err(internal)?;
+            crate::assistants::set_primary_assistant_soul_edit_mode(&ctx.db, soul_edit_mode)
+                .await
+                .map_err(internal)?;
+            Ok(Response::PrimaryAssistantSoulEditMode {
+                soul_edit_mode: soul_edit_mode_to_wire(soul_edit_mode).to_string(),
+            })
+        }
         Request::UpsertAssistant {
             name,
             description,
@@ -9206,7 +9222,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
             }
-            crate::assistants::validate_assistant_name(&name)
+            crate::assistants::validate_named_assistant_name(&name)
                 .map_err(|error| bad_request(error.to_string()))?;
             if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request("assistant markdown exceeds maximum length"));
@@ -11586,6 +11602,7 @@ async fn handle_serialized_request_impl(
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
+            fresh_thread,
         } => {
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
@@ -11596,6 +11613,7 @@ async fn handle_serialized_request_impl(
                         parent_session_id,
                         fork_point_turn_id: fork_point_turn_id.clone(),
                         ephemeral,
+                        fresh_thread,
                     },
                     operation,
                 )?;
@@ -11605,6 +11623,7 @@ async fn handle_serialized_request_impl(
                     parent_session_id,
                     fork_point_turn_id,
                     ephemeral,
+                    fresh_thread,
                     &ledger,
                 )
                 .await;
@@ -11615,6 +11634,7 @@ async fn handle_serialized_request_impl(
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
+                fresh_thread,
             )
             .await
         }
@@ -28144,6 +28164,14 @@ pub(super) fn assistant_to_proto(
         definition_revision: None,
         definition_diagnostic: None,
         projection_digest: String::new(),
+    }
+}
+
+fn soul_edit_mode_to_wire(mode: crate::assistants::identity::SoulEditMode) -> &'static str {
+    match mode {
+        crate::assistants::identity::SoulEditMode::HumanOnly => "human_only",
+        crate::assistants::identity::SoulEditMode::ApproveProposals => "approve_proposals",
+        crate::assistants::identity::SoulEditMode::Autonomous => "autonomous",
     }
 }
 

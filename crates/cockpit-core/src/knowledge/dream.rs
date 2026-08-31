@@ -16,9 +16,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    Citation, KnowledgeConcept, KnowledgeDreamCommit, KnowledgeDreamGitOutcome,
-    KnowledgeDreamWrite, apply_knowledge_dream_writes, apply_registered_knowledge_dream,
-    parse_bundle, validate_knowledge_dream_writes,
+    Citation, KnowledgeCommitOrigin, KnowledgeConcept, KnowledgeDreamCommit,
+    KnowledgeDreamGitOutcome, KnowledgeDreamWrite, apply_knowledge_dream_writes,
+    apply_registered_knowledge_dream, parse_bundle, validate_knowledge_dream_writes,
 };
 use crate::config::extended::{ExtendedConfig, KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
 use crate::config::providers::{ModelTrust, ProvidersConfig};
@@ -31,7 +31,6 @@ use crate::session::Session;
 #[serde(rename_all = "lowercase")]
 pub enum ConceptProvenance {
     Human,
-    Agent,
     Dream,
 }
 
@@ -39,7 +38,6 @@ impl ConceptProvenance {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Human => "human",
-            Self::Agent => "agent",
             Self::Dream => "dream",
         }
     }
@@ -199,6 +197,7 @@ impl DreamSink for LocalGitSink {
         let change_set = change_set.clone();
         let commit = KnowledgeDreamCommit {
             knowledge_base_id: change_set.knowledge_base_id.clone(),
+            origin: KnowledgeCommitOrigin::Dream,
             model: model.reference(),
             sessions_dreamed: change_set.source_session_ids.len(),
             concepts_written: change_set.upserts.len(),

@@ -840,6 +840,10 @@ pub struct AgentSession {
     pub agent: Arc<Agent>,
     pub computer_coordinator: Option<crate::computer::coordinator::ComputerActionCoordinator>,
     pub computer_contract: Option<crate::computer::ComputerToolContract>,
+    /// The target and policy boundary of `computer_coordinator`. Rebuilt
+    /// agents must match it before the coordinator can be reused.
+    pub(crate) computer_coordinator_config:
+        Option<crate::computer::NativeComputerCoordinatorConfig>,
     pub pending_computer_continuations: Vec<serde_json::Value>,
     /// Durable lifecycle identity for this concrete executor.  Agent display
     /// names are intentionally not used as identity: several task children can
@@ -1109,6 +1113,11 @@ pub struct Driver {
     /// frames. The queue merely schedules a safe-boundary turn; its placeholder
     /// text is never authority for the recovered model input.
     recovered_interactive_continuations: std::collections::HashMap<uuid::Uuid, Message>,
+    /// Recovered interactive continuations whose durable initial snapshot
+    /// contains seed declarations that must run before their first inference.
+    /// The queue UUID is a scheduling key only; the declarations remain in the
+    /// task snapshot until ordinary dispatch records their tool results.
+    recovered_interactive_seed_replays: std::collections::HashSet<uuid::Uuid>,
     /// Reattached accepted late-steer checkpoints waiting for the worker's
     /// exact `ResumeAcceptedLateUserDecisionSteer` control.  Keeping this
     /// separate from the queue scheduler makes an accepted checkpoint
@@ -1980,6 +1989,8 @@ impl Driver {
             coordinator,
             contract,
             action_items,
+            &self.session,
+            self.approver.as_ref(),
         )
         .await;
         if wire.is_empty() && proposal_result.is_none() {
@@ -1998,10 +2009,17 @@ impl Driver {
     /// Open the selected delegation's backend before its first advertised
     /// native-computer request. Candidate scans leave geometry unset; this is
     /// the only path that turns that metadata into a live capability.
-    async fn open_native_computer_for_active_frame(&mut self) {
-        let (mut agent, delegation_id, mut coordinator, mut contract, mut pending) = {
+    async fn open_native_computer_for_active_frame(&mut self) -> Result<()> {
+        let (
+            mut agent,
+            delegation_id,
+            mut coordinator,
+            mut contract,
+            mut coordinator_config,
+            mut pending,
+        ) = {
             let Some(frame) = self.stack.last_mut() else {
-                return;
+                return Ok(());
             };
             (
                 frame.agent.as_ref().clone(),
@@ -2012,6 +2030,7 @@ impl Driver {
                     .to_string(),
                 frame.computer_coordinator.take(),
                 frame.computer_contract.take(),
+                frame.computer_coordinator_config.take(),
                 std::mem::take(&mut frame.pending_computer_continuations),
             )
         };
@@ -2022,14 +2041,17 @@ impl Driver {
             delegation_id,
             &mut coordinator,
             &mut contract,
+            &mut coordinator_config,
             &mut pending,
         )
-        .await;
+        .await?;
         let frame = self.stack.last_mut().expect("stack nonempty");
         frame.agent = Arc::new(agent);
         frame.computer_coordinator = coordinator;
         frame.computer_contract = contract;
+        frame.computer_coordinator_config = coordinator_config;
         frame.pending_computer_continuations = pending;
+        Ok(())
     }
 
     /// Build the Driver authority used by a detached/nested turn loop to drain
@@ -2198,6 +2220,7 @@ impl Driver {
                     agent: frame.agent.clone(),
                     computer_coordinator: None,
                     computer_contract: frame.computer_contract,
+                    computer_coordinator_config: frame.computer_coordinator_config,
                     pending_computer_continuations: Vec::new(),
                     agent_instance_id: frame.agent_instance_id,
                     endpoint_generation: frame.endpoint_generation,
@@ -2223,6 +2246,7 @@ impl Driver {
             pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
+            recovered_interactive_seed_replays: std::collections::HashSet::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             time_injection_interval_minutes: self.time_injection_interval_minutes,
@@ -2583,6 +2607,7 @@ impl Driver {
                 agent: root,
                 computer_coordinator: None,
                 computer_contract: None,
+                computer_coordinator_config: None,
                 pending_computer_continuations: Vec::new(),
                 agent_instance_id: None,
                 endpoint_generation: None,
@@ -2599,6 +2624,7 @@ impl Driver {
             pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
+            recovered_interactive_seed_replays: std::collections::HashSet::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -4052,6 +4078,8 @@ impl Driver {
                 .context("recovered interactive task snapshot has no history")?,
         )
         .context("decoding recovered interactive task history")?;
+        let recovered_seed_replay =
+            !crate::engine::seed_reads::pending_declared_seed_calls(&history).is_empty();
         let snapshot_next_prompt = snapshot
             .get("next_prompt")
             .cloned()
@@ -4130,6 +4158,7 @@ impl Driver {
             agent: Arc::new(child),
             computer_coordinator: None,
             computer_contract: None,
+            computer_coordinator_config: None,
             pending_computer_continuations: Vec::new(),
             agent_instance_id: Some(recovery.agent_instance_id),
             endpoint_generation: Some(endpoint_generation),
@@ -4200,6 +4229,10 @@ impl Driver {
             .await;
         self.recovered_interactive_continuations
             .insert(queue_item_id, next_prompt);
+        if recovered_seed_replay {
+            self.recovered_interactive_seed_replays
+                .insert(queue_item_id);
+        }
         Ok(endpoint_generation)
     }
 
@@ -4444,9 +4477,10 @@ impl Driver {
                 .context("driver stack is empty")?
                 .history;
             ensure_or_restore_parked_tool_call(history, &payload)?;
-            if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
-                return Ok(());
-            }
+            // A crash may occur after this seed's paired result commits but
+            // before its remaining siblings execute. Do not return early for
+            // a completed seed: the continuation below derives those
+            // siblings from the declared history and closes that gap.
         }
 
         let ctx = crate::engine::tool::ToolCtx {
@@ -4559,27 +4593,160 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            interrupt_id,
-            response,
-            question,
-            async {
-                let frame = self.stack.last_mut().context("driver stack is empty")?;
-                crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
-                    crate::engine::agent::tool_dispatch::execute_ordinary_call(
-                        &env,
-                        &mut frame.history,
-                        &call,
-                        &payload.tool,
-                        crate::db::tool_calls::Recovery::Clean,
-                        None,
-                    )
+        let call_completed = self.stack.last().is_some_and(|frame| {
+            crate::engine::agent::history_ends_with_tool_result_call(
+                &frame.history,
+                &payload.call_id,
+            )
+        });
+        if !call_completed {
+            crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                interrupt_id,
+                response,
+                question,
+                async {
+                    let frame = self.stack.last_mut().context("driver stack is empty")?;
+                    crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
+                        crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                            &env,
+                            &mut frame.history,
+                            &call,
+                            &payload.tool,
+                            crate::db::tool_calls::Recovery::Clean,
+                            None,
+                        )
+                        .await
+                    })
                     .await
-                })
-                .await
-            },
-        )
-        .await
+                },
+            )
+            .await?;
+        }
+        if payload.call_id.starts_with("seed-read-") {
+            let pending = self
+                .stack
+                .last()
+                .map(|frame| crate::engine::seed_reads::pending_declared_seed_calls(&frame.history))
+                .unwrap_or_default();
+            if !pending.is_empty() {
+                let frame = self.stack.last_mut().context("driver stack is empty")?;
+                crate::engine::seed_reads::execute_declared_seed_calls(
+                    &env,
+                    &mut frame.history,
+                    pending,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run seed calls that were declared in the interactive child's durable
+    /// history before its first model inference.  Recovery reuses the same
+    /// declarations and call IDs, so publication never depends on the
+    /// in-memory explore receipt remaining available.
+    async fn execute_interactive_declared_seed_reads(
+        &mut self,
+        brief: Message,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        let pending = self
+            .stack
+            .last()
+            .map(|frame| crate::engine::seed_reads::pending_declared_seed_calls(&frame.history))
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Ok(brief);
+        }
+        let agent = self
+            .stack
+            .last()
+            .context("driver stack is empty")?
+            .agent
+            .clone();
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
+                .await;
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
+            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
+            agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
+            lock_identity: agent.lock_identity.clone(),
+            write_scope: agent.write_scope.clone(),
+            dream_read_scope: self.dream_read_scope.clone(),
+            workspace_lease: agent.workspace_lease.clone(),
+            current_tool_call_id: None,
+            tool_steering: agent.tool_steering,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel,
+            shutdown_gate: agent.model.shutdown_gate(),
+            approver: self.approver.clone(),
+            image_generation_dispatch: self.session.image_generation_dispatch(),
+            transcription_dispatch: None,
+            deferred_log: self
+                .stack
+                .last()
+                .context("driver stack is empty")?
+                .deferred_log
+                .clone(),
+            root_agent_frame: false,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            has_tree: active_tools.get("code").is_some(),
+            has_bash: active_tools.get("bash").is_some(),
+            events: Some(tx.clone()),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            env_overlay: agent.env_overlay.clone(),
+            config: self.config.clone(),
+            mcp_resolver: agent.mcp_resolver.clone(),
+        };
+        let snapshot = self.config.snapshot();
+        let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+            agent: &agent,
+            session: &self.session,
+            model: &agent.model,
+            active_tools: &active_tools,
+            ctx: &ctx,
+            tx,
+            hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
+                &self.session,
+                &self.config,
+            ),
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: snapshot.hooks(),
+        };
+        let frame = self.stack.last_mut().context("driver stack is empty")?;
+        frame.history.push(brief);
+        crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
+            .await?;
+        Ok(crate::engine::seed_reads::completion_prompt())
     }
 
     async fn continue_after_parked_interrupt_replay(
@@ -4634,7 +4801,7 @@ impl Driver {
             if !active_frame_has_scheduled_turn {
                 self.maybe_auto_prune(tx).await;
             }
-            self.open_native_computer_for_active_frame().await;
+            self.open_native_computer_for_active_frame().await?;
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
@@ -4685,6 +4852,19 @@ impl Driver {
                 }
                 Ok(PendingScheduledReentry::Advanced(result)) => Some(result),
             };
+            // A replayed seed call is a pre-inference continuation rather
+            // than a model turn. Once every declared seed has a result, feed
+            // the same host notice used by the uninterrupted path into the
+            // first inference without first duplicating it in history.
+            let seed_reads_completed = crate::engine::agent::tool_result_call_id(&next_prompt)
+                .is_some_and(|call_id| call_id.starts_with("seed-read-"))
+                && self.stack.last().is_some_and(|frame| {
+                    crate::engine::seed_reads::pending_declared_seed_calls(&frame.history)
+                        .is_empty()
+                });
+            if seed_reads_completed {
+                next_prompt = crate::engine::seed_reads::completion_prompt();
+            }
             self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
             let is_root = self.stack.len() == 1;
@@ -7969,17 +8149,33 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
-        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
-            self.keep_warm_armed_for_idle_window = false;
-        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
             )
         );
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+            // Oversized submissions have not been accepted yet: phase-two
+            // materialization records activity only after its durable commit.
+            // This keeps rejected leases from resetting idle wakes and gives
+            // every accepted submission one, consistent activity timestamp.
+            if !has_oversized_artifact_lease {
+                self.schedule.record_user_activity();
+            }
+        }
         self.auto_compact_gate
             .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
+    pub(crate) fn set_idle_activity_sender(
+        &mut self,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+        gate: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.schedule.set_idle_activity_sender(sender);
+        self.schedule.set_idle_activity_gate(gate);
     }
 
     /// Tools whose in-flight execution can be adopted by the
@@ -11361,6 +11557,11 @@ impl Driver {
             self.recovered_interactive_continuations
                 .remove(queue_item_id)
         });
+        let recovered_seed_replay = recovered_next_prompt.is_some()
+            && submission.queue_item_ids.iter().any(|queue_item_id| {
+                self.recovered_interactive_seed_replays
+                    .remove(queue_item_id)
+            });
         let submission_has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
@@ -11831,9 +12032,16 @@ impl Driver {
                         // turn start because the oversized lease was still
                         // unmaterialized; this is the delayed ExternalRoot
                         // gate advance for that path.
+                        // Materialization is this path's acceptance boundary.
+                        // Keep the durable reset and in-memory epoch in the
+                        // same admission interval as ordinary ingress.
+                        let idle_activity_gate = self.schedule.idle_activity_gate();
+                        let _idle_activity_admission = idle_activity_gate.lock().await;
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
+                        self.schedule
+                            .record_materialized_user_activity_after_acceptance();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {
@@ -12402,6 +12610,11 @@ impl Driver {
                 delivery_class: Default::default(),
             })
         };
+        if recovered_seed_replay {
+            next_prompt = self
+                .execute_interactive_declared_seed_reads(next_prompt, tx, cancel.clone())
+                .await?;
+        }
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
         // ROOT stop-gate latch for THIS user turn (`tool-hooks-lifecycle-
@@ -12449,7 +12662,7 @@ impl Driver {
             if !active_frame_has_scheduled_turn {
                 self.maybe_auto_prune(tx).await;
             }
-            self.open_native_computer_for_active_frame().await;
+            self.open_native_computer_for_active_frame().await?;
 
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
@@ -13254,6 +13467,8 @@ impl Driver {
                     model,
                     remaining_depth,
                     granted_tools,
+                    seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13350,6 +13565,7 @@ impl Driver {
                         "model": model_selector_json(&model),
                         "remaining_depth": remaining_depth,
                         "granted_tools": &granted_tools,
+                        "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,
                         "provider_item_id": &task_provider_item_id,
                         "function_call_id": &task_function_call_id,
@@ -13443,9 +13659,45 @@ impl Driver {
                             continue;
                         }
                     };
+                    // Declare every seed before publishing the child. The
+                    // declaration is durable executor state: after the
+                    // one-use receipt is committed, restart replays these
+                    // exact calls through the implementation child's normal
+                    // tool boundary before it permits any inference.
+                    let declared_seed_calls =
+                        match crate::engine::seed_reads::declare_seed_read_calls(&seed_reads) {
+                            Ok(calls) => calls,
+                            Err(error) => {
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                                continue;
+                            }
+                        };
+                    let mut snapshot_history = delegation_payload_history.clone();
+                    if !declared_seed_calls.is_empty() {
+                        snapshot_history.push(Message::Assistant {
+                            id: None,
+                            content: declared_seed_calls
+                                .iter()
+                                .cloned()
+                                .map(crate::engine::message::AssistantContent::ToolCall)
+                                .collect(),
+                        });
+                    }
                     let snapshot_json = match serde_json::to_string(&serde_json::json!({
-                        "version": 1,
-                        "history": &delegation_payload_history,
+                        "version": 2,
+                        "history": &snapshot_history,
+                        // This is also the recovery continuation when no
+                        // seed was selected. When declarations are present,
+                        // reattachment records it in history before replaying
+                        // the calls and supplies the completion notice next.
+                        "next_prompt": Message::user(brief.clone()),
+                        "late_user_steer_continuation_id": serde_json::Value::Null,
                     })) {
                         Ok(snapshot_json) => snapshot_json,
                         Err(error) => {
@@ -13467,7 +13719,23 @@ impl Driver {
                     // publish together.  A restart can therefore observe
                     // either an unstarted task child or a fully-addressable
                     // interactive executor, never the old orphaned middle.
-                    let child_agent_instance_id = match self
+                    let seed_read_claim = match self
+                        .session
+                        .claim_seed_read_receipt(seed_reads_receipt.as_deref(), &seed_reads)
+                    {
+                        Ok(claim) => claim,
+                        Err(error) => {
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                            continue;
+                        }
+                    };
+                    let publication = match self
                         .session
                         .db
                         .publish_task_delegation_children_and_agents(
@@ -13488,14 +13756,9 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(mut children) if children.len() == 1 => {
-                            children
-                                .pop()
-                                .expect("one published interactive child")
-                                .agent_instance_id
-                        }
-                        Ok(_) => {
-                            tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
+                        Ok(publication) => publication,
+                        Err(error) => {
+                            tracing::warn!(%error, %task_call_id, "atomically publishing interactive task child and agent tree identity failed");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -13508,8 +13771,37 @@ impl Driver {
                             );
                             continue;
                         }
-                        Err(error) => {
-                            tracing::warn!(%error, %task_call_id, "atomically publishing interactive task child and agent tree identity failed");
+                    };
+                    // Publication commits the recovery descriptor before the
+                    // fallible policy reduction and child builtin load below.
+                    // From this point a restart can recover the child, so the
+                    // receipt must not be made claimable again.
+                    if let Some(claim) = seed_read_claim {
+                        claim.commit();
+                    }
+                    if let Some(error) = publication.post_publication_error() {
+                        tracing::warn!(%error, %task_call_id, "interactive task child published but automatic-answer policy application failed");
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                &repair_notes,
+                            ),
+                        );
+                        continue;
+                    }
+                    let child_agent_instance_id = match publication.into_children() {
+                        mut children if children.len() == 1 => {
+                            children
+                                .pop()
+                                .expect("one published interactive child")
+                                .agent_instance_id
+                        }
+                        _ => {
+                            tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -13595,10 +13887,11 @@ impl Driver {
                         agent: Arc::new(child),
                         computer_coordinator: None,
                         computer_contract: None,
+                        computer_coordinator_config: None,
                         pending_computer_continuations: Vec::new(),
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),
-                        history: delegation_payload_history,
+                        history: snapshot_history,
                         answering: Some(PendingTaskCall {
                             call_id: task_call_id.clone(),
                             provider_item_id: task_provider_item_id,
@@ -13681,7 +13974,13 @@ impl Driver {
                             &brief,
                         )
                     };
-                    next_prompt = Message::user(brief);
+                    next_prompt = self
+                        .execute_interactive_declared_seed_reads(
+                            Message::user(brief),
+                            tx,
+                            cancel.clone(),
+                        )
+                        .await?;
                     continue;
                 }
                 TurnOutcome::SpawnNoninteractive {
@@ -13696,6 +13995,8 @@ impl Driver {
                     workspace_lease,
                     context,
                     granted_tools,
+                    seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13964,6 +14265,8 @@ impl Driver {
                             .as_ref()
                             .map(|lease| lease.id.to_string()),
                         granted_tools,
+                        seed_reads,
+                        seed_reads_receipt,
                         todo_ids,
                         child_recursion,
                         repair_notes,

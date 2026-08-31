@@ -42,7 +42,7 @@ use super::ToolTier;
 /// agents coexist on disjoint paths while a same-path write is
 /// serialized/rejected. Sourced from the `builder` factory's tool surface in
 /// [`crate::engine::builtin`].
-pub const LOCK_WRITE_TOOLS: &[&str] = &["write", "edit", "unlock"];
+pub const LOCK_WRITE_TOOLS: &[&str] = &["write", "edit", "delete", "unlock"];
 
 /// The docs-answerer-only sandboxed search tools (Docs.2). Never
 /// grantable to a user agent — they exist solely so the docs answerer can

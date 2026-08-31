@@ -6066,6 +6066,8 @@ pub(super) async fn run_worker(
     >,
     trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
+    idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
+    idle_activity_gate: Arc<tokio::sync::Mutex<()>>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
@@ -6184,17 +6186,20 @@ pub(super) async fn run_worker(
         prepared_root_launch.is_some(),
         session.is_freshly_created(),
     );
-    // Root primary: the session's stored active agent (so a resume restarts
+    // Root primary: Computer entry-mode owns a dedicated root; other sessions
+    // use the stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
-    // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`). Issue #75: the mode axis no longer
-    // selects the primary — `defaultPrimaryAgent` governs.
-    let root_agent_name = match session.assistant_name.clone() {
-        Some(name) => name,
-        None => match prepared_root_launch.as_ref() {
+    // configured default when it's unset/unknown. `assistant_name` carries
+    // identity/knowledge ownership only; it must not replace a built-in root
+    // such as `Assistant`. Computer mode is the one explicit mode-owned root.
+    // Removed stored primaries force the release default (`Build`).
+    let root_agent_name = if session.session_entry_mode() == proto::SessionEntryMode::Computer {
+        "Computer".to_string()
+    } else {
+        match prepared_root_launch.as_ref() {
             Some(prepared) => prepared.root_agent_name.clone(),
             None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
-        },
+        }
     };
     if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
@@ -6461,14 +6466,18 @@ pub(super) async fn run_worker(
             .await
             {
                 Ok(agent) => agent,
-                Err(error) if prepared_root_launch.is_none() => {
+                Err(error) if prepared_root_launch.is_none() && root_agent_name != "Computer" => {
                     tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
                     builtin::default_build(&spawn_args)
                 }
                 Err(error) => {
-                    let message = format!(
-                        "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
-                    );
+                    let message = if root_agent_name == "Computer" {
+                        format!("Computer primary could not start: {error:#}")
+                    } else {
+                        format!(
+                            "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                        )
+                    };
                     tracing::error!(%message, %session_id, "session startup refused");
                     let mut driver_failed = false;
                     emit_session_driver_failed_once(
@@ -6483,14 +6492,18 @@ pub(super) async fn run_worker(
                 }
             }
         }
-        Err(error) if prepared_root_launch.is_none() => {
+        Err(error) if prepared_root_launch.is_none() && root_agent_name != "Computer" => {
             tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
             builtin::default_build(&spawn_args)
         }
         Err(error) => {
-            let message = format!(
-                "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
-            );
+            let message = if root_agent_name == "Computer" {
+                format!("Computer primary could not start: {error:#}")
+            } else {
+                format!(
+                    "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                )
+            };
             tracing::error!(%message, %session_id, "session startup refused");
             let mut driver_failed = false;
             emit_session_driver_failed_once(
@@ -6557,6 +6570,8 @@ pub(super) async fn run_worker(
             return;
         }
     };
+    #[cfg(test)]
+    session.record_booted_root_for_test(&root_result);
     let root = Arc::new(root_result);
     let root_is_vnext = root
         .definition
@@ -6880,6 +6895,7 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    driver.set_idle_activity_sender(idle_activity_tx.clone(), idle_activity_gate.clone());
     driver.bind_enqueue_target(foreground_input_target.clone());
     let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
     driver.set_adopted_process_registry(adopted_processes.clone());
@@ -6911,6 +6927,10 @@ pub(super) async fn run_worker(
     if let Some(scheduler) = resource_scheduler {
         driver.set_resource_scheduler(scheduler);
     }
+    // Inline user-message admission is owned by this worker, while oversized
+    // admission becomes durable in the driver. Keep a separate scheduler
+    // source for the former so its reset can happen before acknowledgement.
+    let ingress_scheduler = scheduler.clone();
     driver.set_daemon_scheduler_source(scheduler);
     driver.set_write_scope_source(write_scope.clone());
     // Durable lifecycle rows foreign-key to `sessions`. A resumed session is
@@ -10022,6 +10042,12 @@ pub(super) async fn run_worker(
                     artifact_admission,
                     respond_to,
                 } => {
+                    // Inline external-root submissions become accepted at the
+                    // queue insert below. Oversized submissions have only a
+                    // phase-one reservation here; their activity stays owned
+                    // by the driver's phase-two materialization path.
+                    let reset_idle_timer =
+                        artifact_admission.is_none() && submission.origin.advances_activity_epoch();
                     let client_submission_id = submission
                         .client_submissions
                         .first()
@@ -11040,6 +11066,16 @@ pub(super) async fn run_worker(
                     // stack-last transition can adopt between that clone and
                     // this insert; using it here would strand the item on a
                     // dead id (AC2).
+                    // The gate starts before the queue mutation and remains
+                    // held through both activity publications. A due idle
+                    // wake therefore either commits before this acceptance or
+                    // observes its reset; it cannot run in the inserted-but-
+                    // unannounced gap.
+                    let _idle_activity_admission = if reset_idle_timer {
+                        Some(idle_activity_gate.lock().await)
+                    } else {
+                        None
+                    };
                     let (id, snapshot, outcome) = driver_input_queue
                         .push_idempotent_on_live_target(
                             receipt,
@@ -11065,6 +11101,21 @@ pub(super) async fn run_worker(
                         };
                         let _ = respond_to.send(Err(rejection));
                         continue;
+                    }
+                    if reset_idle_timer
+                        && matches!(outcome, crate::engine::message::IdempotentPush::Inserted)
+                    {
+                        // The admission gate is still held, so a due idle
+                        // timer cannot commit until it can observe this epoch
+                        // and the durable scheduler's rebuilt timeline.
+                        let _ = idle_activity_tx.send(tokio::time::Instant::now());
+                        let scheduler = ingress_scheduler
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(scheduler) = scheduler {
+                            scheduler.record_user_activity_after_acceptance().await;
+                        }
                     }
                     let queue: Vec<proto::QueueItem> =
                         snapshot.into_iter().map(queue_item_to_proto).collect();

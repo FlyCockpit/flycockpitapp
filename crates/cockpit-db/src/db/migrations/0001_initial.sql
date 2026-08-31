@@ -115,6 +115,10 @@ CREATE TABLE sessions (
     -- [relationship:foreign] Optional historical event sequence in that exact
     -- parent session. NULL means the parent's durable tail at fork time.
     fork_point_turn_id TEXT,
+    -- First-class assistant thread marker. A thread is a persistent,
+    -- message-anchored child; ordinary forks and `/btw` children must never
+    -- enter the assistant thread surface merely because they have a parent.
+    is_assistant_thread INTEGER NOT NULL DEFAULT 0 CHECK (is_assistant_thread IN (0, 1)),
     title              TEXT,                     -- utility-model-generated label (§17d)
     description        TEXT CHECK (
         description IS NULL OR length(CAST(description AS BLOB)) BETWEEN 1 AND 4000
@@ -255,6 +259,14 @@ CREATE TABLE sessions (
         AND length(fork_point_turn_id) > 0
         AND fork_point_turn_id NOT GLOB '*[^0-9]*'
         AND fork_point_turn_id = CAST(CAST(fork_point_turn_id AS INTEGER) AS TEXT)
+    )),
+    CHECK (is_assistant_thread = 0 OR (
+        parent_session_id IS NOT NULL
+        AND fork_point_turn_id IS NOT NULL
+        AND ephemeral = 0
+        AND btw_parent_session_id IS NULL
+        AND assistant_name IS NOT NULL
+        AND is_dream_session = 0
     )),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
     CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
@@ -1109,6 +1121,12 @@ CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_
   WHERE shared_with_collaborators = 1;
 CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_unix_ms DESC)
   WHERE assistant_name IS NOT NULL;
+CREATE INDEX idx_sessions_assistant_threads
+    ON sessions (assistant_name, project_id, last_active_at_unix_ms DESC)
+    WHERE is_assistant_thread = 1
+      AND ephemeral = 0
+      AND archived_at_unix_ms IS NULL
+      AND is_dream_session = 0;
 
 -- ---- knowledge dream scope + completion ledger ----------------------------
 -- Attachment is the explicit consent boundary for cross-session dream reads.
@@ -2774,7 +2792,8 @@ CREATE TABLE session_events (
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
         'goal_progress_diagnostic', 'resource_promotion', 'notice',
-        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree'
+        'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree',
+        'thread_anchor'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

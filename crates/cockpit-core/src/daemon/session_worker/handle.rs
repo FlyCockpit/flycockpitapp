@@ -28,6 +28,9 @@ pub struct SessionWorkerHandle {
     pub(crate) workspace_root_authority:
         Arc<crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority>,
     work_tx: mpsc::Sender<SessionWork>,
+    /// Live per-thread activity epoch shared directly with the driver's
+    /// schedule authority. Dispatch publishes only after durable acceptance.
+    idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
@@ -678,9 +681,12 @@ impl SessionConfigHandle {
             },
             None => {}
         }
-        Self::detached(SessionConfigSnapshot::with_hooks(
+        // Test contexts sometimes replace this snapshot to exercise a
+        // config-dependent tool decision. Keep their handle live over its
+        // isolated cell; production turn handles remain pinned by `repin`.
+        Self::new(Arc::new(RwLock::new(SessionConfigSnapshot::with_hooks(
             generation, providers, extended, hooks,
-        ))
+        ))))
     }
 
     fn read_shared(&self) -> SessionConfigSnapshot {
@@ -688,6 +694,15 @@ impl SessionConfigHandle {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Replace the isolated live snapshot used by a tool/replay test.
+    #[cfg(test)]
+    pub(crate) fn set_full_config_snapshot_for_tests(&self, snapshot: SessionConfigSnapshot) {
+        *self
+            .shared
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
     }
 
     /// The snapshot this handle reads: the pinned view if pinned, else the
@@ -1199,6 +1214,7 @@ impl SessionWorkerHandle {
         locks: Arc<LockManager>,
     ) -> (Self, mpsc::Receiver<SessionWork>) {
         let (work_tx, work_rx) = mpsc::channel(WORK_QUEUE_CAPACITY);
+        let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
         let (event_tx, _event_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let redaction: SharedRedactionTable =
             Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
@@ -1244,6 +1260,7 @@ impl SessionWorkerHandle {
                 .expect("test workspace authority"),
             ),
             work_tx,
+            idle_activity_tx,
             event_tx,
             turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
             redaction,
@@ -1683,6 +1700,17 @@ impl SessionWorkerHandle {
         }
         permit.send(work);
         Ok(())
+    }
+
+    pub(crate) fn record_user_activity(&self) {
+        let _ = self.idle_activity_tx.send(tokio::time::Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe_user_activity_for_test(
+        &self,
+    ) -> tokio::sync::watch::Receiver<tokio::time::Instant> {
+        self.idle_activity_tx.subscribe()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -2480,19 +2508,24 @@ pub(crate) fn spawn(
     // it uses the session's in-memory active agent, which is hydrated from the
     // persisted row or the deferred row built on new-session creation. The
     // worker still re-resolves async at startup for stale removed primaries.
-    let initial_agent = match session.assistant_name.clone() {
-        Some(name) => name,
-        None => {
-            let active = session.active_agent();
-            if crate::agents::is_builtin_primary(&active)
-                || crate::agents::is_removed_primary(&active)
-            {
-                crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
-            } else if !active.trim().is_empty() {
-                active
-            } else {
-                initial_active_agent(extended_cfg).to_string()
-            }
+    // `assistant_name` identifies SOUL/USER and knowledge ownership; it is
+    // not the active root. In particular, the built-in `Assistant` primary
+    // uses a lowercase durable identity key and must still open as `Assistant`.
+    // Computer mode, conversely, owns a dedicated root regardless of any
+    // identity attached to the session.
+    let initial_agent = if session.session_entry_mode()
+        == crate::daemon::proto::SessionEntryMode::Computer
+    {
+        "Computer".to_string()
+    } else {
+        let active = session.active_agent();
+        if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active)
+        {
+            crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
+        } else if !active.trim().is_empty() {
+            active
+        } else {
+            initial_active_agent(extended_cfg).to_string()
         }
     };
     // Resolve the new-session sandbox default (highest wins):
@@ -2518,6 +2551,11 @@ pub(crate) fn spawn(
     // overridden). A later `/settings` change re-resolves on the next session.
     session.set_shell_compression(extended_cfg.shell_compression);
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
+    let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let idle_activity_gate = crate::sync::lock_or_recover(&scheduler)
+        .as_ref()
+        .map(crate::daemon::scheduler::DaemonSchedulerHandle::activity_gate)
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
     let legacy_disk_origins = match session.persisted_disk_redaction_origins() {
@@ -2595,6 +2633,7 @@ pub(crate) fn spawn(
         trust_transition_pending: trust_transition_pending.clone(),
         workspace_root_authority: workspace_root_authority.clone(),
         work_tx,
+        idle_activity_tx: idle_activity_tx.clone(),
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),
         redaction: redaction.clone(),
@@ -2645,6 +2684,8 @@ pub(crate) fn spawn(
             workspace_root_authority,
             worker_trust_policy,
             work_rx,
+            idle_activity_tx.clone(),
+            idle_activity_gate,
             event_tx,
             turn_completions,
             redaction,

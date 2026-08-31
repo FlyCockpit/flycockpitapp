@@ -472,16 +472,11 @@ pub(crate) async fn turn_toolbox(
         agent.model.provider_id(),
         agent.model.model_id_ref()
     );
-    toolbox = crate::knowledge::with_memory_search_if_attached(
+    toolbox = crate::knowledge::with_knowledge_search_tools(
         toolbox,
-        session,
-        cwd,
         agent.definition.as_deref(),
-        config,
         &executing_model,
-        agent.model.is_trusted(),
-    )
-    .await;
+    );
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
     toolbox.apply_capabilities(&env, cwd, target)
 }
@@ -771,7 +766,7 @@ pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
     // Read/search pages are bounded responses, not new durable captures.
     !matches!(
         tool,
-        "read" | "write" | "edit" | "unlock" | "delegation_payload_retrieve"
+        "read" | "write" | "edit" | "delete" | "unlock" | "delegation_payload_retrieve"
     )
 }
 
@@ -1014,7 +1009,7 @@ async fn translate_final_response(
 /// shims. Under the settled approval model, configuring that custom web command
 /// is itself the approval; do not add a custom-provider carve-out here.
 pub(crate) fn is_gated_tool(name: &str) -> bool {
-    matches!(name, "bash" | "mcp" | "write" | "edit")
+    matches!(name, "bash" | "mcp" | "write" | "edit" | "delete")
 }
 
 pub(crate) fn result_scan_tool_candidate(name: &str) -> bool {

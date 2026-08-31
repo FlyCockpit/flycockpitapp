@@ -226,6 +226,7 @@ pub async fn connect_forwarded(
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
     let context = context.with_forwarded_epoch(epoch);
+    context.ensure_host_access()?;
     context.authorize_forwarded_connect(entry, epoch).await?;
     epoch.recheck_effect_gate()?;
     let timeouts = McpTimeouts::from_secs(10, 120);

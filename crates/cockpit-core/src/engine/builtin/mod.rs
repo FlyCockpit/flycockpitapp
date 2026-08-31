@@ -446,6 +446,7 @@ fn with_write_tools(tb: ToolBox) -> ToolBox {
     tb.with(Arc::new(crate::tools::read::ReadTool))
         .with(Arc::new(crate::tools::write::WriteTool))
         .with(Arc::new(crate::tools::edit::EditTool))
+        .with(Arc::new(crate::tools::delete::DeleteTool))
         .with(Arc::new(crate::tools::unlock::UnlockTool))
 }
 
@@ -554,6 +555,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "todo",
         "write",
         "edit",
+        "delete",
         "unlock",
         "grep",
         "glob",
@@ -631,6 +633,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             family: "Locks",
             name: "edit",
             summary: "Edit files with automatic daemon-arbitrated locking.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "delete",
+            summary: "Delete files with automatic daemon-arbitrated locking.",
             condition: None,
         },
         BuiltinToolInventoryItem {
@@ -910,6 +918,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
     vec![
         Arc::new(tools::read::ReadTool),
         Arc::new(tools::write::WriteTool),
+        Arc::new(tools::delete::DeleteTool),
         Arc::new(tools::unlock::UnlockTool),
         Arc::new(tools::edit::EditTool),
         Arc::new(tools::bash::BashTool::new()),
@@ -1042,6 +1051,7 @@ pub(crate) fn materialize_tool_by_name(
         "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
         "write" => tb.with(Arc::new(tools::write::WriteTool)),
         "edit" => tb.with(Arc::new(tools::edit::EditTool)),
+        "delete" => tb.with(Arc::new(tools::delete::DeleteTool)),
         "unlock" => tb.with(Arc::new(tools::unlock::UnlockTool)),
         "context_pack" => tb.with(Arc::new(tools::intel::ContextPackTool)),
         "code" => tb.with(Arc::new(tools::intel::CodeTool)),
@@ -4840,6 +4850,7 @@ pub(crate) mod tests {
             "bash",
             "write",
             "edit",
+            "delete",
             "unlock",
             "search",
             "code",

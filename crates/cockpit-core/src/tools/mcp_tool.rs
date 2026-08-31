@@ -115,6 +115,14 @@ impl Tool for McpTool {
         // bypassing the common dispatcher.
         crate::knowledge::ensure_workspace_tool_access(ctx, self.name())?;
 
+        // The script may perform discovery as well as invocation. Discovery
+        // can start a configured stdio MCP server, so the whole opaque MCP
+        // surface is one identity-sensitive host effect, not just
+        // `mcp.invoke`.
+        let identity_accounting =
+            crate::assistants::identity::check_identity_opaque_host_effect(ctx, "MCP tools")
+                .await?;
+
         let script = args
             .get("script")
             .and_then(Value::as_str)
@@ -129,14 +137,18 @@ impl Tool for McpTool {
         }
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
         let cfg = catalog.to_mcp_config();
-        match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
+        let result = match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
             Ok(out) => Ok(rendered_result_output(out)),
             // Unhandled Monty compile/runtime/OS denial/import/host
             // exceptions are failed parent tool calls (`hard_fail`). Authored
             // try/except that returns a value remains Ok above. Do not infer
             // failure by inspecting successful result text.
             Err(e) => Err(e),
+        };
+        if let Some(accounting) = identity_accounting {
+            accounting.publish().await?;
         }
+        result
     }
 
     async fn on_abandon(&self, ctx: &ToolCtx) -> Result<()> {

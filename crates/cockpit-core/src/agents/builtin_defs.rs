@@ -361,6 +361,7 @@ fn assistant_def() -> AgentDef {
             "bash",
             "write",
             "edit",
+            "delete",
             "unlock",
             "semantic_search",
             "history_search",

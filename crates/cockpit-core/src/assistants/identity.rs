@@ -65,6 +65,14 @@ pub enum IdentityWriteGate {
 #[derive(Debug, Clone)]
 pub enum IdentityShellGate {
     NotAnAssistantSession,
+    /// Shell work remains available in human-only mode, but it must execute
+    /// with the identity files denied by filesystem confinement.  Parsing
+    /// shell text is not a security boundary: redirects, substitutions, and
+    /// child processes can all reach these files without a useful lexical
+    /// pathname.
+    Protect {
+        denied_paths: Vec<PathBuf>,
+    },
     Allow {
         note: Option<String>,
         accounting: IdentityShellAccounting,
@@ -410,9 +418,9 @@ pub async fn check_identity_shell(ctx: &ToolCtx) -> Result<IdentityShellGate> {
             )
         })?;
     match config.soul_edit_mode {
-        SoulEditMode::HumanOnly => Ok(IdentityShellGate::Refuse(
-            "Refused: bash is unavailable while soul_edit_mode=human_only because arbitrary shell commands cannot be proven not to modify the assistant's SOUL.md/USER.md. The human must edit those files outside model tools.".to_string(),
-        )),
+        SoulEditMode::HumanOnly => Ok(IdentityShellGate::Protect {
+            denied_paths: vec![soul_path(&home), user_path(&home)],
+        }),
         SoulEditMode::ApproveProposals => {
             let Some(approver) = ctx.approver.as_ref() else {
                 return Ok(IdentityShellGate::Refuse(
@@ -451,6 +459,65 @@ pub async fn check_identity_shell(ctx: &ToolCtx) -> Result<IdentityShellGate> {
             ),
             accounting: IdentityShellAccounting { db: ctx.session.db.clone(), row, home },
         }),
+    }
+}
+
+/// Gate an opaque host capability such as an external MCP tool. Unlike a
+/// native file tool, Cockpit cannot inspect the capability's eventual file
+/// targets; unlike a confined shell, it cannot impose deny mounts on the
+/// third-party process. Treat it as a potential identity writer.
+///
+/// The returned accounting must be published after the capability completes,
+/// including an error result, because the external process may have written
+/// before reporting failure.
+pub async fn check_identity_opaque_host_effect(
+    ctx: &ToolCtx,
+    capability: &str,
+) -> Result<Option<IdentityShellAccounting>> {
+    let Some((row, home)) = assistant_identity(ctx).await? else {
+        return Ok(None);
+    };
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| {
+            format!(
+                "assistant `{}` has malformed durable configuration; refusing {capability}",
+                row.name
+            )
+        })?;
+    match config.soul_edit_mode {
+        SoulEditMode::HumanOnly => anyhow::bail!(
+            "Refused: {capability} is unavailable while soul_edit_mode=human_only because an opaque external capability cannot be prevented from modifying the assistant's SOUL.md/USER.md. The human must edit those files outside model tools."
+        ),
+        SoulEditMode::ApproveProposals => {
+            let Some(approver) = ctx.approver.as_ref() else {
+                anyhow::bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL);
+            };
+            let decision = approver
+                .approve_path(
+                    &home,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await?;
+            if decision.is_allowed() {
+                Ok(Some(IdentityShellAccounting {
+                    db: ctx.session.db.clone(),
+                    row,
+                    home,
+                }))
+            } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
+                anyhow::bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+            } else {
+                anyhow::bail!(
+                    "Refused: user declined {capability} for assistant identity `{}`.",
+                    row.name
+                )
+            }
+        }
+        SoulEditMode::Autonomous => Ok(Some(IdentityShellAccounting {
+            db: ctx.session.db.clone(),
+            row,
+            home,
+        })),
     }
 }
 
@@ -897,11 +964,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn human_only_blocks_dynamic_shell_writes_before_execution() {
+    async fn human_only_never_allows_dynamic_shell_identity_writes() {
         let project = tempfile::tempdir().unwrap();
         let (ctx, _, home, _env) =
             assistant_tool_ctx(project.path(), SoulEditMode::HumanOnly).await;
         let original = std::fs::read_to_string(soul_path(&home)).unwrap();
+        let gate = check_identity_shell(&ctx).await.unwrap();
+        assert!(matches!(
+            gate,
+            IdentityShellGate::Protect { denied_paths }
+                if denied_paths == vec![soul_path(&home), user_path(&home)]
+        ));
         let command = format!(
             "target={}; printf 'model rewrite\\n' > \"$target\"",
             soul_path(&home).display()
@@ -912,7 +985,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(out.content.contains("soul_edit_mode=human_only"), "{out:?}");
+        assert!(out.sandbox.is_some(), "{out:?}");
         assert_eq!(std::fs::read_to_string(soul_path(&home)).unwrap(), original);
     }
 

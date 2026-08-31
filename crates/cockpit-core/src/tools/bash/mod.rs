@@ -425,8 +425,13 @@ async fn call_bash_inner(
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
+    let mut identity_denied_paths = Vec::new();
     let identity_accounting = match crate::assistants::identity::check_identity_shell(ctx).await? {
         crate::assistants::identity::IdentityShellGate::NotAnAssistantSession => None,
+        crate::assistants::identity::IdentityShellGate::Protect { denied_paths } => {
+            identity_denied_paths = denied_paths;
+            None
+        }
         crate::assistants::identity::IdentityShellGate::Allow { note, accounting } => {
             if let Some(note) = note {
                 tracing::info!(%note, "assistant identity shell invocation allowed");
@@ -466,18 +471,21 @@ async fn call_bash_inner(
             "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    if !denied_knowledge_paths.is_empty() && options.force_unconfined {
+    if (!denied_knowledge_paths.is_empty() || !identity_denied_paths.is_empty())
+        && options.force_unconfined
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash cannot run unconfined while a local knowledge base requires a trusted model.",
+            "Access denied: bash cannot run unconfined while protected local files require filesystem confinement.",
         ));
     }
     let sandbox_on = if ctx.write_scope.is_some()
         || ctx.workspace_lease.is_some()
         || !denied_knowledge_paths.is_empty()
+        || !identity_denied_paths.is_empty()
     {
         true
     } else {
-        sandbox_enabled && !options.force_unconfined
+        (sandbox_enabled || !identity_denied_paths.is_empty()) && !options.force_unconfined
     };
 
     let escalation_preauthorized_scope =
@@ -490,6 +498,7 @@ async fn call_bash_inner(
 
     let is_container_run = !options.force_unconfined
         && ctx.workspace_lease.is_none()
+        && identity_denied_paths.is_empty()
         && ctx.session.sandbox_mode().is_container();
     if is_container_run && !denied_knowledge_paths.is_empty() {
         return Ok(ToolOutput::text(
@@ -596,6 +605,12 @@ async fn call_bash_inner(
             unavailable_reason: Some(reason.clone()),
             resource_profiles: command_resource_plan.metas.clone(),
         };
+        if !identity_denied_paths.is_empty() {
+            return Ok(ToolOutput::text(format!(
+                "Error: `bash` needs filesystem confinement while soul_edit_mode=human_only so SOUL.md/USER.md remain protected, but the shell sandbox cannot start here ({reason}). Keep the identity files human-only or use native file tools for other work."
+            ))
+            .with_sandbox(meta));
+        }
         if !options.escalated
             && ctx.tool_steering == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
@@ -694,6 +709,8 @@ async fn call_bash_inner(
         };
     let extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
+    let mut denied_paths = denied_knowledge_paths;
+    denied_paths.extend(identity_denied_paths);
     let sandbox_cwd = ctx
         .workspace_lease
         .as_ref()
@@ -727,7 +744,7 @@ async fn call_bash_inner(
         &scrub,
         &session_env,
         &extra_sandbox_paths,
-        &denied_knowledge_paths,
+        &denied_paths,
         ctx,
         timeout_ms,
         &mut resource_lease,
@@ -803,7 +820,7 @@ async fn call_bash_inner(
     let mut classified_denial_action_note = None;
     if confine
         && !options.escalated
-        && denied_knowledge_paths.is_empty()
+        && denied_paths.is_empty()
         && ctx.write_scope.is_none()
         && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
@@ -871,7 +888,7 @@ async fn call_bash_inner(
                 &scrub,
                 &session_env,
                 &extra_sandbox_paths,
-                &denied_knowledge_paths,
+                &denied_paths,
                 ctx,
                 timeout_ms,
                 &mut resource_lease,

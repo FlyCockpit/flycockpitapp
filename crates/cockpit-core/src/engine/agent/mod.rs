@@ -771,7 +771,7 @@ pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
     // Read/search pages are bounded responses, not new durable captures.
     !matches!(
         tool,
-        "read" | "write" | "edit" | "unlock" | "delegation_payload_retrieve"
+        "read" | "write" | "edit" | "delete" | "unlock" | "delegation_payload_retrieve"
     )
 }
 
@@ -1014,7 +1014,7 @@ async fn translate_final_response(
 /// shims. Under the settled approval model, configuring that custom web command
 /// is itself the approval; do not add a custom-provider carve-out here.
 pub(crate) fn is_gated_tool(name: &str) -> bool {
-    matches!(name, "bash" | "mcp" | "write" | "edit")
+    matches!(name, "bash" | "mcp" | "write" | "edit" | "delete")
 }
 
 pub(crate) fn result_scan_tool_candidate(name: &str) -> bool {

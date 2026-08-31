@@ -698,6 +698,7 @@ const APPROVED_BLOCKING_ADAPTERS: &[&str] = &[
     "discard_session_blocking",
     "list_sessions_blocking",
     "read_session_messages_blocking",
+    "read_assistant_inbox_blocking",
     "read_client_submission_receipt_blocking",
     "read_history_page_blocking",
     "read_subagent_history_page_blocking",
@@ -2489,7 +2490,9 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             self.responder |= name.as_deref() == Some("serve_lifecycle_requests");
             if matches!(
                 name.as_deref(),
-                Some("new_composed" | "new_composed_with_session")
+                Some(
+                    "new_composed" | "new_composed_with_session" | "new_composed_with_session_mode"
+                )
             ) {
                 self.constructor |= !self.lifecycle_reassigned
                     && call.args.last().is_some_and(|argument| {

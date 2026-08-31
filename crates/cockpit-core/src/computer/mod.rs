@@ -470,6 +470,13 @@ impl VirtualDisplayBackend {
         }
     }
 
+    /// Exact X11 display capability opened by a real-desktop backend. Driver
+    /// composition uses this value instead of re-reading a mutable environment.
+    #[cfg(target_os = "linux")]
+    pub fn real_x11_display(&self) -> Option<&str> {
+        (self.backend_kind == target::BackendKind::RealDesktopX11).then_some(&self.display)
+    }
+
     #[cfg(target_os = "linux")]
     fn new_real_desktop() -> Result<Self, ComputerError> {
         if std::env::var("XDG_SESSION_TYPE")

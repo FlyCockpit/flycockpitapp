@@ -1200,21 +1200,21 @@ impl HostInputArbiter {
 
     /// Returns true if the given physical key currently has an active lease.
     pub fn is_held(&self, target_key: &PhysicalTargetKey) -> bool {
-        let key_str = Self::key_string(target_key);
-        self.current_lease.contains_key(&key_str)
+        self.current_lease
+            .values()
+            .any(|lease| lease.target_key == *target_key)
     }
 
     /// Returns the number of waiters queued for the given physical key.
     pub fn waiter_count(&self, target_key: &PhysicalTargetKey) -> usize {
-        let key_str = Self::key_string(target_key);
         self.queues
-            .get(&key_str)
-            .map(|q| {
-                q.iter()
-                    .filter(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
-                    .count()
+            .values()
+            .flat_map(|waiters| waiters.iter())
+            .filter(|waiter| {
+                waiter.target_key == *target_key
+                    && !waiter.cancelled.load(std::sync::atomic::Ordering::Acquire)
             })
-            .unwrap_or(0)
+            .count()
     }
 
     /// Simulate owner death: release all leases held by the given owner
@@ -6561,7 +6561,12 @@ mod tests {
         // the coordinator's key while the arbiter still records it as holder.
         {
             let mut external = shared_os.shared_clone();
-            external.release(&key);
+            external.release(
+                &coordinator
+                    .host_lease()
+                    .expect("host lease")
+                    .arbitration_key,
+            );
         }
 
         // Detection must not emit stale-owner cleanup. A competing process can

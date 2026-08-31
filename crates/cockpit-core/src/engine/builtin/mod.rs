@@ -549,7 +549,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_invoke",
         "history_search",
         "thread_start",
-        "knowledge_retrieve",
+        "semantic_search",
+        "structured_search",
         "todo",
         "write",
         "edit",
@@ -706,9 +707,15 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Knowledge",
-            name: "knowledge_retrieve",
-            summary: "Retrieve cited attached-KB knowledge and bounded fresh-session updates.",
-            condition: Some("knowledge retrieval subagent"),
+            name: "semantic_search",
+            summary: "Semantically search attached knowledge bases with citations.",
+            condition: Some("knowledge-base attachment resolved at call time"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "structured_search",
+            summary: "Search attached knowledge by text, frontmatter, or structured data.",
+            condition: Some("knowledge-base attachment resolved at call time"),
         },
         BuiltinToolInventoryItem {
             family: "Session",
@@ -1065,9 +1072,19 @@ pub(crate) fn materialize_tool_by_name(
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
+        "history_search" if def.is_some_and(|def| def.name == "knowledge") => tb.with(Arc::new(
+            crate::knowledge::FreshKnowledgeHistorySearchTool::new(
+                def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                    .cloned(),
+            ),
+        )),
         "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
         "thread_start" => tb.with(Arc::new(tools::thread_start::ThreadStartTool)),
-        "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
+        "semantic_search" => tb.with(Arc::new(crate::knowledge::SemanticSearchTool::new(
+            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                .cloned(),
+        ))),
+        "structured_search" => tb.with(Arc::new(crate::knowledge::StructuredSearchTool::new(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                 .cloned(),
         ))),
@@ -4114,6 +4131,13 @@ pub(crate) mod tests {
         test_spawn_args_with_provider_can_delegate(cwd, None)
     }
 
+    fn test_spawn_args_with_model_trust(
+        cwd: &Path,
+        trust: crate::config::providers::ModelTrust,
+    ) -> SpawnArgs {
+        test_spawn_args_with_provider_can_delegate_and_trust(cwd, None, Some(trust))
+    }
+
     /// Give a vNext definition the same host-resolved grant a daemon-owned
     /// session would carry.  Tests that inspect `task` must opt into this
     /// explicit authority path: merely loading a manifest deliberately does
@@ -4166,6 +4190,14 @@ pub(crate) mod tests {
         cwd: &Path,
         can_delegate: Option<bool>,
     ) -> SpawnArgs {
+        test_spawn_args_with_provider_can_delegate_and_trust(cwd, can_delegate, None)
+    }
+
+    fn test_spawn_args_with_provider_can_delegate_and_trust(
+        cwd: &Path,
+        can_delegate: Option<bool>,
+        trust: Option<crate::config::providers::ModelTrust>,
+    ) -> SpawnArgs {
         let _trust = crate::config::trust::enter_workspace_trust_policy(trusted_policy(cwd));
         use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
         use std::collections::BTreeMap;
@@ -4176,6 +4208,7 @@ pub(crate) mod tests {
                 url: "http://localhost:1/v1".into(),
                 headers: vec![],
                 can_delegate,
+                trust,
                 ..ProviderEntry::default()
             },
         );
@@ -4245,6 +4278,103 @@ pub(crate) mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[tokio::test]
+    async fn knowledge_search_tool_schemas_are_stable_across_attachment_and_trust_changes() {
+        use crate::config::providers::ModelTrust;
+
+        let _env = crate::test_env::lock_async().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dream_definition = crate::agents::embedded_internal_default("Dream")
+            .expect("Dream has an internal agent definition");
+        let session = crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Dream",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let unattached_args = test_spawn_args(tmp.path());
+        let unattached_agent = agent_from_def(&dream_definition, &unattached_args).unwrap();
+        assert!(!unattached_agent.model.is_trusted());
+        let unattached_tools = crate::engine::agent::turn_toolbox(
+            &unattached_agent,
+            &session,
+            tmp.path(),
+            &unattached_args.config,
+        )
+        .await;
+        assert!(unattached_tools.names().contains(&"semantic_search"));
+        assert!(unattached_tools.names().contains(&"structured_search"));
+        let unattached_definitions = serde_json::to_vec(
+            &unattached_tools.advertised_definitions(unattached_agent.tool_steering),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/knowledge/index.md"),
+            "# Knowledge\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"lmstudio:local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+        )
+        .unwrap();
+
+        let attached_untrusted_args = test_spawn_args(tmp.path());
+        assert_eq!(
+            attached_untrusted_args
+                .config
+                .extended()
+                .knowledge_bases
+                .len(),
+            1
+        );
+        let attached_untrusted_agent =
+            agent_from_def(&dream_definition, &attached_untrusted_args).unwrap();
+        assert!(!attached_untrusted_agent.model.is_trusted());
+        let attached_untrusted_tools = crate::engine::agent::turn_toolbox(
+            &attached_untrusted_agent,
+            &session,
+            tmp.path(),
+            &attached_untrusted_args.config,
+        )
+        .await;
+        assert_eq!(
+            unattached_definitions,
+            serde_json::to_vec(
+                &attached_untrusted_tools
+                    .advertised_definitions(attached_untrusted_agent.tool_steering),
+            )
+            .unwrap(),
+            "KB attachment changes must not change the model-facing tool array"
+        );
+
+        let attached_trusted_args =
+            test_spawn_args_with_model_trust(tmp.path(), ModelTrust::Trusted);
+        let attached_trusted_agent =
+            agent_from_def(&dream_definition, &attached_trusted_args).unwrap();
+        assert!(attached_trusted_agent.model.is_trusted());
+        let attached_trusted_tools = crate::engine::agent::turn_toolbox(
+            &attached_trusted_agent,
+            &session,
+            tmp.path(),
+            &attached_trusted_args.config,
+        )
+        .await;
+        assert_eq!(
+            unattached_definitions,
+            serde_json::to_vec(
+                &attached_trusted_tools
+                    .advertised_definitions(attached_trusted_agent.tool_steering),
+            )
+            .unwrap(),
+            "KB trust changes must not change the model-facing tool array"
+        );
     }
 
     #[test]

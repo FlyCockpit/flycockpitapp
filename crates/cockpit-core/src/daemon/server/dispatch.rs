@@ -11246,12 +11246,36 @@ async fn handle_serialized_request_impl(
             action,
         } => {
             let att = require_attached(state)?;
+            // LSP control can execute configured install/uninstall commands
+            // and restart opaque workspace hosts. Treat every action as an
+            // agent-reachable host-control surface, including `Check`, while
+            // the selected session has any local knowledge base attached.
+            // Read the selected worker's published snapshot rather than the
+            // caller-supplied project path's live config so this cannot be
+            // bypassed by pointing the request at another directory.
+            let session_config = att.handle.config_snapshot();
+            let protected_roots = crate::knowledge::configured_local_knowledge_roots(
+                &att.handle.session(),
+                &att.handle.project_root(),
+                &session_config.extended,
+            )
+            .await;
+            if !protected_roots.is_empty() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "LSP control is unavailable while this session has a local knowledge base attached.".into(),
+                });
+            }
             let cwd = Path::new(&project_root);
             let trust_policy = attached_trust_policy(ctx, att).await?;
             let (_, config) = ctx
                 .config_source()
                 .load_with_trust(cwd, &trust_policy)
                 .map_err(internal)?;
+            // Keep the selected-session authorization fence above for a
+            // precise RPC error. The manager repeats the check daemon-wide
+            // under its operation lease, covering a no-KB selected session
+            // while another session owns protected roots.
             let message = ctx
                 .registry
                 .lsp_manager()

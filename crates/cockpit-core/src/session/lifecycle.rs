@@ -912,6 +912,7 @@ impl Session {
             knowledge_base_prompt_snapshot_captured: AtomicBool::new(
                 row.knowledge_base_prompt_snapshot_captured,
             ),
+            knowledge_read_snapshots: Mutex::new(super::KnowledgeReadSnapshotStore::default()),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),

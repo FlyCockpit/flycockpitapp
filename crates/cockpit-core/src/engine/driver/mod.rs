@@ -4451,6 +4451,11 @@ impl Driver {
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
             executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
             knowledge_access_trusted: agent.model.is_trusted(),
             caller_model: Some(crate::engine::tool::CallerModel::from_model(
@@ -7294,6 +7299,14 @@ impl Driver {
         fields: crate::engine::agent::hooks::ObserveFields<'_>,
     ) {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 self.session.process_containment(),
@@ -7310,6 +7323,7 @@ impl Driver {
             None,
             None,
             fields,
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -7345,10 +7359,15 @@ impl Driver {
         let session_id = self.session.id;
         let cwd = self.cwd.clone();
         let db = self.session.db.clone();
+        let session = self.session.clone();
         let subagent_type = subagent_type.to_string();
         let subagent_id = subagent_id.map(str::to_owned);
         let end_reason = end_reason.map(str::to_owned);
         async move {
+            let extended = snapshot.extended.clone();
+            let local_knowledge_write_fence_active =
+                crate::knowledge::local_knowledge_write_fence_active(&session, &cwd, &extended)
+                    .await;
             crate::engine::agent::hooks::run_observe_hooks(
                 &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                     containment,
@@ -7369,6 +7388,7 @@ impl Driver {
                     end_reason: end_reason.as_deref(),
                     ..Default::default()
                 },
+                local_knowledge_write_fence_active,
             )
             .await;
         }
@@ -7565,6 +7585,14 @@ impl Driver {
         state: &mut crate::engine::agent::hooks::StopGateState,
     ) -> crate::engine::agent::hooks::StopHookOutcome {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_stop_hooks(
             runner,
             process_env,
@@ -7579,6 +7607,7 @@ impl Driver {
             None,
             None,
             None,
+            local_knowledge_write_fence_active,
             state,
         )
         .await
@@ -7605,6 +7634,14 @@ impl Driver {
         end_reason: &str,
     ) {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let mut discarded = crate::engine::agent::hooks::StopGateState::default();
         let _ = crate::engine::agent::hooks::run_stop_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
@@ -7621,6 +7658,7 @@ impl Driver {
             Some(subagent_type),
             subagent_id,
             Some(end_reason),
+            local_knowledge_write_fence_active,
             &mut discarded,
         )
         .await;
@@ -7652,6 +7690,14 @@ impl Driver {
             .map(|pending| pending.call_id.clone());
         let mut state = std::mem::take(&mut frame.stop_gate);
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let outcome = crate::engine::agent::hooks::run_stop_hooks(
             runner,
             process_env,
@@ -7664,6 +7710,7 @@ impl Driver {
             Some(&child_type),
             child_id.as_deref(),
             Some("completed"),
+            local_knowledge_write_fence_active,
             &mut state,
         )
         .await;

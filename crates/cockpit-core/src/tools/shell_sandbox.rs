@@ -319,14 +319,16 @@ pub async fn build_sandboxed_command(
         extra_paths,
         write_scope,
         &[],
+        &[],
     )
     .await
 }
 
-/// Build a confined command while carving protected roots out of both read
-/// and write authority. Deny entries take precedence over the workspace root,
-/// which keeps a trusted local KB inaccessible even when it lives below cwd.
-/// The durable workspace scratch is an explicit read/write capability.
+/// Build a confined command while carving protected roots out of read and/or
+/// write authority. Read denies take precedence over the workspace root;
+/// write-only denies preserve approved KB reads while keeping generic shell
+/// writes out of every configured KB. The durable workspace scratch is an
+/// explicit read/write capability.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_sandboxed_command_with_sandbox_roots(
     command: &str,
@@ -338,6 +340,7 @@ pub async fn build_sandboxed_command_with_sandbox_roots(
     extra_paths: &[ExtraSandboxPath],
     write_scope: Option<&std::path::Path>,
     denied_paths: &[std::path::PathBuf],
+    write_denied_paths: &[std::path::PathBuf],
 ) -> Result<tokio::process::Command> {
     build_sandboxed_command_with_visibility_root(
         command,
@@ -352,6 +355,7 @@ pub async fn build_sandboxed_command_with_sandbox_roots(
         false,
         true,
         denied_paths,
+        write_denied_paths,
     )
     .await
 }
@@ -374,6 +378,7 @@ pub async fn build_sandboxed_command_with_visibility_root(
     restrict_to_visibility: bool,
     workspace_write_allowed: bool,
     denied_paths: &[std::path::PathBuf],
+    write_denied_paths: &[std::path::PathBuf],
 ) -> Result<tokio::process::Command> {
     // The ephemeral tmp remains lease-local, while the session's durable
     // scratch is an explicit capability and remains available outside a child
@@ -444,6 +449,9 @@ pub async fn build_sandboxed_command_with_visibility_root(
 
     for path in denied_paths {
         sandbox = sandbox.deny_read(path.clone()).deny_write(path.clone());
+    }
+    for path in write_denied_paths {
+        sandbox = sandbox.deny_write(path.clone());
     }
 
     if workspace_write_allowed
@@ -545,6 +553,26 @@ pub fn gate_decision(sandbox_on: bool, availability: &SandboxAvailability) -> Sa
         },
         SandboxAvailability::UnsupportedPlatform { .. } => SandboxGate::Unconfined,
     }
+}
+
+/// Decide a shell gate where a caller must enforce filesystem confinement for
+/// a local-KB fence. Unlike ordinary sandbox use, unsupported platforms may
+/// not fall back to an approved unconfined process on this path.
+pub fn gate_decision_requiring_confinement(
+    sandbox_on: bool,
+    confinement_required: bool,
+    availability: &SandboxAvailability,
+) -> SandboxGate {
+    if confinement_required {
+        return match availability {
+            SandboxAvailability::Available => SandboxGate::Confine,
+            SandboxAvailability::Unavailable { reason, .. }
+            | SandboxAvailability::UnsupportedPlatform { reason } => SandboxGate::Refuse {
+                reason: reason.clone(),
+            },
+        };
+    }
+    gate_decision(sandbox_on, availability)
 }
 
 /// Process-lifetime cache for the one-shot environment probe.
@@ -808,6 +836,19 @@ mod tests {
             reason: "no Windows backend".to_string(),
         };
         assert_eq!(gate_decision(true, &availability), SandboxGate::Unconfined);
+    }
+
+    #[test]
+    fn gate_unsupported_platform_refuses_when_a_kb_fence_requires_confinement() {
+        let availability = SandboxAvailability::UnsupportedPlatform {
+            reason: "no Windows backend".to_string(),
+        };
+        assert_eq!(
+            gate_decision_requiring_confinement(true, true, &availability),
+            SandboxGate::Refuse {
+                reason: "no Windows backend".to_string()
+            }
+        );
     }
 
     #[test]

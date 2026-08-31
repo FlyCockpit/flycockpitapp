@@ -1062,6 +1062,9 @@ impl ToolOutput {
 /// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
     pub(crate) agent_id: String,
+    /// Local knowledge bases this concrete agent definition may access. `None`
+    /// inherits the workspace registry; an empty set permits none.
+    pub(crate) allowed_knowledge_bases: Option<std::collections::BTreeSet<String>>,
     /// History-read trust of the concrete tool frame. This is carried from the
     /// agent frame rather than inferred from the session's active model;
     /// delegated frames remain untrusted even when a host-selected fallback
@@ -1277,6 +1280,7 @@ impl ToolCtx {
     pub(crate) fn clone_for_dispatch(&self) -> Self {
         Self {
             agent_id: self.agent_id.clone(),
+            allowed_knowledge_bases: self.allowed_knowledge_bases.clone(),
             executing_model_trusted: self.executing_model_trusted,
             knowledge_access_trusted: self.knowledge_access_trusted,
             caller_model: self.caller_model.clone(),

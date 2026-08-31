@@ -256,36 +256,7 @@ fn create_assistant_with_installation_id_sync(
     if cockpit_config::config::read_config_file_nofollow(&path)?.is_some() {
         bail!("assistant definition already exists without a registry row");
     }
-    let agent = AgentDef {
-        name: spec.name.clone(),
-        description: spec.description,
-        // These retained in-memory fields are ignored by schemaVersion 2.
-        // They cannot be configured from the assistant specification.
-        mode: AgentMode::Primary,
-        model: None,
-        temperature: None,
-        tools: None,
-        tool_tiers: std::collections::BTreeMap::new(),
-        tool_descriptions: std::collections::BTreeMap::new(),
-        scan_tool_results: None,
-        goal_supervision: crate::agents::GoalSettingsOverride::default(),
-        permission: None,
-        capabilities: None,
-        tool_steering: None,
-        context_policy: None,
-        // Assistant homes are daemon-owned definition locations, so they are
-        // the sole constructor allowed to use the local publisher. Tool/model
-        // selections from the legacy wizard remain host-side setup inputs and
-        // are intentionally absent from the serialized v2 definition.
-        vnext: Some(vnext_for_private_assistant(installation_id)),
-        prompt: spec.prompt,
-        prompt_overrides: std::collections::BTreeMap::new(),
-        package_files: None,
-        mcp_bindings: Vec::new(),
-        private_subagents: std::collections::BTreeMap::new(),
-        source: path.clone(),
-    };
-    crate::agents::validate_invariants(&agent)?;
+    let agent = private_assistant_agent(&spec, installation_id, path.clone())?;
     let markdown = agent.to_markdown()?;
     identity::seed_identity_files(&spec.home_dir)?;
     cockpit_host::private_fs::ensure_private_dir(&spec.home_dir.join("knowledge")).with_context(
@@ -332,6 +303,44 @@ fn create_assistant_with_installation_id_sync(
     Ok(row)
 }
 
+fn private_assistant_agent(
+    spec: &CreateAssistantSpec,
+    installation_id: Uuid,
+    source: PathBuf,
+) -> Result<AgentDef> {
+    let agent = AgentDef {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        // These retained in-memory fields are ignored by schemaVersion 2.
+        // They cannot be configured from the assistant specification.
+        mode: AgentMode::Primary,
+        model: None,
+        temperature: None,
+        tools: None,
+        tool_tiers: std::collections::BTreeMap::new(),
+        tool_descriptions: std::collections::BTreeMap::new(),
+        scan_tool_results: None,
+        goal_supervision: crate::agents::GoalSettingsOverride::default(),
+        permission: None,
+        capabilities: None,
+        tool_steering: None,
+        context_policy: None,
+        // Assistant homes are daemon-owned definition locations, so they are
+        // the sole constructor allowed to use the local publisher. Tool/model
+        // selections from the legacy wizard remain host-side setup inputs and
+        // are intentionally absent from the serialized v2 definition.
+        vnext: Some(vnext_for_private_assistant(installation_id)),
+        prompt: spec.prompt.clone(),
+        prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        mcp_bindings: Vec::new(),
+        private_subagents: std::collections::BTreeMap::new(),
+        source,
+    };
+    crate::agents::validate_invariants(&agent)?;
+    Ok(agent)
+}
+
 /// Provision the identity and normal assistant-owned knowledge base used by
 /// the built-in `Assistant` primary. The assistant session keeps its built-in
 /// root definition; this durable identity supplies only SOUL/USER state and
@@ -341,18 +350,10 @@ pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
         return validate_primary_assistant(db, row).await;
     }
 
-    let home_dir = default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?;
-    let spec = CreateAssistantSpec {
-        name: PRIMARY_ASSISTANT_IDENTITY_NAME.to_string(),
-        description: "Identity and knowledge base for Cockpit's built-in Assistant primary."
-            .to_string(),
-        prompt: "This daemon-owned assistant identity supplies personal context to Cockpit's built-in Assistant primary."
-            .to_string(),
-        home_dir,
-    };
+    let spec = primary_assistant_spec()?;
     match create_assistant_with_installation_id_and_soul_edit_mode(
         db,
-        spec,
+        spec.clone(),
         PRIMARY_ASSISTANT_INSTALLATION_ID,
         identity::SoulEditMode::Autonomous,
     )
@@ -364,9 +365,88 @@ pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
             // identity. Use the stored row; no error-string matching or
             // duplicate home initialization is needed.
             Some(row) => validate_primary_assistant(db, row).await,
-            None => Err(create_error).context("provisioning built-in Assistant identity"),
+            None => {
+                let row = recover_unregistered_primary_assistant(db, &spec)
+                    .await
+                    .with_context(|| {
+                        format!("provisioning built-in Assistant identity after {create_error}")
+                    })?;
+                validate_primary_assistant(db, row).await
+            }
         },
     }
+}
+
+fn primary_assistant_spec() -> Result<CreateAssistantSpec> {
+    Ok(CreateAssistantSpec {
+        name: PRIMARY_ASSISTANT_IDENTITY_NAME.to_string(),
+        description: "Identity and knowledge base for Cockpit's built-in Assistant primary."
+            .to_string(),
+        prompt: "This daemon-owned assistant identity supplies personal context to Cockpit's built-in Assistant primary."
+            .to_string(),
+        home_dir: default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?,
+    })
+}
+
+/// Reconcile only the immutable, daemon-owned primary identity if its
+/// definition survived while its registry row did not. Ordinary assistant
+/// definitions never take this path: an unregistered user-owned file remains
+/// a containment failure. Exact generated bytes are required, so a pathname
+/// occupant cannot acquire the reserved identity by merely claiming its name.
+async fn recover_unregistered_primary_assistant(
+    db: &Db,
+    spec: &CreateAssistantSpec,
+) -> Result<AssistantRow> {
+    let db = db.clone();
+    let spec = spec.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = assistant_definition_path(&spec.home_dir);
+        let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;
+        recover_creation_journal_locked(&db, &spec.home_dir)?;
+        if let Some(row) = get_assistant_blocking(&db, PRIMARY_ASSISTANT_IDENTITY_NAME)? {
+            return Ok(row);
+        }
+        let actual = String::from_utf8(
+            cockpit_config::config::read_config_file_nofollow(&path)?
+                .context("built-in Assistant definition is absent")?,
+        )
+        .context("built-in Assistant definition is not UTF-8")?;
+        let expected = private_assistant_agent(
+            &spec,
+            PRIMARY_ASSISTANT_INSTALLATION_ID,
+            path.clone(),
+        )?
+        .to_markdown()?;
+        anyhow::ensure!(
+            actual == expected,
+            "unregistered built-in Assistant definition does not match the immutable daemon template"
+        );
+        identity::seed_identity_files(&spec.home_dir)?;
+        cockpit_host::private_fs::ensure_private_dir(&spec.home_dir.join("knowledge"))?;
+        let config = AssistantConfig {
+            installation_id: PRIMARY_ASSISTANT_INSTALLATION_ID,
+            agent_source: path.to_string_lossy().into_owned(),
+            soul_edit_mode: identity::SoulEditMode::Autonomous,
+            soul_hash: identity::hash_optional_file(&identity::soul_path(&spec.home_dir))?,
+            user_hash: identity::hash_optional_file(&identity::user_path(&spec.home_dir))?,
+            ..AssistantConfig::default()
+        };
+        let config_json = serde_json::to_string(&config)?;
+        let content_hash = markdown_content_identity(&db, &actual)?;
+        let name = PRIMARY_ASSISTANT_IDENTITY_NAME.to_string();
+        let home_dir = spec.home_dir.to_string_lossy().into_owned();
+        db.blocking_write_for_sync_event(move |conn| {
+            crate::db::Db::upsert_assistant_conn(
+                conn,
+                &name,
+                &home_dir,
+                &config_json,
+                &content_hash,
+            )
+        })
+    })
+    .await
+    .context("built-in Assistant recovery coordinator joined")?
 }
 
 /// Change the daemon-owned Assistant primary's SOUL.md edit policy without
@@ -1514,6 +1594,23 @@ mod tests {
                 .join("knowledge")
                 .is_dir()
         );
+    }
+
+    #[tokio::test]
+    async fn primary_assistant_recovers_an_exact_daemon_owned_definition_after_registry_loss() {
+        let env = crate::test_env::lock_async().await;
+        let temp = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", temp.path());
+        let original_db = Db::open_in_memory().unwrap();
+        ensure_primary_assistant(&original_db).await.unwrap();
+
+        let replacement_db = Db::open_in_memory().unwrap();
+        let recovered = ensure_primary_assistant(&replacement_db).await.unwrap();
+
+        assert_eq!(recovered.name, PRIMARY_ASSISTANT_IDENTITY_NAME);
+        validate_primary_assistant(&replacement_db, recovered)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

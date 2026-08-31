@@ -6246,8 +6246,10 @@ pub(crate) mod tests {
         let original = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
         let mut rebuild_args = disk_model_spawn_args(tmp.path(), "text");
         rebuild_args.model_override = Some(rebuild_args.model.clone());
-        let error = rebuild_from_pinned_definition(&original, &rebuild_args)
-            .expect_err("Computer model switches must reject non-computer models");
+        let error = match rebuild_from_pinned_definition(&original, &rebuild_args) {
+            Ok(_) => panic!("Computer model switches must reject non-computer models"),
+            Err(error) => error,
+        };
 
         assert!(
             error

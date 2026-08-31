@@ -3063,7 +3063,7 @@ async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebu
         std::time::Instant::now(),
         None,
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
-        SessionConfigSnapshot::new(0, providers, extended),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
     .unwrap();
     start_permit.release();

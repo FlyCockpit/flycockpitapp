@@ -1032,7 +1032,7 @@ mod tests {
             let mut opener = {
                 let opens = Arc::clone(&opens);
                 let reopened_releases = Arc::clone(&reopened_releases);
-                move |_agent: &mut Agent| {
+                move |_agent: &mut Agent| -> BoxFuture<'_, anyhow::Result<Option<ComputerActionCoordinator>>> {
                     let opens = Arc::clone(&opens);
                     let reopened_releases = Arc::clone(&reopened_releases);
                     Box::pin(async move {

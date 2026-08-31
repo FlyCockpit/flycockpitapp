@@ -3063,6 +3063,7 @@ async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebu
         &extended,
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
+        None,
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,

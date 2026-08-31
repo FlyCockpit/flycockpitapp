@@ -756,6 +756,17 @@ mod tests {
             .expect("coordinator open")
     }
 
+    fn open_release_counting_coordinator<'a>(
+        _agent: &'a mut Agent,
+        opens: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+        Box::pin(async move {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(make_release_counting_coordinator(releases).await))
+        })
+    }
+
     /// AC5: call the named production driver registration function. Fixture
     /// raw provider output → extract → fake coordinator → continuation
     /// injection.
@@ -1029,19 +1040,23 @@ mod tests {
                 "call_id": "stale-call"
             })];
             let opens = Arc::new(AtomicUsize::new(0));
-            let mut opener = {
+            let mut opener: Box<
+                dyn for<'a> FnMut(
+                    &'a mut Agent,
+                ) -> BoxFuture<
+                    'a,
+                    anyhow::Result<Option<ComputerActionCoordinator>>,
+                >,
+            > = {
                 let opens = Arc::clone(&opens);
                 let reopened_releases = Arc::clone(&reopened_releases);
-                move |_agent: &mut Agent| -> BoxFuture<'_, anyhow::Result<Option<ComputerActionCoordinator>>> {
-                    let opens = Arc::clone(&opens);
-                    let reopened_releases = Arc::clone(&reopened_releases);
-                    Box::pin(async move {
-                        opens.fetch_add(1, Ordering::SeqCst);
-                        Ok(Some(
-                            make_release_counting_coordinator(reopened_releases).await,
-                        ))
-                    })
-                }
+                Box::new(move |agent| {
+                    open_release_counting_coordinator(
+                        agent,
+                        Arc::clone(&opens),
+                        Arc::clone(&reopened_releases),
+                    )
+                })
             };
 
             reconcile_native_computer_for_delegation_with_opener(

@@ -941,6 +941,9 @@ fn capture_command(
             }
         }
         CaptureTool::Import(_) => {
+            // `import` is interactive without an explicit root target. Both
+            // virtual and real-desktop captures must be unattended.
+            cmd.arg("-window").arg("root");
             if let Some(region) = region {
                 cmd.arg("-crop").arg(format!(
                     "{}x{}+{}+{}",

@@ -698,9 +698,10 @@ fn parse_display_identity(display: &str, default_screen: u32) -> Option<(String,
             transport.to_string()
         },
         display_number.parse().ok()?,
-        screen
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default_screen),
+        match screen {
+            Some(value) => value.parse().ok()?,
+            None => default_screen,
+        },
     ))
 }
 
@@ -735,4 +736,32 @@ pub fn authorized_x11rb_present() -> bool {
 pub fn authorized_atspi_present() -> bool {
     let _ = core::mem::size_of::<atspi::AccessibilityConnection>();
     true
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod production_adapter_tests {
+    use super::parse_display_identity;
+
+    #[test]
+    fn display_identity_parses_local_remote_and_default_screen() {
+        assert_eq!(
+            parse_display_identity(":0", 2),
+            Some(("unix".to_string(), 0, 2))
+        );
+        assert_eq!(
+            parse_display_identity("workstation.example:7.1", 0),
+            Some(("workstation.example".to_string(), 7, 1))
+        );
+        assert_eq!(
+            parse_display_identity("[::1]:3.0", 4),
+            Some(("[::1]".to_string(), 3, 0))
+        );
+    }
+
+    #[test]
+    fn display_identity_rejects_malformed_numbers() {
+        assert_eq!(parse_display_identity(":desktop", 0), None);
+        assert_eq!(parse_display_identity(":0.screen", 0), None);
+        assert_eq!(parse_display_identity("missing-colon", 0), None);
+    }
 }

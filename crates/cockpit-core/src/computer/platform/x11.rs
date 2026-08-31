@@ -5,6 +5,17 @@
 //! Xauthority cookie bytes never enter the identity.
 
 use crate::computer::host_identity::domain_hash;
+#[cfg(target_os = "linux")]
+use crate::computer::host_identity::{
+    HostInstallationId, RealHostIdentityFs, SysHostIdentityRng,
+    load_or_create_host_installation_id,
+};
+#[cfg(target_os = "linux")]
+use crate::computer::target::{
+    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, OpaqueWindowId,
+    RedactedHint, StableApplicationId, TargetEvidenceAdapter, TargetGeometry,
+    TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X11SessionParts {
@@ -342,6 +353,374 @@ pub fn make_valid_edid(seed: u8) -> Vec<u8> {
 
 #[derive(Debug, Default)]
 pub struct X11EvidenceLogic;
+
+/// Production target-evidence adapter for the X11 desktop selected by
+/// `DISPLAY`. Each snapshot is queried synchronously from one X server
+/// connection so the focused window and RandR resources share one request
+/// ordering boundary.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct X11TargetEvidenceAdapter {
+    display: String,
+    host: HostInstallationId,
+    reducer: FocusGenerationReducer,
+    observed_epoch: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl X11TargetEvidenceAdapter {
+    pub fn new(display: impl Into<String>) -> Result<Self, TargetUnavailableReason> {
+        let display = display.into();
+        if display.trim().is_empty() {
+            return Err(TargetUnavailableReason::UnsupportedPlatform);
+        }
+        let data_dir = crate::config::resolve::cockpit_data_dir()
+            .map_err(|_| TargetUnavailableReason::HostIdentityUnavailable)?;
+        let host = load_or_create_host_installation_id(
+            &data_dir,
+            &mut SysHostIdentityRng,
+            &mut RealHostIdentityFs,
+        )
+        .map_err(|_| TargetUnavailableReason::HostIdentityUnavailable)?;
+        Ok(Self {
+            display,
+            host,
+            reducer: FocusGenerationReducer::new(),
+            observed_epoch: 0,
+        })
+    }
+
+    fn capture_x11_snapshot(
+        &self,
+    ) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::randr::{Connection as RandrConnection, ConnectionExt as _};
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+        let unavailable = |_| TargetUnavailableReason::MissingCapability;
+        let (connection, screen_index) =
+            x11rb::connect(Some(&self.display)).map_err(unavailable)?;
+        let setup = connection.setup();
+        let screen = setup
+            .roots
+            .get(screen_index)
+            .ok_or(TargetUnavailableReason::MissingCapability)?;
+        let root = screen.root;
+
+        let randr_version = connection
+            .randr_query_version(1, 3)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        check_randr_version(randr_version.major_version, randr_version.minor_version)
+            .map_err(map_evidence_error)?;
+
+        let active_window_atom = connection
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?
+            .atom;
+        let active_window_reply = connection
+            .get_property(
+                false,
+                root,
+                active_window_atom,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        let active_window = active_window_reply
+            .value32()
+            .and_then(|mut values| values.next())
+            .filter(|window| *window != x11rb::NONE)
+            .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)?;
+
+        let window_geometry = connection
+            .get_geometry(active_window)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        let translated = connection
+            .translate_coordinates(active_window, root, 0, 0)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        let focused_geometry = FocusedWindowGeom {
+            x: translated.dst_x,
+            y: translated.dst_y,
+            w: window_geometry.width,
+            h: window_geometry.height,
+        };
+
+        let edid_atom = connection
+            .intern_atom(false, b"EDID")
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?
+            .atom;
+        let resources = connection
+            .randr_get_screen_resources_current(root)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        let mut outputs = Vec::with_capacity(resources.outputs.len());
+        for output in &resources.outputs {
+            let info = connection
+                .randr_get_output_info(*output, resources.config_timestamp)
+                .map_err(unavailable)?
+                .reply()
+                .map_err(unavailable)?;
+            check_resource_timestamp(info.timestamp, resources.config_timestamp)
+                .map_err(map_evidence_error)?;
+            let connected = info.connection == RandrConnection::CONNECTED;
+            let crtc = (info.crtc != x11rb::NONE).then_some(info.crtc);
+            let crtc_info = if let Some(crtc) = crtc {
+                let reply = connection
+                    .randr_get_crtc_info(crtc, resources.config_timestamp)
+                    .map_err(unavailable)?
+                    .reply()
+                    .map_err(unavailable)?;
+                check_resource_timestamp(reply.timestamp, resources.config_timestamp)
+                    .map_err(map_evidence_error)?;
+                Some(reply)
+            } else {
+                None
+            };
+            let edid_reply = connection
+                .randr_get_output_property(
+                    *output,
+                    edid_atom,
+                    AtomEnum::ANY,
+                    0,
+                    256,
+                    false,
+                    false,
+                )
+                .map_err(unavailable)?
+                .reply()
+                .map_err(unavailable)?;
+            let edid = (edid_reply.format == 8
+                && edid_reply.bytes_after == 0
+                && !edid_reply.data.is_empty())
+                .then_some(edid_reply.data);
+            outputs.push(RandrOutputSnapshot {
+                screen_index: screen_index as u32,
+                connector_name: String::from_utf8_lossy(&info.name).into_owned(),
+                edid,
+                crtc_id: crtc,
+                mode_id: crtc_info
+                    .as_ref()
+                    .and_then(|reply| (reply.mode != x11rb::NONE).then_some(reply.mode)),
+                geometry: crtc_info
+                    .as_ref()
+                    .map(|reply| (reply.x, reply.y, reply.width, reply.height)),
+                rotation: crtc_info
+                    .as_ref()
+                    .map_or(0, |reply| u16::from(reply.rotation)),
+                connected,
+                clone_group: None,
+            });
+        }
+        let groups = build_mirror_groups(&outputs).map_err(map_evidence_error)?;
+        let focused_group =
+            select_mirror_group(&groups, focused_geometry).map_err(map_evidence_error)?;
+
+        let (transport, display_number, screen_number) =
+            parse_display_identity(&self.display, screen_index as u32)
+                .ok_or(TargetUnavailableReason::MissingCapability)?;
+        let session = x11_session_or_seat_id(&X11SessionParts {
+            transport,
+            display_number,
+            screen: screen_number,
+            vendor: String::from_utf8_lossy(&setup.vendor).into_owned(),
+            release: setup.release_number,
+            root_window_id: root,
+            xauthority_cookie: Vec::new(),
+        });
+
+        let pid_atom = connection
+            .intern_atom(false, b"_NET_WM_PID")
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?
+            .atom;
+        let process_id = connection
+            .get_property(false, active_window, pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32().and_then(|mut values| values.next()));
+        let title = x11_text_property(&connection, active_window, b"_NET_WM_NAME");
+        let class = x11_text_property(&connection, active_window, b"WM_CLASS");
+        let mut window_bytes = [0_u8; 16];
+        window_bytes[..4].copy_from_slice(&active_window.to_le_bytes());
+
+        let mut snapshot = empty_unavailable(BackendKind::RealDesktopX11);
+        snapshot.host_installation_id =
+            FieldEvidence::available(self.host, EvidenceSource::X11ServerSetup);
+        snapshot.platform_session_or_seat_id =
+            FieldEvidence::available(session, EvidenceSource::X11ServerSetup);
+        snapshot.physical_display_id = FieldEvidence::available(
+            focused_group.physical_display_id(),
+            EvidenceSource::X11Randr,
+        );
+        snapshot.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes(window_bytes),
+            EvidenceSource::X11NetActiveWindow,
+        );
+        snapshot.process_id = process_id.map_or_else(
+            || {
+                FieldEvidence::unavailable(
+                    TargetUnavailableReason::PartialEvidence,
+                    Some(EvidenceSource::X11NetActiveWindow),
+                )
+            },
+            |pid| FieldEvidence::available(pid, EvidenceSource::X11NetActiveWindow),
+        );
+        snapshot.stable_application_id = FieldEvidence::<StableApplicationId>::unavailable(
+            TargetUnavailableReason::PartialEvidence,
+            Some(EvidenceSource::X11NetActiveWindow),
+        );
+        // TODO(a11y perception): AT-SPI roles remain additive evidence; screen
+        // understanding and action targeting continue to use captured pixels.
+        snapshot.accessibility_role = FieldEvidence::unavailable(
+            TargetUnavailableReason::PartialEvidence,
+            Some(EvidenceSource::AtSpi),
+        );
+        snapshot.accessibility_subrole = FieldEvidence::unavailable(
+            TargetUnavailableReason::PartialEvidence,
+            Some(EvidenceSource::AtSpi),
+        );
+        snapshot.title_hint = title.map_or_else(
+            || {
+                FieldEvidence::unavailable(
+                    TargetUnavailableReason::PartialEvidence,
+                    Some(EvidenceSource::X11NetActiveWindow),
+                )
+            },
+            |value| {
+                FieldEvidence::available(
+                    RedactedHint::from_raw(&value),
+                    EvidenceSource::X11NetActiveWindow,
+                )
+            },
+        );
+        snapshot.class_hint = class.map_or_else(
+            || {
+                FieldEvidence::unavailable(
+                    TargetUnavailableReason::PartialEvidence,
+                    Some(EvidenceSource::X11NetActiveWindow),
+                )
+            },
+            |value| {
+                FieldEvidence::available(
+                    RedactedHint::from_raw(&value),
+                    EvidenceSource::X11NetActiveWindow,
+                )
+            },
+        );
+        snapshot.geometry = FieldEvidence::available(
+            TargetGeometry {
+                x: i32::from(focused_geometry.x),
+                y: i32::from(focused_geometry.y),
+                width: u32::from(focused_geometry.w),
+                height: u32::from(focused_geometry.h),
+                scale: 1.0,
+            },
+            EvidenceSource::X11NetActiveWindow,
+        );
+        snapshot.synchronous_recheck = true;
+        Ok(snapshot)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TargetEvidenceAdapter for X11TargetEvidenceAdapter {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::RealDesktopX11
+    }
+
+    fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+        let mut snapshot = self.capture_x11_snapshot()?;
+        self.observed_epoch = self
+            .observed_epoch
+            .checked_add(1)
+            .ok_or(TargetUnavailableReason::EpochOverflow)?;
+        snapshot.adapter_observed_epoch = self.observed_epoch;
+        snapshot.focus_generation = self.reducer.observe(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn observed_focus_epoch(&self) -> u64 {
+        self.observed_epoch
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_text_property(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    name: &[u8],
+) -> Option<String> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let atom = connection.intern_atom(true, name).ok()?.reply().ok()?.atom;
+    if atom == x11rb::NONE {
+        return None;
+    }
+    let reply = connection
+        .get_property(false, window, atom, AtomEnum::ANY, 0, 256)
+        .ok()?
+        .reply()
+        .ok()?;
+    let value = reply
+        .value
+        .split(|byte| *byte == 0)
+        .find(|part| !part.is_empty())?;
+    Some(String::from_utf8_lossy(value).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_display_identity(display: &str, default_screen: u32) -> Option<(String, u32, u32)> {
+    let (transport, display_and_screen) = display.rsplit_once(':')?;
+    let (display_number, screen) = display_and_screen
+        .split_once('.')
+        .map_or((display_and_screen, None), |(display, screen)| {
+            (display, Some(screen))
+        });
+    Some((
+        if transport.is_empty() {
+            "unix".to_string()
+        } else {
+            transport.to_string()
+        },
+        display_number.parse().ok()?,
+        screen
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default_screen),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn map_evidence_error(error: X11EvidenceError) -> TargetUnavailableReason {
+    match error {
+        X11EvidenceError::AmbiguousOutput => TargetUnavailableReason::AmbiguousOutput,
+        X11EvidenceError::MissingActiveWindow => TargetUnavailableReason::FocusIdentityUnavailable,
+        X11EvidenceError::InconsistentTimestamp => TargetUnavailableReason::StaleTarget,
+        X11EvidenceError::RandrVersionTooOld | X11EvidenceError::MissingRandr => {
+            TargetUnavailableReason::MissingCapability
+        }
+        X11EvidenceError::Unauthenticated => TargetUnavailableReason::PermissionDenied,
+        X11EvidenceError::MissingGeometry
+        | X11EvidenceError::InvalidEdid
+        | X11EvidenceError::NoConnectedCrtc
+        | X11EvidenceError::NoMode
+        | X11EvidenceError::NoIntersectingGroup => TargetUnavailableReason::PartialEvidence,
+    }
+}
 
 /// Ownership anchor: audited `x11rb` leaf is linked on Linux.
 #[cfg(target_os = "linux")]

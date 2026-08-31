@@ -25,3 +25,5 @@ pub use x11::{
     EdidValidation, MirrorGroup, RandrOutputSnapshot, X11EvidenceLogic, X11SessionParts,
     select_mirror_group, validate_edid, x11_physical_display_id, x11_session_or_seat_id,
 };
+#[cfg(target_os = "linux")]
+pub use x11::X11TargetEvidenceAdapter;

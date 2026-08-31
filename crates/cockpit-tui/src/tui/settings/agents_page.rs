@@ -2207,7 +2207,7 @@ impl AgentsPage {
                 }
                 self.editing = draft.take();
                 self.status = Some(format!(
-                    "daemon authoritatively rejected editor settlement: {}",
+                    "failed to atomically commit external edit: {}",
                     error.message
                 ));
             }
@@ -2490,11 +2490,23 @@ impl AgentsPage {
             (super::pointer_actions::ExternalEditOutcome::Saved, Ok(text)) => {
                 (outcome, detail, Some(text))
             }
-            (non_saved, Ok(recovery)) => {
+            // Cancellation is an explicit decision to discard the external
+            // editor's staging bytes and return to the in-TUI draft. A failed
+            // editor run differs: preserve readable staging text for recovery.
+            (super::pointer_actions::ExternalEditOutcome::Cancelled, _) => (
+                super::pointer_actions::ExternalEditOutcome::Cancelled,
+                detail,
+                None,
+            ),
+            (super::pointer_actions::ExternalEditOutcome::Failed, Ok(recovery)) => {
                 if let Some(editor) = pending.draft.as_mut() {
                     editor.replace_with_recovery_text(&recovery);
                 }
-                (non_saved, detail, None)
+                (
+                    super::pointer_actions::ExternalEditOutcome::Failed,
+                    detail,
+                    None,
+                )
             }
             (_, Err(error)) => (
                 super::pointer_actions::ExternalEditOutcome::Failed,
@@ -5440,7 +5452,12 @@ pub(super) mod tests {
             "click row is relative to retained editor-body origin"
         );
 
-        let agent = super::super::pointer_actions::AgentId::workspace("pointer-agent");
+        let agent = page(&dialog)
+            .editing
+            .as_ref()
+            .expect("raw editor remains open for external edit")
+            .authority_id
+            .clone();
         let action = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
         );
@@ -5582,6 +5599,7 @@ pub(super) mod tests {
             super::super::pointer_actions::ExternalEditOutcome::Saved,
             None,
         );
+        settle_agent_effects(&mut dialog);
         super::super::pointer_acceptance_tests::record_dispatched_action(&saved_result);
         assert!(
             fs::read_to_string(agents_dir.join("pointer-agent.md"))
@@ -5629,8 +5647,14 @@ pub(super) mod tests {
                 .as_mut()
                 .expect("pointer Edit opens the in-TUI raw editor")
                 .paste("RETAINED");
+            let retry_agent = page(&retry)
+                .editing
+                .as_ref()
+                .expect("raw editor remains open for terminal retry")
+                .authority_id
+                .clone();
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
-                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(retry_agent.clone()),
             );
             {
                 let page = &mut retry.dialog.page;
@@ -5638,6 +5662,7 @@ pub(super) mod tests {
                 page.handle_pointer_control(cx, action.clone());
                 page.handle_pointer_control(cx, action);
             }
+            settle_agent_effects(&mut retry);
             let effect = page_mut(&mut retry)
                 .take_external_edit_request()
                 .expect("terminal outcome effect");
@@ -5645,12 +5670,13 @@ pub(super) mod tests {
             fs::write(&effect.path, "externally changed staging").unwrap();
             let result_action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditResult(
-                    agent.clone(),
+                    retry_agent,
                     outcome,
                 ),
             );
             super::super::pointer_acceptance_tests::record_source_action(&result_action);
             retry.finish_agent_external_edit(operation, outcome, None);
+            settle_agent_effects(&mut retry);
             super::super::pointer_acceptance_tests::record_dispatched_action(&result_action);
             assert!(page(&retry).pending_external_edit.is_none());
             // Cancelling restores the exact pre-handoff draft; a failed editor
@@ -5696,8 +5722,14 @@ pub(super) mod tests {
                 )),
             );
             click_agent_action(&mut conflict, &edit_action);
+            let conflict_agent = page(&conflict)
+                .editing
+                .as_ref()
+                .expect("raw editor remains open for conflict test")
+                .authority_id
+                .clone();
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
-                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(conflict_agent),
             );
             {
                 let page = &mut conflict.dialog.page;
@@ -5705,6 +5737,7 @@ pub(super) mod tests {
                 page.handle_pointer_control(cx, action.clone());
                 page.handle_pointer_control(cx, action);
             }
+            settle_agent_effects(&mut conflict);
             let effect = page_mut(&mut conflict)
                 .take_external_edit_request()
                 .expect("regular-file conflict effect");
@@ -5729,6 +5762,7 @@ pub(super) mod tests {
                 super::super::pointer_actions::ExternalEditOutcome::Saved,
                 None,
             );
+            settle_agent_effects(&mut conflict);
             assert_eq!(
                 fs::read(&target).unwrap(),
                 concurrent,
@@ -5752,8 +5786,14 @@ pub(super) mod tests {
                 )),
             );
             click_agent_action(&mut chmod_race, &edit_action);
+            let chmod_agent = page(&chmod_race)
+                .editing
+                .as_ref()
+                .expect("raw editor remains open for chmod race")
+                .authority_id
+                .clone();
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
-                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(chmod_agent),
             );
             {
                 let page = &mut chmod_race.dialog.page;
@@ -5761,10 +5801,15 @@ pub(super) mod tests {
                 page.handle_pointer_control(cx, action.clone());
                 page.handle_pointer_control(cx, action);
             }
+            settle_agent_effects(&mut chmod_race);
             let effect = page_mut(&mut chmod_race)
                 .take_external_edit_request()
                 .expect("chmod-race effect");
-            fs::write(&effect.path, "staged replacement").unwrap();
+            fs::write(
+                &effect.path,
+                vnext_workspace_agent("pointer-agent", "pointer fixture", "Zbody"),
+            )
+            .unwrap();
             // The suite may run under a process umask changed by another
             // regression, and the identity-replacement case above creates a
             // fresh inode. Choose a mode relative to the live target so the
@@ -5777,6 +5822,7 @@ pub(super) mod tests {
                 super::super::pointer_actions::ExternalEditOutcome::Saved,
                 None,
             );
+            settle_agent_effects(&mut chmod_race);
             assert_eq!(
                 fs::read(&target).unwrap(),
                 before,
@@ -5812,8 +5858,14 @@ pub(super) mod tests {
                 )),
             );
             click_agent_action(&mut swapped, &edit_action);
+            let swapped_agent = page(&swapped)
+                .editing
+                .as_ref()
+                .expect("raw editor remains open for swap test")
+                .authority_id
+                .clone();
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
-                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(swapped_agent),
             );
             {
                 let page = &mut swapped.dialog.page;
@@ -5821,6 +5873,7 @@ pub(super) mod tests {
                 page.handle_pointer_control(cx, action.clone());
                 page.handle_pointer_control(cx, action);
             }
+            settle_agent_effects(&mut swapped);
             let effect = page_mut(&mut swapped)
                 .take_external_edit_request()
                 .expect("symlink-swap effect");
@@ -5841,6 +5894,7 @@ pub(super) mod tests {
                 super::super::pointer_actions::ExternalEditOutcome::Saved,
                 None,
             );
+            settle_agent_effects(&mut swapped);
             assert_eq!(
                 fs::read_to_string(&victim).unwrap(),
                 "victim stays unchanged"
@@ -5887,7 +5941,12 @@ pub(super) mod tests {
                     "pointer fixture",
                     "changed-by-pointer",
                 ));
-            let agent = super::super::pointer_actions::AgentId::workspace("pointer-agent");
+            let agent = page(&dialog)
+                .editing
+                .as_ref()
+                .expect("raw editor remains open for terminal action")
+                .authority_id
+                .clone();
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 if terminal == "save" {
                     super::super::pointer_actions::AgentsAction::Save(agent)
@@ -5982,15 +6041,24 @@ pub(super) mod tests {
         }
     }
 
+    /// External editor completion travels through a private staging read and
+    /// a daemon lease settlement. Drive that reducer/effect loop before
+    /// asserting a terminal file state.
+    fn settle_agent_effects(dialog: &mut SettingsDialog) {
+        dialog.settle_test_effects();
+    }
+
     fn overridden_pointer_agent_dialog(tmp: &TempDir, name: &str) -> TrustedAgentsDialog {
         let _editor = EditorEnv::unset();
         let mut dialog = populated_pointer_agents_dialog(tmp);
         focus(&mut dialog, name);
         dialog.handle_key(press(KeyCode::Char('e')));
         dialog.handle_key(press(KeyCode::Esc));
-        if let TestPageMut::Agents(page) = dialog.test_page_mut() {
-            *page = AgentsPage::new(tmp.path());
-        }
+        // Agent inventories are daemon-owned. Re-enter through the root
+        // reducer so the replacement page queues and settles a fresh paired
+        // inventory/assistant snapshot instead of constructing an empty page
+        // with no authority load behind it.
+        super::super::tests::enter_root_node(&mut dialog, "Agents");
         focus(&mut dialog, name);
         assert!(
             tmp.path()
@@ -6163,9 +6231,9 @@ pub(super) mod tests {
         )
         .unwrap();
         // Refresh the page so it sees the custom agent.
-        if let TestPageMut::Agents(p) = d.test_page_mut() {
-            *p = AgentsPage::new(tmp.path());
-        }
+        // Reload through the production entry point; `AgentsPage::new` is an
+        // intentionally empty pre-snapshot shell.
+        super::super::tests::enter_root_node(&mut d, "Agents");
         // `R` then `y` resets.
         d.handle_key(press(KeyCode::Char('R')));
         assert!(page(&d).confirm_reset);

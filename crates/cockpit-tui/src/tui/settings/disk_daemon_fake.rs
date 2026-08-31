@@ -40,7 +40,7 @@ use cockpit_proto::{
     AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
     AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, CockpitConfigLayer,
     CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus, DesiredDenylistEntry,
-    ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
+    ErrorCode, ErrorPayload, ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
     ExtendedConfigPathMutation, RedactedDenylistEntry, Request, Response,
 };
 use sha2::{Digest as _, Sha256};
@@ -400,8 +400,9 @@ fn embedded_source_identity(root: &Path, name: &str, content: &[u8]) -> String {
     )
 }
 
-/// Bind the identity to the exact filesystem object, so a rewritten override
-/// mints a new revision even when its bytes are unchanged.
+/// Bind the identity to the exact filesystem object and its publication mode,
+/// so a rewritten or permission-changed override mints a new revision even
+/// when its bytes are unchanged.
 fn opaque_source_identity(
     root: &Path,
     source: &Path,
@@ -419,6 +420,7 @@ fn opaque_source_identity(
         use std::os::unix::fs::MetadataExt as _;
         platform_identity.extend_from_slice(&metadata.dev().to_le_bytes());
         platform_identity.extend_from_slice(&metadata.ino().to_le_bytes());
+        platform_identity.extend_from_slice(&metadata.mode().to_le_bytes());
     }
     #[cfg(windows)]
     {
@@ -2115,12 +2117,15 @@ fn complete_editor_lease(
     lease_id: &str,
     markdown: Option<cockpit_proto::SensitiveWirePayload>,
 ) -> Result<Response, String> {
-    let lease = editor_leases()
-        .lock()
-        .map_err(|_| poisoned("agent editor lease"))?
-        .get(lease_id)
-        .cloned()
-        .ok_or_else(|| "editor lease is absent, expired, or already completed".to_string())?;
+    let lease = {
+        let leases = editor_leases()
+            .lock()
+            .map_err(|_| poisoned("agent editor lease"))?;
+        leases
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| "editor lease is absent, expired, or already completed".to_string())?
+    };
     if lease.root != root {
         return Err("editor lease belongs to another workspace".to_string());
     }
@@ -2130,7 +2135,7 @@ fn complete_editor_lease(
     let mut result = match markdown {
         Some(markdown) => {
             let mut markdown = markdown.into_zeroizing();
-            mutate_agent(
+            match mutate_agent(
                 client_operation_id.clone(),
                 content_hash(format!("editor-save:{lease_id}:{}", lease.name).as_bytes()),
                 root,
@@ -2139,7 +2144,31 @@ fn complete_editor_lease(
                     markdown: std::mem::take(&mut *markdown),
                 },
                 Some(lease.revision.clone()),
-            )?
+            ) {
+                Ok(result) => result,
+                Err(message) => {
+                    editor_leases()
+                        .lock()
+                        .map_err(|_| poisoned("agent editor lease"))?
+                        .remove(lease_id);
+                    return Ok(Response::AgentEditorLeaseCompleted(AgentEditorCompletion {
+                        client_operation_id,
+                        project_root: root.to_string_lossy().into_owned(),
+                        owner_scope: format!("project:{}", root.to_string_lossy()),
+                        agent_name: lease.name,
+                        lease_id: lease_id.to_string(),
+                        consumed_revision: lease.revision,
+                        consumed_config_generation: None,
+                        result_config_generation: None,
+                        status: AgentEditorSettlementStatus::Rejected {
+                            error: ErrorPayload {
+                                code: ErrorCode::Conflict,
+                                message,
+                            },
+                        },
+                    }));
+                }
+            }
         }
         None => {
             let generation = current_config_generation();

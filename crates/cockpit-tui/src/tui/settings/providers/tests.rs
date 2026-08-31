@@ -37,6 +37,10 @@ struct ProviderDaemonFixture {
 
 impl ProviderDaemonFixture {
     fn new() -> Self {
+        Self::with_config_path(None)
+    }
+
+    fn with_config_path(config_path: Option<&std::path::Path>) -> Self {
         let nested = PROVIDER_DAEMON_FIXTURE_DEPTH.with(|depth| {
             let value = depth.get();
             depth.set(value.saturating_add(1));
@@ -53,8 +57,12 @@ impl ProviderDaemonFixture {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        if let Some(config_path) = config_path {
+            env.set_cockpit_config(config_path);
+        }
         Self {
-            env: Some(cockpit_test_support::TestEnvGuard::isolated_cockpit_home()),
+            env: Some(env),
             daemon: Some(
                 cockpit_core::daemon::enable_in_process_auto_promote_with_production_config(),
             ),
@@ -82,6 +90,75 @@ fn provider_daemon_runtime() -> (ProviderDaemonFixture, tokio::runtime::Runtime)
         .build()
         .expect("provider daemon test runtime");
     (fixture, runtime)
+}
+
+fn trust_provider_project(root: &std::path::Path) {
+    let project_root = root.display().to_string();
+    let set_trust = async move {
+        let lifecycle = crate::tui::settings::test_lifecycle_client();
+        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+            .await
+            .expect("provider fixture daemon client");
+        let expected_config_generation = match client
+            .request(cockpit_proto::Request::GetWorkspaceTrust {
+                project_root: project_root.clone(),
+            })
+            .await
+            .expect("provider fixture trust read transport")
+            .expect("provider fixture trust read response")
+        {
+            cockpit_proto::Response::WorkspaceTrust {
+                config_generation, ..
+            } => config_generation,
+            other => panic!("unexpected provider fixture trust read: {other:?}"),
+        };
+        let response = client
+            .request(cockpit_proto::Request::SetWorkspaceTrust {
+                project_root,
+                mode: cockpit_proto::WorkspaceTrustMode::Trust,
+                expected_config_generation,
+            })
+            .await
+            .expect("provider fixture trust transport")
+            .expect("provider fixture trust response");
+        assert!(matches!(
+            response,
+            cockpit_proto::Response::WorkspaceTrustSet { .. }
+        ));
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(set_trust));
+    } else {
+        futures::executor::block_on(set_trust);
+    }
+}
+
+/// Drive a settings dialog through the production daemon transport while
+/// retaining the synchronous reducer loop used by focused TUI tests. This is
+/// intentionally limited to tests that assert daemon-owned effects (such as
+/// provider credential cleanup); ordinary presentation tests use the
+/// file-backed transport fixture instead.
+struct InProcessSettingsDaemonEffect;
+
+impl super::super::SettingsDaemonEffect for InProcessSettingsDaemonEffect {
+    fn request(&self, request: cockpit_proto::Request) -> Result<cockpit_proto::Response, String> {
+        let request = async move {
+            let lifecycle = crate::tui::settings::test_lifecycle_client();
+            let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(request))
+        } else {
+            futures::executor::block_on(request)
+        }
+    }
 }
 
 /// Seed a daemon-owned provider credential record for `credential_ref`,
@@ -183,44 +260,7 @@ fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDi
     // the auto-promoted daemon itself, not merely the local presentation
     // policy or a file-backed DB that the in-process daemon does not use.
     if PROVIDER_DAEMON_FIXTURE_DEPTH.with(Cell::get) != 0 {
-        let project_root = trust_root.root.display().to_string();
-        let set_trust = async move {
-            let lifecycle = crate::tui::settings::test_lifecycle_client();
-            let client = crate::tui::settings::settings_daemon_client(&lifecycle)
-                .await
-                .expect("provider fixture daemon client");
-            let expected_config_generation = match client
-                .request(cockpit_proto::Request::GetWorkspaceTrust {
-                    project_root: project_root.clone(),
-                })
-                .await
-                .expect("provider fixture trust read transport")
-                .expect("provider fixture trust read response")
-            {
-                cockpit_proto::Response::WorkspaceTrust {
-                    config_generation, ..
-                } => config_generation,
-                other => panic!("unexpected provider fixture trust read: {other:?}"),
-            };
-            let response = client
-                .request(cockpit_proto::Request::SetWorkspaceTrust {
-                    project_root,
-                    mode: cockpit_proto::WorkspaceTrustMode::Trust,
-                    expected_config_generation,
-                })
-                .await
-                .expect("provider fixture trust transport")
-                .expect("provider fixture trust response");
-            assert!(matches!(
-                response,
-                cockpit_proto::Response::WorkspaceTrustSet { .. }
-            ));
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(set_trust));
-        } else {
-            futures::executor::block_on(set_trust);
-        }
+        trust_provider_project(&trust_root.root);
     }
     // Provider-save tests must never touch the developer's real credential
     // store when literal-header protection runs as part of a save.
@@ -723,7 +763,12 @@ fn pointer_model_dismiss_renders_and_dispatches_from_fresh_state() {
         let (tmp, mut dialog) = dialog_with_config(config);
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
-        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let mut editor = SettingsEditor::for_model_with_generation(
+            "p",
+            &entry,
+            &model_id,
+            dialog.config.resolution_generation.max(1),
+        );
         let refresh_id = editor
             .begin_multimodal_refresh()
             .expect("multimodal refresh begins");
@@ -795,7 +840,12 @@ fn pointer_model_rebind_renders_and_dispatches_from_fresh_state() {
         let (tmp, mut dialog) = dialog_with_config(config);
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
-        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let mut editor = SettingsEditor::for_model_with_generation(
+            "p",
+            &entry,
+            &model_id,
+            dialog.config.resolution_generation.max(1),
+        );
         editor.cursor = editor
             .fields()
             .iter()
@@ -882,7 +932,12 @@ fn pointer_model_reapply_renders_and_dispatches_from_fresh_state() {
         let (tmp, mut dialog) = dialog_with_config(config);
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
-        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let mut editor = SettingsEditor::for_model_with_generation(
+            "p",
+            &entry,
+            &model_id,
+            dialog.config.resolution_generation.max(1),
+        );
         editor.cursor = editor
             .fields()
             .iter()
@@ -972,7 +1027,12 @@ fn pointer_model_reload_renders_and_dispatches_from_fresh_state() {
         let (tmp, mut dialog) = dialog_with_config(config);
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
-        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let mut editor = SettingsEditor::for_model_with_generation(
+            "p",
+            &entry,
+            &model_id,
+            dialog.config.resolution_generation.max(1),
+        );
         editor.cursor = editor
             .fields()
             .iter()
@@ -1058,7 +1118,12 @@ fn pointer_model_retry_renders_and_dispatches_from_fresh_state() {
         let (tmp, mut dialog) = dialog_with_config(config);
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
-        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let mut editor = SettingsEditor::for_model_with_generation(
+            "p",
+            &entry,
+            &model_id,
+            dialog.config.resolution_generation.max(1),
+        );
         let refresh_id = editor
             .begin_multimodal_refresh()
             .expect("multimodal refresh begins");
@@ -1123,7 +1188,12 @@ fn pointer_model_discard_renders_and_dispatches_from_fresh_state() {
         let (tmp, mut dialog) = dialog_with_config(config);
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
-        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let mut editor = SettingsEditor::for_model_with_generation(
+            "p",
+            &entry,
+            &model_id,
+            dialog.config.resolution_generation.max(1),
+        );
         editor.cursor = editor
             .fields()
             .iter()
@@ -1207,7 +1277,12 @@ fn pointer_model_refresh_renders_and_dispatches_from_fresh_state() {
         let entry = dialog.config.providers["p"].clone();
         let model_id = entry.models[0].id.clone();
         dialog.page = super::super::providers_page(ProvidersPage::ModelSettings {
-            editor: SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1),
+            editor: SettingsEditor::for_model_with_generation(
+                "p",
+                &entry,
+                &model_id,
+                dialog.config.resolution_generation.max(1),
+            ),
             models: Box::new(ModelEditor::new(None, entry.models.clone())),
             parent: Box::new(EditState::new("p".into(), entry)),
         });
@@ -5354,74 +5429,97 @@ fn provider_delete_retains_unproven_unshared_stored_secret() {
 
 #[test]
 fn provider_delete_removes_grok_oauth_provider_via_daemon() {
-    let (_daemon_fixture, runtime) = provider_daemon_runtime();
-    let _runtime_guard = runtime.enter();
     let provider_id = "grok-unshared";
-    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(provider_id, provider_id));
+    let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join(".cockpit/config.json");
+    std::fs::create_dir_all(
+        config_path
+            .parent()
+            .expect("provider fixture config parent"),
+    )
+    .unwrap();
+    std::fs::write(&config_path, "{}").unwrap();
+    ConfigDoc::load(&config_path)
+        .unwrap()
+        .write(&oauth_provider_config(provider_id, provider_id))
+        .unwrap();
+    let _daemon_fixture = ProviderDaemonFixture::with_config_path(Some(&config_path));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("provider daemon test runtime");
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        trust_provider_project(tmp.path());
+        let mut dialog = SettingsDialog::open(config_path.clone());
+        dialog.active_project_root = Some(tmp.path().to_path_buf());
+        dialog.credential_store_path = Some(tmp.path().join("credentials.json"));
 
-    // Seed the daemon-owned credential record through the same owner RPC used
-    // by the OAuth completion path. This makes the regression cover the
-    // unshared-record cleanup, rather than only provider-file removal.
-    let client = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let lifecycle = crate::tui::settings::test_lifecycle_client();
-            crate::tui::settings::settings_daemon_client(&lifecycle)
-                .await
-                .expect("provider-delete fixture daemon client")
+        // Seed the daemon-owned credential record through the same owner RPC used
+        // by the OAuth completion path. This makes the regression cover the
+        // unshared-record cleanup, rather than only provider-file removal.
+        let client = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let lifecycle = crate::tui::settings::test_lifecycle_client();
+                crate::tui::settings::settings_daemon_client(&lifecycle)
+                    .await
+                    .expect("provider-delete fixture daemon client")
+            })
+        });
+        let seeded = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                client.request(cockpit_proto::Request::PutProviderCredential {
+                    client_operation_id: "provider-delete-seed".into(),
+                    provider_id: provider_id.to_string(),
+                    record: json!({"access_token": "opaque-fixture-token"})
+                        .to_string()
+                        .into(),
+                }),
+            )
         })
+        .expect("provider credential seed transport")
+        .expect("provider credential seed response");
+        assert!(matches!(
+            seeded,
+            cockpit_proto::Response::ProviderCredentialCommitted {
+                client_operation_id,
+                provider_id: committed_provider_id,
+                stored: true,
+                ..
+            } if client_operation_id == "provider-delete-seed"
+                && committed_provider_id == provider_id
+        ));
+
+        assert_eq!(
+            dialog
+                .delete_provider_and_stored_secrets(provider_id, true)
+                .unwrap(),
+            0
+        );
+        dialog.flush_request_daemon_effects_for_test();
+
+        let persisted = ConfigDoc::load(&config_path).unwrap().providers();
+        assert!(!persisted.providers.contains_key(provider_id));
+
+        let inventory = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.request(
+                cockpit_proto::Request::ListSecretInventory {
+                    cursor: None,
+                    limit: None,
+                },
+            ))
+        })
+        .expect("provider credential inventory transport")
+        .expect("provider credential inventory response");
+        let cockpit_proto::Response::SecretInventory { entries, .. } = inventory else {
+            panic!("unexpected provider credential inventory response");
+        };
+        assert!(!entries.iter().any(|entry| {
+            entry.name == provider_id
+                && entry.kind == cockpit_proto::SecretInventoryKind::CredentialRecord
+        }));
     });
-    let seeded = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            client.request(cockpit_proto::Request::PutProviderCredential {
-                client_operation_id: "provider-delete-seed".into(),
-                provider_id: provider_id.to_string(),
-                record: json!({"access_token": "opaque-fixture-token"})
-                    .to_string()
-                    .into(),
-            }),
-        )
-    })
-    .expect("provider credential seed transport")
-    .expect("provider credential seed response");
-    assert!(matches!(
-        seeded,
-        cockpit_proto::Response::ProviderCredentialCommitted {
-            client_operation_id,
-            provider_id: committed_provider_id,
-            stored: true,
-            ..
-        } if client_operation_id == "provider-delete-seed"
-            && committed_provider_id == provider_id
-    ));
-
-    assert_eq!(
-        dialog
-            .delete_provider_and_stored_secrets(provider_id, true)
-            .unwrap(),
-        0
-    );
-
-    let persisted = ConfigDoc::load(&config_path).unwrap().providers();
-    assert!(!persisted.providers.contains_key(provider_id));
-
-    let inventory = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(client.request(
-            cockpit_proto::Request::ListSecretInventory {
-                cursor: None,
-                limit: None,
-            },
-        ))
-    })
-    .expect("provider credential inventory transport")
-    .expect("provider credential inventory response");
-    let cockpit_proto::Response::SecretInventory { entries, .. } = inventory else {
-        panic!("unexpected provider credential inventory response");
-    };
-    assert!(!entries.iter().any(|entry| {
-        entry.name == provider_id
-            && entry.kind == cockpit_proto::SecretInventoryKind::CredentialRecord
-    }));
 }
 
 #[test]

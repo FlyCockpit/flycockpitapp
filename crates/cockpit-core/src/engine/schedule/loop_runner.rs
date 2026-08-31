@@ -1199,6 +1199,7 @@ mod tests {
             turn_tx,
             event_tx,
             idle_activity_rx: None,
+            idle_activity_gate: None,
             active_idle_wake: None,
             iteration_completed_tx: Some(iteration_completed_tx),
         }));

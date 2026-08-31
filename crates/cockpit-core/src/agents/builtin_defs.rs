@@ -177,7 +177,15 @@ fn def_with_normal(
     // embedded default and the same agent re-parsed from its ejected file
     // compare byte-equal (eject faithfulness).
     let body = prompt.trim_end().to_string();
-    let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
+    let vnext = if name == "docs-answerer" {
+        // The docs pipeline is an internal two-stage implementation, not a
+        // user-authored AgentDef language. The answerer must nevertheless
+        // carry its explicit no-KB grant in the definition snapshot so prompt
+        // injection, toolbox construction, and every ToolCtx agree.
+        let mut definition = builtin_vnext(name, mode);
+        definition.allowed_knowledge_bases = Some(std::collections::BTreeSet::new());
+        Some(definition)
+    } else if name == "docs-resolver" {
         // The docs pipeline is an internal two-stage implementation, not a
         // user-authored AgentDef language. Keep its fixed surfaces outside
         // vNext discovery and serialization.
@@ -559,15 +567,19 @@ fn history_def() -> AgentDef {
     def
 }
 
-/// `knowledge` — a read-only retrieval specialist. It has no direct KB write
-/// surface: `knowledge_retrieve` reads attached KBs through `KbProvider` and
-/// consults only the dream-bounded fresh-session subset.
+/// `knowledge` — a read-only retrieval specialist. It composes KB search
+/// primitives with native reads and has no direct KB write surface.
 fn knowledge_def() -> AgentDef {
     def_with_normal(
         "knowledge",
-        "Read-only knowledge retrieval specialist; returns a cited synthesis from attached KBs and bounded fresh sessions.",
+        "Read-only knowledge retrieval specialist; composes cited KB search primitives and reads into a concise synthesis.",
         AgentMode::Subagent,
-        &["knowledge_retrieve"],
+        &[
+            "read",
+            "semantic_search",
+            "structured_search",
+            "history_search",
+        ],
         crate::engine::builtin::KNOWLEDGE_PROMPT,
         None,
     )
@@ -786,6 +798,16 @@ fn docs_answerer_def() -> AgentDef {
 mod tests {
     use super::*;
     use crate::agents::{AgentCapability, PostureResolution};
+
+    #[test]
+    fn docs_answerer_definition_attaches_no_knowledge_bases() {
+        let def = embedded_internal_default("docs-answerer").expect("docs answerer definition");
+        assert!(
+            def.allowed_knowledge_bases()
+                .is_some_and(|bases| bases.is_empty()),
+            "docs answerer must carry an explicit empty KB allowlist"
+        );
+    }
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
@@ -1119,8 +1141,13 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"knowledge"));
         assert_eq!(
             def.tools,
-            Some(vec!["knowledge_retrieve".to_string()]),
-            "the KB specialist receives only its read-only composite retrieval tool"
+            Some(vec![
+                "read".to_string(),
+                "semantic_search".to_string(),
+                "structured_search".to_string(),
+                "history_search".to_string(),
+            ]),
+            "the KB specialist receives only native read and its read-only search primitives"
         );
         for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
             assert!(
@@ -1133,8 +1160,10 @@ mod tests {
             );
         }
         assert!(
-            def.prompt.contains("knowledge_retrieve"),
-            "the specialist prompt must direct every request through provider-backed retrieval"
+            def.prompt.contains("semantic_search")
+                && def.prompt.contains("structured_search")
+                && def.prompt.contains("history_search"),
+            "the specialist prompt must direct retrieval through both provider-backed search primitives and bounded fresh-session recall"
         );
     }
 }

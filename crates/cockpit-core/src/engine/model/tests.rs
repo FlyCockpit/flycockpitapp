@@ -79,8 +79,9 @@ fn cache_boundary_keeps_system_and_tools_byte_identical_across_volatile_turns() 
     let (_tmp, redact) = secret_table();
     let model = model_at("http://127.0.0.1:1/v1", redact);
     let tools = [crate::engine::message::ToolDefinition {
-        name: "memory_search".to_string(),
-        description: "search attached OKF memory bundles with citations".to_string(),
+        name: "semantic_search".to_string(),
+        description: "semantically search attached OKF knowledge bundles with citations"
+            .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": { "query": { "type": "string" } },

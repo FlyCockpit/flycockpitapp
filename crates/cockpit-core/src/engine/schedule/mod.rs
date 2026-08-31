@@ -33,9 +33,9 @@
 //! - `background` is shell-only (a loop is already a background job).
 //! - A configurable [`max_concurrent`](ScheduleAuthority::max_concurrent) cap
 //!   guards against accidental fan-out.
-//! - Jobs live for the **daemon/session lifetime**. Surviving a daemon
-//!   restart is out of scope for v1 — the registry is in-memory only; a
-//!   restart drops live jobs (they are not persisted).
+//! - Jobs live for the **daemon/session lifetime**. A persistent daemon keeps
+//!   the owning session worker alive between TUI attaches; in daemonless TUI
+//!   mode timers are intentionally live only while that TUI remains open.
 
 pub mod authority;
 pub(crate) mod background;

@@ -4469,6 +4469,11 @@ impl Driver {
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
             executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
             knowledge_access_trusted: agent.model.is_trusted(),
             caller_model: Some(crate::engine::tool::CallerModel::from_model(
@@ -7312,6 +7317,14 @@ impl Driver {
         fields: crate::engine::agent::hooks::ObserveFields<'_>,
     ) {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 self.session.process_containment(),
@@ -7328,6 +7341,7 @@ impl Driver {
             None,
             None,
             fields,
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -7363,10 +7377,15 @@ impl Driver {
         let session_id = self.session.id;
         let cwd = self.cwd.clone();
         let db = self.session.db.clone();
+        let session = self.session.clone();
         let subagent_type = subagent_type.to_string();
         let subagent_id = subagent_id.map(str::to_owned);
         let end_reason = end_reason.map(str::to_owned);
         async move {
+            let extended = snapshot.extended.clone();
+            let local_knowledge_write_fence_active =
+                crate::knowledge::local_knowledge_write_fence_active(&session, &cwd, &extended)
+                    .await;
             crate::engine::agent::hooks::run_observe_hooks(
                 &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                     containment,
@@ -7387,6 +7406,7 @@ impl Driver {
                     end_reason: end_reason.as_deref(),
                     ..Default::default()
                 },
+                local_knowledge_write_fence_active,
             )
             .await;
         }
@@ -7583,6 +7603,14 @@ impl Driver {
         state: &mut crate::engine::agent::hooks::StopGateState,
     ) -> crate::engine::agent::hooks::StopHookOutcome {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_stop_hooks(
             runner,
             process_env,
@@ -7597,6 +7625,7 @@ impl Driver {
             None,
             None,
             None,
+            local_knowledge_write_fence_active,
             state,
         )
         .await
@@ -7623,6 +7652,14 @@ impl Driver {
         end_reason: &str,
     ) {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let mut discarded = crate::engine::agent::hooks::StopGateState::default();
         let _ = crate::engine::agent::hooks::run_stop_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
@@ -7639,6 +7676,7 @@ impl Driver {
             Some(subagent_type),
             subagent_id,
             Some(end_reason),
+            local_knowledge_write_fence_active,
             &mut discarded,
         )
         .await;
@@ -7670,6 +7708,14 @@ impl Driver {
             .map(|pending| pending.call_id.clone());
         let mut state = std::mem::take(&mut frame.stop_gate);
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let outcome = crate::engine::agent::hooks::run_stop_hooks(
             runner,
             process_env,
@@ -7682,6 +7728,7 @@ impl Driver {
             Some(&child_type),
             child_id.as_deref(),
             Some("completed"),
+            local_knowledge_write_fence_active,
             &mut state,
         )
         .await;
@@ -7940,17 +7987,33 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
-        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
-            self.keep_warm_armed_for_idle_window = false;
-        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
             )
         );
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+            // Oversized submissions have not been accepted yet: phase-two
+            // materialization records activity only after its durable commit.
+            // This keeps rejected leases from resetting idle wakes and gives
+            // every accepted submission one, consistent activity timestamp.
+            if !has_oversized_artifact_lease {
+                self.schedule.record_user_activity();
+            }
+        }
         self.auto_compact_gate
             .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
+    pub(crate) fn set_idle_activity_sender(
+        &mut self,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+        gate: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.schedule.set_idle_activity_sender(sender);
+        self.schedule.set_idle_activity_gate(gate);
     }
 
     /// Tools whose in-flight execution can be adopted by the
@@ -11802,9 +11865,16 @@ impl Driver {
                         // turn start because the oversized lease was still
                         // unmaterialized; this is the delayed ExternalRoot
                         // gate advance for that path.
+                        // Materialization is this path's acceptance boundary.
+                        // Keep the durable reset and in-memory epoch in the
+                        // same admission interval as ordinary ingress.
+                        let idle_activity_gate = self.schedule.idle_activity_gate();
+                        let _idle_activity_admission = idle_activity_gate.lock().await;
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
+                        self.schedule
+                            .record_materialized_user_activity_after_acceptance();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {
@@ -13459,9 +13529,11 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(mut children) if children.len() == 1 => {
-                            children
-                                .pop()
+                        Ok(publication) if publication.children.len() == 1 => {
+                            publication
+                                .children
+                                .into_iter()
+                                .next()
                                 .expect("one published interactive child")
                                 .agent_instance_id
                         }

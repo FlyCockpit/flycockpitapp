@@ -1294,6 +1294,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             &extended,
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
+            None,
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -1637,6 +1638,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             &extended,
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
+            None,
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -1957,6 +1959,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             &extended,
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
+            None,
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -2252,6 +2255,19 @@ fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUse
         delivery_class: Default::default(),
         send_now: false,
     }
+}
+
+#[tokio::test]
+async fn worker_handle_publishes_user_activity_without_worker_queue_progress() {
+    let handle = test_session_handle();
+    let mut activity = handle.subscribe_user_activity_for_test();
+
+    handle.record_user_activity();
+
+    activity
+        .changed()
+        .await
+        .expect("live activity epoch must remain connected");
 }
 
 async fn recv_queue_updated_for_test(event_rx: &mut EventReceiver) -> Vec<proto::QueueItem> {
@@ -2938,6 +2954,7 @@ async fn absent_scheduler_is_not_an_error() {
         &extended,
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
+        None,
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -3180,6 +3197,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         &extended,
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
+        None,
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -3363,6 +3381,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             false,
             &extended,
             Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
             None,
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),

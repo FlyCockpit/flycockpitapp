@@ -17,21 +17,19 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use crate::config::extended::RedactConfig;
 use crate::config::extended::{
     ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
     KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
 };
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
-use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
@@ -177,12 +175,13 @@ const KB_MACHINE_STATE_GITIGNORE: &[&str] = &[
     "schedule-state/",
     "sealed-material/",
 ];
-pub(crate) const INDEX_LOGIC_VERSION: i64 = 2;
+pub(crate) const INDEX_LOGIC_VERSION: i64 = 3;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
-const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
-const KNOWLEDGE_RETRIEVE_TOOL_NAME: &str = "knowledge_retrieve";
+const SEMANTIC_SEARCH_TOOL_NAME: &str = "semantic_search";
+const STRUCTURED_SEARCH_TOOL_NAME: &str = "structured_search";
+const KNOWLEDGE_SNAPSHOT_READ_PREFIX: &str = "cockpit://knowledge/";
 const KNOWLEDGE_DREAM_SOURCES_TOOL_NAME: &str = "knowledge_dream_sources";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
@@ -190,6 +189,9 @@ const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
 const MAX_KNOWLEDGE_DEPTH: usize = 32;
 const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STRUCTURED_SEARCH_QUERY_CHARS: usize = 1_024;
+const MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS: usize = 256;
+const MAX_STRUCTURED_SEARCH_FILTERS: usize = 16;
 /// A non-secret, host-authenticated generation marker for local KB sealed
 /// values. The marker is ignored by git and carries a host-keyed binding to
 /// the concrete source directory and marker file objects. A copied marker is
@@ -203,8 +205,8 @@ const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN: &[u8] =
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
     &[
-        MEMORY_SEARCH_TOOL_NAME,
-        KNOWLEDGE_RETRIEVE_TOOL_NAME,
+        SEMANTIC_SEARCH_TOOL_NAME,
+        STRUCTURED_SEARCH_TOOL_NAME,
         KNOWLEDGE_DREAM_SOURCES_TOOL_NAME,
         KNOWLEDGE_DREAM_APPLY_TOOL_NAME,
     ]
@@ -225,6 +227,10 @@ pub(crate) struct KnowledgeBundle {
     pub index_md: Option<String>,
     pub log_md: Option<String>,
     pub concepts: Vec<KnowledgeConcept>,
+    /// Exact source bytes captured with the retained KB root. Search results
+    /// cite these through `cockpit://knowledge/…`, rather than reopening a
+    /// mutable path after the search has completed.
+    source_documents: BTreeMap<PathBuf, String>,
     resources: Vec<KnowledgeResource>,
 }
 
@@ -314,6 +320,46 @@ pub(crate) struct SearchResult {
     pub snippet: String,
     pub citations: Vec<Citation>,
     pub score: f64,
+    /// A structured predicate selected this exact row rather than merely its
+    /// owning concept. Its snippet is the row's JSON object and the cited
+    /// snapshot is the markdown table or sibling resource that contains it.
+    matched_structured_row: bool,
+    /// The immutable source bytes from which this hit was indexed. This is
+    /// consumed before rendering into a session-scoped read pseudofile.
+    snapshot_source: Option<String>,
+    snapshot_trust_required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StructuredSearchQuery {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default, rename = "type")]
+    concept_type: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    timestamp: Option<TimestampFilter>,
+    #[serde(default, rename = "structured")]
+    structured_filters: Vec<StructuredValueFilter>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TimestampFilter {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StructuredValueFilter {
+    column: String,
+    equals: JsonValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +401,7 @@ struct ChunkDoc {
 pub(crate) trait KbProvider: Send + Sync {
     async fn is_available(&self) -> Result<bool>;
     async fn retrieve(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    async fn structured_search(&self, query: &StructuredSearchQuery) -> Result<Vec<SearchResult>>;
     /// Apply model-produced OKF output through the provider that owns the KB.
     /// Dream execution must use this rather than resolving a local root itself,
     /// so local Git transactions and future hosted writes stay interchangeable.
@@ -1872,34 +1919,55 @@ impl KbProvider for LocalKb {
         let sidecars = self.sidecars.canonicalized()?;
         let sidecar_lock = sidecar_lock(&sidecars);
         let _sidecar_guard = sidecar_lock.lock().await;
-        let (index, _) = match &self.snapshot {
-            Some(snapshot) => {
-                let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
-                KnowledgeIndex::open_snapshot_locked(
-                    snapshot.clone(),
-                    sidecars.clone(),
-                    &process_lock,
-                    embedder,
-                    Some(query_vector.len()),
-                )
-                .await?
-            }
-            None => {
-                let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
-                KnowledgeIndex::open_snapshot_locked(
-                    bundle,
-                    sidecars,
-                    &process_lock,
-                    embedder,
-                    Some(query_vector.len()),
-                )
-                .await?
-            }
-        };
+        let snapshot = self
+            .snapshot
+            .clone()
+            .context("local knowledge search requires a retained knowledge snapshot")?;
+        let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        let (index, _) = KnowledgeIndex::open_snapshot_locked(
+            snapshot.clone(),
+            sidecars,
+            &process_lock,
+            embedder,
+            Some(query_vector.len()),
+        )
+        .await?;
         let mut results = index.search_with_vector(&query_vector, query, limit)?;
         for result in &mut results {
             result.knowledge_base_id = self.entry.id.clone();
             result.knowledge_base_name = self.entry.name.clone();
+            result.snapshot_source = Some(snapshot_source_for_result(&snapshot, result)?);
+            result.snapshot_trust_required = self.entry.trust_required;
+        }
+        Ok(results)
+    }
+
+    async fn structured_search(&self, query: &StructuredSearchQuery) -> Result<Vec<SearchResult>> {
+        if !self.is_available().await? {
+            bail!(
+                "local knowledge base `{}` does not exist at {}",
+                self.entry.id,
+                self.root.display()
+            );
+        }
+        let sidecars = self.sidecars.canonicalized()?;
+        let sidecar_lock = sidecar_lock(&sidecars);
+        let _sidecar_guard = sidecar_lock.lock().await;
+        let bundle = self
+            .snapshot
+            .clone()
+            .context("local structured knowledge search requires a retained knowledge snapshot")?;
+        let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        let index = open_index_connection(&sidecars.index, &process_lock)?;
+        ensure_index_schema(&index)?;
+        rebuild_index(&index, &bundle)?;
+        persist_private_sidecar_connection(&index, &sidecars.index, &process_lock)?;
+        let mut results = structured_search_index(&index, query)?;
+        for result in &mut results {
+            result.knowledge_base_id = self.entry.id.clone();
+            result.knowledge_base_name = self.entry.name.clone();
+            result.snapshot_source = Some(snapshot_source_for_result(&bundle, result)?);
+            result.snapshot_trust_required = self.entry.trust_required;
         }
         Ok(results)
     }
@@ -1933,6 +2001,19 @@ impl KbProvider for LocalKb {
     }
 }
 
+fn snapshot_source_for_result(bundle: &KnowledgeBundle, result: &SearchResult) -> Result<String> {
+    bundle
+        .source_documents
+        .get(Path::new(&result.source_path))
+        .cloned()
+        .with_context(|| {
+            format!(
+                "knowledge search result {} references source {} absent from its retained snapshot",
+                result.concept_id, result.source_path
+            )
+        })
+}
+
 #[async_trait]
 impl KbProvider for RemoteKb {
     async fn is_available(&self) -> Result<bool> {
@@ -1944,6 +2025,11 @@ impl KbProvider for RemoteKb {
 
     async fn retrieve(&self, _query: &str, _limit: usize) -> Result<Vec<SearchResult>> {
         // TODO(#136): implement hosted KbProvider retrieval for remote-owned KBs.
+        bail!("remote knowledge-base providers are not implemented")
+    }
+
+    async fn structured_search(&self, _query: &StructuredSearchQuery) -> Result<Vec<SearchResult>> {
+        // TODO(#136): implement hosted structured search for remote-owned KBs.
         bail!("remote knowledge-base providers are not implemented")
     }
 
@@ -2009,6 +2095,7 @@ fn finish_bundle(
     index_md: Option<String>,
     log_md: Option<String>,
     mut concepts: Vec<KnowledgeConcept>,
+    source_documents: BTreeMap<PathBuf, String>,
     markdown_files: usize,
     markdown_bytes: usize,
 ) -> Result<KnowledgeBundle> {
@@ -2021,11 +2108,19 @@ fn finish_bundle(
         markdown_files,
         markdown_bytes,
     )?;
+    let mut source_documents = source_documents;
+    // Structured resource hits cite their retained CSV/JSONL source directly,
+    // just as markdown hits cite their retained concept document. The index is
+    // disposable, so a follow-up read must never reopen the mutable resource.
+    for resource in &resources {
+        source_documents.insert(resource.path.clone(), resource.body.clone());
+    }
     Ok(KnowledgeBundle {
         root,
         index_md,
         log_md,
         concepts,
+        source_documents,
         resources,
     })
 }
@@ -2108,6 +2203,7 @@ fn parse_bundle_snapshot(
 ) -> Result<KnowledgeBundle> {
     let markdown_files = documents.len();
     let markdown_bytes = documents.iter().map(|(_, body)| body.len()).sum();
+    let source_documents = documents.iter().cloned().collect();
     let mut index_md = None;
     let mut log_md = None;
     let mut concepts = Vec::new();
@@ -2128,6 +2224,7 @@ fn parse_bundle_snapshot(
         index_md,
         log_md,
         concepts,
+        source_documents,
         markdown_files,
         markdown_bytes,
     )
@@ -2190,6 +2287,14 @@ fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<Knowledg
             root.join(&rel).display()
         );
     };
+    if let Some(timestamp) = frontmatter.get("timestamp") {
+        normalized_rfc3339_timestamp(timestamp).with_context(|| {
+            format!(
+                "knowledge concept {} has an invalid RFC 3339 `timestamp` frontmatter value",
+                root.join(&rel).display()
+            )
+        })?;
+    }
     let (body, citations) = split_citations(markdown);
     let id = frontmatter
         .get("id")
@@ -2206,6 +2311,19 @@ fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<Knowledg
         body: body.trim().to_string(),
         citations,
     }))
+}
+
+/// Normalize RFC 3339 values before persisting or comparing them. The fixed
+/// nanosecond precision and UTC `Z` offset make SQLite TEXT ordering match
+/// chronological ordering across source offset spellings.
+fn normalized_rfc3339_timestamp(value: &str) -> Result<String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("`{value}` is not an RFC 3339 timestamp"))
+        .map(|timestamp| {
+            timestamp
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        })
 }
 
 fn split_frontmatter(raw: &str) -> Option<(BTreeMap<String, String>, &str)> {
@@ -2662,7 +2780,11 @@ fn rebuild_index(conn: &Connection, bundle: &KnowledgeBundle) -> Result<()> {
                 concept.frontmatter.get("description"),
                 concept.frontmatter.get("resource"),
                 serde_json::to_string(&parse_string_list(concept.frontmatter.get("tags")))?,
-                concept.frontmatter.get("timestamp"),
+                concept
+                    .frontmatter
+                    .get("timestamp")
+                    .map(|timestamp| normalized_rfc3339_timestamp(timestamp))
+                    .transpose()?,
                 serde_json::to_string(&concept.frontmatter)?,
                 concept.body,
                 serde_json::to_string(&concept.citations)?,
@@ -3263,6 +3385,138 @@ fn keyword_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i6
     Ok(out)
 }
 
+fn structured_search_index(
+    conn: &Connection,
+    query: &StructuredSearchQuery,
+) -> Result<Vec<SearchResult>> {
+    let matches_structured_rows = !query.structured_filters.is_empty();
+    let mut sql = if matches_structured_rows {
+        String::from(
+            "SELECT c.id, sr.source_path, sr.row_index, sr.values_json, c.citations_json\n             FROM concepts c\n             JOIN structured_rows sr ON sr.concept_id = c.id\n             WHERE 1 = 1",
+        )
+    } else {
+        String::from(
+            "SELECT c.id, c.path, 0, c.body, c.citations_json\n             FROM concepts c\n             WHERE 1 = 1",
+        )
+    };
+    let mut values = Vec::new();
+
+    if let Some(query) = query.query.as_deref() {
+        let fts = fts_query(query);
+        if !fts.is_empty() {
+            sql.push_str(
+                "\n AND EXISTS (\n    SELECT 1 FROM chunks_fts\n    WHERE chunks_fts.concept_id = c.id AND chunks_fts MATCH ?\n )",
+            );
+            values.push(SqlValue::Text(fts));
+        }
+    }
+    if let Some(concept_type) = query.concept_type.as_deref() {
+        sql.push_str(
+            "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'type' AND cf.value = ?\n )",
+        );
+        values.push(SqlValue::Text(concept_type.to_string()));
+    }
+    if let Some(title) = query.title.as_deref() {
+        sql.push_str(
+            "\n AND EXISTS (\n    SELECT 1 FROM concept_frontmatter cf\n    WHERE cf.concept_id = c.id AND cf.key = 'title' AND cf.value LIKE ? ESCAPE '!'\n )",
+        );
+        values.push(SqlValue::Text(format!("%{}%", escape_like(title))));
+    }
+    for tag in &query.tags {
+        sql.push_str(
+            "\n AND EXISTS (\n    SELECT 1 FROM json_each(c.tags_json) tag\n    WHERE tag.value = ?\n )",
+        );
+        values.push(SqlValue::Text(tag.clone()));
+    }
+    if let Some(timestamp) = &query.timestamp {
+        if let Some(after) = timestamp.after.as_deref() {
+            sql.push_str("\n AND c.timestamp >= ?");
+            values.push(SqlValue::Text(normalized_rfc3339_timestamp(after)?));
+        }
+        if let Some(before) = timestamp.before.as_deref() {
+            sql.push_str("\n AND c.timestamp <= ?");
+            values.push(SqlValue::Text(normalized_rfc3339_timestamp(before)?));
+        }
+    }
+    if matches_structured_rows {
+        for filter in &query.structured_filters {
+            sql.push_str(
+                "\n AND EXISTS (SELECT 1 FROM structured_values sv WHERE sv.row_id = sr.id AND sv.column_name = ? AND ",
+            );
+            values.push(SqlValue::Text(filter.column.clone()));
+            append_structured_value_predicate(&mut sql, &mut values, &filter.equals)?;
+            sql.push(')');
+        }
+    }
+    sql.push_str("\n ORDER BY c.id\n LIMIT ?");
+    values.push(SqlValue::Integer(
+        query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20) as i64,
+    ));
+
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+        let citations_json: String = row.get(4)?;
+        Ok(SearchResult {
+            knowledge_base_id: String::new(),
+            knowledge_base_name: String::new(),
+            concept_id: row.get(0)?,
+            source_path: row.get(1)?,
+            chunk_index: row.get::<_, i64>(2)? as usize,
+            snippet: row.get(3)?,
+            citations: serde_json::from_str(&citations_json).unwrap_or_default(),
+            score: 1.0,
+            matched_structured_row: matches_structured_rows,
+            snapshot_source: None,
+            snapshot_trust_required: false,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn append_structured_value_predicate(
+    sql: &mut String,
+    values: &mut Vec<SqlValue>,
+    value: &JsonValue,
+) -> Result<()> {
+    match value {
+        JsonValue::String(value) => {
+            sql.push_str("sv.value_type = 'text' AND sv.value_text = ?");
+            values.push(SqlValue::Text(value.clone()));
+        }
+        JsonValue::Bool(value) => {
+            sql.push_str("sv.value_type = 'boolean' AND sv.value_boolean = ?");
+            values.push(SqlValue::Integer(if *value { 1 } else { 0 }));
+        }
+        JsonValue::Number(value) if value.is_i64() => {
+            sql.push_str("sv.value_type = 'integer' AND sv.value_integer = ?");
+            values.push(SqlValue::Integer(value.as_i64().expect("checked is_i64")));
+        }
+        JsonValue::Number(value) if value.is_u64() => {
+            let value = i64::try_from(value.as_u64().expect("checked is_u64"))
+                .map_err(|_| anyhow::anyhow!("structured filter integers must fit in i64"))?;
+            sql.push_str("sv.value_type = 'integer' AND sv.value_integer = ?");
+            values.push(SqlValue::Integer(value));
+        }
+        JsonValue::Number(value) => {
+            let value = value
+                .as_f64()
+                .context("structured filter number is not representable as f64")?;
+            sql.push_str("(sv.value_type = 'real' AND sv.value_real = ?)");
+            values.push(SqlValue::Real(value));
+        }
+        _ => bail!("structured filter values must be strings, numbers, or booleans"),
+    }
+    Ok(())
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_")
+}
+
 fn fts_query(query: &str) -> String {
     query
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
@@ -3309,64 +3563,15 @@ fn rrf_merge(
                     snippet: row.get(3)?,
                     citations,
                     score,
+                    matched_structured_row: false,
+                    snapshot_source: None,
+                    snapshot_trust_required: false,
                 })
             },
         )?;
         out.push(result);
     }
     Ok(out)
-}
-
-pub(crate) fn render_injection(
-    results: &[SearchResult],
-    max_tokens: usize,
-    redact: &RedactionTable,
-) -> Option<String> {
-    if results.is_empty() || max_tokens == 0 {
-        return None;
-    }
-    let mut out = String::from("[knowledge]\nRelevant cited memory from attached OKF bundles:\n");
-    for result in results {
-        let citation = citation_label(result);
-        out.push_str("- ");
-        out.push_str(&result.concept_id);
-        out.push_str(" — ");
-        out.push_str(&short_summary(&result.snippet));
-        out.push_str(" [");
-        out.push_str(&citation);
-        out.push_str("]\n");
-        let scrubbed = redact.scrub(&out);
-        if crate::tokens::count(&scrubbed) > max_tokens {
-            out.push_str("- [knowledge truncated by token budget]\n");
-            break;
-        }
-    }
-    let scrubbed = redact.scrub(&out);
-    Some(token_cap(&scrubbed, max_tokens))
-}
-
-pub(crate) fn retrieval_query_from_turn(history: &[Message], prompt: &Message) -> String {
-    let mut parts = history
-        .iter()
-        .rev()
-        .take(6)
-        .filter_map(message_text)
-        .collect::<Vec<_>>();
-    parts.reverse();
-    if let Some(text) = message_text(prompt) {
-        parts.push(text);
-    }
-    parts.join("\n")
-}
-
-fn message_text(message: &Message) -> Option<String> {
-    let text = match message {
-        Message::User { content } => crate::engine::message::extract_user_text(content),
-        Message::Assistant { content, .. } => crate::engine::message::extract_text(content),
-        Message::System { content } => content.clone(),
-    };
-    let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn citation_label(result: &SearchResult) -> String {
@@ -3376,9 +3581,54 @@ fn citation_label(result: &SearchResult) -> String {
         .map(|citation| format!("{}: {}", citation.label, citation.target))
         .unwrap_or_else(|| format!("{}#chunk-{}", result.source_path, result.chunk_index));
     format!(
-        "{} (knowledge base: {} / {})",
-        citation, result.knowledge_base_name, result.knowledge_base_id
+        "{}; source: {} (knowledge base: {} / {})",
+        citation, result.source_path, result.knowledge_base_name, result.knowledge_base_id
     )
+}
+
+fn retain_search_result_sources(results: &mut [SearchResult], session: &Session) -> Result<()> {
+    for result in results {
+        let contents = result.snapshot_source.take().with_context(|| {
+            format!(
+                "knowledge search result {} has no retained source bytes for a follow-up read",
+                result.concept_id
+            )
+        })?;
+        let snapshot_id =
+            session.retain_knowledge_read_snapshot(contents, result.snapshot_trust_required)?;
+        result.source_path = format!("{KNOWLEDGE_SNAPSHOT_READ_PREFIX}{snapshot_id}");
+    }
+    Ok(())
+}
+
+pub(crate) fn is_knowledge_snapshot_read_path(path: &str) -> bool {
+    path.starts_with(KNOWLEDGE_SNAPSHOT_READ_PREFIX)
+}
+
+pub(crate) async fn read_knowledge_snapshot(
+    args: &serde_json::Value,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_input("`path` is required"))?;
+    let snapshot_id = path
+        .strip_prefix(KNOWLEDGE_SNAPSHOT_READ_PREFIX)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or_else(|| invalid_input("invalid cited knowledge snapshot path"))?;
+    let Some(snapshot) = ctx.session.knowledge_read_snapshot(snapshot_id) else {
+        return Ok(ToolOutput::text(
+            "Error: this cited knowledge snapshot is unavailable; rerun semantic_search or structured_search before using it.",
+        ));
+    };
+    if snapshot.trust_required && !ctx.knowledge_access_trusted {
+        return Err(invalid_input(
+            "access denied: this cited knowledge snapshot requires a trusted model",
+        ));
+    }
+    crate::tools::read::read_snapshot_contents(args, ctx, path, snapshot.contents.as_bytes()).await
 }
 
 fn short_summary(snippet: &str) -> String {
@@ -3387,91 +3637,6 @@ fn short_summary(snippet: &str) -> String {
         cleaned
     } else {
         format!("{}…", cleaned.chars().take(240).collect::<String>())
-    }
-}
-
-fn token_cap(body: &str, max_tokens: usize) -> String {
-    if crate::tokens::count(body) <= max_tokens {
-        return body.to_string();
-    }
-    let mut out = String::new();
-    for word in body.split_whitespace() {
-        let candidate = if out.is_empty() {
-            word.to_string()
-        } else {
-            format!("{out} {word}")
-        };
-        if crate::tokens::count(&candidate) > max_tokens.saturating_sub(8) {
-            break;
-        }
-        out = candidate;
-    }
-    out.push_str(" [knowledge truncated]");
-    out
-}
-
-pub(crate) async fn inject_knowledge_for_turn(
-    history: &mut Vec<Message>,
-    session: &Session,
-    cwd: &Path,
-    definition: Option<&crate::agents::AgentDef>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-    query: &str,
-    redact: Arc<RedactionTable>,
-    executing_model_trusted: bool,
-) {
-    let extended = config.extended();
-    let providers = config.providers();
-    if let Err(error) = validate_dream_models(&extended, &providers) {
-        tracing::warn!(%error, "refusing knowledge injection because dream-model policy is invalid");
-        return;
-    }
-    let attachments = match attached_bundles(
-        session,
-        cwd,
-        definition.and_then(crate::agents::AgentDef::allowed_knowledge_bases),
-        &extended,
-        executing_model_trusted,
-    )
-    .await
-    {
-        Ok(bundles) => bundles,
-        Err(error) => {
-            tracing::warn!(%error, "refusing knowledge injection because knowledge attachment resolution failed");
-            return;
-        }
-    };
-    if attachments.bundles.is_empty() {
-        return;
-    }
-    match production_embedder(&extended, config, redact.clone(), session).await {
-        Ok(Some(embedder)) => {
-            match retrieve_from_knowledge_bases(
-                &attachments.bundles,
-                embedder,
-                query,
-                DEFAULT_SEARCH_LIMIT,
-                Some(&crate::sealed::LocalVaultResolver::new(
-                    session.secret_vault().clone(),
-                )),
-                executing_model_trusted,
-            )
-            .await
-            {
-                Ok(results) => {
-                    if let Some(block) =
-                        render_injection(&results, extended.knowledge_inject_max_tokens, &redact)
-                    {
-                        history.push(Message::user(block));
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "knowledge retrieval failed"),
-            }
-        }
-        Ok(None) => {
-            tracing::debug!("knowledge bundle attached but no embedding_model is configured")
-        }
-        Err(error) => tracing::warn!(%error, "building knowledge embedder failed"),
     }
 }
 
@@ -3554,6 +3719,51 @@ async fn retrieve_from_knowledge_bases(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     all.truncate(limit);
+    Ok(all)
+}
+
+async fn retrieve_structured_from_knowledge_bases(
+    knowledge_bases: &[AttachedKnowledgeBase],
+    query: &StructuredSearchQuery,
+    resolver: Option<&dyn crate::sealed::SealedResolver>,
+    trusted_reader: bool,
+) -> Result<Vec<SearchResult>> {
+    let mut all = Vec::new();
+    for knowledge_base in knowledge_bases {
+        match knowledge_base.provider.is_available().await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    knowledge_base = %knowledge_base.entry.id,
+                    "skipping unavailable knowledge provider"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "checking availability of knowledge base `{}`",
+                        knowledge_base.entry.id
+                    )
+                });
+            }
+        }
+        let mut results = knowledge_base.provider.structured_search(query).await?;
+        if let Some(resolver) = resolver {
+            for result in &mut results {
+                result.snippet = crate::sealed::resolve_kb_markdown(
+                    &result.snippet,
+                    &knowledge_base.sealed_id,
+                    resolver,
+                    trusted_reader,
+                )
+                .await?;
+            }
+        }
+        all.extend(results);
+    }
+    all.sort_by(|a, b| a.concept_id.cmp(&b.concept_id));
+    all.truncate(query.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20));
     Ok(all)
 }
 
@@ -4186,47 +4396,326 @@ fn validate_dream_models(
     )
 }
 
-/// Return canonical local KB roots withheld from this model. The result is
-/// shared by native-path and shell confinement gates so trust-required source
-/// Markdown cannot be reached through an ordinary filesystem surface.
-pub(crate) fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
-    denied_local_knowledge_roots_for_model(
+#[derive(Debug)]
+struct ResolvedLocalKnowledgeBase {
+    id: String,
+    root: PathBuf,
+    trust_required: bool,
+    /// A duplicate registry label has no single retrieval authority. Keep
+    /// every affected root in the filesystem policy, but never let a label
+    /// grant access to any of them.
+    registry_id_conflicted: bool,
+    /// The source identity could not be validated. Its known daemon-owned
+    /// root remains fenced, but it cannot grant any read capability.
+    policy_denied: bool,
+}
+
+/// Resolve the local portion of the effective registry for a native tool
+/// frame. Remote knowledge bases intentionally contribute no filesystem
+/// capability: they remain available only through retrieval tools.
+async fn resolved_local_knowledge_bases(ctx: &ToolCtx) -> Result<Vec<ResolvedLocalKnowledgeBase>> {
+    Ok(effective_local_knowledge_bases(&ctx.session, &ctx.cwd, &ctx.config.extended()).await)
+}
+
+/// Resolve every local KB root that can currently contribute to a native or
+/// shell filesystem policy. This deliberately shares the live assistant
+/// registry with native reads: assistant KBs are not merely retrieval inputs.
+/// If resolving an assistant snapshot fails, retain its daemon-owned knowledge
+/// root as a conservative denied policy entry. That preserves the filesystem
+/// fence without making unrelated workspace paths fail merely because the
+/// assistant registry is temporarily unavailable.
+async fn effective_local_knowledge_bases(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Vec<ResolvedLocalKnowledgeBase> {
+    let mut registry = Vec::with_capacity(extended.knowledge_bases.len() + 1);
+    match assistant_knowledge_registry_entry(session).await {
+        Ok(Some(assistant)) => registry.push((assistant.entry, false)),
+        Ok(None) => {}
+        Err(error) => match conservative_assistant_knowledge_policy_entry(session) {
+            Ok(assistant) => {
+                tracing::warn!(%error, "retaining unavailable assistant knowledge source as a denied filesystem policy entry");
+                registry.push((assistant, true));
+            }
+            Err(fallback_error) => tracing::warn!(
+                %error,
+                %fallback_error,
+                "assistant knowledge source is unavailable and its conservative filesystem policy root could not be derived"
+            ),
+        },
+    }
+    registry.extend(
+        extended
+            .knowledge_bases
+            .iter()
+            .cloned()
+            .map(|entry| (entry, false)),
+    );
+
+    // IDs name retrieval authorities across the complete effective registry,
+    // not merely its local subset. A remote entry sharing an assistant or
+    // configured local entry's ID makes that label ambiguous, so the local
+    // root must remain a denied fence rather than inheriting native access.
+    let duplicate_ids: BTreeSet<_> = registry
+        .iter()
+        .map(|(entry, _)| entry.id.as_str())
+        .fold(BTreeMap::new(), |mut counts, id| {
+            *counts.entry(id).or_insert(0_usize) += 1;
+            counts
+        })
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id.to_owned()))
+        .collect();
+    if !duplicate_ids.is_empty() {
+        tracing::warn!(ids = ?duplicate_ids, "denying duplicate knowledge-base registry IDs in filesystem policy");
+    }
+
+    let mut local = Vec::new();
+    for (entry, policy_denied) in registry {
+        let KnowledgeBaseSource::Local { path } = entry.source else {
+            continue;
+        };
+        let registry_id_conflicted = duplicate_ids.contains(&entry.id);
+        let root = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        // Keep a dangling source's lexical root fenced. A source that cannot
+        // be resolved cannot grant filesystem authority, but neither can a
+        // later shell write turn that spelling into an unfenced target.
+        let root = crate::tools::sandbox::effective_native_path(&root).unwrap_or(root);
+        local.push(ResolvedLocalKnowledgeBase {
+            id: entry.id,
+            root,
+            trust_required: entry.trust_required,
+            registry_id_conflicted,
+            policy_denied,
+        });
+    }
+    local
+}
+
+/// Fall back to the assistant's daemon-owned home when a live assistant
+/// snapshot cannot be acquired. The caller records it as policy-denied, so it
+/// can only shrink native capabilities even for a broad allowlist or trusted
+/// executor.
+fn conservative_assistant_knowledge_policy_entry(
+    session: &Session,
+) -> Result<KnowledgeBaseRegistryEntry> {
+    let name = session
+        .assistant_name
+        .as_deref()
+        .context("session has no assistant knowledge source")?;
+    crate::assistants::validate_assistant_name(name)?;
+    let root = crate::assistants::default_home_dir(name)?.join("knowledge");
+    Ok(KnowledgeBaseRegistryEntry::new(
+        format!("assistant-policy-unavailable-{name}"),
+        "Unavailable assistant knowledge".to_string(),
+        "Assistant knowledge source could not be validated.".to_string(),
+        KnowledgeBaseSource::Local { path: root },
+        KnowledgeBaseEmbeddingOwnership::Local,
+        None,
+        None,
+        false,
+        KnowledgeBaseMergePolicy::Auto,
+    ))
+}
+
+fn native_knowledge_base_permitted(
+    ctx: &ToolCtx,
+    knowledge_base: &ResolvedLocalKnowledgeBase,
+) -> bool {
+    native_knowledge_base_permitted_for_model(
+        knowledge_base,
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
+    )
+}
+
+fn native_knowledge_base_permitted_for_model(
+    knowledge_base: &ResolvedLocalKnowledgeBase,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
+) -> bool {
+    !knowledge_base.policy_denied
+        && !knowledge_base.registry_id_conflicted
+        && !allowed_knowledge_bases.is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        && (!knowledge_base.trust_required || executing_model_trusted)
+}
+
+/// Return the registry-resolved local roots that the calling agent may read.
+/// This is intentionally a read-only capability: native writes continue
+/// through the ordinary path-approval and write gates.
+pub(crate) async fn attached_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    attached_local_knowledge_roots_for_model(
+        &ctx.session,
         &ctx.cwd,
         &ctx.config.extended(),
-        ctx.knowledge_access_trusted,
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
     )
+    .await
+}
+
+/// Return registry-resolved local roots that are native read capabilities for
+/// a model without requiring a full tool context. Driver-owned execution
+/// paths use this before a [`ToolCtx`] exists so their shell sandbox has the
+/// same read authority as the native tools.
+pub(crate) async fn attached_local_knowledge_roots_for_model(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        if !native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
+            continue;
+        }
+        if !roots.iter().any(|root| root == &knowledge_base.root) {
+            roots.push(knowledge_base.root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Return every registry-resolved local root that is not a native read
+/// capability for this frame. Recursive native tools use this to keep a walk
+/// rooted in the workspace from crossing into a nested, withheld KB.
+pub(crate) async fn denied_native_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if !native_knowledge_base_permitted(ctx, &knowledge_base)
+            && !roots.iter().any(|root| root == &knowledge_base.root)
+        {
+            roots.push(knowledge_base.root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Validate a native path that falls under a configured local KB. Returns
+/// whether the path is in an attached local KB so the native sandbox can add
+/// that root to its implicit read set. A configured but non-attached KB is a
+/// hard refusal and therefore cannot be reached through a path approval.
+pub(crate) async fn check_native_local_knowledge_path_access(
+    ctx: &ToolCtx,
+    path: &Path,
+) -> Result<bool> {
+    let mut attached = false;
+    for knowledge_base in resolved_local_knowledge_bases(ctx).await? {
+        if !cockpit_host::path_containment::contained_under(&knowledge_base.root, path) {
+            continue;
+        }
+        if knowledge_base.policy_denied {
+            bail!(
+                "access denied: `{}` is in an assistant knowledge base whose source could not be validated",
+                path.display()
+            );
+        }
+        if knowledge_base.registry_id_conflicted {
+            bail!(
+                "access denied: `{}` is in a local knowledge base with a duplicate registry ID",
+                path.display()
+            );
+        }
+        if ctx
+            .allowed_knowledge_bases
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&knowledge_base.id))
+        {
+            bail!(
+                "access denied: `{}` is in local knowledge base `{}` which is not attached to this agent",
+                path.display(),
+                knowledge_base.id
+            );
+        }
+        if knowledge_base.trust_required && !ctx.executing_model_trusted {
+            bail!(
+                "access denied: `{}` is in a local knowledge base that requires a trusted model",
+                path.display()
+            );
+        }
+        // Overlapping KB roots are an intersection of capabilities. A later
+        // containing root may be restricted even when an earlier one is not.
+        attached = true;
+    }
+    Ok(attached)
+}
+
+/// Return local KB roots withheld from this native/shell frame. The result is
+/// shared by opaque-host and shell confinement gates so a source that is not
+/// attached to this agent (or requires a trusted executor) cannot be reached
+/// through an ordinary filesystem surface.
+pub(crate) async fn denied_local_knowledge_roots(ctx: &ToolCtx) -> Result<Vec<PathBuf>> {
+    denied_local_knowledge_roots_for_model(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+        ctx.allowed_knowledge_bases.as_ref(),
+        ctx.executing_model_trusted,
+    )
+    .await
+}
+
+/// Return every configured local KB root. Shell execution uses this separate
+/// write fence: an attached source may be readable there, but generic shell
+/// writes must never mutate a KB outside the dream/human-owned paths.
+pub(crate) async fn configured_local_knowledge_roots(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        let root = knowledge_base.root;
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Whether an opaque host process must be denied because a configured local
+/// knowledge base is present. An attached KB grants bounded read access; it
+/// never grants an ambient process authority to write that source.
+pub(crate) async fn local_knowledge_write_fence_active(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> bool {
+    !configured_local_knowledge_roots(session, cwd, extended)
+        .await
+        .is_empty()
 }
 
 /// Return canonical local KB roots withheld from a model without requiring a
 /// full tool context. Driver-owned execution paths (for example scheduled
 /// shell jobs) use this before a [`ToolCtx`] exists.
-pub(crate) fn denied_local_knowledge_roots_for_model(
+pub(crate) async fn denied_local_knowledge_roots_for_model(
+    session: &Session,
     cwd: &Path,
     extended: &ExtendedConfig,
-    knowledge_access_trusted: bool,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    executing_model_trusted: bool,
 ) -> Result<Vec<PathBuf>> {
-    if knowledge_access_trusted {
-        return Ok(Vec::new());
-    }
     let mut roots = Vec::new();
-    for entry in &extended.knowledge_bases {
-        if !entry.trust_required {
+    for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
+        if native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
             continue;
         }
-        let KnowledgeBaseSource::Local { path } = &entry.source else {
-            continue;
-        };
-        let root = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
-        let root = crate::tools::sandbox::effective_native_path(&root).map_err(|error| {
-            anyhow::anyhow!(
-                "cannot resolve trust-required knowledge base `{}` source: {error}",
-                entry.id
-            )
-        })?;
+        let root = knowledge_base.root;
         if !roots.iter().any(|existing| existing == &root) {
             roots.push(root);
         }
@@ -4235,8 +4724,8 @@ pub(crate) fn denied_local_knowledge_roots_for_model(
 }
 
 /// Reject a direct native filesystem operation on a protected KB source.
-pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> Result<()> {
-    for root in denied_local_knowledge_roots(ctx)? {
+pub(crate) async fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> Result<()> {
+    for root in denied_local_knowledge_roots(ctx).await? {
         if cockpit_host::path_containment::contained_under(&root, path) {
             bail!(
                 "access denied: `{}` is in a local knowledge base that requires a trusted model",
@@ -4251,7 +4740,10 @@ pub(crate) fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> 
 /// media authority opens its held descriptor. Media path sources are always
 /// relative to the session project root; unlike ordinary native tools, they do
 /// not pass through `check_native_access`.
-pub(crate) fn ensure_local_knowledge_media_path_access(ctx: &ToolCtx, path: &str) -> Result<()> {
+pub(crate) async fn ensure_local_knowledge_media_path_access(
+    ctx: &ToolCtx,
+    path: &str,
+) -> Result<()> {
     let path = Path::new(path);
     // Match the local media authority's lexical policy. It rejects absolute,
     // dot, and parent components itself, so leave those invalid spellings to
@@ -4269,30 +4761,35 @@ pub(crate) fn ensure_local_knowledge_media_path_access(ctx: &ToolCtx, path: &str
             path.display()
         )
     })?;
-    ensure_local_knowledge_path_access(ctx, &effective)
+    ensure_local_knowledge_path_access(ctx, &effective).await
 }
 
 /// Workspace-wide inspection and opaque host-proxy tools cannot safely prove
 /// which files a model-authored request will touch before it executes. Deny
-/// their entire operation whenever that root contains a trust-required local
-/// KB. Targeted native tools use [`ensure_local_knowledge_path_access`]
-/// instead.
-pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
+/// their entire operation whenever a local KB root is withheld from the
+/// model. Native `glob` and `grep` prove their requested root and filter each
+/// discovered entry, so they remain available to browse attached roots.
+///
+/// A smaller set of opaque host tools can mutate through an ambient process
+/// even when their own Cockpit-facing interface is advisory or read-only.
+/// Those tools are unavailable whenever *any* local KB is attached: attached
+/// KBs are a read-only capability, not an ambient host write capability.
+pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
     const UNBOUNDED_HOST_ACCESS_TOOLS: &[&str] = &[
         "code",
         "context_pack",
         "change_impact",
         "circular",
         "deps",
-        "glob",
         "graph",
-        "grep",
         "hot",
         "harness_invoke",
+        "harness_list",
         // An MCP script can invoke any configured third-party server. The
         // server's runtime capability is not knowable from the outer script,
-        // so this is an opaque host-filesystem proxy just like a workspace
-        // walker when a local KB requires a trusted model.
+        // so this is an opaque host-filesystem proxy. The dedicated MCP gate
+        // below additionally fences every configured local KB, including
+        // attached sources that are readable through native tools.
         "mcp",
         "search",
         "symbol_find",
@@ -4300,8 +4797,22 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
         "word",
         "worktree_orchestrate",
     ];
+    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &[
+        "harness_invoke",
+        "harness_list",
+        "lsp",
+        "worktree_orchestrate",
+    ];
+
+    if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
+        && local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
+    {
+        bail!(
+            "access denied: `{tool_name}` is unavailable because attached local knowledge bases are read-only"
+        );
+    }
     if UNBOUNDED_HOST_ACCESS_TOOLS.contains(&tool_name)
-        && !denied_local_knowledge_roots(ctx)?.is_empty()
+        && !denied_local_knowledge_roots(ctx).await?.is_empty()
     {
         bail!(
             "access denied: `{tool_name}` cannot inspect this workspace because it contains a local knowledge base that requires a trusted model"
@@ -4310,17 +4821,38 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
     Ok(())
 }
 
-/// Reject MCP server access for an untrusted model when a configured local KB
-/// requires a trusted model. A configured server is arbitrary host code: its
-/// initialization, discovery, and tool calls can all inspect the filesystem,
-/// so this must fence the connection boundary rather than only named tools.
-pub(crate) fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
-    if denied_local_knowledge_roots(ctx)?.is_empty() {
+/// Reject MCP server access whenever a local KB is configured. A configured
+/// server is arbitrary host code and an opaque tool call cannot prove that it
+/// will not mutate an attached KB, so this fences the connection boundary
+/// rather than only trust-withheld roots or named tools.
+pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    if configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
+        .await
+        .is_empty()
+    {
         return Ok(());
     }
     bail!(
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base that requires a trusted model"
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
     );
+}
+
+/// Synchronous conservative subset used while constructing an MCP connection
+/// context. An assistant session itself is sufficient to deny: its
+/// daemon-owned KB root remains fenced even if its live snapshot is currently
+/// unavailable. The async dispatcher adds the exact assistant root before any
+/// host process is reached.
+pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String> {
+    let fenced = ctx.session.assistant_name.is_some()
+        || ctx
+            .config
+            .extended()
+            .knowledge_bases
+            .iter()
+            .any(|entry| matches!(&entry.source, KnowledgeBaseSource::Local { .. }));
+    fenced.then(|| {
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence".to_string()
+    })
 }
 
 /// Resolve a workspace-local KB to the filesystem object that owns it.
@@ -4653,44 +5185,29 @@ fn provider_for(
     }
 }
 
-pub(crate) async fn with_memory_search_if_attached(
+pub(crate) fn with_knowledge_search_tools(
     toolbox: crate::engine::tool::ToolBox,
-    session: &Session,
-    cwd: &Path,
     definition: Option<&crate::agents::AgentDef>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
     executing_model: &str,
-    executing_model_trusted: bool,
 ) -> crate::engine::tool::ToolBox {
     let allowed_knowledge_bases = definition
         .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
         .cloned();
     // Keep the search schema present for the whole agent lifetime. Attachment
-    // state is deliberately resolved in `MemorySearchTool::call`, where an
+    // state is deliberately resolved in each search tool's `call`, where an
     // absent bundle produces the normal content-free availability result
     // instead of churning the provider's cacheable tools array.
-    let toolbox = toolbox.with(Arc::new(MemorySearchTool {
-        allowed_knowledge_bases: allowed_knowledge_bases.clone(),
-    }));
-    let extended = config.extended();
-    let dream_writes_enabled = attached_bundles(
-        session,
-        cwd,
-        allowed_knowledge_bases.as_ref(),
-        &extended,
-        executing_model_trusted,
-    )
-    .await
-    .is_ok_and(|bundles| {
-        bundles.bundles.iter().any(|knowledge_base| {
-            knowledge_base.entry.dream_model.as_deref() == Some(executing_model)
-                && matches!(
-                    &knowledge_base.entry.source,
-                    KnowledgeBaseSource::Local { .. }
-                )
-        })
-    });
-    if dream_writes_enabled && definition.is_some_and(|definition| definition.name == "Dream") {
+    let toolbox = toolbox
+        .with(Arc::new(SemanticSearchTool::new(
+            allowed_knowledge_bases.clone(),
+        )))
+        .with(Arc::new(StructuredSearchTool::new(
+            allowed_knowledge_bases.clone(),
+        )));
+    // Dream's governed write tools are also cache-stable. Their attachment,
+    // trust, source-kind, and executing-model checks belong at call time, so
+    // changing an attached KB cannot change a provider-visible tool array.
+    if definition.is_some_and(|definition| definition.name == "Dream") {
         toolbox
             .with(Arc::new(KnowledgeDreamApplyTool {
                 allowed_knowledge_bases: allowed_knowledge_bases.clone(),
@@ -4702,8 +5219,6 @@ pub(crate) async fn with_memory_search_if_attached(
             }))
     } else {
         toolbox
-            .without(KNOWLEDGE_DREAM_SOURCES_TOOL_NAME)
-            .without(KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
     }
 }
 
@@ -4717,15 +5232,38 @@ fn knowledge_access_denied_message(knowledge_base_ids: &[String]) -> String {
 /// A turn-toolbox instance binds the executing agent definition's KB
 /// restriction.  The tool can therefore refresh workspace configuration at
 /// call time without re-resolving a mutable, same-named agent definition.
-pub(crate) struct MemorySearchTool {
+pub(crate) struct SemanticSearchTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+impl SemanticSearchTool {
+    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            allowed_knowledge_bases,
+        }
+    }
+}
+
+/// Search the disposable OKF index using FTS, frontmatter, and structured-row
+/// predicates. Like semantic search, the schema is always advertised and the
+/// attached KB set is resolved only when the tool is called.
+pub(crate) struct StructuredSearchTool {
+    allowed_knowledge_bases: Option<BTreeSet<String>>,
+}
+
+impl StructuredSearchTool {
+    pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            allowed_knowledge_bases,
+        }
+    }
 }
 
 /// The production model-facing dream executor.  It accepts a complete,
 /// validated OKF projection rather than a filesystem path, and invokes the
 /// registered-provider boundary so local writes always pass through the Git
-/// transaction/fence.  It is advertised only for attached local KBs that
-/// configure the model executing this turn.
+/// transaction/fence. Its availability is resolved at call time to keep the
+/// provider-visible Dream tool array cache-stable.
 pub(crate) struct KnowledgeDreamApplyTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
     executing_model: String,
@@ -4955,208 +5493,6 @@ impl Tool for KnowledgeDreamApplyTool {
             ctx.knowledge_access_trusted,
         )
         .await?;
-        /* Retrieval implementation is defined below beside the stable memory search surface.
-                        if bundles.is_empty() {
-                            return Ok(ToolOutput::text(
-                                "No attached knowledge bundles are available; no fresh-session subset was searched.",
-                            ));
-                        }
-
-                        let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
-                        let results =
-                            match production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session)
-                                .await?
-                            {
-                                Some(embedder) => {
-                                    retrieve_from_knowledge_bases(&bundles, embedder, &args.query, limit).await?
-                                }
-                                None => Vec::new(),
-                            };
-                        let freshness = retrieve_undreamed_session_hits(&bundles, &args.query, limit, ctx).await?;
-                        Ok(ToolOutput::text(render_knowledge_retrieval(
-                            &results,
-                            &freshness,
-                            ctx.redact.as_ref(),
-                        )))
-                    }
-                }
-
-        struct FreshSessionRetrieval {
-                    hits: Vec<crate::db::session_search::SearchHit>,
-                    boundary_knowledge_bases: Vec<String>,
-                    oldest_boundary_session_event_seq: Option<i64>,
-                    missing_boundary_knowledge_bases: Vec<String>,
-                }
-
-                async fn retrieve_undreamed_session_hits(
-                    bundles: &[AttachedKnowledgeBase],
-                    query: &str,
-                    limit: usize,
-                    ctx: &ToolCtx,
-                ) -> Result<FreshSessionRetrieval> {
-                    let project_uuid = ctx
-                        .session
-                        .db
-                        .authoritative_project_uuid(&ctx.session.project_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
-                    let mut boundary_knowledge_bases = Vec::new();
-                    let mut missing_boundary_knowledge_bases = Vec::new();
-                    let mut oldest_boundary_session_event_seq = None;
-                    for bundle in bundles {
-                        match ctx
-                            .session
-                            .db
-                            .knowledge_dream_boundary(crate::db::knowledge_dreams::KnowledgeDreamLedgerKey {
-                                project_uuid,
-                                knowledge_base_attachment_id: bundle.entry.attachment_id(),
-                            })
-                            .await?
-                        {
-                            Some(boundary) => {
-                                boundary_knowledge_bases.push(bundle.entry.id.clone());
-                                oldest_boundary_session_event_seq = Some(
-                                    oldest_boundary_session_event_seq
-                                        .map(|oldest: i64| oldest.min(boundary.last_dreamed_session_event_seq))
-                                        .unwrap_or(boundary.last_dreamed_session_event_seq),
-                                );
-                            }
-                            None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
-                        }
-                    }
-
-                    // A missing ordering boundary is not evidence that history has been dreamed. On
-                    // first use (and whenever any attached KB lacks a ledger row), search the
-                    // project's matching session history conservatively instead of silently
-                    // returning no fresh results. Once every attached KB has a boundary, the
-                    // oldest exact event boundary safely bounds the shared candidate set.
-                    let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
-                        match oldest_boundary_session_event_seq {
-                            // The DB predicate is strictly greater than this durable global
-                            // event sequence. A later commit receives a greater sequence even
-                            // when it shares the dream snapshot's millisecond timestamp.
-                            Some(boundary) => (Some(boundary), true),
-                            None => (None, false),
-                        }
-                    } else {
-                        (None, true)
-                    };
-                    let hits = if search_enabled {
-                        let pool = limit.saturating_mul(3).clamp(limit, 60) as u32;
-                        let caller_trust = crate::tools::session_search::caller_history_trust(ctx);
-                        let hits = match after_session_event_seq {
-                            Some(boundary) => {
-                                ctx.session
-                                    .db
-                                    .search_candidates_after_session_event_seq_for_trust(
-                                        query,
-                                        Some(ctx.session.project_id.as_str()),
-                                        None,
-                                        boundary,
-                                        pool,
-                                        caller_trust,
-                                    )
-                                    .await?
-                            }
-                            None => {
-                                ctx.session
-                                    .db
-                                    .search_candidates_for_trust(
-                                        query,
-                                        Some(ctx.session.project_id.as_str()),
-                                        None,
-                                        None,
-                                        pool,
-                                        caller_trust,
-                                    )
-                                    .await?
-                            }
-                        };
-                        hits.into_iter().take(limit).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(FreshSessionRetrieval {
-                        hits,
-                        boundary_knowledge_bases,
-                        oldest_boundary_session_event_seq,
-                        missing_boundary_knowledge_bases,
-                    })
-                }
-
-                fn render_knowledge_retrieval(
-                    results: &[SearchResult],
-                    freshness: &FreshSessionRetrieval,
-                    redact: &RedactionTable,
-                ) -> String {
-                    let mut out = String::from("knowledge_retrieve results:\n");
-                    if results.is_empty() {
-                        out.push_str(
-                            "- No matching knowledge-base entries (or no embedding model is configured).\n",
-                        );
-                    } else {
-                        out.push_str("Knowledge-base citations:\n");
-                        for result in results {
-                            out.push_str("- ");
-                            out.push_str(&result.concept_id);
-                            out.push_str(" — ");
-                            out.push_str(&short_summary(&result.snippet));
-                            out.push_str(" [");
-                            out.push_str(&citation_label(result));
-                            out.push_str("]\n");
-                        }
-                    }
-
-                    if !freshness.missing_boundary_knowledge_bases.is_empty() {
-                        out.push_str(
-                            "Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
-                        );
-                        render_fresh_session_hits(&mut out, &freshness.hits);
-                    } else {
-                        match freshness.oldest_boundary_session_event_seq {
-                            Some(boundary) => {
-                                out.push_str(
-                                    "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence ",
-                                );
-                                out.push_str(&boundary.to_string());
-                                out.push_str(" for KB(s) ");
-                                out.push_str(&freshness.boundary_knowledge_bases.join(", "));
-                                out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
-                                render_fresh_session_hits(&mut out, &freshness.hits);
-                            }
-                            None => out.push_str(
-                                "Fresh-session staleness check: no eligible fresh-session boundary is available.\n",
-                            ),
-                        }
-                    }
-                    if !freshness.missing_boundary_knowledge_bases.is_empty() {
-                        out.push_str("KB(s) without a dream ordering boundary: ");
-                        out.push_str(&freshness.missing_boundary_knowledge_bases.join(", "));
-                        out.push_str(".\n");
-                    }
-                    redact.scrub(&out)
-                }
-
-                fn render_fresh_session_hits(out: &mut String, hits: &[crate::db::session_search::SearchHit]) {
-                    if hits.is_empty() {
-                        out.push_str("- No matching undreamed-session updates.\n");
-                    } else {
-                        out.push_str("Undreamed-session citations:\n");
-                        for hit in hits {
-                            let fallback_reference = hit.session_id.to_string();
-                            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
-                            out.push_str("- session ");
-                            out.push_str(reference);
-                            out.push_str(" — ");
-                            out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
-                            out.push_str(" — ");
-                            out.push_str(&short_summary(&hit.snippet));
-                            out.push_str(" [session ref: ");
-                            out.push_str(&hit.session_id.to_string());
-                            out.push_str("]\n");
-                        }
-            }
-        */
         let knowledge_base = bundles
             .bundles
             .iter()
@@ -5481,14 +5817,22 @@ fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutp
     ToolOutput::text(text)
 }
 
-/// Read-only retrieval surface used by the built-in `knowledge` specialist.
-/// It combines cited KB matches with a bounded view of sessions that may have
-/// advanced since the shared dream boundary.
-pub(crate) struct KnowledgeRetrieveTool {
+#[derive(Debug, Deserialize)]
+struct SemanticSearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// The `knowledge` specialist's history-search surface.  This keeps the KB
+/// retrieval primitives focused on KB content while restoring the bounded
+/// session freshness check that makes its synthesis equivalent to the former
+/// composite retrieval tool.
+pub(crate) struct FreshKnowledgeHistorySearchTool {
     allowed_knowledge_bases: Option<BTreeSet<String>>,
 }
 
-impl KnowledgeRetrieveTool {
+impl FreshKnowledgeHistorySearchTool {
     pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
         Self {
             allowed_knowledge_bases,
@@ -5497,18 +5841,18 @@ impl KnowledgeRetrieveTool {
 }
 
 #[async_trait]
-impl Tool for KnowledgeRetrieveTool {
+impl Tool for FreshKnowledgeHistorySearchTool {
     fn name(&self) -> &str {
-        KNOWLEDGE_RETRIEVE_TOOL_NAME
+        "history_search"
     }
 
     fn description(&self) -> &str {
-        "retrieve cited knowledge-base results and bounded undreamed-session updates"
+        "search bounded, trust-filtered session updates that may be newer than attached knowledge bases"
     }
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search attached knowledge bases through their configured providers and return cited results plus a bounded, trust-filtered view of sessions newer than the recorded dream boundary."
+            "Search this project's matching sessions after the oldest relevant attached-KB dream boundary. If any attached KB has no boundary, search conservatively because no session history can yet be proven dreamed. Results are bounded, trust-filtered session citations."
                 .to_string(),
         )
     }
@@ -5521,8 +5865,8 @@ impl Tool for KnowledgeRetrieveTool {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "retrieval query" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum cited results from each source" }
+                "query": { "type": "string", "description": "session-history search query" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum fresh-session citations" }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -5530,9 +5874,9 @@ impl Tool for KnowledgeRetrieveTool {
     }
 
     async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let args: MemorySearchArgs = typed_args(args)?;
+        let args: SemanticSearchArgs = typed_args(args)?;
         if args.query.trim().is_empty() {
-            return Err(invalid_input("knowledge_retrieve query must not be empty"));
+            return Err(invalid_input("history_search query must not be empty"));
         }
         let extended = ctx.config.extended();
         let providers = ctx.config.providers();
@@ -5555,31 +5899,10 @@ impl Tool for KnowledgeRetrieveTool {
                 "No attached knowledge bundles are available; no fresh-session subset was searched.",
             ));
         }
-
         let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
-        let results =
-            match production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session)
-                .await?
-            {
-                Some(embedder) => {
-                    retrieve_from_knowledge_bases(
-                        &bundles.bundles,
-                        embedder,
-                        &args.query,
-                        limit,
-                        Some(&crate::sealed::LocalVaultResolver::new(
-                            ctx.session.secret_vault().clone(),
-                        )),
-                        ctx.knowledge_access_trusted,
-                    )
-                    .await?
-                }
-                None => Vec::new(),
-            };
         let freshness =
             retrieve_undreamed_session_hits(&bundles.bundles, &args.query, limit, ctx).await?;
-        Ok(ToolOutput::text(render_knowledge_retrieval(
-            &results,
+        Ok(ToolOutput::text(render_fresh_session_retrieval(
             &freshness,
             ctx.redact.as_ref(),
         )))
@@ -5629,6 +5952,11 @@ async fn retrieve_undreamed_session_hits(
             None => missing_boundary_knowledge_bases.push(bundle.entry.id.clone()),
         }
     }
+
+    // A missing ordering boundary is not evidence that history has been
+    // dreamed. Search conservatively until every attached KB provides the
+    // durable event-sequence boundary; after that, the oldest boundary bounds
+    // the shared candidate set without timestamp ambiguity.
     let (after_session_event_seq, search_enabled) = if missing_boundary_knowledge_bases.is_empty() {
         match oldest_boundary_session_event_seq {
             Some(boundary) => (Some(boundary), true),
@@ -5680,33 +6008,23 @@ async fn retrieve_undreamed_session_hits(
     })
 }
 
-fn render_knowledge_retrieval(
-    results: &[SearchResult],
+fn render_fresh_session_retrieval(
     freshness: &FreshSessionRetrieval,
     redact: &RedactionTable,
 ) -> String {
-    let mut out = String::from("knowledge_retrieve results:\n");
-    if results.is_empty() {
+    let mut out = String::from("history_search fresh-session results:\n");
+    if !freshness.missing_boundary_knowledge_bases.is_empty() {
         out.push_str(
-            "- No matching knowledge-base entries (or no embedding model is configured).\n",
+            "No dream ordering boundary is recorded for every attached KB, so a bounded set of matching sessions from this project was searched conservatively; no session history can yet be proven dreamed into those KBs.\n",
         );
+    } else if let Some(boundary) = freshness.oldest_boundary_session_event_seq {
+        out.push_str("Searched this project's sessions with events after dream boundary sequence ");
+        out.push_str(&boundary.to_string());
+        out.push_str(" for KB(s) ");
+        out.push_str(&freshness.boundary_knowledge_bases.join(", "));
+        out.push_str(". These sessions may not yet be dreamed into those KBs.\n");
     } else {
-        out.push_str("Knowledge-base citations:\n");
-        for result in results {
-            out.push_str(&format!(
-                "- {} — {} [{}]\n",
-                result.concept_id,
-                short_summary(&result.snippet),
-                citation_label(result),
-            ));
-        }
-    }
-    match freshness.oldest_boundary_session_event_seq {
-        Some(boundary) if freshness.missing_boundary_knowledge_bases.is_empty() => out.push_str(&format!(
-            "Fresh-session staleness check: searched this project's sessions with events after dream boundary sequence {boundary} for KB(s) {}.\n",
-            freshness.boundary_knowledge_bases.join(", "),
-        )),
-        _ => out.push_str("Fresh-session staleness check: no dream ordering boundary is recorded for every attached KB, so matching project sessions were searched conservatively.\n"),
+        out.push_str("No eligible fresh-session boundary is available.\n");
     }
     if !freshness.missing_boundary_knowledge_bases.is_empty() {
         out.push_str("KB(s) without a dream ordering boundary: ");
@@ -5718,40 +6036,41 @@ fn render_knowledge_retrieval(
     } else {
         out.push_str("Undreamed-session citations:\n");
         for hit in &freshness.hits {
-            out.push_str(&format!(
-                "- session {} — {} — {} [session ref: {}]\n",
-                hit.short_id.as_deref().unwrap_or_default(),
-                hit.title.as_deref().unwrap_or("(untitled)"),
-                short_summary(&hit.snippet),
-                hit.session_id,
-            ));
+            let fallback_reference = hit.session_id.to_string();
+            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
+            out.push_str("- session ");
+            out.push_str(reference);
+            out.push_str(" — ");
+            out.push_str(hit.title.as_deref().unwrap_or("(untitled)"));
+            out.push_str(" — ");
+            out.push_str(&short_summary(&hit.snippet));
+            out.push_str(" [session ref: ");
+            out.push_str(&hit.session_id.to_string());
+            out.push_str("]\n");
         }
     }
     redact.scrub(&out)
 }
 
-#[derive(Debug, Deserialize)]
-struct MemorySearchArgs {
-    query: String,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
 #[async_trait]
-impl Tool for MemorySearchTool {
+impl Tool for SemanticSearchTool {
     fn name(&self) -> &str {
-        MEMORY_SEARCH_TOOL_NAME
+        SEMANTIC_SEARCH_TOOL_NAME
     }
 
     fn description(&self) -> &str {
-        "search attached OKF memory bundles with citations"
+        "semantically search attached OKF knowledge bundles with citations"
     }
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "Search attached named OKF knowledge bases for a specific query and return cited ranked results."
+                "Search attached named OKF knowledge bases with vector similarity and return cited ranked results."
                 .to_string(),
         )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -5767,9 +6086,9 @@ impl Tool for MemorySearchTool {
     }
 
     async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let args: MemorySearchArgs = typed_args(args)?;
+        let args: SemanticSearchArgs = typed_args(args)?;
         if args.query.trim().is_empty() {
-            return Err(invalid_input("memory_search query must not be empty"));
+            return Err(invalid_input("semantic_search query must not be empty"));
         }
         let extended = ctx.config.extended();
         let providers = ctx.config.providers();
@@ -5796,7 +6115,7 @@ impl Tool for MemorySearchTool {
             production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session).await?
         else {
             return Ok(ToolOutput::text(
-                "No embedding_model is configured, so memory_search cannot build the knowledge index.",
+                "No embedding_model is configured, so semantic_search cannot build the knowledge index.",
             ));
         };
         let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
@@ -5811,16 +6130,286 @@ impl Tool for MemorySearchTool {
             ctx.knowledge_access_trusted,
         )
         .await?;
+        let mut results = results;
+        retain_search_result_sources(&mut results, &ctx.session)?;
         let content = render_tool_results(&results, ctx.redact.as_ref());
         Ok(ToolOutput::text(content))
     }
 }
 
+#[async_trait]
+impl Tool for StructuredSearchTool {
+    fn name(&self) -> &str {
+        STRUCTURED_SEARCH_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "search attached OKF knowledge by full text, frontmatter, or structured data with citations"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Search the disposable OKF index without embeddings. Combine full-text `query`, frontmatter filters, and exact structured row values; results are cited concepts that can be inspected with read."
+                .to_string(),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_QUERY_CHARS, "description": "full-text query over concept bodies" },
+                "type": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "exact concept type frontmatter filter" },
+                "title": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "case-sensitive title frontmatter substring filter" },
+                "tags": { "type": "array", "maxItems": MAX_STRUCTURED_SEARCH_FILTERS, "items": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS }, "description": "tags every matching concept must have" },
+                "timestamp": {
+                    "type": "object",
+                    "properties": {
+                        "after": { "type": "string", "format": "date-time", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "inclusive RFC 3339 timestamp frontmatter lower bound" },
+                        "before": { "type": "string", "format": "date-time", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "inclusive RFC 3339 timestamp frontmatter upper bound" }
+                    },
+                    "additionalProperties": false,
+                    "description": "inclusive timestamp frontmatter range"
+                },
+                "structured": {
+                    "type": "array",
+                    "maxItems": MAX_STRUCTURED_SEARCH_FILTERS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "column": { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS, "description": "structured row column name" },
+                            "equals": {
+                                "oneOf": [
+                                    { "type": "string", "maxLength": MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS },
+                                    { "type": "number" },
+                                    { "type": "boolean" }
+                                ],
+                                "description": "exact scalar value in the same structured row"
+                            }
+                        },
+                        "required": ["column", "equals"],
+                        "additionalProperties": false
+                    },
+                    "description": "exact structured-row predicates; all predicates must match one row"
+                },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "maximum cited concepts" }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let query: StructuredSearchQuery = typed_args(args)?;
+        validate_structured_search_query(&query)?;
+        let extended = ctx.config.extended();
+        let providers = ctx.config.providers();
+        validate_dream_models(&extended, &providers)?;
+        let bundles = attached_bundles(
+            &ctx.session,
+            &ctx.cwd,
+            self.allowed_knowledge_bases.as_ref(),
+            &extended,
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
+        if bundles.bundles.is_empty() {
+            if !bundles.denied_knowledge_base_ids.is_empty() {
+                return Err(anyhow::anyhow!(knowledge_access_denied_message(
+                    &bundles.denied_knowledge_base_ids
+                )));
+            }
+            return Ok(ToolOutput::text(
+                "No attached knowledge bundles are available.",
+            ));
+        }
+        let mut results = retrieve_structured_from_knowledge_bases(
+            &bundles.bundles,
+            &query,
+            Some(&crate::sealed::LocalVaultResolver::new(
+                ctx.session.secret_vault().clone(),
+            )),
+            ctx.knowledge_access_trusted,
+        )
+        .await?;
+        retain_search_result_sources(&mut results, &ctx.session)?;
+        Ok(ToolOutput::text(render_structured_tool_results(
+            &results,
+            ctx.redact.as_ref(),
+        )))
+    }
+}
+
+fn validate_structured_search_query(query: &StructuredSearchQuery) -> Result<()> {
+    if query
+        .query
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > MAX_STRUCTURED_SEARCH_QUERY_CHARS)
+    {
+        return Err(invalid_input(format!(
+            "structured_search query must be at most {MAX_STRUCTURED_SEARCH_QUERY_CHARS} characters"
+        )));
+    }
+    let has_query = query
+        .query
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if query.query.is_some() && !has_query {
+        return Err(invalid_input("structured_search query must not be empty"));
+    }
+    if let Some(query) = query.query.as_deref()
+        && fts_query(query).is_empty()
+    {
+        return Err(invalid_input(
+            "structured_search query must contain searchable text",
+        ));
+    }
+    for (name, value) in [("type", &query.concept_type), ("title", &query.title)] {
+        if value
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(invalid_input(format!(
+                "structured_search {name} must not be empty"
+            )));
+        }
+        if value
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS)
+        {
+            return Err(invalid_input(format!(
+                "structured_search {name} must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+            )));
+        }
+    }
+    if query.tags.len() > MAX_STRUCTURED_SEARCH_FILTERS {
+        return Err(invalid_input(format!(
+            "structured_search tags must contain at most {MAX_STRUCTURED_SEARCH_FILTERS} values"
+        )));
+    }
+    if query.tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err(invalid_input(
+            "structured_search tags must not contain empty values",
+        ));
+    }
+    if query
+        .tags
+        .iter()
+        .any(|tag| tag.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS)
+    {
+        return Err(invalid_input(format!(
+            "structured_search tags must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+        )));
+    }
+    if let Some(timestamp) = &query.timestamp {
+        if timestamp
+            .after
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+            || timestamp
+                .before
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(invalid_input(
+                "structured_search timestamp bounds must not be empty",
+            ));
+        }
+        if timestamp.after.is_none() && timestamp.before.is_none() {
+            return Err(invalid_input(
+                "structured_search timestamp requires after or before",
+            ));
+        }
+        for (name, value) in [("after", &timestamp.after), ("before", &timestamp.before)] {
+            if let Some(value) = value {
+                if value.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS {
+                    return Err(invalid_input(format!(
+                        "structured_search timestamp {name} must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+                    )));
+                }
+                normalized_rfc3339_timestamp(value).map_err(|_| {
+                    invalid_input(format!(
+                        "structured_search timestamp {name} must be an RFC 3339 timestamp"
+                    ))
+                })?;
+            }
+        }
+    }
+    if query.structured_filters.len() > MAX_STRUCTURED_SEARCH_FILTERS {
+        return Err(invalid_input(format!(
+            "structured_search structured must contain at most {MAX_STRUCTURED_SEARCH_FILTERS} predicates"
+        )));
+    }
+    for filter in &query.structured_filters {
+        if filter.column.trim().is_empty() {
+            return Err(invalid_input(
+                "structured_search structured column must not be empty",
+            ));
+        }
+        if filter.column.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS {
+            return Err(invalid_input(format!(
+                "structured_search structured column must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+            )));
+        }
+        if !filter.equals.is_string() && !filter.equals.is_number() && !filter.equals.is_boolean() {
+            return Err(invalid_input(
+                "structured_search structured equals must be a string, number, or boolean",
+            ));
+        }
+        if filter
+            .equals
+            .as_str()
+            .is_some_and(|value| value.chars().count() > MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS)
+        {
+            return Err(invalid_input(format!(
+                "structured_search structured equals strings must be at most {MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS} characters"
+            )));
+        }
+    }
+    if !has_query
+        && query.concept_type.is_none()
+        && query.title.is_none()
+        && query.tags.is_empty()
+        && query.timestamp.is_none()
+        && query.structured_filters.is_empty()
+    {
+        return Err(invalid_input(
+            "structured_search requires query, frontmatter, timestamp, or structured filters",
+        ));
+    }
+    Ok(())
+}
+
+fn render_structured_tool_results(results: &[SearchResult], redact: &RedactionTable) -> String {
+    if results.is_empty() {
+        return "No matching structured knowledge entries.".to_string();
+    }
+    let mut out = String::from("structured_search results:\n");
+    for result in results {
+        out.push_str("- ");
+        out.push_str(&result.concept_id);
+        out.push_str(" — ");
+        if result.matched_structured_row {
+            out.push_str("matching row: ");
+            out.push_str(&result.snippet);
+        } else {
+            out.push_str(&short_summary(&result.snippet));
+        }
+        out.push_str(" [");
+        out.push_str(&citation_label(result));
+        out.push_str("]\n");
+    }
+    redact.scrub(&out)
+}
+
 fn render_tool_results(results: &[SearchResult], redact: &RedactionTable) -> String {
     if results.is_empty() {
-        return "No matching memory entries.".to_string();
+        return "No matching knowledge entries.".to_string();
     }
-    let mut out = String::from("memory_search results:\n");
+    let mut out = String::from("semantic_search results:\n");
     for result in results {
         out.push_str("- ");
         out.push_str(&result.concept_id);
@@ -5836,6 +6425,7 @@ fn render_tool_results(results: &[SearchResult], redact: &RedactionTable) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::tool::Tool as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -5852,6 +6442,42 @@ mod tests {
         assert!(first.contains("Last dreamed at: 1970-01-01T00:00:00+00:00"));
         assert!(first.contains("Newer information may live in sessions"));
         assert!(!first.contains("undreamed"));
+    }
+
+    #[tokio::test]
+    async fn cited_source_reads_the_retained_snapshot_after_the_kb_file_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("deploy.md");
+        let original = "---\ntype: procedure\n---\n\nDeploy through the retained lane.\n";
+        fs::write(&source, original).unwrap();
+        let bundle = parse_bundle(tmp.path()).unwrap();
+        let mut results = vec![SearchResult {
+            knowledge_base_id: "project".to_string(),
+            knowledge_base_name: "Project".to_string(),
+            concept_id: "deploy".to_string(),
+            source_path: "deploy.md".to_string(),
+            chunk_index: 0,
+            snippet: "Deploy through the retained lane.".to_string(),
+            citations: Vec::new(),
+            score: 1.0,
+            matched_structured_row: false,
+            snapshot_source: None,
+            snapshot_trust_required: false,
+        }];
+        let retained_source = snapshot_source_for_result(&bundle, &results[0]).unwrap();
+        results[0].snapshot_source = Some(retained_source);
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        retain_search_result_sources(&mut results, &ctx.session).unwrap();
+        let cited_path = results[0].source_path.clone();
+        assert!(is_knowledge_snapshot_read_path(&cited_path));
+
+        fs::write(&source, "---\ntype: procedure\n---\n\nSuccessor content.\n").unwrap();
+        let output = crate::tools::read::ReadTool
+            .call(serde_json::json!({ "path": cited_path }), &ctx)
+            .await
+            .unwrap();
+        assert!(output.content.contains("retained lane"));
+        assert!(!output.content.contains("Successor content"));
     }
 
     struct MockEmbedder;
@@ -5967,17 +6593,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_retrieval_renders_kb_and_undreamed_session_citations() {
-        let results = vec![SearchResult {
-            knowledge_base_id: "project".to_string(),
-            knowledge_base_name: "Project knowledge".to_string(),
-            concept_id: "deploy-policy".to_string(),
-            source_path: "concepts/deploy.md".to_string(),
-            chunk_index: 0,
-            snippet: "Deploy through the green lane.".to_string(),
-            citations: Vec::new(),
-            score: 1.0,
-        }];
+    fn fresh_session_retrieval_renders_cited_updates() {
         let session_id = uuid::Uuid::new_v4();
         let freshness = FreshSessionRetrieval {
             hits: vec![crate::db::session_search::SearchHit {
@@ -5994,15 +6610,15 @@ mod tests {
             missing_boundary_knowledge_bases: Vec::new(),
         };
 
-        let rendered = render_knowledge_retrieval(&results, &freshness, &RedactionTable::empty());
-        assert!(rendered.contains("concepts/deploy.md#chunk-0"));
+        let rendered = render_fresh_session_retrieval(&freshness, &RedactionTable::empty());
+        assert!(rendered.contains("dream boundary sequence 100"));
         assert!(rendered.contains("session ab12cd"));
         assert!(rendered.contains(&session_id.to_string()));
         assert!(rendered.contains("may not yet be dreamed"));
     }
 
     #[tokio::test]
-    async fn fresh_retrieval_includes_the_current_session_before_the_first_boundary() {
+    async fn fresh_session_retrieval_includes_current_session_before_the_first_boundary() {
         let tmp = TempDir::new().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.session
@@ -6045,7 +6661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_retrieval_uses_the_event_sequence_boundary_not_a_timestamp() {
+    async fn fresh_session_retrieval_uses_the_event_sequence_boundary_not_a_timestamp() {
         let tmp = TempDir::new().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         let entry = project_knowledge_registry_entry();
@@ -6429,20 +7045,6 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    #[test]
-    fn fresh_retrieval_reports_its_conservative_first_use_search() {
-        let freshness = FreshSessionRetrieval {
-            hits: Vec::new(),
-            boundary_knowledge_bases: Vec::new(),
-            oldest_boundary_session_event_seq: None,
-            missing_boundary_knowledge_bases: vec!["project".to_string()],
-        };
-
-        let rendered = render_knowledge_retrieval(&[], &freshness, &RedactionTable::empty());
-        assert!(rendered.contains("searched conservatively"));
-        assert!(rendered.contains("no session history can yet be proven dreamed"));
-    }
-
     fn write_bundle(root: &Path) {
         fs::create_dir_all(root).unwrap();
         fs::write(root.join("index.md"), "# Index\n\n- [[deploy]]\n").unwrap();
@@ -6614,6 +7216,196 @@ timestamp: 2026-08-29T12:00:00Z
         assert_eq!(markdown_rows, 1);
         assert_eq!(resource_rows, 1);
         assert_eq!(count, 4);
+    }
+
+    #[tokio::test]
+    async fn structured_search_filters_frontmatter_fts_and_one_structured_row() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("inventory.csv"),
+            "sku,count,active\nA-1,4,true\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("structured.md"),
+            r#"---
+type: catalog
+title: Inventory
+resource: inventory.csv
+tags: [warehouse, current]
+timestamp: 2026-08-29T12:00:00Z
+---
+
+Inventory facts for warehouse operations.
+
+# Citations
+
+- [inventory](docs/inventory.md)
+"#,
+        )
+        .unwrap();
+
+        let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let results = structured_search_index(
+            &index.index,
+            &StructuredSearchQuery {
+                query: Some("warehouse operations".to_string()),
+                concept_type: Some("catalog".to_string()),
+                title: Some("ventor".to_string()),
+                tags: vec!["warehouse".to_string(), "current".to_string()],
+                timestamp: Some(TimestampFilter {
+                    after: Some("2026-08-01T00:00:00Z".to_string()),
+                    before: Some("2026-09-01T00:00:00Z".to_string()),
+                }),
+                structured_filters: vec![
+                    StructuredValueFilter {
+                        column: "count".to_string(),
+                        equals: JsonValue::from(4),
+                    },
+                    StructuredValueFilter {
+                        column: "active".to_string(),
+                        equals: JsonValue::from(true),
+                    },
+                ],
+                limit: Some(6),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].concept_id, "structured");
+        assert!(results[0].matched_structured_row);
+        assert_eq!(results[0].source_path, "inventory.csv");
+        assert_eq!(
+            results[0].snippet,
+            r#"{"active":true,"count":4,"sku":"A-1"}"#
+        );
+        assert_eq!(results[0].citations[0].target, "docs/inventory.md");
+        let bundle = parse_bundle(tmp.path()).unwrap();
+        assert_eq!(
+            snapshot_source_for_result(&bundle, &results[0]).unwrap(),
+            "sku,count,active\nA-1,4,true\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_search_normalizes_timestamp_offsets_before_filtering() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("offset.md"),
+            "---\ntype: event\ntimestamp: 2026-08-29T12:00:00+02:00\n---\n\nOffset event.\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("earlier.md"),
+            "---\ntype: event\ntimestamp: 2026-08-29T09:30:00Z\n---\n\nEarlier event.\n",
+        )
+        .unwrap();
+
+        let (index, _) = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        let results = structured_search_index(
+            &index.index,
+            &StructuredSearchQuery {
+                query: None,
+                concept_type: None,
+                title: None,
+                tags: Vec::new(),
+                timestamp: Some(TimestampFilter {
+                    after: Some("2026-08-29T09:45:00Z".to_string()),
+                    before: Some("2026-08-29T10:15:00Z".to_string()),
+                }),
+                structured_filters: Vec::new(),
+                limit: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].concept_id, "offset");
+    }
+
+    #[test]
+    fn knowledge_concept_timestamp_must_be_rfc3339() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("invalid.md"),
+            "---\ntype: event\ntimestamp: definitely-not-a-timestamp\n---\n\nInvalid event.\n",
+        )
+        .unwrap();
+
+        let error = parse_bundle(tmp.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid RFC 3339 `timestamp`"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn structured_search_validation_bounds_model_authored_input() {
+        let schema = StructuredSearchTool::new(None).parameters();
+        assert_eq!(
+            schema["properties"]["tags"]["maxItems"],
+            json!(MAX_STRUCTURED_SEARCH_FILTERS)
+        );
+        assert_eq!(
+            schema["properties"]["structured"]["maxItems"],
+            json!(MAX_STRUCTURED_SEARCH_FILTERS)
+        );
+        let too_many_tags = StructuredSearchQuery {
+            query: None,
+            concept_type: None,
+            title: None,
+            tags: vec!["tag".to_string(); MAX_STRUCTURED_SEARCH_FILTERS + 1],
+            timestamp: None,
+            structured_filters: Vec::new(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&too_many_tags).is_err());
+
+        let too_many_structured = StructuredSearchQuery {
+            query: None,
+            concept_type: None,
+            title: None,
+            tags: Vec::new(),
+            timestamp: None,
+            structured_filters: (0..=MAX_STRUCTURED_SEARCH_FILTERS)
+                .map(|index| StructuredValueFilter {
+                    column: format!("column-{index}"),
+                    equals: JsonValue::from(true),
+                })
+                .collect(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&too_many_structured).is_err());
+
+        let oversized_query = StructuredSearchQuery {
+            query: Some("word ".repeat(MAX_STRUCTURED_SEARCH_QUERY_CHARS)),
+            concept_type: None,
+            title: None,
+            tags: Vec::new(),
+            timestamp: None,
+            structured_filters: Vec::new(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&oversized_query).is_err());
+
+        let invalid_timestamp = StructuredSearchQuery {
+            query: None,
+            concept_type: None,
+            title: None,
+            tags: Vec::new(),
+            timestamp: Some(TimestampFilter {
+                after: Some("not-a-timestamp".to_string()),
+                before: None,
+            }),
+            structured_filters: Vec::new(),
+            limit: None,
+        };
+        assert!(validate_structured_search_query(&invalid_timestamp).is_err());
     }
 
     #[tokio::test]
@@ -7079,37 +7871,6 @@ timestamp: 2026-08-29T12:00:00Z
         assert!(paraphrase.iter().any(|r| r.concept_id == "deploy"));
     }
 
-    #[test]
-    fn knowledge_injection_capped_and_redacted() {
-        let redact = {
-            let cfg = RedactConfig {
-                enabled: true,
-                denylist: vec!["sk-secret".to_string()],
-                placeholder: "[redacted]".to_string(),
-                ..RedactConfig::default()
-            };
-            RedactionTable::build(&cfg, Path::new(".")).unwrap()
-        };
-        let results = vec![SearchResult {
-            knowledge_base_id: "project".to_string(),
-            knowledge_base_name: "Project".to_string(),
-            concept_id: "deploy".to_string(),
-            source_path: "deploy.md".to_string(),
-            chunk_index: 0,
-            snippet: "Use sk-secret and the green deploy pipeline with citations.".to_string(),
-            citations: vec![Citation {
-                label: "runbook".to_string(),
-                target: "docs/deploy.md".to_string(),
-            }],
-            score: 1.0,
-        }];
-        let rendered = render_injection(&results, 80, &redact).unwrap();
-        assert!(rendered.contains("runbook"));
-        assert!(rendered.contains("[redacted]"));
-        assert!(!rendered.contains("sk-secret"));
-        assert!(crate::tokens::count(&rendered) <= 80);
-    }
-
     #[tokio::test]
     async fn project_bundle_requires_a_trusted_model() {
         let _env = crate::test_env::lock_async().await;
@@ -7223,6 +7984,49 @@ timestamp: 2026-08-29T12:00:00Z
         .unwrap();
         assert_eq!(attached.bundles.len(), 1);
         assert_eq!(attached.bundles[0].entry.id, "project");
+        assert_eq!(
+            attached_local_knowledge_roots_for_model(
+                &session,
+                tmp.path(),
+                &extended,
+                agent.allowed_knowledge_bases(),
+                true,
+            )
+            .await
+            .unwrap(),
+            vec![tmp.path().join(".cockpit/knowledge")],
+            "driver-owned shell launches receive only this agent's attached local KB roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_effective_registry_ids_are_retained_only_as_denied_fences() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let session = test_session(tmp.path()).await;
+        let mut first = project_knowledge_registry_entry();
+        first.trust_required = false;
+        first.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("first"),
+        };
+        let mut second = first.clone();
+        second.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("second"),
+        };
+
+        let resolved = effective_local_knowledge_bases(
+            &session,
+            tmp.path(),
+            &ExtendedConfig {
+                knowledge_bases: vec![first, second],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(resolved.len(), 2, "both conflicting roots stay fenced");
+        assert!(resolved.iter().all(|entry| entry.registry_id_conflicted));
+        assert!(resolved.iter().all(|entry| !entry.policy_denied));
     }
 
     #[test]
@@ -7311,6 +8115,12 @@ timestamp: 2026-08-29T12:00:00Z
             format!("assistant-{installation_id}")
         );
         assert!(attached.bundles[0].provider.is_available().await.unwrap());
+        assert_eq!(
+            configured_local_knowledge_roots(&session, tmp.path(), &ExtendedConfig::default())
+                .await,
+            vec![home.join("knowledge")],
+            "assistant-owned KBs must be in the shell write fence"
+        );
 
         fs::remove_dir_all(home.join("knowledge")).unwrap();
         fs::create_dir_all(home.join("knowledge")).unwrap();
@@ -7331,6 +8141,131 @@ timestamp: 2026-08-29T12:00:00Z
                 .iter()
                 .any(|result| result.concept_id == "replacement")
         );
+    }
+
+    #[tokio::test]
+    async fn remote_duplicate_of_assistant_id_denies_only_assistant_native_root() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        env.set_var("XDG_DATA_HOME", tmp.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let home = crate::assistants::default_home_dir("helper-bot").unwrap();
+        let installation_id = uuid::Uuid::from_u128(43);
+        crate::assistants::create_assistant_with_installation_id(
+            &db,
+            crate::assistants::CreateAssistantSpec {
+                name: "helper-bot".to_string(),
+                description: "Helper bot".to_string(),
+                prompt: "Help with tests.".to_string(),
+                home_dir: home.clone(),
+            },
+            installation_id,
+        )
+        .await
+        .unwrap();
+        write_bundle(&home.join("knowledge"));
+        let ordinary_root = tmp.path().join("ordinary");
+        write_bundle(&ordinary_root);
+        let session = crate::session::Session::create_assistant_deferred_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "helper-bot",
+            "helper-bot",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let remote_duplicate = KnowledgeBaseRegistryEntry::new(
+            format!("assistant-{installation_id}"),
+            "Remote duplicate".to_string(),
+            "A remote source with the assistant's registry ID.".to_string(),
+            KnowledgeBaseSource::Remote {
+                url: "https://knowledge.example.test".to_string(),
+            },
+            KnowledgeBaseEmbeddingOwnership::RemoteOwned,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let ordinary = KnowledgeBaseRegistryEntry::new(
+            "ordinary".to_string(),
+            "Ordinary".to_string(),
+            "An unrelated local source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("ordinary"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![remote_duplicate, ordinary],
+            ..Default::default()
+        };
+
+        let resolved = effective_local_knowledge_bases(&session, tmp.path(), &extended).await;
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved.iter().any(|entry| {
+                entry.root == home.join("knowledge") && entry.registry_id_conflicted
+            })
+        );
+        assert!(resolved.iter().any(|entry| {
+            entry.root == ordinary_root && !entry.registry_id_conflicted && !entry.policy_denied
+        }));
+
+        let denied =
+            denied_local_knowledge_roots_for_model(&session, tmp.path(), &extended, None, true)
+                .await
+                .unwrap();
+        assert_eq!(denied, vec![home.join("knowledge")]);
+    }
+
+    #[tokio::test]
+    async fn opaque_write_capable_host_tools_preserve_attached_kb_read_only_policy() {
+        let _env = crate::test_env::lock_async().await;
+        let tmp = TempDir::new().unwrap();
+        let knowledge_root = tmp.path().join("knowledge");
+        write_bundle(&knowledge_root);
+        let entry = KnowledgeBaseRegistryEntry::new(
+            "ordinary".to_string(),
+            "Ordinary".to_string(),
+            "An attached read-only local source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from("knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        );
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                ExtendedConfig {
+                    knowledge_bases: vec![entry],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        // An ordinary attached KB remains readable through bounded inspection
+        // tools, but opaque host processes must not inherit a write path.
+        ensure_workspace_tool_access(&ctx, "code").await.unwrap();
+        for tool in ["harness_invoke", "lsp", "worktree_orchestrate"] {
+            let error = ensure_workspace_tool_access(&ctx, tool)
+                .await
+                .expect_err("opaque host tool must not receive ambient KB write access");
+            assert!(
+                error.to_string().contains("knowledge bases are read-only"),
+                "unexpected {tool} error: {error:#}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7438,83 +8373,6 @@ timestamp: 2026-08-29T12:00:00Z
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("hosted"));
         assert!(diagnostic.contains("not implemented"));
-    }
-
-    #[tokio::test]
-    async fn memory_search_tool_schema_is_stable_when_bundles_change() {
-        let _env = crate::test_env::lock_async().await;
-        let tmp = TempDir::new().unwrap();
-        let session = test_session(tmp.path()).await;
-        let base = crate::engine::tool::ToolBox::new();
-        assert!(
-            with_memory_search_if_attached(
-                base.clone(),
-                &session,
-                tmp.path(),
-                None,
-                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
-                    tmp.path()
-                ),
-                "openai:gpt-5",
-                false,
-            )
-            .await
-            .names()
-            .contains(&"memory_search")
-        );
-
-        write_bundle(&tmp.path().join(".cockpit/knowledge"));
-        fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
-        fs::write(
-            tmp.path().join(".cockpit/config.json"),
-            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"openai:gpt-5","trustRequired":true,"mergePolicy":"auto"}]}"#,
-        )
-        .unwrap();
-        let untrusted_toolbox = with_memory_search_if_attached(
-            base.clone(),
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-            "openai:gpt-5",
-            false,
-        )
-        .await;
-        assert!(untrusted_toolbox.names().contains(&"memory_search"));
-        assert!(
-            !untrusted_toolbox
-                .names()
-                .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
-        );
-        let attached_toolbox = with_memory_search_if_attached(
-            base,
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-            "openai:gpt-5",
-            true,
-        )
-        .await;
-        let attached = attached_toolbox.names();
-        assert!(attached.contains(&"memory_search"));
-        assert!(attached.contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME));
-        let mismatched_toolbox = with_memory_search_if_attached(
-            crate::engine::tool::ToolBox::new(),
-            &session,
-            tmp.path(),
-            None,
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-            "anthropic:claude",
-            true,
-        )
-        .await;
-        assert!(mismatched_toolbox.names().contains(&"memory_search"));
-        assert!(
-            !mismatched_toolbox
-                .names()
-                .contains(&KNOWLEDGE_DREAM_APPLY_TOOL_NAME)
-        );
     }
 
     #[tokio::test]

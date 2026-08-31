@@ -92,6 +92,29 @@ fn knowledge_base_registry_round_trips_through_extended_config_doc() {
 }
 
 #[test]
+fn duplicate_knowledge_base_ids_are_rejected_before_config_can_grant_them() {
+    let local = |path| {
+        KnowledgeBaseRegistryEntry::new(
+            "shared".to_string(),
+            "Shared knowledge".to_string(),
+            "A local knowledge source.".to_string(),
+            KnowledgeBaseSource::Local {
+                path: PathBuf::from(path),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        )
+    };
+
+    let error = validate_knowledge_base_local_policy(&[local("one"), local("two")])
+        .expect_err("a registry label must name exactly one retrieval authority");
+    assert!(error.to_string().contains("duplicate ID `shared`"));
+}
+
+#[test]
 fn configured_knowledge_attachment_provisional_identity_follows_its_source() {
     let entry = KnowledgeBaseRegistryEntry::new(
         "project".to_string(),

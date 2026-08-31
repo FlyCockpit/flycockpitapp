@@ -251,8 +251,8 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
         vec![
             "AcpForwardedMcpDeclarationV1".to_string(),
             "AcpForwardedMcpIngressV1".to_string(),
-            "AcpForwardedMcpTransportV1".to_string(),
             "AcpForwardedMcpNameValuePairV1".to_string(),
+            "AcpForwardedMcpTransportV1".to_string(),
         ],
         "the closed ingress family is the only public ACP/MCP type family"
     );

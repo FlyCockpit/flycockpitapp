@@ -21,6 +21,11 @@ pub const MAX_RAISES_PER_ASSISTANT_PER_HOUR: i64 = 32;
 /// Product limit for not-yet-delivered work visible in one assistant inbox.
 pub const MAX_PENDING_INBOX_ITEMS_PER_ASSISTANT: i64 = 8;
 
+/// Corrupt session ancestry must not turn inbox delivery into an unbounded
+/// database walk. This is deliberately independent from the per-hour raise
+/// limit: a valid thread lineage can contain every currently permitted raise.
+const MAX_ASSISTANT_THREAD_ANCESTRY_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssistantInboxDelivery {
@@ -376,7 +381,12 @@ fn assistant_main_session(
     assistant_name: &str,
 ) -> Result<SessionRow> {
     let mut current = raising.clone();
-    for _ in 0..32 {
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..MAX_ASSISTANT_THREAD_ANCESTRY_DEPTH {
+        ensure!(
+            visited.insert(current.session_id),
+            "assistant thread ancestry contains a cycle"
+        );
         let Some(parent_id) = current.parent_session_id else {
             ensure!(
                 !current.is_assistant_thread,

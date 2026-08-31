@@ -3,9 +3,7 @@
 //! Local wire framing and typed request/event transport live in
 //! `cockpit-client`; this module owns only process and daemon lifecycle.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -337,8 +335,11 @@ pub async fn serve_lifecycle_requests(
     .await
 }
 
-type LifecycleResolutionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<cockpit_client::LifecycleResolution>> + Send + 'a>>;
+type LifecycleResolutionFuture<'a> = std::pin::Pin<
+    std::boxed::Box<
+        dyn std::future::Future<Output = Result<cockpit_client::LifecycleResolution>> + Send + 'a,
+    >,
+>;
 
 /// Serialize lifecycle work while retaining each request's reply channel in
 /// the host. Keeping the loop separate from resolution lets terminal

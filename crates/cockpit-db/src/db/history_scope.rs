@@ -42,12 +42,12 @@ impl Db {
         let now = Utc::now().timestamp_millis();
         self.write(move |conn| {
             conn.execute(
-                "INSERT INTO workspace_history_scopes \\
-                    (project_id, outbound_enabled, inbound_enabled, updated_at_unix_ms) \\
-                 VALUES (?1, ?2, ?3, ?4) \\
-                 ON CONFLICT(project_id) DO UPDATE SET \\
-                    outbound_enabled = excluded.outbound_enabled, \\
-                    inbound_enabled = excluded.inbound_enabled, \\
+                "INSERT INTO workspace_history_scopes
+                    (project_id, outbound_enabled, inbound_enabled, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                    outbound_enabled = excluded.outbound_enabled,
+                    inbound_enabled = excluded.inbound_enabled,
                     updated_at_unix_ms = excluded.updated_at_unix_ms",
                 params![project_id, scope.outbound, scope.inbound, now],
             )

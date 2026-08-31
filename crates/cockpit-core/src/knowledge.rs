@@ -2710,6 +2710,17 @@ impl KbProvider for RemoteKb {
 
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
+    // Dream transactions deliberately use a descriptor-bound root on Unix so
+    // no pathname replacement can redirect Git or model writes. The Linux
+    // procfs descriptor spelling is a capability view, not a caller-controlled
+    // symlink path, so duplicate that held directory instead of passing its
+    // magic link through the normal no-follow pathname walker.
+    #[cfg(target_os = "linux")]
+    if root.starts_with("/proc/self/fd/") {
+        let handle = fs::File::open(&root)
+            .with_context(|| format!("duplicating retained knowledge root {}", root.display()))?;
+        return parse_bundle_from_retained_root(root, &handle);
+    }
     let handle = cockpit_config::config::open_config_directory_nofollow(&root)?;
     parse_bundle_from_retained_root(root, &handle)
 }

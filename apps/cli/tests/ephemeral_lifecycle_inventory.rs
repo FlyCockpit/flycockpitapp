@@ -1268,7 +1268,7 @@ fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
         violations: Vec::new(),
     };
     visitor.visit_file(&file);
-    if visitor.canonical_self_types != ["connect", "connect"] {
+    if visitor.canonical_self_types != ["connect"] {
         visitor.violations.push(format!(
             "OwnedDaemonSession Self type inventory changed: {:?}",
             visitor.canonical_self_types

@@ -539,7 +539,7 @@ impl Drop for GuidanceDelegationDropGuard {
 /// The continuations carry transient screenshots (from the live frame)
 /// only in the wire payload; the coordinator journals only sanitized
 /// `CoordinatedOutcome` values (AC6).
-async fn handle_native_computer_items(
+pub async fn handle_native_computer_items(
     coordinator: Option<&mut ComputerActionCoordinator>,
     contract: ComputerToolContract,
     raw_output: &[serde_json::Value],

@@ -2693,10 +2693,14 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     );
     let lifecycle_source = production_source(&read("crates/cockpit-core/src/daemon/client.rs"));
     assert!(
-        lifecycle_source.contains("in_process_owner: Option<crate::daemon::InProcessDaemonGuard>")
+        lifecycle_source
+            .contains("run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, operation).await"),
+        "foreground work must acquire the same discoverable ephemeral owner as TUI clients"
     );
-    assert!(lifecycle_source.contains("drop(client);"));
-    assert!(lifecycle_source.contains("owner.shutdown().await"));
+    assert!(
+        !lifecycle_source.contains("boot_in_process("),
+        "foreground lifecycle must not hide work behind an in-process owner"
+    );
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(!settings.contains("serve_lifecycle_requests"));
     assert!(!settings.contains("LifecycleClient::channel"));

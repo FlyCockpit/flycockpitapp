@@ -527,22 +527,22 @@ pub enum AcpForwardedMcpTransportV1 {
     Stdio {
         command: String,
         args: Vec<String>,
-        env: Vec<AcpNameValuePairV1>,
+        env: Vec<AcpForwardedMcpNameValuePairV1>,
     },
     Http {
         url: String,
-        headers: Vec<AcpNameValuePairV1>,
+        headers: Vec<AcpForwardedMcpNameValuePairV1>,
     },
     Sse {
         url: String,
-        headers: Vec<AcpNameValuePairV1>,
+        headers: Vec<AcpForwardedMcpNameValuePairV1>,
     },
 }
 
 /// Explicit name/value pair used for env and headers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AcpNameValuePairV1 {
+pub struct AcpForwardedMcpNameValuePairV1 {
     pub name: String,
     pub value: String,
 }
@@ -689,7 +689,7 @@ fn validate_count<T>(values: &[T], field: &str) -> Result<(), String> {
 }
 
 fn normalize_pairs(
-    pairs: &mut [AcpNameValuePairV1],
+    pairs: &mut [AcpForwardedMcpNameValuePairV1],
     field: &str,
     ascii_case_insensitive: bool,
 ) -> Result<(), String> {
@@ -823,8 +823,8 @@ mod forwarded_mcp_tests {
     use super::*;
     use serde_json::json;
 
-    fn pair(name: &str, value: &str) -> AcpNameValuePairV1 {
-        AcpNameValuePairV1 {
+    fn pair(name: &str, value: &str) -> AcpForwardedMcpNameValuePairV1 {
+        AcpForwardedMcpNameValuePairV1 {
             name: name.to_string(),
             value: value.to_string(),
         }

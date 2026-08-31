@@ -3909,15 +3909,6 @@ async fn handle_send_user_message(
     } else {
         None
     };
-    // Legacy-sized/media messages retain their existing admission behavior.
-    // Oversized FCM2 messages record activity only after the worker has
-    // durably accepted both the receipt triple and source reservation.
-    if origin == proto::UserMessageOrigin::ExternalRoot
-        && artifact_admission.is_none()
-        && let Some(scheduler) = &ctx.scheduler
-    {
-        scheduler.record_user_activity().await;
-    }
     let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
         origin,
         &text,
@@ -4061,9 +4052,10 @@ async fn handle_send_user_message(
         Ok(result) => result,
         Err(error) => return Err(error),
     };
-    // Oversized activity is advanced by the driver only after phase-two
-    // materialization. The dispatch path must not create an accepted-turn
-    // side effect merely because phase one reserved a lease.
+    // The worker publishes inline/media activity at its fresh-insert boundary,
+    // before it resolves this acknowledgement. Replays intentionally never
+    // reach that publication. Oversized FCM2 still advances activity only at
+    // its phase-two materialization boundary in the driver.
     Ok(Response::UserMessageQueued { item, queue })
 }
 
@@ -11246,12 +11238,36 @@ async fn handle_serialized_request_impl(
             action,
         } => {
             let att = require_attached(state)?;
+            // LSP control can execute configured install/uninstall commands
+            // and restart opaque workspace hosts. Treat every action as an
+            // agent-reachable host-control surface, including `Check`, while
+            // the selected session has any local knowledge base attached.
+            // Read the selected worker's published snapshot rather than the
+            // caller-supplied project path's live config so this cannot be
+            // bypassed by pointing the request at another directory.
+            let session_config = att.handle.config_snapshot();
+            let protected_roots = crate::knowledge::configured_local_knowledge_roots(
+                &att.handle.session(),
+                &att.handle.project_root(),
+                &session_config.extended,
+            )
+            .await;
+            if !protected_roots.is_empty() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "LSP control is unavailable while this session has a local knowledge base attached.".into(),
+                });
+            }
             let cwd = Path::new(&project_root);
             let trust_policy = attached_trust_policy(ctx, att).await?;
             let (_, config) = ctx
                 .config_source()
                 .load_with_trust(cwd, &trust_policy)
                 .map_err(internal)?;
+            // Keep the selected-session authorization fence above for a
+            // precise RPC error. The manager repeats the check daemon-wide
+            // under its operation lease, covering a no-KB selected session
+            // while another session owns protected roots.
             let message = ctx
                 .registry
                 .lsp_manager()
@@ -11562,6 +11578,7 @@ async fn handle_serialized_request_impl(
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
+            fresh_thread,
         } => {
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
@@ -11572,6 +11589,7 @@ async fn handle_serialized_request_impl(
                         parent_session_id,
                         fork_point_turn_id: fork_point_turn_id.clone(),
                         ephemeral,
+                        fresh_thread,
                     },
                     operation,
                 )?;
@@ -11581,6 +11599,7 @@ async fn handle_serialized_request_impl(
                     parent_session_id,
                     fork_point_turn_id,
                     ephemeral,
+                    fresh_thread,
                     &ledger,
                 )
                 .await;
@@ -11591,6 +11610,7 @@ async fn handle_serialized_request_impl(
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
+                fresh_thread,
             )
             .await
         }

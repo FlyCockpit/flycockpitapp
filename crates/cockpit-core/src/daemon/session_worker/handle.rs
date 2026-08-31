@@ -28,6 +28,9 @@ pub struct SessionWorkerHandle {
     pub(crate) workspace_root_authority:
         Arc<crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority>,
     work_tx: mpsc::Sender<SessionWork>,
+    /// Live per-thread activity epoch shared directly with the driver's
+    /// schedule authority. Dispatch publishes only after durable acceptance.
+    idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
@@ -1199,6 +1202,7 @@ impl SessionWorkerHandle {
         locks: Arc<LockManager>,
     ) -> (Self, mpsc::Receiver<SessionWork>) {
         let (work_tx, work_rx) = mpsc::channel(WORK_QUEUE_CAPACITY);
+        let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
         let (event_tx, _event_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let redaction: SharedRedactionTable =
             Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
@@ -1244,6 +1248,7 @@ impl SessionWorkerHandle {
                 .expect("test workspace authority"),
             ),
             work_tx,
+            idle_activity_tx,
             event_tx,
             turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
             redaction,
@@ -1683,6 +1688,17 @@ impl SessionWorkerHandle {
         }
         permit.send(work);
         Ok(())
+    }
+
+    pub(crate) fn record_user_activity(&self) {
+        let _ = self.idle_activity_tx.send(tokio::time::Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe_user_activity_for_test(
+        &self,
+    ) -> tokio::sync::watch::Receiver<tokio::time::Instant> {
+        self.idle_activity_tx.subscribe()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -2432,7 +2448,7 @@ pub enum SessionWork {
 /// sessions it creates to be unsandboxed. The session-spawn default is
 /// resolved here by the precedence daemon-flag → client-flag → ON.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn(
+pub(crate) fn spawn(
     session: Arc<Session>,
     guidance_proposals: Arc<
         tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
@@ -2453,6 +2469,7 @@ pub fn spawn(
     daemon_no_sandbox: bool,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     lsp: Arc<crate::daemon::lsp::LspManager>,
+    initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
@@ -2481,6 +2498,11 @@ pub fn spawn(
     // worker still re-resolves async at startup for stale removed primaries.
     let initial_agent = match session.assistant_name.clone() {
         Some(name) => name,
+        None if session.session_entry_mode()
+            == crate::daemon::proto::SessionEntryMode::Computer =>
+        {
+            "Computer".to_string()
+        }
         None => {
             let active = session.active_agent();
             if crate::agents::is_builtin_primary(&active)
@@ -2517,6 +2539,11 @@ pub fn spawn(
     // overridden). A later `/settings` change re-resolves on the next session.
     session.set_shell_compression(extended_cfg.shell_compression);
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
+    let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let idle_activity_gate = crate::sync::lock_or_recover(&scheduler)
+        .as_ref()
+        .map(crate::daemon::scheduler::DaemonSchedulerHandle::activity_gate)
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
     let legacy_disk_origins = match session.persisted_disk_redaction_origins() {
@@ -2594,6 +2621,7 @@ pub fn spawn(
         trust_transition_pending: trust_transition_pending.clone(),
         workspace_root_authority: workspace_root_authority.clone(),
         work_tx,
+        idle_activity_tx: idle_activity_tx.clone(),
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),
         redaction: redaction.clone(),
@@ -2644,6 +2672,8 @@ pub fn spawn(
             workspace_root_authority,
             worker_trust_policy,
             work_rx,
+            idle_activity_tx.clone(),
+            idle_activity_gate,
             event_tx,
             turn_completions,
             redaction,
@@ -2657,6 +2687,7 @@ pub fn spawn(
             trust_transition_pending,
             authoritative_active_model_state,
             lsp,
+            initial_lsp_session_protection,
             resource_scheduler,
             scheduler,
             write_scope,

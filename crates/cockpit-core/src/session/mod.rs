@@ -20,6 +20,7 @@
 
 #![allow(deprecated)]
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,6 +73,19 @@ pub struct SessionEventLineage {
     pub label: String,
 }
 
+/// Test-only observation of the root that completed worker boot. It exists to
+/// verify construction across the worker's snapshot/rebuild boundary without
+/// making the driver's live root frame externally observable in production.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct BootedRootProfile {
+    pub agent_name: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub tool_names: Vec<String>,
+    pub native_computer: Option<crate::computer::NativeComputerToolConfig>,
+}
+
 pub struct SessionCompactionRecord<'a> {
     pub successor_session_id: Uuid,
     pub successor_short_id: &'a str,
@@ -86,6 +100,93 @@ pub struct SessionCompactionRecord<'a> {
     pub tail_kept: usize,
     pub tail_trimmed: usize,
     pub tail_messages: &'a [crate::engine::message::Message],
+}
+
+/// Retained KB source bytes addressed by opaque, session-local read paths.
+/// They intentionally stay in memory: a resumed daemon cannot honestly claim
+/// it can still serve a prior process's retained source snapshot.
+#[derive(Default)]
+pub(crate) struct KnowledgeReadSnapshotStore {
+    entries: std::collections::HashMap<Uuid, KnowledgeReadSnapshot>,
+    /// Least-recently-used at the front. Snapshot citations are a bounded
+    /// convenience cache, not durable session state: retaining a newer source
+    /// must never make later searches unavailable for the life of a session.
+    recency: VecDeque<Uuid>,
+    total_bytes: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct KnowledgeReadSnapshot {
+    pub contents: String,
+    pub trust_required: bool,
+}
+
+const MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+impl KnowledgeReadSnapshotStore {
+    fn mark_knowledge_read_snapshot_recent(&mut self, id: Uuid) {
+        if let Some(position) = self.recency.iter().position(|candidate| *candidate == id) {
+            self.recency.remove(position);
+        }
+        self.recency.push_back(id);
+    }
+
+    fn retain(&mut self, contents: String, trust_required: bool, capacity: usize) -> Result<Uuid> {
+        if let Some(id) = self
+            .entries
+            .iter()
+            .find(|(_, snapshot)| {
+                snapshot.contents == contents && snapshot.trust_required == trust_required
+            })
+            .map(|(id, _)| *id)
+        {
+            self.mark_knowledge_read_snapshot_recent(id);
+            return Ok(id);
+        }
+        anyhow::ensure!(
+            contents.len() <= capacity,
+            "knowledge search source is larger than the per-session {} MiB cited-read cache",
+            capacity / (1024 * 1024)
+        );
+        while self.total_bytes > capacity - contents.len() {
+            let evicted_id = self.recency.pop_front().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge read snapshot cache lost its eviction order while retaining a source"
+                )
+            })?;
+            let evicted = self.entries.remove(&evicted_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge read snapshot cache eviction order references a missing source"
+                )
+            })?;
+            self.total_bytes = self
+                .total_bytes
+                .checked_sub(evicted.contents.len())
+                .context("knowledge read snapshot byte count underflow during eviction")?;
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(contents.len())
+            .context("knowledge read snapshot byte count overflow")?;
+        let id = Uuid::new_v4();
+        self.entries.insert(
+            id,
+            KnowledgeReadSnapshot {
+                contents,
+                trust_required,
+            },
+        );
+        self.recency.push_back(id);
+        Ok(id)
+    }
+
+    fn get(&mut self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
+        let snapshot = self.entries.get(&id).cloned();
+        if snapshot.is_some() {
+            self.mark_knowledge_read_snapshot_recent(id);
+        }
+        snapshot
+    }
 }
 
 tokio::task_local! {
@@ -350,6 +451,11 @@ pub struct Session {
     /// daemon's skill inventory reads this snapshot so conditional Hermes
     /// activation matches execution, including config tools and grants.
     active_tool_names: Mutex<std::collections::HashSet<String>>,
+    /// Final root construction evidence for worker integration tests. This is
+    /// deliberately test-only: production authority remains exclusively on
+    /// the driver's live root frame.
+    #[cfg(test)]
+    booted_root_profile: Mutex<Option<BootedRootProfile>>,
     /// Session-owned image-generation dispatch funnel installed by the daemon
     /// worker before agent turns begin. Isolated/test sessions leave it absent.
     image_generation_dispatch:
@@ -399,6 +505,9 @@ pub struct Session {
     /// set is a valid completed capture. A false value means worker startup
     /// was interrupted before the first root-definition-bound capture.
     knowledge_base_prompt_snapshot_captured: AtomicBool,
+    /// Exact KB files returned by search, retained only for follow-up native
+    /// `read` calls during this daemon lifetime.
+    knowledge_read_snapshots: Mutex<KnowledgeReadSnapshotStore>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -522,6 +631,26 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) fn retain_knowledge_read_snapshot(
+        &self,
+        contents: String,
+        trust_required: bool,
+    ) -> Result<Uuid> {
+        let mut snapshots = self
+            .knowledge_read_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.retain(contents, trust_required, MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES)
+    }
+
+    pub(crate) fn knowledge_read_snapshot(&self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
+        let mut snapshots = self
+            .knowledge_read_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.get(id)
+    }
+
     /// The session-owned knowledge-dream attachment-consent cell.
     pub(crate) fn dream_read_scope(
         &self,
@@ -1255,6 +1384,22 @@ impl Session {
             .iter()
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_booted_root_for_test(&self, root: &crate::engine::agent::Agent) {
+        *self.booted_root_profile.lock().unwrap() = Some(BootedRootProfile {
+            agent_name: root.name.clone(),
+            provider_id: root.model.provider_id().to_string(),
+            model_id: root.model.model_id_ref().to_string(),
+            tool_names: root.tools.names().into_iter().map(str::to_string).collect(),
+            native_computer: root.params.native_computer.clone(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn booted_root_profile_for_test(&self) -> Option<BootedRootProfile> {
+        self.booted_root_profile.lock().unwrap().clone()
     }
 
     pub fn model_system_prompt_snapshot(&self) -> Arc<ModelSystemPromptSnapshot> {
@@ -2086,6 +2231,21 @@ mod tests {
             assert!(scope.read().unwrap().is_some());
         }
         assert!(scope.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn knowledge_read_snapshots_evict_the_least_recently_used_source() {
+        let mut snapshots = KnowledgeReadSnapshotStore::default();
+        let first = snapshots.retain("one".to_string(), false, 6).unwrap();
+        let second = snapshots.retain("two".to_string(), false, 6).unwrap();
+
+        assert_eq!(snapshots.get(first).unwrap().contents, "one");
+        let third = snapshots.retain("six".to_string(), false, 6).unwrap();
+
+        assert!(snapshots.get(second).is_none());
+        assert_eq!(snapshots.get(first).unwrap().contents, "one");
+        assert_eq!(snapshots.get(third).unwrap().contents, "six");
+        assert_eq!(snapshots.total_bytes, 6);
     }
 
     #[tokio::test]

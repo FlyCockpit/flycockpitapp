@@ -172,7 +172,14 @@ impl KnowledgeBaseRegistryEntry {
 /// Remote KBs are served to arbitrary third-party agents, so a local-model
 /// trust promise is unenforceable and must be rejected at config load time.
 pub fn validate_knowledge_base_local_policy(entries: &[KnowledgeBaseRegistryEntry]) -> Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
     for entry in entries {
+        if !ids.insert(&entry.id) {
+            anyhow::bail!(
+                "knowledge base registry contains duplicate ID `{}`",
+                entry.id
+            );
+        }
         if matches!(&entry.source, KnowledgeBaseSource::Remote { .. }) && entry.trust_required {
             anyhow::bail!(
                 "knowledge base `{}` is remote and cannot set trustRequired; trustRequired is only enforceable for local knowledge bases",
@@ -361,6 +368,12 @@ pub struct ExtendedConfig {
     /// call site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
+
+    /// Display controlled by the standalone Computer primary. Real desktop is
+    /// the default and remains subject to the machine-local grant; virtual is
+    /// an explicit opt-in and is also suitable as a host fallback.
+    #[serde(default, skip_serializing_if = "ComputerTarget::is_default")]
+    pub computer_target: ComputerTarget,
 
     /// Layer-local opt-in for user-reviewed typed computer-use guidance
     /// proposals. Each layer (global, canonical machine-local project,
@@ -1220,6 +1233,21 @@ pub enum ComputerUseMode {
     Yolo,
 }
 
+/// Display target for the standalone Computer primary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerTarget {
+    Virtual,
+    #[default]
+    RealDesktop,
+}
+
+impl ComputerTarget {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl ComputerUseMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1743,6 +1771,7 @@ impl Default for ExtendedConfig {
             tools: HashMap::new(),
             web: WebConfig::default(),
             computer_use: None,
+            computer_target: ComputerTarget::default(),
             allow_computer_guidance_proposals: None,
             allow_remote_config: false,
             utility_model: None,
@@ -2725,6 +2754,7 @@ impl ExtendedConfigDoc {
         parse_field!("tools", tools);
         parse_field!("web", web);
         parse_field!("computer_use", computer_use);
+        parse_field!("computer_target", computer_target);
         parse_field!(
             "allow_computer_guidance_proposals",
             allow_computer_guidance_proposals
@@ -2753,13 +2783,8 @@ impl ExtendedConfigDoc {
                     cfg.knowledge_bases = entries;
                 }
                 Ok(_) | Err(_) => {
-                    tracing::warn!(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                    );
-                    warnings.push(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                            .to_string(),
-                    );
+                    tracing::warn!("ignored invalid `knowledgeBases` policy");
+                    warnings.push("ignored invalid `knowledgeBases` policy".to_string());
                 }
             }
         }
@@ -2913,18 +2938,14 @@ impl ExtendedConfigDoc {
         }
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
+        remove_malformed!("computer_target", ComputerTarget);
         remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
         if let Some(value) = obj.get("knowledgeBases") {
             match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
                 Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {}
                 Ok(_) | Err(_) => {
-                    tracing::warn!(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                    );
-                    warnings.push(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                            .to_string(),
-                    );
+                    tracing::warn!("ignored invalid `knowledgeBases` policy");
+                    warnings.push("ignored invalid `knowledgeBases` policy".to_string());
                     // An invalid upper registry must not reveal a lower one.
                     obj.insert("knowledgeBases".into(), serde_json::json!([]));
                 }

@@ -119,11 +119,22 @@ impl Driver {
         .into_iter()
         .map(str::to_string)
         .collect();
+        // Auto-selected skill bodies may carry Claude-style `!` commands.
+        // Treat those ambient shell launches exactly like every other opaque
+        // host writer: an attached local KB is read-only, not a write grant.
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let (selection, diagnostics) = crate::skills::auto_select::select_with_diagnostics(
             &self.cwd,
             &extended,
             &providers,
             self.redact.clone(),
+            local_knowledge_write_fence_active,
             Some(self.stack[0].agent.model.shutdown_gate()),
             &active_tools,
             &turns,

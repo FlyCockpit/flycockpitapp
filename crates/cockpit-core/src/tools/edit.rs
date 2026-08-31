@@ -249,7 +249,13 @@ impl Tool for EditTool {
             stage,
             normalized.len()
         );
-        if let Some(lsp) = &ctx.lsp {
+        // Diagnostics can spawn or reuse an opaque LSP host.  A completed
+        // native edit does not make an attached KB writable to that host.
+        if let Some(lsp) = &ctx.lsp
+            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
+                .await
+                .is_empty()
+        {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
         if let Some(note) =

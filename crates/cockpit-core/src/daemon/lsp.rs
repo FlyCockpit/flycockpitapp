@@ -90,11 +90,70 @@ pub struct LspManager {
 
 #[derive(Debug)]
 struct LspInner {
-    clients: Mutex<HashMap<ClientKey, Arc<LspClient>>>,
+    /// Serializes LSP host operations against protection-policy publication.
+    /// Readers retain this for the full lifetime of an opaque host operation,
+    /// including client startup; a writer publishes a new protected-root
+    /// policy only after those operations have drained.
+    operation_gate: RwLock<()>,
+    state: StdMutex<LspState>,
     statuses: RwLock<HashMap<String, LspServerStatus>>,
     prompted: Mutex<HashSet<String>>,
     installed: RwLock<HashMap<String, InstalledRecord>>,
     notices: StdMutex<Option<(EventSender, SharedRedactionTable)>>,
+}
+
+/// Evidence that an LSP operation has passed the manager-wide protection
+/// fence.  `client_for_file` requires this token so a new call site cannot
+/// spawn or hand out a client without holding the reader lease.
+struct LspOperationLease<'a> {
+    _gate: tokio::sync::RwLockReadGuard<'a, ()>,
+}
+
+/// Registry-wide LSP state.  The daemon owns one manager for every session,
+/// so the protection policy belongs beside the client cache rather than in a
+/// worker-local tool gate.  The operation gate serializes policy publication
+/// with host operations; this mutex keeps the policy and cache mutation atomic
+/// once that lease has been acquired.  No host-process await occurs while this
+/// state is locked.
+#[derive(Debug, Default)]
+struct LspState {
+    clients: HashMap<ClientKey, Arc<LspClient>>,
+    protected_roots_by_session: HashMap<uuid::Uuid, Vec<PathBuf>>,
+}
+
+/// Worker-lifetime owner for a session's contribution to the shared LSP
+/// policy.  Dropping it clears the contribution even when startup returns
+/// early, before `run_worker` reaches its normal `WorkerStop` teardown.
+pub(crate) struct LspSessionProtection {
+    manager: Arc<LspManager>,
+    session_id: uuid::Uuid,
+}
+
+impl Drop for LspSessionProtection {
+    fn drop(&mut self) {
+        self.manager.clear_session_protected_roots(self.session_id);
+    }
+}
+
+impl LspState {
+    fn root_is_protected(&self, root: &Path) -> bool {
+        self.protected_roots_by_session
+            .values()
+            .flatten()
+            .any(|protected| paths_overlap(root, protected))
+    }
+
+    fn evict_protected_clients(&mut self) -> Vec<Arc<LspClient>> {
+        let keys: Vec<_> = self
+            .clients
+            .keys()
+            .filter(|key| self.root_is_protected(&key.root))
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.clients.remove(&key))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +174,8 @@ impl LspManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(LspInner {
-                clients: Mutex::new(HashMap::new()),
+                operation_gate: RwLock::new(()),
+                state: StdMutex::new(LspState::default()),
                 statuses: RwLock::new(HashMap::new()),
                 prompted: Mutex::new(HashSet::new()),
                 installed: RwLock::new(HashMap::new()),
@@ -168,7 +228,8 @@ impl LspManager {
         if !config.lsp.enabled || !config.lsp.diagnostics.enabled {
             return String::new();
         }
-        let Some(client) = self.client_for_file(cwd, file, config).await else {
+        let operation = self.operation_lease().await;
+        let Some(client) = self.client_for_file(&operation, cwd, file, config).await else {
             return String::new();
         };
         let text = match tokio::fs::read_to_string(file).await {
@@ -205,7 +266,11 @@ impl LspManager {
         if !config.lsp.enabled {
             return "LSP is disabled.".to_string();
         }
-        let Some(client) = self.client_for_file(cwd, &req.file, config).await else {
+        let operation = self.operation_lease().await;
+        let Some(client) = self
+            .client_for_file(&operation, cwd, &req.file, config)
+            .await
+        else {
             return "No available LSP server for this file.".to_string();
         };
         let line = req.line.unwrap_or(1).saturating_sub(1);
@@ -229,6 +294,14 @@ impl LspManager {
         action: crate::daemon::proto::LspControlAction,
         config: &ExtendedConfig,
     ) -> String {
+        // Control actions can run install/uninstall commands or signal cached
+        // opaque hosts.  Keep the read lease through the action so a newly
+        // published protected root cannot race a no-KB session's control RPC.
+        let _operation = self.operation_lease().await;
+        if self.has_protected_roots() {
+            return "LSP control is unavailable while a session has a local knowledge base attached."
+                .to_string();
+        }
         let Some(recipe) = registry()
             .into_iter()
             .find(|r| r.id == server_id)
@@ -377,12 +450,79 @@ impl LspManager {
     }
 
     async fn restart(&self, server_id: &str) -> String {
-        let mut clients = self.inner.clients.lock().await;
-        let before = clients.len();
-        clients.retain(|key, _| key.server_id != server_id);
-        let stopped = before.saturating_sub(clients.len());
+        let stopped = {
+            let mut state = crate::sync::lock_or_recover(&self.inner.state);
+            let before = state.clients.len();
+            state.clients.retain(|key, _| key.server_id != server_id);
+            before.saturating_sub(state.clients.len())
+        };
         self.inner.statuses.write().await.remove(server_id);
         format!("Restarted LSP `{server_id}`; stopped {stopped} cached client(s).")
+    }
+
+    /// Publish the local-KB roots protected by one live session.  Protection is
+    /// daemon-wide because cached LSP hosts are shared by every session.
+    ///
+    /// This must be called before a configuration snapshot that adds or
+    /// changes a root is published.  The exclusive gate waits for every LSP
+    /// host operation (including in-progress initialization) to finish before
+    /// mutating the cache policy.  State is never held across an await.
+    pub async fn set_session_protected_roots(
+        &self,
+        session_id: uuid::Uuid,
+        protected_roots: Vec<PathBuf>,
+    ) -> usize {
+        let mut unique_roots = Vec::new();
+        for root in protected_roots {
+            if !unique_roots.iter().any(|existing| existing == &root) {
+                unique_roots.push(root);
+            }
+        }
+        let _publication = self.inner.operation_gate.write().await;
+        let removed = {
+            let mut state = crate::sync::lock_or_recover(&self.inner.state);
+            if unique_roots.is_empty() {
+                state.protected_roots_by_session.remove(&session_id);
+            } else {
+                state
+                    .protected_roots_by_session
+                    .insert(session_id, unique_roots);
+            }
+            state.evict_protected_clients()
+        };
+        for client in &removed {
+            client.terminate();
+        }
+        removed.len()
+    }
+
+    /// Remove a stopped session's contribution to the daemon-wide LSP policy.
+    /// Removing a root only loosens policy, so teardown need not await the
+    /// operation gate (and can remain safe in `Drop`).
+    pub fn clear_session_protected_roots(&self, session_id: uuid::Uuid) -> usize {
+        let mut state = crate::sync::lock_or_recover(&self.inner.state);
+        if state
+            .protected_roots_by_session
+            .remove(&session_id)
+            .is_some()
+        {
+            1
+        } else {
+            0
+        }
+    }
+
+    pub(crate) async fn protect_session(
+        self: &Arc<Self>,
+        session_id: uuid::Uuid,
+        protected_roots: Vec<PathBuf>,
+    ) -> LspSessionProtection {
+        self.set_session_protected_roots(session_id, protected_roots)
+            .await;
+        LspSessionProtection {
+            manager: self.clone(),
+            session_id,
+        }
     }
 
     async fn notice(&self, text: String) {
@@ -395,8 +535,21 @@ impl LspManager {
         }
     }
 
+    async fn operation_lease(&self) -> LspOperationLease<'_> {
+        LspOperationLease {
+            _gate: self.inner.operation_gate.read().await,
+        }
+    }
+
+    fn has_protected_roots(&self) -> bool {
+        !crate::sync::lock_or_recover(&self.inner.state)
+            .protected_roots_by_session
+            .is_empty()
+    }
+
     async fn client_for_file(
         &self,
+        _operation: &LspOperationLease<'_>,
         cwd: &Path,
         file: &Path,
         config: &ExtendedConfig,
@@ -421,15 +574,34 @@ impl LspManager {
         let idle_ttl = Duration::from_secs(config.lsp.idle_ttl_secs);
         let max_cached = config.lsp.max_cached_clients.max(1);
         let cached = {
-            let mut clients = self.inner.clients.lock().await;
-            evict_lsp_clients(&mut clients, Instant::now(), idle_ttl, max_cached);
-            clients.get(&key).cloned()
+            let mut state = crate::sync::lock_or_recover(&self.inner.state);
+            if state.root_is_protected(&root) {
+                return None;
+            }
+            evict_lsp_clients(&mut state.clients, Instant::now(), idle_ttl, max_cached);
+            state.clients.get(&key).cloned()
         };
         if let Some(client) = cached
             && !client.is_broken().await
         {
-            client.touch();
-            return Some(client);
+            // A refresh can publish a protected root while `is_broken` awaits.
+            // Revalidate that this exact cached client is still admitted before
+            // handing it back to the caller.
+            let reusable = {
+                let state = crate::sync::lock_or_recover(&self.inner.state);
+                !state.root_is_protected(&root)
+                    && state
+                        .clients
+                        .get(&key)
+                        .is_some_and(|cached| Arc::ptr_eq(cached, &client))
+            };
+            if reusable {
+                client.touch();
+                return Some(client);
+            }
+        }
+        if crate::sync::lock_or_recover(&self.inner.state).root_is_protected(&root) {
+            return None;
         }
         if !lsp_recipe_available(&recipe, cwd) {
             self.handle_missing(&recipe, cwd, config).await;
@@ -438,11 +610,26 @@ impl LspManager {
         match LspClient::spawn(recipe.clone(), root).await {
             Ok(client) => {
                 let client = Arc::new(client);
-                {
-                    let mut clients = self.inner.clients.lock().await;
-                    clients.insert(key, client.clone());
-                    evict_lsp_clients(&mut clients, Instant::now(), idle_ttl, max_cached);
-                }
+                let admitted = {
+                    let mut state = crate::sync::lock_or_recover(&self.inner.state);
+                    if state.root_is_protected(&key.root) {
+                        None
+                    } else {
+                        evict_lsp_clients(&mut state.clients, Instant::now(), idle_ttl, max_cached);
+                        Some(
+                            state
+                                .clients
+                                .entry(key)
+                                .or_insert_with(|| client.clone())
+                                .clone(),
+                        )
+                    }
+                };
+                let Some(client) = admitted else {
+                    // The policy changed while the opaque host was starting.
+                    // Dropping this last reference terminates it immediately.
+                    return None;
+                };
                 self.inner
                     .statuses
                     .write()
@@ -733,6 +920,12 @@ impl LspClient {
         *self.broken.write().await = true;
     }
 
+    fn terminate(&self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            cockpit_host::process::terminate_group_start(&mut child);
+        }
+    }
+
     async fn request<P, R>(&self, method: &str, params: P) -> Result<R>
     where
         P: serde::Serialize,
@@ -967,10 +1160,19 @@ async fn remove_lsp_pending(
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.try_lock() {
-            cockpit_host::process::terminate_group_start(&mut child);
-        }
+        self.terminate();
     }
+}
+
+/// Workspace and knowledge roots overlap whenever either could contain the
+/// other.  Prefer symlink-aware containment, with a lexical fallback for a
+/// configured-but-not-yet-created KB root; this can only stop an extra client,
+/// never expand filesystem authority.
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    cockpit_host::path_containment::contained_under(left, right)
+        || cockpit_host::path_containment::contained_under(right, left)
+        || left.starts_with(right)
+        || right.starts_with(left)
 }
 
 async fn read_lsp_message(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<Value> {
@@ -1555,6 +1757,103 @@ mod tests {
         let cfg = crate::config::extended::LspConfig::default();
         assert_eq!(cfg.idle_ttl_secs, 30 * 60);
         assert_eq!(cfg.max_cached_clients, 16);
+    }
+
+    #[test]
+    fn protected_knowledge_root_overlaps_workspace_root_in_both_directions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let knowledge = workspace.path().join("knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+
+        assert!(paths_overlap(workspace.path(), &knowledge));
+        assert!(paths_overlap(&knowledge, workspace.path()));
+        let sibling = workspace
+            .path()
+            .parent()
+            .unwrap()
+            .join("unrelated-lsp-workspace");
+        assert!(!paths_overlap(workspace.path(), &sibling));
+    }
+
+    #[tokio::test]
+    async fn session_protection_is_daemon_wide_and_clears_with_its_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        let knowledge = workspace.path().join("knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        let manager = Arc::new(LspManager::new());
+        let protected_session = uuid::Uuid::new_v4();
+        let unrelated_session = uuid::Uuid::new_v4();
+
+        let protection = manager
+            .protect_session(protected_session, vec![knowledge.clone()])
+            .await;
+        // A different session without a KB cannot weaken the registry-wide
+        // fence, and both parent/child workspace shapes remain protected.
+        manager
+            .set_session_protected_roots(unrelated_session, Vec::new())
+            .await;
+        assert!(
+            crate::sync::lock_or_recover(&manager.inner.state).root_is_protected(workspace.path())
+        );
+        assert!(crate::sync::lock_or_recover(&manager.inner.state).root_is_protected(&knowledge));
+
+        drop(protection);
+        assert!(
+            !crate::sync::lock_or_recover(&manager.inner.state).root_is_protected(workspace.path())
+        );
+
+        // A resumed worker for the same session installs a fresh policy after
+        // its prior worker lifetime ended.
+        manager
+            .set_session_protected_roots(protected_session, vec![knowledge])
+            .await;
+        assert!(
+            crate::sync::lock_or_recover(&manager.inner.state).root_is_protected(workspace.path())
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_root_publication_waits_for_lsp_operations() {
+        let manager = Arc::new(LspManager::new());
+        let session_id = uuid::Uuid::new_v4();
+        let root = PathBuf::from("/protected-lsp-root");
+        let operation = manager.operation_lease().await;
+        let publication_manager = manager.clone();
+        let publication = tokio::spawn(async move {
+            publication_manager
+                .set_session_protected_roots(session_id, vec![root])
+                .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !publication.is_finished(),
+            "policy publication must wait for the active LSP operation"
+        );
+        drop(operation);
+        publication.await.unwrap();
+        assert!(manager.has_protected_roots());
+    }
+
+    #[tokio::test]
+    async fn lsp_control_is_blocked_by_any_session_protected_root() {
+        let manager = LspManager::new();
+        manager
+            .set_session_protected_roots(uuid::Uuid::new_v4(), vec![PathBuf::from("/knowledge")])
+            .await;
+
+        let message = manager
+            .control(
+                Path::new("/"),
+                "never-execute",
+                crate::daemon::proto::LspControlAction::Check,
+                &ExtendedConfig::default(),
+            )
+            .await;
+        assert_eq!(
+            message,
+            "LSP control is unavailable while a session has a local knowledge base attached."
+        );
     }
 
     #[test]

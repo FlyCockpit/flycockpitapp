@@ -1709,6 +1709,8 @@ fn build_manifest_conn(
                 "short_id": session.short_id,
                 "parent_session_id": session.parent_session_id.map(|p| p.to_string()),
                 "fork_point_turn_id": session.fork_point_turn_id,
+                "assistant_name": session.assistant_name,
+                "is_assistant_thread": session.is_assistant_thread,
                 "active_model": active_model,
                 "session_entry_mode": session.session_entry_mode,
                 "active_agent": session.active_agent,

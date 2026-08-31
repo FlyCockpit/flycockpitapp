@@ -2599,14 +2599,17 @@ impl DaemonContext {
         current_redaction(&self.global_redaction)
     }
 
-    /// Ephemeral daemons have no durable media root. Attachment paths must
-    /// therefore use storage only while this owner is persistent.
+    /// Return the media authority installed for this daemon.
+    ///
+    /// A production ephemeral owner normally does not provision a media root,
+    /// but an explicitly installed authority is still valid for the lifetime
+    /// of that owner (and is how in-process attachment flows are exercised).
+    /// Do not use the daemon lifetime as a second, unrelated availability
+    /// gate: callers already fail closed when no authority was installed.
     pub(crate) fn active_media_storage_recovery(
         &self,
     ) -> Option<Arc<crate::media_storage::MediaStorageRecovery>> {
-        (!self.paths.ephemeral)
-            .then(|| self.media_storage_recovery.clone())
-            .flatten()
+        self.media_storage_recovery.clone()
     }
 
     /// Begin last-client teardown only after every worker is idle. Persistent

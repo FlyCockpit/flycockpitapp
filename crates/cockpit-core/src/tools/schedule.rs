@@ -34,7 +34,7 @@ use crate::engine::schedule::spec::{
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
 /// The fixed schema for the `schedule` meta-tool.
-pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work without blocking the conversation; choose `action` (`loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, `list`) and put per-action details in `args`; use limit=1 for one-shot timers; set idle=true to reset a bounded timer after each user message";
+pub const SCHEDULE_DESCRIPTION: &str = "Schedule loop/background work: choose an `action`, put details in `args`, use limit=1 for one-shot timers, and idle=true to reset a bounded timer after each user message";
 
 /// The verbose-steering `schedule` description
 /// (implementation note): explicit steering for the

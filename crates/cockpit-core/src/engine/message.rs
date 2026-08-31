@@ -3582,7 +3582,8 @@ mod tests {
                 .iter()
                 .map(|item| item.delivery_class)
                 .collect::<Vec<_>>(),
-            vec![QueueDeliveryClass::Held, QueueDeliveryClass::Held]
+            vec![QueueDeliveryClass::Steering, QueueDeliveryClass::Held],
+            "a send-now item retains Held durably but is steering while it is consumed"
         );
     }
 

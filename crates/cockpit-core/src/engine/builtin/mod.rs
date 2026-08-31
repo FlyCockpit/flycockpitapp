@@ -6346,7 +6346,26 @@ pub(crate) mod tests {
             }"#,
         );
 
-        let agent = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let mut args = disk_model_spawn_args(tmp.path(), "vision");
+        // Delegation is host-granted vNext authority, not an implicit
+        // consequence of an embedded manifest. Mirror the daemon-owned root
+        // construction so this surface test exercises Computer's declared
+        // builder/explore delegation contract.
+        let host = Arc::new(crate::agents::VnextHostPolicy::for_session_config(
+            &args.config.extended(),
+        ));
+        let definition = crate::agents::embedded_internal_default("Computer")
+            .expect("Computer primary definition");
+        args.vnext_grant = Some(
+            definition
+                .vnext
+                .as_ref()
+                .expect("Computer has a vNext declaration")
+                .resolve_grant(&host)
+                .expect("Computer vNext grant resolves"),
+        );
+        args.vnext_host_policy = Some(host);
+        let agent = load("Computer", &args).unwrap();
         let native = agent
             .params
             .native_computer

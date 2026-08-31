@@ -3519,18 +3519,23 @@ mod tests {
         let supplied_root = project_root.join(".");
         let canonical_root = std::fs::canonicalize(&project_root).unwrap();
         let db = Db::open_in_memory().unwrap();
-        let a = Session::create_for_test(
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let a = Session::create(
             db.clone(),
             supplied_root.clone(),
             "builder",
+            &crate::config::extended::ExtendedConfig::default(),
             crate::session::test_redaction_key_resolver(),
+            vault.clone(),
         )
         .unwrap();
-        let b = Session::create_for_test(
+        let b = Session::create(
             db.clone(),
             supplied_root,
             "builder",
+            &crate::config::extended::ExtendedConfig::default(),
             crate::session::test_redaction_key_resolver(),
+            vault,
         )
         .unwrap();
 

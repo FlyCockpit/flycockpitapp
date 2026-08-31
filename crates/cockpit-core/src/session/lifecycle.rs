@@ -206,13 +206,16 @@ impl Session {
 
     #[cfg(any(test, feature = "test-support"))]
     fn test_workspace_root(project_root: PathBuf) -> (PathBuf, bool) {
-        // Test fixtures commonly use stable synthetic paths (for example
-        // `/proj`) to exercise path policy without creating host files.
-        // Prefer production identity when the fixture root exists.
-        match std::fs::canonicalize(&project_root) {
-            Ok(canonical_root) => (canonical_root, true),
-            Err(_) => (project_root, false),
-        }
+        // Test-support constructors must not publish production workspace
+        // markers. Test runners create and remove temporary directories at a
+        // high rate, so their filesystem identities can be reused while the
+        // process-global durable state directory retains the old marker.
+        // Production constructors remain the only path that proves an on-disk
+        // workspace identity and initializes durable workspace scratch.
+        (
+            std::fs::canonicalize(&project_root).unwrap_or(project_root),
+            false,
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -790,9 +793,9 @@ impl Session {
             canonical_workspace_root(&project_root)
                 .context("canonicalizing persisted session workspace root")?
         } else {
-            // Test-support constructors deliberately permit synthetic roots
-            // such as `/proj`. Preserve canonicalization when possible so
-            // fixtures using real roots keep production-equivalent identity.
+            // Test-support project ids are derived from a stable path spelling
+            // rather than a host directory identity, and are never published
+            // through a production workspace marker.
             std::fs::canonicalize(&project_root).unwrap_or(project_root)
         };
         anyhow::ensure!(

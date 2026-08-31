@@ -96,6 +96,25 @@ fn bind_test_socket() -> (tempfile::TempDir, PathBuf, UnixListener) {
     (dir, socket, listener)
 }
 
+fn canonical_ephemeral_paths() -> crate::daemon::DaemonPaths {
+    let mut paths = crate::daemon::DaemonPaths::resolve_canonical()
+        .expect("resolve isolated canonical daemon paths");
+    paths.ephemeral = true;
+    paths
+}
+
+fn publish_test_ephemeral_owner(paths: &crate::daemon::DaemonPaths) -> std::process::Child {
+    let executable = std::fs::canonicalize("/bin/sleep").expect("canonical fixture executable");
+    let child = std::process::Command::new(&executable)
+        .arg("30")
+        .spawn()
+        .expect("spawn ephemeral owner fixture child");
+    cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, child.id(), &executable)
+        .expect("publish ephemeral owner receipt");
+    crate::daemon::write_endpoint_record(paths).expect("publish ephemeral endpoint record");
+    child
+}
+
 async fn send_daemon_hello(
     daemon: &mut ProtoStream<UnixStream>,
     daemon_version: impl Into<String>,
@@ -153,6 +172,48 @@ async fn accept_restart_if_idle(daemon: &mut ProtoStream<UnixStream>) {
         ))
         .await
         .unwrap();
+}
+
+async fn accept_live_promotion_or_restart(
+    daemon: &mut ProtoStream<UnixStream>,
+    listener: &UnixListener,
+) {
+    let request = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request { id, request, .. } => (id, request),
+            other => panic!("expected promotion request, got {other:?}"),
+        },
+        other => panic!("expected promotion request envelope, got {other:?}"),
+    };
+    match request.1 {
+        Request::RestartIfIdle => {
+            daemon
+                .send(&Envelope::response(
+                    request.0,
+                    Response::RestartDecision {
+                        will_restart: true,
+                        reason: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        Request::PromoteToPersistent => {
+            daemon
+                .send(&Envelope::response(request.0, Response::Unknown))
+                .await
+                .unwrap();
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept restart fallback client");
+            let mut fallback = ProtoStream::new(stream);
+            send_daemon_hello(&mut fallback, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut fallback).await;
+            accept_restart_if_idle(&mut fallback).await;
+        }
+        other => panic!("expected PromoteToPersistent or RestartIfIdle, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -374,18 +435,23 @@ async fn accepted_assistant_promotion_replaces_the_ephemeral_owner_with_persiste
     env.set_var("XDG_RUNTIME_DIR", &runtime);
     let _promote = crate::daemon::enable_in_process_auto_promote();
 
-    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
-    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion");
+    let paths = canonical_ephemeral_paths();
+    let mut owner_child = publish_test_ephemeral_owner(&paths);
     let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
     let socket = paths.socket.clone();
+    let predecessor_paths = paths.clone();
     let predecessor = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept promotion client");
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
         confirm_client_lifetime(&mut daemon).await;
-        accept_restart_if_idle(&mut daemon).await;
+        accept_live_promotion_or_restart(&mut daemon, &listener).await;
         drop(daemon);
         drop(listener);
+        owner_child.kill().expect("stop released predecessor child");
+        owner_child.wait().expect("reap released predecessor child");
+        std::fs::remove_file(predecessor_paths.pid_file)
+            .expect("release accepted predecessor receipt");
         std::fs::remove_file(&socket).expect("release accepted predecessor socket");
     });
 
@@ -432,10 +498,14 @@ fn promoted_lifecycle_resolution_preserves_an_independent_startup_notice() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
-    let root = tempfile::tempdir().expect("ephemeral promotion socket root");
-    let paths = temp_ephemeral_paths(root.path(), "assistant-promotion-timeout");
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
+    let paths = canonical_ephemeral_paths();
+    let mut owner_child = publish_test_ephemeral_owner(&paths);
     let listener = UnixListener::bind(&paths.socket).expect("bind ephemeral promotion socket");
     let socket = paths.socket.clone();
+    let predecessor_paths = paths.clone();
     let predecessor = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept promotion client");
         let mut daemon = ProtoStream::new(stream);
@@ -444,6 +514,10 @@ async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
         accept_restart_if_idle(&mut daemon).await;
         drop(daemon);
         drop(listener);
+        owner_child.kill().expect("stop released predecessor child");
+        owner_child.wait().expect("reap released predecessor child");
+        std::fs::remove_file(predecessor_paths.pid_file)
+            .expect("release accepted predecessor receipt");
         std::fs::remove_file(&socket).expect("release accepted predecessor socket");
     });
 

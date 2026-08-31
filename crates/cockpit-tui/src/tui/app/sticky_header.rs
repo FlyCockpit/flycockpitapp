@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::render::chat_visible_top;
-use super::{App, HistoryEntryId};
+use super::{App, HistoryEntryId, MouseGestureInvalidation};
 use crate::tui::history::HistoryEntry;
 use crate::tui::pins_overlay::{PIN_YELLOW, preview_text_rows};
 use crate::tui::theme::{MUTED_COLOR_INDEX, TRANSCRIPT_HOVER_BG};
@@ -67,13 +67,13 @@ impl App {
     }
 
     fn apply_sticky_visibility(&mut self, pane: Rect, visible: bool) {
-        // A selection is expressed in the live terminal-cell grid. Carving
-        // or releasing the header changes that grid, so retaining a selection
-        // would make its coordinates point at different transcript content.
-        // Preserve the scroll offset, but invalidate the coordinate-based
-        // selection whenever visibility flips.
-        if self.sticky_header_area.is_some() != visible {
-            self.selection = None;
+        let was_visible = self.sticky_header_area.is_some();
+        if was_visible != visible {
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                self.event_loop_monotonic_now,
+            );
+            self.chat_scroll_anchor = None;
         }
         self.sticky_header_area = visible.then(|| Rect {
             x: pane.x,

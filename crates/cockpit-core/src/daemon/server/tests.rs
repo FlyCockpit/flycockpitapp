@@ -10711,6 +10711,7 @@ async fn fork_session_remote_path_commits_transactional_ledger() {
         parent_session_id: parent.session_id,
         fork_point_turn_id: None,
         ephemeral: false,
+        fresh_thread: false,
     };
     let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
         .await
@@ -19221,6 +19222,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             parent_session_id: session_id,
             fork_point_turn_id: None,
             ephemeral: false,
+            fresh_thread: false,
         },
         "discard_session" => Request::DiscardSession { session_id },
         "btw_create" => Request::CreateBtwFork {
@@ -24285,6 +24287,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     parent_session_id: session.session_id,
                     fork_point_turn_id: None,
                     ephemeral: false,
+                    fresh_thread: false,
                 },
             )
             .await
@@ -24471,6 +24474,7 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
             parent_session_id: missing,
             fork_point_turn_id: None,
             ephemeral: false,
+            fresh_thread: false,
         },
         "discard_session" => Request::DiscardSession {
             session_id: session.session_id,
@@ -24941,6 +24945,47 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         }
         other => panic!("unexpected in-memory/global case {other}"),
     }
+}
+
+#[tokio::test]
+async fn lsp_control_is_denied_for_an_attached_session_with_a_local_knowledge_base() {
+    let ctx = test_ctx();
+    let workspace = tempfile::tempdir().unwrap();
+    let knowledge = workspace.path().join("knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    let (mut state, _) = attached_state(&ctx, workspace.path()).await;
+    let handle = state.attached.as_ref().unwrap().handle.clone();
+    let mut snapshot = handle.config_snapshot();
+    snapshot.extended.knowledge_bases.push(
+        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+            "local-kb".into(),
+            "Local KB".into(),
+            "test local knowledge".into(),
+            crate::config::extended::KnowledgeBaseSource::Local { path: knowledge },
+            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+        ),
+    );
+    handle.set_full_config_snapshot_for_tests(snapshot);
+
+    let error = handle_request(
+        Request::LspControl {
+            // The selected session's snapshot, not this path, owns the fence.
+            project_root: workspace.path().to_string_lossy().into_owned(),
+            server_id: "rust-analyzer".into(),
+            action: proto::LspControlAction::Check,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("local knowledge base blocks every LSP control action");
+
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert!(error.message.contains("local knowledge base"));
 }
 
 fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
@@ -26161,6 +26206,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 parent_session_id,
                 fork_point_turn_id: None,
                 ephemeral: false,
+                fresh_thread: false,
             },
             kind: "fork_session",
             session_id: Some(parent_session_id),

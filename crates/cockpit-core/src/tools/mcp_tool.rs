@@ -130,7 +130,8 @@ impl Tool for McpTool {
         // configured third-party server, including one with filesystem or
         // command access. This also protects direct Tool callers from
         // bypassing the common dispatcher.
-        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())?;
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name()).await?;
+        crate::knowledge::ensure_mcp_host_access(ctx).await?;
 
         // The script may perform discovery as well as invocation. Discovery
         // can start a configured stdio MCP server, so the whole opaque MCP
@@ -231,10 +232,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_model_cannot_reach_configured_mcp_through_trusted_kb() {
+    async fn mcp_does_not_spawn_configured_server_for_attached_local_kb() {
         let tmp = tempfile::tempdir().unwrap();
         let protected_root = tmp.path().join(".cockpit/knowledge");
         std::fs::create_dir_all(&protected_root).unwrap();
+        let marker = tmp.path().join("mcp-server-spawned");
+
+        let mut mcp_config = crate::mcp::config::McpConfig::default();
+        mcp_config.servers.insert(
+            "sentinel".to_string(),
+            crate::mcp::config::ServerConfig {
+                transport: crate::mcp::config::Transport::Stdio,
+                endpoint: None,
+                command: Some("sh".to_string()),
+                args: vec!["-c".to_string(), format!("touch {}", marker.display())],
+                env: Default::default(),
+                env_credential_refs: Default::default(),
+                auth: Default::default(),
+                mode: Default::default(),
+                enabled: true,
+                cache_ttl_secs: 0,
+                connect_timeout_secs: None,
+                timeout_secs: None,
+                profiles: Default::default(),
+            },
+        );
 
         let entry = crate::config::extended::KnowledgeBaseRegistryEntry::new(
             "private".to_string(),
@@ -246,10 +268,13 @@ mod tests {
             crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
             None,
             None,
-            true,
+            false,
             crate::config::extended::KnowledgeBaseMergePolicy::Auto,
         );
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.mcp_resolver = crate::mcp::resolver::EffectiveCatalogResolver::from_catalog(
+            crate::mcp::resolver::EffectiveCatalog::from_mcp_config(&mcp_config),
+        );
         ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
@@ -263,17 +288,23 @@ mod tests {
 
         let error = McpTool
             .call(
-                serde_json::json!({ "script": "mcp.invoke('local', 'read', {})" }),
+                serde_json::json!({ "script": "mcp.invoke('sentinel', 'read', {})" }),
                 &ctx,
             )
             .await
-            .expect_err("untrusted models must not reach opaque MCP servers");
+            .expect_err("MCP must be fenced before a configured server is spawned");
 
         assert!(error.to_string().contains("access denied"), "{error:#}");
         assert!(error.to_string().contains("mcp"), "{error:#}");
         assert!(
-            error.to_string().contains("requires a trusted model"),
+            error.to_string().contains(
+                "MCP is unavailable because this workspace contains a local knowledge base"
+            ),
             "{error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "the configured MCP server must not spawn before the local-KB host fence rejects it"
         );
     }
 

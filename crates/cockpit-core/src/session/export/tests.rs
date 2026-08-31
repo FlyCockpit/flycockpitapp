@@ -109,6 +109,7 @@ async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> Sessio
             parent_session_id,
             None,
             false,
+            false,
             Uuid::new_v4(),
             chrono::Utc::now().timestamp_millis(),
         )

@@ -1299,7 +1299,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v21 includes the V2 tagged ingress envelope,
+/// Current wire schema version. v21 includes first-class assistant-thread
+/// creation and durable lineage projections, alongside the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
 /// daemon-owned setup inventory, bounded base64 media previews, the

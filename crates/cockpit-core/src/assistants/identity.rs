@@ -858,6 +858,7 @@ mod tests {
         (
             ToolCtx {
                 agent_id: "helper".to_string(),
+                allowed_knowledge_bases: None,
                 executing_model_trusted: false,
                 knowledge_access_trusted: false,
                 caller_model: None,

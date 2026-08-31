@@ -2310,7 +2310,7 @@ fn rebuild_history(
                             additional_params: None,
                         };
                         pending.calls.push(call.clone());
-                        let result_content = ev
+                        let canonical_result = ev
                             .data
                             .get("canonical_output")
                             .and_then(|value| {
@@ -2322,7 +2322,28 @@ fn rebuild_history(
                             .and_then(|parts| {
                                 crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
                             })
-                            .and_then(|parts| parts.to_rig_contents().ok())
+                            .and_then(|parts| parts.to_rig_contents().ok());
+                        let projection_required = ev
+                            .data
+                            .get("model_projection_required")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let canonical_text = ev
+                            .data
+                            .get("canonical_output_text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|text| vec![ToolResultContent::text(text.to_string())]);
+                        let result_content = canonical_result
+                            .or_else(|| projection_required.then(|| canonical_text).flatten());
+                        if projection_required && result_content.is_none() {
+                            return Err(anyhow::Error::new(RehydrateRepairRequired::new(
+                                "missing_model_projection",
+                                vec![call_id.to_string()],
+                                Some(ev.seq.saturating_sub(1)),
+                                "model-ephemeral structured result projection is missing or malformed; refusing unprojected replay",
+                            )));
+                        }
+                        let result_content = result_content
                             .unwrap_or_else(|| vec![ToolResultContent::text(tc.output.clone())]);
                         pending
                             .results

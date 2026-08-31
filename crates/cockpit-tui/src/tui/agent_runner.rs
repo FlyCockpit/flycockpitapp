@@ -3592,6 +3592,7 @@ pub fn fork_session_blocking(
     parent_session_id: uuid::Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
+    fresh_thread: bool,
 ) -> Result<(uuid::Uuid, String), String> {
     match request_on_endpoint(
         endpoint,
@@ -3599,6 +3600,7 @@ pub fn fork_session_blocking(
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
+            fresh_thread,
         },
     )? {
         Response::Forked {

@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use crate::engine::TurnEvent;
 use crate::engine::tool::{
-    ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolOutput, ToolOutputSidecar,
-    ToolPresentation, single_line_preview, string_field,
+    ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolEffect, ToolOutput,
+    ToolOutputSidecar, ToolPresentation, single_line_preview, string_field,
 };
 use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
@@ -152,6 +152,18 @@ impl Tool for BashTool {
         Self::declared_binary_requirements()
     }
 
+    fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {
+        // A non-zero shell exit says nothing about effects that occurred
+        // before it (for example, `touch marker && false`). A timeout or
+        // cancellation with an unknown host effect is likewise conservative.
+        // Only the lexical read-only proof may discard an idle wake action.
+        if bash_command_is_proven_read_only(args.get("command").and_then(Value::as_str)) {
+            ToolEffect::ReadOnly
+        } else {
+            ToolEffect::Dynamic
+        }
+    }
+
     fn honors_dispatch_cancel(&self) -> bool {
         true
     }
@@ -198,6 +210,34 @@ impl Tool for BashTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         call_bash_inner(&self.prelude, args, ctx, BashRunOptions::default()).await
+    }
+}
+
+/// A narrow, lexical proof for shell calls that cannot change state. This is
+/// intentionally an allowlist rather than a shell parser: uncertain syntax or
+/// commands retain Bash's dynamic effect and therefore stay durable after a
+/// successful idle wake.
+fn bash_command_is_proven_read_only(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    if command.is_empty()
+        || command.contains(['\n', '\r', ';', '|', '&', '>', '<', '`', '$', '(', ')'])
+    {
+        return false;
+    }
+    let mut words = command.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    match program {
+        "pwd" | "true" | "false" | "echo" | "printf" | "cat" | "head" | "tail" | "ls" | "grep"
+        | "stat" | "wc" | "which" => true,
+        "git" => matches!(
+            words.next(),
+            Some("status" | "diff" | "log" | "show" | "rev-parse")
+        ),
+        _ => false,
     }
 }
 
@@ -385,7 +425,22 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
-    let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx)?;
+    let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots(ctx)
+        .await?
+        .into_iter()
+        .map(|path| crate::tools::shell_sandbox::ExtraSandboxPath {
+            kind: "attached_knowledge_base".to_string(),
+            path,
+            access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        })
+        .collect::<Vec<_>>();
+    let mut denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
+    let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+    )
+    .await;
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -471,7 +526,11 @@ async fn call_bash_inner(
             "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    if (!denied_knowledge_paths.is_empty() || !identity_denied_paths.is_empty())
+    // SOUL/USER and untrusted knowledge bases use the same hard read fence.
+    // Keep the identity list separately for diagnostics, then include it in
+    // the sandbox policy passed to the process launcher.
+    denied_knowledge_paths.extend(identity_denied_paths.iter().cloned());
+    if (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
         && options.force_unconfined
     {
         return Ok(ToolOutput::text(
@@ -481,7 +540,7 @@ async fn call_bash_inner(
     let sandbox_on = if ctx.write_scope.is_some()
         || ctx.workspace_lease.is_some()
         || !denied_knowledge_paths.is_empty()
-        || !identity_denied_paths.is_empty()
+        || !write_denied_knowledge_paths.is_empty()
     {
         true
     } else {
@@ -500,9 +559,11 @@ async fn call_bash_inner(
         && ctx.workspace_lease.is_none()
         && identity_denied_paths.is_empty()
         && ctx.session.sandbox_mode().is_container();
-    if is_container_run && !denied_knowledge_paths.is_empty() {
+    if is_container_run
+        && (!denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty())
+    {
         return Ok(ToolOutput::text(
-            "Access denied: bash is unavailable for this model because container execution cannot exclude a local knowledge base that requires a trusted model.",
+            "Access denied: bash is unavailable because container execution cannot enforce the local knowledge-base filesystem fence.",
         ));
     }
     // Reject legacy sealed binding fields before any lookup or spawn.
@@ -579,7 +640,11 @@ async fn call_bash_inner(
         // Not consulted on these paths; the gate ignores it.
         crate::tools::shell_sandbox::SandboxAvailability::Available
     };
-    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability);
+    let gate = crate::tools::shell_sandbox::gate_decision_requiring_confinement(
+        sandbox_on,
+        !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+        &availability,
+    );
 
     if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
         // Sandbox enabled but cannot initialize: record the accurate
@@ -707,10 +772,9 @@ async fn call_bash_inner(
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
-    let extra_sandbox_paths =
+    let mut extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
-    let mut denied_paths = denied_knowledge_paths;
-    denied_paths.extend(identity_denied_paths);
+    extra_sandbox_paths.extend(attached_knowledge_paths);
     let sandbox_cwd = ctx
         .workspace_lease
         .as_ref()
@@ -744,7 +808,8 @@ async fn call_bash_inner(
         &scrub,
         &session_env,
         &extra_sandbox_paths,
-        &denied_paths,
+        &denied_knowledge_paths,
+        &write_denied_knowledge_paths,
         ctx,
         timeout_ms,
         &mut resource_lease,
@@ -820,7 +885,8 @@ async fn call_bash_inner(
     let mut classified_denial_action_note = None;
     if confine
         && !options.escalated
-        && denied_paths.is_empty()
+        && denied_knowledge_paths.is_empty()
+        && write_denied_knowledge_paths.is_empty()
         && ctx.write_scope.is_none()
         && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
@@ -888,7 +954,8 @@ async fn call_bash_inner(
                 &scrub,
                 &session_env,
                 &extra_sandbox_paths,
-                &denied_paths,
+                &denied_knowledge_paths,
+                &write_denied_knowledge_paths,
                 ctx,
                 timeout_ms,
                 &mut resource_lease,
@@ -2671,6 +2738,7 @@ async fn run_shell(
     session_env: &std::collections::HashMap<String, String>,
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     denied_knowledge_paths: &[PathBuf],
+    write_denied_knowledge_paths: &[PathBuf],
     ctx: &ToolCtx,
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
@@ -2711,6 +2779,7 @@ async fn run_shell(
                 .map(|lease| lease.allows_write())
                 .unwrap_or(true),
             denied_knowledge_paths,
+            write_denied_knowledge_paths,
         )
         .await
         {
@@ -3132,6 +3201,43 @@ fn scrub_overrides(
         .filter(|k| k.starts_with("SEALED_") || crate::redact::env_scrub_patterns(k))
         .map(|k| (k, String::new()))
         .collect()
+}
+
+#[cfg(test)]
+mod idle_wake_effect_tests {
+    use super::{BashTool, bash_command_is_proven_read_only};
+    use crate::engine::tool::{Tool, ToolEffect, ToolOutput};
+    use serde_json::json;
+
+    #[test]
+    fn only_simple_read_only_shell_forms_are_proven_read_only() {
+        for command in ["git status --short", "git diff", "pwd", "grep needle file"] {
+            assert!(bash_command_is_proven_read_only(Some(command)), "{command}");
+        }
+        for command in [
+            "git branch -D old",
+            "git remote set-url origin https://example.test/repo",
+            "git status && rm file",
+            "printf x > file",
+            "find . -exec touch {} \\;",
+        ] {
+            assert!(
+                !bash_command_is_proven_read_only(Some(command)),
+                "{command} must retain the dynamic effect"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_dynamic_shell_completion_remains_stateful() {
+        let tool = BashTool::new();
+        let output = ToolOutput::text("exit: 1\n").with_exit_code(1);
+
+        assert_eq!(
+            tool.completed_call_effect(&json!({ "command": "touch marker && false" }), &output),
+            ToolEffect::Dynamic
+        );
+    }
 }
 
 /// Platform-independent unit tests for the run-fail-escalate gate

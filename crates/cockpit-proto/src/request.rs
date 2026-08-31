@@ -1368,7 +1368,8 @@ pub enum Request {
     },
 
     /// Branch a fork off `parent_session_id` at `fork_point_turn_id`
-    /// (None = tail). GOALS §17e. `ephemeral` marks a throwaway `/side`
+    /// (None = tail). `fresh_thread` creates a persistent child with an empty
+    /// transcript plus an anchor reference to that exact message. `ephemeral` marks a throwaway `/side`
     /// side-conversation fork — excluded from lists, never auto-titled,
     /// discarded on end/exit.
     ForkSession {
@@ -1377,6 +1378,7 @@ pub enum Request {
         fork_point_turn_id: Option<String>,
         #[serde(default)]
         ephemeral: bool,
+        fresh_thread: bool,
     },
 
     /// Stop an ephemeral side-conversation (`/side`) worker and discard its
@@ -4668,7 +4670,7 @@ macro_rules! command {
             (Request::SessionLiveStatus { session_ids }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>", [session_ids: Vec<Uuid> => param]);
             (Request::ArchiveSession { session_id, cascade }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool", [session_id: Uuid => session, cascade: bool => param]);
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
-            (Request::ForkSession { parent_session_id, fork_point_turn_id, ephemeral }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool", [parent_session_id: Uuid => param, fork_point_turn_id: Option<String> => param, ephemeral: bool => param]);
+            (Request::ForkSession { parent_session_id, fork_point_turn_id, ephemeral, fresh_thread }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool|fresh_thread:bool", [parent_session_id: Uuid => param, fork_point_turn_id: Option<String> => param, ephemeral: bool => param, fresh_thread: bool => param]);
             (Request::DiscardSession { session_id }, "discard_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CreateBtwFork { parent_session_id, tangent }, "btw_create", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|tangent:bool", [parent_session_id: Uuid => param, tangent: bool => param]);
             (Request::EndBtwFork { parent_session_id }, "btw_end", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid", [parent_session_id: Uuid => param]);

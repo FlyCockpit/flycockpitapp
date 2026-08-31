@@ -58,7 +58,7 @@ pub fn is_removed_primary(name: &str) -> bool {
 /// Built-in primaries that are real primary agents but never appear in the
 /// normal `/agent` list or Shift+Tab cycle. They are reached only through a
 /// dedicated feature flow.
-pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Dream", "Multireview"];
+pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Computer", "Dream", "Multireview"];
 
 pub fn is_hidden_primary(name: &str) -> bool {
     HIDDEN_PRIMARY_NAMES.contains(&name)
@@ -67,7 +67,7 @@ pub fn is_hidden_primary(name: &str) -> bool {
 /// Feature-only root agents are excluded from the selectable roster but may
 /// be selected by their owning command flow.
 pub fn is_feature_primary(name: &str) -> bool {
-    matches!(name, "Dream")
+    matches!(name, "Computer" | "Dream")
 }
 
 /// Public built-in primaries in the `/agent` listing and Shift+Tab cycle.
@@ -80,6 +80,7 @@ pub const BUILTIN_PRIMARY_NAMES: &[&str] = &[
     "Plan",
     "Build",
     "Careful",
+    "Computer",
     "Dream",
     "Multireview",
 ];
@@ -129,6 +130,7 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
 
 pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
     match name {
+        "Computer" => Some(computer_primary_def()),
         "computer" => Some(computer_def()),
         "docs-resolver" => Some(docs_resolver_def()),
         "docs-answerer" => Some(docs_answerer_def()),
@@ -178,7 +180,15 @@ fn def_with_normal(
     // embedded default and the same agent re-parsed from its ejected file
     // compare byte-equal (eject faithfulness).
     let body = prompt.trim_end().to_string();
-    let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
+    let vnext = if name == "docs-answerer" {
+        // The docs pipeline is an internal two-stage implementation, not a
+        // user-authored AgentDef language. The answerer must nevertheless
+        // carry its explicit no-KB grant in the definition snapshot so prompt
+        // injection, toolbox construction, and every ToolCtx agree.
+        let mut definition = builtin_vnext(name, mode);
+        definition.allowed_knowledge_bases = Some(std::collections::BTreeSet::new());
+        Some(definition)
+    } else if name == "docs-resolver" {
         // The docs pipeline is an internal two-stage implementation, not a
         // user-authored AgentDef language. Keep its fixed surfaces outside
         // vNext discovery and serialization.
@@ -264,7 +274,7 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
 /// frontmatter file. Their historic tool arrays remain host-owned factory
 /// inputs, while their ejected form is the closed v2 contract below.
 fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
-    let execution_kind = if name == "computer" {
+    let execution_kind = if matches!(name, "Computer" | "computer") {
         ExecutionKind::Computer
     } else if mode.is_chat_ownable() {
         ExecutionKind::Assistant
@@ -297,6 +307,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
         "Dream" => &["dream-worker"],
         "Plan" => &["explore", "history", "knowledge"],
         "Multireview" => &["scout"],
+        "Computer" => &["builder", "explore"],
         "builder" | "bee" => &["explore"],
         _ => &[],
     };
@@ -528,6 +539,7 @@ fn builder_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
+            "grep",
             "write",
             "unlock",
             "edit",
@@ -590,6 +602,7 @@ fn explore_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
+            "mcp",
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
@@ -614,15 +627,19 @@ fn history_def() -> AgentDef {
     def
 }
 
-/// `knowledge` — a read-only retrieval specialist. It has no direct KB write
-/// surface: `knowledge_retrieve` reads attached KBs through `KbProvider` and
-/// consults only the dream-bounded fresh-session subset.
+/// `knowledge` — a read-only retrieval specialist. It composes KB search
+/// primitives with native reads and has no direct KB write surface.
 fn knowledge_def() -> AgentDef {
     def_with_normal(
         "knowledge",
-        "Read-only knowledge retrieval specialist; returns a cited synthesis from attached KBs and bounded fresh sessions.",
+        "Read-only knowledge retrieval specialist; composes cited KB search primitives and reads into a concise synthesis.",
         AgentMode::Subagent,
-        &["knowledge_retrieve"],
+        &[
+            "read",
+            "semantic_search",
+            "structured_search",
+            "history_search",
+        ],
         crate::engine::builtin::KNOWLEDGE_PROMPT,
         None,
     )
@@ -792,6 +809,16 @@ fn computer_def() -> AgentDef {
     )
 }
 
+fn computer_primary_def() -> AgentDef {
+    def(
+        "Computer",
+        "Standalone provider-native computer-use primary; delegates coding work to code agents.",
+        AgentMode::Primary,
+        &["read", "bash", "task"],
+        crate::engine::builtin::COMPUTER_PRIMARY_PROMPT,
+    )
+}
+
 fn docs_resolver_def() -> AgentDef {
     def(
         "docs-resolver",
@@ -831,6 +858,16 @@ fn docs_answerer_def() -> AgentDef {
 mod tests {
     use super::*;
     use crate::agents::{AgentCapability, PostureResolution};
+
+    #[test]
+    fn docs_answerer_definition_attaches_no_knowledge_bases() {
+        let def = embedded_internal_default("docs-answerer").expect("docs answerer definition");
+        assert!(
+            def.allowed_knowledge_bases()
+                .is_some_and(|bases| bases.is_empty()),
+            "docs answerer must carry an explicit empty KB allowlist"
+        );
+    }
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
@@ -1050,6 +1087,44 @@ mod tests {
     }
 
     #[test]
+    fn computer_primary_is_hidden_and_keeps_delegated_computer_worker() {
+        let primary = embedded_internal_default("Computer").expect("Computer primary");
+        let worker = embedded_internal_default("computer").expect("computer worker");
+
+        assert!(is_builtin_primary("Computer"));
+        assert!(is_hidden_primary("Computer"));
+        assert!(is_feature_primary("Computer"));
+        assert_eq!(primary.mode, AgentMode::Primary);
+        assert_eq!(worker.mode, AgentMode::Subagent);
+        assert_eq!(
+            primary.tools,
+            Some(
+                ["read", "bash", "task"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        let children = &primary
+            .vnext
+            .expect("Computer vNext definition")
+            .delegation
+            .allowed_children;
+        assert!(children.iter().any(|child| matches!(
+            child,
+            AllowedChild::PortableRef { portable_agent_ref }
+                if portable_agent_ref == "cockpit/builder"
+        )));
+        assert_eq!(
+            worker
+                .vnext
+                .expect("computer worker vNext definition")
+                .execution_kind,
+            ExecutionKind::Computer
+        );
+    }
+
+    #[test]
     fn dream_agent_chain_has_no_direct_mutation_or_shell_capability() {
         let dream = embedded_internal_default("Dream").expect("Dream definition");
         let worker = embedded_internal_default("dream-worker").expect("worker definition");
@@ -1183,8 +1258,13 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"knowledge"));
         assert_eq!(
             def.tools,
-            Some(vec!["knowledge_retrieve".to_string()]),
-            "the KB specialist receives only its read-only composite retrieval tool"
+            Some(vec![
+                "read".to_string(),
+                "semantic_search".to_string(),
+                "structured_search".to_string(),
+                "history_search".to_string(),
+            ]),
+            "the KB specialist receives only native read and its read-only search primitives"
         );
         for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
             assert!(
@@ -1197,8 +1277,10 @@ mod tests {
             );
         }
         assert!(
-            def.prompt.contains("knowledge_retrieve"),
-            "the specialist prompt must direct every request through provider-backed retrieval"
+            def.prompt.contains("semantic_search")
+                && def.prompt.contains("structured_search")
+                && def.prompt.contains("history_search"),
+            "the specialist prompt must direct retrieval through both provider-backed search primitives and bounded fresh-session recall"
         );
     }
 }

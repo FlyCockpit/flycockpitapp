@@ -54,6 +54,7 @@ pub mod spawn;
 pub mod task;
 pub mod task_repair;
 pub mod text_search;
+pub mod thread_start;
 pub mod todo;
 pub mod transcribe_audio;
 pub mod unlock;

@@ -94,6 +94,7 @@ pub(crate) const DREAM_PROMPT: &str = include_str!("dream.md");
 pub(crate) const DREAM_WORKER_PROMPT: &str = include_str!("dream_worker.md");
 // `bee` — `Swarm`'s recursive parallel worker (GOALS §24/§26).
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
+pub(crate) const COMPUTER_PRIMARY_PROMPT: &str = include_str!("computer.md");
 pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
@@ -289,6 +290,8 @@ fn resolved_computer_use_for_model(
             .and_then(|capability| capability.contract)
             .map(|contract| crate::computer::NativeComputerToolConfig {
                 contract: contract.into(),
+                target: crate::computer::DisplayTarget::Virtual,
+                require_backend: false,
                 geometry: None,
                 approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
             })
@@ -336,6 +339,14 @@ pub(crate) fn computer_use_custody_route(
 pub(crate) fn computer_use_criteria(
     selector: &str,
 ) -> crate::config::providers::ModelPolicyCriteria<'_> {
+    computer_use_criteria_for_role(selector, true, "computer")
+}
+
+fn computer_use_criteria_for_role<'a>(
+    selector: &'a str,
+    require_subagent_invokable: bool,
+    agent: &'a str,
+) -> crate::config::providers::ModelPolicyCriteria<'a> {
     use crate::config::providers::{
         AvailabilityScope, ModelOptimization, ModelPolicyCriteria, ModelPolicySelector,
         RequiredModelCapability,
@@ -344,28 +355,126 @@ pub(crate) fn computer_use_criteria(
         selector: ModelPolicySelector::Exact(selector),
         required_capabilities: vec![RequiredModelCapability::ImageInput],
         min_context_tokens: None,
-        require_subagent_invokable: true,
+        require_subagent_invokable,
         optimize: ModelOptimization::Balanced,
         role: Some("computer"),
-        agent: Some("computer"),
+        agent: Some(agent),
         // The host enabled `computer_use` on this exact model.
         availability: AvailabilityScope::HostNamedTarget,
     }
+}
+
+fn computer_primary_candidate(
+    providers: &crate::config::providers::ProvidersConfig,
+    cwd: &Path,
+    target: crate::computer::DisplayTarget,
+    selected_model: Option<(&str, &str)>,
+) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
+    computer_candidate(
+        providers,
+        cwd,
+        false,
+        "Computer",
+        target,
+        true,
+        selected_model,
+    )
+}
+
+/// Resolve the one model selection a Computer primary is permitted to run.
+///
+/// The session registry calls this before it stages a new session's active
+/// model.  The same selection is then passed back to [`computer_primary`] as
+/// its root pin, so the ledger, request preferences, and factory-installed
+/// model are one authority rather than two independently chosen candidates.
+pub(crate) fn computer_primary_active_model_selection(
+    providers: &crate::config::providers::ProvidersConfig,
+    extended: &crate::config::extended::ExtendedConfig,
+    cwd: &Path,
+    requested_model: Option<&crate::config::providers::ActiveModelRef>,
+) -> Result<crate::config::providers::ActiveModelRef> {
+    let target = match extended.computer_target {
+        crate::config::extended::ComputerTarget::Virtual => crate::computer::DisplayTarget::Virtual,
+        crate::config::extended::ComputerTarget::RealDesktop => {
+            crate::computer::DisplayTarget::RealDesktop
+        }
+    };
+    let selected_model =
+        requested_model.map(|model| (model.provider.as_str(), model.model.as_str()));
+    let Some((provider, model, _)) =
+        computer_primary_candidate(providers, cwd, target, selected_model)
+    else {
+        bail!(
+            "Computer requires a configured vision-capable model with a native computer_use contract and computer_use enabled"
+        );
+    };
+
+    // A caller's explicit root pin carries its associated model preferences;
+    // a factory-selected fallback must not inherit preferences from a
+    // different active model.
+    Ok(requested_model
+        .filter(|requested| requested.provider == provider && requested.model == model)
+        .cloned()
+        .unwrap_or(crate::config::providers::ActiveModelRef {
+            provider,
+            model,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }))
 }
 
 fn computer_subagent_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
+    computer_candidate(
+        providers,
+        cwd,
+        true,
+        "computer",
+        crate::computer::DisplayTarget::Virtual,
+        false,
+        None,
+    )
+}
+
+fn computer_candidate(
+    providers: &crate::config::providers::ProvidersConfig,
+    cwd: &Path,
+    require_subagent_invokable: bool,
+    agent: &str,
+    target: crate::computer::DisplayTarget,
+    require_backend: bool,
+    selected_model: Option<(&str, &str)>,
+) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
         for model in &provider.models {
-            let tier =
-                providers.resolve_computer_use_effective(provider_id, &model.id, configured, None);
+            if selected_model.is_some_and(|(selected_provider, selected_model)| {
+                selected_provider != provider_id || selected_model != model.id
+            }) {
+                continue;
+            }
+            let tier = if require_backend {
+                crate::config::extended::ComputerUseMode::most_restrictive(
+                    [
+                        providers.resolve_computer_use_catalog(provider_id, &model.id),
+                        configured,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )
+                .unwrap_or(crate::config::extended::ComputerUseMode::Ask)
+            } else {
+                providers.resolve_computer_use_effective(provider_id, &model.id, configured, None)
+            };
             if tier == crate::config::extended::ComputerUseMode::Disabled {
                 continue;
             }
-            if !providers.resolve_subagent_invokable(provider_id, &model.id) {
+            if require_subagent_invokable
+                && !providers.resolve_subagent_invokable(provider_id, &model.id)
+            {
                 continue;
             }
             let caps = providers.resolve_effective_model_capabilities(
@@ -385,7 +494,17 @@ fn computer_subagent_candidate(
             // The custody class is the configured computer-use model's own
             // trust class: the host authorized this model for computer use, a
             // model never picks it.
-            if computer_use_custody_route(providers, provider_id, &model.id).is_err() {
+            let selector = format!("{provider_id}:{}", model.id);
+            let custody = crate::engine::model_roles::custody_for_trust(
+                providers.resolve_trust(provider_id, &model.id),
+            );
+            if providers
+                .resolve_sensitive_model_policy_eligibility(
+                    &computer_use_criteria_for_role(&selector, require_subagent_invokable, agent),
+                    custody,
+                )
+                .is_err()
+            {
                 continue;
             }
             return Some((
@@ -393,8 +512,15 @@ fn computer_subagent_candidate(
                 model.id.clone(),
                 crate::computer::NativeComputerToolConfig {
                     contract: contract.into(),
+                    target,
+                    require_backend,
                     geometry: None,
-                    approval_required: tier == crate::config::extended::ComputerUseMode::Ask,
+                    // A real desktop is a distinct safety boundary. Its
+                    // catalog/config tier still governs reachability, but it
+                    // can never remove the per-action Ask approval required
+                    // alongside the desktop grant.
+                    approval_required: target == crate::computer::DisplayTarget::RealDesktop
+                        || tier == crate::config::extended::ComputerUseMode::Ask,
                 },
             ));
         }
@@ -550,8 +676,9 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_list",
         "harness_invoke",
         "history_search",
-        "knowledge_retrieve",
+        "thread_start",
         "semantic_search",
+        "structured_search",
         "todo",
         "write",
         "edit",
@@ -708,16 +835,22 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
-            family: "Knowledge",
-            name: "semantic_search",
-            summary: "Semantically search attached KBs with citations and bounded fresh-session updates.",
-            condition: Some("Assistant primary"),
+            family: "Session",
+            name: "thread_start",
+            summary: "Start a fresh child thread from a recorded message.",
+            condition: Some("interactive assistant sessions"),
         },
         BuiltinToolInventoryItem {
             family: "Knowledge",
-            name: "knowledge_retrieve",
-            summary: "Retrieve cited attached-KB knowledge and bounded fresh-session updates.",
-            condition: Some("knowledge retrieval subagent"),
+            name: "semantic_search",
+            summary: "Semantically search attached knowledge bases with citations.",
+            condition: Some("knowledge-base attachment resolved at call time"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "structured_search",
+            summary: "Search attached knowledge by text, frontmatter, or structured data.",
+            condition: Some("knowledge-base attachment resolved at call time"),
         },
         BuiltinToolInventoryItem {
             family: "Session",
@@ -947,6 +1080,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::return_tool::ReturnTool),
         Arc::new(tools::plan_doc::StartBuildTool),
         Arc::new(tools::session_search::HistorySearchTool),
+        Arc::new(tools::thread_start::ThreadStartTool),
         Arc::new(tools::todo::TodoTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
@@ -1075,17 +1209,22 @@ pub(crate) fn materialize_tool_by_name(
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
-        "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
-        "knowledge_retrieve" => tb.with(Arc::new(crate::knowledge::KnowledgeRetrieveTool::new(
-            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
-                .cloned(),
-        ))),
-        "semantic_search" => tb.with(Arc::new(
-            crate::knowledge::KnowledgeRetrieveTool::semantic_search(
+        "history_search" if def.is_some_and(|def| def.name == "knowledge") => tb.with(Arc::new(
+            crate::knowledge::FreshKnowledgeHistorySearchTool::new(
                 def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                     .cloned(),
             ),
         )),
+        "history_search" => tb.with(Arc::new(tools::session_search::HistorySearchTool)),
+        "thread_start" => tb.with(Arc::new(tools::thread_start::ThreadStartTool)),
+        "semantic_search" => tb.with(Arc::new(crate::knowledge::SemanticSearchTool::new(
+            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                .cloned(),
+        ))),
+        "structured_search" => tb.with(Arc::new(crate::knowledge::StructuredSearchTool::new(
+            def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                .cloned(),
+        ))),
         "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
             args.swarm_depth,
             args.swarm_max_depth,
@@ -1781,6 +1920,9 @@ pub fn load_with_tool_surface_override(
             "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
         );
     }
+    if name == "Computer" {
+        return computer_primary(args);
+    }
     if name == "computer" {
         return computer(args);
     }
@@ -1810,11 +1952,22 @@ pub fn load_with_tool_surface_override(
 /// through `args`, but edits to the definition itself affect only agents built
 /// after the edit (new children or a newly started root session).
 pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) -> Result<Agent> {
-    let definition = agent.definition.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("running agent `{}` has no pinned definition", agent.name)
-    })?;
-    let mut definition = (**definition).clone();
-    let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
+    // The Computer primary owns construction-time security invariants that are
+    // not expressible in its embedded definition. Rebuilding through the
+    // generic definition path would replace the factory-selected model and
+    // native-computer configuration with ordinary direct-computer params.
+    // Keep the pinned definition requirement for every other role, but route
+    // its factory through the same authority as initial construction.
+    let mut rebuilt = match agent.name.as_str() {
+        "Computer" => computer_primary(args)?,
+        _ => {
+            let definition = agent.definition.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("running agent `{}` has no pinned definition", agent.name)
+            })?;
+            let mut definition = (**definition).clone();
+            load_resolved_def(&agent.name, args, None, &mut definition)?
+        }
+    };
     // A foreground child may already carry the parent's no-widening
     // intersection. Rebuilding from its governing definition must not restore
     // grants removed at admission. `load_resolved_def` only intersects when
@@ -1838,6 +1991,9 @@ pub async fn load_with_assistant_db_and_tool_surface_override(
         bail!(
             "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
         );
+    }
+    if name == "Computer" {
+        return computer_primary(args);
     }
     if name == "computer" {
         return computer(args);
@@ -1980,7 +2136,7 @@ pub(crate) fn is_docs_pipeline(name: &str) -> bool {
 fn is_internal_agent_def_name(name: &str) -> bool {
     matches!(
         name,
-        "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker"
+        "Computer" | "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker"
     )
 }
 
@@ -2756,7 +2912,7 @@ fn test_host_tool_surface(cwd: &Path, name: &str) -> Option<Vec<String>> {
 fn default_assistant_tools() -> Vec<String> {
     let mut tools = default_custom_tools();
     tools.extend(
-        ["mcp", "history_search", "skill_manage"]
+        ["mcp", "history_search", "thread_start", "skill_manage"]
             .into_iter()
             .map(str::to_string),
     );
@@ -3570,17 +3726,56 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
+    computer_agent(args, "computer", true)
+}
+
+/// `Computer` — the dedicated interactive computer-use primary. Unlike the
+/// lowercase delegation worker, its eligible model need not be marked
+/// subagent-invokable; it is the root model for this session.
+pub fn computer_primary(args: &SpawnArgs) -> Result<Agent> {
+    computer_agent(args, "Computer", false)
+}
+
+fn computer_agent(args: &SpawnArgs, name: &str, require_subagent_invokable: bool) -> Result<Agent> {
     if args.workspace_lease.as_ref().is_some_and(|lease| {
         !lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_computer()
     }) {
         bail!("workspace lease does not permit computer use");
     }
-    let (_extended, providers) = args.config.configs();
-    let Some((provider_id, model_id, native_computer)) =
+    let (extended, providers) = args.config.configs();
+    let candidate = if require_subagent_invokable {
         computer_subagent_candidate(&providers, &args.cwd)
-    else {
+    } else {
+        let target = match extended.computer_target {
+            crate::config::extended::ComputerTarget::Virtual => {
+                crate::computer::DisplayTarget::Virtual
+            }
+            crate::config::extended::ComputerTarget::RealDesktop => {
+                crate::computer::DisplayTarget::RealDesktop
+            }
+        };
+        // A live picker selection is an explicit root-model request.  Do not
+        // silently substitute another computer-capable model: validate the
+        // exact selection through the Computer factory or let the switch fail
+        // before it is persisted. Ordinary startup has no override and still
+        // selects the configured eligible Computer model.
+        computer_primary_candidate(
+            &providers,
+            &args.cwd,
+            target,
+            args.model_override
+                .as_deref()
+                .map(|model| (model.provider_id(), model.model_id_ref())),
+        )
+    };
+    let Some((provider_id, model_id, native_computer)) = candidate else {
         bail!(
-            "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
+            "{name} requires a configured vision-capable model with a native computer_use contract and computer_use enabled{}",
+            if require_subagent_invokable {
+                " that is subagent-invokable"
+            } else {
+                ""
+            }
         );
     };
     // The worker route is a *sensitive* route — computer use ships screenshots
@@ -3594,7 +3789,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     );
     let worker_selector = format!("{provider_id}:{model_id}");
     let request = crate::config::providers::SensitiveModelPolicyRequest::new(
-        computer_use_criteria(&worker_selector),
+        computer_use_criteria_for_role(&worker_selector, require_subagent_invokable, name),
         custody,
         crate::engine::model_roles::custody_payload_for(custody, &session_redact),
     )
@@ -3606,15 +3801,27 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
         custody = resolved.custody.as_str(),
         granted = resolved.trusted_custody_grant().is_some(),
         routing = %serde_json::to_string(&resolved.policy.routing_diagnostics()).unwrap_or_default(),
-        "computer-use subagent custody"
+        "computer-use agent custody"
     );
-    let model = Arc::new(crate::engine::model::Model::for_provider_optional_store(
-        &providers,
-        &provider_id,
-        &model_id,
-        session_redact,
-        args.credential_store.clone(),
-    )?);
+    let model = args
+        .model_override
+        .as_ref()
+        .filter(|model| model.provider_id() == provider_id && model.model_id_ref() == model_id)
+        .or_else(|| {
+            Some(&args.model).filter(|model| {
+                model.provider_id() == provider_id && model.model_id_ref() == model_id
+            })
+        })
+        .cloned()
+        .unwrap_or(Arc::new(
+            crate::engine::model::Model::for_provider_optional_store(
+                &providers,
+                &provider_id,
+                &model_id,
+                session_redact,
+                args.credential_store.clone(),
+            )?,
+        ));
     let caps = providers.resolve_effective_model_capabilities(
         model.provider_id(),
         model.model_id_ref(),
@@ -3622,16 +3829,17 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     );
     if !caps.supports_image_input() {
         bail!(
-            "computer-use subagent requires a vision-capable model; `{}`:`{}` is not vision-capable",
+            "{name} requires a vision-capable model; `{}`:`{}` is not vision-capable",
             model.provider_id(),
             model.model_id_ref()
         );
     }
     let mut child_args = args.clone();
-    child_args.model = model;
+    child_args.model = model.clone();
+    child_args.model_override = Some(model);
     child_args.params.native_computer = Some(native_computer);
-    let def = crate::agents::embedded_internal_default("computer")
-        .expect("computer has an internal agent definition");
+    let def = crate::agents::embedded_internal_default(name)
+        .expect("computer agent has an internal definition");
     let mut agent = agent_from_def(&def, &child_args)?;
     agent.delegation_recursion = DelegationRecursionContext {
         enabled: args.delegation_recursion.enabled,
@@ -4129,6 +4337,13 @@ pub(crate) mod tests {
         test_spawn_args_with_provider_can_delegate(cwd, None)
     }
 
+    fn test_spawn_args_with_model_trust(
+        cwd: &Path,
+        trust: crate::config::providers::ModelTrust,
+    ) -> SpawnArgs {
+        test_spawn_args_with_provider_can_delegate_and_trust(cwd, None, Some(trust))
+    }
+
     /// Give a vNext definition the same host-resolved grant a daemon-owned
     /// session would carry.  Tests that inspect `task` must opt into this
     /// explicit authority path: merely loading a manifest deliberately does
@@ -4181,6 +4396,14 @@ pub(crate) mod tests {
         cwd: &Path,
         can_delegate: Option<bool>,
     ) -> SpawnArgs {
+        test_spawn_args_with_provider_can_delegate_and_trust(cwd, can_delegate, None)
+    }
+
+    fn test_spawn_args_with_provider_can_delegate_and_trust(
+        cwd: &Path,
+        can_delegate: Option<bool>,
+        trust: Option<crate::config::providers::ModelTrust>,
+    ) -> SpawnArgs {
         let _trust = crate::config::trust::enter_workspace_trust_policy(trusted_policy(cwd));
         use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
         use std::collections::BTreeMap;
@@ -4191,6 +4414,7 @@ pub(crate) mod tests {
                 url: "http://localhost:1/v1".into(),
                 headers: vec![],
                 can_delegate,
+                trust,
                 ..ProviderEntry::default()
             },
         );
@@ -4260,6 +4484,103 @@ pub(crate) mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[tokio::test]
+    async fn knowledge_search_tool_schemas_are_stable_across_attachment_and_trust_changes() {
+        use crate::config::providers::ModelTrust;
+
+        let _env = crate::test_env::lock_async().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dream_definition = crate::agents::embedded_internal_default("Dream")
+            .expect("Dream has an internal agent definition");
+        let session = crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Dream",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let unattached_args = test_spawn_args(tmp.path());
+        let unattached_agent = agent_from_def(&dream_definition, &unattached_args).unwrap();
+        assert!(!unattached_agent.model.is_trusted());
+        let unattached_tools = crate::engine::agent::turn_toolbox(
+            &unattached_agent,
+            &session,
+            tmp.path(),
+            &unattached_args.config,
+        )
+        .await;
+        assert!(unattached_tools.names().contains(&"semantic_search"));
+        assert!(unattached_tools.names().contains(&"structured_search"));
+        let unattached_definitions = serde_json::to_vec(
+            &unattached_tools.advertised_definitions(unattached_agent.tool_steering),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/knowledge/index.md"),
+            "# Knowledge\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            r#"{"knowledgeBases":[{"id":"project","name":"Project","description":"Workspace project knowledge","source":{"kind":"local","path":".cockpit/knowledge"},"embeddingOwnership":"local","dreamModel":"lmstudio:local","trustRequired":true,"mergePolicy":"auto"}]}"#,
+        )
+        .unwrap();
+
+        let attached_untrusted_args = test_spawn_args(tmp.path());
+        assert_eq!(
+            attached_untrusted_args
+                .config
+                .extended()
+                .knowledge_bases
+                .len(),
+            1
+        );
+        let attached_untrusted_agent =
+            agent_from_def(&dream_definition, &attached_untrusted_args).unwrap();
+        assert!(!attached_untrusted_agent.model.is_trusted());
+        let attached_untrusted_tools = crate::engine::agent::turn_toolbox(
+            &attached_untrusted_agent,
+            &session,
+            tmp.path(),
+            &attached_untrusted_args.config,
+        )
+        .await;
+        assert_eq!(
+            unattached_definitions,
+            serde_json::to_vec(
+                &attached_untrusted_tools
+                    .advertised_definitions(attached_untrusted_agent.tool_steering),
+            )
+            .unwrap(),
+            "KB attachment changes must not change the model-facing tool array"
+        );
+
+        let attached_trusted_args =
+            test_spawn_args_with_model_trust(tmp.path(), ModelTrust::Trusted);
+        let attached_trusted_agent =
+            agent_from_def(&dream_definition, &attached_trusted_args).unwrap();
+        assert!(attached_trusted_agent.model.is_trusted());
+        let attached_trusted_tools = crate::engine::agent::turn_toolbox(
+            &attached_trusted_agent,
+            &session,
+            tmp.path(),
+            &attached_trusted_args.config,
+        )
+        .await;
+        assert_eq!(
+            unattached_definitions,
+            serde_json::to_vec(
+                &attached_trusted_tools
+                    .advertised_definitions(attached_trusted_agent.tool_steering),
+            )
+            .unwrap(),
+            "KB trust changes must not change the model-facing tool array"
+        );
     }
 
     #[test]
@@ -5913,6 +6234,183 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn computer_primary_real_desktop_forces_ask_even_when_configured_yolo() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [{
+                    "id": "vision",
+                    "subagent_invokable": false,
+                    "capabilities": {
+                        "image_input": "supported",
+                        "computer_use": { "contract": "open_ai_responses" }
+                    }
+                }]
+            }"#,
+        );
+
+        let agent = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let native = agent
+            .params
+            .native_computer
+            .expect("Computer primary native tool");
+        assert_eq!(agent.name, "Computer");
+        assert_eq!(native.target, crate::computer::DisplayTarget::RealDesktop);
+        assert!(native.require_backend);
+        assert!(native.approval_required);
+        assert!(agent.tools.names().contains(&"read"));
+        assert!(agent.tools.names().contains(&"bash"));
+        assert!(agent.tools.names().contains(&"task"));
+    }
+
+    #[test]
+    fn computer_primary_selection_replaces_an_ineligible_active_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [
+                    { "id": "text" },
+                    {
+                        "id": "vision",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+
+        let args = disk_model_spawn_args(tmp.path(), "text");
+        let (extended, providers) = args.config.configs();
+        let selected =
+            computer_primary_active_model_selection(&providers, &extended, tmp.path(), None)
+                .expect("Computer must select its eligible model before session staging");
+
+        assert_eq!(selected.provider, "p");
+        assert_eq!(selected.model, "vision");
+        assert!(selected.reasoning_effort.is_none());
+        assert!(selected.thinking_mode.is_none());
+        assert!(selected.prompt_cache_retention.is_none());
+    }
+
+    #[test]
+    fn computer_primary_virtual_target_is_explicit_and_still_strict() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            r#"{"computer_target":"virtual"}"#,
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [{
+                    "id": "vision",
+                    "capabilities": {
+                        "image_input": "supported",
+                        "computer_use": { "contract": "open_ai_responses" }
+                    }
+                }]
+            }"#,
+        );
+
+        let agent = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let native = agent
+            .params
+            .native_computer
+            .expect("Computer primary native tool");
+        assert_eq!(native.target, crate::computer::DisplayTarget::Virtual);
+        assert!(native.require_backend);
+        assert!(!native.approval_required);
+    }
+
+    #[test]
+    fn computer_primary_rebuild_retains_its_custody_checked_model_and_native_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            r#"{"computer_target":"virtual"}"#,
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [
+                    {
+                        "id": "vision-a",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    },
+                    {
+                        "id": "vision-b",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+
+        let original = load("Computer", &disk_model_spawn_args(tmp.path(), "vision-a")).unwrap();
+        let mut rebuild_args = disk_model_spawn_args(tmp.path(), "vision-b");
+        rebuild_args.model_override = Some(rebuild_args.model.clone());
+        let rebuilt = rebuild_from_pinned_definition(&original, &rebuild_args).unwrap();
+        let native = rebuilt
+            .params
+            .native_computer
+            .expect("Computer rebuild must retain its native-computer capability");
+
+        assert_eq!(rebuilt.name, "Computer");
+        assert_eq!(rebuilt.model.model_id_ref(), "vision-b");
+        assert_eq!(native.target, crate::computer::DisplayTarget::Virtual);
+        assert!(native.require_backend);
+        assert!(native.approval_required);
+    }
+
+    #[test]
+    fn computer_primary_rebuild_rejects_a_model_without_its_required_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            r#"{"computer_target":"virtual"}"#,
+            r#"{
+                "url": "http://localhost:1/v1",
+                "models": [
+                    {
+                        "id": "vision",
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    },
+                    { "id": "text" }
+                ]
+            }"#,
+        );
+
+        let original = load("Computer", &disk_model_spawn_args(tmp.path(), "vision")).unwrap();
+        let mut rebuild_args = disk_model_spawn_args(tmp.path(), "text");
+        rebuild_args.model_override = Some(rebuild_args.model.clone());
+        let error = match rebuild_from_pinned_definition(&original, &rebuild_args) {
+            Ok(_) => panic!("Computer model switches must reject non-computer models"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a configured vision-capable model"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn nonvision_delegates_not_direct() {
         let tmp = tempfile::tempdir().unwrap();
         write_computer_provider_config(
@@ -6424,6 +6922,7 @@ pub(crate) mod tests {
         let names = known_agent_tool_names();
         assert!(names.contains(&"todo"));
         assert!(names.contains(&"history_search"));
+        assert!(names.contains(&"thread_start"));
         // `goal` is deliberately not a grantable/runtime tool: the session goal
         // is host/driver-owned durable state, not a tool an agent may mention in
         // `tools:` (see `worker_cannot_create_or_mutate_goal`). Its retired
@@ -6440,7 +6939,7 @@ pub(crate) mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "history_search"] {
+        for name in ["todo", "history_search", "thread_start"] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }
@@ -6667,7 +7166,13 @@ pub(crate) mod tests {
     fn explore_never_gets_removed_seed_tool() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
-        assert!(!explore(&args).tools.names().contains(&"seed"));
+        let explore_agent = explore(&args);
+        let tools = explore_agent.tools.names();
+        assert!(!tools.contains(&"seed"));
+        assert!(
+            tools.contains(&"mcp"),
+            "explore keeps Monty in its stable base toolbox"
+        );
     }
 
     #[test]

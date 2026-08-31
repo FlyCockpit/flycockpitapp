@@ -1074,7 +1074,7 @@ async fn dispatch_av_tool(
     // interval/sampling/index must never leave a fetched or persisted source.
     let parsed = parse_semantic_args(&args, kind)?;
     if let NestedMediaSource::Path(path) = &parsed.source {
-        crate::knowledge::ensure_local_knowledge_media_path_access(ctx, path)?;
+        crate::knowledge::ensure_local_knowledge_media_path_access(ctx, path).await?;
     }
     // Live authority first. An unavailable snapshot stores Unknown
     // modalities as placeholders, not a model-capability diagnosis, so

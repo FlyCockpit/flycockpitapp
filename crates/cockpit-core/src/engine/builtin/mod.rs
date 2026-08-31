@@ -550,6 +550,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_invoke",
         "history_search",
         "knowledge_retrieve",
+        "semantic_search",
         "todo",
         "write",
         "edit",
@@ -697,6 +698,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             name: "history_search",
             summary: "Search persisted history by scope.",
             condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Knowledge",
+            name: "semantic_search",
+            summary: "Semantically search attached KBs with citations and bounded fresh-session updates.",
+            condition: Some("Assistant primary"),
         },
         BuiltinToolInventoryItem {
             family: "Knowledge",
@@ -1063,6 +1070,12 @@ pub(crate) fn materialize_tool_by_name(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                 .cloned(),
         ))),
+        "semantic_search" => tb.with(Arc::new(
+            crate::knowledge::KnowledgeRetrieveTool::semantic_search(
+                def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+                    .cloned(),
+            ),
+        )),
         "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
             args.swarm_depth,
             args.swarm_max_depth,

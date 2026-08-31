@@ -369,30 +369,55 @@ pub async fn ensure_primary_assistant(db: &Db) -> Result<AssistantRow> {
     }
 }
 
-async fn validate_primary_assistant(db: &Db, row: AssistantRow) -> Result<AssistantRow> {
-    anyhow::ensure!(
-        row.name == PRIMARY_ASSISTANT_IDENTITY_NAME,
-        "built-in Assistant identity has an invalid registry name"
-    );
+/// Change the daemon-owned Assistant primary's SOUL.md edit policy without
+/// exposing its reserved persistence identity to ordinary assistant CRUD.
+///
+/// The primary starts autonomous, but the human may select `human_only` (or
+/// the existing proposal-approval middle mode) at any time.  This owns the
+/// configuration mutation under the same definition lock used by identity
+/// recovery, so an in-flight identity publisher cannot overwrite the policy.
+pub async fn set_primary_assistant_soul_edit_mode(
+    db: &Db,
+    soul_edit_mode: identity::SoulEditMode,
+) -> Result<AssistantRow> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        set_primary_assistant_soul_edit_mode_sync(&db, soul_edit_mode)
+    })
+    .await
+    .context("built-in Assistant soul-edit setting coordinator joined")?
+}
+
+fn set_primary_assistant_soul_edit_mode_sync(
+    db: &Db,
+    soul_edit_mode: identity::SoulEditMode,
+) -> Result<AssistantRow> {
+    let row = get_assistant_blocking(db, PRIMARY_ASSISTANT_IDENTITY_NAME)?
+        .context("built-in Assistant identity is not provisioned")?;
     let home = validate_row_home(&row)?;
-    anyhow::ensure!(
-        home == default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?,
-        "built-in Assistant identity has an invalid daemon-owned home"
-    );
-    let config: AssistantConfig = serde_json::from_str(&row.config_json)
-        .context("parsing built-in Assistant identity configuration")?;
-    anyhow::ensure!(
-        config.installation_id == PRIMARY_ASSISTANT_INSTALLATION_ID,
-        "reserved assistant identity is not the daemon-owned built-in Assistant installation"
-    );
-    anyhow::ensure!(
-        config.agent_source == assistant_definition_path(&home).to_string_lossy(),
-        "built-in Assistant identity has invalid definition provenance"
-    );
-    anyhow::ensure!(
-        config.soul_edit_mode == identity::SoulEditMode::Autonomous,
-        "built-in Assistant identity must default to autonomous SOUL editing"
-    );
+    validate_primary_assistant_config(&row, &home)?;
+    let definition = assistant_definition_path(&home);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    recover_creation_journal_locked(db, &home)?;
+    let row = get_assistant_blocking(db, PRIMARY_ASSISTANT_IDENTITY_NAME)?
+        .context("built-in Assistant identity disappeared while updating SOUL edit mode")?;
+    let home = validate_row_home(&row)?;
+    validate_primary_assistant_config(&row, &home)?;
+    recover_definition_journal_locked(db, &row)?;
+    let row = get_assistant_blocking(db, PRIMARY_ASSISTANT_IDENTITY_NAME)?
+        .context("built-in Assistant identity disappeared during definition recovery")?;
+    let home = validate_row_home(&row)?;
+    let mut config = validate_primary_assistant_config(&row, &home)?;
+    config.soul_edit_mode = soul_edit_mode;
+    let config_json = serde_json::to_string(&config)?;
+    db.blocking_write_for_sync_event(move |conn| {
+        crate::db::Db::update_assistant_identity_hashes_cas_conn(conn, row, &config_json)
+    })
+}
+
+async fn validate_primary_assistant(db: &Db, row: AssistantRow) -> Result<AssistantRow> {
+    let home = validate_row_home(&row)?;
+    validate_primary_assistant_config(&row, &home)?;
     let definition = load_verified(db, PRIMARY_ASSISTANT_IDENTITY_NAME)
         .await?
         .context("built-in Assistant identity definition is missing")?;
@@ -406,6 +431,28 @@ async fn validate_primary_assistant(db: &Db, row: AssistantRow) -> Result<Assist
         "built-in Assistant identity definition provenance does not match its daemon installation"
     );
     Ok(row)
+}
+
+fn validate_primary_assistant_config(row: &AssistantRow, home: &Path) -> Result<AssistantConfig> {
+    anyhow::ensure!(
+        row.name == PRIMARY_ASSISTANT_IDENTITY_NAME,
+        "built-in Assistant identity has an invalid registry name"
+    );
+    anyhow::ensure!(
+        home == default_home_dir(PRIMARY_ASSISTANT_IDENTITY_NAME)?.as_path(),
+        "built-in Assistant identity has an invalid daemon-owned home"
+    );
+    let config: AssistantConfig = serde_json::from_str(&row.config_json)
+        .context("parsing built-in Assistant identity configuration")?;
+    anyhow::ensure!(
+        config.installation_id == PRIMARY_ASSISTANT_INSTALLATION_ID,
+        "reserved assistant identity is not the daemon-owned built-in Assistant installation"
+    );
+    anyhow::ensure!(
+        config.agent_source == assistant_definition_path(&home).to_string_lossy(),
+        "built-in Assistant identity has invalid definition provenance"
+    );
+    Ok(config)
 }
 
 /// The sole daemon-owned v2 template for private assistants.  CLI-side
@@ -1466,6 +1513,29 @@ mod tests {
                 .unwrap()
                 .join("knowledge")
                 .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_assistant_soul_edit_mode_can_be_changed_to_human_only() {
+        let env = crate::test_env::lock_async().await;
+        let temp = tempfile::tempdir().unwrap();
+        env.set_var("XDG_DATA_HOME", temp.path());
+        let db = Db::open_in_memory().unwrap();
+
+        ensure_primary_assistant(&db).await.unwrap();
+        let updated = set_primary_assistant_soul_edit_mode(&db, identity::SoulEditMode::HumanOnly)
+            .await
+            .unwrap();
+        let config: AssistantConfig = serde_json::from_str(&updated.config_json).unwrap();
+
+        assert_eq!(config.soul_edit_mode, identity::SoulEditMode::HumanOnly);
+        let reloaded = ensure_primary_assistant(&db).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<AssistantConfig>(&reloaded.config_json)
+                .unwrap()
+                .soul_edit_mode,
+            identity::SoulEditMode::HumanOnly
         );
     }
 

@@ -150,10 +150,12 @@ fn load_for_session_sync(db: &Db, requested: &AssistantRow) -> Result<IdentityLo
     let row = super::get_assistant_blocking(db, &requested.name)?
         .with_context(|| format!("assistant `{}` disappeared", requested.name))?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     super::recover_definition_journal_locked(db, &row)?;
     let row = super::get_assistant_blocking(db, &row.name)?
         .with_context(|| format!("assistant `{}` disappeared during recovery", row.name))?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     let original_config: crate::assistants::AssistantConfig =
         serde_json::from_str(&row.config_json)
             .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
@@ -479,9 +481,11 @@ fn record_identity_shell_write_sync(db: &Db, requested: AssistantRow, home: &Pat
     let row = super::get_assistant_blocking(db, &requested.name)?
         .context("assistant disappeared while recording shell identity writes")?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     super::recover_definition_journal_locked(db, &row)?;
     let row = super::get_assistant_blocking(db, &row.name)?
         .context("assistant disappeared during shell identity recovery")?;
+    ensure_same_authorized_installation(&requested, &row)?;
     let mut config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
         .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
     config.soul_hash = hash_optional_file(&soul_path(home))?;
@@ -504,10 +508,12 @@ fn record_identity_write_sync(
     let row = super::get_assistant_blocking(db, &requested.name)?
         .context("assistant disappeared while recording identity write")?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     super::recover_definition_journal_locked(db, &row)?;
     let row = super::get_assistant_blocking(db, &row.name)?
         .context("assistant disappeared during identity recovery")?;
     crate::assistants::validate_row_home(&row)?;
+    ensure_same_authorized_installation(&requested, &row)?;
     let expected_path = match identity_file {
         SOUL_FILE => soul_path(&home),
         USER_FILE => user_path(&home),
@@ -525,6 +531,43 @@ fn record_identity_write_sync(
     }
     let config_json = serde_json::to_string(&config)?;
     update_identity_hashes_cas_blocking(db, row, config_json)?;
+    Ok(())
+}
+
+/// A shell authorization belongs to the exact assistant installation that was
+/// loaded before process creation, not merely to a reusable name/home pair.
+/// The registry's daemon-minted installation UUID is immutable provenance for
+/// a normal assistant; the row-generation fields additionally fence the
+/// daemon-owned primary, whose installation UUID is intentionally stable.
+fn ensure_same_authorized_installation(
+    authorized: &AssistantRow,
+    current: &AssistantRow,
+) -> Result<()> {
+    anyhow::ensure!(
+        authorized.name == current.name
+            && authorized.home_dir == current.home_dir
+            && authorized.created_at_unix_ms == current.created_at_unix_ms,
+        "assistant installation changed before identity hash publication"
+    );
+    let authorized_config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&authorized.config_json).with_context(|| {
+            format!(
+                "parsing authorized assistant configuration for `{}`",
+                authorized.name
+            )
+        })?;
+    let current_config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&current.config_json).with_context(|| {
+            format!(
+                "parsing current assistant configuration for `{}`",
+                current.name
+            )
+        })?;
+    anyhow::ensure!(
+        !authorized_config.installation_id.is_nil()
+            && authorized_config.installation_id == current_config.installation_id,
+        "assistant installation changed before identity hash publication"
+    );
     Ok(())
 }
 
@@ -602,6 +645,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identity_publication_rejects_a_replaced_assistant_installation() {
+        let installation_id = uuid::Uuid::new_v4();
+        let config = crate::assistants::AssistantConfig {
+            installation_id,
+            ..crate::assistants::AssistantConfig::default()
+        };
+        let authorized = AssistantRow {
+            name: "helper".to_string(),
+            created_at_unix_ms: 1,
+            home_dir: "/private/helper".to_string(),
+            config_json: serde_json::to_string(&config).unwrap(),
+            content_hash: "0".repeat(64),
+        };
+        let replacement_config = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
+            ..config
+        };
+        let replacement = AssistantRow {
+            config_json: serde_json::to_string(&replacement_config).unwrap(),
+            ..authorized.clone()
+        };
+
+        assert!(ensure_same_authorized_installation(&authorized, &replacement).is_err());
+    }
+
     /// Build a tool context for the `helper` assistant inside an isolated
     /// cockpit home. `validate_row_home` requires the canonical
     /// `default_home_dir`, so the home is derived here and returned for the
@@ -617,6 +686,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed_identity_files(&home).unwrap();
         let cfg = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
             agent_source: home.join("assistant.md").display().to_string(),
             soul_edit_mode: mode,
             soul_hash: hash_optional_file(&soul_path(&home)).unwrap(),
@@ -763,6 +833,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed_identity_files(&home).unwrap();
         let cfg = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
             agent_source: home.join("assistant.md").display().to_string(),
             soul_hash: hash_optional_file(&soul_path(&home)).unwrap(),
             user_hash: hash_optional_file(&user_path(&home)).unwrap(),

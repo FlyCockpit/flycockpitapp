@@ -183,6 +183,7 @@ const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 const KNOWLEDGE_RETRIEVE_TOOL_NAME: &str = "knowledge_retrieve";
+const SEMANTIC_SEARCH_TOOL_NAME: &str = "semantic_search";
 const KNOWLEDGE_DREAM_SOURCES_TOOL_NAME: &str = "knowledge_dream_sources";
 const KNOWLEDGE_DREAM_APPLY_TOOL_NAME: &str = "knowledge_dream_apply";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
@@ -5485,12 +5486,24 @@ fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutp
 /// It combines cited KB matches with a bounded view of sessions that may have
 /// advanced since the shared dream boundary.
 pub(crate) struct KnowledgeRetrieveTool {
+    name: &'static str,
     allowed_knowledge_bases: Option<BTreeSet<String>>,
 }
 
 impl KnowledgeRetrieveTool {
     pub(crate) fn new(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
         Self {
+            name: KNOWLEDGE_RETRIEVE_TOOL_NAME,
+            allowed_knowledge_bases,
+        }
+    }
+
+    /// The Assistant primary's explicitly named semantic KB search surface.
+    /// It uses the same provider-backed, cited retrieval implementation as
+    /// the knowledge specialist instead of a prompt-only spelling.
+    pub(crate) fn semantic_search(allowed_knowledge_bases: Option<BTreeSet<String>>) -> Self {
+        Self {
+            name: SEMANTIC_SEARCH_TOOL_NAME,
             allowed_knowledge_bases,
         }
     }
@@ -5499,7 +5512,7 @@ impl KnowledgeRetrieveTool {
 #[async_trait]
 impl Tool for KnowledgeRetrieveTool {
     fn name(&self) -> &str {
-        KNOWLEDGE_RETRIEVE_TOOL_NAME
+        self.name
     }
 
     fn description(&self) -> &str {
@@ -5532,7 +5545,10 @@ impl Tool for KnowledgeRetrieveTool {
     async fn call(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let args: MemorySearchArgs = typed_args(args)?;
         if args.query.trim().is_empty() {
-            return Err(invalid_input("knowledge_retrieve query must not be empty"));
+            return Err(invalid_input(format!(
+                "{} query must not be empty",
+                self.name
+            )));
         }
         let extended = ctx.config.extended();
         let providers = ctx.config.providers();
@@ -5579,6 +5595,7 @@ impl Tool for KnowledgeRetrieveTool {
         let freshness =
             retrieve_undreamed_session_hits(&bundles.bundles, &args.query, limit, ctx).await?;
         Ok(ToolOutput::text(render_knowledge_retrieval(
+            self.name,
             &results,
             &freshness,
             ctx.redact.as_ref(),
@@ -5681,11 +5698,12 @@ async fn retrieve_undreamed_session_hits(
 }
 
 fn render_knowledge_retrieval(
+    tool_name: &str,
     results: &[SearchResult],
     freshness: &FreshSessionRetrieval,
     redact: &RedactionTable,
 ) -> String {
-    let mut out = String::from("knowledge_retrieve results:\n");
+    let mut out = format!("{tool_name} results:\n");
     if results.is_empty() {
         out.push_str(
             "- No matching knowledge-base entries (or no embedding model is configured).\n",
@@ -5994,7 +6012,12 @@ mod tests {
             missing_boundary_knowledge_bases: Vec::new(),
         };
 
-        let rendered = render_knowledge_retrieval(&results, &freshness, &RedactionTable::empty());
+        let rendered = render_knowledge_retrieval(
+            KNOWLEDGE_RETRIEVE_TOOL_NAME,
+            &results,
+            &freshness,
+            &RedactionTable::empty(),
+        );
         assert!(rendered.contains("concepts/deploy.md#chunk-0"));
         assert!(rendered.contains("session ab12cd"));
         assert!(rendered.contains(&session_id.to_string()));
@@ -6438,7 +6461,12 @@ mod tests {
             missing_boundary_knowledge_bases: vec!["project".to_string()],
         };
 
-        let rendered = render_knowledge_retrieval(&[], &freshness, &RedactionTable::empty());
+        let rendered = render_knowledge_retrieval(
+            KNOWLEDGE_RETRIEVE_TOOL_NAME,
+            &[],
+            &freshness,
+            &RedactionTable::empty(),
+        );
         assert!(rendered.contains("searched conservatively"));
         assert!(rendered.contains("no session history can yet be proven dreamed"));
     }

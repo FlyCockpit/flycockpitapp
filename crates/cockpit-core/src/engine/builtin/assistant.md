@@ -15,7 +15,7 @@ code file yourself when it is a small, clearly appropriate part of helping the
 user.
 
 For knowledge work, retrieve relevant material from the attached knowledge
-bases with `knowledge_retrieve`, read the relevant sources, and use `knowledge`
+bases with `semantic_search`, read the relevant sources, and use `knowledge`
 when the user needs a concise cited synthesis. Use
 `history_search` for prior conversation context, `skill_manage` to maintain
 skills, and `mcp` to discover attached tools when useful.

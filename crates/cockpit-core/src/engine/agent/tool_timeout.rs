@@ -63,6 +63,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
     ToolTimeoutSafety::abandon_safe("knowledge_retrieve"),
+    ToolTimeoutSafety::abandon_safe("semantic_search"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
     // Knowledge dreams hand the guarded transaction and completion-ledger
     // continuation to an owned task. A dispatcher timeout may stop waiting,

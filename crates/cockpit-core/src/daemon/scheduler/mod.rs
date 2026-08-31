@@ -1116,7 +1116,11 @@ pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {
             prompt,
             project_root,
         } => {
-            crate::assistants::validate_assistant_name(assistant)?;
+            // `assistant` is the daemon-owned identity backing the built-in
+            // Assistant primary, never a client-runnable named assistant.
+            // Keep this sibling entry point behind the same reservation as
+            // ordinary assistant CRUD and chat.
+            crate::assistants::validate_named_assistant_name(assistant)?;
             let expected = format!("assistant:{assistant}");
             if job.owner != expected {
                 bail!("RunPrompt owner must be `{expected}`");
@@ -3055,6 +3059,12 @@ mod tests {
         assert!(validate_job_create(&job).is_err());
         job.owner = "assistant:bob".to_string();
         assert!(validate_job_create(&job).is_ok());
+        let ScheduledJobPayload::RunPrompt { assistant, .. } = &mut job.payload else {
+            unreachable!("test job is a RunPrompt");
+        };
+        *assistant = "assistant".to_string();
+        job.owner = "assistant:assistant".to_string();
+        assert!(validate_job_create(&job).is_err());
 
         let mut callback =
             callback_job("job-callback", ScheduledJobSchedule::Every { seconds: 60 });

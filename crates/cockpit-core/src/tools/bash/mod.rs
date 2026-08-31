@@ -2977,6 +2977,11 @@ async fn spawn_adopted_shell_completion(
                         )
                     }
                     Ok(Err(error)) => {
+                        // A failed wait leaves adopted-process ownership
+                        // unresolved. Reclaim it before publishing identity
+                        // hashes so a survivor cannot write after accounting
+                        // has recorded a terminal state.
+                        kill_child(&mut child, child_pid).await;
                         stdout_task.abort();
                         stderr_task.abort();
                         let _ = stdout_task.join().await;

@@ -419,6 +419,7 @@ impl RealDesktopGrantStore {
 
 pub struct VirtualDisplayBackend {
     display: String,
+    backend_kind: target::BackendKind,
     /// `Child` is `Send` but not `Sync`. The mutex exists so the backend (and
     /// therefore a coordinator on the driver stack) can be `Sync`; the process
     /// is still uniquely owned and only taken on drop.
@@ -464,12 +465,80 @@ impl VirtualDisplayBackend {
                 if !grant_store.is_some_and(RealDesktopGrantStore::has_current_machine_grant) {
                     return Err(ComputerError::RealDesktopGrantMissing);
                 }
-                // TODO(issue #180 per-OS backend dependencies): dispatch to
-                // the native macOS, Windows, X11, or Wayland action backend
-                // once the corresponding host backend is available.
-                Err(unsupported_platform())
+                Self::new_real_desktop()
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn new_real_desktop() -> Result<Self, ComputerError> {
+        if std::env::var("XDG_SESSION_TYPE")
+            .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
+        {
+            return Err(ComputerError::UnsupportedPlatform {
+                platform: "linux-wayland".to_string(),
+            });
+        }
+        let display = std::env::var("DISPLAY")
+            .ok()
+            .filter(|display| !display.trim().is_empty())
+            .ok_or_else(|| ComputerError::UnsupportedPlatform {
+                platform: "linux-without-x11".to_string(),
+            })?;
+        let xdotool = require_capability("xdotool", "the `xdotool` package")?;
+        let capture = require_capture_tool()?;
+        let capture_root = private_capture_root()?;
+        let output = Command::new(&xdotool)
+            .env("DISPLAY", &display)
+            .arg("getdisplaygeometry")
+            .output()
+            .map_err(|error| ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let dimensions = String::from_utf8_lossy(&output.stdout);
+        let mut dimensions = dimensions.split_whitespace();
+        let width = dimensions.next().and_then(|value| value.parse().ok());
+        let height = dimensions.next().and_then(|value| value.parse().ok());
+        let (Some(width), Some(height), None) = (width, height, dimensions.next()) else {
+            return Err(ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: "getdisplaygeometry returned malformed dimensions".to_string(),
+            });
+        };
+        if width == 0 || height == 0 {
+            return Err(ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: "getdisplaygeometry returned an empty desktop".to_string(),
+            });
+        }
+        Ok(Self {
+            display,
+            backend_kind: target::BackendKind::RealDesktopX11,
+            xvfb: Mutex::new(None),
+            geometry: DisplayGeometry {
+                physical: PixelSize { width, height },
+                logical: LogicalSize {
+                    width: f64::from(width),
+                    height: f64::from(height),
+                },
+                scale_factor: ScaleFactor(1.0),
+            },
+            tools: LinuxTools { xdotool, capture },
+            held_keys: Vec::new(),
+            capture_root,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new_real_desktop() -> Result<Self, ComputerError> {
+        Err(unsupported_platform())
     }
 
     #[cfg(target_os = "linux")]
@@ -514,6 +583,7 @@ impl VirtualDisplayBackend {
             })?;
         Ok(Self {
             display,
+            backend_kind: target::BackendKind::VirtualDisplay,
             xvfb: Mutex::new(Some(child)),
             geometry,
             tools: LinuxTools { xdotool, capture },
@@ -935,7 +1005,7 @@ impl CaptureRunner for RealCaptureRunner {
 #[async_trait]
 impl ComputerBackend for VirtualDisplayBackend {
     fn backend_kind(&self) -> target::BackendKind {
-        target::BackendKind::VirtualDisplay
+        self.backend_kind
     }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         Ok(self.geometry.clone())

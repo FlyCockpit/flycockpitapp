@@ -84,6 +84,7 @@ pub(crate) async fn open_native_computer_for_delegation(
             return Ok(None);
         }
     };
+    let owner_instance = crate::computer::coordinator::OwnerInstance(u64::from(std::process::id()));
     let (target_adapter, host_arbiter) = match candidate.target {
         crate::computer::DisplayTarget::Virtual => (
             Box::new(
@@ -110,7 +111,7 @@ pub(crate) async fn open_native_computer_for_delegation(
                     Some(Arc::new(std::sync::Mutex::new(
                         crate::computer::coordinator::HostInputArbiter::new(
                             Box::new(file_lock),
-                            crate::computer::coordinator::OwnerInstance(1),
+                            owner_instance,
                         ),
                     ))),
                 )
@@ -137,7 +138,7 @@ pub(crate) async fn open_native_computer_for_delegation(
         } else {
             crate::computer::coordinator::ComputerApprovalTier::Yolo
         },
-        owner_instance: crate::computer::coordinator::OwnerInstance(1),
+        owner_instance,
         authorizer: Arc::new(
             crate::computer::authorizer::ApproverComputerAuthorizer::new(approver),
         ),

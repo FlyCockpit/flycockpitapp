@@ -27,6 +27,7 @@ use super::{
 /// listing order. Drives the override-resolution, listing, and reset
 /// paths. Driven off the code (the factory functions).
 pub const BUILTIN_AGENT_NAMES: &[&str] = &[
+    "Assistant",
     "Build",
     "Careful",
     "builder",
@@ -57,7 +58,7 @@ pub fn is_removed_primary(name: &str) -> bool {
 /// Built-in primaries that are real primary agents but never appear in the
 /// normal `/agent` list or Shift+Tab cycle. They are reached only through a
 /// dedicated feature flow.
-pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Dream", "Multireview"];
+pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Computer", "Dream", "Multireview"];
 
 pub fn is_hidden_primary(name: &str) -> bool {
     HIDDEN_PRIMARY_NAMES.contains(&name)
@@ -66,15 +67,23 @@ pub fn is_hidden_primary(name: &str) -> bool {
 /// Feature-only root agents are excluded from the selectable roster but may
 /// be selected by their owning command flow.
 pub fn is_feature_primary(name: &str) -> bool {
-    matches!(name, "Dream")
+    matches!(name, "Computer" | "Dream")
 }
 
 /// Public built-in primaries in the `/agent` listing and Shift+Tab cycle.
-pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful"];
+pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Assistant", "Plan", "Build", "Careful"];
 
 /// Every built-in primary that may own a root session, including hidden
 /// feature-flow primaries.
-pub const BUILTIN_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful", "Dream", "Multireview"];
+pub const BUILTIN_PRIMARY_NAMES: &[&str] = &[
+    "Assistant",
+    "Plan",
+    "Build",
+    "Careful",
+    "Computer",
+    "Dream",
+    "Multireview",
+];
 
 pub fn is_builtin_primary(name: &str) -> bool {
     BUILTIN_PRIMARY_NAMES.contains(&name)
@@ -103,6 +112,7 @@ pub fn resolve_primary(requested_or_stored: Option<&str>, configured_default: &s
 /// factory functions compose into the system prompt.
 pub fn embedded_default(name: &str) -> Option<AgentDef> {
     match name {
+        "Assistant" => Some(assistant_def()),
         "Build" => Some(build_def()),
         "Careful" => Some(careful_def()),
         "builder" => Some(builder_def()),
@@ -120,6 +130,7 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
 
 pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
     match name {
+        "Computer" => Some(computer_primary_def()),
         "computer" => Some(computer_def()),
         "docs-resolver" => Some(docs_resolver_def()),
         "docs-answerer" => Some(docs_answerer_def()),
@@ -169,7 +180,15 @@ fn def_with_normal(
     // embedded default and the same agent re-parsed from its ejected file
     // compare byte-equal (eject faithfulness).
     let body = prompt.trim_end().to_string();
-    let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
+    let vnext = if name == "docs-answerer" {
+        // The docs pipeline is an internal two-stage implementation, not a
+        // user-authored AgentDef language. The answerer must nevertheless
+        // carry its explicit no-KB grant in the definition snapshot so prompt
+        // injection, toolbox construction, and every ToolCtx agree.
+        let mut definition = builtin_vnext(name, mode);
+        definition.allowed_knowledge_bases = Some(std::collections::BTreeSet::new());
+        Some(definition)
+    } else if name == "docs-resolver" {
         // The docs pipeline is an internal two-stage implementation, not a
         // user-authored AgentDef language. Keep its fixed surfaces outside
         // vNext discovery and serialization.
@@ -255,7 +274,7 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
 /// frontmatter file. Their historic tool arrays remain host-owned factory
 /// inputs, while their ejected form is the closed v2 contract below.
 fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
-    let execution_kind = if name == "computer" {
+    let execution_kind = if matches!(name, "Computer" | "computer") {
         ExecutionKind::Computer
     } else if mode.is_chat_ownable() {
         ExecutionKind::Assistant
@@ -267,6 +286,16 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     // tool grant: the daemon still intersects them with its host policy and
     // resolves the portable ids uniquely before launch.
     let children: &[&str] = match name {
+        "Assistant" => &[
+            "builder",
+            "Build",
+            "explore",
+            "history",
+            "knowledge",
+            "deepthink",
+            "scout",
+            "computer",
+        ],
         "Build" | "Careful" => &[
             "builder",
             "explore",
@@ -278,6 +307,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
         "Dream" => &["dream-worker"],
         "Plan" => &["explore", "history", "knowledge"],
         "Multireview" => &["scout"],
+        "Computer" => &["builder", "explore"],
         "builder" | "bee" => &["explore"],
         _ => &[],
     };
@@ -288,7 +318,15 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
             allowed_children: children
                 .iter()
                 .map(|child| AllowedChild::PortableRef {
-                    portable_agent_ref: format!("cockpit/{child}"),
+                    // Built-in agent IDs are lowercase, while `Build` is the
+                    // public primary launch target. Keep the portable identity
+                    // canonical so vNext resolution can surface `Build` as a
+                    // reachable task target.
+                    portable_agent_ref: if *child == "Build" {
+                        "cockpit/build".to_string()
+                    } else {
+                        format!("cockpit/{child}")
+                    },
                 })
                 .collect(),
             max_descendant_depth: Some(1),
@@ -318,6 +356,43 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
         verification: None,
         allowed_knowledge_bases: None,
     }
+}
+
+/// `Assistant` — the user-facing personal-assistant primary. It is fully
+/// file-capable inside the session sandbox, but its role is personal work,
+/// knowledge, and coordination rather than implementation. Coding work is
+/// deliberately handed to a coding agent through `task` by default.
+fn assistant_def() -> AgentDef {
+    let mut def = def_with_normal(
+        "Assistant",
+        "General-purpose personal assistant; file-capable and knowledge-aware, delegates coding work to builder.",
+        AgentMode::Primary,
+        &[
+            "read",
+            "bash",
+            "write",
+            "edit",
+            "delete",
+            "unlock",
+            "semantic_search",
+            "history_search",
+            "skill_manage",
+            "task",
+            "mcp",
+        ],
+        crate::engine::builtin::ASSISTANT_PROMPT,
+        None,
+    );
+    def.tool_descriptions.insert(
+        "task".to_string(),
+        ToolDescriptionSpec::WithVerbose {
+            text: "Delegate coding and computer work by default: use `builder` or `Build` for code changes, `explore` for repository investigation, `knowledge` for cited KB synthesis, and `computer` for display work. Keep the brief self-contained and report the result.".to_string(),
+            verbose_text: Some(
+                "You are a general-purpose personal assistant, not the coding specialist. For code changes, delegate a self-contained implementation brief to `builder` (or `Build` when a primary coding conversation is needed) instead of editing code yourself by default. Use `explore` for repository investigation, `knowledge` for a cited synthesis of KB findings, and `computer` for display work. You retain normal file access for personal artifacts, scratch work, KB maintenance, and small direct changes when that is the clearest way to help; this is guidance, not a prohibition on editing code files. Each delegation brief must state the goal, constraints, relevant paths, and what done looks like. If a task backgrounds, use its task_call_id or await the async result rather than duplicate it.".to_string(),
+            ),
+        },
+    );
+    def
 }
 
 /// `Careful` — the verbose/conservative write-capable primary. It keeps only
@@ -464,6 +539,7 @@ fn builder_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
+            "grep",
             "write",
             "unlock",
             "edit",
@@ -526,6 +602,7 @@ fn explore_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
+            "mcp",
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
@@ -550,15 +627,19 @@ fn history_def() -> AgentDef {
     def
 }
 
-/// `knowledge` — a read-only retrieval specialist. It has no direct KB write
-/// surface: `knowledge_retrieve` reads attached KBs through `KbProvider` and
-/// consults only the dream-bounded fresh-session subset.
+/// `knowledge` — a read-only retrieval specialist. It composes KB search
+/// primitives with native reads and has no direct KB write surface.
 fn knowledge_def() -> AgentDef {
     def_with_normal(
         "knowledge",
-        "Read-only knowledge retrieval specialist; returns a cited synthesis from attached KBs and bounded fresh sessions.",
+        "Read-only knowledge retrieval specialist; composes cited KB search primitives and reads into a concise synthesis.",
         AgentMode::Subagent,
-        &["knowledge_retrieve"],
+        &[
+            "read",
+            "semantic_search",
+            "structured_search",
+            "history_search",
+        ],
         crate::engine::builtin::KNOWLEDGE_PROMPT,
         None,
     )
@@ -728,6 +809,16 @@ fn computer_def() -> AgentDef {
     )
 }
 
+fn computer_primary_def() -> AgentDef {
+    def(
+        "Computer",
+        "Standalone provider-native computer-use primary; delegates coding work to code agents.",
+        AgentMode::Primary,
+        &["read", "bash", "task"],
+        crate::engine::builtin::COMPUTER_PRIMARY_PROMPT,
+    )
+}
+
 fn docs_resolver_def() -> AgentDef {
     def(
         "docs-resolver",
@@ -767,6 +858,16 @@ fn docs_answerer_def() -> AgentDef {
 mod tests {
     use super::*;
     use crate::agents::{AgentCapability, PostureResolution};
+
+    #[test]
+    fn docs_answerer_definition_attaches_no_knowledge_bases() {
+        let def = embedded_internal_default("docs-answerer").expect("docs answerer definition");
+        assert!(
+            def.allowed_knowledge_bases()
+                .is_some_and(|bases| bases.is_empty()),
+            "docs answerer must carry an explicit empty KB allowlist"
+        );
+    }
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
@@ -929,6 +1030,101 @@ mod tests {
     }
 
     #[test]
+    fn assistant_is_a_file_capable_public_primary_with_delegated_coding_steer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let def = embedded_default("Assistant").expect("Assistant embedded default");
+        let tools = def.tools.as_ref().expect("Assistant explicit tools");
+
+        assert!(is_builtin_primary("Assistant"));
+        assert!(
+            crate::agents::chat_ownable_primaries(tmp.path())
+                .iter()
+                .any(|name| name == "Assistant")
+        );
+        for tool in [
+            "read",
+            "write",
+            "edit",
+            "unlock",
+            "semantic_search",
+            "history_search",
+            "mcp",
+            "skill_manage",
+            "task",
+        ] {
+            assert!(tools.iter().any(|name| name == tool), "{tool} missing");
+        }
+        assert!(def.prompt.contains("not Cockpit's coding specialist"));
+        let task = def
+            .tool_descriptions
+            .get("task")
+            .expect("Assistant task steering");
+        let task_description = format!("{task:?}");
+        assert!(task_description.contains("builder"));
+        assert!(task_description.contains("Build"));
+        assert!(def
+            .vnext
+            .as_ref()
+            .expect("Assistant vNext declaration")
+            .delegation
+            .allowed_children
+            .iter()
+            .any(|child| matches!(child, AllowedChild::PortableRef { portable_agent_ref } if portable_agent_ref == "cockpit/computer")));
+        assert!(def
+            .vnext
+            .as_ref()
+            .expect("Assistant vNext declaration")
+            .delegation
+            .allowed_children
+            .iter()
+            .any(|child| matches!(child, AllowedChild::PortableRef { portable_agent_ref } if portable_agent_ref == "cockpit/build")));
+        for tool in tools {
+            assert!(
+                crate::engine::builtin::known_agent_tool_names().contains(&tool.as_str()),
+                "Assistant grants unknown tool `{tool}`"
+            );
+        }
+    }
+
+    #[test]
+    fn computer_primary_is_hidden_and_keeps_delegated_computer_worker() {
+        let primary = embedded_internal_default("Computer").expect("Computer primary");
+        let worker = embedded_internal_default("computer").expect("computer worker");
+
+        assert!(is_builtin_primary("Computer"));
+        assert!(is_hidden_primary("Computer"));
+        assert!(is_feature_primary("Computer"));
+        assert_eq!(primary.mode, AgentMode::Primary);
+        assert_eq!(worker.mode, AgentMode::Subagent);
+        assert_eq!(
+            primary.tools,
+            Some(
+                ["read", "bash", "task"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        let children = &primary
+            .vnext
+            .expect("Computer vNext definition")
+            .delegation
+            .allowed_children;
+        assert!(children.iter().any(|child| matches!(
+            child,
+            AllowedChild::PortableRef { portable_agent_ref }
+                if portable_agent_ref == "cockpit/builder"
+        )));
+        assert_eq!(
+            worker
+                .vnext
+                .expect("computer worker vNext definition")
+                .execution_kind,
+            ExecutionKind::Computer
+        );
+    }
+
+    #[test]
     fn dream_agent_chain_has_no_direct_mutation_or_shell_capability() {
         let dream = embedded_internal_default("Dream").expect("Dream definition");
         let worker = embedded_internal_default("dream-worker").expect("worker definition");
@@ -1062,8 +1258,13 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"knowledge"));
         assert_eq!(
             def.tools,
-            Some(vec!["knowledge_retrieve".to_string()]),
-            "the KB specialist receives only its read-only composite retrieval tool"
+            Some(vec![
+                "read".to_string(),
+                "semantic_search".to_string(),
+                "structured_search".to_string(),
+                "history_search".to_string(),
+            ]),
+            "the KB specialist receives only native read and its read-only search primitives"
         );
         for forbidden in ["task", "spawn", "write", "edit", "unlock", "bash"] {
             assert!(
@@ -1076,8 +1277,10 @@ mod tests {
             );
         }
         assert!(
-            def.prompt.contains("knowledge_retrieve"),
-            "the specialist prompt must direct every request through provider-backed retrieval"
+            def.prompt.contains("semantic_search")
+                && def.prompt.contains("structured_search")
+                && def.prompt.contains("history_search"),
+            "the specialist prompt must direct retrieval through both provider-backed search primitives and bounded fresh-session recall"
         );
     }
 }

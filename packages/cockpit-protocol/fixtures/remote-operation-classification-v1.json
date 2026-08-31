@@ -1184,6 +1184,21 @@
       "tag": "list_assistants"
     },
     {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "soul_edit_mode:string",
+      "fcorRoles": [
+        {
+          "field": "soul_edit_mode",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "soul_edit_mode:String",
+      "strategy": "none",
+      "tag": "set_primary_assistant_soul_edit_mode"
+    },
+    {
       "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "name:string|description:string|prompt:string",
@@ -2070,7 +2085,7 @@
     {
       "class": "transactional_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "parent_session_id:uuid|fork_point_turn_id:option<string>|ephemeral:bool",
+      "fcorCanonicalSchema": "parent_session_id:uuid|fork_point_turn_id:option<string>|ephemeral:bool|fresh_thread:bool",
       "fcorRoles": [
         {
           "field": "parent_session_id",
@@ -2086,9 +2101,14 @@
           "field": "ephemeral",
           "role": "param",
           "type": "bool"
+        },
+        {
+          "field": "fresh_thread",
+          "role": "param",
+          "type": "bool"
         }
       ],
-      "fcorSchema": "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool",
+      "fcorSchema": "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool|fresh_thread:bool",
       "strategy": "sql_transaction",
       "tag": "fork_session"
     },

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use croner::parser::{CronParser, Seconds};
 use serde_json::json;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot, watch};
 
 use crate::daemon::proto::{
     EnvSnapshotSource, MissedRunPolicy, ScheduledJobCreate, ScheduledJobLastResult,
@@ -129,6 +129,10 @@ pub struct DaemonScheduler {
     clock: Arc<dyn SchedulerClock>,
     executor: Arc<dyn JobExecutor>,
     jitter: Arc<dyn JitterSource>,
+    /// Serializes accepted-user activity with idle due-job claims. An ingress
+    /// owner takes this before it inserts a message, then publishes activity
+    /// and rebuilds the timeline before releasing it.
+    activity_gate: Arc<AsyncMutex<()>>,
     last_user_activity: Arc<RwLock<i64>>,
     timeline: Arc<RwLock<BinaryHeap<Reverse<i64>>>>,
     in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -146,6 +150,11 @@ pub struct DaemonSchedulerHandle {
 impl DaemonSchedulerHandle {
     pub(crate) fn scheduler(&self) -> &Arc<DaemonScheduler> {
         &self.scheduler
+    }
+
+    /// The admission gate shared with session ingress and idle fork timers.
+    pub(crate) fn activity_gate(&self) -> Arc<AsyncMutex<()>> {
+        self.scheduler.activity_gate()
     }
 
     pub fn wake_generation(&self) -> u64 {
@@ -177,6 +186,16 @@ impl DaemonSchedulerHandle {
 
     pub async fn record_user_activity(&self) {
         if let Err(error) = self.scheduler.record_user_activity().await {
+            tracing::warn!(error = %error, "scheduler activity recompute failed");
+        }
+        self.wake();
+    }
+
+    /// Record activity while the caller holds [`Self::activity_gate`]. This
+    /// lets queue admission, the in-memory epoch, and the durable scheduler
+    /// timeline form one ordering boundary.
+    pub(crate) async fn record_user_activity_after_acceptance(&self) {
+        if let Err(error) = self.scheduler.record_user_activity_after_acceptance().await {
             tracing::warn!(error = %error, "scheduler activity recompute failed");
         }
         self.wake();
@@ -279,6 +298,7 @@ impl DaemonScheduler {
             clock,
             executor,
             jitter,
+            activity_gate: Arc::new(AsyncMutex::new(())),
             last_user_activity: Arc::new(RwLock::new(now)),
             timeline: Arc::new(RwLock::new(BinaryHeap::new())),
             in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -349,11 +369,21 @@ impl DaemonScheduler {
     }
 
     pub async fn record_user_activity(&self) -> Result<()> {
+        let _activity = self.activity_gate.lock().await;
+        self.record_user_activity_after_acceptance().await
+    }
+
+    /// Caller must hold [`Self::activity_gate`].
+    async fn record_user_activity_after_acceptance(&self) -> Result<()> {
         *self
             .last_user_activity
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.clock.now();
         self.rebuild_timeline().await
+    }
+
+    pub(crate) fn activity_gate(&self) -> Arc<AsyncMutex<()>> {
+        self.activity_gate.clone()
     }
 
     pub(crate) async fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
@@ -575,6 +605,7 @@ impl DaemonScheduler {
     }
 
     pub async fn run_due_once(&self) -> Result<Vec<ScheduledJobLastResult>> {
+        let _activity = self.activity_gate.lock().await;
         let now = self.clock.now();
         let jobs = self
             .db
@@ -1116,7 +1147,11 @@ pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {
             prompt,
             project_root,
         } => {
-            crate::assistants::validate_assistant_name(assistant)?;
+            // `assistant` is the daemon-owned identity backing the built-in
+            // Assistant primary, never a client-runnable named assistant.
+            // Keep this sibling entry point behind the same reservation as
+            // ordinary assistant CRUD and chat.
+            crate::assistants::validate_named_assistant_name(assistant)?;
             let expected = format!("assistant:{assistant}");
             if job.owner != expected {
                 bail!("RunPrompt owner must be `{expected}`");
@@ -3055,6 +3090,12 @@ mod tests {
         assert!(validate_job_create(&job).is_err());
         job.owner = "assistant:bob".to_string();
         assert!(validate_job_create(&job).is_ok());
+        let ScheduledJobPayload::RunPrompt { assistant, .. } = &mut job.payload else {
+            unreachable!("test job is a RunPrompt");
+        };
+        *assistant = "assistant".to_string();
+        job.owner = "assistant:assistant".to_string();
+        assert!(validate_job_create(&job).is_err());
 
         let mut callback =
             callback_job("job-callback", ScheduledJobSchedule::Every { seconds: 60 });

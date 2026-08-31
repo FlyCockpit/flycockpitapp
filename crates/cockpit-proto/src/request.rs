@@ -954,6 +954,13 @@ pub enum Request {
     /// List persisted assistant definitions.
     ListAssistants,
 
+    /// Set the built-in Assistant primary's durable SOUL.md edit policy.
+    /// This is intentionally separate from ordinary assistant CRUD because
+    /// the primary identity is daemon-owned and reserved.
+    SetPrimaryAssistantSoulEditMode {
+        soul_edit_mode: String,
+    },
+
     UpsertAssistant {
         name: String,
         description: String,
@@ -1361,7 +1368,8 @@ pub enum Request {
     },
 
     /// Branch a fork off `parent_session_id` at `fork_point_turn_id`
-    /// (None = tail). GOALS §17e. `ephemeral` marks a throwaway `/side`
+    /// (None = tail). `fresh_thread` creates a persistent child with an empty
+    /// transcript plus an anchor reference to that exact message. `ephemeral` marks a throwaway `/side`
     /// side-conversation fork — excluded from lists, never auto-titled,
     /// discarded on end/exit.
     ForkSession {
@@ -1370,6 +1378,7 @@ pub enum Request {
         fork_point_turn_id: Option<String>,
         #[serde(default)]
         ephemeral: bool,
+        fresh_thread: bool,
     },
 
     /// Stop an ephemeral side-conversation (`/side`) worker and discard its
@@ -3505,6 +3514,14 @@ impl Request {
             Self::GetAgentInventory { project_root } => {
                 validate_owner_project_root(project_root)?;
             }
+            Self::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
+                if !matches!(
+                    soul_edit_mode.as_str(),
+                    "human_only" | "approve_proposals" | "autonomous"
+                ) {
+                    return Err("assistant soul_edit_mode must be human_only, approve_proposals, or autonomous".into());
+                }
+            }
             Self::SaveAssistantDefinition {
                 client_operation_id,
                 mutation_intent_hash,
@@ -4262,6 +4279,7 @@ macro_rules! request_variants {
             (Request::ExecuteStorageCleanup { .. }, "execute_storage_cleanup");
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
+            (Request::SetPrimaryAssistantSoulEditMode { .. }, "set_primary_assistant_soul_edit_mode");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
             (Request::SaveAssistantDefinition { .. }, "save_assistant_definition");
             (Request::CreateAssistantSession { .. }, "create_assistant_session");
@@ -4597,6 +4615,7 @@ macro_rules! command {
             (Request::ExecuteStorageCleanup { preview_id }, "execute_storage_cleanup", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "preview_id:Uuid", [preview_id: Uuid => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode }, "set_primary_assistant_soul_edit_mode", owner_only, none, true, local_only, none, serialized, none, "soul_edit_mode:String", [soul_edit_mode: String => param]);
             (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
             (Request::SaveAssistantDefinition { client_operation_id, mutation_intent_hash, project_root, name, markdown, expected_revision, expected_config_generation }, "save_assistant_definition", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|name:String|markdown:String|expected_revision:String|expected_config_generation:u64", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, name: String => param, markdown: String => param, expected_revision: String => param, expected_config_generation: u64 => param]);
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
@@ -4651,7 +4670,7 @@ macro_rules! command {
             (Request::SessionLiveStatus { session_ids }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>", [session_ids: Vec<Uuid> => param]);
             (Request::ArchiveSession { session_id, cascade }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool", [session_id: Uuid => session, cascade: bool => param]);
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
-            (Request::ForkSession { parent_session_id, fork_point_turn_id, ephemeral }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool", [parent_session_id: Uuid => param, fork_point_turn_id: Option<String> => param, ephemeral: bool => param]);
+            (Request::ForkSession { parent_session_id, fork_point_turn_id, ephemeral, fresh_thread }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool|fresh_thread:bool", [parent_session_id: Uuid => param, fork_point_turn_id: Option<String> => param, ephemeral: bool => param, fresh_thread: bool => param]);
             (Request::DiscardSession { session_id }, "discard_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CreateBtwFork { parent_session_id, tangent }, "btw_create", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|tangent:bool", [parent_session_id: Uuid => param, tangent: bool => param]);
             (Request::EndBtwFork { parent_session_id }, "btw_end", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid", [parent_session_id: Uuid => param]);

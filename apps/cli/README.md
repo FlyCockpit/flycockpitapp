@@ -21,7 +21,7 @@ The project is early (`0.1.0`), but the codebase already has a broad surface: du
 - Interactive terminal UI: run `cockpit` to open an interactive project session.
 - Headless automation: `cockpit run` streams assistant output or NDJSON events for scripts and CI.
 - Persistent daemon: sessions survive client exits and can be listed, resumed, forked, exported, and imported.
-- Multi-agent workflow: public `Plan`, `Build`, and `Careful` primaries (the default), plus specialist agents such as `builder`, `bee`, `explore`, and `scout`.
+- Multi-agent workflow: public `Assistant`, `Plan`, `Build`, and `Careful` primaries (the default), plus specialist agents such as `builder`, `bee`, `explore`, and `scout`.
 - File safety: write-capable agents use daemon-arbitrated file locks plus sandbox-aware shell execution.
 - Provider flexibility: OpenAI-compatible endpoints plus templates for OpenAI, Codex OAuth, xAI/Grok, z.ai, MiniMax, OpenCode Zen, GitHub Copilot, OpenRouter, DeepSeek, Anthropic, Xiaomi MiMo, Nous Research (`https://inference-api.nousresearch.com/v1`, `NOUS_API_KEY`; Chat Completions only — configure models with `cockpit provider add nous-research` or `/setup model`; no published `/models`, no automatic x402), and Baseten Model APIs (`https://inference.baseten.co/v1`, `BASETEN_API_KEY`; live `/v1/models` catalog; vision/audio input capabilities stay model-dependent and conservatively Unknown until mapped; custom deployments stay separate custom providers).
 - MCP support: configure streamable HTTP, stdio, or SSE MCP servers reached through the sandboxed `mcp` tool.
@@ -521,6 +521,8 @@ the ledger is one of these exact runner strings:
   gone.
 - `descendant_containment_failed` — the containment actor itself errored while
   terminating or awaiting empty.
+- `local_knowledge_write_fence` — an attached local knowledge base is read-only,
+  so the matching hook is audited as failed without launching its command.
 
 On Windows, a hook whose parent process has no `SystemRoot` also fails open with
 a `missing SystemRoot` clean-environment construction error rather than being

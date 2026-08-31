@@ -98,7 +98,15 @@ impl Tool for HarnessListTool {
             .as_deref()
             .map(|raw| normalize_harness_selector(raw, &ctx.config))
             .transpose()?;
+        // Listing can launch each configured harness's auth probe, and a
+        // refresh launches its model-list command. Keep direct callers from
+        // bypassing the dispatcher fence and handing an ambient filesystem
+        // write path to either subprocess.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
         require_workspace_trust_for_harness_spawn()?;
+        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -327,6 +335,11 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
+        // The dispatcher normally applies this fence, but direct tool callers
+        // must not be able to hand ambient filesystem access to a harness.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
         // An external harness is an OS subprocess, not a Cockpit native tool.
         // We do not yet have an OS confinement primitive that can prove every
         // configured harness operation stays within a workspace lease's
@@ -371,6 +384,7 @@ impl Tool for HarnessInvokeTool {
 
         let cwd = ctx.cwd.clone();
         require_workspace_trust_for_harness_spawn()?;
+        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -660,6 +674,26 @@ fn require_workspace_trust_for_harness_spawn() -> Result<()> {
     }
 }
 
+/// An external harness is arbitrary host code. Unlike native tools it has no
+/// descriptor-backed KB write route and no OS-enforced deny mount, so granting
+/// it a process would let it bypass the two permitted KB authoring paths.
+/// Refuse every operation that can launch a configured harness (including a
+/// model-list refresh) while the session has any local KB configured.
+async fn ensure_harness_cannot_reach_local_knowledge_bases(ctx: &ToolCtx) -> Result<()> {
+    let roots = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
+        &ctx.cwd,
+        &ctx.config.extended(),
+    )
+    .await;
+    if roots.is_empty() {
+        return Ok(());
+    }
+    Err(invalid_input(
+        "external harnesses are unavailable while local knowledge bases are configured because their subprocesses do not have OS-enforced knowledge-base confinement",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +763,37 @@ mod tests {
         (ctx, approver, db, hub)
     }
 
+    fn ctx_with_attached_local_knowledge_base(
+        root: &std::path::Path,
+    ) -> crate::engine::tool::ToolCtx {
+        let mut ctx = crate::tools::common::test_ctx(root);
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![
+                        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                            "private".to_string(),
+                            "Private".to_string(),
+                            "Private local knowledge".to_string(),
+                            crate::config::extended::KnowledgeBaseSource::Local {
+                                path: root.join("knowledge"),
+                            },
+                            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                            None,
+                            None,
+                            false,
+                            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+        );
+        ctx
+    }
+
     fn resolve_next_interrupt(
         db: crate::db::Db,
         session_id: uuid::Uuid,
@@ -760,6 +825,32 @@ mod tests {
             .call(invoke_args(), ctx)
             .await
             .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn direct_invoke_keeps_local_knowledge_host_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_attached_local_knowledge_base(workspace.path());
+
+        let error = HarnessInvokeTool
+            .call(invoke_args(), &ctx)
+            .await
+            .expect_err("direct harness calls must not receive a local KB host path");
+        assert!(error.to_string().contains("knowledge bases are read-only"));
+    }
+
+    #[tokio::test]
+    async fn direct_list_keeps_local_knowledge_host_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_attached_local_knowledge_base(workspace.path());
+
+        let error = HarnessListTool
+            .call(serde_json::json!({}), &ctx)
+            .await
+            .expect_err(
+                "direct harness listings must not launch probes with local KB write access",
+            );
+        assert!(error.to_string().contains("knowledge bases are read-only"));
     }
 
     #[test]
@@ -944,6 +1035,35 @@ mod tests {
         .await;
         assert!(
             err.to_string().contains("unknown external harness"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_refuses_an_opaque_subprocess_when_a_local_kb_is_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(tmp.path().join("knowledge")).unwrap();
+        std::fs::create_dir_all(&cockpit).unwrap();
+        std::fs::write(
+            cockpit.join("config.json"),
+            r#"{"harnesses":{"codex":{"command":"definitely-not-a-real-binary-xyz"}},"knowledgeBases":[{"id":"project","name":"Project","description":"Project knowledge","source":{"kind":"local","path":"knowledge"},"embeddingOwnership":"local","trustRequired":false,"mergePolicy":"auto"}]}"#,
+        )
+        .unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.agent_id = "Build".to_string();
+
+        let err = with_trusted_workspace(tmp.path(), async {
+            HarnessInvokeTool
+                .call(invoke_args(), &ctx)
+                .await
+                .unwrap_err()
+        })
+        .await;
+
+        assert!(
+            err.to_string()
+                .contains("do not have OS-enforced knowledge-base confinement"),
             "{err}"
         );
     }

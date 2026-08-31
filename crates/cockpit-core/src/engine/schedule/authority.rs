@@ -26,10 +26,10 @@
 //!   runs the prompt as a real turn in **main history**, then tells the
 //!   authority the iteration finished ([`ScheduleCommand::IterationFinished`])
 //!   so it can schedule the next tick or terminate.
-//! - `keep_in_context = false`: the whole loop runs inside the spawned
-//!   task on an **ephemeral fork** ([`super::loop_runner`]); only `note`s
-//!   (live UI) and the terminal result (via [`ScheduleEvent::Completed`]) cross
-//!   to main.
+//! - `keep_in_context = false`: the whole loop runs inside the spawned task on
+//!   an **ephemeral fork** ([`super::loop_runner`]); ordinary loops promote
+//!   `note`s (live UI) and their terminal result, while idle loops promote
+//!   each acting wake independently and discard read-only wakes.
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -37,8 +37,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::engine::agent::{Agent, TurnEvent};
@@ -48,6 +49,10 @@ use crate::engine::schedule::spec::{
 };
 use crate::redact::RedactionTable;
 use crate::session::Session;
+use crate::tools::schedule::{
+    ActiveIdleWake, IdleWakeCancellationClaim, new_active_idle_wake,
+    take_active_idle_wake_for_cancellation,
+};
 
 use super::{background, swarm};
 
@@ -92,6 +97,26 @@ pub enum ScheduleEvent {
     /// main history. After the turn the driver posts
     /// [`ScheduleCommand::IterationFinished`].
     LoopIterationDue { job_id: String, prompt: String },
+    /// An idle wake finished in its fork without a visible action. The driver
+    /// releases the live slot without recording a transcript turn.
+    EphemeralCompleted { job_id: String },
+    /// Cancellation raced an acting idle wake after the runner acquired
+    /// publication ownership. The acting event is ordered ahead of this
+    /// lifecycle-only marker; no synthetic cancellation turn is needed.
+    IdleWakePublicationCancelled {
+        job_id: String,
+        label: String,
+        kind: ScheduleKind,
+    },
+    /// An idle wake took a visible action. Unlike [`Self::Completed`], this
+    /// settles one wake but leaves the bounded idle loop registered for its
+    /// later wakes. The driver injects this wake's result immediately.
+    IdleWakeCompleted {
+        job_id: String,
+        kind: ScheduleKind,
+        result: String,
+        requests: Vec<SpawnRequest>,
+    },
     /// A genuine recursive-`Swarm` child subagent (`bee` / `scout`) has just
     /// STARTED its background task. Emitted by the runner ([`super::swarm::run_swarm`])
     /// as its FIRST action — on the SAME authority→driver channel and by the
@@ -162,6 +187,10 @@ struct ScheduleEntry {
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
     background: Option<Arc<background::BackgroundHandle>>,
+    /// The currently executing idle wake, if this is an idle fork. The
+    /// authority claims it during cancellation so an already-recorded action
+    /// cannot be lost when aborting the runner task.
+    active_idle_wake: Option<ActiveIdleWake>,
 }
 
 /// Per-iteration scheduling state for a keep-in-context loop. The
@@ -381,6 +410,14 @@ pub struct ScheduleAuthority {
     /// Recursive `Swarm` spawns that arrived while at the concurrency cap
     /// (GOALS §24). Drained FIFO as running jobs complete and slots free.
     swarm_queue: std::collections::VecDeque<SpawnSpec>,
+    /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
+    /// user message resets their countdown without polling.
+    idle_activity_tx: watch::Sender<Instant>,
+    /// Serializes ingress acceptance with an idle timer deciding that its
+    /// deadline elapsed. The owner publishes the watch update before release.
+    idle_activity_gate: Arc<tokio::sync::Mutex<()>>,
+    /// True when daemon ingress publishes accepted inline/media activity.
+    ingress_activity_owned: bool,
 }
 
 impl ScheduleAuthority {
@@ -399,6 +436,18 @@ impl ScheduleAuthority {
         self.ctx.write_scope = Some(write_scope);
     }
 
+    /// Bind the daemon-ingress activity epoch. The worker handle publishes to
+    /// this sender as soon as durable queue admission succeeds, independently
+    /// of whether the driver is currently executing a turn.
+    pub fn set_idle_activity_sender(&mut self, sender: watch::Sender<Instant>) {
+        self.idle_activity_tx = sender;
+        self.ingress_activity_owned = true;
+    }
+
+    pub fn set_idle_activity_gate(&mut self, gate: Arc<tokio::sync::Mutex<()>>) {
+        self.idle_activity_gate = gate;
+    }
+
     /// Build an authority. `event_tx` is drained by the driver at the turn
     /// boundary; `cmd_tx` lets in-task timers re-arm; `turn_tx` is the
     /// engine event channel for UI-only signals.
@@ -409,6 +458,7 @@ impl ScheduleAuthority {
         ctx: ScheduleContext,
         max_concurrent: usize,
     ) -> Self {
+        let (idle_activity_tx, _) = watch::channel(Instant::now());
         Self {
             registry: BTreeMap::new(),
             max_concurrent: max_concurrent.max(1),
@@ -419,6 +469,9 @@ impl ScheduleAuthority {
             swarm_max_concurrency: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
+            idle_activity_tx,
+            idle_activity_gate: Arc::new(tokio::sync::Mutex::new(())),
+            ingress_activity_owned: false,
         }
     }
 
@@ -575,6 +628,7 @@ impl ScheduleAuthority {
             abort: Some(handle.abort_handle()),
             in_context: None,
             background: None,
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -665,6 +719,13 @@ impl ScheduleAuthority {
     /// Start a loop/timer that accumulates in the main context. Returns
     /// the registered job id (echoed back to the model so it can cancel).
     pub fn start_loop_in_context(&mut self, args: LoopStartArgs) -> String {
+        // These options are owned by the fork runner: an idle wake needs
+        // per-wake effect classification, and watch mode must suppress model
+        // inference while unchanged. Keep direct authority callers from
+        // bypassing that boundary.
+        if args.idle || !args.watch_paths.is_empty() {
+            return self.start_loop_forked(args);
+        }
         let job_id = new_job_id();
         let kind = args.kind();
         let label = loop_label(&args);
@@ -681,6 +742,7 @@ impl ScheduleAuthority {
                 timer_abort: None,
             }),
             background: None,
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         self.emit_started(&job_id, &label, kind);
@@ -697,6 +759,7 @@ impl ScheduleAuthority {
         let kind = args.kind();
         let label = loop_label(&args);
         self.emit_started(&job_id, &label, kind);
+        let active_idle_wake = args.idle.then(new_active_idle_wake);
 
         let run_ctx = LoopRunCtx {
             job_id: job_id.clone(),
@@ -705,6 +768,9 @@ impl ScheduleAuthority {
             ctx: self.ctx.clone(),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
+            idle_activity_rx: args.idle.then(|| self.idle_activity_tx.subscribe()),
+            idle_activity_gate: args.idle.then(|| self.idle_activity_gate.clone()),
+            active_idle_wake: active_idle_wake.clone(),
         };
         let handle = tokio::spawn(loop_runner::run_forked_loop(run_ctx));
         let entry = ScheduleEntry {
@@ -716,9 +782,34 @@ impl ScheduleAuthority {
             abort: Some(handle.abort_handle()),
             in_context: None,
             background: None,
+            active_idle_wake,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
+    }
+
+    /// Reset this thread's idle schedules after an accepted external user
+    /// message. Scheduled work and rejected input never call this method.
+    pub fn record_user_activity(&self) {
+        if !self.ingress_activity_owned {
+            self.publish_user_activity();
+        }
+    }
+
+    /// The same admission gate used by daemon ingress. Phase-two artifact
+    /// materialization takes it before its durable acceptance/reset pair.
+    pub fn idle_activity_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.idle_activity_gate.clone()
+    }
+
+    /// Publish phase-two FCM2 activity while the caller holds
+    /// [`Self::idle_activity_gate`].
+    pub fn record_materialized_user_activity_after_acceptance(&self) {
+        self.publish_user_activity();
+    }
+
+    fn publish_user_activity(&self) {
+        let _ = self.idle_activity_tx.send(Instant::now());
     }
 
     /// Start a background shell job. Returns the job id.
@@ -752,6 +843,7 @@ impl ScheduleAuthority {
             abort: Some(abort),
             in_context: None,
             background: Some(Arc::new(handle)),
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -767,13 +859,25 @@ impl ScheduleAuthority {
         let Some(mut entry) = self.registry.remove(job_id) else {
             return false;
         };
+        // Claim the active idle wake before aborting its task. Its tools write
+        // effect records synchronously into this authority-owned state, so a
+        // cancellation racing an in-flight wake cannot erase an action that
+        // already happened.
+        let idle_wake_claim = entry
+            .active_idle_wake
+            .as_ref()
+            .map(take_active_idle_wake_for_cancellation);
+        let publication_owned_by_runner = matches!(
+            &idle_wake_claim,
+            Some(IdleWakeCancellationClaim::Publishing)
+        );
         // Stop any armed tick timer + spawned task.
         if let Some(ic) = &mut entry.in_context
             && let Some(t) = ic.timer_abort.take()
         {
             t.abort();
         }
-        if let Some(a) = entry.abort.take() {
+        if !publication_owned_by_runner && let Some(a) = entry.abort.take() {
             a.abort();
         }
         if let Some(bg) = &entry.background {
@@ -798,15 +902,51 @@ impl ScheduleAuthority {
         // Ephemeral loops + background: the spawned task is aborted; we
         // synthesize the terminal completion here since the task won't get
         // to send its own.
-        else {
+        else if !publication_owned_by_runner {
             let was_swarm = entry.kind == ScheduleKind::Swarm;
+            let (result, requests) =
+                if let Some(IdleWakeCancellationClaim::Running(state)) = idle_wake_claim {
+                    let notes = state.take_notes();
+                    let requests = state.take_requests();
+                    let actions = state.take_actions();
+                    if notes.is_empty() && requests.is_empty() && actions.is_empty() {
+                        (
+                            format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                            requests,
+                        )
+                    } else {
+                        let mut result = format!(
+                            "{} `{}` cancelled after an acting idle wake.",
+                            entry.kind.as_str(),
+                            entry.label
+                        );
+                        if !actions.is_empty() {
+                            result.push_str("\nActions:");
+                            for action in actions {
+                                result.push_str(&format!("\n- {action}"));
+                            }
+                        }
+                        if !notes.is_empty() {
+                            result.push_str("\nNotes:");
+                            for note in notes {
+                                result.push_str(&format!("\n- {note}"));
+                            }
+                        }
+                        (result, requests)
+                    }
+                } else {
+                    (
+                        format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                        Vec::new(),
+                    )
+                };
             self.send_terminal_event(ScheduleEvent::Completed {
                 job_id: entry.job_id.clone(),
                 label: entry.label.clone(),
                 kind: entry.kind,
-                result: format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                result,
                 failed: false,
-                requests: Vec::new(),
+                requests,
             });
             // A swarm runner may ALSO publish its own terminal `Completed`
             // (`abort()` is not synchronous). Free the concurrency slot HERE,
@@ -1187,6 +1327,25 @@ mod tests {
         assert!(!auth.has_loop());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn watch_paths_cannot_bypass_the_fork_runner() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 60,
+            "prompt": "watch status",
+            "watch_paths": ["status.json"]
+        }))
+        .unwrap();
+
+        // The default `keep_in_context = true` must still route through the
+        // runner that computes the digest before requesting inference.
+        let job_id = auth.start_loop_in_context(args);
+        let entry = auth.registry.get(&job_id).expect("registered watch loop");
+        assert!(entry.in_context.is_none());
+        assert!(entry.abort.is_some());
+        assert!(auth.cancel(&job_id));
+    }
+
     /// A timer (`limit = 1`) fires exactly one iteration then completes.
     #[tokio::test(start_paused = true)]
     async fn timer_fires_once() {
@@ -1438,6 +1597,9 @@ mod tests {
                             "goal-supervision worker {worker:?} must not emit SwarmChildStopGateCompleted"
                         )
                     }
+                    ScheduleEvent::EphemeralCompleted { .. } => {}
+                    ScheduleEvent::IdleWakeCompleted { .. }
+                    | ScheduleEvent::IdleWakePublicationCancelled { .. } => {}
                     ScheduleEvent::Completed { .. } => break,
                     ScheduleEvent::LoopIterationDue { .. } => {}
                 }

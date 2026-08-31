@@ -679,7 +679,7 @@ impl Tool for ReadImageTool {
         let parsed = ReadImageArgs::from_value(&args)?;
 
         if let ReadImageSource::Path { path } = &parsed.source {
-            crate::knowledge::ensure_local_knowledge_media_path_access(ctx, path)?;
+            crate::knowledge::ensure_local_knowledge_media_path_access(ctx, path).await?;
         }
 
         let Some(authority) = ctx.media_authority() else {

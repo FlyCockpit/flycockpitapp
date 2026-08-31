@@ -358,6 +358,11 @@ pub enum AssistantCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Set whether the built-in Assistant may edit its SOUL.md identity file.
+    SoulEditMode {
+        #[arg(value_enum)]
+        mode: AssistantSoulEditMode,
+    },
     /// Turn local paths, URLs, text, or a recent workflow into a reusable skill.
     Learn(LearnArgs),
     /// Inspect or repair durable media accounting.
@@ -412,6 +417,23 @@ pub struct AssistantDeleteArgs {
     /// Do not prompt for confirmation.
     #[arg(long, short = 'y')]
     pub yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AssistantSoulEditMode {
+    HumanOnly,
+    ApproveProposals,
+    Autonomous,
+}
+
+impl AssistantSoulEditMode {
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::HumanOnly => "human_only",
+            Self::ApproveProposals => "approve_proposals",
+            Self::Autonomous => "autonomous",
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]

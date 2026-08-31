@@ -596,6 +596,36 @@ pub struct NewTaskDelegationAgent {
     pub resolved_installation_id: Option<Uuid>,
 }
 
+/// The durable portion of a task-child publication has committed.
+///
+/// Applying the resolved auto-answer policy happens after that transaction so
+/// a policy-reduction failure cannot roll the child snapshot and its AgentTree
+/// identity back. Callers that hold one-shot admission authority must consume
+/// it as soon as this value is returned, including when
+/// [`Self::post_publication_error`] is present.
+pub struct TaskDelegationPublication {
+    children: Vec<AgentInstanceRow>,
+    post_publication_error: Option<anyhow::Error>,
+}
+
+impl TaskDelegationPublication {
+    /// The child agents atomically published with their recovery snapshots.
+    pub fn children(&self) -> &[AgentInstanceRow] {
+        &self.children
+    }
+
+    /// Consume the publication result after handling any post-publication
+    /// failure.
+    pub fn into_children(self) -> Vec<AgentInstanceRow> {
+        self.children
+    }
+
+    /// A fallible action that ran only after the child transaction committed.
+    pub fn post_publication_error(&self) -> Option<&anyhow::Error> {
+        self.post_publication_error.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionRequestRow {
     pub decision_request_id: Uuid,
@@ -1402,7 +1432,7 @@ impl Db {
         task_call_id: String,
         children: Vec<NewTaskDelegationAgent>,
         now_unix_ms: i64,
-    ) -> Result<Vec<AgentInstanceRow>> {
+    ) -> Result<TaskDelegationPublication> {
         ensure!(
             !children.is_empty(),
             "task delegation publication requires at least one child"
@@ -1551,16 +1581,29 @@ impl Db {
             .await?;
         for row in &rows {
             if let Some(snapshot_id) = row.resolved_profile_snapshot_id {
-                self.set_agent_auto_answer_from_resolved_profile(
-                    session_id,
-                    row.agent_instance_id,
-                    snapshot_id,
-                    now_unix_ms,
-                )
-                .await?;
+                if let Err(error) = self
+                    .set_agent_auto_answer_from_resolved_profile(
+                        session_id,
+                        row.agent_instance_id,
+                        snapshot_id,
+                        now_unix_ms,
+                    )
+                    .await
+                {
+                    // The child snapshot and AgentTree identity are already
+                    // durable. Return that fact separately so one-shot
+                    // admission claims are retired rather than retried.
+                    return Ok(TaskDelegationPublication {
+                        children: rows,
+                        post_publication_error: Some(error),
+                    });
+                }
             }
         }
-        Ok(rows)
+        Ok(TaskDelegationPublication {
+            children: rows,
+            post_publication_error: None,
+        })
     }
 
     /// Allocate a distinct durable node for a recursive vNext executor. The
@@ -15878,8 +15921,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(children.len(), 1);
-        let child = children.into_iter().next().unwrap();
+        assert_eq!(children.children().len(), 1);
+        let child = children.into_children().into_iter().next().unwrap();
         let descriptor = db
             .task_delegation_recovery_descriptor(session.session_id, child.agent_instance_id)
             .await
@@ -15973,7 +16016,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.children().len(), 2);
         let (published_children, mapped_agents): (i64, i64) = db
             .read(move |conn| {
                 Ok((

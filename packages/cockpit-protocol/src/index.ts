@@ -1032,6 +1032,7 @@ const requestParamSchemas = {
       parent_session_id: uuidSchema,
       fork_point_turn_id: z.string().nullable().optional(),
       ephemeral: z.boolean().optional(),
+      fresh_thread: z.boolean(),
     })
     .strict(),
   fs_create_dir: z.object({ project_root: projectRootSchema, path: z.string() }).strict(),
@@ -3047,6 +3048,8 @@ export const sessionSummarySchema = z
     title: z.string().nullable().optional(),
     description: z.string().nullable().optional(),
     parent_session_id: uuidSchema.nullable().optional(),
+    fork_point_turn_id: z.string().nullable(),
+    is_assistant_thread: z.boolean(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),
   })

@@ -417,7 +417,12 @@ pub struct RunInvocationOptions {
 /// Client → daemon RPCs. The daemon answers each with a matching
 /// [`Response`] keyed by envelope id, or an [`ErrorPayload`].
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "request", rename_all = "snake_case", content = "params")]
+#[serde(
+    tag = "request",
+    rename_all = "snake_case",
+    content = "params",
+    deny_unknown_fields
+)]
 pub enum Request {
     CreateCodeRootV1(crate::CreateCodeRootV1Request),
     AttachExistingCodeRootV1(crate::AttachExistingCodeRootV1Request),

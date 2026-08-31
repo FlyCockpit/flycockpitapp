@@ -2111,7 +2111,14 @@ impl Db {
                 crate::db::session_log::SessionEventKind::ThreadAnchor,
                 None,
                 None,
-                crate::db::session_log::SessionEventContext::default(),
+                crate::db::session_log::SessionEventContext {
+                    origin_principal: None,
+                    task_call_id: None,
+                    label: None,
+                    provider_id: None,
+                    model_id: None,
+                    model_trust: None,
+                },
                 now_unix_ms,
                 &serde_json::json!({
                     "parent_session_id": parent_session_id,
@@ -6048,6 +6055,18 @@ mod tests {
     async fn thread_starts_fresh_with_only_a_durable_anchor_reference() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/x", "assistant").await.unwrap();
+        db.write({
+            let session_id = parent.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET assistant_name = 'test-assistant' WHERE session_id = ?1",
+                    [session_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
         record_message(&db, parent.session_id, "keep this out", false).await;
         let anchor = record_message(&db, parent.session_id, "start here", true).await;
 

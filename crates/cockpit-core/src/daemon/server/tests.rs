@@ -10666,7 +10666,14 @@ async fn remote_archive_unarchive_and_rename_reject_unknown_session_before_ledge
 #[cfg(feature = "remote")]
 async fn remote_archive_stops_worker_before_committing_archive() {
     let ctx = persistent_test_ctx();
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     insert_hung_worker(&ctx, session.session_id);
     let mut state = owner_state();
     let shared = state.shared_snapshot();
@@ -15045,9 +15052,7 @@ async fn attached_state_with_worker_receiver(
         .to_string_lossy()
         .into_owned();
     let project_root = project_root.to_str().unwrap().to_string();
-    let session_project_root = project_root.clone();
-    let session_row = ctx
-        .db
+    ctx.db
         .write(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
@@ -15055,20 +15060,19 @@ async fn attached_state_with_worker_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let mut row = crate::db::Db::build_new_session_row_conn(
-                conn,
-                "p",
-                &session_project_root,
-                "Build",
-            )?;
-            let selection = stub_active_model_ref();
-            row.provider = Some(selection.provider.clone());
-            row.model = Some(selection.model.clone());
-            row.model_selection_json = Some(serde_json::to_string(&selection)?);
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            Ok(())
         })
         .await
         .unwrap();
+    let session_row = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new(&project_root),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_model_selection(stub_active_model_ref()),
+    )
+    .await
+    .unwrap();
     let session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -20363,7 +20367,14 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::SessionLiveStatus => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+                let session = Session::insert_row_for_test(
+                    &ctx.db,
+                    Path::new("/repo"),
+                    "Build",
+                    crate::session::TestSessionRowOptions::default(),
+                )
+                .await
+                .unwrap();
                 insert_hung_worker(&ctx, session.session_id);
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -21571,9 +21582,7 @@ async fn live_worker_with_receiver(
         .to_string_lossy()
         .into_owned();
     let project_root = project_root.to_str().unwrap().to_string();
-    let session_project_root = project_root.clone();
-    let row = ctx
-        .db
+    ctx.db
         .write(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
@@ -21581,20 +21590,19 @@ async fn live_worker_with_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let mut row = crate::db::Db::build_new_session_row_conn(
-                conn,
-                "p",
-                &session_project_root,
-                "Build",
-            )?;
-            let selection = stub_active_model_ref();
-            row.provider = Some(selection.provider.clone());
-            row.model = Some(selection.model.clone());
-            row.model_selection_json = Some(serde_json::to_string(&selection)?);
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            Ok(())
         })
         .await
         .unwrap();
+    let row = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new(&project_root),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_model_selection(stub_active_model_ref()),
+    )
+    .await
+    .unwrap();
     let session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -24395,11 +24403,14 @@ async fn assert_curator_mutating_happy() {
 async fn assert_session_db_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     match kind {
         "archive_session" => {
             let response = dispatch_matrix_request(
@@ -28983,13 +28994,17 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     // V2 resolves attachment identities through durable typed-media storage.
     // Provision it so acceptance and the later worker delivery use the same
     // retained component.
-    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
-        crate::media_storage::MediaStorageRecovery::open_or_create(
-            db,
-            &media_dir.path().join("media"),
-        )
-        .unwrap(),
-    ));
+    {
+        let context = Arc::get_mut(&mut ctx).unwrap();
+        context.paths.ephemeral = false;
+        context.media_storage_recovery = Some(Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(
+                db,
+                &media_dir.path().join("media"),
+            )
+            .unwrap(),
+        ));
+    }
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
@@ -29034,43 +29049,56 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     };
     assert_eq!(submission.client_submissions[0].id, first_id);
 
-    // Dropping the worker response is a post-accept handoff failure. The V2
-    // receipt is terminalized before the caller receives its deterministic
-    // rejection; immutable media remains reusable by a different submission.
+    // Dropping the worker response is an ambiguous post-accept handoff
+    // failure. Dispatch must leave the durable receipt accepted so an exact
+    // retry can reuse the same immutable identity without admitting a second
+    // durable execution.
     drop(respond_to);
     let (mut state, result) = first.await.unwrap();
-    let error = result.expect_err("lost worker response is durably rejected");
-    assert_eq!(error.code, ErrorCode::UserMessageTerminated);
-    let terminal = ctx
+    let error = result.expect_err("lost worker response is surfaced to the caller");
+    assert_eq!(error.code, ErrorCode::Internal);
+    let accepted = ctx
         .db
         .message_receipt_status(session_id, *first_operation_id.as_bytes())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(terminal.state, "terminal_rejected");
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.client_submission_id, *first_id.as_bytes());
+    assert_eq!(accepted.attachments.len(), 1);
+    assert_eq!(
+        accepted.attachments[0].attachment_id,
+        *image_ref.attachment_id.as_bytes()
+    );
+    assert_eq!(
+        accepted.attachments[0].attachment_version,
+        image_ref.attachment_version
+    );
+    assert_eq!(accepted.attachments[0].checksum, image_ref.checksum);
+    let accepted_queue = ctx.db.accepted_message_queue(session_id).await.unwrap();
+    assert_eq!(accepted_queue.len(), 1);
+    assert_eq!(accepted_queue[0].queue_item_id, *first_id.as_bytes());
+    assert_eq!(accepted_queue[0].client_submission_id, *first_id.as_bytes());
     assert_durable_attachment_persists(&ctx, image_ref.attachment_id).await;
 
-    let competing_ctx = ctx.clone();
-    let competing_request = request(Uuid::now_v7(), Uuid::now_v7());
-    let competing = tokio::spawn(async move {
-        let result = handle_request(competing_request, &mut state, &competing_ctx).await;
+    let retry_ctx = ctx.clone();
+    let retry_request = request(first_operation_id, first_id);
+    let retry = tokio::spawn(async move {
+        let result = handle_request(retry_request, &mut state, &retry_ctx).await;
         (state, result)
     });
     let SessionWork::UserMessage {
         submission,
         respond_to,
         ..
-    } = work_rx
-        .recv()
-        .await
-        .expect("competing request reaches worker")
+    } = work_rx.recv().await.expect("exact retry reaches worker")
     else {
-        panic!("expected competing UserMessage work");
+        panic!("expected retry UserMessage work");
     };
+    assert_eq!(submission.client_submissions[0].id, first_id);
     assert_same_durable_png_pixels(&submission.media[0], &sample_png());
-    let competing_id = submission.client_submissions[0].id;
     let item = proto::QueueItem {
-        id: competing_id,
+        id: first_id,
         status: proto::QueueItemStatus::Folding,
         text: submission.text.clone(),
         display_text: submission.display_text.clone(),
@@ -29079,16 +29107,35 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
         send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
-    let (mut state, competing) = competing.await.unwrap();
-    assert!(matches!(
-        competing.unwrap(),
-        Response::UserMessageQueued { .. }
-    ));
+    let (_state, retry) = retry.await.unwrap();
+    assert!(matches!(retry.unwrap(), Response::UserMessageQueued { .. }));
 
-    let retry_result = handle_request(request(first_operation_id, first_id), &mut state, &ctx)
+    let accepted = ctx
+        .db
+        .message_receipt_status(session_id, *first_operation_id.as_bytes())
         .await
-        .expect_err("same-UUID retry replays the durable terminal rejection");
-    assert_eq!(retry_result.code, ErrorCode::UserMessageTerminated);
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.client_submission_id, *first_id.as_bytes());
+    assert_eq!(accepted.attachments.len(), 1);
+    assert_eq!(
+        accepted.attachments[0].attachment_id,
+        *image_ref.attachment_id.as_bytes()
+    );
+    assert_eq!(
+        accepted.attachments[0].attachment_version,
+        image_ref.attachment_version
+    );
+    assert_eq!(accepted.attachments[0].checksum, image_ref.checksum);
+    let accepted_queue = ctx.db.accepted_message_queue(session_id).await.unwrap();
+    assert_eq!(
+        accepted_queue.len(),
+        1,
+        "exact retry must not admit duplicate execution"
+    );
+    assert_eq!(accepted_queue[0].queue_item_id, *first_id.as_bytes());
+    assert_eq!(accepted_queue[0].client_submission_id, *first_id.as_bytes());
 }
 
 #[tokio::test]
@@ -32518,11 +32565,15 @@ async fn serialized_requests_apply_in_receipt_order() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -33098,11 +33149,15 @@ async fn attach_replay_precedes_live_events_under_task_split() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -33194,11 +33249,15 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -33867,7 +33926,14 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
 async fn delete_live_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
     let err = handle_request(
@@ -33897,7 +33963,14 @@ async fn delete_live_session_timeout_leaves_row_intact() {
 async fn archive_live_session_timeout_leaves_row_unarchived() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
     let err = handle_request(
@@ -33926,7 +33999,14 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
 async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let parent = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     let side = ctx
         .db
         .create_ephemeral_fork(parent.session_id, None)
@@ -34001,11 +34081,14 @@ async fn btw_concurrent_with_parent_turn() {
     let mut ctx = test_ctx();
     attach_fake_secure_key_actor(&mut ctx).await;
     let tmp = tempfile::tempdir().unwrap();
-    let parent_row = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let parent_row = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     let parent_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34234,11 +34317,15 @@ async fn btw_rehydrate_reports_live_fork() {
         )
         .await
         .unwrap();
-    let parent = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let parent = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let created = ctx
         .db
         .create_btw_fork(parent.session_id, true)
@@ -34295,7 +34382,14 @@ async fn btw_rehydrate_reports_live_fork() {
 async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let root = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let root = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     let child = ctx.db.create_fork(root.session_id, None).await.unwrap();
     insert_hung_worker(&ctx, child.session_id);
 
@@ -34387,11 +34481,14 @@ async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
         )
         .await
         .expect("trust workspace");
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .expect("create session");
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .expect("create session");
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34625,11 +34722,15 @@ async fn attach_replays_drain_state_after_attached_response() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34718,11 +34819,15 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let seq1 = ctx
         .db
         .insert_session_event(

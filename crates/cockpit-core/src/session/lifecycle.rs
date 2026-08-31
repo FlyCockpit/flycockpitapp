@@ -188,6 +188,22 @@ impl CapturedKnowledgeBasePromptSnapshot {
 }
 
 impl Session {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn test_session_identity(project_root: &Path) -> (PathBuf, String) {
+        let project_root =
+            std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let project_id = Self::project_id_for_canonical_test_session_root(&project_root);
+        (project_root, project_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn project_id_for_canonical_test_session_root(project_root: &Path) -> String {
+        super::project_id_from_workspace_object(&format!(
+            "cockpit-synthetic-test-workspace-root-v1\\0{}",
+            project_root.display()
+        ))
+    }
+
     /// Derive a session project id. Production sessions always prove the
     /// workspace directory identity; synthetic test roots retain a separate,
     /// deterministic test-only namespace and never publish workspace state.
@@ -198,10 +214,13 @@ impl Session {
         if initialize_workspace_scratch {
             return project_id_for(project_root);
         }
-        Ok(super::project_id_from_workspace_object(&format!(
-            "cockpit-synthetic-test-workspace-root-v1\\0{}",
-            project_root.display()
-        )))
+        #[cfg(any(test, feature = "test-support"))]
+        return Ok(Self::project_id_for_canonical_test_session_root(
+            project_root,
+        ));
+
+        #[cfg(not(any(test, feature = "test-support")))]
+        unreachable!("synthetic session roots are test-support only")
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -212,10 +231,7 @@ impl Session {
         // process-global durable state directory retains the old marker.
         // Production constructors remain the only path that proves an on-disk
         // workspace identity and initializes durable workspace scratch.
-        (
-            std::fs::canonicalize(&project_root).unwrap_or(project_root),
-            false,
-        )
+        (Self::test_session_identity(&project_root).0, false)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -257,7 +273,6 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
-            false,
         )
     }
 
@@ -296,7 +311,6 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
-            false,
         )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -340,7 +354,6 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
-            false,
         )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -379,7 +392,6 @@ impl Session {
             vault,
             false,
             initialize_workspace_scratch,
-            false,
         )
     }
 
@@ -408,7 +420,6 @@ impl Session {
             vault,
             false,
             initialize_workspace_scratch,
-            true,
         )?))
     }
 
@@ -447,7 +458,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault, true, true, false)
+        Self::from_row(db, project_root, row, resolver, vault, true, true)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -481,16 +492,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(
-            db,
-            project_root,
-            row.clone(),
-            resolver,
-            vault,
-            true,
-            true,
-            false,
-        )?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -640,16 +642,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(
-            db,
-            project_root,
-            row.clone(),
-            resolver,
-            vault,
-            true,
-            true,
-            false,
-        )?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -772,7 +765,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault, false, true, false)
+        Self::from_row(db, project_root, row, resolver, vault, false, true)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -800,7 +793,6 @@ impl Session {
             vault,
             false,
             true,
-            false,
         )?))
     }
 
@@ -812,7 +804,6 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
         freshly_created: bool,
         initialize_workspace_scratch: bool,
-        allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Self> {
         let project_root = if initialize_workspace_scratch {
             canonical_workspace_root(&project_root)
@@ -831,7 +822,7 @@ impl Session {
             // resume path, which otherwise has no caller-side indication that
             // the persisted row is synthetic. The durable project id is the
             // discriminator: never downgrade an unrecognised production row.
-            let synthetic_id = Self::project_id_for_session_root(&project_root, false)?;
+            let synthetic_id = Self::project_id_for_canonical_test_session_root(&project_root);
             if row.project_id == synthetic_id {
                 false
             } else if project_id_for(&project_root).ok().as_deref() == Some(&row.project_id) {
@@ -840,15 +831,9 @@ impl Session {
                 initialize_workspace_scratch
             }
         };
-        let project_id_matches =
-            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
-                == row.project_id;
-        // Low-level test fixtures deliberately construct rows without a real
-        // workspace authority (often with a short placeholder project id).
-        // They can only enter here through `resume_for_test`; production
-        // resumes and test-created sessions still prove the durable identity.
         anyhow::ensure!(
-            project_id_matches || allow_unbound_test_fixture_project_id,
+            Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
+                == row.project_id,
             "persisted session project id does not match canonical workspace root"
         );
         let session_entry_mode = match row.session_entry_mode.as_str() {

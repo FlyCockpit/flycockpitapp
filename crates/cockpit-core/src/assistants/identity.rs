@@ -823,22 +823,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let project_id = crate::session::project_id_for(project).unwrap();
-        let project_root = project.display().to_string();
-        let session_row = db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::insert_session_row_conn(
-                    conn,
-                    &crate::db::Db::build_new_assistant_session_row_conn(
-                        conn,
-                        &project_id,
-                        &project_root,
-                        "helper",
-                        "helper",
-                    )?,
-                )
-            })
-            .unwrap();
+        let session_row = crate::session::Session::insert_row_for_test(
+            &db,
+            project,
+            "helper",
+            crate::session::TestSessionRowOptions::default().with_assistant("helper"),
+        )
+        .await
+        .unwrap();
         let session = crate::session::Session::resume_for_test(
             db.clone(),
             session_row.session_id,

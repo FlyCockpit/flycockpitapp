@@ -11140,19 +11140,14 @@ Inventory facts for warehouse operations.
 
     async fn test_session(root: &Path) -> Session {
         let db = crate::db::Db::open(&root.join("cockpit.db")).unwrap();
-        let project_root = root.to_str().unwrap().to_string();
-        let row = db
-            .write(move |conn| {
-                let row = crate::db::Db::build_new_session_row_conn(
-                    conn,
-                    "project",
-                    &project_root,
-                    "test",
-                )?;
-                crate::db::Db::insert_session_row_conn(conn, &row)
-            })
-            .await
-            .unwrap();
+        let row = Session::insert_row_for_test(
+            &db,
+            root,
+            "test",
+            crate::session::TestSessionRowOptions::default(),
+        )
+        .await
+        .unwrap();
         Session::resume_for_test(
             db,
             row.session_id,

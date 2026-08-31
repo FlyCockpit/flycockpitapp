@@ -48,6 +48,8 @@ mod recording;
 pub mod sealed_values;
 #[cfg(any(test, feature = "test-support"))]
 mod test_constructors;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_constructors::TestSessionRowOptions;
 /// The trusted-child sealed-value capture authority + pending-record registry
 /// (leak-report AC7/AC8, sub-increment 2c-2). Exercised end-to-end by its own
 /// unit tests; the production coordinator that mints and drives it lands in the
@@ -4053,18 +4055,25 @@ mod tests {
     #[tokio::test]
     async fn resume_rejects_divergent_model_selection_projections() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "Build").await.unwrap();
-        row.provider = Some("projection-provider".to_string());
-        row.model = Some("projection-model".to_string());
-        row.model_selection_json = Some(
-            serde_json::json!({
-                "provider": "structured-provider",
-                "model": "structured-model",
-                "thinking_mode": "high"
-            })
-            .to_string(),
-        );
-        let row = db.insert_session_row(&row).await.unwrap();
+        let row = Session::insert_row_for_test(
+            &db,
+            Path::new("/x"),
+            "Build",
+            TestSessionRowOptions::default().with_raw_model_selection_fields(
+                Some("projection-provider".to_string()),
+                Some("projection-model".to_string()),
+                Some(
+                    serde_json::json!({
+                        "provider": "structured-provider",
+                        "model": "structured-model",
+                        "thinking_mode": "high"
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
 
         let error = Session::resume_for_test(
             db,
@@ -4080,10 +4089,18 @@ mod tests {
     #[tokio::test]
     async fn resume_rejects_projection_only_model_state() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "Build").await.unwrap();
-        row.provider = Some("projection-provider".to_string());
-        row.model = Some("projection-model".to_string());
-        let row = db.insert_session_row(&row).await.unwrap();
+        let row = Session::insert_row_for_test(
+            &db,
+            Path::new("/x"),
+            "Build",
+            TestSessionRowOptions::default().with_raw_model_selection_fields(
+                Some("projection-provider".to_string()),
+                Some("projection-model".to_string()),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
 
         let error = Session::resume_for_test(
             db,
@@ -4094,6 +4111,86 @@ mod tests {
         .expect("projection-only state must not synthesize empty preferences")
         .to_string();
         assert!(error.contains("require model_selection_json"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn insert_row_for_test_rejects_assistant_with_non_assistant_entry_mode() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
+
+        let error = Session::insert_row_for_test(
+            &db,
+            Path::new("/x"),
+            "Build",
+            TestSessionRowOptions::default()
+                .with_assistant("helper")
+                .with_entry_mode(crate::daemon::proto::SessionEntryMode::Computer),
+        )
+        .await
+        .expect_err("assistant rows must reject non-assistant entry modes")
+        .to_string();
+
+        assert_eq!(error, "assistant test row requires assistant entry mode");
+        assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_for_test_rejects_mismatched_raw_project_identity() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut row = db
+            .new_session_row(
+                "deliberately-mismatched-project-id",
+                root.path().to_str().unwrap(),
+                "Build",
+            )
+            .await
+            .unwrap();
+        row = db.insert_session_row(&row).await.unwrap();
+
+        let error = Session::resume_for_test(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .err()
+        .expect("raw identity mismatch must fail closed")
+        .to_string();
+        assert_eq!(
+            error,
+            "persisted session project id does not match canonical workspace root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_row_persists_canonical_symlink_target_for_resume() {
+        let db = Db::open_in_memory().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("original");
+        let replacement = fixture.path().join("replacement");
+        let alias = fixture.path().join("workspace");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let canonical_original = std::fs::canonicalize(&original).unwrap();
+
+        let row =
+            Session::insert_row_for_test(&db, &alias, "Build", TestSessionRowOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(PathBuf::from(&row.project_root), canonical_original);
+
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        let resumed = Session::resume_for_test(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("durable row remains bound to the original canonical target");
+        assert_eq!(resumed.project_root, canonical_original);
     }
 
     #[tokio::test]

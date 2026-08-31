@@ -159,9 +159,7 @@ impl Tool for GrepTool {
                         .iter()
                         .any(|root| cockpit_host::path_containment::contained_under(root, path))
             })
-            .map(|outcome| {
-                render_search_outcome(outcome, &query, attached_knowledge_read)
-            })
+            .map(|outcome| render_search_outcome(outcome, &query, attached_knowledge_read))
         })
         .await
         .map_err(|e| anyhow::anyhow!("grep worker joined: {e}"))??;

@@ -122,7 +122,7 @@ impl Inner {
         reason: EdgeReason,
     ) -> bool {
         if to == PermissionStateName::Released {
-            return self.release_by_id(request_id, reason);
+            return self.transition_to_released(request_id, reason);
         }
         let Some(entry) = self.entries.get_mut(request_id) else {
             return false;
@@ -134,7 +134,7 @@ impl Inner {
         true
     }
 
-    fn release_by_id(&mut self, request_id: &str, reason: EdgeReason) -> bool {
+    fn transition_to_released(&mut self, request_id: &str, reason: EdgeReason) -> bool {
         let Some(entry) = self.entries.get_mut(request_id) else {
             return false;
         };
@@ -177,7 +177,7 @@ impl Inner {
                 PermissionStateName::Reserved => EdgeReason::IncompleteOutput,
                 _ => EdgeReason::Disconnect,
             };
-            let _ = self.release_by_id(&id, reason);
+            let _ = self.transition_to_released(&id, reason);
         }
     }
 }
@@ -529,7 +529,7 @@ impl OutboundPermissionRegistry {
                 }
                 let _gate = self.gate.lock().expect("registry gate");
                 let mut inner = self.inner.lock().expect("registry");
-                let _ = inner.release_by_id(request_id, EdgeReason::AcpCancelled);
+                let _ = inner.transition_to_released(request_id, EdgeReason::AcpCancelled);
                 return Ok(());
             }
             InboundPermissionAction::Resolve(resolve_request) => resolve_request,
@@ -571,13 +571,13 @@ impl OutboundPermissionRegistry {
             | ResolveCodeRootInterruptResultV1::AlreadyResolvedSame => {
                 counters.approval_acks += 1;
                 ack.ack_approval_delivery(&delivery_id);
-                let _ = inner.release_by_id(request_id, EdgeReason::AckOrClose);
+                let _ = inner.transition_to_released(request_id, EdgeReason::AckOrClose);
                 None
             }
             ResolveCodeRootInterruptResultV1::AlreadyResolvedOther
             | ResolveCodeRootInterruptResultV1::Cancelled
             | ResolveCodeRootInterruptResultV1::Expired => {
-                let _ = inner.release_by_id(request_id, EdgeReason::AckOrClose);
+                let _ = inner.transition_to_released(request_id, EdgeReason::AckOrClose);
                 Some(outcome)
             }
         };
@@ -600,7 +600,7 @@ impl OutboundPermissionRegistry {
                     || entry.state == PermissionStateName::Terminal
             });
             if !skip {
-                let _ = inner.release_by_id(&id, EdgeReason::Disconnect);
+                let _ = inner.transition_to_released(&id, EdgeReason::Disconnect);
             }
         }
         let _ = counters;
@@ -635,7 +635,7 @@ impl OutboundPermissionRegistry {
                 continue;
             }
             if !inner.writable {
-                let _ = inner.release_by_id(&id, EdgeReason::DaemonTerminal);
+                let _ = inner.transition_to_released(&id, EdgeReason::DaemonTerminal);
                 continue;
             }
             if !inner.apply_edge(
@@ -648,7 +648,7 @@ impl OutboundPermissionRegistry {
             counters.cancel_notifications_queued += 1;
             match sink.write_json_value(&cancel_request_notification(&id), counters) {
                 Ok(WriteOutcome::Complete) => {
-                    let _ = inner.release_by_id(&id, EdgeReason::DaemonTerminal);
+                    let _ = inner.transition_to_released(&id, EdgeReason::DaemonTerminal);
                 }
                 Ok(WriteOutcome::Partial { .. }) | Ok(WriteOutcome::Failed) | Err(_) => {
                     inner.close_and_release_all();
@@ -674,7 +674,7 @@ impl OutboundPermissionRegistry {
             return;
         }
         if !inner.writable {
-            let _ = inner.release_by_id(request_id, EdgeReason::DaemonTerminal);
+            let _ = inner.transition_to_released(request_id, EdgeReason::DaemonTerminal);
             return;
         }
         if !inner.apply_edge(
@@ -687,7 +687,7 @@ impl OutboundPermissionRegistry {
         counters.cancel_notifications_queued += 1;
         match sink.write_json_value(&cancel_request_notification(request_id), counters) {
             Ok(WriteOutcome::Complete) => {
-                let _ = inner.release_by_id(request_id, EdgeReason::DaemonTerminal);
+                let _ = inner.transition_to_released(request_id, EdgeReason::DaemonTerminal);
             }
             Ok(WriteOutcome::Partial { .. }) | Ok(WriteOutcome::Failed) | Err(_) => {
                 inner.close_and_release_all();

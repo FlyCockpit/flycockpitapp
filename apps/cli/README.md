@@ -222,6 +222,7 @@ cockpit packages prune --dry-run
 | `cockpit assistants` | Manage persistent assistants. |
 | `cockpit computer` | Launch the Computer-mode TUI. |
 | `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
+| `cockpit acp` | Run the local Agent Client Protocol stdio server for Code roots. |
 | `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |
 | `cockpit invocation status <id>` | Show durable status for a run invocation by client_submission_id. |
 | `cockpit invocation cancel <id>` | Request cancellation of a run invocation (idempotent). |
@@ -243,6 +244,8 @@ cockpit packages prune --dry-run
 | `cockpit session list` | List recorded sessions. |
 | `cockpit session delete <session> [--yes]` | Permanently delete one session and its local data; prompts unless `--yes` is supplied. |
 | `cockpit session purge --before <YYYY-MM-DD|30d> [--dry-run] [--yes]` | Permanently delete ended sessions before a cutoff; `--dry-run` reports the count only. |
+| `cockpit knowledge attach <kb> <session>` | Attach a session to a knowledge base as dream input consent. |
+| `cockpit dream <kb>\|--all` | Dream one knowledge base or every configured knowledge base. |
 | `cockpit schedule list` | List durable scheduler jobs. |
 | `cockpit skill curator status` | Show skill curation and snapshot state. |
 | `cockpit trust status [path]` | Show workspace trust state. |

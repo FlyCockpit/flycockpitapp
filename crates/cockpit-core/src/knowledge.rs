@@ -971,8 +971,26 @@ pub enum KnowledgeDreamGitOutcome {
     Deferred {
         branch: Option<String>,
         commit: Option<String>,
+        /// The mutation crossed Git's irreversible commit boundary, but a
+        /// later local bookkeeping or transport step could not complete.
+        /// `commit` can be absent when resolving the new `HEAD` itself
+        /// failed, so callers must not infer this state from the SHA alone.
+        committed: bool,
         reason: String,
     },
+}
+
+impl KnowledgeDreamGitOutcome {
+    fn committed_locally(&self) -> bool {
+        matches!(
+            self,
+            Self::Committed { .. }
+                | Self::Deferred {
+                    committed: true,
+                    ..
+                }
+        )
+    }
 }
 
 enum PreparedKnowledgeGit {
@@ -995,6 +1013,29 @@ enum KnowledgeGitStaging {
         relative_path: PathBuf,
         content: Vec<u8>,
     },
+}
+
+enum KnowledgeGitCommitIndex<'a> {
+    Worktree,
+    ExactFile {
+        index_path: &'a Path,
+        empty_hooks_path: &'a Path,
+        relative_path: &'a Path,
+        blob: &'a str,
+    },
+}
+
+impl KnowledgeGitCommitIndex<'_> {
+    fn refresh_worktree_paths(&self) -> bool {
+        matches!(self, Self::Worktree)
+    }
+
+    fn environment(&self) -> Option<(&str, &std::ffi::OsStr)> {
+        match self {
+            Self::Worktree => None,
+            Self::ExactFile { index_path, .. } => Some(("GIT_INDEX_FILE", index_path.as_os_str())),
+        }
+    }
 }
 
 impl KnowledgeGitStaging {
@@ -1096,6 +1137,7 @@ where
         return Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: None,
             commit: None,
+            committed: false,
             reason: reason.clone(),
         });
     }
@@ -1124,6 +1166,7 @@ where
                     return Ok(KnowledgeDreamGitOutcome::Deferred {
                         branch: None,
                         commit: None,
+                        committed: false,
                         reason: format!("validating existing knowledge for Git failed: {error}"),
                     });
                 }
@@ -1170,6 +1213,7 @@ where
         PreparedKnowledgeGit::Deferred(reason) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: None,
             commit: None,
+            committed: false,
             reason,
         }),
         PreparedKnowledgeGit::Active {
@@ -1189,6 +1233,7 @@ where
                 Err(error) => Ok(KnowledgeDreamGitOutcome::Deferred {
                     branch: Some(branch.clone()),
                     commit: None,
+                    committed: false,
                     reason: format!("recording dream history failed: {error}"),
                 }),
             };
@@ -1202,6 +1247,10 @@ where
                 return Ok(KnowledgeDreamGitOutcome::Deferred {
                     branch: Some(branch),
                     commit,
+                    committed: outcome
+                        .as_ref()
+                        .ok()
+                        .is_some_and(KnowledgeDreamGitOutcome::committed_locally),
                     reason: format!(
                         "restoring the knowledge base branch after review failed: {error}"
                     ),
@@ -1419,6 +1468,7 @@ fn commit_knowledge_dream(
             return Ok(KnowledgeDreamGitOutcome::Deferred {
                 branch: Some(branch.to_string()),
                 commit: None,
+                committed: false,
                 reason: format!("validating dream output for Git failed: {error}"),
             });
         }
@@ -1456,7 +1506,14 @@ fn commit_knowledge_dream(
         );
     }
 
-    commit_staged_knowledge_dream(root, branch, remote, dream, &paths, true)
+    commit_staged_knowledge_dream(
+        root,
+        branch,
+        remote,
+        dream,
+        &paths,
+        KnowledgeGitCommitIndex::Worktree,
+    )
 }
 
 /// Stage a validated human concept from its exact bytes, rather than asking
@@ -1493,8 +1550,46 @@ fn commit_exact_knowledge_file(
         !blob.is_empty() && blob.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "Git returned an invalid object ID for validated human output"
     );
+    let git_dir = knowledge_git_dir(root)?;
+    let isolated = tempfile::Builder::new()
+        .prefix("flycockpit-human-index-")
+        .tempdir_in(&git_dir)
+        .context("creating an isolated Git index for validated human output")?;
+    let index_path = isolated.path().join("index");
+    let empty_hooks_path = isolated.path().join("empty-hooks");
+    fs::create_dir(&empty_hooks_path)
+        .context("creating an empty Git hooks directory for validated human output")?;
+    let index = KnowledgeGitCommitIndex::ExactFile {
+        index_path: &index_path,
+        empty_hooks_path: &empty_hooks_path,
+        relative_path,
+        blob,
+    };
+    let read_tree = match knowledge_git_with_index(root, &index, &["read-tree", "HEAD"]) {
+        Ok(read_tree) => read_tree,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "preparing the isolated human Git index",
+                error.to_string(),
+            );
+        }
+    };
+    if !read_tree.success {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "preparing the isolated human Git index",
+            read_tree.stderr.trim().to_string(),
+        );
+    }
     let cacheinfo = format!("100644,{blob},{}", rel_string(relative_path));
-    let staged = match knowledge_git(root, &["update-index", "--add", "--cacheinfo", &cacheinfo]) {
+    let staged = match knowledge_git_with_index(
+        root,
+        &index,
+        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+    ) {
         Ok(staged) => staged,
         Err(error) => {
             return deferred_knowledge_dream_after_rollback(
@@ -1513,26 +1608,42 @@ fn commit_exact_knowledge_file(
             staged.stderr.trim().to_string(),
         );
     }
+    if let Err(error) = run_knowledge_pre_commit_hook(root, &index) {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "running the knowledge pre-commit hook",
+            error.to_string(),
+        );
+    }
+    if let Err(error) = validate_exact_knowledge_git_index(root, &index) {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "validating the isolated human Git index",
+            error.to_string(),
+        );
+    }
     commit_staged_knowledge_dream(
         root,
         branch,
         remote,
         dream,
         &[relative_path.to_path_buf()],
-        false,
+        index,
     )
 }
 
-/// Commit the selected index entries. Exact-byte staging must not use
-/// `commit --only`: that option refreshes the index by reopening worktree
-/// paths, which would discard the validated-byte boundary above.
+/// Commit the selected index entries. Exact-byte staging uses an isolated
+/// index so neither a hook nor another Git process can add an unvalidated
+/// entry to the human commit. The normal worktree path retains `--only`.
 fn commit_staged_knowledge_dream(
     root: &Path,
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
     paths: &[PathBuf],
-    refresh_worktree_paths: bool,
+    index: KnowledgeGitCommitIndex<'_>,
 ) -> Result<KnowledgeDreamGitOutcome> {
     let mut cached_args = vec![
         "diff".to_string(),
@@ -1542,7 +1653,7 @@ fn commit_staged_knowledge_dream(
     ];
     cached_args.extend(paths.iter().map(|path| rel_string(path)));
     let cached_refs: Vec<_> = cached_args.iter().map(String::as_str).collect();
-    let changed = match knowledge_git(root, &cached_refs) {
+    let changed = match knowledge_git_with_index(root, &index, &cached_refs) {
         Ok(changed) => changed,
         Err(error) => {
             return deferred_knowledge_dream_after_rollback(
@@ -1583,13 +1694,20 @@ fn commit_staged_knowledge_dream(
         "-m".to_string(),
         message,
     ];
-    if refresh_worktree_paths {
+    if index.refresh_worktree_paths() {
         commit_args.push("--only".to_string());
         commit_args.push("--".to_string());
         commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    } else if let KnowledgeGitCommitIndex::ExactFile {
+        empty_hooks_path, ..
+    } = &index
+    {
+        commit_args.insert(0, format!("core.hooksPath={}", empty_hooks_path.display()));
+        commit_args.insert(0, "-c".to_string());
+        commit_args.push("--no-verify".to_string());
     }
     let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
-    let committed = match knowledge_git(root, &commit_refs) {
+    let committed = match knowledge_git_with_index(root, &index, &commit_refs) {
         Ok(committed) => committed,
         Err(error) => {
             return deferred_knowledge_dream_after_rollback(
@@ -1608,7 +1726,29 @@ fn commit_staged_knowledge_dream(
             committed.stderr.trim().to_string(),
         );
     }
-    let commit = crate::git::head_sha(root)?;
+    let commit = match crate::git::head_sha(root) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                None,
+                error.to_string(),
+            ));
+        }
+    };
+    if let KnowledgeGitCommitIndex::ExactFile {
+        relative_path,
+        blob,
+        ..
+    } = &index
+        && let Err(error) = stage_exact_knowledge_file_in_primary_index(root, relative_path, blob)
+    {
+        return Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(commit),
+            format!("synchronizing the primary Git index after the human commit failed: {error}"),
+        ));
+    }
 
     let Some(remote) = remote else {
         return Ok(KnowledgeDreamGitOutcome::Committed {
@@ -1617,7 +1757,17 @@ fn commit_staged_knowledge_dream(
             pushed: false,
         });
     };
-    if knowledge_git_push(root, remote, branch)?.success {
+    let first_push = match knowledge_git_push(root, remote, branch) {
+        Ok(push) => push,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                Some(commit),
+                format!("pushing knowledge output failed: {error}"),
+            ));
+        }
+    };
+    if first_push.success {
         return Ok(KnowledgeDreamGitOutcome::Committed {
             commit,
             branch: branch.to_string(),
@@ -1629,35 +1779,54 @@ fn commit_staged_knowledge_dream(
     // and try once more. A conflict is aborted so the next ledger-driven dream
     // run starts from a clean repository; no force-push is ever attempted.
     if let Err(error) = knowledge_git_fetch(root, remote) {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: Some(commit),
-            reason: error.to_string(),
-        });
+        return Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(commit),
+            error.to_string(),
+        ));
     }
     if let Err(error) = knowledge_git_rebase_remote_branch(root, remote, branch, true) {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: Some(commit),
-            reason: error.to_string(),
-        });
+        return Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(commit),
+            error.to_string(),
+        ));
     }
-    let pushed = knowledge_git_push(root, remote, branch)?;
+    let rebased_commit = match crate::git::head_sha(root) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                None,
+                error.to_string(),
+            ));
+        }
+    };
+    let pushed = match knowledge_git_push(root, remote, branch) {
+        Ok(push) => push,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                Some(rebased_commit),
+                format!("pushing rebased knowledge output failed: {error}"),
+            ));
+        }
+    };
     if pushed.success {
         Ok(KnowledgeDreamGitOutcome::Committed {
-            commit: crate::git::head_sha(root)?,
+            commit: rebased_commit,
             branch: branch.to_string(),
             pushed: true,
         })
     } else {
-        Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: Some(commit),
-            reason: format!(
+        Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(rebased_commit),
+            format!(
                 "pushing dream output was rejected after rebase retry: {}",
                 pushed.stderr.trim()
             ),
-        })
+        ))
     }
 }
 
@@ -1697,16 +1866,154 @@ fn deferred_knowledge_dream_after_rollback(
         Ok(()) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: Some(branch.to_string()),
             commit: None,
+            committed: false,
             reason: format!("{operation} failed: {failure}"),
         }),
         Err(cleanup_error) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: Some(branch.to_string()),
             commit: None,
+            committed: false,
             reason: format!(
                 "{operation} failed: {failure}; refusing automatic re-entry because cleanup failed: {cleanup_error}"
             ),
         }),
     }
+}
+
+fn deferred_after_knowledge_commit(
+    branch: &str,
+    commit: Option<String>,
+    reason: String,
+) -> KnowledgeDreamGitOutcome {
+    KnowledgeDreamGitOutcome::Deferred {
+        branch: Some(branch.to_string()),
+        commit,
+        committed: true,
+        reason,
+    }
+}
+
+fn knowledge_git_with_index(
+    root: &Path,
+    index: &KnowledgeGitCommitIndex<'_>,
+    args: &[&str],
+) -> Result<crate::git::GitOutcome> {
+    match index.environment() {
+        Some(environment) => crate::git::run_git_with_env(root, args, &[environment]),
+        None => crate::git::run_git(root, args),
+    }
+    .with_context(|| format!("running knowledge Git command `git {}`", args.join(" ")))
+}
+
+fn knowledge_git_dir(root: &Path) -> Result<PathBuf> {
+    let git_dir = knowledge_git(root, &["rev-parse", "--git-dir"])?;
+    if !git_dir.success {
+        bail!(
+            "resolving the knowledge Git directory failed: {}",
+            git_dir.stderr.trim()
+        );
+    }
+    let git_dir = PathBuf::from(git_dir.stdout.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        root.join(git_dir)
+    };
+    fs::canonicalize(&git_dir).with_context(|| {
+        format!(
+            "resolving the knowledge Git directory {}",
+            git_dir.display()
+        )
+    })
+}
+
+fn run_knowledge_pre_commit_hook(root: &Path, index: &KnowledgeGitCommitIndex<'_>) -> Result<()> {
+    let KnowledgeGitCommitIndex::ExactFile { .. } = index else {
+        return Ok(());
+    };
+    let hook = knowledge_git(root, &["rev-parse", "--git-path", "hooks/pre-commit"])?;
+    if !hook.success {
+        bail!(
+            "locating the knowledge pre-commit hook failed: {}",
+            hook.stderr.trim()
+        );
+    }
+    let hook = PathBuf::from(hook.stdout.trim());
+    let hook = if hook.is_absolute() {
+        hook
+    } else {
+        root.join(hook)
+    };
+    if !hook.is_file() {
+        return Ok(());
+    }
+    let outcome = knowledge_git_with_index(root, index, &["hook", "run", "pre-commit"])?;
+    if !outcome.success {
+        bail!("pre-commit hook failed: {}", outcome.stderr.trim());
+    }
+    Ok(())
+}
+
+fn validate_exact_knowledge_git_index(
+    root: &Path,
+    index: &KnowledgeGitCommitIndex<'_>,
+) -> Result<()> {
+    let KnowledgeGitCommitIndex::ExactFile {
+        relative_path,
+        blob,
+        ..
+    } = index
+    else {
+        return Ok(());
+    };
+    let changed =
+        knowledge_git_with_index(root, index, &["diff", "--cached", "--name-only", "-z"])?;
+    if !changed.success {
+        bail!(
+            "checking the isolated human Git index failed: {}",
+            changed.stderr.trim()
+        );
+    }
+    let changed = changed
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let expected_path = rel_string(relative_path);
+    ensure!(
+        changed.as_slice() == [expected_path.as_str()],
+        "the pre-commit hook changed unvalidated Git index entries"
+    );
+    let staged =
+        knowledge_git_with_index(root, index, &["ls-files", "--stage", "--", &expected_path])?;
+    if !staged.success {
+        bail!(
+            "reading the isolated human Git index failed: {}",
+            staged.stderr.trim()
+        );
+    }
+    let expected_entry = format!("100644 {blob} 0\t{expected_path}");
+    ensure!(
+        staged.stdout.trim_end() == expected_entry,
+        "the pre-commit hook changed the validated human concept in the Git index"
+    );
+    Ok(())
+}
+
+fn stage_exact_knowledge_file_in_primary_index(
+    root: &Path,
+    relative_path: &Path,
+    blob: &str,
+) -> Result<()> {
+    let cacheinfo = format!("100644,{blob},{}", rel_string(relative_path));
+    let staged = knowledge_git(root, &["update-index", "--add", "--cacheinfo", &cacheinfo])?;
+    if !staged.success {
+        bail!(
+            "updating the primary Git index with the validated human concept failed: {}",
+            staged.stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -5084,22 +5391,17 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
         )?;
         // A deferred Git transaction has two materially different states:
         // failures before/during the commit path are rolled back, while a
-        // post-commit transport failure retains the local commit. Report the
-        // latter as applied so the user can distinguish a retryable push from
-        // an edit that must be submitted again.
-        let applied = matches!(
-            &git,
-            KnowledgeDreamGitOutcome::Committed { .. }
-                | KnowledgeDreamGitOutcome::NoChanges { .. }
-                | KnowledgeDreamGitOutcome::Deferred {
-                    commit: Some(_),
-                    ..
-                }
-        );
+        // post-commit local or transport failure retains the edit even when
+        // Git could not resolve a commit SHA for it.
+        let applied = human_knowledge_edit_was_applied(&git);
         Ok(HumanKnowledgeEditOutcome { git, applied })
     })
     .await
     .context("human knowledge edit task terminated before completing")?
+}
+
+fn human_knowledge_edit_was_applied(git: &KnowledgeDreamGitOutcome) -> bool {
+    git.committed_locally() || matches!(git, KnowledgeDreamGitOutcome::NoChanges { .. })
 }
 
 /// The exact new leaf published by a human concept write. Rollback never
@@ -5492,8 +5794,10 @@ pub(crate) fn human_knowledge_edit_outcome_note(outcome: &HumanKnowledgeEditOutc
         KnowledgeDreamGitOutcome::Skipped { reason } => {
             format!("human knowledge concept was not applied: {reason}")
         }
-        KnowledgeDreamGitOutcome::Deferred { reason, .. } => {
-            if outcome.applied {
+        KnowledgeDreamGitOutcome::Deferred {
+            committed, reason, ..
+        } => {
+            if *committed {
                 format!(
                     "human knowledge concept applied, but Git synchronization deferred: {reason}"
                 )
@@ -6347,18 +6651,25 @@ fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutp
         KnowledgeDreamGitOutcome::Deferred {
             branch,
             commit,
+            committed,
             reason,
-        } => format!(
-            "Knowledge dream output was retained{}{}; synchronization deferred: {reason}",
-            branch
-                .as_deref()
-                .map(|branch| format!(" on `{branch}`"))
-                .unwrap_or_default(),
-            commit
-                .as_deref()
-                .map(|commit| format!(" at `{commit}`"))
-                .unwrap_or_default(),
-        ),
+        } => {
+            if committed {
+                format!(
+                    "Knowledge dream output was retained{}{}; synchronization deferred: {reason}",
+                    branch
+                        .as_deref()
+                        .map(|branch| format!(" on `{branch}`"))
+                        .unwrap_or_default(),
+                    commit
+                        .as_deref()
+                        .map(|commit| format!(" at `{commit}`"))
+                        .unwrap_or_default(),
+                )
+            } else {
+                format!("Knowledge dream was rolled back or not applied; retry required: {reason}")
+            }
+        }
     };
     ToolOutput::text(text)
 }
@@ -8992,6 +9303,80 @@ Inventory facts for warehouse operations.
 
     #[cfg(unix)]
     #[test]
+    fn rejected_rebase_retry_reports_the_rewritten_commit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("knowledge-remote.git");
+        let remote_arg = remote.to_string_lossy().into_owned();
+        crate::git::run_git_checked(tmp.path(), &["init", "-q", "--bare", &remote_arg]).unwrap();
+
+        let seed = tmp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        write_bundle(&seed);
+        crate::git::run_git_checked(&seed, &["init", "-q"]).unwrap();
+        configure_knowledge_git(&seed);
+        crate::git::run_git_checked(&seed, &["add", "--all"]).unwrap();
+        crate::git::run_git_checked(&seed, &["commit", "-q", "-m", "seed"]).unwrap();
+        crate::git::run_git_checked(&seed, &["branch", "-M", "main"]).unwrap();
+        crate::git::run_git_checked(&seed, &["remote", "add", "origin", &remote_arg]).unwrap();
+        crate::git::run_git_checked(&seed, &["push", "-q", "origin", "main"]).unwrap();
+
+        let root = tmp.path().join("writer");
+        let root_arg = root.to_string_lossy().into_owned();
+        crate::git::run_git_checked(
+            tmp.path(),
+            &["clone", "-q", "--branch", "main", &remote_arg, &root_arg],
+        )
+        .unwrap();
+        configure_knowledge_git(&root);
+        let hook = root.join(".git/hooks/pre-push");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let outcome = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            |root, _| {
+                write_dream_concept(root, "local-concept", "Local dream output.");
+                let other = tmp.path().join("other-writer");
+                let other_arg = other.to_string_lossy().into_owned();
+                crate::git::run_git_checked(
+                    tmp.path(),
+                    &["clone", "-q", "--branch", "main", &remote_arg, &other_arg],
+                )
+                .unwrap();
+                configure_knowledge_git(&other);
+                write_dream_concept(&other, "remote-concept", "Remote writer output.");
+                crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
+                crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote advance"])
+                    .unwrap();
+                crate::git::run_git_checked(&other, &["push", "-q", "origin", "main"]).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let KnowledgeDreamGitOutcome::Deferred {
+            commit: Some(commit),
+            committed: true,
+            ..
+        } = outcome
+        else {
+            panic!("the rejected retry must retain the rebased local commit");
+        };
+        assert_eq!(commit, crate::git::head_sha(&root).unwrap());
+        let parent = crate::git::run_git_checked(&root, &["rev-parse", "HEAD^"]).unwrap();
+        let remote_head =
+            crate::git::run_git_checked(&root, &["rev-parse", "origin/main"]).unwrap();
+        assert_eq!(parent.trim(), remote_head.trim());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deferred_local_commit_is_pushed_before_a_noop_ledger_retry() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -9489,6 +9874,84 @@ Inventory facts for warehouse operations.
             expected,
             "the assertion is meaningful only if Git did not reopen the worktree path"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_human_git_staging_rejects_hook_added_index_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |_root, _| Ok(()),
+        )
+        .unwrap();
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'unvalidated hook content\\n' > hook-added.md\ngit add hook-added.md\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let human = KnowledgeDreamCommit {
+            knowledge_base_id: "personal".to_string(),
+            origin: KnowledgeCommitOrigin::Human,
+            model: "human".to_string(),
+            sessions_dreamed: 0,
+            concepts_written: 1,
+            data_files_written: 0,
+        };
+
+        let outcome = commit_exact_knowledge_file(
+            tmp.path(),
+            "main",
+            None,
+            &human,
+            Path::new("manual.md"),
+            b"---\nid: manual\ntype: memory\nprovenance: human\n---\n\nValidated human correction.\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Deferred {
+                committed: false,
+                ..
+            }
+        ));
+        assert!(
+            !tmp.path().join("hook-added.md").exists(),
+            "the failed transaction must remove the hook side effect"
+        );
+        let tree =
+            crate::git::run_git_checked(tmp.path(), &["ls-tree", "-r", "--name-only", "HEAD"])
+                .unwrap();
+        assert!(!tree.contains("hook-added.md"));
+        assert!(
+            crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "the rejected isolated index must not leave staged entries"
+        );
+    }
+
+    #[test]
+    fn human_edit_recognizes_a_committed_edit_even_without_a_resolved_sha() {
+        let git = KnowledgeDreamGitOutcome::Deferred {
+            branch: Some("main".to_string()),
+            commit: None,
+            committed: true,
+            reason: "resolving HEAD failed after commit".to_string(),
+        };
+
+        assert!(human_knowledge_edit_was_applied(&git));
+        assert!(git.committed_locally());
     }
 
     #[cfg(unix)]

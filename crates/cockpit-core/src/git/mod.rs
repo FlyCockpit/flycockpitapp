@@ -4,6 +4,7 @@
 //! than depending on `git2`/`libgit2`. Reasons: smaller binary, respects
 //! the user's git config and SSH keys, no version-skew breakage.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -187,6 +188,17 @@ pub struct GitOutcome {
 /// *launch* git (binary missing) is an `Err`; a non-zero git exit is a
 /// `GitOutcome { success: false, .. }` the caller inspects.
 pub fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutcome> {
+    run_git_with_env(dir, args, &[])
+}
+
+/// Run `git <args>` with a tightly-scoped environment override. This is kept
+/// alongside [`run_git`] so callers that need an isolated Git index do not
+/// bypass the external-runtime health gate.
+pub(crate) fn run_git_with_env(
+    dir: &Path,
+    args: &[&str],
+    environment: &[(&str, &OsStr)],
+) -> Result<GitOutcome> {
     crate::external_runtime::require_live_available_for_launch(
         crate::external_runtime::ID_GIT,
         dir,
@@ -194,6 +206,7 @@ pub fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutcome> {
     .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
     let output = Command::new("git")
         .args(args)
+        .envs(environment.iter().copied())
         .current_dir(dir)
         .output()
         .with_context(|| format!("launching `git {}`", args.join(" ")))?;

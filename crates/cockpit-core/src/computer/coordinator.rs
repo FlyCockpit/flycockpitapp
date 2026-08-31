@@ -4240,7 +4240,12 @@ impl ComputerActionCoordinator {
     pub async fn close(&mut self) -> Result<(), ComputerError> {
         // Revoke Ask delegation leases for this delegation.
         self.revoke_ask_lease_for_delegation();
-        self.release_input_before_host_lease()
+        self.release_input_before_host_lease()?;
+        // `close` is the terminal owner of backend cleanup.  The coordinator
+        // is commonly dropped immediately afterwards, so leave the drop path
+        // unable to inject a second neutralization into the same backend.
+        self.input_cleanup_permitted = false;
+        Ok(())
     }
 
     /// Neutralize backend-owned key/button state before making the physical

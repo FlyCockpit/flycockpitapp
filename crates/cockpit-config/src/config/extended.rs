@@ -422,9 +422,8 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
 
-    /// Prefer the active session model for the cache-reusing, ephemeral
-    /// title-and-description fork. When no utility title model is configured,
-    /// Cockpit also takes this path automatically.
+    /// Use the active session model for the cache-reusing, ephemeral
+    /// title-and-description fork instead of a configured utility model.
     #[serde(default)]
     pub auto_title_with_session_model: bool,
 

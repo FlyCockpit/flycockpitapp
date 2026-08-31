@@ -12550,8 +12550,7 @@ impl Driver {
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
         let (extended, providers) = self.config.configs();
-        let use_session_model_metadata =
-            extended.auto_title_with_session_model || extended.auto_title_model_ref().is_none();
+        let use_session_model_metadata = extended.auto_title_with_session_model;
         let (title_action, mut metadata_work) = if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,

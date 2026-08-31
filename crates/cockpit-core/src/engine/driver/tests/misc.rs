@@ -176,7 +176,10 @@ async fn stale_shadow_discarded() {
     install_test_providers(
         &mut driver,
         CacheMode::None,
-        ContextConfig::default(),
+        ContextConfig {
+            rolling_precompaction: false,
+            ..ContextConfig::default()
+        },
         10_000,
     );
     record_test_context_tokens(&driver, 7_600).await;

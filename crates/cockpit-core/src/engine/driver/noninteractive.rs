@@ -11313,21 +11313,37 @@ pub(crate) async fn run_noninteractive_resumable(
                     match persisted {
                         Ok(true) => {}
                         Ok(false) => {
-                            retain_noninteractive_late_steer_checkpoint(
-                                &active_claimed_agent_tree_steers,
-                                std::mem::take(&mut active_externally_claimed_agent_tree_steers),
-                                crate::engine::driver::LateUserSteerContinuationOutcome::failed(
-                                    "noninteractive executor lost its durable recovery descriptor",
-                                ),
-                            );
-                            return Err(NoninteractiveRunError::new(
-                                anyhow::anyhow!(
-                                    "noninteractive executor lost its durable recovery descriptor"
-                                ),
-                                history,
-                                fallback_decision,
-                                fallback_tried,
-                            ));
+                            // A directly started inline child can reach its
+                            // first checkpoint before the scheduler has
+                            // published it. Publish this exact recoverable
+                            // state atomically; already-live children retain
+                            // their normal CAS update above.
+                            let activated = session
+                                .db
+                                .activate_task_delegation_children_with_snapshots(
+                                    &target.task_call_id,
+                                    vec![(target.label.clone(), snapshot_json)],
+                                )
+                                .await;
+                            if activated.is_err() {
+                                retain_noninteractive_late_steer_checkpoint(
+                                    &active_claimed_agent_tree_steers,
+                                    std::mem::take(
+                                        &mut active_externally_claimed_agent_tree_steers,
+                                    ),
+                                    crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                        "noninteractive executor lost its durable recovery descriptor",
+                                    ),
+                                );
+                                return Err(NoninteractiveRunError::new(
+                                    anyhow::anyhow!(
+                                        "noninteractive executor lost its durable recovery descriptor"
+                                    ),
+                                    history,
+                                    fallback_decision,
+                                    fallback_tried,
+                                ));
+                            }
                         }
                         Err(error) => {
                             retain_noninteractive_late_steer_checkpoint(

@@ -421,9 +421,13 @@ pub async fn check_gitignore_read(
         return Ok(Some(gitignore_refusal(&display)));
     }
 
-    // No approver (headless / background) → deny with a clear result.
+    // No approver (headless / background) must settle through the shared
+    // machine-readable denial. This keeps synthetic seed reads and ordinary
+    // tool calls on the same noninteractive approval contract.
     let Some(approver) = ctx.approver.as_ref() else {
-        return Ok(Some(gitignore_refusal(&display)));
+        return Ok(Some(ToolOutput::text(
+            crate::approval::NONINTERACTIVE_RUN_DENIAL,
+        )));
     };
 
     // Build the glob shapes + the project-relative parent label for stage 1.

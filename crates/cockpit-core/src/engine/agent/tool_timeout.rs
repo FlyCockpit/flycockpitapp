@@ -71,6 +71,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("knowledge_dream_sources"),
     ToolTimeoutSafety::abandon_safe("semantic_search"),
     ToolTimeoutSafety::abandon_safe("structured_search"),
+    ToolTimeoutSafety::abandon_safe("thread_start"),
     ToolTimeoutSafety::abandon_safe("note"),
     ToolTimeoutSafety::human_blocking("question"),
     // `raise` crosses a durable SQLite commit boundary. It observes dispatcher

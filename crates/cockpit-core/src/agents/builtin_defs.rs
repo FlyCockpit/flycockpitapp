@@ -539,7 +539,6 @@ fn builder_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
-            "grep",
             "write",
             "unlock",
             "edit",

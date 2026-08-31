@@ -32,9 +32,9 @@ pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use acp::{
-    AckCodeRootDeliveriesV1Request, AckCodeRootDeliveriesV1Result, AcpForwardedMcpDeclarationV1,
-    AcpForwardedMcpIngressV1, AcpForwardedMcpNameValuePairV1, AcpForwardedMcpTransportV1,
-    AttachExistingCodeRootV1Request, AttachExistingCodeRootV1Result,
+    ACP_FORWARDED_MCP_VERSION_V1, AckCodeRootDeliveriesV1Request, AckCodeRootDeliveriesV1Result,
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpNameValuePairV1,
+    AcpForwardedMcpTransportV1, AttachExistingCodeRootV1Request, AttachExistingCodeRootV1Result,
     AttachExistingCodeRootWithAcpIngressV1Request, AttachExistingCodeRootWithAcpIngressV1Result,
     CloseAcpCodeRootAttachmentV1Outcome, CloseAcpCodeRootAttachmentV1Request,
     CloseAcpCodeRootAttachmentV1Result, CloseCodeRootAttachmentV1Request,

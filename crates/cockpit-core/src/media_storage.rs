@@ -297,7 +297,7 @@ impl HeldMediaComponentLease {
 
     /// Complete-read verification is deliberately coupled to durable release.
     /// Failure atomically blocks the aggregate/component and records evidence.
-    pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
+    pub(crate) async fn read_verified(self, now_unix_ms: i64) -> Result<Vec<u8>> {
         let verified = self.read_verified_retained(now_unix_ms).await?;
         let bytes = verified.bytes.clone();
         verified.release(now_unix_ms).await?;

@@ -1420,7 +1420,7 @@ const MAX_SESSION: i64 = super::MAX_PROPOSALS_PER_SESSION as i64;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::guidance::{ObservationCadence, enablement::resolve_guidance_enablement};
+    use crate::computer::guidance::ObservationCadence;
     use cockpit_db::Db;
     use std::sync::Mutex;
 

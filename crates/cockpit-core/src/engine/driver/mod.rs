@@ -4695,6 +4695,9 @@ impl Driver {
             dream_read_scope: self.dream_read_scope.clone(),
             workspace_lease: agent.workspace_lease.clone(),
             current_tool_call_id: None,
+            // Seed reads are host-selected, pre-inference calls. They have no
+            // model inference attempt to use as a durable effect scope.
+            current_tool_call_scope: None,
             tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),

@@ -30,6 +30,7 @@ use crate::config::extended::{
 };
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
+use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;

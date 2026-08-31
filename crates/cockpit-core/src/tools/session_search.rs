@@ -207,7 +207,7 @@ impl Tool for HistorySearchTool {
                         )
                         .await
                         .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
-                    render_session_hits(query, &hits, limit, false, ctx).await
+                    render_session_hits(query, &hits, limit, false, ctx).await?
                 } else {
                     let threads = ctx
                         .session
@@ -215,7 +215,7 @@ impl Tool for HistorySearchTool {
                         .list_threads_for_assistant(&assistant_name, &ctx.session.project_id, limit)
                         .await
                         .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
-                    render_thread_list(threads, trust, ctx).await
+                    render_thread_list(threads, trust, ctx).await?
                 }
             }
             HistorySearchScope::CurrentArtifacts => {

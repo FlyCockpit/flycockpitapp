@@ -1,9 +1,11 @@
 //! X11/RandR target-evidence pure logic.
 //!
-//! Session identity is a domain hash over display/screen plus length-delimited
-//! server setup vendor/release and root-window identity. Transport spellings
-//! are deliberately excluded: `:0` and `unix:0` can name the same server.
-//! Xauthority cookie bytes never enter the identity.
+//! Session identity is a domain hash over the canonical X server endpoint and
+//! length-delimited server setup vendor/release. A screen suffix and its root
+//! window are deliberately excluded: both are scoped beneath an X server,
+//! while XTEST input injection is server-global. Local transport spellings
+//! are canonicalized so `:0` and `unix:0` name the same server. Xauthority
+//! cookie bytes never enter the identity.
 
 use crate::computer::host_identity::domain_hash;
 #[cfg(target_os = "linux")]
@@ -30,15 +32,21 @@ pub struct X11SessionParts {
 }
 
 pub fn x11_session_or_seat_id(parts: &X11SessionParts) -> [u8; 32] {
-    // Intentionally omit xauthority_cookie.
+    // Intentionally omit the Xauthority credential and screen-scoped
+    // selectors. The resulting ID is also the server-wide X11 input-arbiter
+    // namespace, so screen aliases must never partition it.
+    let transport = if parts.transport.is_empty() || parts.transport.eq_ignore_ascii_case("unix") {
+        "unix"
+    } else {
+        &parts.transport
+    };
     domain_hash(
         b"cockpit.x11.session.v1",
         &[
+            transport.as_bytes(),
             &parts.display_number.to_le_bytes(),
-            &parts.screen.to_le_bytes(),
             parts.vendor.as_bytes(),
             &parts.release.to_le_bytes(),
-            &parts.root_window_id.to_le_bytes(),
         ],
     )
 }
@@ -923,6 +931,26 @@ mod production_adapter_tests {
         assert_eq!(
             x11_session_or_seat_id(&parts("")),
             x11_session_or_seat_id(&parts("unix"))
+        );
+    }
+
+    #[test]
+    fn screen_scoped_selectors_share_one_session_identity() {
+        let server = |screen, root_window_id| X11SessionParts {
+            transport: "unix".to_string(),
+            display_number: 0,
+            screen,
+            vendor: "X.Org".to_string(),
+            release: 1,
+            root_window_id,
+            xauthority_cookie: Vec::new(),
+        };
+
+        // `:0.0` and `:0.1` select different screen roots, but xdotool's
+        // XTEST keyboard/pointer injection remains global to the X server.
+        assert_eq!(
+            x11_session_or_seat_id(&server(0, 42)),
+            x11_session_or_seat_id(&server(1, 99))
         );
     }
 

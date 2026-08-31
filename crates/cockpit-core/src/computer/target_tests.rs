@@ -1240,10 +1240,12 @@ fn computer_x11_randr_output_identity() {
         build_mirror_groups(std::slice::from_ref(&out_b)).unwrap()[0].physical_display_id()
     );
 
-    // Reconnect same endpoint fingerprint reproduces key; different root changes session
+    // Screen roots are local selectors, not X server identities: an X11 input
+    // lease must cover every `DISPLAY` screen suffix on the same server.
     let mut p3 = parts.clone();
+    p3.screen = 1;
     p3.root_window_id = 999;
-    assert_ne!(x11_session_or_seat_id(&parts), x11_session_or_seat_id(&p3));
+    assert_eq!(x11_session_or_seat_id(&parts), x11_session_or_seat_id(&p3));
 }
 
 // ---------------------------------------------------------------------------

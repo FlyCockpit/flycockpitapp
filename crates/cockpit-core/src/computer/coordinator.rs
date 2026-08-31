@@ -4916,6 +4916,7 @@ impl NativeResponseExtractor {
 #[cfg(test)]
 mod tests {
     use super::super::host_identity::HostInstallationId;
+    use super::super::platform::x11::{X11SessionParts, x11_session_or_seat_id};
     use super::super::target::{
         FakeTargetEvidenceAdapter, TargetIdentityEvidence, empty_unavailable,
         sample_physical_evidence,
@@ -5671,7 +5672,7 @@ mod tests {
     }
 
     #[test]
-    fn x11_arbiter_serializes_monitors_but_other_backends_do_not() {
+    fn x11_arbiter_serializes_monitors_and_screen_suffixes_but_other_backends_do_not() {
         let os_lock = InMemoryOsAdvisoryLock::new();
         let mut arbiter_a =
             HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
@@ -5679,6 +5680,21 @@ mod tests {
         let monitor_a = physical_key();
         let mut monitor_b = monitor_a;
         monitor_b.physical_display_id = [99; 32];
+        let server = |screen, root_window_id| X11SessionParts {
+            transport: "unix".to_string(),
+            display_number: 0,
+            screen,
+            vendor: "X.Org".to_string(),
+            release: 1,
+            root_window_id,
+            xauthority_cookie: Vec::new(),
+        };
+        monitor_a.platform_session_or_seat_id = x11_session_or_seat_id(&server(0, 42));
+        monitor_b.platform_session_or_seat_id = x11_session_or_seat_id(&server(1, 99));
+        assert_eq!(
+            monitor_a.platform_session_or_seat_id, monitor_b.platform_session_or_seat_id,
+            "DISPLAY screen suffixes must share the X server input-arbiter namespace"
+        );
 
         let token_a = match arbiter_a
             .try_acquire_x11(&monitor_a, DelegationId("x11-monitor-a".to_string()))

@@ -16534,9 +16534,24 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "attached response plus live session registration",
         },
         MutatingDispatchCase {
+            kind: "attach_knowledge_base_session",
+            effect_class: Durable,
+            observation: "knowledge-base attachment row is visible to later Dream source selection",
+        },
+        MutatingDispatchCase {
+            kind: "detach_knowledge_base_session",
+            effect_class: Durable,
+            observation: "knowledge-base attachment row is removed from later Dream source selection",
+        },
+        MutatingDispatchCase {
             kind: "send_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::UserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "acknowledge_assistant_inbox_human_read",
+            effect_class: Durable,
+            observation: "idempotent durable human-read acknowledgement returns a typed receipt",
         },
         MutatingDispatchCase {
             kind: "send_user_message_bulk",
@@ -16602,6 +16617,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "send_now_queued_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::SendNowQueuedUserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "resume_from_compaction",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::ResumeFromCompaction is settled by the attached driver",
         },
         MutatingDispatchCase {
             kind: "resume_paused_work",
@@ -17255,6 +17275,9 @@ fn authz_allow(kind: &'static str) -> AuthzExpectation {
 fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
     match kind {
         "attach"
+        | "attach_knowledge_base_session"
+        | "detach_knowledge_base_session"
+        | "acknowledge_assistant_inbox_human_read"
         | "subagent_transcript"
         | "cancel_attachment_upload"
         | "goal_status"
@@ -17428,6 +17451,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_schedule"
         | "prune"
         | "compact"
+        | "resume_from_compaction"
         | "pin" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
@@ -17616,7 +17640,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
     vec![
         authz_session_reader("attach"),
         authz_session_reader("subagent_transcript"),
+        authz_session_writer("attach_knowledge_base_session"),
+        authz_session_writer("detach_knowledge_base_session"),
         authz_session_writer("send_user_message"),
+        authz_session_writer("acknowledge_assistant_inbox_human_read"),
         authz_bulk_user_message(),
         authz_session_writer("steer_delegation"),
         authz_session_writer("begin_attachment_upload"),
@@ -17747,6 +17774,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("cancel_schedule"),
         authz_session_writer("prune"),
         authz_session_writer("compact"),
+        authz_session_writer("resume_from_compaction"),
         authz_session_writer("pin"),
         #[cfg(feature = "remote")]
         authz_owner_only("store_flycockpit_credential"),
@@ -18726,6 +18754,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_schedule"
             | "prune"
             | "compact"
+            | "resume_from_compaction"
             | "pin"
             | "refresh_env"
             | "refresh_config"
@@ -18841,6 +18870,14 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
     let root = project_root.to_string_lossy().into_owned();
     match kind {
         "attach" => attach_existing_request(session_id, project_root),
+        "attach_knowledge_base_session" => Request::AttachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id,
+        },
+        "detach_knowledge_base_session" => Request::DetachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id,
+        },
         "subagent_transcript" => Request::SubagentTranscript {
             session_id,
             task_call_id: "task-1".into(),
@@ -18879,6 +18916,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             forced_skill: None,
             delivery_class_override: None,
             run_invocation_options: None,
+        },
+        "acknowledge_assistant_inbox_human_read" => Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id: session_id,
+            inbox_item_ids: vec![Uuid::new_v4()],
         },
         "steer_delegation" => Request::SteerDelegation {
             session_id,
@@ -19363,6 +19404,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember".into(),
         },
@@ -20996,6 +21038,12 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
             };
             assert!(ctx.registry.live_handle(session_id).is_some());
         }
+        "attach_knowledge_base_session" | "detach_knowledge_base_session" => {
+            assert_knowledge_base_session_mutating_happy(case.kind).await;
+        }
+        "acknowledge_assistant_inbox_human_read" => {
+            assert_assistant_inbox_human_read_happy().await;
+        }
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -21148,6 +21196,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "cancel_schedule"
         | "prune"
         | "compact"
+        | "resume_from_compaction"
         | "pin" => assert_worker_delivery_happy(case.kind).await,
         "cancel_run_invocation" => {
             let ctx = test_ctx();
@@ -21229,6 +21278,37 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .expect_err("unknown attach session");
             assert_eq!(err.code, ErrorCode::UnknownSession);
             assert!(ctx.registry.active_session_ids().is_empty());
+        }
+        "attach_knowledge_base_session" | "detach_knowledge_base_session" => {
+            let ctx = test_ctx();
+            let request = if case.kind == "attach_knowledge_base_session" {
+                Request::AttachKnowledgeBaseSession {
+                    knowledge_base_id: "kb".into(),
+                    session_id: Uuid::new_v4(),
+                }
+            } else {
+                Request::DetachKnowledgeBaseSession {
+                    knowledge_base_id: "kb".into(),
+                    session_id: Uuid::new_v4(),
+                }
+            };
+            let err = dispatch_matrix_request(&ctx, request)
+                .await
+                .expect_err("unknown knowledge-base attachment session is rejected");
+            assert_eq!(err.code, ErrorCode::UnknownSession);
+        }
+        "acknowledge_assistant_inbox_human_read" => {
+            let ctx = test_ctx();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::AcknowledgeAssistantInboxHumanRead {
+                    main_session_id: Uuid::new_v4(),
+                    inbox_item_ids: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("empty human-read acknowledgement is rejected before persistence");
+            assert_eq!(err.code, ErrorCode::BadRequest);
         }
         "begin_attachment_upload"
         | "upload_attachment_chunk"
@@ -21368,6 +21448,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "cancel_schedule"
         | "prune"
         | "compact"
+        | "resume_from_compaction"
         | "pin" => assert_attached_required_malformed(case.kind).await,
         "steer_delegation" => assert_steer_delegation_malformed().await,
         "set_caffeinate" => {
@@ -22109,6 +22190,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(job_id, "job-1");
                 }
                 ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
+                ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
+                    respond_to
+                        .send(Ok(()))
+                        .expect("settle resume compaction work");
+                }
                 ("pin", SessionWork::Pin { text }) => {
                     assert_eq!(text, "remember this");
                 }
@@ -22430,6 +22516,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
@@ -22648,6 +22735,77 @@ async fn assert_attachment_mutating_happy(kind: &str) {
         .await
         .expect("server task joins")
         .expect("server task succeeds");
+}
+
+#[cfg(unix)]
+async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let project_root = root.path().to_string_lossy().into_owned();
+    let project_id = crate::session::project_id_for(root.path()).unwrap();
+    let session = ctx
+        .db
+        .create_session(&project_id, &project_root, "Build")
+        .await
+        .unwrap();
+    if kind == "detach_knowledge_base_session" {
+        ctx.db
+            .attach_session_to_knowledge_base("kb", &project_root, session.session_id)
+            .await
+            .unwrap();
+    }
+    let request = if kind == "attach_knowledge_base_session" {
+        Request::AttachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id: session.session_id,
+        }
+    } else {
+        Request::DetachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id: session.session_id,
+        }
+    };
+    let response = dispatch_matrix_request(&ctx, request)
+        .await
+        .expect("knowledge-base session attachment mutation");
+    assert!(matches!(response, Response::Ack));
+    let attached: i64 = ctx
+        .db
+        .read(move |conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM knowledge_base_session_attachments
+                 WHERE knowledge_base_id = ?1 AND project_root = ?2 AND session_id = ?3",
+                rusqlite::params!["kb", project_root, session.session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        attached,
+        (kind == "attach_knowledge_base_session") as i64,
+        "knowledge-base attachment mutation must durably change its exact row"
+    );
+}
+
+#[cfg(unix)]
+async fn assert_assistant_inbox_human_read_happy() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id: session.session_id,
+            // An already-settled (or unknown) id is intentionally an
+            // idempotent acknowledgement, but still traverses the durable
+            // owner-bound mutation path.
+            inbox_item_ids: vec![Uuid::new_v4()],
+        },
+    )
+    .await
+    .expect("idempotent human-read acknowledgement");
+    assert!(matches!(response, Response::Ack));
 }
 
 #[cfg(unix)]

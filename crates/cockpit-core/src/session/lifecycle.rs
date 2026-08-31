@@ -257,6 +257,7 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
+            false,
         )
     }
 
@@ -295,6 +296,7 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
+            false,
         )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -338,6 +340,7 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
+            false,
         )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -376,6 +379,7 @@ impl Session {
             vault,
             false,
             initialize_workspace_scratch,
+            false,
         )
     }
 
@@ -404,6 +408,7 @@ impl Session {
             vault,
             false,
             initialize_workspace_scratch,
+            true,
         )?))
     }
 
@@ -442,7 +447,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault, true, true)
+        Self::from_row(db, project_root, row, resolver, vault, true, true, false)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -476,7 +481,16 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            true,
+            false,
+        )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -626,7 +640,16 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            true,
+            false,
+        )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -749,7 +772,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault, false, true)
+        Self::from_row(db, project_root, row, resolver, vault, false, true, false)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -777,6 +800,7 @@ impl Session {
             vault,
             false,
             true,
+            false,
         )?))
     }
 
@@ -788,6 +812,7 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
         freshly_created: bool,
         initialize_workspace_scratch: bool,
+        allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Self> {
         let project_root = if initialize_workspace_scratch {
             canonical_workspace_root(&project_root)
@@ -815,9 +840,15 @@ impl Session {
                 initialize_workspace_scratch
             }
         };
-        anyhow::ensure!(
+        let project_id_matches =
             Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
-                == row.project_id,
+                == row.project_id;
+        // Low-level test fixtures deliberately construct rows without a real
+        // workspace authority (often with a short placeholder project id).
+        // They can only enter here through `resume_for_test`; production
+        // resumes and test-created sessions still prove the durable identity.
+        anyhow::ensure!(
+            project_id_matches || allow_unbound_test_fixture_project_id,
             "persisted session project id does not match canonical workspace root"
         );
         let session_entry_mode = match row.session_entry_mode.as_str() {

@@ -664,7 +664,12 @@ mod tests {
             Arc::new(LockManager::in_memory(db.clone())),
             ShutdownSignal::new(),
             None,
-            ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
+            // The real Dream attach resolves its explicitly selected model
+            // against the daemon's config snapshot before it can persist the
+            // deferred audit transcript. Keep this registry fixture aligned
+            // with the scheduler's Dream model instead of relying on the
+            // pre-validation empty provider catalog.
+            ConfigSource::fixed(test_dream_providers(), ExtendedConfig::default()),
         );
         registry.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
         registry.set_secret_vault(crate::secure_key::vault_for_db(db).unwrap());

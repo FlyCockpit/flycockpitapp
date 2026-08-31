@@ -5812,10 +5812,38 @@ async fn handle_serialized_request_impl(
             require_attached(state)?;
             Ok(Response::Ack)
         }
-        Request::ResumeFromCompaction => Err(ErrorPayload {
-            code: ErrorCode::Conflict,
-            message: "resume compaction requires an offered interactive away-resume choice".into(),
-        }),
+        Request::ResumeFromCompaction => {
+            let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::ResumeFromCompaction,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::ResumeFromCompaction { respond_to })
+                .await
+                .map_err(session_work_error)?;
+            match response_rx.await.map_err(internal)? {
+                Ok(()) => finish_nonrepeatable_response!(
+                    remote_operation,
+                    ctx,
+                    "resume_from_compaction",
+                    Response::Ack
+                ),
+                Err(message) => Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message,
+                }),
+            }
+        }
         Request::CreateCodeRootWithAcpIngressV1(request) => {
             let service = ctx
                 .acp_catalog_composition

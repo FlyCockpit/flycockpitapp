@@ -780,6 +780,60 @@ fn dispatch_all_category_descriptor_actions() {
                 TestPageRef::Category(page) if page.editing == Some(setting)
             ));
         }
+
+        // Some descriptor activations render a follow-up confirmation or a
+        // filesystem-backed path suggestion. Exercise each from a fresh
+        // activation: selecting one dismisses or mutates the editor, so
+        // replaying siblings from this dialog would leave them unrepresentable.
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let follow_up_actions = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    RenderAction::Page(
+                        action @ SettingsPointerAction::Category(
+                            CategoryAction::Confirm(_, _) | CategoryAction::SuggestionSelect(_, _),
+                        ),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for follow_up in follow_up_actions {
+            let tmp = TempDir::new().unwrap();
+            let mut replay = fresh_dialog(&tmp);
+            super::tests::open_category_on(&mut replay, category, setting);
+            let _ = render_settings_rows(&replay, 100, 50);
+            let descriptor =
+                SettingsPointerAction::Category(CategoryAction::DescriptorActivate(setting));
+            let descriptor_target = replay
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled && target.action == RenderAction::Page(descriptor.clone())
+                })
+                .cloned()
+                .expect("follow-up replay descriptor is rendered");
+            click_target(&mut replay, &descriptor_target);
+            let _ = render_settings_rows(&replay, 100, 50);
+            let follow_up_target = replay
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled && target.action == RenderAction::Page(follow_up.clone())
+                })
+                .cloned()
+                .expect("follow-up action rerenders from its descriptor source");
+            click_target(&mut replay, &follow_up_target);
+        }
     }
 }
 
@@ -927,6 +981,7 @@ fn dispatch_category_nested_editor_actions() {
             .expect("packages path editor")
             .set_text_for_test("a".into(), &suggestion_root);
     }
+    source.settle_test_effects();
     let _ = render_settings_rows(&source, 100, 50);
     let path_actions = source
         .pointer_surface
@@ -969,6 +1024,7 @@ fn dispatch_category_nested_editor_actions() {
                 .expect("fresh packages path editor")
                 .set_text_for_test("a".into(), &suggestion_root);
         }
+        dialog.settle_test_effects();
         let _ = render_settings_rows(&dialog, 100, 50);
         let target = dialog
             .pointer_surface
@@ -1087,6 +1143,7 @@ fn dispatch_path_editor_actions(
             .expect("path editor source")
             .set_text_for_test(seed.into(), cwd);
     }
+    source.settle_test_effects();
     let _ = render_settings_rows(&source, 100, 50);
     let actions = source
         .pointer_surface
@@ -1124,6 +1181,7 @@ fn dispatch_path_editor_actions(
                 .expect("fresh path editor")
                 .set_text_for_test(seed.into(), cwd);
         }
+        dialog.settle_test_effects();
         let _ = render_settings_rows(&dialog, 100, 50);
         let target = dialog
             .pointer_surface

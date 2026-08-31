@@ -293,6 +293,11 @@ fn write_endpoint_record_with_receipt_and_canonical(
     receipt: &DaemonPidReceipt,
 ) -> Result<()> {
     if paths.pid_file != canonical.pid_file || paths.socket != canonical.socket {
+        if paths.ephemeral {
+            // Ephemeral owners are intentionally private to their launching
+            // client and must never create a process-global endpoint record.
+            return Ok(());
+        }
         anyhow::bail!(
             "refusing to publish shared daemon endpoint from noncanonical paths: pid_file={}, socket={}",
             paths.pid_file.display(),

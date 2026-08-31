@@ -81,7 +81,7 @@ CREATE INDEX assistant_inbox_items_assistant_rate_idx
 -- network-order bytes and never derive an identity by hashing the legacy key.
 CREATE TABLE project_identities (
     project_id   TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
-    project_uuid BLOB NOT NULL CHECK (
+    project_uuid BLOB NOT NULL UNIQUE CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
         AND project_uuid <> zeroblob(16)
     ),
@@ -171,17 +171,6 @@ CREATE TABLE sessions (
     description_provider_id TEXT,
     description_model_id    TEXT,
     description_model_trust TEXT,
-    CHECK (
-        (description IS NULL
-         AND description_provider_id IS NULL
-         AND description_model_id IS NULL
-         AND description_model_trust IS NULL)
-        OR
-        (description IS NOT NULL
-         AND description_provider_id IS NOT NULL
-         AND description_model_id IS NOT NULL
-         AND description_model_trust IN ('trusted', 'untrusted'))
-    ),
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -293,6 +282,17 @@ CREATE TABLE sessions (
     -- execution containment is ProvenEmpty, then the session row may drop.
     lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'deleting')),
 
+    CHECK (
+        (description IS NULL
+         AND description_provider_id IS NULL
+         AND description_model_id IS NULL
+         AND description_model_trust IS NULL)
+        OR
+        (description IS NOT NULL
+         AND description_provider_id IS NOT NULL
+         AND description_model_id IS NOT NULL
+         AND description_model_trust IN ('trusted', 'untrusted'))
+    ),
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
     CHECK (fork_point_turn_id IS NULL OR (
         parent_session_id IS NOT NULL
@@ -1226,7 +1226,7 @@ CREATE INDEX idx_knowledge_dream_schedule_state_last
 -- UUID, rather than the mutable registry id, prevents a replacement source
 -- from inheriting the predecessor's dream state.
 CREATE TABLE knowledge_dream_ledger (
-    project_uuid BLOB NOT NULL UNIQUE CHECK (
+    project_uuid BLOB NOT NULL CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
         AND project_uuid <> zeroblob(16)
     ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,

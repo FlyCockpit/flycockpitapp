@@ -73,6 +73,12 @@ impl Driver {
                 ),
             )?;
         let mut args = self.spawn_args(true);
+        // The caller has already resolved the root's model against the
+        // current prepared route.  Rebuilding solely to attach the frozen KB
+        // prefix must not re-resolve that pinned definition through the
+        // outgoing foreground model.
+        args.model = agent.model.clone();
+        args.model_override = Some(agent.model.clone());
         args.knowledge_base_system_prefix = captured.system_prefix();
         let rebuilt = crate::engine::builtin::rebuild_from_pinned_definition(&agent, &args)?;
         self.session
@@ -1764,10 +1770,10 @@ impl Driver {
     /// Ordinary vNext reconstruction pins the running model (`spawn_args`).
     /// That pin is the wrong authority for first-time `SetAgent`: the session
     /// has already adopted the prepared primary default, while the live root
-    /// still runs the outgoing agent. Drop the pin when it disagrees with the
-    /// adopted session selection so slot resolution takes the prepared
-    /// default. Re-applying the same prepared root keeps the pin when live
-    /// model and session already agree (user picker / resume).
+    /// still runs the outgoing agent. Rebind the spawn arguments to that
+    /// adopted selection before loading. This keeps the selected, validated
+    /// prepared route authoritative even when a transient route lookup cannot
+    /// supply a default, rather than falling back to the outgoing model.
     pub(in crate::engine::driver) async fn rebuild_prepared_primary(
         &mut self,
         name: &str,
@@ -1783,11 +1789,26 @@ impl Driver {
         }
         let mut args = self.spawn_args(true);
         args.vnext_host_policy = Some(host_policy);
-        if self.session.active_model_ref().is_none_or(|selection| {
+        if let Some(selection) = self.session.active_model_ref().filter(|selection| {
             let running = &self.stack[0].agent.model;
             running.provider_id() != selection.provider || running.model_id_ref() != selection.model
         }) {
-            args.model_override = None;
+            match self.build_live_model(&selection) {
+                Ok(model) => {
+                    let model = Arc::new(model);
+                    args.model = model.clone();
+                    args.model_override = Some(model);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        provider = %selection.provider,
+                        model = %selection.model,
+                        "prepared primary rebuild could not bind adopted model selection"
+                    );
+                    return false;
+                }
+            }
         }
         let agent = match crate::engine::builtin::load(name, &args) {
             Ok(agent) => agent,

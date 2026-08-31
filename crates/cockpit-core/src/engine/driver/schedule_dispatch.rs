@@ -687,7 +687,7 @@ fn background_sandbox_unavailable_refusal(reason: &str) -> String {
 
 fn background_knowledge_sandbox_unavailable_refusal(reason: &str) -> String {
     format!(
-        "Access denied: `background.start` is unavailable for this model because a local knowledge base requires a trusted model and the shell sandbox cannot start here ({reason}). A background command must remain confined so it cannot read or write that knowledge base."
+        "Access denied: `background.start` is unavailable because local knowledge bases are attached and the shell sandbox cannot start here ({reason}). A background command must remain confined so it cannot read or write those knowledge bases."
     )
 }
 

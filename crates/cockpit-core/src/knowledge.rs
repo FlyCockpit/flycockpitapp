@@ -1019,7 +1019,7 @@ pub(crate) fn apply_knowledge_dream<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path) -> Result<()>,
+    F: FnOnce(&Path, &fs::File) -> Result<()>,
 {
     apply_knowledge_dream_cancellable(root, merge_policy, dream, &CancellationToken::new(), apply)
 }
@@ -1036,7 +1036,7 @@ fn apply_knowledge_dream_cancellable<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path) -> Result<()>,
+    F: FnOnce(&Path, &fs::File) -> Result<()>,
 {
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
@@ -1085,12 +1085,14 @@ where
     };
 
     // The supplied path is descriptor-bound on Linux and has been proven to
-    // name the held root everywhere else. Callers must write only through it.
+    // name the held root everywhere else. The retained descriptor is passed
+    // alongside it so a mutation that needs to traverse descendants can keep
+    // every component-relative operation beneath the admitted root.
     if cancel.is_cancelled() {
         bail!("knowledge dream write cancelled before applying model output");
     }
     process_lock.revalidate_root()?;
-    let applied = apply(&mutation_root);
+    let applied = apply(&mutation_root, process_lock.directory());
     if let Err(error) = applied {
         if matches!(&prepared, PreparedKnowledgeGit::Active { .. })
             && let Err(cleanup_error) = restore_knowledge_dream_worktree(&mutation_root)
@@ -2039,7 +2041,7 @@ impl KbProvider for LocalKb {
             self.entry.merge_policy,
             dream,
             cancel,
-            |root| mutation.apply(root),
+            |root, _| mutation.apply(root),
         )
     }
 
@@ -4890,33 +4892,15 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
             target.merge_policy,
             &commit,
             &cancel,
-            |root| {
-                let path = root.join(&target.relative_path);
-                let previous = match fs::read(&path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("capturing human knowledge concept {}", path.display())
-                        });
-                    }
-                };
-                if previous.as_deref() != expected_previous.as_deref() {
-                    bail!(
-                        "human knowledge edit `{}` became stale before entering the knowledge-base fence; read it again before retrying",
-                        target.relative_path.display()
-                    );
-                }
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("creating human knowledge concept parent {}", parent.display())
-                    })?;
-                }
+            |root, directory| {
+                let mutation = write_human_knowledge_concept_nofollow(
+                    directory,
+                    &target.relative_path,
+                    content.as_bytes(),
+                    expected_previous.as_deref(),
+                )?;
                 let applied = (|| {
-                    fs::write(&path, &content).with_context(|| {
-                        format!("writing human knowledge concept {}", path.display())
-                    })?;
-                    let bundle = parse_bundle(root)?;
+                    let bundle = parse_bundle_from_retained_root(root.to_path_buf(), directory)?;
                     if !bundle.concepts.iter().any(|concept| {
                         concept.path == target.relative_path
                             && concept.provenance() == Some("human")
@@ -4929,20 +4913,15 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
                     Ok(())
                 })();
                 if let Err(error) = applied {
-                    match previous {
-                        Some(bytes) => fs::write(&path, bytes).with_context(|| {
-                            format!("restoring human knowledge concept {}", path.display())
-                        })?,
-                        None => match fs::remove_file(&path) {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                            Err(restore_error) => {
-                                return Err(error.context(format!(
-                                    "human knowledge edit failed and restoring {} failed: {restore_error}",
-                                    path.display()
-                                )));
-                            }
-                        },
+                    if let Err(restore_error) = rollback_human_knowledge_concept_nofollow(
+                        directory,
+                        &target.relative_path,
+                        mutation,
+                    ) {
+                        return Err(error.context(format!(
+                            "human knowledge edit failed and restoring {} failed: {restore_error}",
+                            target.relative_path.display()
+                        )));
                     }
                     return Err(error);
                 }
@@ -4964,13 +4943,327 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
                     ..
                 }
         );
-        Ok(HumanKnowledgeEditOutcome {
-            git,
-            applied,
-        })
+        Ok(HumanKnowledgeEditOutcome { git, applied })
     })
     .await
     .context("human knowledge edit task terminated before completing")?
+}
+
+/// The exact new leaf published by a human concept write. Rollback never
+/// follows a path spelling: it only removes or replaces this inode through a
+/// freshly re-walked, no-follow parent capability.
+#[cfg(unix)]
+#[derive(Debug)]
+struct HumanKnowledgeConceptMutation {
+    previous: Option<Vec<u8>>,
+    written_device: u64,
+    written_inode: u64,
+}
+
+/// Mutate one concept below the retained KB directory.  The process fence
+/// protects cooperating writers; this separate descriptor walk protects the
+/// filesystem boundary against an unrelated process replacing a descendant
+/// with a symlink between admission and mutation.
+#[cfg(unix)]
+fn write_human_knowledge_concept_nofollow(
+    root: &fs::File,
+    relative_path: &Path,
+    content: &[u8],
+    expected_previous: Option<&[u8]>,
+) -> Result<HumanKnowledgeConceptMutation> {
+    let (parent, leaf) = human_knowledge_concept_parent_nofollow(root, relative_path)?;
+    let previous = read_human_knowledge_concept_nofollow(&parent, &leaf)?;
+    if previous.as_deref() != expected_previous {
+        bail!(
+            "human knowledge edit `{}` became stale before entering the knowledge-base fence; read it again before retrying",
+            relative_path.display()
+        );
+    }
+    let (written_device, written_inode) =
+        replace_human_knowledge_concept_nofollow(&parent, &leaf, content, relative_path)?;
+    Ok(HumanKnowledgeConceptMutation {
+        previous,
+        written_device,
+        written_inode,
+    })
+}
+
+/// Restore a failed human edit only when its published inode is still the
+/// entry below the held parent. A replacement or a descendant symlink race
+/// therefore fails closed instead of touching whatever now occupies the
+/// pathname.
+#[cfg(unix)]
+fn rollback_human_knowledge_concept_nofollow(
+    root: &fs::File,
+    relative_path: &Path,
+    mutation: HumanKnowledgeConceptMutation,
+) -> Result<()> {
+    let (parent, leaf) = human_knowledge_concept_parent_nofollow(root, relative_path)?;
+    if !human_knowledge_concept_matches(
+        &parent,
+        &leaf,
+        mutation.written_device,
+        mutation.written_inode,
+    )? {
+        bail!(
+            "human knowledge concept `{}` changed after publication; refusing rollback",
+            relative_path.display()
+        );
+    }
+    match mutation.previous {
+        Some(previous) => {
+            replace_human_knowledge_concept_nofollow(&parent, &leaf, &previous, relative_path)?;
+        }
+        None => {
+            use std::os::fd::AsRawFd as _;
+
+            cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &leaf, 0)
+                .with_context(|| {
+                    format!(
+                        "removing failed human knowledge concept {}",
+                        relative_path.display()
+                    )
+                })?;
+            parent.sync_all().with_context(|| {
+                format!(
+                    "syncing parent directory after removing failed human knowledge concept {}",
+                    relative_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn human_knowledge_concept_parent_nofollow(
+    root: &fs::File,
+    relative_path: &Path,
+) -> Result<(fs::File, std::ffi::CString)> {
+    use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
+
+    let leaf = relative_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("human knowledge concept has no file name")?;
+    let leaf = std::ffi::CString::new(leaf.as_bytes())
+        .context("human knowledge concept file name contains NUL")?;
+    let mut parent = root
+        .try_clone()
+        .context("cloning retained knowledge-base root for human edit")?;
+    let parent_path = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent_path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::CurDir) {
+                continue;
+            }
+            bail!(
+                "human knowledge concept `{}` has an unsafe parent component",
+                relative_path.display()
+            );
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .context("human knowledge concept directory component contains NUL")?;
+        let child = match cockpit_host::private_fs::held_fd::openat(
+            parent.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &name, 0o777) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "creating human knowledge concept directory component `{}`",
+                                relative_path.display()
+                            )
+                        });
+                    }
+                }
+                cockpit_host::private_fs::held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .with_context(|| {
+                    format!(
+                        "opening created human knowledge concept directory component `{}` without following links",
+                        relative_path.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "opening human knowledge concept directory component `{}` without following links",
+                        relative_path.display()
+                    )
+                });
+            }
+        };
+        ensure!(
+            child.metadata()?.is_dir(),
+            "human knowledge concept parent `{}` is not a directory",
+            relative_path.display()
+        );
+        parent = child;
+    }
+    Ok((parent, leaf))
+}
+
+#[cfg(unix)]
+fn read_human_knowledge_concept_nofollow(
+    parent: &fs::File,
+    leaf: &std::ffi::CStr,
+) -> Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut file = match cockpit_host::private_fs::held_fd::openat(
+        parent.as_raw_fd(),
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("opening human knowledge concept without following links");
+        }
+    };
+    ensure!(
+        file.metadata()?.is_file(),
+        "human knowledge concept is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .context("reading human knowledge concept through held parent")?;
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn replace_human_knowledge_concept_nofollow(
+    parent: &fs::File,
+    leaf: &std::ffi::CStr,
+    content: &[u8],
+    relative_path: &Path,
+) -> Result<(u64, u64)> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
+
+    let temporary = std::ffi::CString::new(format!(
+        ".cockpit-human-knowledge-{}",
+        uuid::Uuid::new_v4().simple()
+    ))?;
+    let mut file = cockpit_host::private_fs::held_fd::openat_mode(
+        parent.as_raw_fd(),
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o666,
+    )
+    .with_context(|| {
+        format!(
+            "creating held human knowledge concept {}",
+            relative_path.display()
+        )
+    })?;
+    let write_result = file.write_all(content).and_then(|_| file.sync_all());
+    let metadata = file.metadata();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+        return Err(error).context("writing held human knowledge concept");
+    }
+    let metadata = metadata.context("inspecting held human knowledge concept")?;
+    let identity = (metadata.dev(), metadata.ino());
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), leaf) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            if let Err(error) = cockpit_host::private_fs::held_fd::renameat(
+                parent.as_raw_fd(),
+                &temporary,
+                parent.as_raw_fd(),
+                leaf,
+            ) {
+                let _ =
+                    cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+                return Err(error).context("replacing held human knowledge concept");
+            }
+        }
+        Ok(_) => {
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            bail!(
+                "refusing to replace non-regular human knowledge concept `{}`",
+                relative_path.display()
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) = cockpit_host::private_fs::held_fd::linkat(
+                parent.as_raw_fd(),
+                &temporary,
+                parent.as_raw_fd(),
+                leaf,
+                0,
+            ) {
+                let _ =
+                    cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+                return Err(error)
+                    .context("publishing held human knowledge concept without replacement");
+            }
+            cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0)
+                .context("removing published human knowledge concept temporary")?;
+        }
+        Err(error) => {
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            return Err(error).context("checking held human knowledge concept destination");
+        }
+    }
+    parent
+        .sync_all()
+        .context("syncing held human knowledge concept parent")?;
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn human_knowledge_concept_matches(
+    parent: &fs::File,
+    leaf: &std::ffi::CStr,
+    device: u64,
+    inode: u64,
+) -> Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), leaf) {
+        Ok(stat) => Ok(stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && stat.st_dev as u64 == device
+            && stat.st_ino as u64 == inode),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("checking published human knowledge concept identity"),
+    }
+}
+
+// The retained-dir API above has an implementation on every supported Unix
+// target. Other targets have no equivalent write primitive here yet, so refuse
+// human edits rather than falling back to path-based traversal.
+#[cfg(not(unix))]
+struct HumanKnowledgeConceptMutation;
+
+#[cfg(not(unix))]
+fn write_human_knowledge_concept_nofollow(
+    _root: &fs::File,
+    _relative_path: &Path,
+    _content: &[u8],
+    _expected_previous: Option<&[u8]>,
+) -> Result<HumanKnowledgeConceptMutation> {
+    bail!("human knowledge edits require descriptor-safe descendant mutation on this platform")
+}
+
+#[cfg(not(unix))]
+fn rollback_human_knowledge_concept_nofollow(
+    _root: &fs::File,
+    _relative_path: &Path,
+    _mutation: HumanKnowledgeConceptMutation,
+) -> Result<()> {
+    unreachable!("unsupported human knowledge edit cannot publish a mutation")
 }
 
 pub(crate) fn human_knowledge_edit_outcome_note(outcome: &HumanKnowledgeEditOutcome) -> String {
@@ -8338,7 +8631,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "first-concept", "First dream output.");
                 Ok(())
             },
@@ -8353,7 +8646,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "second-concept", "Second dream output.");
                 Ok(())
             },
@@ -8386,7 +8679,7 @@ Inventory facts for warehouse operations.
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
             &cancel,
-            |root| {
+            |root, _| {
                 fs::write(root.join("must-not-apply.md"), "not reached")?;
                 Ok(())
             },
@@ -8427,7 +8720,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "local-concept", "Local dream output.");
 
                 // This commit lands after the writer's pre-apply fetch, so
@@ -8501,7 +8794,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "deferred", "Retained local dream output.");
                 Ok(())
             },
@@ -8520,7 +8813,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "deferred", "Retained local dream output.");
                 Ok(())
             },
@@ -8564,7 +8857,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "deploy", "Local conflicting dream output.");
 
                 let other = tmp.path().join("other-writer");
@@ -8596,7 +8889,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "must-not-apply", "Deferred re-entry output.");
                 Ok(())
             },
@@ -8620,7 +8913,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "review-concept", "Needs human review.");
                 Ok(())
             },
@@ -8646,7 +8939,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "review-only", "Pending review.");
                 Ok(())
             },
@@ -8664,7 +8957,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("team"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "accepted-base", "Accepted-base dream.");
                 Ok(())
             },
@@ -8693,7 +8986,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "obsolete", "To be removed.");
                 Ok(())
             },
@@ -8704,7 +8997,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 fs::remove_file(root.join("obsolete.md")).unwrap();
                 Ok(())
             },
@@ -8730,7 +9023,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
@@ -8742,7 +9035,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "must-not-commit", "Deferred dream.");
                 Ok(())
             },
@@ -8768,7 +9061,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
@@ -8784,7 +9077,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "retry", "This commit hook rejects once.");
                 Ok(())
             },
@@ -8804,7 +9097,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "retry", "The ledger retry commits cleanly.");
                 Ok(())
             },
@@ -8826,7 +9119,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("project"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "isolated", "KB-only history.");
                 Ok(())
             },
@@ -8855,7 +9148,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 for name in KB_MACHINE_STATE_GITIGNORE {
                     let path = root.join(name.trim_end_matches('/'));
                     if name.ends_with('/') {
@@ -8917,6 +9210,65 @@ Inventory facts for warehouse operations.
         assert!(subject.starts_with("human(kb=personal):"), "{subject}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn human_concept_write_refuses_a_descendant_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("concepts")).unwrap();
+        let directory = cockpit_config::config::open_config_directory_nofollow(&root).unwrap();
+
+        let error = write_human_knowledge_concept_nofollow(
+            &directory,
+            Path::new("concepts/manual.md"),
+            b"outside must remain untouched",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("without following links"));
+        assert!(!outside.join("manual.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn human_concept_rollback_refuses_a_replaced_descendant_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("concepts")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let directory = cockpit_config::config::open_config_directory_nofollow(&root).unwrap();
+        let mutation = write_human_knowledge_concept_nofollow(
+            &directory,
+            Path::new("concepts/manual.md"),
+            b"temporary human concept",
+            None,
+        )
+        .unwrap();
+
+        fs::remove_file(root.join("concepts/manual.md")).unwrap();
+        fs::remove_dir(root.join("concepts")).unwrap();
+        symlink(&outside, root.join("concepts")).unwrap();
+        let error = rollback_human_knowledge_concept_nofollow(
+            &directory,
+            Path::new("concepts/manual.md"),
+            mutation,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("without following links"));
+        assert!(!outside.join("manual.md").exists());
+    }
+
     #[tokio::test]
     async fn review_policy_human_concept_edit_stays_on_the_active_kb_branch_for_later_dreams() {
         let tmp = TempDir::new().unwrap();
@@ -8954,7 +9306,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 let manual = parse_bundle(root)?
                     .concepts
                     .into_iter()
@@ -9057,7 +9409,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "seed", "Seed dream.");
                 Ok(())
             },

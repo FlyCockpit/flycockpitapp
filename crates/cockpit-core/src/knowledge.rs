@@ -5226,34 +5226,6 @@ pub(crate) async fn denied_local_knowledge_roots_for_model(
     Ok(roots)
 }
 
-pub(crate) fn configured_local_knowledge_roots_for_model(
-    cwd: &Path,
-    extended: &ExtendedConfig,
-) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    for entry in &extended.knowledge_bases {
-        let KnowledgeBaseSource::Local { path } = &entry.source else {
-            continue;
-        };
-        let root = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
-        let root = crate::tools::sandbox::effective_native_path(&root).with_context(|| {
-            format!(
-                "resolving configured local knowledge base `{}` root `{}`",
-                entry.id,
-                root.display()
-            )
-        })?;
-        if !roots.iter().any(|existing| existing == &root) {
-            roots.push(root);
-        }
-    }
-    Ok(roots)
-}
-
 /// Reject a direct native filesystem operation on a protected KB source.
 pub(crate) async fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Path) -> Result<()> {
     for root in denied_local_knowledge_roots(ctx).await? {
@@ -5285,17 +5257,6 @@ pub(crate) fn ensure_no_generic_local_knowledge_write(ctx: &ToolCtx, path: &Path
         );
     }
     Ok(())
-}
-
-/// Return every configured local KB root. Opaque host integrations use this
-/// separate fence: a native human concept edit does not make the KB writable
-/// to a reused LSP or another ambient process.
-pub(crate) async fn configured_local_knowledge_roots(
-    _session: &Session,
-    cwd: &Path,
-    extended: &ExtendedConfig,
-) -> Result<Vec<PathBuf>> {
-    configured_local_knowledge_roots_for_model(cwd, extended)
 }
 
 /// Reject a local media path that resolves inside a protected KB before the
@@ -5387,8 +5348,12 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
 /// server is arbitrary host code and an opaque tool call cannot prove that it
 /// will not mutate an attached KB, so this fences the connection boundary
 /// rather than only trust-withheld roots or named tools.
-pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
-    if configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
+async fn ensure_mcp_host_access_for_session(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Result<()> {
+    if configured_local_knowledge_roots(session, cwd, extended)
         .await
         .is_empty()
     {
@@ -5397,6 +5362,10 @@ pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
     bail!(
         "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
     );
+}
+
+pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    ensure_mcp_host_access_for_session(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
 }
 
 /// Synchronous conservative subset used while constructing an MCP connection
@@ -9250,9 +9219,9 @@ Inventory facts for warehouse operations.
         assert_eq!(snapshot.entries()[1].id, "restricted");
     }
 
-    #[test]
-    fn mcp_host_gate_rejects_a_trusted_model_when_a_local_kb_is_configured_without_trust_required()
-    {
+    #[tokio::test]
+    async fn mcp_host_gate_rejects_a_trusted_model_when_a_local_kb_is_configured_without_trust_required()
+     {
         let tmp = TempDir::new().unwrap();
         write_bundle(&tmp.path().join("available"));
         let mut available = project_knowledge_registry_entry();
@@ -9266,16 +9235,20 @@ Inventory facts for warehouse operations.
             knowledge_bases: vec![available],
             ..Default::default()
         };
+        let session = test_session(tmp.path()).await;
 
         let denied_roots =
-            denied_local_knowledge_roots_for_model(tmp.path(), &extended, true).unwrap();
+            denied_local_knowledge_roots_for_model(&session, tmp.path(), &extended, None, true)
+                .await
+                .unwrap();
         assert!(denied_roots.is_empty());
 
-        let error = ensure_mcp_host_access_for_model(tmp.path(), &extended)
+        let error = ensure_mcp_host_access_for_session(&session, tmp.path(), &extended)
+            .await
             .expect_err("MCP must stay fenced for any configured local KB");
 
         assert!(error.to_string().contains(
-            "MCP is unavailable because this workspace contains a configured local knowledge base"
+            "MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
         ));
     }
 

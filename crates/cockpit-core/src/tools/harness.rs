@@ -106,7 +106,7 @@ impl Tool for HarnessListTool {
             .await
             .map_err(|error| invalid_input(error.to_string()))?;
         require_workspace_trust_for_harness_spawn()?;
-        ensure_harness_cannot_reach_local_knowledge_bases(ctx)?;
+        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -384,7 +384,7 @@ impl Tool for HarnessInvokeTool {
 
         let cwd = ctx.cwd.clone();
         require_workspace_trust_for_harness_spawn()?;
-        ensure_harness_cannot_reach_local_knowledge_bases(ctx)?;
+        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -679,11 +679,13 @@ fn require_workspace_trust_for_harness_spawn() -> Result<()> {
 /// it a process would let it bypass the two permitted KB authoring paths.
 /// Refuse every operation that can launch a configured harness (including a
 /// model-list refresh) while the session has any local KB configured.
-fn ensure_harness_cannot_reach_local_knowledge_bases(ctx: &ToolCtx) -> Result<()> {
-    let roots = crate::knowledge::configured_local_knowledge_roots_for_model(
+async fn ensure_harness_cannot_reach_local_knowledge_bases(ctx: &ToolCtx) -> Result<()> {
+    let roots = crate::knowledge::configured_local_knowledge_roots(
+        &ctx.session,
         &ctx.cwd,
         &ctx.config.extended(),
-    )?;
+    )
+    .await;
     if roots.is_empty() {
         return Ok(());
     }

@@ -1006,9 +1006,13 @@ pub fn render_body(
     body: &str,
     cwd: &Path,
     auto_bang_commands: bool,
+    local_knowledge_write_fence_active: bool,
     redact: &RedactionTable,
 ) -> String {
-    if !auto_bang_commands || crate::config::trust::path_blocked_by_workspace_trust(cwd) {
+    if !auto_bang_commands
+        || local_knowledge_write_fence_active
+        || crate::config::trust::path_blocked_by_workspace_trust(cwd)
+    {
         // Codex mode: inject verbatim.
         return body.to_string();
     }
@@ -1180,7 +1184,7 @@ mod tests {
         redact: &RedactionTable,
     ) -> String {
         crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
-            render_body(body, root, expand_commands, redact)
+            render_body(body, root, expand_commands, false, redact)
         })
     }
 
@@ -1757,7 +1761,7 @@ mod tests {
     #[test]
     fn render_body_codex_mode_injects_verbatim() {
         let body = "before !`echo hi` after";
-        let out = render_body(body, Path::new("."), false, &no_redact());
+        let out = render_body(body, Path::new("."), false, false, &no_redact());
         assert_eq!(out, body, "Codex mode leaves the directive verbatim");
     }
 
@@ -1778,7 +1782,7 @@ mod tests {
         let body = "value: !`echo should-not-run`";
 
         let out = crate::config::trust::with_workspace_trust_policy(policy, || {
-            render_body(body, tmp.path(), true, &no_redact())
+            render_body(body, tmp.path(), true, false, &no_redact())
         });
 
         assert_eq!(out, body);
@@ -1819,8 +1823,18 @@ mod tests {
         };
         let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
         let body = "leak: !`echo SUPERSECRETTOKEN`";
-        let out = render_body(body, Path::new("."), true, &redact);
+        let out = render_body(body, Path::new("."), true, false, &redact);
         assert!(out.contains("SUPERSECRETTOKEN"), "got {out:?}");
+    }
+
+    #[test]
+    fn render_body_keeps_bang_directives_verbatim_behind_knowledge_write_fence() {
+        let body = "value: !`echo must-not-run`";
+        let out = trusted_render_body(body, Path::new("."), true, &no_redact());
+        assert_eq!(out, "value: must-not-run");
+
+        let fenced = render_body(body, Path::new("."), true, true, &no_redact());
+        assert_eq!(fenced, body);
     }
 
     #[test]

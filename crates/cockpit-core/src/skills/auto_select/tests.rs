@@ -880,8 +880,13 @@ fn render_multi_match_injects_all_in_relevance_order() {
     let b = write_skill(tmp.path(), "review", "review body");
     let chosen = vec![survivor(&a), survivor(&b)];
     let extended = ExtendedConfig::default();
-    let injected =
-        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        tmp.path(),
+        &extended,
+        false,
+        &no_redact(tmp.path()),
+    );
     assert_eq!(names(&injected), vec!["deploy", "review"]);
     assert_eq!(injected[0].body.trim(), "deploy body");
     assert_eq!(injected[1].body.trim(), "review body");
@@ -893,8 +898,13 @@ fn render_single_match_injects_one() {
     let a = write_skill(tmp.path(), "deploy", "deploy body");
     let chosen = vec![survivor(&a)];
     let extended = ExtendedConfig::default();
-    let injected =
-        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        tmp.path(),
+        &extended,
+        false,
+        &no_redact(tmp.path()),
+    );
     assert_eq!(names(&injected), vec!["deploy"]);
 }
 
@@ -918,8 +928,13 @@ fn render_populates_reason_model_then_fallback() {
             matched: vec!["review".into(), "diff".into()],
         },
     ];
-    let injected =
-        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        tmp.path(),
+        &extended,
+        false,
+        &no_redact(tmp.path()),
+    );
     assert_eq!(
         injected[0].reason.as_deref(),
         Some("because you asked to ship"),
@@ -941,8 +956,13 @@ fn render_cap_keeps_top_n_by_order() {
         .collect();
     let chosen: Vec<Survivor> = s.iter().map(survivor).collect();
     let extended = ExtendedConfig::default();
-    let injected =
-        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        tmp.path(),
+        &extended,
+        false,
+        &no_redact(tmp.path()),
+    );
     assert_eq!(injected.len(), MAX_SELECTED_SKILLS);
     // The kept set is the top-N by relevance order (s0..s{N-1}).
     let expected: Vec<String> = (0..MAX_SELECTED_SKILLS).map(|i| format!("s{i}")).collect();
@@ -959,8 +979,13 @@ fn injected_skill_path_does_not_change_selection() {
     let chosen: Vec<Survivor> = s.iter().map(survivor).collect();
     let extended = ExtendedConfig::default();
 
-    let injected =
-        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        tmp.path(),
+        &extended,
+        false,
+        &no_redact(tmp.path()),
+    );
 
     assert_eq!(injected.len(), MAX_SELECTED_SKILLS);
     assert_eq!(names(&injected), vec!["deploy", "review", "docs"]);
@@ -998,8 +1023,13 @@ fn render_budget_drops_lowest_priority_whole_bodies() {
     let b = write_skill(tmp.path(), "review", &second);
     let chosen = vec![survivor(&a), survivor(&b)];
     let extended = ExtendedConfig::default();
-    let injected =
-        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+    let injected = render_capped_and_budgeted(
+        &chosen,
+        tmp.path(),
+        &extended,
+        false,
+        &no_redact(tmp.path()),
+    );
     // Only the high-priority body survives; the lower one is dropped
     // whole. The survivor is byte-for-byte the full body (no truncation).
     assert_eq!(names(&injected), vec!["deploy"]);
@@ -1150,6 +1180,7 @@ async fn select_low_information_turn_skips_before_model_lookup_with_diagnostics(
             &extended,
             &providers,
             redact,
+            false,
             None,
             &[],
             &turns,

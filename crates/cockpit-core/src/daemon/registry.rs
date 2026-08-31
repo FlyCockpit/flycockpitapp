@@ -77,6 +77,19 @@ pub(crate) struct SessionEntryModeConflict {
 #[error("session changed while attaching; retry attach")]
 pub(crate) struct SessionAttachRetry;
 
+/// A Computer primary has one durable root-model authority: the model stored
+/// on the session.  On resume, pass that model through the worker's root pin
+/// so the Computer factory validates the exact persisted selection instead of
+/// selecting a different eligible candidate from the current configuration.
+fn resumed_root_model_override(session: &Session) -> Result<Option<ActiveModelRef>> {
+    if session.session_entry_mode() == crate::daemon::proto::SessionEntryMode::Computer {
+        return session.active_model_ref().map(Some).context(
+            "resumed Computer session has no persisted active model; cannot validate its root model",
+        );
+    }
+    Ok(None)
+}
+
 /// The prior worker generation reached terminal shutdown but its permanent
 /// lock cleanup could not be committed. The registry retains that exact
 /// generation so a later attach can retry cleanup without ever touching a
@@ -1533,11 +1546,31 @@ impl SessionRegistry {
             );
         }
         let preserve_root_model_override = model_override.is_some();
-        let active = initial_model
-            .clone()
-            .or_else(|| model_override.cloned())
-            .or_else(|| providers_cfg.active_model.clone())
-            .context("no model selected for the new session")?;
+        // Computer's dedicated factory may need to select an eligible model
+        // instead of the ordinary configured active model. Select it here,
+        // before the deferred session is staged, and retain the exact result
+        // as the root pin. The factory receives that pin at worker startup,
+        // so no live Computer root can diverge from the session ledger.
+        let mut worker_model_override =
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+                Some(
+                    crate::engine::builtin::computer_primary_active_model_selection(
+                        &providers_cfg,
+                        &extended_cfg,
+                        &project_root,
+                        model_override,
+                    )?,
+                )
+            } else {
+                model_override.cloned()
+            };
+        let active = match worker_model_override.clone() {
+            Some(selection) => selection,
+            None => initial_model
+                .clone()
+                .or_else(|| providers_cfg.active_model.clone())
+                .context("no model selected for the new session")?,
+        };
         let project_id = crate::session::project_id_for(&project_root)?;
         let last_used = self
             .inner
@@ -1547,11 +1580,16 @@ impl SessionRegistry {
             .ok()
             .flatten();
         let available = crate::agents::chat_ownable_primaries(&project_root);
-        let initial_agent = crate::agents::resolve_setup_default_agent(
-            last_used.as_deref(),
-            &available,
-            session_worker::initial_active_agent(&extended_cfg),
-        );
+        let initial_agent =
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+                "Computer".to_string()
+            } else {
+                crate::agents::resolve_setup_default_agent(
+                    last_used.as_deref(),
+                    &available,
+                    session_worker::initial_active_agent(&extended_cfg),
+                )
+            };
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
@@ -1609,7 +1647,16 @@ impl SessionRegistry {
                     &workspace_layer,
                 )?;
             hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
-            if initial_model.is_none() && model_override.is_none() {
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+                let selection = crate::engine::builtin::computer_primary_active_model_selection(
+                    &providers_cfg,
+                    &extended_cfg,
+                    &session.project_root,
+                    model_override,
+                )?;
+                session.set_active_model_ref(selection.clone())?;
+                worker_model_override = Some(selection);
+            } else if initial_model.is_none() && model_override.is_none() {
                 session.set_active_model_ref(
                     providers_cfg
                         .active_model
@@ -1625,7 +1672,7 @@ impl SessionRegistry {
             &providers_cfg,
             &extended_cfg,
             client_no_sandbox,
-            model_override,
+            worker_model_override.as_ref(),
             preserve_root_model_override,
             None,
             trust_policy,
@@ -1840,6 +1887,11 @@ impl SessionRegistry {
                 )?;
             hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
         }
+        // A resumed Computer root must receive its durable selection as an
+        // explicit pin. `computer_primary` validates that exact model and
+        // fails closed if it is no longer computer-eligible; it must never
+        // rescan and silently substitute a different configured model.
+        let worker_model_override = resumed_root_model_override(&session)?;
         debug_assert!(trust_revision > 0);
         self.start_worker(
             worker_publication,
@@ -1847,8 +1899,8 @@ impl SessionRegistry {
             &providers_cfg,
             &extended_cfg,
             client_no_sandbox,
-            None,
-            false,
+            worker_model_override.as_ref(),
+            worker_model_override.is_some(),
             initial_model,
             trust_policy,
             trust_revision,
@@ -2128,9 +2180,27 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        // Publish the initial local-KB LSP policy before this worker is made
+        // externally live. The guard moves into the worker task below: a
+        // failed spawn drops it here, a cancelled start permit drops it in the
+        // task, and a running worker retains it through normal teardown.
+        let protected_lsp_roots = crate::knowledge::configured_local_knowledge_roots(
+            &session,
+            &project_root,
+            &extended_cfg,
+        )
+        .await;
+        let initial_lsp_session_protection = self
+            .inner
+            .lsp
+            .protect_session(session_id, protected_lsp_roots)
+            .await;
+
         // A concurrent promotion either finishes its complete service bundle
         // before this snapshot, or this new session keeps the coherent
         // pre-promotion bundle. It can never retain an intermediate mix.
+        // Everything after acquiring this synchronous guard is synchronous,
+        // so session startup remains `Send` when spawned by the daemon.
         let _persistent_service_transition = self.lock_persistent_service_transition();
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
@@ -2173,6 +2243,7 @@ impl SessionRegistry {
             daemon_no_sandbox,
             &extended_cfg,
             self.inner.lsp.clone(),
+            Some(initial_lsp_session_protection),
             crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone(),
             self.scheduler_source(),
             self.write_scope_source(),
@@ -3022,6 +3093,72 @@ mod tests {
             )
             .expect("session"),
         )
+    }
+
+    #[test]
+    fn resumed_computer_root_pins_its_complete_persisted_model_selection() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_deferred_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect("deferred session");
+        session
+            .set_deferred_entry_mode(proto::SessionEntryMode::Computer)
+            .expect("Computer entry mode");
+        let persisted = ActiveModelRef {
+            provider: "computer-provider".to_string(),
+            model: "vision-model".to_string(),
+            reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+                value: "high".to_string(),
+            }),
+            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+        };
+        session
+            .set_active_model_ref(persisted.clone())
+            .expect("persisted active model");
+        assert!(session.persist_if_needed().expect("persist session"));
+
+        let resumed = Session::resume_for_test(
+            db,
+            session.id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect("resume session")
+        .expect("persisted session");
+
+        assert_eq!(
+            resumed_root_model_override(&resumed).expect("Computer root pin"),
+            Some(persisted),
+            "resume must pass the exact durable selection to the Computer factory"
+        );
+    }
+
+    #[test]
+    fn resumed_computer_root_without_a_model_fails_closed() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_deferred_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect("deferred session");
+        session
+            .set_deferred_entry_mode(proto::SessionEntryMode::Computer)
+            .expect("Computer entry mode");
+
+        let error = resumed_root_model_override(&session)
+            .expect_err("a Computer resume without a persisted model must be rejected");
+        assert!(
+            error.to_string().contains("has no persisted active model"),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn test_handle(reg: &SessionRegistry, session: Arc<Session>) -> SessionWorkerHandle {

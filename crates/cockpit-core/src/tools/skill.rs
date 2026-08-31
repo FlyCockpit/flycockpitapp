@@ -87,6 +87,8 @@ impl Tool for SkillTool {
             path,
             &ctx.cwd,
             &extended,
+            crate::knowledge::local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &extended)
+                .await,
             &ctx.redact,
             &activation,
             &ctx.env_overlay,
@@ -147,6 +149,7 @@ async fn load_skill_into_output(
             None,
             cwd,
             extended,
+            false,
             redact,
             &activation,
             &std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -163,6 +166,7 @@ async fn load_skill_for_session(
     path: Option<&str>,
     cwd: &std::path::Path,
     extended: &ExtendedConfig,
+    local_knowledge_write_fence_active: bool,
     redact: &crate::redact::RedactionTable,
     activation: &crate::skills::ActivationContext,
     env_overlay: &std::sync::RwLock<std::collections::HashMap<String, String>>,
@@ -208,8 +212,13 @@ async fn load_skill_for_session(
         .map_err(|e| anyhow::anyhow!("loading skill `{name}`: {e}"))?;
     record_skill_view(db, skill, name).await;
     let package_dir = rendered_package_root(skill, redact);
-    let rendered =
-        crate::skills::render_body(&body, cwd, extended.skills.auto_bang_commands, redact);
+    let rendered = crate::skills::render_body(
+        &body,
+        cwd,
+        extended.skills.auto_bang_commands,
+        local_knowledge_write_fence_active,
+        redact,
+    );
     Ok(ToolOutput::text(format!(
         "Skill `{name}` (package directory: {package_dir}):\n\n{rendered}{setup_note}"
     )))
@@ -333,6 +342,7 @@ mod tests {
                 path,
                 cwd,
                 extended,
+                false,
                 redact,
                 activation,
                 env_overlay,

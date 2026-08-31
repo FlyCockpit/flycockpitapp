@@ -2498,6 +2498,11 @@ pub(crate) fn spawn(
     // worker still re-resolves async at startup for stale removed primaries.
     let initial_agent = match session.assistant_name.clone() {
         Some(name) => name,
+        None if session.session_entry_mode()
+            == crate::daemon::proto::SessionEntryMode::Computer =>
+        {
+            "Computer".to_string()
+        }
         None => {
             let active = session.active_agent();
             if crate::agents::is_builtin_primary(&active)

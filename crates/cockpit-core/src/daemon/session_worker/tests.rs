@@ -2990,6 +2990,139 @@ async fn absent_scheduler_is_not_an_error() {
 }
 
 #[tokio::test]
+async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebuild() {
+    use crate::config::providers::{
+        ActiveModelRef, CapabilityStatus, ComputerUseCapability, ComputerUseContract,
+        ModelCapabilities, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let mut deferred = Session::create_deferred_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    deferred
+        .set_deferred_entry_mode(proto::SessionEntryMode::Computer)
+        .unwrap();
+    let session = Arc::new(deferred);
+
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "computer-provider".to_string(),
+        ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            computer_use: Some(crate::config::extended::ComputerUseMode::Ask),
+            models: vec![ModelEntry {
+                id: "computer-vision".to_string(),
+                capabilities: ModelCapabilities {
+                    image_input: CapabilityStatus::Supported,
+                    computer_use: ComputerUseCapability {
+                        contract: Some(ComputerUseContract::OpenAiResponses),
+                        source: None,
+                    },
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "computer-provider".to_string(),
+        model: "computer-vision".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    let redact = Arc::new(RedactionTable::empty());
+    let model =
+        Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    let trust_policy = trusted_test_policy(tmp.path());
+
+    let (handle, join, start_permit) = spawn(
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(db.clone())),
+        )),
+        Arc::new(LockManager::in_memory(db)),
+        redact,
+        model,
+        None,
+        None,
+        None,
+        tmp.path().to_path_buf(),
+        test_workspace_root_authority(tmp.path(), &trust_policy),
+        false,
+        false,
+        &extended,
+        Arc::new(crate::daemon::lsp::LspManager::new()),
+        None,
+        None,
+        Arc::new(StdMutex::new(None)),
+        Arc::new(StdMutex::new(None)),
+        None,
+        trust_policy,
+        0,
+        None,
+        Arc::new(tokio::sync::Mutex::new(())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        ),
+        Uuid::now_v7(),
+        std::time::Instant::now(),
+        None,
+        crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
+    )
+    .unwrap();
+    start_permit.release();
+
+    let profile = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(profile) = session.booted_root_profile_for_test() {
+                return profile;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker boots a root primary");
+
+    let native = profile
+        .native_computer
+        .expect("final Computer root keeps its native-computer configuration");
+    assert_eq!(profile.agent_name, "Computer");
+    assert_eq!(profile.provider_id, "computer-provider");
+    assert_eq!(profile.model_id, "computer-vision");
+    assert_eq!(native.target, crate::computer::DisplayTarget::RealDesktop);
+    assert!(native.require_backend);
+    assert!(native.approval_required);
+    assert!(profile.tool_names.iter().any(|name| name == "read"));
+    assert!(profile.tool_names.iter().any(|name| name == "bash"));
+    assert!(profile.tool_names.iter().any(|name| name == "task"));
+
+    handle
+        .send_work(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), join)
+        .await
+        .expect("worker shuts down")
+        .expect("worker task does not panic");
+}
+
+#[tokio::test]
 async fn worker_driver_respects_attached_ignore_config_policy() {
     let env_root = tempfile::tempdir().unwrap();
     let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(env_root.path()).await;

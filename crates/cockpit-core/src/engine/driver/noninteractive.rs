@@ -10442,6 +10442,7 @@ pub(crate) async fn run_noninteractive_resumable(
     // the immediately following request.
     let mut computer_coordinator = None;
     let mut computer_contract = None;
+    let mut computer_coordinator_config = None;
     let mut pending_computer_continuations = Vec::new();
     // A resumable vNext child is itself a delegation parent. Keep its direct
     // child admission state for this whole invocation, so a nested batch has
@@ -11519,16 +11520,25 @@ pub(crate) async fn run_noninteractive_resumable(
             .unwrap_or(session.id)
             .hyphenated()
             .to_string();
-        super::computer_native::reconcile_native_computer_for_delegation(
+        if let Err(error) = super::computer_native::reconcile_native_computer_for_delegation(
             Arc::make_mut(&mut agent),
             &session,
             approver.clone(),
             delegation_id,
             &mut computer_coordinator,
             &mut computer_contract,
+            &mut computer_coordinator_config,
             &mut pending_computer_continuations,
         )
-        .await;
+        .await
+        {
+            return Err(NoninteractiveRunError::new(
+                error.context("opening native computer backend"),
+                history,
+                fallback_decision,
+                fallback_tried,
+            ));
+        }
         let agent_tree_steer_dispatch_permit = active_agent_tree_steer_permit.clone();
         let mut turn_metadata = BackupTurnMetadata::default();
         // Model-comparison tandem (shadow) set for this leaf subagent turn

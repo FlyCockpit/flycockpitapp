@@ -57,7 +57,7 @@ pub fn is_removed_primary(name: &str) -> bool {
 /// Built-in primaries that are real primary agents but never appear in the
 /// normal `/agent` list or Shift+Tab cycle. They are reached only through a
 /// dedicated feature flow.
-pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Dream", "Multireview"];
+pub const HIDDEN_PRIMARY_NAMES: &[&str] = &["Computer", "Dream", "Multireview"];
 
 pub fn is_hidden_primary(name: &str) -> bool {
     HIDDEN_PRIMARY_NAMES.contains(&name)
@@ -66,7 +66,7 @@ pub fn is_hidden_primary(name: &str) -> bool {
 /// Feature-only root agents are excluded from the selectable roster but may
 /// be selected by their owning command flow.
 pub fn is_feature_primary(name: &str) -> bool {
-    matches!(name, "Dream")
+    matches!(name, "Computer" | "Dream")
 }
 
 /// Public built-in primaries in the `/agent` listing and Shift+Tab cycle.
@@ -74,7 +74,14 @@ pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful"];
 
 /// Every built-in primary that may own a root session, including hidden
 /// feature-flow primaries.
-pub const BUILTIN_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful", "Dream", "Multireview"];
+pub const BUILTIN_PRIMARY_NAMES: &[&str] = &[
+    "Plan",
+    "Build",
+    "Careful",
+    "Computer",
+    "Dream",
+    "Multireview",
+];
 
 pub fn is_builtin_primary(name: &str) -> bool {
     BUILTIN_PRIMARY_NAMES.contains(&name)
@@ -120,6 +127,7 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
 
 pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
     match name {
+        "Computer" => Some(computer_primary_def()),
         "computer" => Some(computer_def()),
         "docs-resolver" => Some(docs_resolver_def()),
         "docs-answerer" => Some(docs_answerer_def()),
@@ -263,7 +271,7 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
 /// frontmatter file. Their historic tool arrays remain host-owned factory
 /// inputs, while their ejected form is the closed v2 contract below.
 fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
-    let execution_kind = if name == "computer" {
+    let execution_kind = if matches!(name, "Computer" | "computer") {
         ExecutionKind::Computer
     } else if mode.is_chat_ownable() {
         ExecutionKind::Assistant
@@ -286,6 +294,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
         "Dream" => &["dream-worker"],
         "Plan" => &["explore", "history", "knowledge"],
         "Multireview" => &["scout"],
+        "Computer" => &["builder", "explore"],
         "builder" | "bee" => &["explore"],
         _ => &[],
     };
@@ -740,6 +749,16 @@ fn computer_def() -> AgentDef {
     )
 }
 
+fn computer_primary_def() -> AgentDef {
+    def(
+        "Computer",
+        "Standalone provider-native computer-use primary; delegates coding work to code agents.",
+        AgentMode::Primary,
+        &["read", "bash", "task"],
+        crate::engine::builtin::COMPUTER_PRIMARY_PROMPT,
+    )
+}
+
 fn docs_resolver_def() -> AgentDef {
     def(
         "docs-resolver",
@@ -947,6 +966,44 @@ mod tests {
         assert!(
             listed.iter().any(|name| name == "Careful"),
             "Careful should be public in the primary list: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn computer_primary_is_hidden_and_keeps_delegated_computer_worker() {
+        let primary = embedded_internal_default("Computer").expect("Computer primary");
+        let worker = embedded_internal_default("computer").expect("computer worker");
+
+        assert!(is_builtin_primary("Computer"));
+        assert!(is_hidden_primary("Computer"));
+        assert!(is_feature_primary("Computer"));
+        assert_eq!(primary.mode, AgentMode::Primary);
+        assert_eq!(worker.mode, AgentMode::Subagent);
+        assert_eq!(
+            primary.tools,
+            Some(
+                ["read", "bash", "task"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        let children = &primary
+            .vnext
+            .expect("Computer vNext definition")
+            .delegation
+            .allowed_children;
+        assert!(children.iter().any(|child| matches!(
+            child,
+            AllowedChild::PortableRef { portable_agent_ref }
+                if portable_agent_ref == "cockpit/builder"
+        )));
+        assert_eq!(
+            worker
+                .vnext
+                .expect("computer worker vNext definition")
+                .execution_kind,
+            ExecutionKind::Computer
         );
     }
 

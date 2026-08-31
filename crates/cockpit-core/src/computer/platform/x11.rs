@@ -798,7 +798,10 @@ fn x11_text_property(
 }
 
 #[cfg(target_os = "linux")]
-fn parse_display_identity(display: &str, default_screen: u32) -> Option<(String, u32, u32)> {
+pub(crate) fn parse_display_identity(
+    display: &str,
+    default_screen: u32,
+) -> Option<(String, u32, u32)> {
     let (transport, display_and_screen) = display.rsplit_once(':')?;
     let (display_number, screen) = display_and_screen
         .split_once('.')
@@ -806,7 +809,7 @@ fn parse_display_identity(display: &str, default_screen: u32) -> Option<(String,
             (display, Some(screen))
         });
     Some((
-        if transport.is_empty() {
+        if transport.is_empty() || transport.eq_ignore_ascii_case("unix") {
             "unix".to_string()
         } else {
             transport.to_string()
@@ -817,6 +820,14 @@ fn parse_display_identity(display: &str, default_screen: u32) -> Option<(String,
             None => default_screen,
         },
     ))
+}
+
+/// Canonical identity of an X server, independent of local transport aliases
+/// and the optional screen suffix. X11 input injection is server-global.
+#[cfg(target_os = "linux")]
+pub(crate) fn canonical_x11_server_identity(display: &str) -> Option<(String, u32)> {
+    parse_display_identity(display, 0)
+        .map(|(transport, display_number, _)| (transport, display_number))
 }
 
 #[cfg(target_os = "linux")]
@@ -856,7 +867,7 @@ pub fn authorized_atspi_present() -> bool {
 mod production_adapter_tests {
     use super::{
         RandrOutputSnapshot, X11SessionParts, assign_production_clone_groups,
-        parse_display_identity, x11_session_or_seat_id,
+        canonical_x11_server_identity, parse_display_identity, x11_session_or_seat_id,
     };
 
     #[test]
@@ -880,6 +891,22 @@ mod production_adapter_tests {
         assert_eq!(parse_display_identity(":desktop", 0), None);
         assert_eq!(parse_display_identity(":0.screen", 0), None);
         assert_eq!(parse_display_identity("missing-colon", 0), None);
+    }
+
+    #[test]
+    fn canonical_server_identity_unifies_local_aliases_and_screens() {
+        assert_eq!(
+            canonical_x11_server_identity(":0"),
+            canonical_x11_server_identity("unix:0")
+        );
+        assert_eq!(
+            canonical_x11_server_identity(":0.1"),
+            canonical_x11_server_identity(":0.0")
+        );
+        assert_ne!(
+            canonical_x11_server_identity(":0"),
+            canonical_x11_server_identity(":1")
+        );
     }
 
     #[test]

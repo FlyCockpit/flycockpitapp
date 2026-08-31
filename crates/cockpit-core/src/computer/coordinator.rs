@@ -99,6 +99,7 @@ pub struct DelegationId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLeaseToken {
     pub target_key: PhysicalTargetKey,
+    arbitration_key: PhysicalTargetKey,
     pub generation: LeaseGeneration,
     pub owner_instance: OwnerInstance,
     pub delegation: DelegationId,
@@ -744,6 +745,7 @@ struct WaiterId(u64);
 struct ArbiterWaiter {
     id: WaiterId,
     target_key: PhysicalTargetKey,
+    arbitration_key: PhysicalTargetKey,
     owner_instance: OwnerInstance,
     delegation: DelegationId,
     /// Set when this waiter has been cancelled. The shared flag lets an
@@ -790,6 +792,7 @@ impl std::error::Error for WaitFailed {}
 pub struct WaitHandle {
     id: WaiterId,
     target_key: PhysicalTargetKey,
+    arbitration_key: PhysicalTargetKey,
     delegation: DelegationId,
     receiver: oneshot::Receiver<Result<HostLeaseToken, WaitFailed>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -835,7 +838,9 @@ impl Drop for WaitHandle {
 /// delegations and Cockpit processes.
 ///
 /// Combines a process-local FIFO with an OS-level named mutex/advisory-lock
-/// file under the private Cockpit data root keyed by `PhysicalTargetKey`.
+/// file under the private Cockpit data root. Most backends key it by
+/// `PhysicalTargetKey`; X11 projects monitor-sensitive evidence onto one
+/// server/session-wide input key because xdotool injection is global there.
 /// Acquisition returns an unforgeable monotonic lease generation; only the
 /// current `(target_key, generation, owner_instance, delegation)` may dispatch.
 ///
@@ -914,7 +919,35 @@ impl HostInputArbiter {
         target_key: &PhysicalTargetKey,
         delegation: DelegationId,
     ) -> AcquireResult {
-        let key_str = Self::key_string(target_key);
+        self.try_acquire_with_key(target_key, target_key, delegation)
+    }
+
+    /// Acquire an X11 lease. Evidence remains monitor-sensitive, but xdotool
+    /// injection is global to the X server/session and therefore shares one
+    /// arbitration key across its RandR outputs.
+    fn try_acquire_x11(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        delegation: DelegationId,
+    ) -> AcquireResult {
+        let arbitration_key = PhysicalTargetKey::new(
+            target_key.host_installation_id,
+            target_key.platform_session_or_seat_id,
+            crate::computer::host_identity::domain_hash(
+                b"cockpit.x11.input-arbiter.v1",
+                &[&target_key.platform_session_or_seat_id],
+            ),
+        );
+        self.try_acquire_with_key(target_key, &arbitration_key, delegation)
+    }
+
+    fn try_acquire_with_key(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        arbitration_key: &PhysicalTargetKey,
+        delegation: DelegationId,
+    ) -> AcquireResult {
+        let key_str = Self::key_string(arbitration_key);
 
         // Queue if there is already a current holder, OR if non-cancelled
         // waiters are already queued ahead: a new acquirer must never leapfrog
@@ -941,6 +974,7 @@ impl HostInputArbiter {
                 .push(ArbiterWaiter {
                     id: waiter_id,
                     target_key: *target_key,
+                    arbitration_key: *arbitration_key,
                     owner_instance: self.owner_instance,
                     delegation: delegation.clone(),
                     cancelled: Arc::clone(&cancelled),
@@ -949,6 +983,7 @@ impl HostInputArbiter {
             return AcquireResult::Queued(WaitHandle {
                 id: waiter_id,
                 target_key: *target_key,
+                arbitration_key: *arbitration_key,
                 delegation,
                 receiver,
                 cancelled,
@@ -957,7 +992,7 @@ impl HostInputArbiter {
         }
 
         // Try the OS-level lock.
-        match self.os_lock.try_lock(target_key) {
+        match self.os_lock.try_lock(arbitration_key) {
             Ok(()) => {}
             Err(err) => return AcquireResult::OsLockFailed(err),
         }
@@ -971,6 +1006,7 @@ impl HostInputArbiter {
 
         let token = HostLeaseToken {
             target_key: *target_key,
+            arbitration_key: *arbitration_key,
             generation: lease_gen,
             owner_instance: self.owner_instance,
             delegation,
@@ -986,7 +1022,7 @@ impl HostInputArbiter {
     /// Returns `true` if the lease was released by the current holder,
     /// `false` if the token was not the current holder.
     pub fn release(&mut self, token: &HostLeaseToken) -> bool {
-        let key_str = Self::key_string(&token.target_key);
+        let key_str = Self::key_string(&token.arbitration_key);
 
         // Verify this is the current holder.
         let is_current = match self.current_lease.get(&key_str) {
@@ -998,7 +1034,7 @@ impl HostInputArbiter {
         }
 
         // Release the OS-level lock.
-        self.os_lock.release(&token.target_key);
+        self.os_lock.release(&token.arbitration_key);
 
         // Remove the current lease.
         self.current_lease.remove(&key_str);
@@ -1012,7 +1048,7 @@ impl HostInputArbiter {
                     waiters.remove(0);
                     continue;
                 }
-                let target_key = next.target_key;
+                let target_key = next.arbitration_key;
                 // Re-acquire the OS lock for the promoted waiter.
                 match self.os_lock.try_lock(&target_key) {
                     Ok(()) => {
@@ -1024,6 +1060,7 @@ impl HostInputArbiter {
                         };
                         let new_token = HostLeaseToken {
                             target_key: waiter.target_key,
+                            arbitration_key: waiter.arbitration_key,
                             generation: lease_gen,
                             owner_instance: waiter.owner_instance,
                             delegation: waiter.delegation.clone(),
@@ -1111,7 +1148,7 @@ impl HostInputArbiter {
     ///
     /// Returns `true` if the waiter was found and removed.
     pub fn cancel_waiter_handle(&mut self, handle: &WaitHandle) -> bool {
-        self.cancel_waiter_by_id(&handle.target_key, handle.id)
+        self.cancel_waiter_by_id(&handle.arbitration_key, handle.id)
     }
 
     fn cancel_waiter_by_id(&mut self, target_key: &PhysicalTargetKey, id: WaiterId) -> bool {
@@ -1137,7 +1174,7 @@ impl HostInputArbiter {
     /// loss, owner death, display-generation change, or lease replacement
     /// invalidates the token.
     pub fn is_lease_valid(&self, token: &HostLeaseToken) -> bool {
-        let key_str = Self::key_string(&token.target_key);
+        let key_str = Self::key_string(&token.arbitration_key);
         match self.current_lease.get(&key_str) {
             Some(current) => {
                 current.generation == token.generation
@@ -1155,7 +1192,7 @@ impl HostInputArbiter {
     ///
     /// Returns `true` when the OS-level lock is absent for this lease.
     pub fn detect_lock_loss(&self, token: &HostLeaseToken) -> bool {
-        if !self.os_lock.is_locked(&token.target_key) {
+        if !self.os_lock.is_locked(&token.arbitration_key) {
             return true;
         }
         false
@@ -1188,7 +1225,7 @@ impl HostInputArbiter {
             .current_lease
             .iter()
             .filter(|(_, token)| token.owner_instance == owner)
-            .map(|(k, t)| (k.clone(), t.target_key))
+            .map(|(k, t)| (k.clone(), t.arbitration_key))
             .collect();
         for (key_str, target_key) in keys_to_release {
             self.os_lock.release(&target_key);
@@ -1224,6 +1261,7 @@ fn lock_poison_safe(
 async fn acquire_host_lease(
     arbiter: &Arc<std::sync::Mutex<HostInputArbiter>>,
     physical_key: &PhysicalTargetKey,
+    backend_kind: BackendKind,
     delegation: DelegationId,
 ) -> Result<HostLeaseToken, CoordinatorOpenError> {
     const CONTENTION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
@@ -1231,7 +1269,11 @@ async fn acquire_host_lease(
     loop {
         let acquired = {
             let mut arbiter = lock_poison_safe(arbiter);
-            arbiter.try_acquire(physical_key, delegation.clone())
+            if backend_kind == BackendKind::RealDesktopX11 {
+                arbiter.try_acquire_x11(physical_key, delegation.clone())
+            } else {
+                arbiter.try_acquire(physical_key, delegation.clone())
+            }
         };
         match acquired {
             AcquireResult::Acquired(token) => return Ok(token),
@@ -2831,6 +2873,7 @@ impl ComputerActionCoordinator {
                             acquire_host_lease(
                                 arbiter,
                                 &physical_key,
+                                backend_kind,
                                 params.delegation_id.clone(),
                             )
                             .await?,
@@ -5625,6 +5668,33 @@ mod tests {
         // Now process B can acquire.
         let result_b2 = arbiter_b.try_acquire(&key, delegation);
         assert!(matches!(result_b2, AcquireResult::Acquired(_)));
+    }
+
+    #[test]
+    fn x11_arbiter_serializes_monitors_but_other_backends_do_not() {
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let mut arbiter_a =
+            HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
+        let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(2));
+        let monitor_a = physical_key();
+        let mut monitor_b = monitor_a;
+        monitor_b.physical_display_id = [99; 32];
+
+        let token_a = match arbiter_a
+            .try_acquire_x11(&monitor_a, DelegationId("x11-monitor-a".to_string()))
+        {
+            AcquireResult::Acquired(token) => token,
+            other => panic!("first X11 monitor should acquire, got {other:?}"),
+        };
+        assert_eq!(token_a.target_key, monitor_a);
+        assert!(matches!(
+            arbiter_b.try_acquire_x11(&monitor_b, DelegationId("x11-monitor-b".to_string()),),
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
+        ));
+
+        let other_backend =
+            arbiter_b.try_acquire(&monitor_b, DelegationId("non-x11-monitor-b".to_string()));
+        assert!(matches!(other_backend, AcquireResult::Acquired(_)));
     }
 
     #[test]

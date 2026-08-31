@@ -467,10 +467,7 @@ impl HeldKeyJournal {
             .map_err(input_journal_error)?
             .join("computer-input-state");
         cockpit_host::private_fs::ensure_private_dir(&root).map_err(input_journal_error)?;
-        let digest = crate::computer::host_identity::domain_hash(
-            b"cockpit.x11.held-keys.v1",
-            &[display.as_bytes()],
-        );
+        let digest = held_key_journal_identity(display)?;
         let name = digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -518,6 +515,17 @@ impl HeldKeyJournal {
         })?;
         cockpit_host::private_fs::write_private_file(path, &bytes).map_err(input_journal_error)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn held_key_journal_identity(display: &str) -> Result<[u8; 32], ComputerError> {
+    let (transport, display_number) =
+        crate::computer::platform::x11::canonical_x11_server_identity(display)
+            .ok_or_else(|| input_journal_error("X11 display identity is malformed"))?;
+    Ok(crate::computer::host_identity::domain_hash(
+        b"cockpit.x11.held-keys.v2",
+        &[transport.as_bytes(), &display_number.to_le_bytes()],
+    ))
 }
 
 fn input_journal_error(error: impl std::fmt::Display) -> ComputerError {
@@ -3428,6 +3436,23 @@ mod tests {
 
         journal.store(&[]).expect("clear after successful keyup");
         assert!(journal.load().expect("empty journal").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_key_journal_uses_canonical_x11_server_identity() {
+        assert_eq!(
+            held_key_journal_identity(":0").unwrap(),
+            held_key_journal_identity("unix:0").unwrap()
+        );
+        assert_eq!(
+            held_key_journal_identity(":0.0").unwrap(),
+            held_key_journal_identity(":0.1").unwrap()
+        );
+        assert_ne!(
+            held_key_journal_identity(":0").unwrap(),
+            held_key_journal_identity(":1").unwrap()
+        );
     }
 
     #[test]

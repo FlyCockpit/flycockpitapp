@@ -83,6 +83,12 @@ pub(crate) fn default_effect() -> Arc<dyn SettingsDaemonEffect> {
 /// snapshotted, revisioned, and patched exactly like a discovered one.
 pub(crate) fn register_settings_layer_target(target: &Path) {
     if let Ok(mut targets) = extra_layer_targets().lock() {
+        // Fixture configs live in `TempDir`s. Keeping a dead registration
+        // makes every later snapshot walk an ever-growing list of vanished
+        // paths, which turns exhaustive pointer matrices quadratic. Retain
+        // missing config files while their parent directory is still live so
+        // materialization fixtures preserve their daemon-visible target.
+        targets.retain(|registered| registered.parent().is_some_and(std::path::Path::exists));
         targets.insert(target.to_path_buf());
     }
 }

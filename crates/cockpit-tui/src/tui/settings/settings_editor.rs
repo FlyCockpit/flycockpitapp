@@ -3719,7 +3719,7 @@ mod tests {
         let mut unsupported_current = current_quick_retention();
         unsupported_current.prompt_cache_retention_status = CapabilityStatus::Unsupported;
         let mut unsupported_quick = QuickDialog::open(unsupported_current, Vec::new());
-        for _ in 0..4 {
+        for _ in 0..3 {
             unsupported_quick.handle_key(press(KeyCode::Tab));
         }
         unsupported_quick.handle_key(press(KeyCode::Down));

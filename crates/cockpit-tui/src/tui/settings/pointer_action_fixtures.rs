@@ -593,7 +593,12 @@ impl ActionFixtureKey {
                 ExpectedReducerOutcome::NoPointerControl
             }
             Self::List(ListFixture::MoveUp | ListFixture::MoveDown)
-            | Self::DefaultModel(DefaultModelFixture::Clear) => ExpectedReducerOutcome::Contextual,
+            | Self::DefaultModel(DefaultModelFixture::Clear)
+            | Self::Sidecar(
+                SidecarFixture::SaveSelection
+                | SidecarFixture::SaveCentralPolicy
+                | SidecarFixture::CreateGrant,
+            ) => ExpectedReducerOutcome::Contextual,
             Self::Root(_)
             | Self::Category(_)
             | Self::Agents(_)

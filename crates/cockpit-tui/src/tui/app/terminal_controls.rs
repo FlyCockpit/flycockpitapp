@@ -6,7 +6,10 @@ impl App {
     /// can have changed durable or host-published state remain represented by
     /// their exact owner/correlation until a terminal receipt is applied.
     pub(super) fn has_unsettled_local_authority(&self) -> bool {
-        self.pending_workspace_trust.is_some()
+        self.pending_prune_confirm
+            || self.pending_resume_compaction_confirm
+            || self.pending_stop_confirm.is_some()
+            || self.pending_workspace_trust.is_some()
             || self.dialog.has_unsettled_local_authority()
             || self.overlay.has_unsettled_local_authority()
             || self.pending_mcp_local.is_some()

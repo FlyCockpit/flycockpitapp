@@ -981,7 +981,12 @@ impl OAuthFlowState {
     }
 
     pub(crate) fn has_unsettled_authority(&self) -> bool {
-        self.pending || self.polling || self.acknowledgement_authority_pending
+        // `pending`/`polling` describe an OAuth browser or device-code session
+        // that is waiting on the user. They are not an in-flight daemon
+        // mutation and must not freeze safe controls such as Copy URL, manual
+        // paste, or Poll. Only a correlated request (or the durable
+        // acknowledgement write) owns the settings interaction fence.
+        self.action_operation.is_pending() || self.acknowledgement_authority_pending
     }
 
     pub(crate) fn has_unsettled_acknowledgement(&self) -> bool {

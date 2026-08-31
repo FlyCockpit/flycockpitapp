@@ -97,7 +97,27 @@ impl Approver {
         let decision = match choice {
             ApprovalChoice::Deny => Decision::Deny,
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
-            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Approve(Scope::Once) => {
+                // A one-shot path approval has no durable grant to persist,
+                // but it still authorizes the exact access candidate offered
+                // to the user. Claim it before a following gate can advance
+                // the agent revision (for example path access followed by a
+                // command approval), otherwise that later gate would make
+                // this ready capability stale at the actual host boundary.
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "path_access_once",
+                    &[serde_json::json!({
+                        "access": {"path": &target, "required_access": format!("{required:?}")}
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    Decision::Deny
+                } else {
+                    Decision::Allow { scope: Scope::Once }
+                }
+            }
             ApprovalChoice::GrantPaths(_) => Decision::Deny,
             ApprovalChoice::Approve(scope) => {
                 if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(

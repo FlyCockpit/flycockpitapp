@@ -2288,7 +2288,10 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
-        definition: old.definition.clone(),
+        // This fixture installs a test-only single-tool surface, so no
+        // definition may rebuild it into an unrelated role default during a
+        // preflight boundary.
+        definition: None,
         assistant_identity_prefix: None,
         mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });

@@ -3514,7 +3514,7 @@ async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
 fn keep_warm_idle_deadline_overflow_fails_closed() {
     assert!(
         keep_warm_idle_deadline(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             std::time::Duration::from_secs(u64::MAX),
         )
         .is_none(),

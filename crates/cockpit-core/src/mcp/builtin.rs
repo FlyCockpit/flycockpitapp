@@ -1511,6 +1511,11 @@ fn set_session_metadata<'a>(
 }
 
 fn rename_session_availability(ctx: &HostContext) -> Availability {
+    if !ctx.root_agent_frame {
+        return Availability::unavailable(
+            "rename_session can only be requested from the root agent frame",
+        );
+    }
     let Some(session) = ctx.session.as_ref() else {
         return Availability::unavailable("rename_session requires a live session");
     };
@@ -1532,6 +1537,11 @@ fn rename_session<'a>(
     args: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
+        if !ctx.root_agent_frame {
+            bail!(
+                "`cockpit.rename_session` is unavailable: session titles can only be changed from the root agent frame"
+            );
+        }
         let raw = args
             .get("name")
             .and_then(Value::as_str)

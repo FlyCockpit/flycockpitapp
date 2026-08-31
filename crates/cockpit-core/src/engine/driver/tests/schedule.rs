@@ -954,12 +954,66 @@ async fn resolve_next_interrupt_with_response(
 ) -> uuid::Uuid {
     let iid = loop {
         let open = db.list_open_interrupts(sid).await.unwrap();
-        if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
+        if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id))
+            && db
+                .decision_request_for_interrupt(sid, row.interrupt_id)
+                .await
+                .unwrap()
+                .is_some()
+        {
             break row.interrupt_id;
         }
         tokio::task::yield_now().await;
     };
-    db.resolve_interrupt(iid, &response).await.unwrap();
+    // Mirror the worker's durable settlement order.  Host approvals are now
+    // bound to an AgentTree decision and typed operation capability; waking
+    // the local InterruptHub alone would make the approver observe a stale
+    // (and therefore denied) capability even when the selected option allows
+    // the exact prompt.
+    let interrupt = db
+        .get_interrupt(iid)
+        .await
+        .unwrap()
+        .expect("open interrupt remains available for lifecycle settlement");
+    let decision = db
+        .decision_request_for_interrupt(sid, iid)
+        .await
+        .unwrap()
+        .expect("host approval interrupt has a bound lifecycle decision");
+    let response_json = serde_json::to_string(&response).unwrap();
+    let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+    if interrupt
+        .questions
+        .as_ref()
+        .is_some_and(|offered| crate::approval::host_approval_response_allows(&response, offered))
+    {
+        let authority = crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+            sid, &decision, &interrupt,
+        )
+        .expect("host approval response retains its durable interrupt binding");
+        lifecycle
+            .resolve_host_approval(
+                sid,
+                decision.decision_request_id,
+                iid,
+                &response_json,
+                authority,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+    } else {
+        lifecycle
+            .cancel_host_approval(
+                sid,
+                decision.decision_request_id,
+                iid,
+                &response_json,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+    }
     assert!(hub.resolve(iid, response));
     iid
 }

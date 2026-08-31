@@ -657,6 +657,13 @@ fn prepared_auto_skill_guidance_is_stable_before_commit() {
 #[tokio::test]
 async fn rejected_oversized_phase_two_discards_prepared_auto_and_forced_skills() {
     let (driver, _tmp) = driver_with_skill_caller();
+    let baseline_event_count = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .len();
     let auto = super::super::inbound::PreparedAutoSkillInjection::Selected {
         selection: crate::skills::auto_select::Selection::Skills(vec![
             crate::skills::auto_select::InjectedSkill {
@@ -696,14 +703,16 @@ async fn rejected_oversized_phase_two_discards_prepared_auto_and_forced_skills()
             .unwrap()
             .is_empty()
     );
-    assert!(
+    assert_eq!(
         driver
             .session
             .db
             .list_session_events(driver.session.id)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        baseline_event_count,
+        "rejected phase two must add no skill-visible session events"
     );
     assert!(
         driver

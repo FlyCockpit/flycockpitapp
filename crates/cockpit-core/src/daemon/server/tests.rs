@@ -25523,6 +25523,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_packages",
         "list_failed_tool_calls",
         "get_session_compactions",
+        "get_storage_report",
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",

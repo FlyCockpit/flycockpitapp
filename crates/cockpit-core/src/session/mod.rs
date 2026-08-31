@@ -4148,7 +4148,7 @@ mod tests {
             .unwrap();
         row = db.insert_session_row(&row).await.unwrap();
 
-        let error = Session::resume_for_test(
+        let error = Session::resume_strict_for_test(
             db,
             row.session_id,
             crate::session::test_redaction_key_resolver(),

@@ -27684,6 +27684,7 @@ pub(super) async fn attach(
         (Some(_), Some(claim), _) => {
             let mode = claim.session_entry_mode();
             if let Some(requested) = requested_session_entry_mode
+                && mode != proto::SessionEntryMode::Code
                 && requested != mode
             {
                 return Err(ErrorPayload {
@@ -27714,6 +27715,7 @@ pub(super) async fn attach(
                     }
                 };
                 if let Some(requested) = requested_session_entry_mode
+                    && mode != proto::SessionEntryMode::Code
                     && requested != mode
                 {
                     return Err(ErrorPayload {

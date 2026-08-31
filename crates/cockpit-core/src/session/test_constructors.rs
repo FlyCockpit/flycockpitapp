@@ -208,4 +208,14 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
         Self::resume_with_test_workspace_root(db, session_id, resolver, vault)
     }
+
+    pub fn resume_strict_for_test(
+        db: Db,
+        session_id: Uuid,
+        resolver: RedactionKeyResolverArc,
+    ) -> Result<Option<Self>> {
+        let vault = crate::secure_key::vault_for_db(&db)
+            .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
+        Self::resume_with_strict_test_workspace_root(db, session_id, resolver, vault)
+    }
 }

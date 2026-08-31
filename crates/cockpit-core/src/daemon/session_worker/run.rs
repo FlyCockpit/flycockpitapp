@@ -6067,6 +6067,7 @@ pub(super) async fn run_worker(
     trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
     idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
+    idle_activity_gate: Arc<tokio::sync::Mutex<()>>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
@@ -6864,7 +6865,7 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
-    driver.set_idle_activity_sender(idle_activity_tx.clone());
+    driver.set_idle_activity_sender(idle_activity_tx.clone(), idle_activity_gate.clone());
     driver.bind_enqueue_target(foreground_input_target.clone());
     let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
     driver.set_adopted_process_registry(adopted_processes.clone());
@@ -11022,6 +11023,16 @@ pub(super) async fn run_worker(
                     // stack-last transition can adopt between that clone and
                     // this insert; using it here would strand the item on a
                     // dead id (AC2).
+                    // The gate starts before the queue mutation and remains
+                    // held through both activity publications. A due idle
+                    // wake therefore either commits before this acceptance or
+                    // observes its reset; it cannot run in the inserted-but-
+                    // unannounced gap.
+                    let _idle_activity_admission = if reset_idle_timer {
+                        Some(idle_activity_gate.lock().await)
+                    } else {
+                        None
+                    };
                     let (id, snapshot, outcome) = driver_input_queue
                         .push_idempotent_on_live_target(
                             receipt,
@@ -11051,19 +11062,16 @@ pub(super) async fn run_worker(
                     if reset_idle_timer
                         && matches!(outcome, crate::engine::message::IdempotentPush::Inserted)
                     {
-                        // `push_idempotent_on_live_target` returns without a
-                        // further await. Publish the in-process epoch before
-                        // any later await, so a due idle timer cannot run in
-                        // the accepted-message gap. The scheduler updates its
-                        // persistent idle timeline before its own
-                        // wake/rebuild await as well.
+                        // The admission gate is still held, so a due idle
+                        // timer cannot commit until it can observe this epoch
+                        // and the durable scheduler's rebuilt timeline.
                         let _ = idle_activity_tx.send(tokio::time::Instant::now());
                         let scheduler = ingress_scheduler
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
                         if let Some(scheduler) = scheduler {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
                     }
                     let queue: Vec<proto::QueueItem> =

@@ -2534,6 +2534,10 @@ pub fn spawn(
     session.set_shell_compression(extended_cfg.shell_compression);
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let idle_activity_gate = crate::sync::lock_or_recover(&scheduler)
+        .as_ref()
+        .map(crate::daemon::scheduler::DaemonSchedulerHandle::activity_gate)
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
     let legacy_disk_origins = match session.persisted_disk_redaction_origins() {
@@ -2663,6 +2667,7 @@ pub fn spawn(
             worker_trust_policy,
             work_rx,
             idle_activity_tx.clone(),
+            idle_activity_gate,
             event_tx,
             turn_completions,
             redaction,

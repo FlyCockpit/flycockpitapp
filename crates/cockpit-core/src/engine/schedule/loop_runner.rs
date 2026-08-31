@@ -50,6 +50,10 @@ pub struct LoopRunCtx {
     /// An accepted parent-thread user message publishes its instant here and
     /// restarts an idle timer's countdown from the actual activity time.
     pub idle_activity_rx: Option<watch::Receiver<Instant>>,
+    /// Shared admission gate. Ingress holds it from queue insertion through
+    /// watch publication, while a due timer holds it before committing to a
+    /// wake; this gives those events a real ordering boundary.
+    pub idle_activity_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     /// The authority owns this handoff while a wake runs. It can promote an
     /// already-recorded action if external cancellation aborts the runner.
     pub active_idle_wake: Option<ActiveIdleWake>,
@@ -73,6 +77,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         turn_tx,
         event_tx,
         mut idle_activity_rx,
+        idle_activity_gate,
         active_idle_wake,
     } = run;
 
@@ -151,7 +156,14 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         // Wait the interval before each iteration (a timer with limit=1
         // therefore fires after one interval — matching "one-shot delayed
         // prompt").
-        match wait_for_next_wake(delay, args.interval_secs, idle_activity_rx.as_mut()).await {
+        match wait_for_next_wake(
+            delay,
+            args.interval_secs,
+            idle_activity_rx.as_mut(),
+            idle_activity_gate.as_ref(),
+        )
+        .await
+        {
             WakeWait::Elapsed { activity_seen } => {
                 // Activity restarts both this countdown and any backoff. The
                 // next wake therefore fires after the configured interval from
@@ -372,6 +384,7 @@ async fn wait_for_next_wake(
     delay_secs: u64,
     reset_delay_secs: u64,
     activity_rx: Option<&mut watch::Receiver<Instant>>,
+    activity_gate: Option<&Arc<tokio::sync::Mutex<()>>>,
 ) -> WakeWait {
     let Some(activity_rx) = activity_rx else {
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
@@ -406,7 +419,28 @@ async fn wait_for_next_wake(
                     + std::time::Duration::from_secs(reset_delay_secs);
                 activity_seen = true;
             }
-            _ = &mut sleep => return WakeWait::Elapsed { activity_seen },
+            _ = &mut sleep => {
+                // The timer may become due while a different worker thread
+                // is accepting a user message. Wait for that admission to
+                // finish, then inspect the watch epoch one last time before
+                // committing to a wake. If the timer wins this gate, it is
+                // ordered before the later acceptance; if ingress wins, its
+                // reset is observed here.
+                let _admission = match activity_gate {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
+                match activity_rx.has_changed() {
+                    Ok(true) => {
+                        deadline = *activity_rx.borrow_and_update()
+                            + std::time::Duration::from_secs(reset_delay_secs);
+                        activity_seen = true;
+                        continue;
+                    }
+                    Ok(false) => return WakeWait::Elapsed { activity_seen },
+                    Err(_) => return WakeWait::ActivityChannelClosed,
+                }
+            }
         }
     }
 }
@@ -854,7 +888,7 @@ mod tests {
         let (activity_tx, activity_rx) = watch::channel(Instant::now());
         let wait = tokio::spawn(async move {
             let mut activity_rx = activity_rx;
-            wait_for_next_wake(300, 60, Some(&mut activity_rx)).await
+            wait_for_next_wake(300, 60, Some(&mut activity_rx), None).await
         });
 
         tokio::task::yield_now().await;
@@ -878,12 +912,53 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn due_idle_wake_observes_activity_accepted_before_gate_release() {
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        // This models the production ingress interval: queue insertion has
+        // completed and the reset is about to be published, while the idle
+        // timer is already due on another worker thread.
+        let admission = gate.lock().await;
+        let wait_gate = gate.clone();
+        let wait = tokio::spawn(async move {
+            let mut activity_rx = activity_rx;
+            wait_for_next_wake(1, 60, Some(&mut activity_rx), Some(&wait_gate)).await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "a due wake must wait for an in-progress accepted ingress"
+        );
+
+        activity_tx.send(Instant::now()).unwrap();
+        drop(admission);
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "accepted activity must reset the deadline"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            wait.await.unwrap(),
+            WakeWait::Elapsed {
+                activity_seen: true
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn closed_idle_activity_channel_is_terminal() {
         let (activity_tx, mut activity_rx) = watch::channel(Instant::now());
         drop(activity_tx);
 
         assert!(matches!(
-            wait_for_next_wake(60, 60, Some(&mut activity_rx)).await,
+            wait_for_next_wake(60, 60, Some(&mut activity_rx), None).await,
             WakeWait::ActivityChannelClosed
         ));
     }
@@ -899,7 +974,9 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(45)).await;
 
         let wait =
-            tokio::spawn(async move { wait_for_next_wake(300, 60, Some(&mut activity_rx)).await });
+            tokio::spawn(
+                async move { wait_for_next_wake(300, 60, Some(&mut activity_rx), None).await },
+            );
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(14)).await;
         tokio::task::yield_now().await;

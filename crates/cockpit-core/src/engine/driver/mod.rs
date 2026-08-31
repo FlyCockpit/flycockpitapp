@@ -7945,8 +7945,10 @@ impl Driver {
     pub(crate) fn set_idle_activity_sender(
         &mut self,
         sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+        gate: Arc<tokio::sync::Mutex<()>>,
     ) {
         self.schedule.set_idle_activity_sender(sender);
+        self.schedule.set_idle_activity_gate(gate);
     }
 
     /// Tools whose in-flight execution can be adopted by the
@@ -11798,10 +11800,16 @@ impl Driver {
                         // turn start because the oversized lease was still
                         // unmaterialized; this is the delayed ExternalRoot
                         // gate advance for that path.
+                        // Materialization is this path's acceptance boundary.
+                        // Keep the durable reset and in-memory epoch in the
+                        // same admission interval as ordinary ingress.
+                        let idle_activity_gate = self.schedule.idle_activity_gate();
+                        let _idle_activity_admission = idle_activity_gate.lock().await;
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
-                        self.schedule.record_materialized_user_activity();
+                        self.schedule
+                            .record_materialized_user_activity_after_acceptance();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {

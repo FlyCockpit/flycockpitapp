@@ -413,6 +413,9 @@ pub struct ScheduleAuthority {
     /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
     /// user message resets their countdown without polling.
     idle_activity_tx: watch::Sender<Instant>,
+    /// Serializes ingress acceptance with an idle timer deciding that its
+    /// deadline elapsed. The owner publishes the watch update before release.
+    idle_activity_gate: Arc<tokio::sync::Mutex<()>>,
     /// True when daemon ingress publishes accepted inline/media activity.
     ingress_activity_owned: bool,
 }
@@ -441,6 +444,10 @@ impl ScheduleAuthority {
         self.ingress_activity_owned = true;
     }
 
+    pub fn set_idle_activity_gate(&mut self, gate: Arc<tokio::sync::Mutex<()>>) {
+        self.idle_activity_gate = gate;
+    }
+
     /// Build an authority. `event_tx` is drained by the driver at the turn
     /// boundary; `cmd_tx` lets in-task timers re-arm; `turn_tx` is the
     /// engine event channel for UI-only signals.
@@ -463,6 +470,7 @@ impl ScheduleAuthority {
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
             idle_activity_tx,
+            idle_activity_gate: Arc::new(tokio::sync::Mutex::new(())),
             ingress_activity_owned: false,
         }
     }
@@ -761,6 +769,7 @@ impl ScheduleAuthority {
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             idle_activity_rx: args.idle.then(|| self.idle_activity_tx.subscribe()),
+            idle_activity_gate: args.idle.then(|| self.idle_activity_gate.clone()),
             active_idle_wake: active_idle_wake.clone(),
         };
         let handle = tokio::spawn(loop_runner::run_forked_loop(run_ctx));
@@ -787,9 +796,15 @@ impl ScheduleAuthority {
         }
     }
 
-    /// Phase-two FCM2 materialization occurs inside the driver and therefore
-    /// remains the acceptance boundary even when ordinary ingress owns resets.
-    pub fn record_materialized_user_activity(&self) {
+    /// The same admission gate used by daemon ingress. Phase-two artifact
+    /// materialization takes it before its durable acceptance/reset pair.
+    pub fn idle_activity_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.idle_activity_gate.clone()
+    }
+
+    /// Publish phase-two FCM2 activity while the caller holds
+    /// [`Self::idle_activity_gate`].
+    pub fn record_materialized_user_activity_after_acceptance(&self) {
         self.publish_user_activity();
     }
 

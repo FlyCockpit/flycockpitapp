@@ -152,13 +152,11 @@ impl Tool for BashTool {
         Self::declared_binary_requirements()
     }
 
-    fn completed_call_effect(&self, args: &Value, output: &ToolOutput) -> ToolEffect {
-        // A non-zero shell exit is a failed invocation for idle-wake
-        // persistence. A timeout/cancellation with an unknown host effect is
-        // intentionally conservative: the wrapper retains its reservation.
-        if !output.host_effect_unknown && output.exit_code.is_none_or(|exit_code| exit_code != 0) {
-            return ToolEffect::ReadOnly;
-        }
+    fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {
+        // A non-zero shell exit says nothing about effects that occurred
+        // before it (for example, `touch marker && false`). A timeout or
+        // cancellation with an unknown host effect is likewise conservative.
+        // Only the lexical read-only proof may discard an idle wake action.
         if bash_command_is_proven_read_only(args.get("command").and_then(Value::as_str)) {
             ToolEffect::ReadOnly
         } else {
@@ -3101,7 +3099,9 @@ fn scrub_overrides(
 
 #[cfg(test)]
 mod idle_wake_effect_tests {
-    use super::bash_command_is_proven_read_only;
+    use super::{BashTool, bash_command_is_proven_read_only};
+    use crate::engine::tool::{Tool, ToolEffect, ToolOutput};
+    use serde_json::json;
 
     #[test]
     fn only_simple_read_only_shell_forms_are_proven_read_only() {
@@ -3120,6 +3120,17 @@ mod idle_wake_effect_tests {
                 "{command} must retain the dynamic effect"
             );
         }
+    }
+
+    #[test]
+    fn nonzero_dynamic_shell_completion_remains_stateful() {
+        let tool = BashTool::new();
+        let output = ToolOutput::text("exit: 1\n").with_exit_code(1);
+
+        assert_eq!(
+            tool.completed_call_effect(&json!({ "command": "touch marker && false" }), &output),
+            ToolEffect::Dynamic
+        );
     }
 }
 

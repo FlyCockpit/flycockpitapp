@@ -963,7 +963,6 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
         Some("reviewer"),
         Some("sub-1"),
         ObserveFields::default(),
-        false,
     )
     .await;
     assert_eq!(env["subagentType"], "reviewer");
@@ -2384,7 +2383,13 @@ async fn local_knowledge_write_fence_skips_stop_hook_commands() {
     let outcome = run_stop_hooks(
         &runner,
         &env,
-        &registry(vec![stop_hook()]),
+        &registry(vec![test_hook(
+            HookEvent::Stop,
+            vec!["stop".to_string()],
+            Some(vec!["end_turn".to_string()]),
+            BTreeMap::new(),
+            5,
+        )]),
         HookEvent::Stop,
         "end_turn",
         sid,

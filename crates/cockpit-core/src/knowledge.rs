@@ -4266,6 +4266,7 @@ async fn effective_local_knowledge_bases(
         let KnowledgeBaseSource::Local { path } = entry.source else {
             continue;
         };
+        let registry_id_conflicted = duplicate_ids.contains(&entry.id);
         let root = if path.is_absolute() {
             path
         } else {
@@ -4279,7 +4280,7 @@ async fn effective_local_knowledge_bases(
             id: entry.id,
             root,
             trust_required: entry.trust_required,
-            registry_id_conflicted: duplicate_ids.contains(&entry.id),
+            registry_id_conflicted,
             policy_denied,
         });
     }

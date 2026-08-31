@@ -10277,7 +10277,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         allowed_knowledge_bases: agent
             .definition
             .as_ref()
-            .and_then(crate::agents::AgentDef::allowed_knowledge_bases)
+            .and_then(|definition| definition.allowed_knowledge_bases())
             .cloned(),
         executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
         knowledge_access_trusted: agent.model.is_trusted(),

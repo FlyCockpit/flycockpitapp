@@ -2229,12 +2229,9 @@ pub(crate) async fn run_turn(
         is_root,
         context_usage,
         history,
-        &prompt,
         &cwd,
-        agent.definition.as_deref(),
         &config,
         redact.clone(),
-        model.is_trusted(),
         tx,
     )
     .await?;
@@ -3698,12 +3695,9 @@ async fn inject_volatile_context(
     is_root: bool,
     context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
-    prompt: &Message,
     cwd: &std::path::Path,
-    definition: Option<&crate::agents::AgentDef>,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
-    executing_model_trusted: bool,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<()> {
     inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history)
@@ -3712,23 +3706,10 @@ async fn inject_volatile_context(
     super::inject_available_skills_catalog(history, cwd, config, &active_tool_names);
 
     inject_initial_project_guidance(&agent.name, history, cwd, config, redact.clone(), tx).await;
-    let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, prompt);
-    crate::knowledge::inject_knowledge_for_turn(
-        history,
-        session,
-        cwd,
-        definition,
-        config,
-        &knowledge_query,
-        redact.clone(),
-        executing_model_trusted,
-    )
-    .await;
-
-    // Live instructions-file diffs and knowledge retrieval are fresh turn
-    // observations, so they stay in history. The same seam is reserved for
-    // knowledge-base freshness notices; their names/descriptions and frozen
-    // `last_dreamed_at` snapshot belong to the spawn-time stable prefix.
+    // Live instructions-file diffs are fresh turn observations, so they stay
+    // in history. Knowledge-base reads are explicit cache-stable tool calls;
+    // their names/descriptions and frozen `last_dreamed_at` snapshot belong to
+    // the spawn-time stable prefix.
     if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
         inject_live_project_guidance_change(history, cwd, config, redact, tx, &message).await;
     }

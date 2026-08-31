@@ -174,7 +174,14 @@ fn cockpit_core_has_no_cli_or_acp_transport_schema_dependency() {
     collect_rust_files(&root, &mut files);
     assert!(!files.is_empty());
     for path in files {
-        let source = fs::read_to_string(&path).expect("read Rust source");
+        // This is a dependency-boundary ratchet, not a documentation
+        // ratchet: core may describe the CLI host in comments and test-only
+        // contracts without depending on its transport schema.
+        let source = production_source(&path)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for forbidden in [
             "apps::cli",
             "apps/cli",

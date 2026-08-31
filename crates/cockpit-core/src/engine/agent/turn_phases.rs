@@ -870,6 +870,7 @@ impl DeferredTurnPlan {
         &mut self,
         agent: &Agent,
         scheduled: &turn_scheduler::ScheduledCall,
+        history: &mut Vec<Message>,
     ) -> Result<Vec<Message>> {
         let text_recovery_marker = self.recovered_markers.remove(&scheduled.call_id);
         let tc = &self.calls[scheduled.source_index];
@@ -886,17 +887,17 @@ impl DeferredTurnPlan {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        let mut call_history = Vec::new();
+        let result_start = history.len();
         super::tool_dispatch::execute_ordinary_call(
             &env,
-            &mut call_history,
+            history,
             tc,
             &scheduled.resolved_name,
             self.name_recoveries[scheduled.source_index].clone(),
             text_recovery_marker,
         )
         .await?;
-        Ok(call_history)
+        Ok(history[result_start..].to_vec())
     }
 
     /// Advance through a mixed ordinary/delegate lane and at most one static
@@ -1045,7 +1046,10 @@ impl DeferredTurnPlan {
                     }
                     return Ok(outcome);
                 }
-                ControlFlow::Continue(()) => match self.execute_ordinary(agent, &scheduled).await {
+                ControlFlow::Continue(()) => match self
+                    .execute_ordinary(agent, &scheduled, history)
+                    .await
+                {
                     Ok(call_history) => {
                         self.record_terminal_with_body(
                             &scheduled,
@@ -1058,7 +1062,6 @@ impl DeferredTurnPlan {
                             })?,
                         )
                         .await?;
-                        history.extend(call_history);
                     }
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         // Interrupt-park is not a terminal scheduler cancel.
@@ -3041,11 +3044,21 @@ pub(crate) async fn run_turn(
     // blanked above, so persisting any part of the raw choice would either replay
     // the plaintext `secret` argument of the report_leak call or leave a
     // `tool_use` without a matching `tool_result`.
-    let stored_choice = if turn_output_contained {
+    let mut stored_choice = if turn_output_contained {
         None
     } else {
         stored_choice
     };
+    // The assistant message is inserted into the driver history before the
+    // per-call scheduler begins. Parallel calls intentionally receive private
+    // result buffers, so their later canonical rewrite cannot be the boundary
+    // that protects this already-stored assistant tool call. Project every
+    // ordinary call here, at the one shared insertion point, using the same
+    // resolved schema lookup as dispatch. This also covers signed-reasoning
+    // turns, which must not be mutated after insertion.
+    if let Some(choice) = &mut stored_choice {
+        project_stored_tool_call_args(choice, &active_tools);
+    }
     history.push(prompt);
     if let Some(stored_choice) = stored_choice {
         history.push(Message::Assistant {
@@ -3498,7 +3511,15 @@ pub(crate) async fn run_turn(
                     .as_ref()
                     .map(|provider| provider.call_id.clone()),
                 resolved_tool: scheduled.resolved_name.clone(),
-                wire_input: call.function.arguments.clone(),
+                // Scheduler continuations can be rehydrated into a model
+                // assistant call when their ordinary dispatch was interrupted.
+                // They are therefore a model-history consumer, not a display
+                // record, and must receive the same store-time projection.
+                wire_input: project_tool_call_args(
+                    &active_tools,
+                    &scheduled.resolved_name,
+                    &call.function.arguments,
+                ),
                 classification: scheduled.classification_str().to_string(),
             }
         })
@@ -3554,6 +3575,35 @@ pub(crate) async fn run_turn(
             cwd,
         }),
     })
+}
+
+/// Project the provider-emitted assistant choice before it becomes live model
+/// history. The later dispatcher rewrite still supplies repaired/canonical
+/// values for ordinary serial calls; this boundary exists for every call,
+/// including parallel calls and signed assistant turns that cannot be mutated.
+fn project_stored_tool_call_args(
+    choice: &mut [crate::engine::message::AssistantContent],
+    active_tools: &ToolBox,
+) {
+    use crate::engine::message::AssistantContent;
+
+    let known = active_tools.names();
+    for part in choice {
+        let AssistantContent::ToolCall(call) = part else {
+            continue;
+        };
+        let resolved = repair::repair_tool_name(&call.function.name, &known).name;
+        call.function.arguments =
+            project_tool_call_args(active_tools, &resolved, &call.function.arguments);
+    }
+}
+
+fn project_tool_call_args(active_tools: &ToolBox, resolved_name: &str, args: &Value) -> Value {
+    active_tools
+        .get(resolved_name)
+        .map(|tool| crate::engine::tool::strip_model_ephemeral_fields(args, &tool.parameters()))
+        // MCP is outside the host-owned schema marker contract.
+        .unwrap_or_else(|| args.clone())
 }
 
 /// Move work scheduled by the driver into the current root turn before request
@@ -4255,6 +4305,54 @@ mod tests {
             signature: None,
             additional_params: None,
         }
+    }
+
+    struct ModelEphemeralHistoryTool;
+
+    #[async_trait::async_trait]
+    impl crate::engine::tool::Tool for ModelEphemeralHistoryTool {
+        fn name(&self) -> &str {
+            "model_ephemeral_history"
+        }
+
+        fn description(&self) -> &str {
+            "test-only model history projection tool"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "keep": { "type": "string" },
+                    "secret": { "x-cockpit-model-ephemeral": true }
+                }
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::text("unused"))
+        }
+    }
+
+    #[test]
+    fn parallel_call_choice_is_projected_before_private_dispatch_buffers_exist() {
+        let toolbox = ToolBox::new().with(Arc::new(ModelEphemeralHistoryTool));
+        let call = identified_ordinary_call(
+            "parallel-ephemeral",
+            "model_ephemeral_history",
+            serde_json::json!({ "keep": "visible", "secret": "argument sentinel" }),
+        );
+        let mut choice = vec![crate::engine::message::AssistantContent::ToolCall(call)];
+
+        project_stored_tool_call_args(&mut choice, &toolbox);
+
+        let crate::engine::message::AssistantContent::ToolCall(call) = &choice[0] else {
+            panic!("expected projected tool call");
+        };
+        assert_eq!(
+            call.function.arguments,
+            serde_json::json!({ "keep": "visible" })
+        );
     }
 
     async fn list_scheduler_continuations(

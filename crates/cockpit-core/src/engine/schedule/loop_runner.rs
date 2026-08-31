@@ -1111,6 +1111,7 @@ mod tests {
                 interval_secs: 5,
                 prompt: "check successor history".into(),
                 limit: Some(2),
+                limit_defaulted: false,
                 backoff: false,
                 watch_paths: Vec::new(),
                 idle: false,

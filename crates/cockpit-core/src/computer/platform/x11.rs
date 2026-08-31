@@ -558,6 +558,35 @@ impl X11TargetEvidenceAdapter {
         let mut window_bytes = [0_u8; 16];
         window_bytes[..4].copy_from_slice(&active_window.to_le_bytes());
 
+        // Close the synchronous-query bracket: neither focus nor the RandR
+        // configuration may have changed while the component fields above
+        // were assembled into one snapshot.
+        let resources_after = connection
+            .randr_get_screen_resources_current(root)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        if resources_after.config_timestamp != resources.config_timestamp {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+        let active_window_after = connection
+            .get_property(
+                false,
+                root,
+                active_window_atom,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?
+            .value32()
+            .and_then(|mut values| values.next());
+        if active_window_after != Some(active_window) {
+            return Err(TargetUnavailableReason::QueryMismatch);
+        }
+
         let mut snapshot = empty_unavailable(BackendKind::RealDesktopX11);
         snapshot.host_installation_id =
             FieldEvidence::available(self.host, EvidenceSource::X11ServerSetup);

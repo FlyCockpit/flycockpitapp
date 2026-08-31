@@ -153,8 +153,13 @@ impl App {
             AsyncActionKind::DaemonRpc("side.start"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("side.start")),
             move || {
-                let (session_id, short_id) =
-                    agent_runner::fork_session_blocking(&endpoint, parent_session_id, None, true)?;
+                let (session_id, short_id) = agent_runner::fork_session_blocking(
+                    &endpoint,
+                    parent_session_id,
+                    None,
+                    true,
+                    false,
+                )?;
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
                     endpoint,

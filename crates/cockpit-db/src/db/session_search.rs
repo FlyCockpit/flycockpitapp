@@ -21,7 +21,7 @@ pub enum HistoryCallerTrust {
 }
 
 impl HistoryCallerTrust {
-    fn can_read_trusted(self) -> bool {
+    pub fn can_read_trusted(self) -> bool {
         matches!(self, Self::Trusted)
     }
 }
@@ -158,6 +158,46 @@ impl Db {
                 caller_trust,
                 None,
                 None,
+                None,
+                false,
+                false,
+            )
+        })
+        .await
+    }
+
+    /// First-class assistant thread candidates, ordered by most recent
+    /// activity. The type and visibility predicates participate in the query
+    /// before its bounded result pool, so unrelated child sessions cannot
+    /// consume a thread-search slot.
+    pub async fn search_assistant_candidates_for_trust(
+        &self,
+        query: &str,
+        assistant_name: &str,
+        project_id: &str,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        let assistant_name = assistant_name.to_string();
+        let project_id = project_id.to_string();
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                Some(&project_id),
+                exclude_session,
+                since,
+                None,
+                pool,
+                caller_trust,
+                None,
+                None,
+                Some(&assistant_name),
+                true,
+                true,
             )
         })
         .await
@@ -189,6 +229,9 @@ impl Db {
                 caller_trust,
                 Some(&session_ids),
                 None,
+                None,
+                false,
+                false,
             )
         })
         .await
@@ -220,6 +263,9 @@ impl Db {
                 caller_trust,
                 None,
                 None,
+                None,
+                false,
+                false,
             )
         })
         .await
@@ -252,6 +298,9 @@ impl Db {
                 caller_trust,
                 None,
                 Some(&reader_project),
+                None,
+                false,
+                false,
             )
         })
         .await
@@ -513,6 +562,9 @@ fn search_candidates_inner(
     caller_trust: HistoryCallerTrust,
     allowed_session_ids: Option<&[Uuid]>,
     reader_project: Option<&str>,
+    assistant_name: Option<&str>,
+    assistant_thread_only: bool,
+    recency_sorted: bool,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
         return Ok(Vec::new());
@@ -560,6 +612,7 @@ fn search_candidates_inner(
                 AND f.row_kind <> 'artifact'
                 AND s.archived_at_unix_ms IS NULL
                 AND s.is_dream_session = 0
+                AND s.ephemeral = 0
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at_unix_ms >= ?4)
@@ -583,7 +636,13 @@ fn search_candidates_inner(
                                      WHERE target.project_id = s.project_id
                                        AND target.inbound_enabled = 1)))
                 AND (?8 IS NULL OR f.session_id IN (SELECT value FROM json_each(?8)))
-              ORDER BY rank ASC, s.last_active_at_unix_ms DESC",
+                AND (?9 IS NULL OR s.assistant_name = ?9)
+                AND (?10 = 0 OR s.is_assistant_thread = 1)
+              ORDER BY
+                CASE WHEN ?11 THEN s.last_active_at_unix_ms END DESC,
+                CASE WHEN ?11 THEN s.session_id END DESC,
+                CASE WHEN NOT ?11 THEN rank END ASC,
+                CASE WHEN NOT ?11 THEN s.last_active_at_unix_ms END DESC",
         )
         .context("preparing search_candidates")?;
 
@@ -603,6 +662,9 @@ fn search_candidates_inner(
                 caller_trust.can_read_trusted(),
                 reader_project,
                 allowed_session_ids,
+                assistant_name,
+                assistant_thread_only,
+                recency_sorted,
             ],
             |row| {
                 let sid: String = row.get("session_id")?;
@@ -619,9 +681,9 @@ fn search_candidates_inner(
         )
         .context("querying search_candidates")?;
 
-    // Collapse to one hit per thread, keeping the first (best-ranking)
-    // snippet seen — the rows arrive in BM25-then-recency order, so the
-    // first occurrence of a session is already its strongest hit.
+    // Collapse to one hit per session. Standard history search retains the
+    // strongest BM25 snippet; thread search deliberately preserves the SQL
+    // recency order required by the threads surface.
     let mut order: Vec<Uuid> = Vec::new();
     let mut by_session: std::collections::HashMap<Uuid, SearchHit> =
         std::collections::HashMap::new();
@@ -653,12 +715,15 @@ fn search_candidates_inner(
         }
     }
 
-    Ok(rank_candidates(
-        order
-            .into_iter()
-            .map(|id| by_session.remove(&id).unwrap())
-            .collect(),
-    ))
+    let candidates = order
+        .into_iter()
+        .map(|id| by_session.remove(&id).unwrap())
+        .collect();
+    Ok(if recency_sorted {
+        candidates
+    } else {
+        rank_candidates(candidates)
+    })
 }
 
 fn search_candidates_in_sessions_inner(

@@ -272,6 +272,7 @@ mod tests {
             "last_active_at_unix_ms": 0,
             "turns": 0,
             "active_agent": "builder",
+            "is_assistant_thread": false,
         }))
         .expect("minimal session summary deserializes")
     }

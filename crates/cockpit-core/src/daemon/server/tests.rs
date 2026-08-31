@@ -10711,6 +10711,7 @@ async fn fork_session_remote_path_commits_transactional_ledger() {
         parent_session_id: parent.session_id,
         fork_point_turn_id: None,
         ephemeral: false,
+        fresh_thread: false,
     };
     let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
         .await
@@ -19218,6 +19219,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             parent_session_id: session_id,
             fork_point_turn_id: None,
             ephemeral: false,
+            fresh_thread: false,
         },
         "discard_session" => Request::DiscardSession { session_id },
         "btw_create" => Request::CreateBtwFork {
@@ -24282,6 +24284,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     parent_session_id: session.session_id,
                     fork_point_turn_id: None,
                     ephemeral: false,
+                    fresh_thread: false,
                 },
             )
             .await
@@ -24468,6 +24471,7 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
             parent_session_id: missing,
             fork_point_turn_id: None,
             ephemeral: false,
+            fresh_thread: false,
         },
         "discard_session" => Request::DiscardSession {
             session_id: session.session_id,
@@ -26195,6 +26199,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 parent_session_id,
                 fork_point_turn_id: None,
                 ephemeral: false,
+                fresh_thread: false,
             },
             kind: "fork_session",
             session_id: Some(parent_session_id),

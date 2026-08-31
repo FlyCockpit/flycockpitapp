@@ -1329,7 +1329,7 @@ impl Session {
             if current.revision > entry.dream_completion_revision {
                 fresh.push((
                     entry.id.clone(),
-                    entry.name.clone(),
+                    entry.freshness_notice_name.clone(),
                     current.revision,
                     current.completed_at_unix_ms,
                 ));

@@ -119,6 +119,7 @@ where
             .after_context(options.context.unwrap_or(0))
             .build();
         let mut sink = RecordSink {
+            path,
             rel,
             matcher: &matcher,
             columns: options.columns,
@@ -154,6 +155,7 @@ fn display_path(path: &Path, display_root: &Path) -> String {
 }
 
 struct RecordSink<'a> {
+    path: &'a Path,
     rel: String,
     matcher: &'a RegexMatcher,
     columns: bool,

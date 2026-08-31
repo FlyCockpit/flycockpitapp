@@ -79,6 +79,7 @@ pub fn configured_recursion_context(
 // Issue #75: each bundled agent has a single canonical prompt body in the
 // flat `<name>.md` file. Per-model-slot overrides live on the AgentDef as
 // `prompt_overrides` (`<name>/<key>.md`).
+pub(crate) const ASSISTANT_PROMPT: &str = include_str!("assistant.md");
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
 pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");

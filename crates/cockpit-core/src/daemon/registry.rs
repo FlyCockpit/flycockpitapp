@@ -1539,19 +1539,27 @@ impl SessionRegistry {
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
         let project_id = crate::session::project_id_for(&project_root)?;
-        let last_used = self
-            .inner
-            .db
-            .last_used_root_agent_for_project(&project_id)
-            .await
-            .ok()
-            .flatten();
-        let available = crate::agents::chat_ownable_primaries(&project_root);
-        let initial_agent = crate::agents::resolve_setup_default_agent(
-            last_used.as_deref(),
-            &available,
-            session_worker::initial_active_agent(&extended_cfg),
-        );
+        let initial_agent =
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant {
+                // Assistant mode owns an explicit first-class primary. Do not let
+                // the Code session's last-used/default selection silently boot
+                // Build here.
+                "Assistant".to_string()
+            } else {
+                let last_used = self
+                    .inner
+                    .db
+                    .last_used_root_agent_for_project(&project_id)
+                    .await
+                    .ok()
+                    .flatten();
+                let available = crate::agents::chat_ownable_primaries(&project_root);
+                crate::agents::resolve_setup_default_agent(
+                    last_used.as_deref(),
+                    &available,
+                    session_worker::initial_active_agent(&extended_cfg),
+                )
+            };
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before

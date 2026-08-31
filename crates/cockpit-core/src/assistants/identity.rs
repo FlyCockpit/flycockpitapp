@@ -30,13 +30,18 @@ to inject nothing.
 -->
 ";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SoulEditMode {
-    #[default]
     HumanOnly,
     ApproveProposals,
     Autonomous,
+}
+
+impl Default for SoulEditMode {
+    fn default() -> Self {
+        Self::Autonomous
+    }
 }
 
 pub fn default_identity_max_tokens() -> usize {
@@ -458,7 +463,17 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::tool::Tool;
+
     use crate::test_env::TestEnvGuard;
+
+    #[test]
+    fn new_assistants_default_to_autonomous_soul_edits() {
+        assert_eq!(SoulEditMode::default(), SoulEditMode::Autonomous);
+        assert_eq!(
+            crate::assistants::AssistantConfig::default().soul_edit_mode,
+            SoulEditMode::Autonomous
+        );
+    }
 
     /// Build a tool context for the `helper` assistant inside an isolated
     /// cockpit home. `validate_row_home` requires the canonical

@@ -24990,6 +24990,7 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         let Response::Attached {
             session_id,
             session_entry_mode,
+            active_agent,
             ..
         } = dispatch_matrix_request(&ctx, attach(None, mode))
             .await
@@ -24998,6 +24999,9 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
             panic!("expected Attached");
         };
         assert_eq!(session_entry_mode, mode.into());
+        if mode == proto::NonCodeSessionEntryMode::Assistant {
+            assert_eq!(active_agent, "Assistant");
+        }
         assert!(
             ctx.db.get_session(session_id).await.unwrap().is_none(),
             "lazy session must not require a durable row before reattach"
@@ -29805,7 +29809,7 @@ async fn list_agents_returns_chat_ownable_primaries() {
             .iter()
             .map(|agent| agent.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Plan", "Build", "Careful"]
+        vec!["Assistant", "Plan", "Build", "Careful"]
     );
     for agent in &agents {
         assert!(agent.builtin);

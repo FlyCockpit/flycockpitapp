@@ -304,6 +304,11 @@ impl LiveScheduleContext {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(ctx: ScheduleContext) -> Self {
+        Self::new(ctx)
+    }
+
     pub fn snapshot(&self) -> ScheduleContext {
         self.state
             .read()
@@ -334,6 +339,11 @@ impl LiveScheduleContext {
             state.migration_generation = state.migration_generation.wrapping_add(1);
         }
         state.ctx = ctx;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_tests(&self, ctx: ScheduleContext) {
+        self.replace(ctx);
     }
 
     fn update(&self, update: impl FnOnce(&mut ScheduleContext)) {
@@ -850,6 +860,8 @@ impl ScheduleAuthority {
             event_tx: self.event_tx.clone(),
             idle_activity_rx: args.idle.then(|| self.idle_activity_tx.subscribe()),
             active_idle_wake: active_idle_wake.clone(),
+            #[cfg(test)]
+            iteration_completed_tx: None,
         };
         let handle = tokio::spawn(loop_runner::run_forked_loop(run_ctx));
         let entry = ScheduleEntry {

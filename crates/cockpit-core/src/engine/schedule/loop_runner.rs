@@ -57,6 +57,10 @@ pub struct LoopRunCtx {
     /// The authority owns this handoff while a wake runs. It can promote an
     /// already-recorded action if external cancellation aborts the runner.
     pub active_idle_wake: Option<ActiveIdleWake>,
+    /// Test-only notification emitted after an iteration's non-independent
+    /// transcript has been retained for the next wake.
+    #[cfg(test)]
+    pub(crate) iteration_completed_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 /// Max turns one fork iteration may take before we cut it off (bounds a
@@ -78,6 +82,8 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         event_tx,
         mut idle_activity_rx,
         active_idle_wake,
+        #[cfg(test)]
+        iteration_completed_tx,
     } = run;
 
     // Ordinary forked loops retain their state until terminal promotion. Idle
@@ -269,6 +275,10 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         }
 
         cap_fork_history(&mut fork_history);
+        #[cfg(test)]
+        if let Some(iteration_completed_tx) = &iteration_completed_tx {
+            let _ = iteration_completed_tx.send(());
+        }
         iteration += 1;
 
         if args.idle {
@@ -795,6 +805,10 @@ mod idle_dispatch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
+    use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+    use std::collections::BTreeMap;
 
     fn test_model() -> Arc<crate::engine::model::Model> {
         let mut providers = std::collections::BTreeMap::new();
@@ -857,6 +871,103 @@ mod tests {
             assistant_identity_prefix: None,
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         })
+    }
+
+    fn message_content_text(message: &serde_json::Value) -> String {
+        match &message["content"] {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+            other => panic!("unexpected message content shape: {other:?}"),
+        }
+    }
+
+    fn loop_test_context(
+        provider_url: String,
+    ) -> (
+        LiveScheduleContext,
+        Arc<crate::session::Session>,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                root.clone(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db));
+        let redact = Arc::new(crate::redact::RedactionTable::empty());
+
+        let providers = ProvidersConfig {
+            providers: BTreeMap::from([(
+                "scripted".to_string(),
+                ProviderEntry {
+                    url: provider_url,
+                    headers: vec![],
+                    wire_api: WireApi::Completions,
+                    ..ProviderEntry::default()
+                },
+            )]),
+            active_model: Some(ActiveModelRef {
+                provider: "scripted".into(),
+                model: "local".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        let model =
+            Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+        let config = SessionConfigHandle::detached(SessionConfigSnapshot::new(
+            0,
+            providers,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
+            session: session.clone(),
+            locks,
+            redact,
+            cwd: root,
+            config,
+            guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+            agent: Arc::new(Agent {
+                name: "builder".into(),
+                system: String::new(),
+                role_prompt: String::new(),
+                tools: crate::engine::tool::ToolBox::new(),
+                model,
+                params: crate::engine::model::ModelParams::default(),
+                scan_tool_results: true,
+                tool_steering: crate::agents::ToolSteering::Terse,
+                posture: crate::agents::PostureResolution::standard(),
+                context_policy: None,
+                lock_identity: "builder".to_string(),
+                write_scope: None,
+                workspace_lease: None,
+                delegated: false,
+                delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+                vnext_grant: None,
+                env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                definition: None,
+                assistant_identity_prefix: None,
+                mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
+            }),
+            write_scope: None,
+        };
+        (LiveScheduleContext::new_for_tests(ctx), session, tmp)
     }
 
     #[test]
@@ -978,5 +1089,106 @@ mod tests {
         cap_fork_history(&mut history);
         assert!(fork_history_bytes(&history) <= FORK_HISTORY_BYTE_CAP);
         assert!(history.len() < 80);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successor_wake_keeps_non_independent_transcript_history() {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("first successor-history reply".into()))
+            .turn(Turn::Text("second successor-history reply".into()))
+            .start()
+            .await;
+        let (ctx, predecessor, tmp) = loop_test_context(provider.base_url());
+        let (turn_tx, _turn_rx) = mpsc::channel(32);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (iteration_completed_tx, mut iteration_completed_rx) = mpsc::unbounded_channel();
+
+        let run = tokio::spawn(run_forked_loop(LoopRunCtx {
+            job_id: "job-successor-history".into(),
+            label: "successor history".into(),
+            args: LoopStartArgs {
+                interval_secs: 5,
+                prompt: "check successor history".into(),
+                limit: Some(2),
+                backoff: false,
+                watch_paths: Vec::new(),
+                idle: false,
+                keep_in_context: false,
+                independent: false,
+            },
+            ctx: ctx.clone(),
+            turn_tx,
+            event_tx,
+            idle_activity_rx: None,
+            active_idle_wake: None,
+            iteration_completed_tx: Some(iteration_completed_tx),
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        iteration_completed_rx
+            .recv()
+            .await
+            .expect("first wake must retain its transcript before migration");
+        assert_eq!(
+            provider.captured().len(),
+            1,
+            "first wake must run before migration"
+        );
+
+        let successor = Arc::new(
+            crate::session::Session::create_for_test(
+                predecessor.db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        successor.install_test_external_journal();
+        let mut successor_ctx = ctx.snapshot();
+        successor_ctx.session = successor;
+        ctx.replace_for_tests(successor_ctx);
+
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let completed = event_rx.recv().await.expect("terminal completion");
+        run.await.unwrap();
+
+        let ScheduleEvent::Completed { result, .. } = completed else {
+            panic!("expected terminal completion event");
+        };
+        assert!(
+            result.contains("second successor-history reply"),
+            "terminal result must come from the successor wake: {result}"
+        );
+
+        let posts: Vec<_> = provider
+            .captured()
+            .into_iter()
+            .filter(|request| request.request_line.starts_with("POST "))
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "two loop iterations should produce two model requests"
+        );
+
+        let second_messages = posts[1].body["messages"]
+            .as_array()
+            .expect("chat completions messages");
+        let second_text = second_messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            second_text.contains("first successor-history reply"),
+            "the successor wake must inherit the prior fork transcript: {second_text}"
+        );
+        assert!(
+            second_text.contains("check successor history"),
+            "the successor wake must retain the earlier user prompt too: {second_text}"
+        );
     }
 }

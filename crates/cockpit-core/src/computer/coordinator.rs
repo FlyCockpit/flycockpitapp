@@ -3010,10 +3010,10 @@ impl ComputerActionCoordinator {
                 // cleanup with a stale token: doing so would itself violate
                 // physical-input serialization. Every physical coordinator
                 // neutralizes input while holding its newly acquired lease.
+                drop(arbiter);
                 self.invalidated = true;
                 self.host_effect_cancel.cancel();
                 self.revoke_ask_lease_for_delegation();
-                drop(arbiter);
                 self.abandon_host_lease_without_input();
                 return false;
             }
@@ -5677,7 +5677,7 @@ mod tests {
         let mut arbiter_a =
             HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
         let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(2));
-        let monitor_a = physical_key();
+        let mut monitor_a = physical_key();
         let mut monitor_b = monitor_a;
         monitor_b.physical_display_id = [99; 32];
         let server = |screen, root_window_id| X11SessionParts {

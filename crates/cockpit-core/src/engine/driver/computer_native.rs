@@ -193,21 +193,18 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let session = Arc::clone(session);
+    let mut opener = NativeComputerDelegationOpener {
+        session: Arc::clone(session),
+        approver,
+        delegation_id,
+    };
     reconcile_native_computer_for_delegation_with_opener(
         agent,
         coordinator,
         contract,
         coordinator_config,
         pending_continuations,
-        &mut move |agent| {
-            let session = Arc::clone(&session);
-            let approver = approver.clone();
-            let delegation_id = delegation_id.clone();
-            Box::pin(async move {
-                open_native_computer_for_delegation(agent, &session, approver, delegation_id).await
-            })
-        },
+        &mut opener,
     )
     .await
 }
@@ -219,16 +216,40 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
 /// clears, and reopens the coordinator without depending on host desktop
 /// tooling. Production always supplies [`open_native_computer_for_delegation`]
 /// through [`reconcile_native_computer_for_delegation`].
+trait NativeComputerCoordinatorOpener {
+    fn open<'a>(
+        &'a mut self,
+        agent: &'a mut Agent,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>>;
+}
+
+struct NativeComputerDelegationOpener {
+    session: Arc<Session>,
+    approver: Option<Arc<crate::approval::Approver>>,
+    delegation_id: String,
+}
+
+impl NativeComputerCoordinatorOpener for NativeComputerDelegationOpener {
+    fn open<'a>(
+        &'a mut self,
+        agent: &'a mut Agent,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+        Box::pin(open_native_computer_for_delegation(
+            agent,
+            &self.session,
+            self.approver.clone(),
+            self.delegation_id.clone(),
+        ))
+    }
+}
+
 async fn reconcile_native_computer_for_delegation_with_opener(
     agent: &mut Agent,
     coordinator: &mut Option<ComputerActionCoordinator>,
     contract: &mut Option<ComputerToolContract>,
     coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
-    opener: &mut impl for<'a> FnMut(
-        &'a mut Agent,
-    )
-        -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>>,
+    opener: &mut impl NativeComputerCoordinatorOpener,
 ) -> anyhow::Result<()> {
     let current_config = agent
         .params
@@ -292,7 +313,7 @@ async fn reconcile_native_computer_for_delegation_with_opener(
         return Ok(());
     }
 
-    let opened = opener(agent).await?;
+    let opened = opener.open(agent).await?;
     if let Some(opened) = opened {
         let opened_config = agent
             .params
@@ -743,6 +764,26 @@ mod tests {
         }
     }
 
+    struct CountingCoordinatorOpener {
+        opens: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl NativeComputerCoordinatorOpener for CountingCoordinatorOpener {
+        fn open<'a>(
+            &'a mut self,
+            agent: &'a mut Agent,
+        ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+            let opens = Arc::clone(&self.opens);
+            let releases = Arc::clone(&self.releases);
+            Box::pin(async move {
+                let _ = agent;
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(make_release_counting_coordinator(releases).await))
+            })
+        }
+    }
+
     async fn make_coordinator() -> ComputerActionCoordinator {
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
@@ -1065,19 +1106,9 @@ mod tests {
                 "call_id": "stale-call"
             })];
             let opens = Arc::new(AtomicUsize::new(0));
-            let mut opener = {
-                let opens = Arc::clone(&opens);
-                let reopened_releases = Arc::clone(&reopened_releases);
-                move |_agent: &mut Agent| -> BoxFuture<'static, anyhow::Result<Option<ComputerActionCoordinator>>> {
-                    let opens = Arc::clone(&opens);
-                    let reopened_releases = Arc::clone(&reopened_releases);
-                    Box::pin(async move {
-                        opens.fetch_add(1, Ordering::SeqCst);
-                        Ok(Some(
-                            make_release_counting_coordinator(reopened_releases).await,
-                        ))
-                    })
-                }
+            let mut opener = CountingCoordinatorOpener {
+                opens: Arc::clone(&opens),
+                releases: Arc::clone(&reopened_releases),
             };
 
             reconcile_native_computer_for_delegation_with_opener(

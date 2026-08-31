@@ -209,7 +209,7 @@ pub fn build_mirror_groups(
             continue;
         }
         used[i] = true;
-        let (_, _, geom_i, _, _, id_i) = usable[i];
+        let (_, mode_i, geom_i, rot_i, _, id_i) = usable[i];
         let mut ids = vec![id_i];
         let mut members = vec![i];
         let mut changed = true;
@@ -445,7 +445,9 @@ impl X11TargetEvidenceAdapter {
         use x11rb::protocol::randr::{Connection as RandrConnection, ConnectionExt as _};
         use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
 
-        let unavailable = |_| TargetUnavailableReason::MissingCapability;
+        fn unavailable<T>(_: T) -> TargetUnavailableReason {
+            TargetUnavailableReason::MissingCapability
+        }
         let (connection, screen_index) =
             x11rb::connect(Some(&self.display)).map_err(unavailable)?;
         let setup = connection.setup();
@@ -919,7 +921,7 @@ mod production_adapter_tests {
 
     #[test]
     fn local_display_aliases_share_one_session_identity() {
-        let parts = |transport| X11SessionParts {
+        let parts = |transport: &str| X11SessionParts {
             transport: transport.to_string(),
             display_number: 0,
             screen: 0,
@@ -956,7 +958,7 @@ mod production_adapter_tests {
 
     #[test]
     fn randr_clone_output_ids_reach_mirror_group_logic() {
-        let output = |name| RandrOutputSnapshot {
+        let output = |name: &str| RandrOutputSnapshot {
             screen_index: 0,
             connector_name: name.to_string(),
             edid: None,

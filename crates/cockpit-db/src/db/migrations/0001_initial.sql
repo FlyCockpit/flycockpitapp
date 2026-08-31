@@ -171,17 +171,6 @@ CREATE TABLE sessions (
     description_provider_id TEXT,
     description_model_id    TEXT,
     description_model_trust TEXT,
-    CHECK (
-        (description IS NULL
-         AND description_provider_id IS NULL
-         AND description_model_id IS NULL
-         AND description_model_trust IS NULL)
-        OR
-        (description IS NOT NULL
-         AND description_provider_id IS NOT NULL
-         AND description_model_id IS NOT NULL
-         AND description_model_trust IN ('trusted', 'untrusted'))
-    ),
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
         short_id IS NULL OR (
@@ -293,6 +282,17 @@ CREATE TABLE sessions (
     -- execution containment is ProvenEmpty, then the session row may drop.
     lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'deleting')),
 
+    CHECK (
+        (description IS NULL
+         AND description_provider_id IS NULL
+         AND description_model_id IS NULL
+         AND description_model_trust IS NULL)
+        OR
+        (description IS NOT NULL
+         AND description_provider_id IS NOT NULL
+         AND description_model_id IS NOT NULL
+         AND description_model_trust IN ('trusted', 'untrusted'))
+    ),
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
     CHECK (fork_point_turn_id IS NULL OR (
         parent_session_id IS NOT NULL

@@ -1,7 +1,7 @@
 {
   "requests": {
     "create_code_root_with_acp_ingress_v1": {
-      "v": 22,
+      "v": 21,
       "kind": "req",
       "id": "11111111-1111-4111-8111-111111111111",
       "request": "create_code_root_with_acp_ingress_v1",
@@ -36,7 +36,7 @@
       }
     },
     "attach_existing_code_root_with_acp_ingress_v1": {
-      "v": 22,
+      "v": 21,
       "kind": "req",
       "id": "11111111-1111-4111-8111-111111111111",
       "request": "attach_existing_code_root_with_acp_ingress_v1",
@@ -71,7 +71,7 @@
       }
     },
     "close_acp_code_root_attachment_v1": {
-      "v": 22,
+      "v": 21,
       "kind": "req",
       "id": "11111111-1111-4111-8111-111111111111",
       "request": "close_acp_code_root_attachment_v1",
@@ -83,7 +83,7 @@
   },
   "responses": {
     "code_root_with_acp_ingress_created": {
-      "v": 22,
+      "v": 21,
       "kind": "res",
       "id": "11111111-1111-4111-8111-111111111111",
       "response": "code_root_with_acp_ingress_created",
@@ -112,7 +112,7 @@
       }
     },
     "code_root_with_acp_ingress_attached": {
-      "v": 22,
+      "v": 21,
       "kind": "res",
       "id": "11111111-1111-4111-8111-111111111111",
       "response": "code_root_with_acp_ingress_attached",
@@ -141,7 +141,7 @@
       }
     },
     "acp_code_root_attachment_closed": {
-      "v": 22,
+      "v": 21,
       "kind": "res",
       "id": "11111111-1111-4111-8111-111111111111",
       "response": "acp_code_root_attachment_closed",

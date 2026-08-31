@@ -1007,8 +1007,8 @@ const requestParamSchemas = {
         env_policy: envDriftPolicySchema.optional(),
       })
       .strict(),
-    // A resume is keyed by durable session identity. The daemon reloads the
-    // mode; a caller may only provide an exact value for explicit checking.
+    // A resume is keyed by durable session identity. The daemon reloads and
+    // verifies this immutable mode assertion before attaching.
     z
       .object({
         session_id: uuidSchema,
@@ -1016,7 +1016,7 @@ const requestParamSchemas = {
         project_root: z.string().optional(),
         no_sandbox: z.boolean().optional(),
         interactive: z.boolean().optional(),
-        session_entry_mode: sessionEntryModeSchema.optional(),
+        session_entry_mode: sessionEntryModeSchema,
         initial_model: activeModelRefSchema.optional(),
         model_override: activeModelRefSchema.optional(),
         client_protocol_version: z.number().int().nonnegative().optional(),

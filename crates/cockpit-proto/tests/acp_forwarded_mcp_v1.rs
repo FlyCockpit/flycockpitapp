@@ -23,7 +23,12 @@ fn with_extra_at(value: &Value, path: &[&str]) -> Value {
     let mut changed = value.clone();
     let mut current = &mut changed;
     for segment in path {
-        current = current.get_mut(*segment).expect("fixture path exists");
+        current = if let Some(index) = current.as_array().and_then(|_| segment.parse().ok()) {
+            current.get_mut(index)
+        } else {
+            current.get_mut(*segment)
+        }
+        .expect("fixture path exists");
     }
     current
         .as_object_mut()
@@ -130,7 +135,6 @@ fn every_request_and_response_depth_rejects_unknown_fields() {
         (
             "create_max",
             vec![
-                vec![],
                 vec!["params"],
                 vec!["params", "base"],
                 vec!["params", "base", "workspace_selector"],
@@ -143,7 +147,6 @@ fn every_request_and_response_depth_rejects_unknown_fields() {
         (
             "attach_max",
             vec![
-                vec![],
                 vec!["params"],
                 vec!["params", "base"],
                 vec!["params", "base", "options"],
@@ -152,7 +155,7 @@ fn every_request_and_response_depth_rejects_unknown_fields() {
                 vec!["params", "ingress", "declarations", "0", "transport"],
             ],
         ),
-        ("close_max", vec![vec![], vec!["params"]]),
+        ("close_max", vec![vec!["params"]]),
     ] {
         let request = &fixture["requests"][name];
         for path in paths {
@@ -165,7 +168,7 @@ fn every_request_and_response_depth_rejects_unknown_fields() {
 
     for name in ["create", "attach", "close_closed", "close_already_closed"] {
         let response = &minimal["responses"][name];
-        let mut paths = vec![vec![], vec!["data"]];
+        let mut paths = vec![vec!["data"]];
         if matches!(name, "create" | "attach") {
             paths.extend([
                 vec!["data", "base"],

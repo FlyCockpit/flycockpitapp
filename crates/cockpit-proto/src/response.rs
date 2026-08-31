@@ -89,12 +89,7 @@ pub struct ResumeCompactionOffer {
 /// one [`Request`] kind. The envelope id pairs the two sides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
-#[serde(
-    tag = "response",
-    rename_all = "snake_case",
-    content = "data",
-    deny_unknown_fields
-)]
+#[serde(tag = "response", rename_all = "snake_case", content = "data")]
 pub enum Response {
     /// Generic "yes, accepted." Used by fire-and-forget requests
     /// whose effects flow back as events (`SendUserMessage`,

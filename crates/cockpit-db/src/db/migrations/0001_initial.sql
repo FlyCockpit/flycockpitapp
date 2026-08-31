@@ -1205,6 +1205,8 @@ CREATE TABLE knowledge_dreamed_sessions (
 );
 CREATE INDEX idx_knowledge_dreamed_sessions_last
     ON knowledge_dreamed_sessions(kb_id, project_root, consumer_id, dreamed_at_unix_ms DESC);
+CREATE INDEX idx_knowledge_dreamed_sessions_session
+    ON knowledge_dreamed_sessions(session_id);
 
 -- Monotonic identity for successful dream completions. Wall-clock time is
 -- presentation only: completion_revision advances even when the clock repeats
@@ -4453,14 +4455,20 @@ BEGIN
            AND a.kind = 'user_input_source' AND a.capture_reason = 'oversized_user_input'
            AND a.content_bytes > 1024
            AND e.type = 'user_message'
-           AND json_type(a.provenance_json, '$.event_seq') = 'integer'
-           AND json_extract(a.provenance_json, '$.source') = 'user_paste'
-           AND json_type(a.provenance_json, '$.blob_path') = 'text'
-           AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
-           AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq
            AND json_type(e.data_json, '$.text') = 'text'
            AND json_extract(e.data_json, '$.text') = a.content
+           AND (
+               (a.content_representation = 'raw'
+                AND json_type(a.provenance_json, '$.event_seq') = 'integer'
+                AND json_extract(a.provenance_json, '$.source') = 'user_paste'
+                AND json_type(a.provenance_json, '$.blob_path') = 'text'
+                AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+                AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
+                AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq)
+               OR
+               (a.content_representation = 'export_redacted'
+                AND a.archive_import_id IS NOT NULL)
+           )
     ) THEN RAISE(ABORT, 'source user artifact binding is invalid') END;
     SELECT CASE WHEN NEW.relation = 'model_user_input_projection' AND NOT EXISTS (
         SELECT 1 FROM session_text_artifacts a JOIN session_events e
@@ -5001,6 +5009,8 @@ CREATE TABLE text_artifact_blob_cleanup_intents (
 
 CREATE INDEX idx_text_artifact_blob_cleanup_created
     ON text_artifact_blob_cleanup_intents(created_at_unix_ms, blob_path);
+CREATE INDEX idx_text_artifact_blob_cleanup_session
+    ON text_artifact_blob_cleanup_intents(session_id);
 
 -- A sidecar is published before its referencing payload transaction starts.
 -- This intent is committed first, so boot recovery can remove a file left by
@@ -6794,6 +6804,7 @@ CREATE TABLE secret_vault_items (
         'subscription_ack',
         'sealed_compartment',
         'session_sealed_value',
+        'knowledge_base_sealed_value',
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,

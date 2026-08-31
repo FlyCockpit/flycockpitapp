@@ -4076,7 +4076,7 @@ mod tests {
         };
         assert_eq!(
             materialized.source_artifact.content,
-            "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES)
+            format!("{}\n", "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES))
         );
         let event = db
             .list_session_events(session.session_id)

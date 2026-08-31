@@ -7,8 +7,7 @@
 use crate::computer::host_identity::domain_hash;
 #[cfg(target_os = "linux")]
 use crate::computer::host_identity::{
-    HostInstallationId, RealHostIdentityFs, SysHostIdentityRng,
-    load_or_create_host_installation_id,
+    HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
 };
 #[cfg(target_os = "linux")]
 use crate::computer::target::{
@@ -390,9 +389,7 @@ impl X11TargetEvidenceAdapter {
         })
     }
 
-    fn capture_x11_snapshot(
-        &self,
-    ) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+    fn capture_x11_snapshot(&self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::randr::{Connection as RandrConnection, ConnectionExt as _};
         use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
@@ -422,14 +419,7 @@ impl X11TargetEvidenceAdapter {
             .map_err(unavailable)?
             .atom;
         let active_window_reply = connection
-            .get_property(
-                false,
-                root,
-                active_window_atom,
-                AtomEnum::WINDOW,
-                0,
-                1,
-            )
+            .get_property(false, root, active_window_atom, AtomEnum::WINDOW, 0, 1)
             .map_err(unavailable)?
             .reply()
             .map_err(unavailable)?;
@@ -491,22 +481,14 @@ impl X11TargetEvidenceAdapter {
                 None
             };
             let edid_reply = connection
-                .randr_get_output_property(
-                    *output,
-                    edid_atom,
-                    AtomEnum::ANY,
-                    0,
-                    256,
-                    false,
-                    false,
-                )
+                .randr_get_output_property(*output, edid_atom, AtomEnum::ANY, 0, 256, false, false)
                 .map_err(unavailable)?
                 .reply()
                 .map_err(unavailable)?;
             let edid = (edid_reply.format == 8
                 && edid_reply.bytes_after == 0
                 && !edid_reply.data.is_empty())
-                .then_some(edid_reply.data);
+            .then_some(edid_reply.data);
             outputs.push(RandrOutputSnapshot {
                 screen_index: screen_index as u32,
                 connector_name: String::from_utf8_lossy(&info.name).into_owned(),
@@ -570,14 +552,7 @@ impl X11TargetEvidenceAdapter {
             return Err(TargetUnavailableReason::StaleTarget);
         }
         let active_window_after = connection
-            .get_property(
-                false,
-                root,
-                active_window_atom,
-                AtomEnum::WINDOW,
-                0,
-                1,
-            )
+            .get_property(false, root, active_window_atom, AtomEnum::WINDOW, 0, 1)
             .map_err(unavailable)?
             .reply()
             .map_err(unavailable)?

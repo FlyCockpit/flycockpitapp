@@ -23,7 +23,10 @@ fn with_extra_at(value: &Value, path: &[&str]) -> Value {
     let mut changed = value.clone();
     let mut current = &mut changed;
     for segment in path {
-        current = if let Some(index) = current.as_array().and_then(|_| segment.parse().ok()) {
+        current = if let Some(index) = current
+            .as_array()
+            .and_then(|_| segment.parse::<usize>().ok())
+        {
             current.get_mut(index)
         } else {
             current.get_mut(*segment)

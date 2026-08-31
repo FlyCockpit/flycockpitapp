@@ -287,6 +287,30 @@ pub(crate) fn knowledge_content_has_injection(body: &str) -> bool {
     !knowledge_injection_findings(body).is_empty()
 }
 
+/// Apply the deterministic KB boundary to a model-facing tool result.  The
+/// caller supplies the complete KB-derived source, rather than only the
+/// displayed prefix, so a finding past a tool's display cap cannot survive in
+/// its retained artifact or be mistaken for a clean result.
+pub(crate) fn fence_knowledge_tool_output_if_needed(output: &mut ToolOutput, source: &str) {
+    if !knowledge_content_has_injection(source) {
+        return;
+    }
+    let original = output.content.model_text();
+    let fenced = fence_knowledge_content_if_needed(original);
+    output.content = crate::engine::tool::CanonicalToolResultContents::text(
+        if fenced != original {
+            fenced
+        } else {
+            format!(
+                "{original}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible result limit; the retained artifact was withheld.]"
+            )
+        },
+    );
+    // A text artifact stores the raw producer body and would otherwise be a
+    // second, unfenced retrieval path around this content boundary.
+    output.text_artifact_capture = None;
+}
+
 fn fence_knowledge_content(body: &str, findings: &[&str]) -> String {
     let fenced = crate::engine::injection_check::wrap_with_fresh_nonce(body);
     format!(
@@ -5736,7 +5760,7 @@ fn dream_write_cancellation(ctx: &ToolCtx) -> DreamWriteCancellation {
     }
 }
 
-fn validate_knowledge_dream_writes(
+pub(super) fn validate_knowledge_dream_writes(
     mut writes: Vec<KnowledgeDreamWrite>,
 ) -> Result<Vec<KnowledgeDreamWrite>> {
     if writes.is_empty() {

@@ -115,8 +115,8 @@ impl Tool for GrepTool {
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
         .await?;
-        let attached_knowledge_read =
-            crate::knowledge::check_native_local_knowledge_path_access(ctx, &search_root).await?;
+        let attached_knowledge_roots =
+            crate::knowledge::attached_local_knowledge_roots(ctx).await?;
         let canonical_root = sandbox::canonical_root(&search_root)?;
 
         if let Some(refusal) = sandbox::check_gitignore_read(ctx, &search_root).await? {
@@ -159,7 +159,7 @@ impl Tool for GrepTool {
                         .iter()
                         .any(|root| cockpit_host::path_containment::contained_under(root, path))
             })
-            .map(|outcome| render_search_outcome(outcome, &query, attached_knowledge_read))
+            .map(|outcome| render_search_outcome(outcome, &query, &attached_knowledge_roots))
         })
         .await
         .map_err(|e| anyhow::anyhow!("grep worker joined: {e}"))??;
@@ -171,7 +171,7 @@ impl Tool for GrepTool {
 fn render_search_outcome(
     outcome: SearchOutcome,
     query: &str,
-    attached_knowledge_read: bool,
+    attached_knowledge_roots: &[std::path::PathBuf],
 ) -> ToolOutput {
     if outcome.records.is_empty() {
         return ToolOutput::text("No matches.".to_string());
@@ -210,22 +210,18 @@ fn render_search_outcome(
     } else {
         ToolOutput::text(body)
     };
-    if attached_knowledge_read {
-        let original = output.content.model_text();
-        let fenced = crate::knowledge::fence_knowledge_content_if_needed(original);
-        let retained_injection = crate::knowledge::knowledge_content_has_injection(&raw);
-        if fenced != original || retained_injection {
-            let delivered = if fenced != original {
-                fenced
-            } else {
-                format!(
-                    "{original}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible search limit; the retained artifact was withheld.]"
-                )
-            };
-            output.content = crate::engine::tool::CanonicalToolResultContents::text(delivered);
-            output.text_artifact_capture = None;
-        }
-    }
+    let knowledge_source = outcome
+        .records
+        .iter()
+        .filter(|record| {
+            attached_knowledge_roots.iter().any(|root| {
+                cockpit_host::path_containment::contained_under(root, &record.source_path)
+            })
+        })
+        .map(|record| record.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::knowledge::fence_knowledge_tool_output_if_needed(&mut output, &knowledge_source);
     output
 }
 

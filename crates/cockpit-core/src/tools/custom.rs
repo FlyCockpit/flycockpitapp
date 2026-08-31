@@ -198,6 +198,7 @@ impl Tool for CustomBashTool {
                 access: crate::tools::shell_sandbox::SandboxPathAccess::Read,
             })
             .collect::<Vec<_>>();
+        let attached_knowledge_read = !attached_knowledge_paths.is_empty();
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
         let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
             &ctx.session,
@@ -407,7 +408,7 @@ impl Tool for CustomBashTool {
             // boundary-straddling PARTIAL survives into the §7 whole-value scrub;
             // the retained (retrievable) body is elided at its own prefix-cut
             // boundary for the same reason.
-            return Ok(ToolOutput::truncated_text(truncate_head_tail_redacted(
+            let mut out = ToolOutput::truncated_text(truncate_head_tail_redacted(
                 &ctx.redact,
                 &combined,
                 OUTPUT_BYTE_CAP,
@@ -417,15 +418,19 @@ impl Tool for CustomBashTool {
                 &selected,
                 status.code(),
                 changed_after_build,
-            )));
+            ));
+            if attached_knowledge_read {
+                crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &combined);
+            }
+            return Ok(out);
         }
-        Ok(
-            ToolOutput::text(combined).with_output_sidecar(self.provenance_sidecar(
-                &selected,
-                status.code(),
-                changed_after_build,
-            )),
-        )
+        let mut out = ToolOutput::text(combined.clone()).with_output_sidecar(
+            self.provenance_sidecar(&selected, status.code(), changed_after_build),
+        );
+        if attached_knowledge_read {
+            crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &combined);
+        }
+        Ok(out)
     }
 }
 

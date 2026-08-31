@@ -155,16 +155,34 @@ impl Tool for SearchTool {
             .session
             .secret_path_matcher(&ctx.config.extended().redact)
             .clone();
+        let attached_knowledge_roots =
+            crate::knowledge::attached_local_knowledge_roots(ctx).await?;
+        let denied_knowledge_roots =
+            crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
         let outcome = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
                 (path == guard_root || path.starts_with(&guard_root))
                     && requested_file.as_ref().is_none_or(|file| path == file)
                     && !secret_paths.is_secret_path(path)
+                    && !denied_knowledge_roots
+                        .iter()
+                        .any(|root| cockpit_host::path_containment::contained_under(root, path))
             })
         })
         .await
         .map_err(|e| anyhow::anyhow!("search worker joined: {e}"))??;
         let hit_match_cap = outcome.hit_match_cap;
+        let knowledge_source = outcome
+            .records
+            .iter()
+            .filter(|record| {
+                attached_knowledge_roots.iter().any(|root| {
+                    cockpit_host::path_containment::contained_under(root, &record.source_path)
+                })
+            })
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let body = format_search_records(&outcome);
         // Hint, attached as a clearly separated note (never interleaved with
         // match data), nudging callers toward a directory scope or
@@ -242,6 +260,7 @@ impl Tool for SearchTool {
         if single_file {
             out.content.push_str(SINGLE_FILE_NOTE);
         }
+        crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &knowledge_source);
         Ok(out)
     }
 }

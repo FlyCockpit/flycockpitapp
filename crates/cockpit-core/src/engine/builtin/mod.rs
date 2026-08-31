@@ -2705,7 +2705,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // `mcp` grant above now controls only external server access; it no
     // longer controls whether native cockpit tools are scriptable.
     if !tb.names().contains(&"mcp") {
-        tb = tb.with(Arc::new(tools::mcp_tool::McpTool));
+        tb = tb.with(Arc::new(crate::tools::mcp_tool::McpTool));
     }
     // vNext deliberately has no `tools:` authority field.  Delegation is the
     // sole declarative request that can cause the host to expose the

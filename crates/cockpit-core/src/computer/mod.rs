@@ -230,6 +230,12 @@ pub enum ComputerError {
     CommandFailed { program: String, detail: String },
 }
 
+/// Provider-controlled action durations are intentionally bounded so a
+/// physical-host lease and any pressed key cannot be held indefinitely.
+pub const MAX_COMPUTER_ACTION_DURATION: Duration = Duration::from_secs(60);
+/// One scroll action maps to one external `xdotool` process per click.
+pub const MAX_SCROLL_CLICK_REPETITIONS: u32 = 1_000;
+
 impl std::fmt::Display for ComputerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -264,7 +270,14 @@ pub trait ComputerBackend: Send + Sync {
         &mut self,
         action: &ComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError>;
-    async fn release_all(&mut self) -> Result<(), ComputerError>;
+    /// Synchronously neutralize every backend-owned input state.
+    ///
+    /// This is deliberately non-async: the coordinator invokes it only after
+    /// re-proving its physical host lease, before it relinquishes that lease on
+    /// every terminal path (including `Drop`). Implementations must attempt
+    /// every relevant key/button release and report a failure rather than
+    /// silently handing the lease to another owner with uncertain input state.
+    fn release_all(&mut self) -> Result<(), ComputerError>;
 
     async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
         let mut completed = Vec::new();
@@ -272,19 +285,12 @@ pub trait ComputerBackend: Send + Sync {
             match self.execute_one(action).await {
                 Ok(outcome) => completed.push(outcome),
                 Err(error) => {
-                    let _ = self.release_all().await;
                     return ComputerBatchReport {
                         completed,
                         failure: Some(ComputerFailure { index, error }),
                     };
                 }
             }
-        }
-        if self.release_all().await.is_err() {
-            // Release failures are deliberately not turned into action
-            // failures after all actions completed; backends log these in
-            // their concrete implementation. The important invariant is that
-            // release is attempted on every terminal path.
         }
         ComputerBatchReport {
             completed,
@@ -381,7 +387,7 @@ impl ComputerBackend for FakeBackend {
         }
     }
 
-    async fn release_all(&mut self) -> Result<(), ComputerError> {
+    fn release_all(&mut self) -> Result<(), ComputerError> {
         self.release_count += 1;
         Ok(())
     }
@@ -419,13 +425,18 @@ impl RealDesktopGrantStore {
 
 pub struct VirtualDisplayBackend {
     display: String,
+    backend_kind: target::BackendKind,
     /// `Child` is `Send` but not `Sync`. The mutex exists so the backend (and
     /// therefore a coordinator on the driver stack) can be `Sync`; the process
     /// is still uniquely owned and only taken on drop.
     xvfb: Mutex<Option<Child>>,
     geometry: DisplayGeometry,
     tools: LinuxTools,
+    /// Keys whose `keydown` may still be active. Real-desktop instances mirror
+    /// this to a private journal so a replacement daemon can neutralize an
+    /// arbitrary key left behind by a failed `keyup`.
     held_keys: Vec<String>,
+    held_key_journal: HeldKeyJournal,
     /// Private, owner-only directory under the Cockpit data root that contains
     /// any transient capture temp files. Never `$TMPDIR`. See
     /// [`private_capture_root`].
@@ -436,6 +447,92 @@ pub struct VirtualDisplayBackend {
 struct LinuxTools {
     xdotool: PathBuf,
     capture: CaptureTool,
+}
+
+/// Crash-persistent ownership record for X11 keys that Cockpit has pressed.
+///
+/// This is deliberately keyed to the X server, rather than to a delegation:
+/// injected keyboard state belongs to that server and must be recovered by the
+/// next real-desktop coordinator after a daemon replacement. The host lease
+/// serializes every caller that can consume this record.
+#[derive(Debug, Default)]
+struct HeldKeyJournal {
+    path: Option<PathBuf>,
+}
+
+impl HeldKeyJournal {
+    #[cfg(target_os = "linux")]
+    fn for_real_x11(display: &str) -> Result<Self, ComputerError> {
+        let root = crate::config::resolve::cockpit_data_dir()
+            .map_err(input_journal_error)?
+            .join("computer-input-state");
+        cockpit_host::private_fs::ensure_private_dir(&root).map_err(input_journal_error)?;
+        let digest = held_key_journal_identity(display)?;
+        let name = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(Self {
+            path: Some(root.join(format!("{name}.json"))),
+        })
+    }
+
+    fn load(&self) -> Result<Vec<String>, ComputerError> {
+        let Some(path) = &self.path else {
+            return Ok(Vec::new());
+        };
+        let Some(bytes) = cockpit_host::private_fs::read_private_file(path, "computer held-key")
+            .map_err(input_journal_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        let keys = serde_json::from_slice::<Vec<String>>(&bytes).map_err(|_| {
+            ComputerError::CommandFailed {
+                program: "computer input-state journal".to_string(),
+                detail: "held-key journal is malformed".to_string(),
+            }
+        })?;
+        if keys.iter().any(|key| key.is_empty()) {
+            return Err(ComputerError::CommandFailed {
+                program: "computer input-state journal".to_string(),
+                detail: "held-key journal contains an empty key".to_string(),
+            });
+        }
+        Ok(keys)
+    }
+
+    fn store(&self, keys: &[String]) -> Result<(), ComputerError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if keys.is_empty() {
+            return cockpit_host::private_fs::delete_private_file(path)
+                .map_err(input_journal_error);
+        }
+        let bytes = serde_json::to_vec(keys).map_err(|error| ComputerError::CommandFailed {
+            program: "computer input-state journal".to_string(),
+            detail: error.to_string(),
+        })?;
+        cockpit_host::private_fs::write_private_file(path, &bytes).map_err(input_journal_error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn held_key_journal_identity(display: &str) -> Result<[u8; 32], ComputerError> {
+    let (transport, display_number) =
+        crate::computer::platform::x11::canonical_x11_server_identity(display)
+            .ok_or_else(|| input_journal_error("X11 display identity is malformed"))?;
+    Ok(crate::computer::host_identity::domain_hash(
+        b"cockpit.x11.held-keys.v2",
+        &[transport.as_bytes(), &display_number.to_le_bytes()],
+    ))
+}
+
+fn input_journal_error(error: impl std::fmt::Display) -> ComputerError {
+    ComputerError::CommandFailed {
+        program: "computer input-state journal".to_string(),
+        detail: error.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -464,12 +561,55 @@ impl VirtualDisplayBackend {
                 if !grant_store.is_some_and(RealDesktopGrantStore::has_current_machine_grant) {
                     return Err(ComputerError::RealDesktopGrantMissing);
                 }
-                // TODO(issue #180 per-OS backend dependencies): dispatch to
-                // the native macOS, Windows, X11, or Wayland action backend
-                // once the corresponding host backend is available.
-                Err(unsupported_platform())
+                Self::new_real_desktop()
             }
         }
+    }
+
+    /// Exact X11 display capability opened by a real-desktop backend. Driver
+    /// composition uses this value instead of re-reading a mutable environment.
+    #[cfg(target_os = "linux")]
+    pub fn real_x11_display(&self) -> Option<&str> {
+        (self.backend_kind == target::BackendKind::RealDesktopX11).then_some(&self.display)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn new_real_desktop() -> Result<Self, ComputerError> {
+        if std::env::var("XDG_SESSION_TYPE")
+            .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
+            || std::env::var("WAYLAND_DISPLAY").is_ok_and(|display| !display.trim().is_empty())
+        {
+            return Err(ComputerError::UnsupportedPlatform {
+                platform: "linux-wayland".to_string(),
+            });
+        }
+        let display = std::env::var("DISPLAY")
+            .ok()
+            .filter(|display| !display.trim().is_empty())
+            .ok_or_else(|| ComputerError::UnsupportedPlatform {
+                platform: "linux-without-x11".to_string(),
+            })?;
+        let xdotool = require_capability("xdotool", "the `xdotool` package")?;
+        let capture = require_capture_tool()?;
+        let capture_root = private_capture_root()?;
+        let held_key_journal = HeldKeyJournal::for_real_x11(&display)?;
+        let held_keys = held_key_journal.load()?;
+        let geometry = query_x11_display_geometry(&xdotool, &display)?;
+        Ok(Self {
+            display,
+            backend_kind: target::BackendKind::RealDesktopX11,
+            xvfb: Mutex::new(None),
+            geometry,
+            tools: LinuxTools { xdotool, capture },
+            held_keys,
+            held_key_journal,
+            capture_root,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new_real_desktop() -> Result<Self, ComputerError> {
+        Err(unsupported_platform())
     }
 
     #[cfg(target_os = "linux")]
@@ -514,10 +654,12 @@ impl VirtualDisplayBackend {
             })?;
         Ok(Self {
             display,
+            backend_kind: target::BackendKind::VirtualDisplay,
             xvfb: Mutex::new(Some(child)),
             geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
+            held_key_journal: HeldKeyJournal::default(),
             capture_root,
         })
     }
@@ -563,6 +705,95 @@ impl VirtualDisplayBackend {
             &self.capture_root,
         )
     }
+
+    /// Merge state written by a predecessor that exited after this backend was
+    /// constructed. This is called only during terminal neutralization, which
+    /// the coordinator performs while it holds the physical host lease.
+    fn reload_held_keys(&mut self) -> Result<(), ComputerError> {
+        for key in self.held_key_journal.load()? {
+            if !self.held_keys.contains(&key) {
+                self.held_keys.push(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist intent before emitting `keydown`: if the external process
+    /// reports an ambiguous failure or the daemon dies, recovery must prefer a
+    /// harmless extra `keyup` over forgetting a potentially pressed key.
+    fn remember_held_key(&mut self, key: String) -> Result<(), ComputerError> {
+        if self.held_keys.contains(&key) {
+            // Re-publish even for a repeated key: a prior recovery attempt may
+            // have loaded the key before its journal was removed, and keydown
+            // must never proceed without a durable recovery record.
+            return self.held_key_journal.store(&self.held_keys);
+        }
+        let mut keys = self.held_keys.clone();
+        keys.push(key);
+        self.held_key_journal.store(&keys)?;
+        self.held_keys = keys;
+        Ok(())
+    }
+
+    /// Forget a key only after its `keyup` completed and the durable record
+    /// has been updated. A journal-write failure intentionally leaves the key
+    /// tracked, making a later cleanup retry it under the same lease.
+    fn forget_held_key(&mut self, key: &str) -> Result<(), ComputerError> {
+        let keys = self
+            .held_keys
+            .iter()
+            .filter(|held| held.as_str() != key)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.held_key_journal.store(&keys)?;
+        self.held_keys = keys;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_x11_display_geometry(
+    xdotool: &std::path::Path,
+    display: &str,
+) -> Result<DisplayGeometry, ComputerError> {
+    let output = Command::new(xdotool)
+        .env("DISPLAY", display)
+        .arg("getdisplaygeometry")
+        .output()
+        .map_err(|error| ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let dimensions = String::from_utf8_lossy(&output.stdout);
+    let mut dimensions = dimensions.split_whitespace();
+    let width = dimensions.next().and_then(|value| value.parse().ok());
+    let height = dimensions.next().and_then(|value| value.parse().ok());
+    let (Some(width), Some(height), None) = (width, height, dimensions.next()) else {
+        return Err(ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: "getdisplaygeometry returned malformed dimensions".to_string(),
+        });
+    };
+    if width == 0 || height == 0 {
+        return Err(ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: "getdisplaygeometry returned an empty desktop".to_string(),
+        });
+    }
+    Ok(DisplayGeometry {
+        physical: PixelSize { width, height },
+        logical: LogicalSize {
+            width: f64::from(width),
+            height: f64::from(height),
+        },
+        scale_factor: ScaleFactor(1.0),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +1095,9 @@ fn capture_command(
             }
         }
         CaptureTool::Import(_) => {
+            // `import` is interactive without an explicit root target. Both
+            // virtual and real-desktop captures must be unattended.
+            cmd.arg("-window").arg("root");
             if let Some(region) = region {
                 cmd.arg("-crop").arg(format!(
                     "{}x{}+{}+{}",
@@ -935,9 +1169,13 @@ impl CaptureRunner for RealCaptureRunner {
 #[async_trait]
 impl ComputerBackend for VirtualDisplayBackend {
     fn backend_kind(&self) -> target::BackendKind {
-        target::BackendKind::VirtualDisplay
+        self.backend_kind
     }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+        #[cfg(target_os = "linux")]
+        if self.backend_kind == target::BackendKind::RealDesktopX11 {
+            self.geometry = query_x11_display_geometry(&self.tools.xdotool, &self.display)?;
+        }
         Ok(self.geometry.clone())
     }
 
@@ -945,32 +1183,52 @@ impl ComputerBackend for VirtualDisplayBackend {
         &mut self,
         action: &ComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
-        let result = execute_virtual_action(self, action);
-        if result.is_err() {
-            let _ = self.release_all().await;
-        }
-        result
+        execute_virtual_action(self, action)
     }
 
-    async fn release_all(&mut self) -> Result<(), ComputerError> {
+    fn release_all(&mut self) -> Result<(), ComputerError> {
         #[cfg(target_os = "linux")]
         {
-            let held_keys = std::mem::take(&mut self.held_keys);
+            // A replacement backend can have been constructed before a
+            // predecessor's final failed `keyup`. Reload under the host lease
+            // so that late durable state is never missed during recovery.
+            self.reload_held_keys()?;
+            let held_keys = self.held_keys.clone();
+            let mut first_error = None;
             for key in held_keys {
-                let _ = self.run_xdotool(&[OsString::from("keyup"), OsString::from(key)]);
+                match self.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)]) {
+                    Ok(()) => {
+                        if let Err(error) = self.forget_held_key(&key)
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
             }
             for key in ["Shift", "Control", "Alt", "Super_L"] {
-                let _ = self.run_xdotool(&[
+                if let Err(error) = self.run_xdotool(&[
                     OsString::from("keyup"),
                     OsString::from("--clearmodifiers"),
                     OsString::from(key),
-                ]);
+                ]) && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
             for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
-                let _ = self.run_xdotool(&[
+                if let Err(error) = self.run_xdotool(&[
                     OsString::from("mouseup"),
                     OsString::from(mouse_button_number(button).to_string()),
-                ]);
+                ]) && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
         }
         Ok(())
@@ -1027,6 +1285,7 @@ fn execute_virtual_action(
             duration,
             easing,
         } => {
+            checked_action_duration(*duration)?;
             let point = checked_point(*to, &backend.geometry)?;
             move_cursor_with_timing(backend, point, *duration, *easing)?;
             Ok(ComputerActionOutcome::Completed)
@@ -1072,6 +1331,7 @@ fn execute_virtual_action(
             }
             let mut checked_path = Vec::with_capacity(path.len());
             for step in path {
+                checked_action_duration(step.duration)?;
                 checked_path.push((
                     checked_point(step.point, &backend.geometry)?,
                     step.duration,
@@ -1104,11 +1364,12 @@ fn execute_virtual_action(
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::HoldKey { key, duration } => {
+            checked_action_duration(*duration)?;
+            backend.remember_held_key(key.clone())?;
             backend.run_xdotool(&[OsString::from("keydown"), OsString::from(key)])?;
-            backend.held_keys.push(key.clone());
             std::thread::sleep(*duration);
             backend.run_xdotool(&[OsString::from("keyup"), OsString::from(key)])?;
-            backend.held_keys.retain(|held| held != key);
+            backend.forget_held_key(key)?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::Scroll {
@@ -1116,6 +1377,8 @@ fn execute_virtual_action(
             delta_y,
             modifiers,
         } => {
+            checked_scroll_delta(*delta_x)?;
+            checked_scroll_delta(*delta_y)?;
             run_modifiers(backend, *modifiers, true)?;
             let vertical = if *delta_y < 0 { "5" } else { "4" };
             for _ in 0..delta_y.unsigned_abs() {
@@ -1129,6 +1392,7 @@ fn execute_virtual_action(
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::Wait { duration } => {
+            checked_action_duration(*duration)?;
             std::thread::sleep(*duration);
             Ok(ComputerActionOutcome::Waited(*duration))
         }
@@ -2347,16 +2611,40 @@ fn key_text_to_chord(text: String) -> Vec<String> {
 }
 
 fn secs(seconds: f64) -> Duration {
-    Duration::from_secs_f64(seconds.max(0.0))
+    if !seconds.is_finite() {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(seconds.clamp(0.0, MAX_COMPUTER_ACTION_DURATION.as_secs_f64()))
 }
 
 fn scroll_delta(direction: ScrollDirection, amount: i32) -> (i32, i32) {
+    let amount = amount.clamp(0, MAX_SCROLL_CLICK_REPETITIONS as i32);
     match direction {
         ScrollDirection::Up => (0, -amount),
         ScrollDirection::Down => (0, amount),
         ScrollDirection::Left => (-amount, 0),
         ScrollDirection::Right => (amount, 0),
     }
+}
+
+fn checked_action_duration(duration: Duration) -> Result<(), ComputerError> {
+    if duration > MAX_COMPUTER_ACTION_DURATION {
+        return Err(ComputerError::Refused(format!(
+            "computer action duration exceeds {} seconds",
+            MAX_COMPUTER_ACTION_DURATION.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+fn checked_scroll_delta(delta: i32) -> Result<(), ComputerError> {
+    if delta.unsigned_abs() > MAX_SCROLL_CLICK_REPETITIONS {
+        return Err(ComputerError::Refused(format!(
+            "scroll magnitude exceeds {} clicks",
+            MAX_SCROLL_CLICK_REPETITIONS
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3119,6 +3407,52 @@ mod tests {
             },
             scale_factor: ScaleFactor(2.0),
         }
+    }
+
+    #[test]
+    fn held_key_journal_retains_keys_until_explicitly_cleared() {
+        let temp = TempDir::new().expect("private test directory");
+        let journal = HeldKeyJournal {
+            path: Some(temp.path().join("held-keys.json")),
+        };
+
+        journal
+            .store(&["F13".to_string(), "a".to_string()])
+            .expect("persist held keys before keydown");
+        assert_eq!(
+            journal.load().expect("reload held keys"),
+            vec!["F13".to_string(), "a".to_string()]
+        );
+
+        // A partial cleanup may remove only the keys whose keyup succeeded;
+        // the remainder is what a retry or replacement daemon must see.
+        journal
+            .store(&["a".to_string()])
+            .expect("retain failed keyup key");
+        assert_eq!(
+            journal.load().expect("reload failed keyup key"),
+            vec!["a".to_string()]
+        );
+
+        journal.store(&[]).expect("clear after successful keyup");
+        assert!(journal.load().expect("empty journal").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_key_journal_uses_canonical_x11_server_identity() {
+        assert_eq!(
+            held_key_journal_identity(":0").unwrap(),
+            held_key_journal_identity("unix:0").unwrap()
+        );
+        assert_eq!(
+            held_key_journal_identity(":0.0").unwrap(),
+            held_key_journal_identity(":0.1").unwrap()
+        );
+        assert_ne!(
+            held_key_journal_identity(":0").unwrap(),
+            held_key_journal_identity(":1").unwrap()
+        );
     }
 
     #[test]
@@ -3911,7 +4245,9 @@ mod tests {
             report.completed[14],
             ComputerActionOutcome::Waited(Duration::from_millis(1))
         );
-        assert_eq!(backend.release_count, 1);
+        // Physical cleanup belongs to the coordinator, which can revalidate
+        // the OS host lease immediately before injecting terminal input.
+        assert_eq!(backend.release_count, 0);
     }
 
     #[tokio::test]
@@ -3924,7 +4260,7 @@ mod tests {
         assert_eq!(backend.recorded, actions[..=3]);
         assert_eq!(report.completed.len(), 3);
         assert_eq!(report.failure.as_ref().unwrap().index, 3);
-        assert_eq!(backend.release_count, 1);
+        assert_eq!(backend.release_count, 0);
     }
 
     #[test]
@@ -4016,12 +4352,12 @@ mod tests {
         let mut ok = FakeBackend::new();
         let ok_report = ok.execute(&actions).await;
         assert_eq!(ok_report.failure, None);
-        assert_eq!(ok.release_count, 1);
+        assert_eq!(ok.release_count, 0);
 
         let mut fail = FakeBackend::failing_at(1, ComputerError::Cancelled);
         let fail_report = fail.execute(&actions).await;
         assert_eq!(fail_report.failure.unwrap().error, ComputerError::Cancelled);
-        assert_eq!(fail.release_count, 1);
+        assert_eq!(fail.release_count, 0);
     }
 
     #[test]

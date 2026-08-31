@@ -84,6 +84,44 @@ pub(crate) async fn open_native_computer_for_delegation(
             return Ok(None);
         }
     };
+    let owner_instance = crate::computer::coordinator::OwnerInstance(u64::from(std::process::id()));
+    let (target_adapter, host_arbiter) = match candidate.target {
+        crate::computer::DisplayTarget::Virtual => (
+            Box::new(
+                crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
+                    *uuid::Uuid::new_v4().as_bytes(),
+                ),
+            ) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+            None,
+        ),
+        crate::computer::DisplayTarget::RealDesktop => {
+            #[cfg(target_os = "linux")]
+            {
+                let display = backend.real_x11_display().ok_or_else(|| {
+                    anyhow::anyhow!("real desktop backend did not expose an X11 display")
+                })?;
+                let adapter = crate::computer::platform::X11TargetEvidenceAdapter::new(display)
+                    .map_err(|reason| {
+                        anyhow::anyhow!("real desktop target evidence unavailable: {reason:?}")
+                    })?;
+                let file_lock = crate::computer::coordinator::FileAdvisoryLock::new()
+                    .map_err(|error| anyhow::anyhow!("host input arbiter unavailable: {error}"))?;
+                (
+                    Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                    Some(Arc::new(std::sync::Mutex::new(
+                        crate::computer::coordinator::HostInputArbiter::new(
+                            Box::new(file_lock),
+                            owner_instance,
+                        ),
+                    ))),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unreachable!("non-Linux real desktop construction fails closed")
+            }
+        }
+    };
     let handoff_journal = session.external_journal().map(|journal| {
         Arc::new(crate::computer::coordinator::ExternalJournalHandoff::new(
             journal,
@@ -93,21 +131,19 @@ pub(crate) async fn open_native_computer_for_delegation(
     let params = crate::computer::coordinator::CoordinatorParams {
         session_id: session.id.hyphenated().to_string(),
         delegation_id: crate::computer::coordinator::DelegationId(delegation_id),
-        tier: if candidate.approval_required {
+        tier: if candidate.target == crate::computer::DisplayTarget::RealDesktop
+            || candidate.approval_required
+        {
             crate::computer::coordinator::ComputerApprovalTier::Ask
         } else {
             crate::computer::coordinator::ComputerApprovalTier::Yolo
         },
-        owner_instance: crate::computer::coordinator::OwnerInstance(1),
+        owner_instance,
         authorizer: Arc::new(
             crate::computer::authorizer::ApproverComputerAuthorizer::new(approver),
         ),
-        host_arbiter: None,
-        target_adapter: Some(Box::new(
-            crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
-                *uuid::Uuid::new_v4().as_bytes(),
-            ),
-        )),
+        host_arbiter,
+        target_adapter: Some(target_adapter),
         provider_id: crate::computer::coordinator::ProviderId(
             agent.model.provider_id().to_string(),
         ),
@@ -690,7 +726,7 @@ mod tests {
             }
         }
 
-        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
+        fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             Ok(())
         }
     }
@@ -723,9 +759,9 @@ mod tests {
             self.inner.execute_one(action).await
         }
 
-        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
+        fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             self.releases.fetch_add(1, Ordering::SeqCst);
-            self.inner.release_all().await
+            self.inner.release_all()
         }
     }
 

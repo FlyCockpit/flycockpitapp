@@ -343,6 +343,23 @@ fn computer_target_focus_toctou() {
     let display = [2u8; 32];
     let base = sample_physical_evidence(h, session, display, [9u8; 16], 10);
 
+    // RandR can resize the root desktop without changing focused-window
+    // geometry. That must still advance the handoff fence generation.
+    let mut reducer = crate::computer::target::FocusGenerationReducer::new();
+    assert_eq!(reducer.observe(&base).unwrap(), 1);
+    let mut resized = base.clone();
+    resized.desktop_geometry = FieldEvidence::available(
+        TargetGeometry {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 900,
+            scale: 2.0,
+        },
+        EvidenceSource::InjectedTest,
+    );
+    assert_eq!(reducer.observe(&resized).unwrap(), 2);
+
     // Order A: change before handoff → stale, zero input
     let adapter = FakeTargetEvidenceAdapter::new(base.clone());
     let mut coord = TargetEvidenceCoordinator::new(adapter.clone());
@@ -1098,6 +1115,17 @@ fn computer_x11_randr_output_identity() {
     let mut no_mode = out_a.clone();
     no_mode.mode_id = None;
     assert!(build_mirror_groups(&[no_mode]).is_err());
+    let mut disabled = out_b.clone();
+    disabled.crtc_id = None;
+    assert_eq!(
+        build_mirror_groups(&[out_a.clone(), disabled])
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut edidless = out_a.clone();
+    edidless.edid = None;
+    assert_eq!(build_mirror_groups(&[edidless]).unwrap().len(), 1);
 
     let groups = build_mirror_groups(&[out_a.clone(), out_b.clone()]).unwrap();
     assert_eq!(groups.len(), 2);
@@ -1212,10 +1240,12 @@ fn computer_x11_randr_output_identity() {
         build_mirror_groups(std::slice::from_ref(&out_b)).unwrap()[0].physical_display_id()
     );
 
-    // Reconnect same endpoint fingerprint reproduces key; different root changes session
+    // Screen roots are local selectors, not X server identities: an X11 input
+    // lease must cover every `DISPLAY` screen suffix on the same server.
     let mut p3 = parts.clone();
+    p3.screen = 1;
     p3.root_window_id = 999;
-    assert_ne!(x11_session_or_seat_id(&parts), x11_session_or_seat_id(&p3));
+    assert_eq!(x11_session_or_seat_id(&parts), x11_session_or_seat_id(&p3));
 }
 
 // ---------------------------------------------------------------------------

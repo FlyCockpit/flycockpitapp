@@ -99,6 +99,7 @@ pub struct DelegationId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLeaseToken {
     pub target_key: PhysicalTargetKey,
+    arbitration_key: PhysicalTargetKey,
     pub generation: LeaseGeneration,
     pub owner_instance: OwnerInstance,
     pub delegation: DelegationId,
@@ -744,11 +745,13 @@ struct WaiterId(u64);
 struct ArbiterWaiter {
     id: WaiterId,
     target_key: PhysicalTargetKey,
+    arbitration_key: PhysicalTargetKey,
     owner_instance: OwnerInstance,
     delegation: DelegationId,
-    /// Set to true when this waiter has been cancelled. Cancelled waiters
-    /// are removed without transferring their generation.
-    cancelled: bool,
+    /// Set when this waiter has been cancelled. The shared flag lets an
+    /// interrupted async opener safely abandon a queued handle without a
+    /// ghost lease being promoted later.
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Delivery channel for the promoted lease token. `release` sends the
     /// minted token here; the owning [`WaitHandle::await_token`] receives it.
     /// `None` once the token (or a failure) has been delivered.
@@ -780,8 +783,8 @@ impl std::error::Error for WaitFailed {}
 
 /// A handle to a queued FIFO waiter. The holder either [`await_token`]s the
 /// promoted lease after the current holder releases, or abandons the wait by
-/// dropping the handle (and, for in-process abandonment, having the arbiter
-/// [`cancel_waiter_by_id`] it so no ghost lease is promoted).
+/// dropping the handle. Dropping marks its FIFO entry cancelled, so no ghost
+/// lease can be promoted if an opener task is interrupted.
 ///
 /// [`await_token`]: WaitHandle::await_token
 /// [`cancel_waiter_by_id`]: HostInputArbiter::cancel_waiter_by_id
@@ -789,21 +792,26 @@ impl std::error::Error for WaitFailed {}
 pub struct WaitHandle {
     id: WaiterId,
     target_key: PhysicalTargetKey,
+    arbitration_key: PhysicalTargetKey,
     delegation: DelegationId,
     receiver: oneshot::Receiver<Result<HostLeaseToken, WaitFailed>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    completed: bool,
 }
 
 impl WaitHandle {
     /// Await promotion. Resolves to the promoted [`HostLeaseToken`] (with a new
     /// generation) once the prior holder releases, or [`WaitFailed`] if the
     /// waiter was cancelled/abandoned, invalidated, or the OS lock failed.
-    pub async fn await_token(self) -> Result<HostLeaseToken, WaitFailed> {
-        match self.receiver.await {
+    pub async fn await_token(mut self) -> Result<HostLeaseToken, WaitFailed> {
+        let result = match (&mut self.receiver).await {
             Ok(result) => result,
             // The sender was dropped without delivering — the waiter was
             // removed (cancelled/abandoned) without a promotion.
             Err(_) => Err(WaitFailed::Cancelled),
-        }
+        };
+        self.completed = true;
+        result
     }
 
     /// The physical key this waiter is queued on.
@@ -817,11 +825,22 @@ impl WaitHandle {
     }
 }
 
+impl Drop for WaitHandle {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// The host-global input arbiter. Serializes every real physical target across
 /// delegations and Cockpit processes.
 ///
 /// Combines a process-local FIFO with an OS-level named mutex/advisory-lock
-/// file under the private Cockpit data root keyed by `PhysicalTargetKey`.
+/// file under the private Cockpit data root. Most backends key it by
+/// `PhysicalTargetKey`; X11 projects monitor-sensitive evidence onto one
+/// server/session-wide input key because xdotool injection is global there.
 /// Acquisition returns an unforgeable monotonic lease generation; only the
 /// current `(target_key, generation, owner_instance, delegation)` may dispatch.
 ///
@@ -900,7 +919,35 @@ impl HostInputArbiter {
         target_key: &PhysicalTargetKey,
         delegation: DelegationId,
     ) -> AcquireResult {
-        let key_str = Self::key_string(target_key);
+        self.try_acquire_with_key(target_key, target_key, delegation)
+    }
+
+    /// Acquire an X11 lease. Evidence remains monitor-sensitive, but xdotool
+    /// injection is global to the X server/session and therefore shares one
+    /// arbitration key across its RandR outputs.
+    fn try_acquire_x11(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        delegation: DelegationId,
+    ) -> AcquireResult {
+        let arbitration_key = PhysicalTargetKey::new(
+            target_key.host_installation_id,
+            target_key.platform_session_or_seat_id,
+            crate::computer::host_identity::domain_hash(
+                b"cockpit.x11.input-arbiter.v1",
+                &[&target_key.platform_session_or_seat_id],
+            ),
+        );
+        self.try_acquire_with_key(target_key, &arbitration_key, delegation)
+    }
+
+    fn try_acquire_with_key(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        arbitration_key: &PhysicalTargetKey,
+        delegation: DelegationId,
+    ) -> AcquireResult {
+        let key_str = Self::key_string(arbitration_key);
 
         // Queue if there is already a current holder, OR if non-cancelled
         // waiters are already queued ahead: a new acquirer must never leapfrog
@@ -909,7 +956,10 @@ impl HostInputArbiter {
         let has_live_waiters = self
             .queues
             .get(&key_str)
-            .map(|q| q.iter().any(|w| !w.cancelled))
+            .map(|q| {
+                q.iter()
+                    .any(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
+            })
             .unwrap_or(false);
         if self.current_lease.contains_key(&key_str) || has_live_waiters {
             let waiter_id = {
@@ -917,27 +967,32 @@ impl HostInputArbiter {
                 WaiterId(self.next_waiter_id)
             };
             let (sender, receiver) = oneshot::channel();
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.queues
                 .entry(key_str.clone())
                 .or_default()
                 .push(ArbiterWaiter {
                     id: waiter_id,
                     target_key: *target_key,
+                    arbitration_key: *arbitration_key,
                     owner_instance: self.owner_instance,
                     delegation: delegation.clone(),
-                    cancelled: false,
+                    cancelled: Arc::clone(&cancelled),
                     sender: Some(sender),
                 });
             return AcquireResult::Queued(WaitHandle {
                 id: waiter_id,
                 target_key: *target_key,
+                arbitration_key: *arbitration_key,
                 delegation,
                 receiver,
+                cancelled,
+                completed: false,
             });
         }
 
         // Try the OS-level lock.
-        match self.os_lock.try_lock(target_key) {
+        match self.os_lock.try_lock(arbitration_key) {
             Ok(()) => {}
             Err(err) => return AcquireResult::OsLockFailed(err),
         }
@@ -951,6 +1006,7 @@ impl HostInputArbiter {
 
         let token = HostLeaseToken {
             target_key: *target_key,
+            arbitration_key: *arbitration_key,
             generation: lease_gen,
             owner_instance: self.owner_instance,
             delegation,
@@ -966,7 +1022,7 @@ impl HostInputArbiter {
     /// Returns `true` if the lease was released by the current holder,
     /// `false` if the token was not the current holder.
     pub fn release(&mut self, token: &HostLeaseToken) -> bool {
-        let key_str = Self::key_string(&token.target_key);
+        let key_str = Self::key_string(&token.arbitration_key);
 
         // Verify this is the current holder.
         let is_current = match self.current_lease.get(&key_str) {
@@ -978,7 +1034,7 @@ impl HostInputArbiter {
         }
 
         // Release the OS-level lock.
-        self.os_lock.release(&token.target_key);
+        self.os_lock.release(&token.arbitration_key);
 
         // Remove the current lease.
         self.current_lease.remove(&key_str);
@@ -988,11 +1044,11 @@ impl HostInputArbiter {
         // waiters are skipped WITHOUT transferring a generation.
         if let Some(waiters) = self.queues.get_mut(&key_str) {
             while let Some(next) = waiters.first() {
-                if next.cancelled {
+                if next.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     waiters.remove(0);
                     continue;
                 }
-                let target_key = next.target_key;
+                let target_key = next.arbitration_key;
                 // Re-acquire the OS lock for the promoted waiter.
                 match self.os_lock.try_lock(&target_key) {
                     Ok(()) => {
@@ -1004,6 +1060,7 @@ impl HostInputArbiter {
                         };
                         let new_token = HostLeaseToken {
                             target_key: waiter.target_key,
+                            arbitration_key: waiter.arbitration_key,
                             generation: lease_gen,
                             owner_instance: waiter.owner_instance,
                             delegation: waiter.delegation.clone(),
@@ -1071,8 +1128,12 @@ impl HostInputArbiter {
         };
         // Mark the first matching waiter as cancelled.
         for waiter in waiters.iter_mut() {
-            if &waiter.delegation == delegation && !waiter.cancelled {
-                waiter.cancelled = true;
+            if &waiter.delegation == delegation
+                && !waiter.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            {
+                waiter
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
                 return true;
             }
         }
@@ -1087,7 +1148,7 @@ impl HostInputArbiter {
     ///
     /// Returns `true` if the waiter was found and removed.
     pub fn cancel_waiter_handle(&mut self, handle: &WaitHandle) -> bool {
-        self.cancel_waiter_by_id(&handle.target_key, handle.id)
+        self.cancel_waiter_by_id(&handle.arbitration_key, handle.id)
     }
 
     fn cancel_waiter_by_id(&mut self, target_key: &PhysicalTargetKey, id: WaiterId) -> bool {
@@ -1097,7 +1158,10 @@ impl HostInputArbiter {
         };
         if let Some(pos) = waiters.iter().position(|w| w.id == id) {
             // Remove outright (dropping the sender) so no promotion targets it.
-            waiters.remove(pos);
+            let waiter = waiters.remove(pos);
+            waiter
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
             if waiters.is_empty() {
                 self.queues.remove(&key_str);
             }
@@ -1110,7 +1174,7 @@ impl HostInputArbiter {
     /// loss, owner death, display-generation change, or lease replacement
     /// invalidates the token.
     pub fn is_lease_valid(&self, token: &HostLeaseToken) -> bool {
-        let key_str = Self::key_string(&token.target_key);
+        let key_str = Self::key_string(&token.arbitration_key);
         match self.current_lease.get(&key_str) {
             Some(current) => {
                 current.generation == token.generation
@@ -1120,16 +1184,15 @@ impl HostInputArbiter {
         }
     }
 
-    /// Detect OS lock loss. If the OS-level lock is no longer held for the
-    /// current lease, the lease is invalidated.
+    /// Detect OS lock loss without changing the logical lease state.
     ///
-    /// Returns `true` if a lease was invalidated due to OS lock loss.
-    pub fn detect_lock_loss(&mut self, token: &HostLeaseToken) -> bool {
-        let key_str = Self::key_string(&token.target_key);
-        if !self.os_lock.is_locked(&token.target_key) {
-            // OS lock lost — invalidate the lease.
-            self.os_lock.release(&token.target_key);
-            self.current_lease.remove(&key_str);
+    /// A caller that observes loss must never inject cleanup using the stale
+    /// token. It can relinquish this process-local token so a future owner can
+    /// acquire a fresh OS lock and neutralize durable input state safely.
+    ///
+    /// Returns `true` when the OS-level lock is absent for this lease.
+    pub fn detect_lock_loss(&self, token: &HostLeaseToken) -> bool {
+        if !self.os_lock.is_locked(&token.arbitration_key) {
             return true;
         }
         false
@@ -1146,7 +1209,11 @@ impl HostInputArbiter {
         let key_str = Self::key_string(target_key);
         self.queues
             .get(&key_str)
-            .map(|q| q.iter().filter(|w| !w.cancelled).count())
+            .map(|q| {
+                q.iter()
+                    .filter(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -1158,7 +1225,7 @@ impl HostInputArbiter {
             .current_lease
             .iter()
             .filter(|(_, token)| token.owner_instance == owner)
-            .map(|(k, t)| (k.clone(), t.target_key))
+            .map(|(k, t)| (k.clone(), t.arbitration_key))
             .collect();
         for (key_str, target_key) in keys_to_release {
             self.os_lock.release(&target_key);
@@ -1184,6 +1251,48 @@ fn lock_poison_safe(
     arbiter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Await a host lease without holding the arbiter mutex across an await.
+/// Process-local holders use the arbiter FIFO; independently composed
+/// production arbiters observe OS-lock contention and retry until the current
+/// process releases the lease. This is what makes separate daemon processes
+/// serialize rather than reject a valid concurrent caller.
+async fn acquire_host_lease(
+    arbiter: &Arc<std::sync::Mutex<HostInputArbiter>>,
+    physical_key: &PhysicalTargetKey,
+    backend_kind: BackendKind,
+    delegation: DelegationId,
+) -> Result<HostLeaseToken, CoordinatorOpenError> {
+    const CONTENTION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    loop {
+        let acquired = {
+            let mut arbiter = lock_poison_safe(arbiter);
+            if backend_kind == BackendKind::RealDesktopX11 {
+                arbiter.try_acquire_x11(physical_key, delegation.clone())
+            } else {
+                arbiter.try_acquire(physical_key, delegation.clone())
+            }
+        };
+        match acquired {
+            AcquireResult::Acquired(token) => return Ok(token),
+            AcquireResult::Queued(handle) => {
+                return handle.await_token().await.map_err(|failure| match failure {
+                    WaitFailed::OsLockFailed(error) => CoordinatorOpenError::HostLockFailed(error),
+                    WaitFailed::Cancelled | WaitFailed::Invalidated => {
+                        CoordinatorOpenError::HostLockFailed(HostLockError::LockLost)
+                    }
+                });
+            }
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess) => {
+                tokio::time::sleep(CONTENTION_POLL).await;
+            }
+            AcquireResult::OsLockFailed(error) => {
+                return Err(CoordinatorOpenError::HostLockFailed(error));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2344,6 +2453,11 @@ pub struct ComputerActionCoordinator {
     host_arbiter: Option<Arc<std::sync::Mutex<HostInputArbiter>>>,
     /// The current host lease token, if a physical target is involved.
     host_lease: Option<HostLeaseToken>,
+    /// Whether this coordinator still has proof that it exclusively owns the
+    /// physical target and may inject terminal `keyup`/`mouseup` events. Once
+    /// the OS lock is lost, only a newly acquired owner may neutralize the
+    /// durable input journal.
+    input_cleanup_permitted: bool,
     /// The central authorizer.
     authorizer: Arc<dyn ComputerAuthorizer>,
     /// The outcome journal for dedup/reconnect.
@@ -2415,10 +2529,14 @@ pub struct ComputerActionCoordinator {
 impl Drop for ComputerActionCoordinator {
     fn drop(&mut self) {
         self.host_effect_cancel.cancel();
-        if let Some(token) = self.host_lease.take()
-            && let Some(arbiter) = &self.host_arbiter
-        {
-            lock_poison_safe(arbiter).release(&token);
+        if let Err(error) = self.release_input_before_host_lease() {
+            // A failed neutralization must never be followed by a normal
+            // lease handoff from this coordinator. `release_input_before_host_lease`
+            // deliberately retains the lease on error, so subsequent local
+            // owners remain fenced rather than receiving a potentially stuck
+            // keyboard or pointer state.
+            tracing::error!(error = %error, "computer backend input cleanup failed during drop; retaining host lease");
+            self.fence_host_lease_until_process_exit();
         }
     }
 }
@@ -2751,26 +2869,15 @@ impl ComputerActionCoordinator {
                                 "a FileAdvisoryLock-backed host lease",
                             ),
                         )?;
-                        let mut arbiter = lock_poison_safe(arbiter);
-                        match arbiter.try_acquire(&physical_key, params.delegation_id.clone()) {
-                            AcquireResult::Acquired(token) => {
-                                host_lease = Some(token);
-                            }
-                            AcquireResult::Queued(handle) => {
-                                // SECURITY-CRITICAL fail-closed: production
-                                // `open` never awaits the FIFO. Abandon the
-                                // waiter before returning — remove its FIFO
-                                // entry and drop the handle — so a later
-                                // `release` cannot promote a ghost lease into
-                                // `current_lease` with no owner.
-                                arbiter.cancel_waiter_handle(&handle);
-                                drop(handle);
-                                return Err(CoordinatorOpenError::HostLockQueued);
-                            }
-                            AcquireResult::OsLockFailed(err) => {
-                                return Err(CoordinatorOpenError::HostLockFailed(err));
-                            }
-                        }
+                        host_lease = Some(
+                            acquire_host_lease(
+                                arbiter,
+                                &physical_key,
+                                backend_kind,
+                                params.delegation_id.clone(),
+                            )
+                            .await?,
+                        );
                     }
                 }
                 Err(reason) => {
@@ -2794,6 +2901,7 @@ impl ComputerActionCoordinator {
             target_adapter,
             host_arbiter: params.host_arbiter,
             host_lease,
+            input_cleanup_permitted: true,
             authorizer: params.authorizer,
             journal: OutcomeJournal::new(),
             delegation_id: params.delegation_id,
@@ -2818,6 +2926,16 @@ impl ComputerActionCoordinator {
             handoff_journal: params.handoff_journal,
             batch_item_outcomes: Vec::new(),
         };
+
+        // A coordinator that recovers a physical lease after a crashed or
+        // replaced predecessor must start from neutral input state. This runs
+        // while its newly acquired lease is still exclusive, before the
+        // coordinator can advertise or dispatch any computer capability.
+        if coordinator.host_lease.is_some() {
+            coordinator
+                .neutralize_input_under_host_lease()
+                .map_err(CoordinatorOpenError::BackendInputCleanup)?;
+        }
 
         // Populate the in-memory replay index from the pre-lease snapshot.
         for (identity, stored) in rehydrated_entries {
@@ -2859,31 +2977,44 @@ impl ComputerActionCoordinator {
         // Revoke Ask delegation leases for this delegation (display/target/host
         // generation change, host-lock loss, etc.).
         self.revoke_ask_lease_for_delegation();
-        // Release the host lease if held.
-        if let Some(token) = self.host_lease.take()
-            && let Some(arbiter) = &self.host_arbiter
-        {
-            let mut arbiter = lock_poison_safe(arbiter);
-            arbiter.release(&token);
+        if let Err(error) = self.release_input_before_host_lease() {
+            tracing::error!(error = %error, "computer backend input cleanup failed during invalidation; retaining host lease");
         }
         let _ = reason; // recorded in the outcome
     }
 
     /// Check host lease validity and detect OS lock loss.
     pub fn check_host_lease(&mut self) -> bool {
-        let Some(token) = self.host_lease.as_ref() else {
+        let Some(token) = self.host_lease.clone() else {
             return true; // No host lease for virtual displays.
         };
         if let Some(arbiter) = &self.host_arbiter {
-            let mut arbiter = lock_poison_safe(arbiter);
-            if arbiter.detect_lock_loss(token) {
-                self.host_lease = None;
+            let arbiter = lock_poison_safe(arbiter);
+            if arbiter.detect_lock_loss(&token) {
+                // We no longer have proof that terminal cleanup is exclusive:
+                // another Cockpit process can acquire the physical target
+                // between lock loss and this observation. Do not inject a
+                // stale owner's keyup/mouseup events. Instead relinquish only
+                // this process's logical token, allowing the next owner that
+                // successfully acquires the OS lock to neutralize the durable
+                // input journal before it dispatches.
+                drop(arbiter);
                 self.invalidated = true;
+                self.host_effect_cancel.cancel();
+                self.revoke_ask_lease_for_delegation();
+                self.abandon_host_lease_without_input();
                 return false;
             }
-            if !arbiter.is_lease_valid(token) {
-                self.host_lease = None;
+            if !arbiter.is_lease_valid(&token) {
+                // Another owner may already hold this target. Do not inject
+                // cleanup with a stale token: doing so would itself violate
+                // physical-input serialization. Every physical coordinator
+                // neutralizes input while holding its newly acquired lease.
+                drop(arbiter);
                 self.invalidated = true;
+                self.host_effect_cancel.cancel();
+                self.revoke_ask_lease_for_delegation();
+                self.abandon_host_lease_without_input();
                 return false;
             }
         }
@@ -3067,11 +3198,33 @@ impl ComputerActionCoordinator {
 
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
+        let cleanup_failure = self.neutralize_input_under_host_lease().err();
+        if let Some(error) = &cleanup_failure {
+            // Input neutralization failed after backend dispatch. Fence this
+            // coordinator immediately; retry cleanup while it still owns the
+            // lease, and hand the lease off only if that retry succeeds.
+            self.backend_dead = true;
+            self.host_effect_cancel.cancel();
+            self.revoke_ask_lease_for_delegation();
+            if let Err(retry_error) = self.release_input_before_host_lease() {
+                tracing::error!(
+                    error = %retry_error,
+                    initial_error = %error,
+                    "computer terminal input cleanup failed; retaining host lease"
+                );
+            }
+        }
+        let effective_failure = report.failure.clone().or_else(|| {
+            cleanup_failure.map(|error| ComputerFailure {
+                index: actions.len().saturating_sub(1),
+                error,
+            })
+        });
 
         // Build per-item BatchItemOutcome from the report (AC12). One
         // outcome per canonical backend item, including NotDispatched tails
         // on early stop. Real batch_index 0..n-1 per canonical backend item.
-        let item_outcomes = match &report.failure {
+        let item_outcomes = match &effective_failure {
             None => (0..actions.len())
                 .map(|_| BatchItemOutcome::BackendCompleted)
                 .collect::<Vec<_>>(),
@@ -3099,7 +3252,7 @@ impl ComputerActionCoordinator {
         if let Some(ticket) = &handoff_ticket
             && let Some(journal) = &self.handoff_journal
         {
-            let succeeded = report.failure.is_none();
+            let succeeded = effective_failure.is_none();
             if let Err(error) = journal.complete(ticket, succeeded).await {
                 tracing::error!(error = %error, "computer handoff settlement failed");
                 self.dispatch_states
@@ -3117,7 +3270,7 @@ impl ComputerActionCoordinator {
         self.dispatch_states
             .insert(call_id.to_string(), DispatchState::Completed);
 
-        if let Some(failure) = report.failure {
+        if let Some(failure) = effective_failure {
             return ExecuteArtifacts {
                 outcome: CoordinatedOutcome::Failed {
                     failure,
@@ -4076,12 +4229,8 @@ impl ComputerActionCoordinator {
         self.host_effect_cancel.cancel();
         // Revoke Ask delegation leases for this delegation.
         self.revoke_ask_lease_for_delegation();
-        // Release the host lease if held.
-        if let Some(token) = self.host_lease.take()
-            && let Some(arbiter) = &self.host_arbiter
-        {
-            let mut arbiter = lock_poison_safe(arbiter);
-            arbiter.release(&token);
+        if let Err(error) = self.release_input_before_host_lease() {
+            tracing::error!(error = %error, "computer backend input cleanup failed after backend death; retaining host lease");
         }
     }
 
@@ -4091,15 +4240,102 @@ impl ComputerActionCoordinator {
     pub async fn close(&mut self) -> Result<(), ComputerError> {
         // Revoke Ask delegation leases for this delegation.
         self.revoke_ask_lease_for_delegation();
-        // Release the host lease.
+        self.release_input_before_host_lease()
+    }
+
+    /// Neutralize backend-owned key/button state before making the physical
+    /// target available to another coordinator. On failure the host lease is
+    /// deliberately retained: handing it off with uncertain injected state
+    /// would allow physical input from two ownership generations to overlap.
+    fn release_input_before_host_lease(&mut self) -> Result<(), ComputerError> {
+        if !self.input_cleanup_permitted {
+            return Ok(());
+        }
+        if let Err(error) = self.neutralize_input_under_host_lease() {
+            // Losing the lock is already safely fenced by the helper. Closing
+            // a stale coordinator must not turn that condition into an
+            // attempted cleanup or a normal lease handoff.
+            if !self.input_cleanup_permitted {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if !self.input_cleanup_permitted {
+            return Ok(());
+        }
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
         {
-            let mut arbiter = lock_poison_safe(arbiter);
-            arbiter.release(&token);
+            lock_poison_safe(arbiter).release(&token);
         }
-        // Release all backend resources.
-        self.backend.release_all().await
+        Ok(())
+    }
+
+    /// Reset injected key/button state while the caller still owns its host
+    /// lease. This intentionally does not alter lease state; open uses it to
+    /// recover stale input from a predecessor before exposing a new owner.
+    fn neutralize_backend_input(&mut self) -> Result<(), ComputerError> {
+        self.backend.release_all()
+    }
+
+    /// Neutralize input without relinquishing a valid host lease.
+    ///
+    /// Every caller must pass through this proof boundary: the backend cannot
+    /// decide whether a physical cleanup is still exclusive across Cockpit
+    /// processes. A lost or stale lease is abandoned without injecting any
+    /// cleanup; the next fresh owner recovers the durable input journal.
+    fn neutralize_input_under_host_lease(&mut self) -> Result<(), ComputerError> {
+        if !self.input_cleanup_permitted {
+            return Err(ComputerError::Refused(
+                "host input lease is no longer exclusive for cleanup".to_string(),
+            ));
+        }
+        let has_exclusive_host_lease = match (&self.host_lease, &self.host_arbiter) {
+            (Some(token), Some(arbiter)) => {
+                let arbiter = lock_poison_safe(arbiter);
+                arbiter.is_lease_valid(token) && !arbiter.detect_lock_loss(token)
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !has_exclusive_host_lease {
+            self.abandon_host_lease_without_input();
+            return Err(ComputerError::Refused(
+                "host input lease lost before terminal cleanup".to_string(),
+            ));
+        }
+        self.neutralize_backend_input()
+    }
+
+    /// Relinquish a physical lease after its OS lock is already absent.
+    ///
+    /// The logical lease is process-local bookkeeping, so releasing it does
+    /// not inject input and lets a local waiter compete for a fresh OS lease.
+    /// Cleanup remains forbidden for this stale coordinator; a successful new
+    /// owner reloads and clears the backend's durable held-key journal first.
+    fn abandon_host_lease_without_input(&mut self) {
+        self.input_cleanup_permitted = false;
+        if let Some(token) = self.host_lease.take()
+            && let Some(arbiter) = &self.host_arbiter
+        {
+            lock_poison_safe(arbiter).release(&token);
+        }
+    }
+
+    /// Keep a failed-cleanup physical lease alive until process exit.
+    ///
+    /// `Drop` cannot return an error or retain the coordinator for a retry.
+    /// Leaking this one arbiter reference is therefore an intentional
+    /// fail-closed fence: its live file descriptor continues to exclude every
+    /// cooperating process rather than allowing a later owner to inject input
+    /// over an uncertain key/button state. A daemon restart is the explicit
+    /// recovery path after such a terminal cleanup failure.
+    fn fence_host_lease_until_process_exit(&mut self) {
+        if self.host_lease.is_some()
+            && let Some(arbiter) = self.host_arbiter.take()
+        {
+            std::mem::forget(arbiter);
+        }
     }
 
     /// Get the dispatch state for a call ID.
@@ -4169,6 +4405,9 @@ pub enum CoordinatorOpenError {
     HostLockQueued,
     /// Host lock acquisition failed (another process holds the OS lock).
     HostLockFailed(HostLockError),
+    /// Input state could not be neutralized while holding a newly acquired
+    /// physical host lease.
+    BackendInputCleanup(ComputerError),
     PhysicalCompositionMissing(&'static str),
     OutcomeStore(String),
 }
@@ -4183,6 +4422,9 @@ impl std::fmt::Display for CoordinatorOpenError {
             }
             Self::HostLockQueued => f.write_str("host lock acquisition queued"),
             Self::HostLockFailed(err) => write!(f, "host lock failed: {err}"),
+            Self::BackendInputCleanup(err) => {
+                write!(f, "backend input cleanup failed: {err}")
+            }
             Self::PhysicalCompositionMissing(component) => {
                 write!(f, "physical computer backend requires {component}")
             }
@@ -4674,6 +4916,7 @@ impl NativeResponseExtractor {
 #[cfg(test)]
 mod tests {
     use super::super::host_identity::HostInstallationId;
+    use super::super::platform::x11::{X11SessionParts, x11_session_or_seat_id};
     use super::super::target::{
         FakeTargetEvidenceAdapter, TargetIdentityEvidence, empty_unavailable,
         sample_physical_evidence,
@@ -4783,8 +5026,39 @@ mod tests {
             self.0.execute_one(action).await
         }
 
-        async fn release_all(&mut self) -> Result<(), ComputerError> {
-            self.0.release_all().await
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.0.release_all()
+        }
+    }
+
+    /// Physical backend fixture that records terminal input neutralization.
+    /// It lets lease-handoff tests assert that cleanup finishes before a
+    /// queued coordinator observes its promoted lease.
+    struct CleanupRecordingPhysicalBackend {
+        inner: FakeBackend,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for CleanupRecordingPhysicalBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::RealDesktopX11
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.inner.geometry().await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            self.inner.execute_one(action).await
+        }
+
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.events.lock().expect("event log").push("cleanup");
+            self.inner.release_all()
         }
     }
 
@@ -5398,6 +5672,48 @@ mod tests {
     }
 
     #[test]
+    fn x11_arbiter_serializes_monitors_and_screen_suffixes_but_other_backends_do_not() {
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let mut arbiter_a =
+            HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
+        let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(2));
+        let mut monitor_a = physical_key();
+        let mut monitor_b = monitor_a;
+        monitor_b.physical_display_id = [99; 32];
+        let server = |screen, root_window_id| X11SessionParts {
+            transport: "unix".to_string(),
+            display_number: 0,
+            screen,
+            vendor: "X.Org".to_string(),
+            release: 1,
+            root_window_id,
+            xauthority_cookie: Vec::new(),
+        };
+        monitor_a.platform_session_or_seat_id = x11_session_or_seat_id(&server(0, 42));
+        monitor_b.platform_session_or_seat_id = x11_session_or_seat_id(&server(1, 99));
+        assert_eq!(
+            monitor_a.platform_session_or_seat_id, monitor_b.platform_session_or_seat_id,
+            "DISPLAY screen suffixes must share the X server input-arbiter namespace"
+        );
+
+        let token_a = match arbiter_a
+            .try_acquire_x11(&monitor_a, DelegationId("x11-monitor-a".to_string()))
+        {
+            AcquireResult::Acquired(token) => token,
+            other => panic!("first X11 monitor should acquire, got {other:?}"),
+        };
+        assert_eq!(token_a.target_key, monitor_a);
+        assert!(matches!(
+            arbiter_b.try_acquire_x11(&monitor_b, DelegationId("x11-monitor-b".to_string()),),
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
+        ));
+
+        let other_backend =
+            arbiter_b.try_acquire(&monitor_b, DelegationId("non-x11-monitor-b".to_string()));
+        assert!(matches!(other_backend, AcquireResult::Acquired(_)));
+    }
+
+    #[test]
     fn computer_native_host_arbiter_generations_not_reused() {
         let os_lock = Box::new(InMemoryOsAdvisoryLock::new());
         let mut arbiter = HostInputArbiter::new(os_lock, OwnerInstance(1));
@@ -5526,9 +5842,12 @@ mod tests {
             external_lock.release(&key);
         }
 
-        // Detect lock loss.
+        // Detection leaves the logical lease installed until the coordinator
+        // has neutralized input and explicitly releases it.
         let lost = arbiter.detect_lock_loss(&token);
         assert!(lost);
+        assert!(arbiter.is_lease_valid(&token));
+        assert!(arbiter.release(&token));
         assert!(!arbiter.is_lease_valid(&token));
     }
 
@@ -5688,13 +6007,10 @@ mod tests {
         assert_eq!(handle_c.await_token().await, Err(WaitFailed::Cancelled));
     }
 
-    /// AC19: production `open` fails closed on a contended host lock. When
-    /// `open` maps contention to `HostLockQueued` it must abandon the FIFO
-    /// waiter before returning, so after the first holder releases there is no
-    /// ghost promotion and `current_lease` is not left held by an unowned
-    /// token.
+    /// AC19: a contended production open waits in FIFO order and receives the
+    /// lease after the current holder releases it.
     #[tokio::test]
-    async fn computer_host_lock_open_queued_cancels_waiter() {
+    async fn computer_host_lock_open_queued_serializes_waiter() {
         let tmp = tempfile::tempdir().expect("temp data root");
         let os_lock =
             FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
@@ -5748,8 +6064,7 @@ mod tests {
         .expect("first open acquires the host lease");
         assert!(arbiter.lock().unwrap().is_held(&key));
 
-        // Second delegation contends: `open` maps it to `HostLockQueued` and
-        // must remove the FIFO waiter before returning.
+        // Second delegation contends and remains queued until A releases.
         let params_b = CoordinatorParams {
             session_id: DURABLE_COMPUTER_SESSION_ID.to_string(),
             delegation_id: DelegationId("delegation-b".to_string()),
@@ -5765,28 +6080,24 @@ mod tests {
             outcome_store: Some(outcome_store),
             handoff_journal: Some(handoff_journal),
         };
-        let result_b = ComputerActionCoordinator::open(
+        let mut opening_b = Box::pin(ComputerActionCoordinator::open(
             Box::new(PhysicalFakeBackend(FakeBackend::new())),
             params_b,
-        )
-        .await;
-        assert!(matches!(
-            result_b,
-            Err(CoordinatorOpenError::HostLockQueued)
         ));
-
-        // The FIFO entry is GONE — the abandoned waiter was removed.
-        assert_eq!(arbiter.lock().unwrap().waiter_count(&key), 0);
-
-        // The first holder releases: there must be NO ghost promotion and no
-        // unowned lease left installed.
-        coordinator_a.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
-        let arb = arbiter.lock().unwrap();
         assert!(
-            !arb.is_held(&key),
-            "no unowned lease may remain after the holder releases"
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut opening_b)
+                .await
+                .is_err()
         );
-        assert_eq!(arb.waiter_count(&key), 0);
+        assert_eq!(arbiter.lock().unwrap().waiter_count(&key), 1);
+
+        // Release the first holder, then the waiting open owns the promoted
+        // lease rather than being refused for ordinary contention.
+        coordinator_a.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
+        let mut coordinator_b = opening_b.await.expect("queued open acquires after release");
+        assert!(arbiter.lock().unwrap().is_held(&key));
+        coordinator_b.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
+        assert!(!arbiter.lock().unwrap().is_held(&key));
     }
 
     /// A test OS lock that grants the first `ok_count` acquisitions and then
@@ -6234,12 +6545,17 @@ mod tests {
             Arc::new(FakeComputerAuthorizer::always_allow());
         let sinks = PhysicalTestSinks::new();
         let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut coordinator = ComputerActionCoordinator::open(
-            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            Box::new(CleanupRecordingPhysicalBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
             params,
         )
         .await
         .expect("coordinator open");
+        events.lock().expect("event log").clear();
 
         // Simulate OS lock loss by externally releasing the OS-level lock for
         // the coordinator's key while the arbiter still records it as holder.
@@ -6248,9 +6564,16 @@ mod tests {
             external.release(&key);
         }
 
-        // Detect lock loss — this drives the host-lease invalidation mechanism.
+        // Detection must not emit stale-owner cleanup. A competing process can
+        // acquire the physical target between loss and this observation; only
+        // its newly acquired coordinator may neutralize the durable journal.
         let valid = coordinator.check_host_lease();
-        let _ = valid;
+        assert!(!valid);
+        assert!(events.lock().expect("event log").is_empty());
+        assert!(!arbiter.lock().expect("arbiter").is_held(&key));
+
+        drop(coordinator);
+        assert!(events.lock().expect("event log").is_empty());
     }
 
     #[tokio::test]
@@ -6595,6 +6918,79 @@ mod tests {
             let key = physical_key();
             assert!(!arb.is_held(&key));
         }
+    }
+
+    #[tokio::test]
+    async fn computer_physical_close_neutralizes_input_before_queued_handoff() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let sinks = PhysicalTestSinks::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+
+        let mut first = ComputerActionCoordinator::open(
+            Box::new(CleanupRecordingPhysicalBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
+            sinks.params(
+                authorizer.clone(),
+                ComputerApprovalTier::Yolo,
+                arbiter.clone(),
+            ),
+        )
+        .await
+        .expect("open first physical coordinator");
+        events.lock().expect("event log").clear();
+
+        let mut second_params =
+            sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        second_params.delegation_id = DelegationId("delegation-queued".to_string());
+        let second_events = events.clone();
+        let opening_second = tokio::spawn(async move {
+            let coordinator = ComputerActionCoordinator::open(
+                Box::new(CleanupRecordingPhysicalBackend {
+                    inner: FakeBackend::new(),
+                    events: second_events.clone(),
+                }),
+                second_params,
+            )
+            .await
+            .expect("queued physical coordinator acquires after release");
+            second_events.lock().expect("event log").push("acquired");
+            coordinator
+        });
+        for _ in 0..10 {
+            if arbiter
+                .lock()
+                .expect("arbiter")
+                .waiter_count(&physical_key())
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            arbiter
+                .lock()
+                .expect("arbiter")
+                .waiter_count(&physical_key()),
+            1
+        );
+
+        first.close().await.expect("close first coordinator");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), opening_second)
+            .await
+            .expect("queued open completes")
+            .expect("queued open task");
+        let events = events.lock().expect("event log").clone();
+        assert_eq!(events, vec!["cleanup", "cleanup", "acquired"]);
+
+        drop(second);
     }
 
     #[tokio::test]
@@ -6998,8 +7394,8 @@ mod tests {
             self.inner.execute_one(action).await
         }
 
-        async fn release_all(&mut self) -> Result<(), ComputerError> {
-            self.inner.release_all().await
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.inner.release_all()
         }
     }
 
@@ -8004,8 +8400,8 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.inner.execute_one(action).await
             }
-            async fn release_all(&mut self) -> Result<(), ComputerError> {
-                self.inner.release_all().await
+            fn release_all(&mut self) -> Result<(), ComputerError> {
+                self.inner.release_all()
             }
         }
 
@@ -8999,8 +9395,8 @@ mod tests {
             self.inner.execute_one(action).await
         }
 
-        async fn release_all(&mut self) -> Result<(), ComputerError> {
-            self.inner.release_all().await
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.inner.release_all()
         }
     }
 

@@ -7969,17 +7969,33 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
-        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
-            self.keep_warm_armed_for_idle_window = false;
-        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
             )
         );
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+            // Oversized submissions have not been accepted yet: phase-two
+            // materialization records activity only after its durable commit.
+            // This keeps rejected leases from resetting idle wakes and gives
+            // every accepted submission one, consistent activity timestamp.
+            if !has_oversized_artifact_lease {
+                self.schedule.record_user_activity();
+            }
+        }
         self.auto_compact_gate
             .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
+    pub(crate) fn set_idle_activity_sender(
+        &mut self,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+        gate: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.schedule.set_idle_activity_sender(sender);
+        self.schedule.set_idle_activity_gate(gate);
     }
 
     /// Tools whose in-flight execution can be adopted by the
@@ -11831,9 +11847,16 @@ impl Driver {
                         // turn start because the oversized lease was still
                         // unmaterialized; this is the delayed ExternalRoot
                         // gate advance for that path.
+                        // Materialization is this path's acceptance boundary.
+                        // Keep the durable reset and in-memory epoch in the
+                        // same admission interval as ordinary ingress.
+                        let idle_activity_gate = self.schedule.idle_activity_gate();
+                        let _idle_activity_admission = idle_activity_gate.lock().await;
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
+                        self.schedule
+                            .record_materialized_user_activity_after_acceptance();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {
@@ -13488,9 +13511,11 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(mut children) if children.len() == 1 => {
-                            children
-                                .pop()
+                        Ok(publication) if publication.children.len() == 1 => {
+                            publication
+                                .children
+                                .into_iter()
+                                .next()
                                 .expect("one published interactive child")
                                 .agent_instance_id
                         }

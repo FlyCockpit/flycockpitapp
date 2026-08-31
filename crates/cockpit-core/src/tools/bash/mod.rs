@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use crate::engine::TurnEvent;
 use crate::engine::tool::{
-    ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolOutput, ToolOutputSidecar,
-    ToolPresentation, single_line_preview, string_field,
+    ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolEffect, ToolOutput,
+    ToolOutputSidecar, ToolPresentation, single_line_preview, string_field,
 };
 use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
@@ -152,6 +152,18 @@ impl Tool for BashTool {
         Self::declared_binary_requirements()
     }
 
+    fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {
+        // A non-zero shell exit says nothing about effects that occurred
+        // before it (for example, `touch marker && false`). A timeout or
+        // cancellation with an unknown host effect is likewise conservative.
+        // Only the lexical read-only proof may discard an idle wake action.
+        if bash_command_is_proven_read_only(args.get("command").and_then(Value::as_str)) {
+            ToolEffect::ReadOnly
+        } else {
+            ToolEffect::Dynamic
+        }
+    }
+
     fn honors_dispatch_cancel(&self) -> bool {
         true
     }
@@ -198,6 +210,34 @@ impl Tool for BashTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         call_bash_inner(&self.prelude, args, ctx, BashRunOptions::default()).await
+    }
+}
+
+/// A narrow, lexical proof for shell calls that cannot change state. This is
+/// intentionally an allowlist rather than a shell parser: uncertain syntax or
+/// commands retain Bash's dynamic effect and therefore stay durable after a
+/// successful idle wake.
+fn bash_command_is_proven_read_only(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    if command.is_empty()
+        || command.contains(['\n', '\r', ';', '|', '&', '>', '<', '`', '$', '(', ')'])
+    {
+        return false;
+    }
+    let mut words = command.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    match program {
+        "pwd" | "true" | "false" | "echo" | "printf" | "cat" | "head" | "tail" | "ls" | "grep"
+        | "stat" | "wc" | "which" => true,
+        "git" => matches!(
+            words.next(),
+            Some("status" | "diff" | "log" | "show" | "rev-parse")
+        ),
+        _ => false,
     }
 }
 
@@ -3085,6 +3125,43 @@ fn scrub_overrides(
         .filter(|k| k.starts_with("SEALED_") || crate::redact::env_scrub_patterns(k))
         .map(|k| (k, String::new()))
         .collect()
+}
+
+#[cfg(test)]
+mod idle_wake_effect_tests {
+    use super::{BashTool, bash_command_is_proven_read_only};
+    use crate::engine::tool::{Tool, ToolEffect, ToolOutput};
+    use serde_json::json;
+
+    #[test]
+    fn only_simple_read_only_shell_forms_are_proven_read_only() {
+        for command in ["git status --short", "git diff", "pwd", "grep needle file"] {
+            assert!(bash_command_is_proven_read_only(Some(command)), "{command}");
+        }
+        for command in [
+            "git branch -D old",
+            "git remote set-url origin https://example.test/repo",
+            "git status && rm file",
+            "printf x > file",
+            "find . -exec touch {} \\;",
+        ] {
+            assert!(
+                !bash_command_is_proven_read_only(Some(command)),
+                "{command} must retain the dynamic effect"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_dynamic_shell_completion_remains_stateful() {
+        let tool = BashTool::new();
+        let output = ToolOutput::text("exit: 1\n").with_exit_code(1);
+
+        assert_eq!(
+            tool.completed_call_effect(&json!({ "command": "touch marker && false" }), &output),
+            ToolEffect::Dynamic
+        );
+    }
 }
 
 /// Platform-independent unit tests for the run-fail-escalate gate

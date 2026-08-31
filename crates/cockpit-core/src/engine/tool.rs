@@ -486,6 +486,15 @@ pub trait Tool: Send + Sync {
         ToolEffect::Dynamic
     }
 
+    /// Call-specific effect classification used by ephemeral idle wakes after
+    /// a call has completed. `Dynamic` remains the conservative default: a
+    /// tool that can prove this exact successful invocation was read-only
+    /// overrides this method. This is deliberately separate from [`Self::effect`],
+    /// whose capability/approval meaning must stay conservative before a call.
+    fn completed_call_effect(&self, _args: &Value, _output: &ToolOutput) -> ToolEffect {
+        self.effect()
+    }
+
     /// Whether the tool owns a narrower, composite authorization chokepoint
     /// inside its implementation. Such a tool still advertises its real effect
     /// and remains subject to review-cage and loop controls, but ordinary-tool
@@ -1799,6 +1808,63 @@ impl ToolBox {
         self.overrides.remove(name);
         self.capability_unavailable.remove(name);
         self.capability_description_suffixes.remove(name);
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    /// Keep only built-in operations whose declared effect is read-only.
+    ///
+    /// This is a capability boundary, not a scheduling hint: an unregistered
+    /// or user-authored tool is excluded even when it claims `ReadOnly`, since
+    /// a custom shell template can make that claim while executing arbitrary
+    /// code. Callers that need a constrained non-read-only escape hatch must
+    /// add that tool back explicitly and own its effect accounting.
+    pub(crate) fn registered_read_only_operations(mut self) -> Self {
+        let is_safe = |tool: &Arc<dyn Tool>| {
+            tool.is_registered_ordinary_operation() && tool.effect() == ToolEffect::ReadOnly
+        };
+        self.tools.retain(|_, tool| is_safe(tool));
+        self.dormant_direct_native_media
+            .retain(|_, tool| is_safe(tool));
+        self.mcp_builtin_tools
+            .retain(|_, entry| is_safe(&entry.tool));
+        self.overrides
+            .retain(|name, _| self.tools.contains_key(name));
+        self.capability_unavailable
+            .retain(|name, _| self.tools.contains_key(name));
+        self.capability_description_suffixes
+            .retain(|name, _| self.tools.contains_key(name));
+        self.direct_native_media_unavailable
+            .retain(|name, _| self.dormant_direct_native_media.contains_key(name));
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    /// Wrap every non-read-only callable operation on this toolbox.
+    ///
+    /// Background fork callers use this to retain the parent capability
+    /// surface while making every possible effect cross their own durable
+    /// accounting boundary. Direct-native media is normally stripped before
+    /// this method is used, but keep the dormant registry coherent too.
+    pub(crate) fn map_non_read_only_operations(
+        mut self,
+        map: impl Fn(Arc<dyn Tool>) -> Arc<dyn Tool>,
+    ) -> Self {
+        for tool in self.tools.values_mut() {
+            if tool.effect() != ToolEffect::ReadOnly {
+                *tool = map(tool.clone());
+            }
+        }
+        for tool in self.dormant_direct_native_media.values_mut() {
+            if tool.effect() != ToolEffect::ReadOnly {
+                *tool = map(tool.clone());
+            }
+        }
+        for entry in self.mcp_builtin_tools.values_mut() {
+            if entry.tool.effect() != ToolEffect::ReadOnly {
+                entry.tool = map(entry.tool.clone());
+            }
+        }
         self.definition_cache.lock().unwrap().clear();
         self
     }

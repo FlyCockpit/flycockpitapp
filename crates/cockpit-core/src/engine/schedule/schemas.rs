@@ -40,7 +40,12 @@ pub fn schema_for(action: ScheduleAction) -> Value {
                 "backoff": { "type": "boolean" },
                 "limit": { "type": "integer", "minimum": 0 },
                 "keep_in_context": { "type": "boolean" },
-                "independent": { "type": "boolean" }
+                "independent": { "type": "boolean" },
+                "idle": { "type": "boolean" },
+                "watch_paths": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
             },
             "required": ["interval", "prompt"],
             "additionalProperties": false

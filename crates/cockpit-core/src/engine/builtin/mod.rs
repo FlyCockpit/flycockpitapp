@@ -599,7 +599,12 @@ fn with_tiered_recall_tools(
         return Ok(tb);
     }
     for name in ["history_search", "todo"] {
+        // Recall is part of the built-in primary-agent surface. It remains
+        // discoverable through native Monty even though every agent now gets
+        // that runtime. A custom assistant must still opt into it explicitly:
+        // otherwise its authored tool boundary would be silently widened.
         if is_assistant
+            && !crate::agents::is_builtin_primary(&def.name)
             && !grant.iter().any(|tool| tool == name)
             && default_assistant_discoverable_tools().contains(&name)
         {
@@ -2519,8 +2524,9 @@ fn derive_parallel_read_only_eligible(child: &Agent, args: &SpawnArgs) -> bool {
     // Every exposed tool must be a registered ordinary read-only operation. The
     // structural `return` completion envelope is the only non-operation tool a
     // delegated leaf carries; it is not a capability, so it does not disqualify.
-    // Anything else that is `Dynamic` (bash, search, mcp, schedule, spawn,
-    // approval-gated tools) or `Mutating`, that cannot be looked up, OR that is
+    // Anything else that is `Dynamic` (bash, search, an externally reachable
+    // or non-read-only `mcp`, schedule, spawn, approval-gated tools) or `Mutating`,
+    // that cannot be looked up, OR that is
     // not a REGISTERED ORDINARY built-in operation (a user-authored custom-bash
     // template — even one marked `approval_exempt` whose `effect()` reads
     // `ReadOnly` — can run an arbitrary shell command) makes the surface
@@ -2533,6 +2539,18 @@ fn derive_parallel_read_only_eligible(child: &Agent, args: &SpawnArgs) -> bool {
     }
     for &name in &names {
         if name == "return" {
+            continue;
+        }
+        // Monty itself is a dispatcher, not an authority grant.  A delegated
+        // native-only child remains read-only when the exact per-agent Monty
+        // registry contains only registered read-only operations.  External
+        // servers, a dynamic/mutating native registry entry, or an
+        // unavailable/empty registry all retain the conservative serial
+        // classification below.
+        if name == "mcp"
+            && !child.mcp_resolver.external_servers_allowed()
+            && child.tools.mcp_native_operations_are_registered_read_only()
+        {
             continue;
         }
         match child.tools.get(name) {
@@ -3239,23 +3257,11 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         return resolve_unprepared_vnext_primary_slot(def, slot, args, &extended);
     }
     if let Some(model) = &args.model_override {
-        if args.delegated {
-            let allowed_label = format_prepared_route_list(&routes);
-            let matching = routes.iter().any(|route| {
-                route.model_id == model.model_id_ref()
-                    && (route.provider_profile_handle == model.provider_id()
-                        || route.provider_id == model.provider_id())
-            });
-            if !matching {
-                bail!(
-                    "explicit model override `{}:{}` is not in vNext child `{}` primary-slot routes: {allowed_label}",
-                    model.provider_id(),
-                    model.model_id_ref(),
-                    def.name
-                );
-            }
-        }
-        // Root (and in-set child) pins already went through `build_live_model`.
+        // Driver-owned overrides are already constructed from the pinned
+        // provider policy.  They are host runtime policy (for example a
+        // trusted delegated route), not a parent-authored selector, so they
+        // must survive a vNext child reconstruction even when that route was
+        // not part of the generation's prepared default list.
         // Re-resolving from `args.config.providers()` would reject a live
         // switch whose catalog lives on the test/live override, not the
         // detached handle.

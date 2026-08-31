@@ -10000,6 +10000,14 @@ impl Driver {
             tokio::time::sleep(delay).await;
         }
 
+        // Preparation is inside the original idle window.  Do not construct
+        // (and therefore do not let Tokio poll) a provider future once that
+        // fixed deadline has passed: a ready `sleep_until` racing a newly
+        // constructed request can otherwise still open a network connection.
+        if tokio::time::Instant::now() >= idle_deadline_at {
+            return Ok("skipped: idle window elapsed".to_string());
+        }
+
         let decision = crate::keep_warm::decide(
             context.keep_warm,
             context.idle_window_secs,
@@ -15073,9 +15081,10 @@ impl Driver {
             mcp_parent_reachable: None,
             mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),
             // Root construction may consume explicit/resumed selection
-            // provenance or a legacy plan-level override. vNext children
-            // discard it at the delegated-spawn boundary and resolve their own
-            // prepared default unless their direct parent supplies a selector.
+            // provenance or a legacy plan-level override. A delegated child
+            // receives only the driver's explicit runtime override; without
+            // one, it resolves its direct selector rather than inheriting
+            // this root reconstruction provenance.
             model_override: root_model_override,
             delegation_model: None,
             delegated: false,
@@ -15130,13 +15139,7 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
-        let parent_is_vnext = self
-            .stack
-            .last()
-            .is_some_and(|frame| frame.agent.vnext_grant.is_some());
-        let model_override = if parent_is_vnext {
-            None
-        } else if recursion.same_model_only {
+        let model_override = if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()
@@ -15208,13 +15211,7 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
-        let parent_is_vnext = self
-            .stack
-            .last()
-            .is_some_and(|frame| frame.agent.vnext_grant.is_some());
-        let model_override = if parent_is_vnext {
-            None
-        } else if recursion.same_model_only {
+        let model_override = if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()
@@ -15485,10 +15482,10 @@ pub(crate) async fn restore_retained_turn_media_authority(session: &Session) {
 /// Build the absolute keep-warm idle fence without assuming every valid
 /// duration can be represented by the platform's monotonic instant.
 fn keep_warm_idle_deadline(
-    origin: std::time::Instant,
+    origin: tokio::time::Instant,
     idle_window: std::time::Duration,
 ) -> Option<tokio::time::Instant> {
-    tokio::time::Instant::from_std(origin).checked_add(idle_window)
+    origin.checked_add(idle_window)
 }
 
 fn driver_spawn_media_availability(

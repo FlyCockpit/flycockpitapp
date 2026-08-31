@@ -36,9 +36,9 @@ async fn insert_pending_assistant_inbox_item(driver: &Driver, delivery: &str, su
         conn.execute(
             "INSERT INTO assistant_inbox_items(
                 inbox_item_id, assistant_name, main_session_id,
-                raising_session_id, operation_id, summary, delivery,
+                raising_session_id, operation_scope, operation_id, summary, delivery,
                 created_at_unix_ms
-             ) VALUES(?1, 'inbox-source', ?2, ?3, ?4, ?5, ?6, ?7)",
+             ) VALUES(?1, 'inbox-source', ?2, ?3, 'test-inbox', ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
                 main_session_id.to_string(),
@@ -91,6 +91,26 @@ fn scripted_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
 
 fn scripted_write_edit_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = scripted_driver(provider);
+    // These fixtures exercise post-write transcript projection and follow-up
+    // edits, not approval prompting.  Install the same local approval owner
+    // used by production dispatch and run it in explicit YOLO mode so an
+    // existing-file edit reaches the filesystem path under test.
+    driver
+        .session
+        .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+    let store = crate::approval::store::GrantStore::new(
+        driver.session.db.clone(),
+        driver.session.id,
+        driver.cwd.clone(),
+        driver.config.clone(),
+    );
+    driver.set_approver(Arc::new(crate::approval::Approver::new(
+        store,
+        driver.session.db.clone(),
+        driver.session.id,
+        "Build",
+        Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+    )));
     let old = driver.stack[0].agent.clone();
     let tools = crate::engine::tool::ToolBox::new()
         .with(Arc::new(crate::tools::write::WriteTool))
@@ -113,7 +133,9 @@ fn scripted_write_edit_driver(provider: &ScriptedProvider) -> (Driver, tempfile:
         delegation_recursion: old.delegation_recursion.clone(),
         vnext_grant: old.vnext_grant.clone(),
         env_overlay: old.env_overlay.clone(),
-        definition: old.definition.clone(),
+        // This fixture installs an in-memory, test-only tool surface.  It has
+        // no corresponding pinned definition to rebuild at a turn boundary.
+        definition: None,
         assistant_identity_prefix: None,
         mcp_resolver: old.mcp_resolver.clone(),
     });
@@ -172,7 +194,9 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         delegation_recursion: old.delegation_recursion.clone(),
         vnext_grant: old.vnext_grant.clone(),
         env_overlay: old.env_overlay.clone(),
-        definition: old.definition.clone(),
+        // This fixture installs an in-memory, test-only tool surface.  It has
+        // no corresponding pinned definition to rebuild at a turn boundary.
+        definition: None,
         assistant_identity_prefix: None,
         mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
@@ -1281,9 +1305,9 @@ fn queued_user_fold_retry_does_not_duplicate_assistant_inbox_text() {
                 conn.execute(
                     "INSERT INTO assistant_inbox_items(
                         inbox_item_id, assistant_name, main_session_id,
-                        raising_session_id, operation_id, summary, delivery,
+                        raising_session_id, operation_scope, operation_id, summary, delivery,
                         created_at_unix_ms
-                     ) VALUES(?1, 'retry-inbox-source', ?2, ?3, 'retry-boundary', ?4, 'defer', 1000)",
+                     ) VALUES(?1, 'retry-inbox-source', ?2, ?3, 'test-inbox', 'retry-boundary', ?4, 'defer', 1000)",
                     rusqlite::params![
                         uuid::Uuid::new_v4().to_string(),
                         main_session_id.to_string(),
@@ -1941,7 +1965,9 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             delegation_recursion: old.delegation_recursion.clone(),
             vnext_grant: old.vnext_grant.clone(),
             env_overlay: old.env_overlay.clone(),
-            definition: old.definition.clone(),
+            // This FIFO probe is an in-memory tool surface, not a persisted
+            // agent definition that the active-frame refresher may rebuild.
+            definition: None,
             assistant_identity_prefix: None,
             mcp_resolver: old.mcp_resolver.clone(),
         });

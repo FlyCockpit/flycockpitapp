@@ -2484,6 +2484,27 @@ impl ToolBox {
         Arc::new(crate::mcp::builtin::BuiltinRegistry::for_agent(funcs))
     }
 
+    /// Whether every native operation reachable through this agent's Monty
+    /// registry is a registered read-only operation.  This deliberately
+    /// describes the registry rather than the provider-visible `mcp` wrapper:
+    /// a native-only Monty runtime cannot broaden a child beyond the tools the
+    /// host put in this exact toolbox.
+    pub(crate) fn mcp_native_operations_are_registered_read_only(&self) -> bool {
+        let mut has_available_operation = false;
+        for (name, entry) in &self.mcp_builtin_tools {
+            if self.capability_unavailable.contains_key(name) {
+                continue;
+            }
+            has_available_operation = true;
+            if !entry.tool.is_registered_ordinary_operation()
+                || entry.tool.effect() != ToolEffect::ReadOnly
+            {
+                return false;
+            }
+        }
+        has_available_operation
+    }
+
     pub(crate) fn discoverable_mcp_tool_names(&self) -> Vec<String> {
         self.mcp_builtin_tools
             .iter()

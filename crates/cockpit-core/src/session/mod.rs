@@ -1110,7 +1110,8 @@ struct LastRecoverableToolCall {
 }
 
 /// The durable identity for exactly one inference send. Wall-clock time
-/// supplies the scheduler deadline; `send_id` prevents two sends in one
+/// supplies the daemon-job timing; the paired Tokio monotonic origin supplies
+/// the in-process scheduler deadline. `send_id` prevents two sends in one
 /// millisecond from being treated as the same cache-producing request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InferenceSendIdentity {
@@ -1121,6 +1122,7 @@ pub(crate) struct InferenceSendIdentity {
 #[derive(Clone, Copy)]
 struct InferenceSendTime {
     monotonic: std::time::Instant,
+    scheduler_monotonic: tokio::time::Instant,
     identity: InferenceSendIdentity,
 }
 
@@ -1731,6 +1733,7 @@ impl Session {
     pub fn note_send(&self) {
         self.note_send_at(
             std::time::Instant::now(),
+            tokio::time::Instant::now(),
             chrono::Utc::now().timestamp_millis(),
         );
     }
@@ -1758,11 +1761,11 @@ impl Session {
     /// window between sampling elapsed time and arming a timer.
     pub(crate) fn last_send_identity_and_origin(
         &self,
-    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
+    ) -> Option<(InferenceSendIdentity, tokio::time::Instant)> {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| (t.identity, t.monotonic))
+            .map(|t| (t.identity, t.scheduler_monotonic))
     }
 
     #[cfg(test)]
@@ -1772,6 +1775,9 @@ impl Session {
             std::time::Instant::now()
                 .checked_sub(elapsed)
                 .unwrap_or_else(std::time::Instant::now),
+            tokio::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(tokio::time::Instant::now),
             chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(elapsed_millis),
@@ -1783,12 +1789,22 @@ impl Session {
     /// the millisecond used to calculate its deadline.
     #[cfg(test)]
     pub(crate) fn note_send_with_unix_millis_for_test(&self, unix_millis: i64) {
-        self.note_send_at(std::time::Instant::now(), unix_millis);
+        self.note_send_at(
+            std::time::Instant::now(),
+            tokio::time::Instant::now(),
+            unix_millis,
+        );
     }
 
-    fn note_send_at(&self, monotonic: std::time::Instant, unix_millis: i64) {
+    fn note_send_at(
+        &self,
+        monotonic: std::time::Instant,
+        scheduler_monotonic: tokio::time::Instant,
+        unix_millis: i64,
+    ) {
         *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
             monotonic,
+            scheduler_monotonic,
             identity: InferenceSendIdentity {
                 unix_millis,
                 send_id: Uuid::new_v4(),

@@ -150,7 +150,11 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             config_dir.join("config.json"),
             serde_json::json!({
                 "active_model": { "provider": "lmstudio", "model": "local" },
-                "delegation": { "maxParallel": 2 }
+                "delegation": { "maxParallel": 2 },
+                // The fixture's authored leaf is intentionally limited to
+                // `read`; disable config-projected web commands so they do
+                // not turn that real child surface Dynamic.
+                "web": { "provider": "custom" }
             })
             .to_string(),
         )

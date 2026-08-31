@@ -5678,7 +5678,9 @@ impl Driver {
             // `recv_group_order_for` returns Ok and after a sibling
             // ReplayParkedInterrupt WaitForStartedSiblings — do not replace
             // history on that tail.
-            if !waiting_for_keep_parked_siblings {
+            let settled_user_turn =
+                self.current_lifecycle_turn_id.is_some() || self.pending_idle_reason.is_some();
+            if !waiting_for_keep_parked_siblings && settled_user_turn {
                 self.maybe_shadow_brief(tx).await;
                 self.maybe_auto_compact(tx).await;
                 self.maybe_schedule_keep_warm().await;

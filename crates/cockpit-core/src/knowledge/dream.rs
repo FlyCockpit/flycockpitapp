@@ -236,25 +236,32 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
         }
     }
 
-    let writes = validate_knowledge_dream_writes(
-        change_set
-            .upserts
-            .iter()
-            .map(|upsert| {
-                let concept = KnowledgeConcept::dream(
-                    upsert.id.clone(),
-                    upsert.concept_type.clone(),
-                    upsert.title.clone(),
-                    upsert.body.clone(),
-                    upsert.citations.clone(),
-                );
-                KnowledgeDreamWrite {
-                    path: concept.path.to_string_lossy().into_owned(),
-                    content: super::serialize_concept(&concept),
-                }
-            })
-            .collect::<Vec<_>>(),
-    )?;
+    let writes = change_set
+        .upserts
+        .iter()
+        .map(|upsert| {
+            let concept = KnowledgeConcept::dream(
+                upsert.id.clone(),
+                upsert.concept_type.clone(),
+                upsert.title.clone(),
+                upsert.body.clone(),
+                upsert.citations.clone(),
+            );
+            KnowledgeDreamWrite {
+                path: concept.path.to_string_lossy().into_owned(),
+                content: super::serialize_concept(&concept),
+            }
+        })
+        .collect::<Vec<_>>();
+    // An orchestrated dream may validly conclude that its source sessions add
+    // no concepts. The interactive `knowledgeDreamApply` contract requires a
+    // non-empty write list, but the sink must still accept that no-op so the
+    // run can record its source sessions as dreamed.
+    let writes = if writes.is_empty() {
+        writes
+    } else {
+        validate_knowledge_dream_writes(writes)?
+    };
     ensure!(
         writes.len() <= super::MAX_KNOWLEDGE_FILES,
         "dream change set exceeds the knowledge file-count limit"
@@ -678,6 +685,21 @@ mod tests {
                 .unwrap()
                 .contains("Keep this")
         );
+    }
+
+    #[test]
+    fn local_sink_accepts_an_empty_orchestrated_change_set() {
+        let root = tempfile::tempdir().unwrap();
+
+        apply_change_set_to_local_bundle(
+            root.path(),
+            &DreamChangeSet {
+                knowledge_base_id: "kb".into(),
+                source_session_ids: vec![Uuid::now_v7()],
+                upserts: Vec::new(),
+            },
+        )
+        .unwrap();
     }
 
     #[test]

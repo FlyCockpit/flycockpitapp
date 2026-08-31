@@ -23047,7 +23047,7 @@ async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
         .read(move |conn| {
             let count = conn.query_row(
                 "SELECT COUNT(*) FROM knowledge_base_session_attachments
-                 WHERE knowledge_base_id = ?1 AND project_root = ?2 AND session_id = ?3",
+                 WHERE kb_id = ?1 AND project_root = ?2 AND session_id = ?3",
                 rusqlite::params!["kb", project_root, session.session_id.to_string()],
                 |row| row.get(0),
             )?;

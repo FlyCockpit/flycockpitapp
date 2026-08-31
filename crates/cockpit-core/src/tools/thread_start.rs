@@ -17,7 +17,14 @@ impl Tool for ThreadStartTool {
     }
 
     fn description(&self) -> &str {
-        "Start a fresh persistent child thread from a message in this chat"
+        "Start a fresh persistent child thread anchored to one recorded message in this chat"
+    }
+
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Start a separate persistent assistant thread from one recorded message when a follow-up deserves its own clean conversation. The new thread keeps only the anchor for navigation and history search; it does not copy this transcript. Use `history_search` to inspect prior context rather than assuming the child inherited it."
+                .to_string(),
+        )
     }
 
     fn effect(&self) -> ToolEffect {
@@ -33,7 +40,8 @@ impl Tool for ThreadStartTool {
                     "description": "Recorded user or assistant message sequence to use as the thread anchor"
                 }
             },
-            "required": ["message_seq"]
+            "required": ["message_seq"],
+            "additionalProperties": false
         })
     }
 

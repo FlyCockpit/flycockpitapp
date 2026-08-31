@@ -997,9 +997,9 @@ mod tests {
         );
         assert!(
             driver.contains(
-                "if !waiting_for_keep_parked_siblings {\n                self.maybe_shadow_brief(tx).await;\n                self.maybe_auto_compact(tx).await;\n            }"
+                "if !waiting_for_keep_parked_siblings {\n                self.maybe_shadow_brief(tx).await;\n                self.maybe_auto_compact(tx).await;\n                self.maybe_schedule_keep_warm().await;\n            }"
             ),
-            "post-select idle tail must not run shadow-brief/auto-compact while persist-on-re-entry owns keep-parked siblings"
+            "post-select idle tail must not run shadow-brief/auto-compact/keep-warm while persist-on-re-entry owns keep-parked siblings"
         );
         let maybe_continue = driver
             .split("async fn maybe_continue_active_goal")

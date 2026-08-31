@@ -4282,7 +4282,26 @@ BEGIN
            AND json_type(NEW.data_json, '$.artifact_projection.preview_head') = 'text'
            AND json_type(NEW.data_json, '$.artifact_projection.preview_tail') = 'text'
            AND json_type(NEW.data_json, '$.artifact_projection.provenance') = 'object'
-           AND (SELECT count(*) FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance'))) = 3
+           -- A spill keeps daemon-private storage identity beside the stable
+           -- tool provenance.  Imported spill artifacts lose only that local
+           -- path, retaining the source/preview contract, so accept the
+           -- tightly-bounded optional spill fields as well as legacy inline
+           -- three-key provenance.
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance')) p
+                 WHERE p.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+           )
+           AND (SELECT count(*) FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance'))) BETWEEN 3 AND 6
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.source') IS NULL
+                OR json_extract(NEW.data_json, '$.artifact_projection.provenance.source') = 'tool_result')
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.preview_lines') IS NULL
+                OR (json_type(NEW.data_json, '$.artifact_projection.provenance.preview_lines') = 'integer'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.preview_lines') BETWEEN 1 AND 10000))
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.blob_path') IS NULL
+                OR (json_type(NEW.data_json, '$.artifact_projection.provenance.blob_path') = 'text'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.blob_path') LIKE 'text-artifacts/%'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.blob_path') NOT LIKE '%..%'))
            AND json_type(NEW.data_json, '$.artifact_projection.provenance.tool') = 'text'
            AND length(CAST(json_extract(NEW.data_json, '$.artifact_projection.provenance.tool') AS BLOB)) BETWEEN 1 AND 256
            AND json_extract(NEW.data_json, '$.artifact_projection.provenance.tool') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
@@ -4341,7 +4360,20 @@ BEGIN
                    OR json_type(p.value, '$.preview_head') IS NOT 'text'
                    OR json_type(p.value, '$.preview_tail') IS NOT 'text'
                    OR json_type(p.value, '$.provenance') IS NOT 'object'
-                   OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) IS NOT 3
+                   OR EXISTS (
+                        SELECT 1 FROM json_each(json_extract(p.value, '$.provenance')) provenance
+                         WHERE provenance.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+                   )
+                   OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) NOT BETWEEN 3 AND 6
+                   OR (json_type(p.value, '$.provenance.source') IS NOT NULL
+                       AND json_extract(p.value, '$.provenance.source') IS NOT 'tool_result')
+                   OR (json_type(p.value, '$.provenance.preview_lines') IS NOT NULL
+                       AND (json_type(p.value, '$.provenance.preview_lines') IS NOT 'integer'
+                            OR json_extract(p.value, '$.provenance.preview_lines') NOT BETWEEN 1 AND 10000))
+                   OR (json_type(p.value, '$.provenance.blob_path') IS NOT NULL
+                       AND (json_type(p.value, '$.provenance.blob_path') IS NOT 'text'
+                            OR json_extract(p.value, '$.provenance.blob_path') NOT LIKE 'text-artifacts/%'
+                            OR json_extract(p.value, '$.provenance.blob_path') LIKE '%..%'))
                    OR json_type(p.value, '$.provenance.tool') IS NOT 'text'
                    OR length(CAST(json_extract(p.value, '$.provenance.tool') AS BLOB)) NOT BETWEEN 1 AND 256
                    OR json_extract(p.value, '$.provenance.tool') GLOB '*[' || char(1) || '-' || char(31) || ']*'
@@ -4482,7 +4514,20 @@ BEGIN
                e.type = 'context_pruned'
                OR json_extract(a.provenance_json, '$.call_id') = e.call_id
            )
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 3
+           AND NOT EXISTS (
+                SELECT 1 FROM json_each(a.provenance_json) provenance
+                 WHERE provenance.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+           )
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) BETWEEN 3 AND 6
+           AND (json_type(a.provenance_json, '$.source') IS NULL
+                OR json_extract(a.provenance_json, '$.source') = 'tool_result')
+           AND (json_type(a.provenance_json, '$.preview_lines') IS NULL
+                OR (json_type(a.provenance_json, '$.preview_lines') = 'integer'
+                    AND json_extract(a.provenance_json, '$.preview_lines') BETWEEN 1 AND 10000))
+           AND (json_type(a.provenance_json, '$.blob_path') IS NULL
+                OR (json_type(a.provenance_json, '$.blob_path') = 'text'
+                    AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
+                    AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'))
     ) THEN RAISE(ABORT, 'tool artifact binding is invalid') END;
     -- The event-owned projection state is the authority for model context.
     -- Do not allow direct SQL to attach a real body to a made-up tool slot,
@@ -4521,7 +4566,7 @@ BEGIN
                     AND json_type(e.data_json, '$.artifact_projection.preview_head') = 'text'
                     AND json_type(e.data_json, '$.artifact_projection.preview_tail') = 'text'
                     AND json_type(e.data_json, '$.artifact_projection.provenance') = 'object'
-                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projection.provenance'))) = 3
+                    AND json_extract(e.data_json, '$.artifact_projection.provenance') = json(a.provenance_json)
                     AND json_extract(e.data_json, '$.artifact_projection.provenance.tool') = json_extract(a.provenance_json, '$.tool')
                     AND json_extract(e.data_json, '$.artifact_projection.provenance.call_id') = json_extract(a.provenance_json, '$.call_id')
                     AND json_type(e.data_json, '$.artifact_projection.provenance.agent_id') = json_type(a.provenance_json, '$.agent_id')
@@ -4566,7 +4611,7 @@ BEGIN
                             OR json_type(p.value, '$.preview_head') IS NOT 'text'
                             OR json_type(p.value, '$.preview_tail') IS NOT 'text'
                             OR json_type(p.value, '$.provenance') IS NOT 'object'
-                            OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) IS NOT 3
+                            OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) NOT BETWEEN 3 AND 6
                             OR json_type(p.value, '$.provenance.tool') IS NOT 'text'
                             OR json_type(p.value, '$.provenance.call_id') IS NOT 'text'
                             OR (json_type(p.value, '$.provenance.agent_id') IS NOT 'text'
@@ -4595,7 +4640,7 @@ BEGIN
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_head') = 'text'
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_tail') = 'text'
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance') = 'object'
-                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance'))) = 3
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance') = json(a.provenance_json)
                     AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.tool') = json_extract(a.provenance_json, '$.tool')
                     AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.call_id') = json_extract(a.provenance_json, '$.call_id')
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.agent_id') = json_type(a.provenance_json, '$.agent_id')

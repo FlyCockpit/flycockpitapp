@@ -12,7 +12,7 @@ use crate::agents::ToolClass;
 /// is unclassified: no verification rule can match it yet.
 pub(crate) fn classify_tool(tool_id: &str) -> Option<ToolClass> {
     match tool_id {
-        "write" | "edit" => Some(ToolClass::ArtifactWrite),
+        "write" | "edit" | "delete" => Some(ToolClass::ArtifactWrite),
         _ => None,
     }
 }

@@ -438,6 +438,7 @@ pub fn known_tool_presentation(tool: &str, args: &Value) -> ToolPresentation {
         "unlock" => tools::unlock::UnlockTool.presentation(args),
         "write" => tools::write::WriteTool.presentation(args),
         "edit" => tools::edit::EditTool.presentation(args),
+        "delete" => tools::delete::DeleteTool.presentation(args),
         "websearch" => tools::web::WebSearchTool.presentation(args),
         "webfetch" => tools::web::WebFetchTool.presentation(args),
         _ => ToolPresentation::default_for(tool, args),

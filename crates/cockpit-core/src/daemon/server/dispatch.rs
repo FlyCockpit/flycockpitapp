@@ -9070,6 +9070,8 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            crate::assistants::validate_named_assistant_name(&assistant_id)
+                .map_err(|error| bad_request(error.to_string()))?;
             let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
@@ -9138,6 +9140,28 @@ async fn handle_serialized_request_impl(
             code: ErrorCode::Internal,
             message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
         }),
+        Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept built-in Assistant settings writes",
+                ));
+            }
+            let soul_edit_mode = match soul_edit_mode.as_str() {
+                "human_only" => crate::assistants::identity::SoulEditMode::HumanOnly,
+                "approve_proposals" => crate::assistants::identity::SoulEditMode::ApproveProposals,
+                "autonomous" => crate::assistants::identity::SoulEditMode::Autonomous,
+                _ => return Err(bad_request("invalid built-in Assistant soul_edit_mode")),
+            };
+            crate::assistants::ensure_primary_assistant(&ctx.db)
+                .await
+                .map_err(internal)?;
+            crate::assistants::set_primary_assistant_soul_edit_mode(&ctx.db, soul_edit_mode)
+                .await
+                .map_err(internal)?;
+            Ok(Response::PrimaryAssistantSoulEditMode {
+                soul_edit_mode: soul_edit_mode_to_wire(soul_edit_mode).to_string(),
+            })
+        }
         Request::UpsertAssistant {
             name,
             description,
@@ -9198,7 +9222,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
             }
-            crate::assistants::validate_assistant_name(&name)
+            crate::assistants::validate_named_assistant_name(&name)
                 .map_err(|error| bad_request(error.to_string()))?;
             if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request("assistant markdown exceeds maximum length"));
@@ -28140,6 +28164,14 @@ pub(super) fn assistant_to_proto(
         definition_revision: None,
         definition_diagnostic: None,
         projection_digest: String::new(),
+    }
+}
+
+fn soul_edit_mode_to_wire(mode: crate::assistants::identity::SoulEditMode) -> &'static str {
+    match mode {
+        crate::assistants::identity::SoulEditMode::HumanOnly => "human_only",
+        crate::assistants::identity::SoulEditMode::ApproveProposals => "approve_proposals",
+        crate::assistants::identity::SoulEditMode::Autonomous => "autonomous",
     }
 }
 

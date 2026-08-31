@@ -1718,6 +1718,7 @@ mod tests {
         crate::assistants::identity::seed_identity_files(&canonical).unwrap();
         let db = Db::open_in_memory().unwrap();
         let cfg = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
             agent_source: canonical.join("assistant.md").display().to_string(),
             soul_edit_mode: crate::assistants::identity::SoulEditMode::HumanOnly,
             soul_hash: crate::assistants::identity::hash_optional_file(

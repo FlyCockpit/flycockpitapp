@@ -13,6 +13,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput, invalid_input};
@@ -20,6 +22,21 @@ use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 pub struct McpTool;
+
+/// A cancelled tool future drops its stack-local state before the dispatcher
+/// invokes [`Tool::on_abandon`]. Keep opaque-effect accounting here, keyed by
+/// the dispatcher-owned context, so the abandonment hook can synchronously
+/// refresh identity hashes before the dispatcher reports completion.
+static ABANDONED_MCP_IDENTITY_ACCOUNTING: LazyLock<
+    Mutex<HashMap<usize, crate::assistants::identity::IdentityShellAccounting>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn identity_accounting_key(ctx: &ToolCtx) -> usize {
+    // The timeout dispatcher owns this exact context for one in-flight call
+    // and passes the same reference to `call` and `on_abandon`. Unlike an
+    // optional provider call id, it is present on every dispatcher entry.
+    ctx as *const ToolCtx as usize
+}
 
 const NORMAL_DESCRIPTION: &str = "Run Python in a sandbox exposing mcp.search, cheap mcp.grep_tool_names, heavier mcp.grep_tool_definitions, mcp.describe, and mcp.invoke. Use try/except around invoke loops.";
 const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
@@ -116,10 +133,30 @@ impl Tool for McpTool {
         crate::knowledge::ensure_workspace_tool_access(ctx, self.name()).await?;
         crate::knowledge::ensure_mcp_host_access(ctx).await?;
 
+        // The script may perform discovery as well as invocation. Discovery
+        // can start a configured stdio MCP server, so the whole opaque MCP
+        // surface is one identity-sensitive host effect, not just
+        // `mcp.invoke`.
+        let identity_accounting =
+            crate::assistants::identity::check_identity_opaque_host_effect(ctx, "MCP tools")
+                .await?;
+
         let script = args
             .get("script")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`script` (a Python string) is required"))?;
+
+        let accounting_key = identity_accounting_key(ctx);
+        if let Some(accounting) = identity_accounting {
+            let mut pending = ABANDONED_MCP_IDENTITY_ACCOUNTING
+                .lock()
+                .expect("MCP identity accounting mutex poisoned");
+            anyhow::ensure!(
+                !pending.contains_key(&accounting_key),
+                "MCP identity accounting already registered for active tool call"
+            );
+            pending.insert(accounting_key, accounting);
+        }
 
         let catalog = ctx.mcp_resolver.catalog();
         if catalog.has_reserved_builtin_server_config()
@@ -130,22 +167,43 @@ impl Tool for McpTool {
         }
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
         let cfg = catalog.to_mcp_config();
-        match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
+        let result = match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
             Ok(out) => Ok(rendered_result_output(out)),
             // Unhandled Monty compile/runtime/OS denial/import/host
             // exceptions are failed parent tool calls (`hard_fail`). Authored
             // try/except that returns a value remains Ok above. Do not infer
             // failure by inspecting successful result text.
             Err(e) => Err(e),
+        };
+        let accounting = ABANDONED_MCP_IDENTITY_ACCOUNTING
+            .lock()
+            .expect("MCP identity accounting mutex poisoned")
+            .remove(&accounting_key);
+        if let Some(accounting) = accounting {
+            accounting.publish().await?;
         }
+        result
     }
 
     async fn on_abandon(&self, ctx: &ToolCtx) -> Result<()> {
+        let accounting = ABANDONED_MCP_IDENTITY_ACCOUNTING
+            .lock()
+            .expect("MCP identity accounting mutex poisoned")
+            .remove(&identity_accounting_key(ctx));
+        // `run_abandon_hook` bounds every tool hook. Retain the token in an
+        // abort-safe guard so that bound cannot discard accounting after the
+        // MCP server may already have committed a write.
+        let accounting = crate::assistants::identity::IdentityAccountingGuard::new(accounting);
         let scope = crate::mcp::transport::stdio::StdioAbandonScope {
             session_id: ctx.session.id,
             tool_call_id: ctx.current_tool_call_id.clone(),
         };
         crate::mcp::transport::stdio::poison_active_for_scope(&scope, "MCP tool abandon").await;
+        // The server may already have committed an identity-file edit before
+        // transport poisoning reaches it. Publish while the dispatcher still
+        // owns abandonment so a subsequent session load cannot call that
+        // model-owned partial effect an external edit.
+        accounting.publish().await?;
         Ok(())
     }
 }

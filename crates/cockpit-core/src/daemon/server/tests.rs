@@ -19006,6 +19006,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             id: Uuid::new_v4(),
         },
         "list_assistants" => Request::ListAssistants,
+        "set_primary_assistant_soul_edit_mode" => Request::SetPrimaryAssistantSoulEditMode {
+            soul_edit_mode: "human_only".into(),
+        },
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
             description: "assistant".into(),
@@ -25035,6 +25038,7 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         let Response::Attached {
             session_id,
             session_entry_mode,
+            active_agent,
             ..
         } = dispatch_matrix_request(&ctx, attach(None, mode))
             .await
@@ -25043,6 +25047,9 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
             panic!("expected Attached");
         };
         assert_eq!(session_entry_mode, mode.into());
+        if mode == proto::NonCodeSessionEntryMode::Assistant {
+            assert_eq!(active_agent, "Assistant");
+        }
         assert!(
             ctx.db.get_session(session_id).await.unwrap().is_none(),
             "lazy session must not require a durable row before reattach"
@@ -27330,6 +27337,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), patch: r#"{"operations":[{"operation":"delete_authored_server","name":"fixture"}]}"#.into(), secret_values_json: "{}".into(), target_scope: None }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveAssistantDefinition { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "22".repeat(32), project_root: "/tmp/project".into(), name: "helper".into(), markdown: "---\n---\n".into(), expected_revision: "rev-1".into(), expected_config_generation: 7 }, kind: "save_assistant_definition", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode: "human_only".into() }, kind: "set_primary_assistant_soul_edit_mode", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAgentInventory { project_root: "/tmp/project".into() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: "/tmp/project".into(), name: "builder".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::MutateAgent { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "33".repeat(32), project_root: "/tmp/project".into(), mutation: cockpit_proto::AgentMutation::ResetAllBuiltins, expected_revision: None }, kind: "mutate_agent", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -27498,6 +27506,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         MarkAppFlagSeen,
         ResolveAssistantSession,
         ListAssistants,
+        SetPrimaryAssistantSoulEditMode,
         UpsertAssistant,
         CreateAssistantSession,
         AutoTitle,
@@ -29851,7 +29860,7 @@ async fn list_agents_returns_chat_ownable_primaries() {
             .iter()
             .map(|agent| agent.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Plan", "Build", "Careful"]
+        vec!["Assistant", "Plan", "Build", "Careful"]
     );
     for agent in &agents {
         assert!(agent.builtin);

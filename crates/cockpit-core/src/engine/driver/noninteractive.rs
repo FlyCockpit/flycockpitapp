@@ -12016,6 +12016,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 coordinator,
                 contract,
                 action_items,
+                &session,
+                approver.as_ref(),
             )
             .await;
             if !wire.is_empty() || proposal_result.is_some() {

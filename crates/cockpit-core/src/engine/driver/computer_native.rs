@@ -503,7 +503,7 @@ impl Drop for GuidanceDelegationDropGuard {
 /// The continuations carry transient screenshots (from the live frame)
 /// only in the wire payload; the coordinator journals only sanitized
 /// `CoordinatedOutcome` values (AC6).
-pub async fn handle_native_computer_items(
+async fn handle_native_computer_items(
     coordinator: Option<&mut ComputerActionCoordinator>,
     contract: ComputerToolContract,
     raw_output: &[serde_json::Value],
@@ -524,8 +524,30 @@ pub(crate) async fn handle_retained_native_computer_items(
     coordinator: &mut ComputerActionCoordinator,
     contract: ComputerToolContract,
     raw_items: Vec<serde_json::Value>,
+    session: &Arc<Session>,
+    approver: Option<&Arc<crate::approval::Approver>>,
 ) -> Vec<serde_json::Value> {
+    if raw_items.is_empty() {
+        return Vec::new();
+    }
+    let accounting = match crate::assistants::identity::check_identity_opaque_session_effect(
+        session,
+        approver,
+        "delegated native computer actions",
+    )
+    .await
+    {
+        Ok(accounting) => crate::assistants::identity::IdentityAccountingGuard::new(accounting),
+        Err(error) => {
+            tracing::warn!(%error, "delegated native computer actions denied by assistant identity policy");
+            return Vec::new();
+        }
+    };
     let continuations = handle_native_computer_items(Some(coordinator), contract, &raw_items).await;
+    if let Err(error) = accounting.publish().await {
+        tracing::error!(%error, "delegated native computer identity accounting failed");
+        return Vec::new();
+    }
     if continuations.is_empty() {
         return Vec::new();
     }
@@ -888,12 +910,14 @@ mod tests {
             "type": "computer_call",
             "action": {"type": "screenshot"}
         })];
-        let wire = handle_retained_native_computer_items(
-            &mut coordinator,
-            ComputerToolContract::OpenAiResponses,
-            raw_items,
-        )
-        .await;
+        let wire = into_wire_items(
+            handle_native_computer_items(
+                Some(&mut coordinator),
+                ComputerToolContract::OpenAiResponses,
+                &raw_items,
+            )
+            .await,
+        );
         assert!(
             wire.is_empty(),
             "a computer_call with no call_id cannot produce a continuation payload"

@@ -14,7 +14,7 @@ use crate::assistants::{
 use crate::assistants::{CreateAssistantSpec, default_home_dir, spec_from_wizard};
 use crate::cli::{
     AssistantCommand, AssistantDeleteArgs, AssistantMediaCommand, AssistantNewArgs,
-    MediaAccountingCommand,
+    AssistantSoulEditMode, MediaAccountingCommand,
 };
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
 use crate::daemon::client::{ensure_assistant_persistent_daemon, ensure_persistent_daemon};
@@ -34,9 +34,29 @@ pub async fn run(
         AssistantCommand::Show { name } => show(&name).await,
         AssistantCommand::Delete(args) => delete(args).await,
         AssistantCommand::Chat { name } => chat(&name, no_sandbox, launch_start).await,
+        AssistantCommand::SoulEditMode { mode } => set_primary_soul_edit_mode(mode).await,
         AssistantCommand::Learn(args) => crate::commands::learn::run(args, no_sandbox).await,
         AssistantCommand::Media { command } => media(command).await,
     }
+}
+
+async fn set_primary_soul_edit_mode(mode: AssistantSoulEditMode) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for built-in Assistant settings")?;
+    let response = daemon
+        .client
+        .request(Request::SetPrimaryAssistantSoulEditMode {
+            soul_edit_mode: mode.as_wire().to_string(),
+        })
+        .await
+        .context("updating built-in Assistant SOUL edit mode")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected built-in Assistant setting: {error}"))?;
+    let Response::PrimaryAssistantSoulEditMode { soul_edit_mode } = response else {
+        bail!("daemon returned unexpected built-in Assistant setting response: {response:?}");
+    };
+    println!("Built-in Assistant SOUL edit mode: {soul_edit_mode}");
+    Ok(())
 }
 
 async fn media(command: AssistantMediaCommand) -> Result<()> {
@@ -119,7 +139,7 @@ fn media_repair_request(
 }
 
 async fn new(args: AssistantNewArgs) -> Result<()> {
-    crate::assistants::validate_assistant_name(&args.name)?;
+    crate::assistants::validate_named_assistant_name(&args.name)?;
     let home_dir = default_home_dir(&args.name)?;
     let descriptor = crate::assistants::descriptor();
     let mut io = StdTerminalIo;
@@ -319,6 +339,7 @@ fn verified_assistant_definition(
 }
 
 async fn delete(args: AssistantDeleteArgs) -> Result<()> {
+    crate::assistants::validate_named_assistant_name(&args.name)?;
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant delete")?;
@@ -464,7 +485,7 @@ async fn fetch_assistant(
 }
 
 async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
-    crate::assistants::validate_assistant_name(name)?;
+    crate::assistants::validate_named_assistant_name(name)?;
     let project_root = std::env::current_dir().context("resolving cwd")?;
     let project_root_str = project_root.to_string_lossy().into_owned();
     let daemon = ensure_assistant_persistent_daemon()

@@ -685,7 +685,7 @@ fn apply_goal_settings_override(
 
 fn tool_family(name: &str) -> &'static str {
     match name {
-        "read" | "write" | "edit" | "unlock" => "files",
+        "read" | "write" | "edit" | "delete" | "unlock" => "files",
         "context_pack" | "code" | "graph" | "search" | "change_impact" | "lsp" => "code intel",
         "bash" | "escalate" | "harness_list" | "harness_invoke" => "execution",
         "task"

@@ -6189,18 +6189,17 @@ pub(super) async fn run_worker(
     // Root primary: Computer entry-mode owns a dedicated root; other sessions
     // use the stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
-    // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`). Issue #75: the mode axis no longer
-    // selects the primary — `defaultPrimaryAgent` governs.
-    let root_agent_name = match session.assistant_name.clone() {
-        Some(name) => name,
-        None if session.session_entry_mode() == proto::SessionEntryMode::Computer => {
-            "Computer".to_string()
-        }
-        None => match prepared_root_launch.as_ref() {
+    // configured default when it's unset/unknown. `assistant_name` carries
+    // identity/knowledge ownership only; it must not replace a built-in root
+    // such as `Assistant`. Computer mode is the one explicit mode-owned root.
+    // Removed stored primaries force the release default (`Build`).
+    let root_agent_name = if session.session_entry_mode() == proto::SessionEntryMode::Computer {
+        "Computer".to_string()
+    } else {
+        match prepared_root_launch.as_ref() {
             Some(prepared) => prepared.root_agent_name.clone(),
             None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
-        },
+        }
     };
     if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {

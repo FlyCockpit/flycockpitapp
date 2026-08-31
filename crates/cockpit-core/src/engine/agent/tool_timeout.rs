@@ -41,6 +41,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("code"),
     ToolTimeoutSafety::abandon_safe("context_pack"),
     ToolTimeoutSafety::abandon_safe("defer_to_orchestrator"),
+    ToolTimeoutSafety::abandon_safe("delete"),
     ToolTimeoutSafety::abandon_safe("delegation_payload_retrieve"),
     ToolTimeoutSafety::abandon_safe("edit"),
     ToolTimeoutSafety::human_blocking("escalate"),

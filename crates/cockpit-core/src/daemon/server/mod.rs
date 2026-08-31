@@ -493,6 +493,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_assistant_summary(assistant, redact);
             }
         }
+        proto::Response::PrimaryAssistantSoulEditMode { .. } => {}
         proto::Response::AssistantSessionCreated { session } => {
             scrub_assistant_session_created(session, redact);
         }
@@ -859,6 +860,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_session_summary(session, redact);
         }
+        proto::Response::PrimaryAssistantSoulEditMode { .. } => {}
         proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
         }
@@ -1884,6 +1886,7 @@ fn finalize_response_projections(
         proto::Response::Assistants { assistants, .. } => assistants
             .iter_mut()
             .for_each(|value| assistant(value, vault)),
+        proto::Response::PrimaryAssistantSoulEditMode { .. } => {}
         proto::Response::AssistantUpserted { assistant: value } => assistant(value, vault),
         proto::Response::AssistantDefinitionSaved {
             assistant: Some(value),
@@ -6492,6 +6495,12 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
         proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
         proto::Response::Assistants { assistants, .. } => {
             assistants.len() <= proto::MAX_ASSISTANT_SUMMARIES && assistants.iter().all(assistant)
+        }
+        proto::Response::PrimaryAssistantSoulEditMode { soul_edit_mode } => {
+            matches!(
+                soul_edit_mode.as_str(),
+                "human_only" | "approve_proposals" | "autonomous"
+            )
         }
         proto::Response::AssistantUpserted { assistant: value } => assistant(value),
         proto::Response::AssistantDefinitionSaved {

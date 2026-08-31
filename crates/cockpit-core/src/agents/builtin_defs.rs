@@ -27,6 +27,7 @@ use super::{
 /// listing order. Drives the override-resolution, listing, and reset
 /// paths. Driven off the code (the factory functions).
 pub const BUILTIN_AGENT_NAMES: &[&str] = &[
+    "Assistant",
     "Build",
     "Careful",
     "builder",
@@ -70,11 +71,12 @@ pub fn is_feature_primary(name: &str) -> bool {
 }
 
 /// Public built-in primaries in the `/agent` listing and Shift+Tab cycle.
-pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful"];
+pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Assistant", "Plan", "Build", "Careful"];
 
 /// Every built-in primary that may own a root session, including hidden
 /// feature-flow primaries.
 pub const BUILTIN_PRIMARY_NAMES: &[&str] = &[
+    "Assistant",
     "Plan",
     "Build",
     "Careful",
@@ -110,6 +112,7 @@ pub fn resolve_primary(requested_or_stored: Option<&str>, configured_default: &s
 /// factory functions compose into the system prompt.
 pub fn embedded_default(name: &str) -> Option<AgentDef> {
     match name {
+        "Assistant" => Some(assistant_def()),
         "Build" => Some(build_def()),
         "Careful" => Some(careful_def()),
         "builder" => Some(builder_def()),
@@ -283,6 +286,16 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     // tool grant: the daemon still intersects them with its host policy and
     // resolves the portable ids uniquely before launch.
     let children: &[&str] = match name {
+        "Assistant" => &[
+            "builder",
+            "Build",
+            "explore",
+            "history",
+            "knowledge",
+            "deepthink",
+            "scout",
+            "computer",
+        ],
         "Build" | "Careful" => &[
             "builder",
             "explore",
@@ -305,7 +318,15 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
             allowed_children: children
                 .iter()
                 .map(|child| AllowedChild::PortableRef {
-                    portable_agent_ref: format!("cockpit/{child}"),
+                    // Built-in agent IDs are lowercase, while `Build` is the
+                    // public primary launch target. Keep the portable identity
+                    // canonical so vNext resolution can surface `Build` as a
+                    // reachable task target.
+                    portable_agent_ref: if *child == "Build" {
+                        "cockpit/build".to_string()
+                    } else {
+                        format!("cockpit/{child}")
+                    },
                 })
                 .collect(),
             max_descendant_depth: Some(1),
@@ -335,6 +356,43 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
         verification: None,
         allowed_knowledge_bases: None,
     }
+}
+
+/// `Assistant` — the user-facing personal-assistant primary. It is fully
+/// file-capable inside the session sandbox, but its role is personal work,
+/// knowledge, and coordination rather than implementation. Coding work is
+/// deliberately handed to a coding agent through `task` by default.
+fn assistant_def() -> AgentDef {
+    let mut def = def_with_normal(
+        "Assistant",
+        "General-purpose personal assistant; file-capable and knowledge-aware, delegates coding work to builder.",
+        AgentMode::Primary,
+        &[
+            "read",
+            "bash",
+            "write",
+            "edit",
+            "delete",
+            "unlock",
+            "semantic_search",
+            "history_search",
+            "skill_manage",
+            "task",
+            "mcp",
+        ],
+        crate::engine::builtin::ASSISTANT_PROMPT,
+        None,
+    );
+    def.tool_descriptions.insert(
+        "task".to_string(),
+        ToolDescriptionSpec::WithVerbose {
+            text: "Delegate coding and computer work by default: use `builder` or `Build` for code changes, `explore` for repository investigation, `knowledge` for cited KB synthesis, and `computer` for display work. Keep the brief self-contained and report the result.".to_string(),
+            verbose_text: Some(
+                "You are a general-purpose personal assistant, not the coding specialist. For code changes, delegate a self-contained implementation brief to `builder` (or `Build` when a primary coding conversation is needed) instead of editing code yourself by default. Use `explore` for repository investigation, `knowledge` for a cited synthesis of KB findings, and `computer` for display work. You retain normal file access for personal artifacts, scratch work, KB maintenance, and small direct changes when that is the clearest way to help; this is guidance, not a prohibition on editing code files. Each delegation brief must state the goal, constraints, relevant paths, and what done looks like. If a task backgrounds, use its task_call_id or await the async result rather than duplicate it.".to_string(),
+            ),
+        },
+    );
+    def
 }
 
 /// `Careful` — the verbose/conservative write-capable primary. It keeps only
@@ -969,6 +1027,63 @@ mod tests {
             listed.iter().any(|name| name == "Careful"),
             "Careful should be public in the primary list: {listed:?}"
         );
+    }
+
+    #[test]
+    fn assistant_is_a_file_capable_public_primary_with_delegated_coding_steer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let def = embedded_default("Assistant").expect("Assistant embedded default");
+        let tools = def.tools.as_ref().expect("Assistant explicit tools");
+
+        assert!(is_builtin_primary("Assistant"));
+        assert!(
+            crate::agents::chat_ownable_primaries(tmp.path())
+                .iter()
+                .any(|name| name == "Assistant")
+        );
+        for tool in [
+            "read",
+            "write",
+            "edit",
+            "unlock",
+            "semantic_search",
+            "history_search",
+            "mcp",
+            "skill_manage",
+            "task",
+        ] {
+            assert!(tools.iter().any(|name| name == tool), "{tool} missing");
+        }
+        assert!(def.prompt.contains("not Cockpit's coding specialist"));
+        let task = def
+            .tool_descriptions
+            .get("task")
+            .expect("Assistant task steering");
+        let task_description = format!("{task:?}");
+        assert!(task_description.contains("builder"));
+        assert!(task_description.contains("Build"));
+        assert!(def
+            .vnext
+            .as_ref()
+            .expect("Assistant vNext declaration")
+            .delegation
+            .allowed_children
+            .iter()
+            .any(|child| matches!(child, AllowedChild::PortableRef { portable_agent_ref } if portable_agent_ref == "cockpit/computer")));
+        assert!(def
+            .vnext
+            .as_ref()
+            .expect("Assistant vNext declaration")
+            .delegation
+            .allowed_children
+            .iter()
+            .any(|child| matches!(child, AllowedChild::PortableRef { portable_agent_ref } if portable_agent_ref == "cockpit/build")));
+        for tool in tools {
+            assert!(
+                crate::engine::builtin::known_agent_tool_names().contains(&tool.as_str()),
+                "Assistant grants unknown tool `{tool}`"
+            );
+        }
     }
 
     #[test]

@@ -694,6 +694,10 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::extended::{
+        ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
+        KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
+    };
     use crate::mcp::config::{DisclosureMode, ServerConfig, Transport};
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -802,6 +806,22 @@ for line in sys.stdin:
         }
     }
 
+    fn local_kb_entry() -> KnowledgeBaseRegistryEntry {
+        KnowledgeBaseRegistryEntry::new(
+            "private".to_string(),
+            "Private".to_string(),
+            "Private local knowledge".to_string(),
+            KnowledgeBaseSource::Local {
+                path: std::path::PathBuf::from(".cockpit/knowledge"),
+            },
+            KnowledgeBaseEmbeddingOwnership::Local,
+            None,
+            None,
+            false,
+            KnowledgeBaseMergePolicy::Auto,
+        )
+    }
+
     async fn host_with_mcp_grant(root: &std::path::Path, server: &str, tool: &str) -> HostContext {
         let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
         ctx.session
@@ -823,6 +843,27 @@ for line in sys.stdin:
             ctx.agent_id.clone(),
             ctx.interrupts.clone(),
         )));
+        HostContext::from_tool_ctx(&ctx)
+    }
+
+    fn host_with_local_kb(root: &std::path::Path) -> HostContext {
+        let knowledge = root.join(".cockpit/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(root);
+        ctx.executing_model_trusted = true;
+        ctx.knowledge_access_trusted = true;
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                ExtendedConfig {
+                    knowledge_bases: vec![local_kb_entry()],
+                    ..Default::default()
+                },
+            ),
+        );
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         HostContext::from_tool_ctx(&ctx)
     }
 
@@ -910,6 +951,23 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(denied["kind"], "approval_noninteractive_denied");
+    }
+
+    #[tokio::test]
+    async fn describe_rejects_model_invoked_external_mcp_when_any_local_kb_exists() {
+        let tmp = fake_stdio_server();
+        let script = tmp.path().join("fake-mcp.py");
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert("fake".into(), stdio_cfg(&script));
+        let grant_root = tempfile::tempdir().unwrap();
+        let host = host_with_local_kb(grant_root.path());
+
+        let err = describe(&cfg, &host, "fake", "count")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("configured local knowledge base"), "{err}");
     }
 
     #[tokio::test]

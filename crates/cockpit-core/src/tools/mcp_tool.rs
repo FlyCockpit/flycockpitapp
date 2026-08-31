@@ -113,7 +113,7 @@ impl Tool for McpTool {
         // configured third-party server, including one with filesystem or
         // command access. This also protects direct Tool callers from
         // bypassing the common dispatcher.
-        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())?;
+        crate::knowledge::ensure_mcp_host_access(ctx)?;
 
         let script = args
             .get("script")
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_model_cannot_reach_configured_mcp_through_trusted_kb() {
+    async fn model_invoked_mcp_is_unavailable_when_any_local_kb_is_configured() {
         let tmp = tempfile::tempdir().unwrap();
         let protected_root = tmp.path().join(".cockpit/knowledge");
         std::fs::create_dir_all(&protected_root).unwrap();
@@ -188,10 +188,12 @@ mod tests {
             crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
             None,
             None,
-            true,
+            false,
             crate::config::extended::KnowledgeBaseMergePolicy::Auto,
         );
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.executing_model_trusted = true;
+        ctx.knowledge_access_trusted = true;
         ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
@@ -209,12 +211,14 @@ mod tests {
                 &ctx,
             )
             .await
-            .expect_err("untrusted models must not reach opaque MCP servers");
+            .expect_err("model-invoked MCP must be denied whenever a local KB exists");
 
         assert!(error.to_string().contains("access denied"), "{error:#}");
         assert!(error.to_string().contains("mcp"), "{error:#}");
         assert!(
-            error.to_string().contains("requires a trusted model"),
+            error
+                .to_string()
+                .contains("configured local knowledge base"),
             "{error:#}"
         );
     }

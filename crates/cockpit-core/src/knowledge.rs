@@ -4593,11 +4593,10 @@ pub(crate) fn ensure_local_knowledge_media_path_access(ctx: &ToolCtx, path: &str
     ensure_local_knowledge_path_access(ctx, &effective)
 }
 
-/// Workspace-wide inspection and opaque host-proxy tools cannot safely prove
-/// which files a model-authored request will touch before it executes. Deny
-/// their entire operation whenever that root contains a trust-required local
-/// KB. Targeted native tools use [`ensure_local_knowledge_path_access`]
-/// instead.
+/// Workspace-wide inspection tools cannot safely prove which files a
+/// model-authored request will touch before they execute. Deny their entire
+/// operation whenever that root contains a trust-required local KB. Targeted
+/// native tools use [`ensure_local_knowledge_path_access`] instead.
 pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Result<()> {
     const UNBOUNDED_HOST_ACCESS_TOOLS: &[&str] = &[
         "code",
@@ -4610,20 +4609,16 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
         "grep",
         "hot",
         "harness_invoke",
-        // An MCP script can invoke any configured third-party server. The
-        // server's runtime capability is not knowable from the outer script,
-        // so this is an opaque host-filesystem proxy just like a workspace
-        // walker when a local KB requires a trusted model.
-        "mcp",
         "search",
         "symbol_find",
         "tree",
         "word",
         "worktree_orchestrate",
     ];
-    if UNBOUNDED_HOST_ACCESS_TOOLS.contains(&tool_name)
-        && !denied_local_knowledge_roots(ctx)?.is_empty()
-    {
+    if !UNBOUNDED_HOST_ACCESS_TOOLS.contains(&tool_name) {
+        return Ok(());
+    }
+    if !denied_local_knowledge_roots(ctx)?.is_empty() {
         bail!(
             "access denied: `{tool_name}` cannot inspect this workspace because it contains a local knowledge base that requires a trusted model"
         );
@@ -4631,17 +4626,24 @@ pub(crate) fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str) -> Re
     Ok(())
 }
 
-/// Reject MCP server access for an untrusted model when a configured local KB
-/// requires a trusted model. A configured server is arbitrary host code: its
+/// Reject model-invoked MCP server access whenever the workspace carries any
+/// configured local KB. A configured server is arbitrary host code: its
 /// initialization, discovery, and tool calls can all inspect the filesystem,
-/// so this must fence the connection boundary rather than only named tools.
-pub(crate) fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
-    if denied_local_knowledge_roots(ctx)?.is_empty() {
+/// so this opaque boundary uses the any-configured-local-KB fence rather than
+/// the trust-required-only workspace-tool gate.
+fn ensure_mcp_host_access_for_model(cwd: &Path, extended: &ExtendedConfig) -> Result<()> {
+    if configured_local_knowledge_roots_for_model(cwd, extended)?.is_empty() {
         return Ok(());
     }
     bail!(
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base that requires a trusted model"
+        "access denied: MCP is unavailable because this workspace contains a configured local knowledge base"
     );
+}
+
+/// Reject MCP server access at the opaque external-MCP boundary whenever the
+/// workspace carries any configured local KB, regardless of per-KB trust mode.
+pub(crate) fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    ensure_mcp_host_access_for_model(&ctx.cwd, &ctx.config.extended())
 }
 
 /// Resolve a workspace-local KB to the filesystem object that owns it.
@@ -8365,6 +8367,35 @@ Inventory facts for warehouse operations.
         assert_eq!(snapshot.entries().len(), 2);
         assert_eq!(snapshot.entries()[0].id, "available");
         assert_eq!(snapshot.entries()[1].id, "restricted");
+    }
+
+    #[test]
+    fn mcp_host_gate_rejects_a_trusted_model_when_a_local_kb_is_configured_without_trust_required()
+    {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(&tmp.path().join("available"));
+        let mut available = project_knowledge_registry_entry();
+        available.id = "available".to_string();
+        available.name = "Available".to_string();
+        available.trust_required = false;
+        available.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("available"),
+        };
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![available],
+            ..Default::default()
+        };
+
+        let denied_roots =
+            denied_local_knowledge_roots_for_model(tmp.path(), &extended, true).unwrap();
+        assert!(denied_roots.is_empty());
+
+        let error = ensure_mcp_host_access_for_model(tmp.path(), &extended)
+            .expect_err("MCP must stay fenced for any configured local KB");
+
+        assert!(error.to_string().contains(
+            "MCP is unavailable because this workspace contains a configured local knowledge base"
+        ));
     }
 
     #[tokio::test]

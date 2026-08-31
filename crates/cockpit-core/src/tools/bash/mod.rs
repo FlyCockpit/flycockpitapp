@@ -2588,6 +2588,7 @@ async fn run_container_shell(
         timeout_ms,
         vec![serde_json::json!({"execute": {"command": command}})],
         resource_lease,
+        false,
     )
     .await
 }
@@ -2788,7 +2789,15 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
-    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects, resource_lease).await
+    run_prepared_command(
+        cmd,
+        ctx,
+        timeout_ms,
+        concrete_effects,
+        resource_lease,
+        attached_knowledge_read,
+    )
+    .await
 }
 
 async fn run_prepared_command(
@@ -2797,6 +2806,7 @@ async fn run_prepared_command(
     timeout_ms: u64,
     concrete_effects: Vec<serde_json::Value>,
     resource_lease: &mut Option<ResourceLeaseGuard>,
+    attached_knowledge_read: bool,
 ) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

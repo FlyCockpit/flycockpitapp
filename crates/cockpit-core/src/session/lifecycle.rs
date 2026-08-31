@@ -861,6 +861,12 @@ impl Session {
             std::fs::canonicalize(&project_root).unwrap_or(project_root)
         };
         #[cfg(any(test, feature = "test-support"))]
+        let legacy_short_fixture_project_id = row.project_id.len() <= 24
+            && row
+                .project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        #[cfg(any(test, feature = "test-support"))]
         let initialize_workspace_scratch = {
             // Test-support rows intentionally use a separate project-id
             // namespace so they cannot publish a process-global workspace
@@ -873,6 +879,13 @@ impl Session {
                 false
             } else if project_id_for(&project_root).ok().as_deref() == Some(&row.project_id) {
                 true
+            } else if legacy_short_fixture_project_id {
+                // The daemon integration tests still create a few low-level
+                // fixture rows directly in the ledger.  Their short labels
+                // are neither workspace-object identities nor safe durable
+                // workspace directory components, so keep them on the
+                // test-only scratch path below.
+                false
             } else {
                 initialize_workspace_scratch
             }
@@ -880,12 +893,6 @@ impl Session {
         let project_id_matches =
             Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
                 == row.project_id;
-        #[cfg(any(test, feature = "test-support"))]
-        let legacy_short_fixture_project_id = row.project_id.len() <= 24
-            && row
-                .project_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
         // Raw test fixtures predate workspace-object identities and enter
         // test-only code with short human labels. Production identities are
         // fixed-length workspace-object digests; deliberately malformed or
@@ -965,7 +972,17 @@ impl Session {
             workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
                 .context("initializing required durable workspace scratch")?
         } else {
-            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)?;
+            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)
+                .or_else(|error| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    if legacy_short_fixture_project_id {
+                        return super::test_fixture_workspace_scratch_path_for_session(
+                            &row.project_id,
+                            row.session_id,
+                        );
+                    }
+                    Err(error)
+                })?;
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
             path

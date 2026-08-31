@@ -17606,6 +17606,35 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "agent_installation_submit_choice"
         | "agent_installation_list"
         | "agent_installation_inspect" => AuthzAllowedOutcome::Response,
+        // Code-root capability probes deliberately use fresh, unknown opaque
+        // authorities. The owner reaches the handler, which rejects the
+        // forged authority after the central owner gate.
+        "attach_existing_code_root_v1"
+        | "close_code_root_attachment_v1"
+        | "attach_existing_code_root_with_acp_ingress_v1"
+        | "close_acp_code_root_attachment_v1"
+        | "read_code_root_v1"
+        | "read_code_root_deliveries_v1"
+        | "ack_code_root_deliveries_v1"
+        | "resolve_code_root_interrupt_v1"
+        | "execute_storage_cleanup"
+        | "set_primary_assistant_soul_edit_mode" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // Root creation requires a configured model; the matrix daemon is
+        // intentionally model-less. Discovery and the owner configuration /
+        // storage read paths remain fully typed on an empty daemon.
+        "create_code_root_v1"
+        | "create_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        "discover_code_roots_v1"
+        | "set_workspace_history_scope"
+        | "get_workspace_history_scope"
+        | "get_storage_report"
+        | "preview_storage_cleanup"
+        | "cancel_all_session_work"
+        | "exit_guard_status"
+        | "release_exit_guard" => AuthzAllowedOutcome::Response,
+        "knowledge_dream_status" | "promote_to_persistent" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Unavailable)
+        }
         // `docs_ask` is authorized for the owner but then resolves workspace
         // trust for its (project_root:None ⇒ daemon canonical cwd) workspace,
         // which the ephemeral matrix daemon never trusts — so it fails closed
@@ -17910,6 +17939,34 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
         authz_owner_only("get_local_operation_settlement"),
+        // Owner-only local-control RPCs added with Code roots, workspace
+        // history consent, storage cleanup, and the attached-session exit
+        // guard. Keep these in the socket authorization inventory: their
+        // product-domain handlers are intentionally heterogeneous, but each
+        // still has to traverse the same owner gate before it can fail or
+        // return its typed result.
+        authz_owner_only("create_code_root_v1"),
+        authz_owner_only("attach_existing_code_root_v1"),
+        authz_owner_only("close_code_root_attachment_v1"),
+        authz_owner_only("create_code_root_with_acp_ingress_v1"),
+        authz_owner_only("attach_existing_code_root_with_acp_ingress_v1"),
+        authz_owner_only("close_acp_code_root_attachment_v1"),
+        authz_owner_only("discover_code_roots_v1"),
+        authz_owner_only("read_code_root_v1"),
+        authz_owner_only("read_code_root_deliveries_v1"),
+        authz_owner_only("ack_code_root_deliveries_v1"),
+        authz_owner_only("resolve_code_root_interrupt_v1"),
+        authz_owner_only("knowledge_dream_status"),
+        authz_owner_only("set_workspace_history_scope"),
+        authz_owner_only("get_workspace_history_scope"),
+        authz_owner_only("get_storage_report"),
+        authz_owner_only("preview_storage_cleanup"),
+        authz_owner_only("execute_storage_cleanup"),
+        authz_owner_only("cancel_all_session_work"),
+        authz_owner_only("promote_to_persistent"),
+        authz_owner_only("exit_guard_status"),
+        authz_owner_only("release_exit_guard"),
+        authz_owner_only("set_primary_assistant_soul_edit_mode"),
     ]
 }
 
@@ -18768,6 +18825,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_media_upload"
             | "finalize_media_upload"
             | "discard_unreferenced_media_attachment"
+            | "cancel_all_session_work"
     )
         // Both kinds gate on `require_attached` before doing any work, in every
         // build profile — the prelude must attach wherever the level can attach
@@ -18790,7 +18848,8 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             kind,
             "read_agent_tree" | "read_agent_attention" | "get_agent_effective_settings"
         ) && level.can_attach())
-        || (kind == "lsp_control" && level.can_write())
+        || (matches!(kind, "lsp_control" | "exit_guard_status" | "release_exit_guard")
+            && level.can_write())
 }
 
 #[cfg(unix)]
@@ -18870,9 +18929,168 @@ fn authz_media_mutation_request(kind: &str) -> Request {
 }
 
 #[cfg(unix)]
+fn authz_opaque_id() -> proto::OpaqueAsciiId128V1 {
+    proto::OpaqueAsciiId128V1::new(Uuid::now_v7().to_string())
+        .expect("generated authz matrix id is valid opaque ASCII")
+}
+
+#[cfg(unix)]
+fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
+    proto::AcpForwardedMcpIngressV1 {
+        version: proto::ACP_FORWARDED_MCP_VERSION_V1,
+        declarations: Vec::new(),
+        client_provenance_id: authz_opaque_id(),
+        ingress_request_id: authz_opaque_id(),
+    }
+}
+
+#[cfg(unix)]
 fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
     let root = project_root.to_string_lossy().into_owned();
     match kind {
+        "create_code_root_v1" => proto::create_code_root_v1_request(
+            root,
+            None,
+            false,
+            false,
+            None,
+            proto::PROTOCOL_VERSION,
+            None,
+            Default::default(),
+        ),
+        "attach_existing_code_root_v1" => proto::attach_existing_code_root_v1_request(
+            session_id,
+            None,
+            None,
+            false,
+            false,
+            None,
+            proto::PROTOCOL_VERSION,
+            None,
+            Default::default(),
+        ),
+        "close_code_root_attachment_v1" => {
+            Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                client_request_id: authz_opaque_id(),
+            })
+        }
+        "create_code_root_with_acp_ingress_v1" => {
+            let Request::CreateCodeRootV1(base) = proto::create_code_root_v1_request(
+                root,
+                None,
+                false,
+                false,
+                None,
+                proto::PROTOCOL_VERSION,
+                None,
+                Default::default(),
+            ) else {
+                unreachable!("Code-root helper returns its documented request variant")
+            };
+            Request::CreateCodeRootWithAcpIngressV1(proto::CreateCodeRootWithAcpIngressV1Request {
+                base,
+                ingress: authz_acp_ingress(),
+            })
+        }
+        "attach_existing_code_root_with_acp_ingress_v1" => {
+            let Request::AttachExistingCodeRootV1(base) =
+                proto::attach_existing_code_root_v1_request(
+                    session_id,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    proto::PROTOCOL_VERSION,
+                    None,
+                    Default::default(),
+                )
+            else {
+                unreachable!("Code-root helper returns its documented request variant")
+            };
+            Request::AttachExistingCodeRootWithAcpIngressV1(
+                proto::AttachExistingCodeRootWithAcpIngressV1Request {
+                    base,
+                    ingress: authz_acp_ingress(),
+                },
+            )
+        }
+        "close_acp_code_root_attachment_v1" => {
+            Request::CloseAcpCodeRootAttachmentV1(proto::CloseAcpCodeRootAttachmentV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                client_request_id: authz_opaque_id(),
+            })
+        }
+        "discover_code_roots_v1" => {
+            Request::DiscoverCodeRootsV1(proto::DiscoverCodeRootsV1Request {
+                workspace_selector: Some(proto::CodeRootWorkspaceSelectorV1 { path: root }),
+                logical_client_id: authz_opaque_id(),
+                cursor: None,
+                limit: 1,
+            })
+        }
+        "read_code_root_v1" => Request::ReadCodeRootV1(proto::ReadCodeRootV1Request {
+            attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                Uuid::now_v7(),
+            ),
+        }),
+        "read_code_root_deliveries_v1" => {
+            Request::ReadCodeRootDeliveriesV1(proto::ReadCodeRootDeliveriesV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                after: None,
+                limit: 1,
+            })
+        }
+        "ack_code_root_deliveries_v1" => {
+            Request::AckCodeRootDeliveriesV1(proto::AckCodeRootDeliveriesV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                through: proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::now_v7()),
+                client_request_id: authz_opaque_id(),
+            })
+        }
+        "resolve_code_root_interrupt_v1" => {
+            Request::ResolveCodeRootInterruptV1(proto::ResolveCodeRootInterruptV1 {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                attention_id: authz_opaque_id(),
+                client_request_id: authz_opaque_id(),
+                selected_choice: authz_opaque_id(),
+            })
+        }
+        "knowledge_dream_status" => Request::KnowledgeDreamStatus {
+            project_root: root,
+            knowledge_base_id: "missing-kb".into(),
+        },
+        "set_workspace_history_scope" => Request::SetWorkspaceHistoryScope {
+            project_root: root,
+            outbound: true,
+            inbound: true,
+        },
+        "get_workspace_history_scope" => Request::GetWorkspaceHistoryScope { project_root: root },
+        "get_storage_report" => Request::GetStorageReport,
+        "preview_storage_cleanup" => Request::PreviewStorageCleanup {
+            target: proto::StorageCleanupTarget::ArchiveSessionsOlderThan {
+                age_days: 30,
+                include_renamed_or_pinned: false,
+            },
+        },
+        "execute_storage_cleanup" => Request::ExecuteStorageCleanup {
+            preview_id: Uuid::now_v7(),
+        },
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "promote_to_persistent" => Request::PromoteToPersistent,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "attach" => attach_existing_request(session_id, project_root),
         "attach_knowledge_base_session" => Request::AttachKnowledgeBaseSession {
             knowledge_base_id: "kb".into(),

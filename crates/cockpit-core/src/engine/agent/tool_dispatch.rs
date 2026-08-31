@@ -2210,6 +2210,12 @@ async fn execute_ordinary_call_unscoped(
         .as_ref()
         .map(crate::agents::ContextPolicy::artifact_preview_lines)
         .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+    // A tool may explicitly retain a body even when it falls below the
+    // automatic spill threshold—for example, a host-capped result with a
+    // small but otherwise inaccessible tail.  The threshold controls only
+    // automatic capture of ordinary inline results, not the tool's explicit
+    // durable artifact contract.
+    let explicit_artifact_capture = artifact_capture.is_some();
     if artifact_capture.is_none()
         && canonical_result_is_text_only
         && result.as_ref().is_ok_and(|output| !output.truncated)
@@ -2225,7 +2231,7 @@ async fn execute_ordinary_call_unscoped(
             Some(capture),
             &output_str,
             recheck_modified_output,
-        ) && capture.content.len() > artifact_spill_bytes
+        ) && (explicit_artifact_capture || capture.content.len() > artifact_spill_bytes)
     });
 
     let truncated = matches!(

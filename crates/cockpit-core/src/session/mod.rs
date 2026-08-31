@@ -2359,6 +2359,25 @@ pub(crate) fn workspace_scratch_path_for_session(
         .join(session_id.to_string()))
 }
 
+/// Isolate direct, pre-identity test fixtures from the production workspace
+/// namespace.  These rows deliberately retain their short labels in the
+/// ledger, so using the label as a directory component would bypass the
+/// production project-id validation.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn test_fixture_workspace_scratch_path_for_session(
+    fixture_project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    let directory_id = project_id_from_workspace_object(&format!(
+        "cockpit-legacy-test-fixture-workspace-v1\\0{fixture_project_id}"
+    ));
+    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
+        .join("test-workspaces")
+        .join(directory_id)
+        .join("sessions")
+        .join(session_id.to_string()))
+}
+
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
 const METADATA_SCHEDULE_SLOTS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 

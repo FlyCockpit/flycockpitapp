@@ -214,6 +214,14 @@ impl HostContext {
         }
     }
 
+    /// The `mcp` grant now admits only non-cockpit MCP servers. The Monty
+    /// runtime and the reserved `cockpit` server remain available without it.
+    pub fn external_mcp_servers_allowed(&self) -> bool {
+        self.native_tool_ctx
+            .as_ref()
+            .is_none_or(|ctx| ctx.mcp_resolver.external_servers_allowed())
+    }
+
     #[allow(dead_code)]
     pub fn empty_for_tests() -> Self {
         Self {

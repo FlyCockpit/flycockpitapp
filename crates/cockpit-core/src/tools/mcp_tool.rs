@@ -38,14 +38,16 @@ fn identity_accounting_key(ctx: &ToolCtx) -> usize {
     ctx as *const ToolCtx as usize
 }
 
-const NORMAL_DESCRIPTION: &str = "Run Python in a sandbox exposing mcp.search, cheap mcp.grep_tool_names, heavier mcp.grep_tool_definitions, mcp.describe, and mcp.invoke. Use try/except around invoke loops.";
+const NORMAL_DESCRIPTION: &str = "Run Python to script native tools, e.g. mcp.invoke('cockpit','read',{'path':'README.md'}), and use mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, mcp.describe, or mcp.invoke.";
 const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
      and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \
      `mcp.grep_tool_definitions(regex)` for heavier regex discovery across names, descriptions, \
      and serialized input schemas, `mcp.describe(server, tool)` when you need one tool's full \
      input schema, and `mcp.invoke(server, tool, args)` to call one. Search or grep before \
-     concluding a capability is missing. Process intermediate results in Python and use a final \
+     concluding a capability is missing. Native cockpit tools are always scriptable, for example \
+     `mcp.invoke(\"cockpit\", \"read\", {\"path\": \"README.md\"})`; non-cockpit servers require \
+     the `mcp` grant. Process intermediate results in Python and use a final \
      expression for the value you want back, for example `hits = mcp.search(\"calendar\")` then \
      `hits`. For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
      `{ok|err}` results so one failure does not abort the loop. If the script returns `None`, \
@@ -131,12 +133,10 @@ impl Tool for McpTool {
         // command access. This also protects direct Tool callers from
         // bypassing the common dispatcher.
         crate::knowledge::ensure_workspace_tool_access(ctx, self.name()).await?;
-        crate::knowledge::ensure_mcp_host_access(ctx).await?;
 
-        // The script may perform discovery as well as invocation. Discovery
-        // can start a configured stdio MCP server, so the whole opaque MCP
-        // surface is one identity-sensitive host effect, not just
-        // `mcp.invoke`.
+        // The script may perform discovery as well as invocation. External
+        // discovery can start a configured stdio MCP server, while native
+        // cockpit calls stay within the ordinary native authority path.
         let identity_accounting =
             crate::assistants::identity::check_identity_opaque_host_effect(ctx, "MCP tools")
                 .await?;

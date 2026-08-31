@@ -3,7 +3,8 @@
 //! MCP tools stay out of context; the model reaches them by writing Python
 //! in the locked-down [`sandbox`] Monty VM via the `mcp` tool
 //! ([`crate::tools::mcp_tool`]), using `mcp.search`/`mcp.describe`/
-//! `mcp.invoke`.
+//! `mcp.invoke`. The runtime and reserved `cockpit` server are available to
+//! every real agent; the legacy `mcp` grant admits only non-cockpit servers.
 //!
 //! Layered config ([`config`]), a source-tagged effective [`resolver`],
 //! three transports ([`transport`]), four auth kinds ([`auth`]), a

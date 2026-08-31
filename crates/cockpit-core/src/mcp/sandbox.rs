@@ -319,6 +319,9 @@ async fn dispatch(
         "invoke" => {
             let server = str_arg(args, 0, "server", "mcp.invoke")?;
             let tool = str_arg(args, 1, "tool", "mcp.invoke")?;
+            if let Err(error) = super::catalog::ensure_external_server_access(host, &server) {
+                return Err(format!("mcp.invoke failed: {error}"));
+            }
             let mut call_args = match args.get(2) {
                 None | Some(MontyObject::None) => Value::Object(Default::default()),
                 Some(obj) => monty_to_json(obj),

@@ -106,6 +106,9 @@ async fn list_tools_for_entry(
 fn forwarded_catalog(
     host: &HostContext,
 ) -> Option<std::sync::Arc<super::forwarded::AcpForwardedMcpCatalogV1>> {
+    if !host.external_mcp_servers_allowed() {
+        return None;
+    }
     host.native_tool_ctx
         .as_ref()
         .and_then(|ctx| ctx.session.forwarded_mcp_catalog())
@@ -135,7 +138,24 @@ async fn list_tools_for_forwarded(
 }
 
 fn catalog_view(cfg: &McpConfig, host: &HostContext) -> EffectiveCatalog {
+    if !host.external_mcp_servers_allowed() {
+        return EffectiveCatalog::default();
+    }
     host.effective_catalog(cfg)
+}
+
+pub(crate) fn ensure_external_server_access(host: &HostContext, server: &str) -> Result<()> {
+    if !builtin::is_builtin_server(server) && !host.external_mcp_servers_allowed() {
+        bail!("external MCP server `{server}` requires the `mcp` grant")
+    }
+    Ok(())
+}
+
+async fn ensure_external_server_host_access(host: &HostContext) -> Result<()> {
+    if let Some(ctx) = host.native_tool_ctx.as_ref() {
+        crate::knowledge::ensure_mcp_host_access(ctx).await?;
+    }
+    Ok(())
 }
 
 /// Fuzzy/keyword search over all enabled servers' tools.
@@ -288,6 +308,8 @@ pub async fn describe(
     if builtin::is_builtin_server(server) {
         return builtin::describe(host, tool);
     }
+    ensure_external_server_access(host, server)?;
+    ensure_external_server_host_access(host).await?;
     if let Some(epoch) = forwarded_catalog(host)
         && let Some(entry) = epoch.entry(server)
     {
@@ -404,6 +426,8 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
+    ensure_external_server_access(host, server)?;
+    ensure_external_server_host_access(host).await?;
     if let Some(epoch) = forwarded_catalog(host)
         && let Some(entry) = epoch.entry(server)
     {

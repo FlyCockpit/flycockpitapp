@@ -795,6 +795,8 @@ mod sessions_activity_tests {
             activity_state,
             archived_at_unix_ms: None,
             pin_count: 0,
+            assistant_inbox_unread: 0,
+            assistant_inbox_latest_source_session_id: None,
         }
     }
 

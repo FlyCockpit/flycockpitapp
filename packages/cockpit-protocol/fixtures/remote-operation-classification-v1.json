@@ -1080,46 +1080,6 @@
       "tag": "get_workspace_trust"
     },
     {
-      "class": "transactional_mutation",
-      "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|outbound:bool|inbound:bool",
-      "fcorRoles": [
-        {
-          "field": "project_root",
-          "role": "project_root",
-          "type": "String"
-        },
-        {
-          "field": "outbound",
-          "role": "param",
-          "type": "bool"
-        },
-        {
-          "field": "inbound",
-          "role": "param",
-          "type": "bool"
-        }
-      ],
-      "fcorSchema": "project_root:String|outbound:bool|inbound:bool",
-      "strategy": "sql_transaction",
-      "tag": "set_workspace_history_scope"
-    },
-    {
-      "class": "read_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "project_root:string",
-      "fcorRoles": [
-        {
-          "field": "project_root",
-          "role": "project_root",
-          "type": "String"
-        }
-      ],
-      "fcorSchema": "project_root:String",
-      "strategy": "none",
-      "tag": "get_workspace_history_scope"
-    },
-    {
       "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string",

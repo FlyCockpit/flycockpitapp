@@ -11350,6 +11350,34 @@ async fn handle_serialized_request_impl(
             })
         }
 
+        Request::ReadAssistantInbox {
+            main_session_id,
+            include_delivered,
+            limit,
+        } => {
+            let items = ctx
+                .db
+                .assistant_inbox_for_main(main_session_id, include_delivered, limit.min(100))
+                .await
+                .map_err(internal)?;
+            let items = items.into_iter().map(assistant_inbox_item_wire).collect();
+            Ok(Response::AssistantInbox {
+                main_session_id,
+                items,
+            })
+        }
+
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id,
+            inbox_item_ids,
+        } => {
+            ctx.db
+                .acknowledge_assistant_inbox_human_read(main_session_id, inbox_item_ids)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::ReadClientSubmissionReceipt {
             session_id,
             client_submission_id,
@@ -18652,6 +18680,33 @@ async fn handle_concurrent_request_impl(
                 messages,
                 has_more,
             })
+        }
+
+        Request::ReadAssistantInbox {
+            main_session_id,
+            include_delivered,
+            limit,
+        } => {
+            let items = ctx
+                .db
+                .assistant_inbox_for_main(main_session_id, include_delivered, limit.min(100))
+                .await
+                .map_err(internal)?;
+            let items = items.into_iter().map(assistant_inbox_item_wire).collect();
+            Ok(Response::AssistantInbox {
+                main_session_id,
+                items,
+            })
+        }
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id,
+            inbox_item_ids,
+        } => {
+            ctx.db
+                .acknowledge_assistant_inbox_human_read(main_session_id, inbox_item_ids)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
         }
         Request::ReadClientSubmissionReceipt {
             session_id,
@@ -29891,5 +29946,22 @@ pub(super) fn paused_work_to_proto(
         daemon_version: row.daemon_version,
         client_version: row.client_version,
         updated_at: row.updated_at,
+    }
+}
+
+fn assistant_inbox_item_wire(
+    item: crate::db::assistant_inbox::AssistantInboxItem,
+) -> proto::AssistantInboxItemWire {
+    proto::AssistantInboxItemWire {
+        inbox_item_id: item.inbox_item_id,
+        assistant_name: item.assistant_name,
+        main_session_id: item.main_session_id,
+        raising_session_id: item.raising_session_id,
+        operation_id: item.operation_id,
+        summary: item.summary,
+        delivery: item.delivery.as_str().to_string(),
+        created_at_unix_ms: item.created_at_unix_ms,
+        delivered_at_unix_ms: item.delivered_at_unix_ms,
+        human_read_at_unix_ms: item.human_read_at_unix_ms,
     }
 }

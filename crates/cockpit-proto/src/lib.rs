@@ -1996,10 +1996,11 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
-    KnowledgeDreamRunOutcome, KnowledgeDreamRunReceipt, Response, ResumeCompactionDefault,
-    ResumeCompactionOffer, RunInvocationCancelOutcome, RunInvocationCancelResultV1,
-    RunInvocationLifecycleState, RunInvocationStatusV1, RunInvocationTerminalReason,
+    ActiveModelState, AssistantInboxItemWire, BtwForkInfo, ClientSubmissionReceiptStatus,
+    ImageIngressAdmissionReceiptV1, KnowledgeDreamRunOutcome, KnowledgeDreamRunReceipt, Response,
+    ResumeCompactionDefault, ResumeCompactionOffer, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};
@@ -4657,6 +4658,8 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "review_guidance_proposal",
         "list_sessions",
         "read_history_page",
+        "read_assistant_inbox",
+        "acknowledge_assistant_inbox_human_read",
         "read_session_messages",
         "read_subagent_history_page",
         "read_agent_attention",
@@ -4707,6 +4710,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "run_invocation_cancel_result",
         "run_invocation_status",
         "session_messages",
+        "assistant_inbox",
         "sessions",
         "session_setup_snapshot",
         "guidance_proposals",

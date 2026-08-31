@@ -83,6 +83,8 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         activity_state: None,
         archived_at_unix_ms: None,
         pin_count: 0,
+        assistant_inbox_unread: 0,
+        assistant_inbox_latest_source_session_id: None,
     }
 }
 

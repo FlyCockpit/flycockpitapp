@@ -38,6 +38,7 @@ pub mod lsp;
 pub mod mcp_tool;
 pub mod plan_doc;
 pub mod question;
+pub mod raise;
 pub mod read;
 pub mod read_image;
 pub mod recall;

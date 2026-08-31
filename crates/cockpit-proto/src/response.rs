@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantInboxItemWire {
+    pub inbox_item_id: Uuid,
+    pub assistant_name: String,
+    pub main_session_id: Uuid,
+    pub raising_session_id: Uuid,
+    pub operation_id: String,
+    pub summary: String,
+    pub delivery: String,
+    pub created_at_unix_ms: i64,
+    pub delivered_at_unix_ms: Option<i64>,
+    pub human_read_at_unix_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageIngressAdmissionReceiptV1 {
@@ -287,6 +302,11 @@ pub enum Response {
         session_id: Uuid,
         messages: Vec<SessionMessage>,
         has_more: bool,
+    },
+
+    AssistantInbox {
+        main_session_id: Uuid,
+        items: Vec<AssistantInboxItemWire>,
     },
 
     ClientSubmissionReceipt {
@@ -1626,6 +1646,7 @@ macro_rules! response_variants {
             (Response::SubagentTranscript { .. }, "subagent_transcript");
             (Response::Sessions { .. }, "sessions");
             (Response::SessionMessages { .. }, "session_messages");
+            (Response::AssistantInbox { .. }, "assistant_inbox");
             (Response::ClientSubmissionReceipt { .. }, "client_submission_receipt");
             (Response::HistoryPage { .. }, "history_page");
             (Response::SubagentHistoryPage { .. }, "subagent_history_page");

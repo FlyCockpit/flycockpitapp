@@ -1552,6 +1552,7 @@ mod redaction_placeholder_guard_tests {
             dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
+            current_tool_call_scope: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(db)),
             session: Arc::new(session),

@@ -1693,6 +1693,11 @@ pub struct ToolCtx {
     /// model-visible arguments. `bash` may echo it in sandbox failure text so
     /// the model can call `escalate` with the required id.
     pub(crate) current_tool_call_id: Option<String>,
+    /// Daemon-owned scope for the concrete tool-call attempt. It names the
+    /// driver-generated inference call and attempt ordinal, so provider call
+    /// IDs may be used for retry correlation without becoming durable
+    /// operation identities.
+    pub(crate) current_tool_call_scope: Option<String>,
     /// The tool-description steering of the calling agent (issue #75). Read
     /// by tools that vary *behavior* (not just description prose) on the
     /// verbose/terse axis — today only `bash`, which appends a
@@ -1877,6 +1882,7 @@ impl ToolCtx {
             dream_read_scope: self.dream_read_scope.clone(),
             workspace_lease: self.workspace_lease.clone(),
             current_tool_call_id: self.current_tool_call_id.clone(),
+            current_tool_call_scope: self.current_tool_call_scope.clone(),
             tool_steering: self.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),
@@ -2249,6 +2255,7 @@ pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
             | "task"
             | "spawn"
             | "defer_to_orchestrator"
+            | "raise"
             | "start_build"
             | "mcp"
             | "read_image"
@@ -4147,6 +4154,7 @@ mod steering_tests {
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),
             ("question", ToolEffect::Dynamic),
+            ("raise", ToolEffect::Mutating),
             ("read", ToolEffect::ReadOnly),
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),

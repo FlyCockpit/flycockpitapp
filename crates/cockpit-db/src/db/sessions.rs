@@ -281,7 +281,7 @@ pub struct StorageSessionCandidate {
 }
 
 impl SessionRow {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id: String = row.get("session_id")?;
         let session_id = parse_uuid(&id)?;
         let parent_str: Option<String> = row.get("parent_session_id")?;
@@ -3685,6 +3685,27 @@ impl Db {
                 row.session_id,
                 Self::pin_count_conn(conn, row.session_id),
             );
+            let (assistant_inbox_unread, assistant_inbox_latest_source_session_id) = conn
+                .query_row(
+                    "SELECT COUNT(*),
+                            (SELECT raising_session_id FROM assistant_inbox_items newest
+                              WHERE newest.main_session_id = ?1
+                                AND newest.human_read_at_unix_ms IS NULL
+                              ORDER BY newest.created_at_unix_ms DESC,
+                                       newest.inbox_item_id DESC LIMIT 1)
+                       FROM assistant_inbox_items
+                      WHERE main_session_id = ?1 AND human_read_at_unix_ms IS NULL",
+                    [row.session_id.to_string()],
+                    |record| {
+                        let count: i64 = record.get(0)?;
+                        let source: Option<String> = record.get(1)?;
+                        Ok((count.max(0).min(u32::MAX as i64) as u32, source))
+                    },
+                )
+                .map(|(count, source)| {
+                    (count, source.and_then(|value| Uuid::parse_str(&value).ok()))
+                })
+                .unwrap_or((0, None));
             summaries.push(crate::db::wire::SessionSummary {
                 session_id: row.session_id,
                 session_entry_mode: row.session_entry_mode,
@@ -3710,6 +3731,8 @@ impl Db {
                 created_by_principal: row.created_by_principal,
                 shared_with_collaborators: row.shared_with_collaborators,
                 pin_count,
+                assistant_inbox_unread,
+                assistant_inbox_latest_source_session_id,
             });
         }
         Ok(summaries)

@@ -65,6 +65,14 @@ pub struct SessionSummary {
     pub archived_at_unix_ms: Option<i64>,
     #[serde(default)]
     pub pin_count: u32,
+    /// Undelivered assistant-inbox work for this main session. Notify-only
+    /// rows are visible here too, but never count toward agent work budgets.
+    #[serde(default)]
+    pub assistant_inbox_unread: u32,
+    /// Raising thread for the newest unread item; clients use this durable
+    /// backlink to drill into the source conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_inbox_latest_source_session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

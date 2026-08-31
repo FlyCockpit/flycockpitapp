@@ -320,6 +320,7 @@ impl Driver {
             dream_read_scope: self.session.dream_read_scope(),
             workspace_lease: None,
             current_tool_call_id: None,
+            current_tool_call_scope: None,
             tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),

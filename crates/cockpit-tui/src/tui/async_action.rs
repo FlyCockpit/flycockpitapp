@@ -166,6 +166,7 @@ impl AsyncActionKind {
                 | "sessions.list"
                 | "sessions.live"
                 | "sessions.preview"
+                | "sessions.inbox"
                 | "skills.list"
                 | "subagent.history.page" => ReadOnly,
                 "assistant.resolve"
@@ -278,6 +279,10 @@ pub enum AsyncActionPayload {
         before_seq: Option<i64>,
         messages: Vec<cockpit_proto::SessionMessage>,
         has_more: bool,
+    },
+    AssistantInbox {
+        main_session_id: uuid::Uuid,
+        items: Vec<cockpit_proto::AssistantInboxItemWire>,
     },
     ClientSubmissionReceipt {
         client_submission_id: uuid::Uuid,

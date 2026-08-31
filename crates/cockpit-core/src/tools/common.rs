@@ -423,6 +423,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
+            current_tool_call_scope: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session,

@@ -663,6 +663,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "skill",
         "skill_manage",
         "question",
+        "raise",
         "schedule",
         "spawn",
         "worktree_orchestrate",
@@ -913,6 +914,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             condition: None,
         },
         BuiltinToolInventoryItem {
+            family: "Session",
+            name: "raise",
+            summary: "Raise a structured item from an assistant thread to its main inbox.",
+            condition: Some("persistent assistant threads"),
+        },
+        BuiltinToolInventoryItem {
             family: "Utility",
             name: "schedule",
             summary: "Schedule follow-up work.",
@@ -1064,6 +1071,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::skill::SkillTool),
         Arc::new(tools::skill_manage::SkillManageTool),
         Arc::new(tools::question::QuestionTool),
+        Arc::new(tools::raise::RaiseTool),
         Arc::new(tools::defer::DeferTool),
         Arc::new(tools::schedule::ScheduleTool),
         Arc::new(tools::schedule::ForkScheduleTool::new(Arc::new(
@@ -1195,6 +1203,7 @@ pub(crate) fn materialize_tool_by_name(
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
         "skill_manage" => tb.with(Arc::new(tools::skill_manage::SkillManageTool)),
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
+        "raise" => tb.with(Arc::new(tools::raise::RaiseTool)),
         "schedule" => tb.with(Arc::new(tools::schedule::ScheduleTool)),
         "mcp" => tb.with(Arc::new(tools::mcp_tool::McpTool)),
         "webfetch" | "websearch" => tb.with(tools::web::materialize_web_tool(
@@ -2912,9 +2921,15 @@ fn test_host_tool_surface(cwd: &Path, name: &str) -> Option<Vec<String>> {
 fn default_assistant_tools() -> Vec<String> {
     let mut tools = default_custom_tools();
     tools.extend(
-        ["mcp", "history_search", "thread_start", "skill_manage"]
-            .into_iter()
-            .map(str::to_string),
+        [
+            "mcp",
+            "history_search",
+            "thread_start",
+            "raise",
+            "skill_manage",
+        ]
+        .into_iter()
+        .map(str::to_string),
     );
     tools
 }

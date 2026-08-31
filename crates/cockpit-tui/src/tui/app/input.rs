@@ -946,6 +946,12 @@ impl App {
                         self.overlay = Overlay::Sessions(pane);
                         self.start_sessions_preview_action(session_id, before_seq);
                     }
+                    Some(crate::tui::sessions_pane::SessionsOutcome::LoadInbox {
+                        main_session_id,
+                    }) => {
+                        self.overlay = Overlay::Sessions(pane);
+                        self.start_sessions_inbox_action(main_session_id);
+                    }
                     Some(crate::tui::sessions_pane::SessionsOutcome::Mutate(request)) => {
                         self.overlay = Overlay::Sessions(pane);
                         self.start_sessions_mutation_action(request);

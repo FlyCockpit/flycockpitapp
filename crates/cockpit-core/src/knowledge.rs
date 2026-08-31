@@ -919,10 +919,37 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeDreamCommit {
     pub knowledge_base_id: String,
+    /// The only two durable KB authoring origins at launch. Native human
+    /// edits deliberately share the dream transaction/fence, but must never
+    /// be represented as dream output in Git history.
+    pub origin: KnowledgeCommitOrigin,
     pub model: String,
     pub sessions_dreamed: usize,
     pub concepts_written: usize,
     pub data_files_written: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeCommitOrigin {
+    Dream,
+    Human,
+}
+
+/// A resolved local KB concept target admitted for the explicit human-edit
+/// path. This is intentionally not a general filesystem capability: callers
+/// may use it only with [`apply_human_knowledge_concept_edit`].
+#[derive(Debug, Clone)]
+pub(crate) struct HumanKnowledgeConceptTarget {
+    knowledge_base_id: String,
+    root: PathBuf,
+    relative_path: PathBuf,
+    merge_policy: KnowledgeBaseMergePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HumanKnowledgeEditOutcome {
+    pub(crate) git: KnowledgeDreamGitOutcome,
+    pub(crate) applied: bool,
 }
 
 /// Git is an optional durability enhancement for a local KB.  A deferred
@@ -944,8 +971,26 @@ pub enum KnowledgeDreamGitOutcome {
     Deferred {
         branch: Option<String>,
         commit: Option<String>,
+        /// The mutation crossed Git's irreversible commit boundary, but a
+        /// later local bookkeeping or transport step could not complete.
+        /// `commit` can be absent when resolving the new `HEAD` itself
+        /// failed, so callers must not infer this state from the SHA alone.
+        committed: bool,
         reason: String,
     },
+}
+
+impl KnowledgeDreamGitOutcome {
+    fn committed_locally(&self) -> bool {
+        matches!(
+            self,
+            Self::Committed { .. }
+                | Self::Deferred {
+                    committed: true,
+                    ..
+                }
+        )
+    }
 }
 
 enum PreparedKnowledgeGit {
@@ -956,6 +1001,47 @@ enum PreparedKnowledgeGit {
     },
     Skipped(String),
     Deferred(String),
+}
+
+/// Selects how a validated mutation reaches Git's index. Dream writes retain
+/// their existing path-based projection. A human edit instead supplies the
+/// exact bytes that passed the descriptor-bound validation, so Git never
+/// reopens the concept pathname after that validation boundary.
+enum KnowledgeGitStaging {
+    Worktree,
+    ExactFile {
+        relative_path: PathBuf,
+        content: Vec<u8>,
+    },
+}
+
+enum KnowledgeGitCommitIndex<'a> {
+    Worktree,
+    ExactFile {
+        index_path: &'a Path,
+        empty_hooks_path: &'a Path,
+        relative_path: &'a Path,
+        blob: &'a str,
+    },
+}
+
+impl KnowledgeGitCommitIndex<'_> {
+    fn refresh_worktree_paths(&self) -> bool {
+        matches!(self, Self::Worktree)
+    }
+
+    fn environment(&self) -> Option<(&str, &std::ffi::OsStr)> {
+        match self {
+            Self::Worktree => None,
+            Self::ExactFile { index_path, .. } => Some(("GIT_INDEX_FILE", index_path.as_os_str())),
+        }
+    }
+}
+
+impl KnowledgeGitStaging {
+    fn requires_git(&self) -> bool {
+        matches!(self, Self::ExactFile { .. })
+    }
 }
 
 /// Wait for the write fence without pinning an async executor worker.  The
@@ -992,7 +1078,7 @@ pub(crate) fn apply_knowledge_dream<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path) -> Result<()>,
+    F: FnOnce(&Path, &fs::File) -> Result<()>,
 {
     apply_knowledge_dream_cancellable(root, merge_policy, dream, &CancellationToken::new(), apply)
 }
@@ -1009,7 +1095,28 @@ fn apply_knowledge_dream_cancellable<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path) -> Result<()>,
+    F: FnOnce(&Path, &fs::File) -> Result<()>,
+{
+    apply_knowledge_dream_cancellable_with_staging(
+        root,
+        merge_policy,
+        dream,
+        cancel,
+        KnowledgeGitStaging::Worktree,
+        apply,
+    )
+}
+
+fn apply_knowledge_dream_cancellable_with_staging<F>(
+    root: &Path,
+    merge_policy: KnowledgeBaseMergePolicy,
+    dream: &KnowledgeDreamCommit,
+    cancel: &CancellationToken,
+    staging: KnowledgeGitStaging,
+    apply: F,
+) -> Result<KnowledgeDreamGitOutcome>
+where
+    F: FnOnce(&Path, &fs::File) -> Result<()>,
 {
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
@@ -1019,46 +1126,66 @@ where
     let process_lock = acquire_knowledge_write_process_lock_cancellable(root, cancel)?;
     process_lock.revalidate_root()?;
     let mutation_root = process_lock.mutation_root();
-    let prepared = prepare_knowledge_git(&mutation_root, merge_policy, &dream.knowledge_base_id);
+    let prepared = prepare_knowledge_git(
+        &mutation_root,
+        merge_policy,
+        &dream.knowledge_base_id,
+        dream.origin,
+    );
 
     if let PreparedKnowledgeGit::Deferred(reason) = &prepared {
         return Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: None,
             commit: None,
+            committed: false,
             reason: reason.clone(),
         });
     }
 
+    if let PreparedKnowledgeGit::Skipped(reason) = &prepared
+        && staging.requires_git()
+    {
+        bail!("human knowledge edits require an available Git fence before mutation: {reason}");
+    }
+
     let before_paths = match &prepared {
-        PreparedKnowledgeGit::Active { .. } => match versioned_knowledge_paths(&mutation_root) {
-            Ok(paths) => Some(paths),
-            Err(error) => {
-                // Parsing the pre-write bundle is required to record deletions
-                if let PreparedKnowledgeGit::Active {
-                    restore_branch: Some(restore_branch),
-                    ..
-                } = &prepared
-                {
-                    let _ = restore_knowledge_branch(&mutation_root, restore_branch);
+        PreparedKnowledgeGit::Active { .. }
+            if matches!(&staging, KnowledgeGitStaging::Worktree) =>
+        {
+            match versioned_knowledge_paths(&mutation_root) {
+                Ok(paths) => Some(paths),
+                Err(error) => {
+                    // Parsing the pre-write bundle is required to record deletions
+                    if let PreparedKnowledgeGit::Active {
+                        restore_branch: Some(restore_branch),
+                        ..
+                    } = &prepared
+                    {
+                        let _ = restore_knowledge_branch(&mutation_root, restore_branch);
+                    }
+                    return Ok(KnowledgeDreamGitOutcome::Deferred {
+                        branch: None,
+                        commit: None,
+                        committed: false,
+                        reason: format!("validating existing knowledge for Git failed: {error}"),
+                    });
                 }
-                return Ok(KnowledgeDreamGitOutcome::Deferred {
-                    branch: None,
-                    commit: None,
-                    reason: format!("validating existing knowledge for Git failed: {error}"),
-                });
             }
-        },
+        }
+        PreparedKnowledgeGit::Active { .. } => None,
         PreparedKnowledgeGit::Skipped(_) => None,
         PreparedKnowledgeGit::Deferred(_) => unreachable!("deferred preparation returned early"),
     };
 
     // The supplied path is descriptor-bound on Linux and has been proven to
-    // name the held root everywhere else. Callers must write only through it.
+    // name the held root everywhere else. The retained descriptor is passed
+    // alongside it so a mutation that needs to traverse descendants can keep
+    // every component-relative operation beneath the admitted root.
     if cancel.is_cancelled() {
         bail!("knowledge dream write cancelled before applying model output");
     }
     process_lock.revalidate_root()?;
-    let applied = apply(&mutation_root);
+    let applied = apply(&mutation_root, process_lock.directory());
     if let Err(error) = applied {
         if matches!(&prepared, PreparedKnowledgeGit::Active { .. })
             && let Err(cleanup_error) = restore_knowledge_dream_worktree(&mutation_root)
@@ -1086,6 +1213,7 @@ where
         PreparedKnowledgeGit::Deferred(reason) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: None,
             commit: None,
+            committed: false,
             reason,
         }),
         PreparedKnowledgeGit::Active {
@@ -1098,14 +1226,14 @@ where
                 &branch,
                 remote.as_deref(),
                 dream,
-                before_paths
-                    .as_ref()
-                    .expect("active Git preparation has a baseline"),
+                before_paths.as_ref(),
+                &staging,
             ) {
                 Ok(outcome) => Ok(outcome),
                 Err(error) => Ok(KnowledgeDreamGitOutcome::Deferred {
                     branch: Some(branch.clone()),
                     commit: None,
+                    committed: false,
                     reason: format!("recording dream history failed: {error}"),
                 }),
             };
@@ -1119,6 +1247,10 @@ where
                 return Ok(KnowledgeDreamGitOutcome::Deferred {
                     branch: Some(branch),
                     commit,
+                    committed: outcome
+                        .as_ref()
+                        .ok()
+                        .is_some_and(KnowledgeDreamGitOutcome::committed_locally),
                     reason: format!(
                         "restoring the knowledge base branch after review failed: {error}"
                     ),
@@ -1134,6 +1266,7 @@ fn prepare_knowledge_git(
     root: &Path,
     merge_policy: KnowledgeBaseMergePolicy,
     knowledge_base_id: &str,
+    origin: KnowledgeCommitOrigin,
 ) -> PreparedKnowledgeGit {
     let probe = match crate::git::run_git(root, &["rev-parse", "--show-toplevel"]) {
         Ok(probe) => probe,
@@ -1257,8 +1390,8 @@ fn prepare_knowledge_git(
     }
 
     let restore_branch = branch.clone();
-    let branch = match merge_policy {
-        KnowledgeBaseMergePolicy::Auto => {
+    let branch = match (merge_policy, origin) {
+        (KnowledgeBaseMergePolicy::Auto, _) => {
             if let Some(remote_name) = remote.as_deref()
                 && let Err(error) =
                     knowledge_git_rebase_remote_branch(root, remote_name, &branch, true)
@@ -1267,7 +1400,16 @@ fn prepare_knowledge_git(
             }
             branch
         }
-        KnowledgeBaseMergePolicy::Review => {
+        (KnowledgeBaseMergePolicy::Review, KnowledgeCommitOrigin::Human) => {
+            if let Some(remote_name) = remote.as_deref()
+                && let Err(error) =
+                    knowledge_git_rebase_remote_branch(root, remote_name, &branch, true)
+            {
+                return PreparedKnowledgeGit::Deferred(error.to_string());
+            }
+            branch
+        }
+        (KnowledgeBaseMergePolicy::Review, KnowledgeCommitOrigin::Dream) => {
             let review_branch = format!(
                 "cockpit/dream/{}/{}",
                 git_branch_component(knowledge_base_id),
@@ -1296,7 +1438,8 @@ fn prepare_knowledge_git(
     };
 
     PreparedKnowledgeGit::Active {
-        restore_branch: (merge_policy == KnowledgeBaseMergePolicy::Review)
+        restore_branch: (merge_policy == KnowledgeBaseMergePolicy::Review
+            && origin == KnowledgeCommitOrigin::Dream)
             .then_some(restore_branch),
         branch,
         remote,
@@ -1308,19 +1451,35 @@ fn commit_knowledge_dream(
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
-    before_paths: &BTreeSet<PathBuf>,
+    before_paths: Option<&BTreeSet<PathBuf>>,
+    staging: &KnowledgeGitStaging,
 ) -> Result<KnowledgeDreamGitOutcome> {
+    if let KnowledgeGitStaging::ExactFile {
+        relative_path,
+        content,
+    } = staging
+    {
+        return commit_exact_knowledge_file(root, branch, remote, dream, relative_path, content);
+    }
+
     let paths = match versioned_knowledge_paths(root) {
         Ok(paths) => paths,
         Err(error) => {
             return Ok(KnowledgeDreamGitOutcome::Deferred {
                 branch: Some(branch.to_string()),
                 commit: None,
+                committed: false,
                 reason: format!("validating dream output for Git failed: {error}"),
             });
         }
     };
-    let paths: BTreeSet<_> = paths.union(before_paths).cloned().collect();
+    // `BTreeSet` de-duplicates and orders the union before we hand the exact
+    // selected path list to Git. The commit boundary consumes a slice so its
+    // path set remains identical to the one used for staging.
+    let paths: Vec<_> = paths
+        .union(before_paths.expect("worktree Git staging has a pre-mutation baseline"))
+        .cloned()
+        .collect();
     if paths.is_empty() {
         return Ok(KnowledgeDreamGitOutcome::NoChanges {
             branch: branch.to_string(),
@@ -1350,6 +1509,145 @@ fn commit_knowledge_dream(
         );
     }
 
+    commit_staged_knowledge_dream(
+        root,
+        branch,
+        remote,
+        dream,
+        &paths,
+        KnowledgeGitCommitIndex::Worktree,
+    )
+}
+
+/// Stage a validated human concept from its exact bytes, rather than asking
+/// Git to reopen its pathname. This keeps the Git object and commit bound to
+/// the descriptor-validated publication even when an unrelated process races
+/// the working tree after validation.
+fn commit_exact_knowledge_file(
+    root: &Path,
+    branch: &str,
+    remote: Option<&str>,
+    dream: &KnowledgeDreamCommit,
+    relative_path: &Path,
+    content: &[u8],
+) -> Result<KnowledgeDreamGitOutcome> {
+    let blob = match crate::git::run_git_checked_with_input(
+        root,
+        &["hash-object", "-w", "--stdin"],
+        content,
+    ) {
+        Ok(blob) => blob,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "hashing validated human output",
+                error.to_string(),
+            );
+        }
+    };
+    let blob = std::str::from_utf8(&blob)
+        .context("Git returned a non-UTF-8 object ID for validated human output")?
+        .trim();
+    ensure!(
+        !blob.is_empty() && blob.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Git returned an invalid object ID for validated human output"
+    );
+    let git_dir = knowledge_git_dir(root)?;
+    let isolated = tempfile::Builder::new()
+        .prefix("flycockpit-human-index-")
+        .tempdir_in(&git_dir)
+        .context("creating an isolated Git index for validated human output")?;
+    let index_path = isolated.path().join("index");
+    let empty_hooks_path = isolated.path().join("empty-hooks");
+    fs::create_dir(&empty_hooks_path)
+        .context("creating an empty Git hooks directory for validated human output")?;
+    let index = KnowledgeGitCommitIndex::ExactFile {
+        index_path: &index_path,
+        empty_hooks_path: &empty_hooks_path,
+        relative_path,
+        blob,
+    };
+    let read_tree = match knowledge_git_with_index(root, &index, &["read-tree", "HEAD"]) {
+        Ok(read_tree) => read_tree,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "preparing the isolated human Git index",
+                error.to_string(),
+            );
+        }
+    };
+    if !read_tree.success {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "preparing the isolated human Git index",
+            read_tree.stderr.trim().to_string(),
+        );
+    }
+    let cacheinfo = format!("100644,{blob},{}", rel_string(relative_path));
+    let staged = match knowledge_git_with_index(
+        root,
+        &index,
+        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+    ) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "staging validated human output",
+                error.to_string(),
+            );
+        }
+    };
+    if !staged.success {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "staging validated human output",
+            staged.stderr.trim().to_string(),
+        );
+    }
+    if let Err(error) = run_knowledge_pre_commit_hook(root, &index) {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "running the knowledge pre-commit hook",
+            error.to_string(),
+        );
+    }
+    if let Err(error) = validate_exact_knowledge_git_index(root, &index) {
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "validating the isolated human Git index",
+            error.to_string(),
+        );
+    }
+    commit_staged_knowledge_dream(
+        root,
+        branch,
+        remote,
+        dream,
+        &[relative_path.to_path_buf()],
+        index,
+    )
+}
+
+/// Commit the selected index entries. Exact-byte staging uses an isolated
+/// index so neither a hook nor another Git process can add an unvalidated
+/// entry to the human commit. The normal worktree path retains `--only`.
+fn commit_staged_knowledge_dream(
+    root: &Path,
+    branch: &str,
+    remote: Option<&str>,
+    dream: &KnowledgeDreamCommit,
+    paths: &[PathBuf],
+    index: KnowledgeGitCommitIndex<'_>,
+) -> Result<KnowledgeDreamGitOutcome> {
     let mut cached_args = vec![
         "diff".to_string(),
         "--cached".to_string(),
@@ -1358,7 +1656,7 @@ fn commit_knowledge_dream(
     ];
     cached_args.extend(paths.iter().map(|path| rel_string(path)));
     let cached_refs: Vec<_> = cached_args.iter().map(String::as_str).collect();
-    let changed = match knowledge_git(root, &cached_refs) {
+    let changed = match knowledge_git_with_index(root, &index, &cached_refs) {
         Ok(changed) => changed,
         Err(error) => {
             return deferred_knowledge_dream_after_rollback(
@@ -1396,14 +1694,23 @@ fn commit_knowledge_dream(
         "-c".to_string(),
         "commit.gpgSign=false".to_string(),
         "commit".to_string(),
-        "--only".to_string(),
         "-m".to_string(),
         message,
     ];
-    commit_args.push("--".to_string());
-    commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    if index.refresh_worktree_paths() {
+        commit_args.push("--only".to_string());
+        commit_args.push("--".to_string());
+        commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    } else if let KnowledgeGitCommitIndex::ExactFile {
+        empty_hooks_path, ..
+    } = &index
+    {
+        commit_args.insert(0, format!("core.hooksPath={}", empty_hooks_path.display()));
+        commit_args.insert(0, "-c".to_string());
+        commit_args.push("--no-verify".to_string());
+    }
     let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
-    let committed = match knowledge_git(root, &commit_refs) {
+    let committed = match knowledge_git_with_index(root, &index, &commit_refs) {
         Ok(committed) => committed,
         Err(error) => {
             return deferred_knowledge_dream_after_rollback(
@@ -1422,7 +1729,29 @@ fn commit_knowledge_dream(
             committed.stderr.trim().to_string(),
         );
     }
-    let commit = crate::git::head_sha(root)?;
+    let commit = match crate::git::head_sha(root) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                None,
+                error.to_string(),
+            ));
+        }
+    };
+    if let KnowledgeGitCommitIndex::ExactFile {
+        relative_path,
+        blob,
+        ..
+    } = &index
+        && let Err(error) = stage_exact_knowledge_file_in_primary_index(root, relative_path, blob)
+    {
+        return Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(commit),
+            format!("synchronizing the primary Git index after the human commit failed: {error}"),
+        ));
+    }
 
     let Some(remote) = remote else {
         return Ok(KnowledgeDreamGitOutcome::Committed {
@@ -1431,7 +1760,17 @@ fn commit_knowledge_dream(
             pushed: false,
         });
     };
-    if knowledge_git_push(root, remote, branch)?.success {
+    let first_push = match knowledge_git_push(root, remote, branch) {
+        Ok(push) => push,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                Some(commit),
+                format!("pushing knowledge output failed: {error}"),
+            ));
+        }
+    };
+    if first_push.success {
         return Ok(KnowledgeDreamGitOutcome::Committed {
             commit,
             branch: branch.to_string(),
@@ -1443,35 +1782,54 @@ fn commit_knowledge_dream(
     // and try once more. A conflict is aborted so the next ledger-driven dream
     // run starts from a clean repository; no force-push is ever attempted.
     if let Err(error) = knowledge_git_fetch(root, remote) {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: Some(commit),
-            reason: error.to_string(),
-        });
+        return Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(commit),
+            error.to_string(),
+        ));
     }
     if let Err(error) = knowledge_git_rebase_remote_branch(root, remote, branch, true) {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: Some(commit),
-            reason: error.to_string(),
-        });
+        return Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(commit),
+            error.to_string(),
+        ));
     }
-    let pushed = knowledge_git_push(root, remote, branch)?;
+    let rebased_commit = match crate::git::head_sha(root) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                None,
+                error.to_string(),
+            ));
+        }
+    };
+    let pushed = match knowledge_git_push(root, remote, branch) {
+        Ok(push) => push,
+        Err(error) => {
+            return Ok(deferred_after_knowledge_commit(
+                branch,
+                Some(rebased_commit),
+                format!("pushing rebased knowledge output failed: {error}"),
+            ));
+        }
+    };
     if pushed.success {
         Ok(KnowledgeDreamGitOutcome::Committed {
-            commit: crate::git::head_sha(root)?,
+            commit: rebased_commit,
             branch: branch.to_string(),
             pushed: true,
         })
     } else {
-        Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: Some(commit),
-            reason: format!(
+        Ok(deferred_after_knowledge_commit(
+            branch,
+            Some(rebased_commit),
+            format!(
                 "pushing dream output was rejected after rebase retry: {}",
                 pushed.stderr.trim()
             ),
-        })
+        ))
     }
 }
 
@@ -1511,16 +1869,154 @@ fn deferred_knowledge_dream_after_rollback(
         Ok(()) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: Some(branch.to_string()),
             commit: None,
+            committed: false,
             reason: format!("{operation} failed: {failure}"),
         }),
         Err(cleanup_error) => Ok(KnowledgeDreamGitOutcome::Deferred {
             branch: Some(branch.to_string()),
             commit: None,
+            committed: false,
             reason: format!(
                 "{operation} failed: {failure}; refusing automatic re-entry because cleanup failed: {cleanup_error}"
             ),
         }),
     }
+}
+
+fn deferred_after_knowledge_commit(
+    branch: &str,
+    commit: Option<String>,
+    reason: String,
+) -> KnowledgeDreamGitOutcome {
+    KnowledgeDreamGitOutcome::Deferred {
+        branch: Some(branch.to_string()),
+        commit,
+        committed: true,
+        reason,
+    }
+}
+
+fn knowledge_git_with_index(
+    root: &Path,
+    index: &KnowledgeGitCommitIndex<'_>,
+    args: &[&str],
+) -> Result<crate::git::GitOutcome> {
+    match index.environment() {
+        Some(environment) => crate::git::run_git_with_env(root, args, &[environment]),
+        None => crate::git::run_git(root, args),
+    }
+    .with_context(|| format!("running knowledge Git command `git {}`", args.join(" ")))
+}
+
+fn knowledge_git_dir(root: &Path) -> Result<PathBuf> {
+    let git_dir = knowledge_git(root, &["rev-parse", "--git-dir"])?;
+    if !git_dir.success {
+        bail!(
+            "resolving the knowledge Git directory failed: {}",
+            git_dir.stderr.trim()
+        );
+    }
+    let git_dir = PathBuf::from(git_dir.stdout.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        root.join(git_dir)
+    };
+    fs::canonicalize(&git_dir).with_context(|| {
+        format!(
+            "resolving the knowledge Git directory {}",
+            git_dir.display()
+        )
+    })
+}
+
+fn run_knowledge_pre_commit_hook(root: &Path, index: &KnowledgeGitCommitIndex<'_>) -> Result<()> {
+    let KnowledgeGitCommitIndex::ExactFile { .. } = index else {
+        return Ok(());
+    };
+    let hook = knowledge_git(root, &["rev-parse", "--git-path", "hooks/pre-commit"])?;
+    if !hook.success {
+        bail!(
+            "locating the knowledge pre-commit hook failed: {}",
+            hook.stderr.trim()
+        );
+    }
+    let hook = PathBuf::from(hook.stdout.trim());
+    let hook = if hook.is_absolute() {
+        hook
+    } else {
+        root.join(hook)
+    };
+    if !hook.is_file() {
+        return Ok(());
+    }
+    let outcome = knowledge_git_with_index(root, index, &["hook", "run", "pre-commit"])?;
+    if !outcome.success {
+        bail!("pre-commit hook failed: {}", outcome.stderr.trim());
+    }
+    Ok(())
+}
+
+fn validate_exact_knowledge_git_index(
+    root: &Path,
+    index: &KnowledgeGitCommitIndex<'_>,
+) -> Result<()> {
+    let KnowledgeGitCommitIndex::ExactFile {
+        relative_path,
+        blob,
+        ..
+    } = index
+    else {
+        return Ok(());
+    };
+    let changed =
+        knowledge_git_with_index(root, index, &["diff", "--cached", "--name-only", "-z"])?;
+    if !changed.success {
+        bail!(
+            "checking the isolated human Git index failed: {}",
+            changed.stderr.trim()
+        );
+    }
+    let changed = changed
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let expected_path = rel_string(relative_path);
+    ensure!(
+        changed.as_slice() == [expected_path.as_str()],
+        "the pre-commit hook changed unvalidated Git index entries"
+    );
+    let staged =
+        knowledge_git_with_index(root, index, &["ls-files", "--stage", "--", &expected_path])?;
+    if !staged.success {
+        bail!(
+            "reading the isolated human Git index failed: {}",
+            staged.stderr.trim()
+        );
+    }
+    let expected_entry = format!("100644 {blob} 0\t{expected_path}");
+    ensure!(
+        staged.stdout.trim_end() == expected_entry,
+        "the pre-commit hook changed the validated human concept in the Git index"
+    );
+    Ok(())
+}
+
+fn stage_exact_knowledge_file_in_primary_index(
+    root: &Path,
+    relative_path: &Path,
+    blob: &str,
+) -> Result<()> {
+    let cacheinfo = format!("100644,{blob},{}", rel_string(relative_path));
+    let staged = knowledge_git(root, &["update-index", "--add", "--cacheinfo", &cacheinfo])?;
+    if !staged.success {
+        bail!(
+            "updating the primary Git index with the validated human concept failed: {}",
+            staged.stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -1588,14 +2084,21 @@ fn initialize_knowledge_git_history(root: &Path, knowledge_base_id: &str) -> Res
 }
 
 fn structured_dream_commit_message(dream: &KnowledgeDreamCommit) -> String {
-    format!(
-        "dream(kb={}): sessions={} model={} concepts={} data_files={}",
-        git_message_field(&dream.knowledge_base_id),
-        dream.sessions_dreamed,
-        git_message_field(&dream.model),
-        dream.concepts_written,
-        dream.data_files_written,
-    )
+    match dream.origin {
+        KnowledgeCommitOrigin::Dream => format!(
+            "dream(kb={}): sessions={} model={} concepts={} data_files={}",
+            git_message_field(&dream.knowledge_base_id),
+            dream.sessions_dreamed,
+            git_message_field(&dream.model),
+            dream.concepts_written,
+            dream.data_files_written,
+        ),
+        KnowledgeCommitOrigin::Human => format!(
+            "human(kb={}): concepts={}",
+            git_message_field(&dream.knowledge_base_id),
+            dream.concepts_written,
+        ),
+    }
 }
 
 fn git_message_field(value: &str) -> String {
@@ -1989,7 +2492,7 @@ impl KbProvider for LocalKb {
             self.entry.merge_policy,
             dream,
             cancel,
-            |root| mutation.apply(root),
+            |root, _| mutation.apply(root),
         )
     }
 
@@ -4736,6 +5239,26 @@ pub(crate) async fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Pat
     Ok(())
 }
 
+/// Ordinary native filesystem surfaces never write a configured KB. The
+/// explicit human concept route enters through its own narrow sandbox gate;
+/// dreams enter through their provider transaction. Keeping this synchronous
+/// guard here also makes a missing target's lexical path fail closed before a
+/// generic approval can turn it into KB authoring authority.
+pub(crate) fn ensure_no_generic_local_knowledge_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
+    if let Some((entry, _)) = most_specific_local_knowledge_base_for_path(
+        &ctx.config.extended().knowledge_bases,
+        &ctx.cwd,
+        path,
+    )? {
+        bail!(
+            "access denied: `{}` is in local knowledge base `{}`; generic native writes are denied",
+            path.display(),
+            entry.id
+        );
+    }
+    Ok(())
+}
+
 /// Reject a local media path that resolves inside a protected KB before the
 /// media authority opens its held descriptor. Media path sources are always
 /// relative to the session project root; unlike ordinary native tools, they do
@@ -4825,8 +5348,12 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
 /// server is arbitrary host code and an opaque tool call cannot prove that it
 /// will not mutate an attached KB, so this fences the connection boundary
 /// rather than only trust-withheld roots or named tools.
-pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
-    if configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &ctx.config.extended())
+async fn ensure_mcp_host_access_for_session(
+    session: &Session,
+    cwd: &Path,
+    extended: &ExtendedConfig,
+) -> Result<()> {
+    if configured_local_knowledge_roots(session, cwd, extended)
         .await
         .is_empty()
     {
@@ -4835,6 +5362,10 @@ pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
     bail!(
         "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
     );
+}
+
+pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    ensure_mcp_host_access_for_session(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
 }
 
 /// Synchronous conservative subset used while constructing an MCP connection
@@ -4989,6 +5520,616 @@ where
     })
     .await
     .context("knowledge dream write task terminated before completing")?
+}
+
+/// Resolve an explicit human/manual native write target. The root primary is
+/// the only non-dream authoring surface: delegated agents cannot turn an
+/// ordinary write/edit capability into autonomous KB authorship.
+pub(crate) fn human_knowledge_concept_target(
+    ctx: &ToolCtx,
+    requested_path: &Path,
+) -> Result<Option<HumanKnowledgeConceptTarget>> {
+    let candidate = crate::tools::sandbox::effective_native_path(requested_path)
+        .unwrap_or_else(|_| requested_path.to_path_buf());
+    if let Some((entry, root)) = most_specific_local_knowledge_base_for_path(
+        &ctx.config.extended().knowledge_bases,
+        &ctx.cwd,
+        &candidate,
+    )? {
+        if !ctx.root_agent_frame || ctx.agent_id == "Dream" {
+            bail!(
+                "access denied: only the foreground assistant primary may apply an explicit human knowledge-base edit"
+            );
+        }
+        if entry.trust_required && !ctx.executing_model_trusted {
+            bail!(
+                "access denied: local knowledge base `{}` requires a trusted model for human edits",
+                entry.id
+            );
+        }
+        let relative_path = candidate.strip_prefix(&root).with_context(|| {
+            format!(
+                "deriving human knowledge concept path under {}",
+                root.display()
+            )
+        })?;
+        if relative_path.as_os_str().is_empty()
+            || relative_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("md")
+            || matches!(
+                relative_path.to_string_lossy().as_ref(),
+                "index.md" | "log.md"
+            )
+        {
+            bail!(
+                "access denied: native knowledge-base edits may target only Markdown concept documents, not `{}`",
+                candidate.display()
+            );
+        }
+        return Ok(Some(HumanKnowledgeConceptTarget {
+            knowledge_base_id: entry.id.clone(),
+            root,
+            relative_path: relative_path.to_path_buf(),
+            merge_policy: entry.merge_policy,
+        }));
+    }
+    Ok(None)
+}
+
+impl HumanKnowledgeConceptTarget {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Validate and normalize one explicit human concept document. The native
+/// tools own the authoring request; this layer owns the durable OKF marker so
+/// a partial edit cannot accidentally remain dream-authored.
+pub(crate) fn normalize_human_knowledge_concept(
+    target: &HumanKnowledgeConceptTarget,
+    content: &str,
+) -> Result<String> {
+    // OKF parsing is newline-normalized; the native writer reapplies the
+    // target file's line-ending convention after provenance is stamped.
+    let content = content.replace("\r\n", "\n");
+    let mut concept = parse_concept(&target.root, target.relative_path.clone(), &content)?
+        .with_context(|| {
+            format!(
+                "human knowledge edit `{}` must be an OKF concept with frontmatter and a `type`",
+                target.relative_path.display()
+            )
+        })?;
+    concept
+        .frontmatter
+        .insert("provenance".to_string(), "human".to_string());
+    Ok(serialize_concept(&concept))
+}
+
+/// Commit one explicit human concept write through the same process lock,
+/// validation, rollback, and Git fence used by dreams. It intentionally does
+/// not route through a provider snapshot: a native edit is a foreground
+/// primary operation against the configured local source itself.
+pub(crate) async fn apply_human_knowledge_concept_edit(
+    target: HumanKnowledgeConceptTarget,
+    content: String,
+    expected_previous: Option<Vec<u8>>,
+    cancel: CancellationToken,
+) -> Result<HumanKnowledgeEditOutcome> {
+    if cancel.is_cancelled() {
+        bail!("human knowledge edit cancelled before entering the knowledge-base fence");
+    }
+    tokio::task::spawn_blocking(move || {
+        let commit = KnowledgeDreamCommit {
+            knowledge_base_id: target.knowledge_base_id.clone(),
+            origin: KnowledgeCommitOrigin::Human,
+            model: "human".to_string(),
+            sessions_dreamed: 0,
+            concepts_written: 1,
+            data_files_written: 0,
+        };
+        let staging = KnowledgeGitStaging::ExactFile {
+            relative_path: target.relative_path.clone(),
+            content: content.as_bytes().to_vec(),
+        };
+        let git = apply_knowledge_dream_cancellable_with_staging(
+            &target.root,
+            target.merge_policy,
+            &commit,
+            &cancel,
+            staging,
+            |root, directory| {
+                let mutation = write_human_knowledge_concept_nofollow(
+                    directory,
+                    &target.relative_path,
+                    content.as_bytes(),
+                    expected_previous.as_deref(),
+                )?;
+                let applied = (|| {
+                    let bundle = parse_bundle_from_retained_root(root.to_path_buf(), directory)?;
+                    if !bundle.concepts.iter().any(|concept| {
+                        concept.path == target.relative_path
+                            && concept.provenance() == Some("human")
+                    }) {
+                        bail!(
+                            "human knowledge edit {} did not produce a human-provenance concept",
+                            target.relative_path.display()
+                        );
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = applied {
+                    if let Err(restore_error) = rollback_human_knowledge_concept_nofollow(
+                        directory,
+                        &target.relative_path,
+                        mutation,
+                    ) {
+                        return Err(error.context(format!(
+                            "human knowledge edit failed and restoring {} failed: {restore_error}",
+                            target.relative_path.display()
+                        )));
+                    }
+                    return Err(error);
+                }
+                verify_human_knowledge_concept_published_content(
+                    directory,
+                    &target.relative_path,
+                    &mutation,
+                    content.as_bytes(),
+                )?;
+                Ok(())
+            },
+        )?;
+        // A deferred Git transaction has two materially different states:
+        // failures before/during the commit path are rolled back, while a
+        // post-commit local or transport failure retains the edit even when
+        // Git could not resolve a commit SHA for it.
+        let applied = human_knowledge_edit_was_applied(&git);
+        Ok(HumanKnowledgeEditOutcome { git, applied })
+    })
+    .await
+    .context("human knowledge edit task terminated before completing")?
+}
+
+fn human_knowledge_edit_was_applied(git: &KnowledgeDreamGitOutcome) -> bool {
+    git.committed_locally() || matches!(git, KnowledgeDreamGitOutcome::NoChanges { .. })
+}
+
+/// The exact new leaf published by a human concept write. Rollback never
+/// follows a path spelling: it only removes or replaces this inode through a
+/// freshly re-walked, no-follow parent capability.
+#[cfg(unix)]
+#[derive(Debug)]
+struct HumanKnowledgeConceptMutation {
+    previous: Option<Vec<u8>>,
+    written_device: u64,
+    written_inode: u64,
+}
+
+/// Mutate one concept below the retained KB directory.  The process fence
+/// protects cooperating writers; this separate descriptor walk protects the
+/// filesystem boundary against an unrelated process replacing a descendant
+/// with a symlink between admission and mutation.
+#[cfg(unix)]
+fn write_human_knowledge_concept_nofollow(
+    root: &fs::File,
+    relative_path: &Path,
+    content: &[u8],
+    expected_previous: Option<&[u8]>,
+) -> Result<HumanKnowledgeConceptMutation> {
+    let (parent, leaf) = human_knowledge_concept_parent_nofollow(root, relative_path)?;
+    let previous = read_human_knowledge_concept_nofollow(&parent, &leaf)?;
+    if previous.as_deref() != expected_previous {
+        bail!(
+            "human knowledge edit `{}` became stale before entering the knowledge-base fence; read it again before retrying",
+            relative_path.display()
+        );
+    }
+    let (written_device, written_inode) =
+        replace_human_knowledge_concept_nofollow(&parent, &leaf, content, relative_path)?;
+    Ok(HumanKnowledgeConceptMutation {
+        previous,
+        written_device,
+        written_inode,
+    })
+}
+
+/// Prove that the path validated as an OKF bundle is still the exact leaf we
+/// published, and that it still contains the bytes about to be staged from
+/// memory. After this check, Git receives only `expected`, never a path it
+/// could reopen and race.
+#[cfg(unix)]
+fn verify_human_knowledge_concept_published_content(
+    root: &fs::File,
+    relative_path: &Path,
+    mutation: &HumanKnowledgeConceptMutation,
+    expected: &[u8],
+) -> Result<()> {
+    let (parent, leaf) = human_knowledge_concept_parent_nofollow(root, relative_path)?;
+    if !human_knowledge_concept_matches(
+        &parent,
+        &leaf,
+        mutation.written_device,
+        mutation.written_inode,
+    )? {
+        bail!(
+            "human knowledge concept `{}` changed after validation; refusing Git commit",
+            relative_path.display()
+        );
+    }
+    let actual = read_human_knowledge_concept_nofollow(&parent, &leaf)?.with_context(|| {
+        format!(
+            "human knowledge concept `{}` disappeared after validation",
+            relative_path.display()
+        )
+    })?;
+    ensure!(
+        actual.as_slice() == expected,
+        "human knowledge concept `{}` changed after validation; refusing Git commit",
+        relative_path.display()
+    );
+    ensure!(
+        human_knowledge_concept_matches(
+            &parent,
+            &leaf,
+            mutation.written_device,
+            mutation.written_inode,
+        )?,
+        "human knowledge concept `{}` changed while verifying its validated bytes; refusing Git commit",
+        relative_path.display()
+    );
+    Ok(())
+}
+
+/// Restore a failed human edit only when its published inode is still the
+/// entry below the held parent. A replacement or a descendant symlink race
+/// therefore fails closed instead of touching whatever now occupies the
+/// pathname.
+#[cfg(unix)]
+fn rollback_human_knowledge_concept_nofollow(
+    root: &fs::File,
+    relative_path: &Path,
+    mutation: HumanKnowledgeConceptMutation,
+) -> Result<()> {
+    let (parent, leaf) = human_knowledge_concept_parent_nofollow(root, relative_path)?;
+    if !human_knowledge_concept_matches(
+        &parent,
+        &leaf,
+        mutation.written_device,
+        mutation.written_inode,
+    )? {
+        bail!(
+            "human knowledge concept `{}` changed after publication; refusing rollback",
+            relative_path.display()
+        );
+    }
+    match mutation.previous {
+        Some(previous) => {
+            replace_human_knowledge_concept_nofollow(&parent, &leaf, &previous, relative_path)?;
+        }
+        None => {
+            use std::os::fd::AsRawFd as _;
+
+            cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &leaf, 0)
+                .with_context(|| {
+                    format!(
+                        "removing failed human knowledge concept {}",
+                        relative_path.display()
+                    )
+                })?;
+            parent.sync_all().with_context(|| {
+                format!(
+                    "syncing parent directory after removing failed human knowledge concept {}",
+                    relative_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn human_knowledge_concept_parent_nofollow(
+    root: &fs::File,
+    relative_path: &Path,
+) -> Result<(fs::File, std::ffi::CString)> {
+    use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
+
+    let leaf = relative_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("human knowledge concept has no file name")?;
+    let leaf = std::ffi::CString::new(leaf.as_bytes())
+        .context("human knowledge concept file name contains NUL")?;
+    let mut parent = root
+        .try_clone()
+        .context("cloning retained knowledge-base root for human edit")?;
+    let parent_path = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent_path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::CurDir) {
+                continue;
+            }
+            bail!(
+                "human knowledge concept `{}` has an unsafe parent component",
+                relative_path.display()
+            );
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .context("human knowledge concept directory component contains NUL")?;
+        let child = match cockpit_host::private_fs::held_fd::openat(
+            parent.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), &name, 0o777) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "creating human knowledge concept directory component `{}`",
+                                relative_path.display()
+                            )
+                        });
+                    }
+                }
+                cockpit_host::private_fs::held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .with_context(|| {
+                    format!(
+                        "opening created human knowledge concept directory component `{}` without following links",
+                        relative_path.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "opening human knowledge concept directory component `{}` without following links",
+                        relative_path.display()
+                    )
+                });
+            }
+        };
+        ensure!(
+            child.metadata()?.is_dir(),
+            "human knowledge concept parent `{}` is not a directory",
+            relative_path.display()
+        );
+        parent = child;
+    }
+    Ok((parent, leaf))
+}
+
+#[cfg(unix)]
+fn read_human_knowledge_concept_nofollow(
+    parent: &fs::File,
+    leaf: &std::ffi::CStr,
+) -> Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut file = match cockpit_host::private_fs::held_fd::openat(
+        parent.as_raw_fd(),
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("opening human knowledge concept without following links");
+        }
+    };
+    ensure!(
+        file.metadata()?.is_file(),
+        "human knowledge concept is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .context("reading human knowledge concept through held parent")?;
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn replace_human_knowledge_concept_nofollow(
+    parent: &fs::File,
+    leaf: &std::ffi::CStr,
+    content: &[u8],
+    relative_path: &Path,
+) -> Result<(u64, u64)> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
+
+    let temporary = std::ffi::CString::new(format!(
+        ".cockpit-human-knowledge-{}",
+        uuid::Uuid::new_v4().simple()
+    ))?;
+    let mut file = cockpit_host::private_fs::held_fd::openat_mode(
+        parent.as_raw_fd(),
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o666,
+    )
+    .with_context(|| {
+        format!(
+            "creating held human knowledge concept {}",
+            relative_path.display()
+        )
+    })?;
+    let write_result = file.write_all(content).and_then(|_| file.sync_all());
+    let metadata = file.metadata();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+        return Err(error).context("writing held human knowledge concept");
+    }
+    let metadata = metadata.context("inspecting held human knowledge concept")?;
+    let identity = (metadata.dev(), metadata.ino());
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), leaf) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            if let Err(error) = cockpit_host::private_fs::held_fd::renameat(
+                parent.as_raw_fd(),
+                &temporary,
+                parent.as_raw_fd(),
+                leaf,
+            ) {
+                let _ =
+                    cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+                return Err(error).context("replacing held human knowledge concept");
+            }
+        }
+        Ok(_) => {
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            bail!(
+                "refusing to replace non-regular human knowledge concept `{}`",
+                relative_path.display()
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) = cockpit_host::private_fs::held_fd::linkat(
+                parent.as_raw_fd(),
+                &temporary,
+                parent.as_raw_fd(),
+                leaf,
+                0,
+            ) {
+                let _ =
+                    cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+                return Err(error)
+                    .context("publishing held human knowledge concept without replacement");
+            }
+            cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0)
+                .context("removing published human knowledge concept temporary")?;
+        }
+        Err(error) => {
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(parent.as_raw_fd(), &temporary, 0);
+            return Err(error).context("checking held human knowledge concept destination");
+        }
+    }
+    parent
+        .sync_all()
+        .context("syncing held human knowledge concept parent")?;
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn human_knowledge_concept_matches(
+    parent: &fs::File,
+    leaf: &std::ffi::CStr,
+    device: u64,
+    inode: u64,
+) -> Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(parent.as_raw_fd(), leaf) {
+        Ok(stat) => Ok(stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && stat.st_dev as u64 == device
+            && stat.st_ino as u64 == inode),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("checking published human knowledge concept identity"),
+    }
+}
+
+// The retained-dir API above has an implementation on every supported Unix
+// target. Other targets have no equivalent write primitive here yet, so refuse
+// human edits rather than falling back to path-based traversal.
+#[cfg(not(unix))]
+struct HumanKnowledgeConceptMutation;
+
+#[cfg(not(unix))]
+fn write_human_knowledge_concept_nofollow(
+    _root: &fs::File,
+    _relative_path: &Path,
+    _content: &[u8],
+    _expected_previous: Option<&[u8]>,
+) -> Result<HumanKnowledgeConceptMutation> {
+    bail!("human knowledge edits require descriptor-safe descendant mutation on this platform")
+}
+
+#[cfg(not(unix))]
+fn verify_human_knowledge_concept_published_content(
+    _root: &fs::File,
+    _relative_path: &Path,
+    _mutation: &HumanKnowledgeConceptMutation,
+    _expected: &[u8],
+) -> Result<()> {
+    unreachable!("unsupported human knowledge edit cannot publish a mutation")
+}
+
+#[cfg(not(unix))]
+fn rollback_human_knowledge_concept_nofollow(
+    _root: &fs::File,
+    _relative_path: &Path,
+    _mutation: HumanKnowledgeConceptMutation,
+) -> Result<()> {
+    unreachable!("unsupported human knowledge edit cannot publish a mutation")
+}
+
+pub(crate) fn human_knowledge_edit_outcome_note(outcome: &HumanKnowledgeEditOutcome) -> String {
+    match &outcome.git {
+        KnowledgeDreamGitOutcome::Committed {
+            commit,
+            branch,
+            pushed,
+        } => format!(
+            "human knowledge concept committed to `{branch}` as `{commit}`{}",
+            if *pushed { " and pushed" } else { "" }
+        ),
+        KnowledgeDreamGitOutcome::NoChanges { branch } => {
+            format!("human knowledge concept is unchanged on `{branch}`")
+        }
+        KnowledgeDreamGitOutcome::Skipped { reason } => {
+            format!("human knowledge concept was not applied: {reason}")
+        }
+        KnowledgeDreamGitOutcome::Deferred {
+            committed, reason, ..
+        } => {
+            if *committed {
+                format!(
+                    "human knowledge concept applied, but Git synchronization deferred: {reason}"
+                )
+            } else {
+                format!(
+                    "human knowledge concept was rolled back or not applied; retry required: {reason}"
+                )
+            }
+        }
+    }
+}
+
+fn most_specific_local_knowledge_base_for_path<'a>(
+    entries: &'a [KnowledgeBaseRegistryEntry],
+    cwd: &Path,
+    candidate: &Path,
+) -> Result<Option<(&'a KnowledgeBaseRegistryEntry, PathBuf)>> {
+    let mut best: Option<(&KnowledgeBaseRegistryEntry, PathBuf)> = None;
+    for entry in entries {
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let configured_root = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let root = crate::tools::sandbox::effective_native_path(&configured_root)
+            .with_context(|| format!("resolving local knowledge base `{}`", entry.id))?;
+        if !cockpit_host::path_containment::contained_under(&root, candidate) {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(_, current_root)| {
+            root.components().count() > current_root.components().count()
+        });
+        if replace {
+            best = Some((entry, root));
+        }
+    }
+    Ok(best)
 }
 
 #[derive(Debug, Clone)]
@@ -5536,6 +6677,7 @@ impl Tool for KnowledgeDreamApplyTool {
         let data_files_written = writes.len().saturating_sub(concepts_written);
         let dream = KnowledgeDreamCommit {
             knowledge_base_id: args.knowledge_base_id.clone(),
+            origin: KnowledgeCommitOrigin::Dream,
             model: self.executing_model.clone(),
             sessions_dreamed: args.source_session_ids.len(),
             concepts_written,
@@ -5801,18 +6943,25 @@ fn render_knowledge_dream_outcome(outcome: KnowledgeDreamGitOutcome) -> ToolOutp
         KnowledgeDreamGitOutcome::Deferred {
             branch,
             commit,
+            committed,
             reason,
-        } => format!(
-            "Knowledge dream output was retained{}{}; synchronization deferred: {reason}",
-            branch
-                .as_deref()
-                .map(|branch| format!(" on `{branch}`"))
-                .unwrap_or_default(),
-            commit
-                .as_deref()
-                .map(|commit| format!(" at `{commit}`"))
-                .unwrap_or_default(),
-        ),
+        } => {
+            if committed {
+                format!(
+                    "Knowledge dream output was retained{}{}; synchronization deferred: {reason}",
+                    branch
+                        .as_deref()
+                        .map(|branch| format!(" on `{branch}`"))
+                        .unwrap_or_default(),
+                    commit
+                        .as_deref()
+                        .map(|commit| format!(" at `{commit}`"))
+                        .unwrap_or_default(),
+                )
+            } else {
+                format!("Knowledge dream was rolled back or not applied; retry required: {reason}")
+            }
+        }
     };
     ToolOutput::text(text)
 }
@@ -8071,6 +9220,39 @@ Inventory facts for warehouse operations.
     }
 
     #[tokio::test]
+    async fn mcp_host_gate_rejects_a_trusted_model_when_a_local_kb_is_configured_without_trust_required()
+     {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(&tmp.path().join("available"));
+        let mut available = project_knowledge_registry_entry();
+        available.id = "available".to_string();
+        available.name = "Available".to_string();
+        available.trust_required = false;
+        available.source = KnowledgeBaseSource::Local {
+            path: PathBuf::from("available"),
+        };
+        let extended = ExtendedConfig {
+            knowledge_bases: vec![available],
+            ..Default::default()
+        };
+        let session = test_session(tmp.path()).await;
+
+        let denied_roots =
+            denied_local_knowledge_roots_for_model(&session, tmp.path(), &extended, None, true)
+                .await
+                .unwrap();
+        assert!(denied_roots.is_empty());
+
+        let error = ensure_mcp_host_access_for_session(&session, tmp.path(), &extended)
+            .await
+            .expect_err("MCP must stay fenced for any configured local KB");
+
+        assert!(error.to_string().contains(
+            "MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
+        ));
+    }
+
+    #[tokio::test]
     async fn installed_assistant_knowledge_is_attached_as_a_verified_registry_entry() {
         let env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
@@ -8407,6 +9589,7 @@ Inventory facts for warehouse operations.
     fn test_dream(knowledge_base_id: &str) -> KnowledgeDreamCommit {
         KnowledgeDreamCommit {
             knowledge_base_id: knowledge_base_id.to_string(),
+            origin: KnowledgeCommitOrigin::Dream,
             model: "openai:gpt-5".to_string(),
             sessions_dreamed: 2,
             concepts_written: 1,
@@ -8464,7 +9647,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "first-concept", "First dream output.");
                 Ok(())
             },
@@ -8479,7 +9662,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "second-concept", "Second dream output.");
                 Ok(())
             },
@@ -8512,7 +9695,7 @@ Inventory facts for warehouse operations.
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
             &cancel,
-            |root| {
+            |root, _| {
                 fs::write(root.join("must-not-apply.md"), "not reached")?;
                 Ok(())
             },
@@ -8553,7 +9736,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "local-concept", "Local dream output.");
 
                 // This commit lands after the writer's pre-apply fetch, so
@@ -8586,6 +9769,80 @@ Inventory facts for warehouse operations.
                 .unwrap();
         assert!(remote_tree.contains("local-concept.md"));
         assert!(remote_tree.contains("remote-concept.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_rebase_retry_reports_the_rewritten_commit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("knowledge-remote.git");
+        let remote_arg = remote.to_string_lossy().into_owned();
+        crate::git::run_git_checked(tmp.path(), &["init", "-q", "--bare", &remote_arg]).unwrap();
+
+        let seed = tmp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        write_bundle(&seed);
+        crate::git::run_git_checked(&seed, &["init", "-q"]).unwrap();
+        configure_knowledge_git(&seed);
+        crate::git::run_git_checked(&seed, &["add", "--all"]).unwrap();
+        crate::git::run_git_checked(&seed, &["commit", "-q", "-m", "seed"]).unwrap();
+        crate::git::run_git_checked(&seed, &["branch", "-M", "main"]).unwrap();
+        crate::git::run_git_checked(&seed, &["remote", "add", "origin", &remote_arg]).unwrap();
+        crate::git::run_git_checked(&seed, &["push", "-q", "origin", "main"]).unwrap();
+
+        let root = tmp.path().join("writer");
+        let root_arg = root.to_string_lossy().into_owned();
+        crate::git::run_git_checked(
+            tmp.path(),
+            &["clone", "-q", "--branch", "main", &remote_arg, &root_arg],
+        )
+        .unwrap();
+        configure_knowledge_git(&root);
+        let hook = root.join(".git/hooks/pre-push");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let outcome = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("shared"),
+            |root, _| {
+                write_dream_concept(root, "local-concept", "Local dream output.");
+                let other = tmp.path().join("other-writer");
+                let other_arg = other.to_string_lossy().into_owned();
+                crate::git::run_git_checked(
+                    tmp.path(),
+                    &["clone", "-q", "--branch", "main", &remote_arg, &other_arg],
+                )
+                .unwrap();
+                configure_knowledge_git(&other);
+                write_dream_concept(&other, "remote-concept", "Remote writer output.");
+                crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
+                crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote advance"])
+                    .unwrap();
+                crate::git::run_git_checked(&other, &["push", "-q", "origin", "main"]).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let KnowledgeDreamGitOutcome::Deferred {
+            commit: Some(commit),
+            committed: true,
+            ..
+        } = outcome
+        else {
+            panic!("the rejected retry must retain the rebased local commit");
+        };
+        assert_eq!(commit, crate::git::head_sha(&root).unwrap());
+        let parent = crate::git::run_git_checked(&root, &["rev-parse", "HEAD^"]).unwrap();
+        let remote_head =
+            crate::git::run_git_checked(&root, &["rev-parse", "origin/main"]).unwrap();
+        assert_eq!(parent.trim(), remote_head.trim());
     }
 
     #[cfg(unix)]
@@ -8627,7 +9884,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "deferred", "Retained local dream output.");
                 Ok(())
             },
@@ -8646,7 +9903,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "deferred", "Retained local dream output.");
                 Ok(())
             },
@@ -8690,7 +9947,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "deploy", "Local conflicting dream output.");
 
                 let other = tmp.path().join("other-writer");
@@ -8722,7 +9979,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "must-not-apply", "Deferred re-entry output.");
                 Ok(())
             },
@@ -8746,7 +10003,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "review-concept", "Needs human review.");
                 Ok(())
             },
@@ -8772,7 +10029,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "review-only", "Pending review.");
                 Ok(())
             },
@@ -8790,7 +10047,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("team"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "accepted-base", "Accepted-base dream.");
                 Ok(())
             },
@@ -8819,7 +10076,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "obsolete", "To be removed.");
                 Ok(())
             },
@@ -8830,7 +10087,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 fs::remove_file(root.join("obsolete.md")).unwrap();
                 Ok(())
             },
@@ -8856,7 +10113,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
@@ -8868,7 +10125,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "must-not-commit", "Deferred dream.");
                 Ok(())
             },
@@ -8894,7 +10151,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
@@ -8910,7 +10167,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "retry", "This commit hook rejects once.");
                 Ok(())
             },
@@ -8930,7 +10187,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "retry", "The ledger retry commits cleanly.");
                 Ok(())
             },
@@ -8952,7 +10209,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("project"),
-            |root| {
+            |root, _| {
                 write_dream_concept(root, "isolated", "KB-only history.");
                 Ok(())
             },
@@ -8981,7 +10238,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root| {
+            |root, _| {
                 for name in KB_MACHINE_STATE_GITIGNORE {
                     let path = root.join(name.trim_end_matches('/'));
                     if name.ends_with('/') {
@@ -9003,6 +10260,411 @@ Inventory facts for warehouse operations.
             .unwrap();
             assert!(ignored.success, "{name} must be ignored in a KB repository");
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_human_concept_edit_is_stamped_and_committed_through_the_kb_fence() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let target = HumanKnowledgeConceptTarget {
+            knowledge_base_id: "personal".to_string(),
+            root: tmp.path().to_path_buf(),
+            relative_path: PathBuf::from("manual.md"),
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let content = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\nprovenance: dream\n---\n\nHuman correction.\n",
+        )
+        .unwrap();
+
+        let outcome =
+            apply_human_knowledge_concept_edit(target, content, None, CancellationToken::new())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            outcome.git,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        assert!(outcome.applied);
+        let concept = parse_bundle(tmp.path())
+            .unwrap()
+            .concepts
+            .into_iter()
+            .find(|concept| concept.id == "manual")
+            .expect("human concept is present");
+        assert_eq!(concept.provenance(), Some("human"));
+        let subject =
+            crate::git::run_git_checked(tmp.path(), &["log", "-1", "--format=%s"]).unwrap();
+        assert!(subject.starts_with("human(kb=personal):"), "{subject}");
+    }
+
+    #[test]
+    fn exact_human_git_staging_commits_validated_bytes_not_a_reopened_path() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |_root, _| Ok(()),
+        )
+        .unwrap();
+
+        let target = PathBuf::from("manual.md");
+        let expected = b"---\nid: manual\ntype: memory\nprovenance: human\n---\n\nValidated human correction.\n";
+        fs::write(
+            tmp.path().join(&target),
+            "---\nid: manual\ntype: memory\n---\n\nUnvalidated replacement.\n",
+        )
+        .unwrap();
+        let human = KnowledgeDreamCommit {
+            knowledge_base_id: "personal".to_string(),
+            origin: KnowledgeCommitOrigin::Human,
+            model: "human".to_string(),
+            sessions_dreamed: 0,
+            concepts_written: 1,
+            data_files_written: 0,
+        };
+
+        let outcome =
+            commit_exact_knowledge_file(tmp.path(), "main", None, &human, &target, expected)
+                .unwrap();
+
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        let committed =
+            crate::git::run_git_checked(tmp.path(), &["show", "HEAD:manual.md"]).unwrap();
+        assert_eq!(committed.as_bytes(), expected);
+        assert_ne!(
+            fs::read(tmp.path().join(target)).unwrap(),
+            expected,
+            "the assertion is meaningful only if Git did not reopen the worktree path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_human_git_staging_rejects_hook_added_index_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |_root, _| Ok(()),
+        )
+        .unwrap();
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'unvalidated hook content\\n' > hook-added.md\ngit add hook-added.md\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let human = KnowledgeDreamCommit {
+            knowledge_base_id: "personal".to_string(),
+            origin: KnowledgeCommitOrigin::Human,
+            model: "human".to_string(),
+            sessions_dreamed: 0,
+            concepts_written: 1,
+            data_files_written: 0,
+        };
+
+        let outcome = commit_exact_knowledge_file(
+            tmp.path(),
+            "main",
+            None,
+            &human,
+            Path::new("manual.md"),
+            b"---\nid: manual\ntype: memory\nprovenance: human\n---\n\nValidated human correction.\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            KnowledgeDreamGitOutcome::Deferred {
+                committed: false,
+                ..
+            }
+        ));
+        assert!(
+            !tmp.path().join("hook-added.md").exists(),
+            "the failed transaction must remove the hook side effect"
+        );
+        let tree =
+            crate::git::run_git_checked(tmp.path(), &["ls-tree", "-r", "--name-only", "HEAD"])
+                .unwrap();
+        assert!(!tree.contains("hook-added.md"));
+        assert!(
+            crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "the rejected isolated index must not leave staged entries"
+        );
+    }
+
+    #[test]
+    fn human_edit_recognizes_a_committed_edit_even_without_a_resolved_sha() {
+        let git = KnowledgeDreamGitOutcome::Deferred {
+            branch: Some("main".to_string()),
+            commit: None,
+            committed: true,
+            reason: "resolving HEAD failed after commit".to_string(),
+        };
+
+        assert!(human_knowledge_edit_was_applied(&git));
+        assert!(git.committed_locally());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn human_concept_write_refuses_a_descendant_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("concepts")).unwrap();
+        let directory = cockpit_config::config::open_config_directory_nofollow(&root).unwrap();
+
+        let error = write_human_knowledge_concept_nofollow(
+            &directory,
+            Path::new("concepts/manual.md"),
+            b"outside must remain untouched",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("without following links"));
+        assert!(!outside.join("manual.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn human_concept_rollback_refuses_a_replaced_descendant_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("concepts")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let directory = cockpit_config::config::open_config_directory_nofollow(&root).unwrap();
+        let mutation = write_human_knowledge_concept_nofollow(
+            &directory,
+            Path::new("concepts/manual.md"),
+            b"temporary human concept",
+            None,
+        )
+        .unwrap();
+
+        fs::remove_file(root.join("concepts/manual.md")).unwrap();
+        fs::remove_dir(root.join("concepts")).unwrap();
+        symlink(&outside, root.join("concepts")).unwrap();
+        let error = rollback_human_knowledge_concept_nofollow(
+            &directory,
+            Path::new("concepts/manual.md"),
+            mutation,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("without following links"));
+        assert!(!outside.join("manual.md").exists());
+    }
+
+    #[tokio::test]
+    async fn review_policy_human_concept_edit_stays_on_the_active_kb_branch_for_later_dreams() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let target = HumanKnowledgeConceptTarget {
+            knowledge_base_id: "personal".to_string(),
+            root: tmp.path().to_path_buf(),
+            relative_path: PathBuf::from("manual.md"),
+            merge_policy: KnowledgeBaseMergePolicy::Review,
+        };
+        let content = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\n---\n\nHuman correction.\n",
+        )
+        .unwrap();
+
+        let outcome =
+            apply_human_knowledge_concept_edit(target, content, None, CancellationToken::new())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            outcome.git,
+            KnowledgeDreamGitOutcome::Committed { .. }
+        ));
+        assert!(outcome.applied);
+        assert_eq!(
+            crate::git::run_git_checked(tmp.path(), &["branch", "--show-current"])
+                .unwrap()
+                .trim(),
+            "main"
+        );
+
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Review,
+            &test_dream("personal"),
+            |root, _| {
+                let manual = parse_bundle(root)?
+                    .concepts
+                    .into_iter()
+                    .find(|concept| concept.id == "manual")
+                    .expect("human concept is visible to the next dream");
+                assert_eq!(manual.provenance(), Some("human"));
+                write_dream_concept(root, "later-dream", "Later dream.");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(tmp.path().join("manual.md").is_file());
+        assert_eq!(
+            crate::git::run_git_checked(tmp.path(), &["branch", "--show-current"])
+                .unwrap()
+                .trim(),
+            "main"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_human_concept_edit_fails_when_source_becomes_stale_before_kb_fence() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let target = HumanKnowledgeConceptTarget {
+            knowledge_base_id: "personal".to_string(),
+            root: tmp.path().to_path_buf(),
+            relative_path: PathBuf::from("manual.md"),
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let previous = Some(b"---\nid: manual\ntype: memory\n---\n\nBefore.\n".to_vec());
+        std::fs::write(
+            tmp.path().join("manual.md"),
+            "---\nid: manual\ntype: memory\n---\n\nConcurrent dream.\n",
+        )
+        .unwrap();
+        let content = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\n---\n\nHuman correction.\n",
+        )
+        .unwrap();
+
+        let error =
+            apply_human_knowledge_concept_edit(target, content, previous, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("became stale before entering the knowledge-base fence")
+        );
+    }
+
+    #[tokio::test]
+    async fn human_edit_deferred_before_callback_does_not_report_preexisting_human_concept_as_applied()
+     {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let target = HumanKnowledgeConceptTarget {
+            knowledge_base_id: "personal".to_string(),
+            root: tmp.path().to_path_buf(),
+            relative_path: PathBuf::from("manual.md"),
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let existing = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\n---\n\nExisting human concept.\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("manual.md"), existing).unwrap();
+        std::fs::write(tmp.path().join("dirty.txt"), "dirty").unwrap();
+        let content = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\n---\n\nNew human concept.\n",
+        )
+        .unwrap();
+
+        let outcome =
+            apply_human_knowledge_concept_edit(target, content, None, CancellationToken::new())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            outcome.git,
+            KnowledgeDreamGitOutcome::Deferred { .. }
+        ));
+        assert!(!outcome.applied);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn human_edit_deferred_after_callback_rollback_does_not_report_applied() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |root, _| {
+                write_dream_concept(root, "seed", "Seed dream.");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let target = HumanKnowledgeConceptTarget {
+            knowledge_base_id: "personal".to_string(),
+            root: tmp.path().to_path_buf(),
+            relative_path: PathBuf::from("manual.md"),
+            merge_policy: KnowledgeBaseMergePolicy::Auto,
+        };
+        let content = normalize_human_knowledge_concept(
+            &target,
+            "---\nid: manual\ntype: memory\n---\n\nHuman correction.\n",
+        )
+        .unwrap();
+
+        let outcome =
+            apply_human_knowledge_concept_edit(target, content, None, CancellationToken::new())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            outcome.git,
+            KnowledgeDreamGitOutcome::Deferred { .. }
+        ));
+        assert!(!outcome.applied);
+        assert!(!tmp.path().join("manual.md").exists());
+        assert!(
+            crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "a deferred human edit must restore a clean retriable worktree"
+        );
     }
 
     fn ids(results: &[SearchResult]) -> Vec<String> {

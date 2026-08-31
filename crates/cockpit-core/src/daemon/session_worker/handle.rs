@@ -681,9 +681,12 @@ impl SessionConfigHandle {
             },
             None => {}
         }
-        Self::detached(SessionConfigSnapshot::with_hooks(
+        // Test contexts sometimes replace this snapshot to exercise a
+        // config-dependent tool decision. Keep their handle live over its
+        // isolated cell; production turn handles remain pinned by `repin`.
+        Self::new(Arc::new(RwLock::new(SessionConfigSnapshot::with_hooks(
             generation, providers, extended, hooks,
-        ))
+        ))))
     }
 
     fn read_shared(&self) -> SessionConfigSnapshot {
@@ -691,6 +694,15 @@ impl SessionConfigHandle {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Replace the isolated live snapshot used by a tool/replay test.
+    #[cfg(test)]
+    pub(crate) fn set_full_config_snapshot_for_tests(&self, snapshot: SessionConfigSnapshot) {
+        *self
+            .shared
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
     }
 
     /// The snapshot this handle reads: the pinned view if pinned, else the

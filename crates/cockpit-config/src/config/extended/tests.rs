@@ -160,6 +160,85 @@ fn configured_knowledge_attachment_id_is_not_accepted_from_workspace_config() {
 }
 
 #[test]
+fn overlapping_local_knowledge_roots_are_rejected() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge/nested")).unwrap();
+    std::fs::write(
+        tmp.path().join("config.json"),
+        r#"{
+          "knowledgeBases": [
+            {
+              "id": "outer",
+              "name": "Outer",
+              "description": "Outer",
+              "source": {"kind": "local", "path": ".cockpit/knowledge"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            },
+            {
+              "id": "inner",
+              "name": "Inner",
+              "description": "Inner",
+              "source": {"kind": "local", "path": ".cockpit/knowledge/nested"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let _trust = enter_trusted_workspace(tmp.path());
+    let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
+    assert!(error.to_string().contains("overlapping roots"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_local_knowledge_roots_fail_closed_when_a_symlinked_child_root_is_not_yet_materialized()
+ {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("knowledge");
+    std::fs::create_dir_all(real.join("nested")).unwrap();
+    symlink(&real, tmp.path().join("alias")).unwrap();
+    std::fs::write(
+        tmp.path().join("config.json"),
+        r#"{
+          "knowledgeBases": [
+            {
+              "id": "outer",
+              "name": "Outer",
+              "description": "Outer",
+              "source": {"kind": "local", "path": "knowledge"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            },
+            {
+              "id": "inner",
+              "name": "Inner",
+              "description": "Inner",
+              "source": {"kind": "local", "path": "alias/nested/future-child"},
+              "embeddingOwnership": "local",
+              "trustRequired": true,
+              "mergePolicy": "auto"
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let _trust = enter_trusted_workspace(tmp.path());
+    let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
+    assert!(error.to_string().contains("overlapping roots"), "{error}");
+    assert!(error.to_string().contains("future-child"), "{error}");
+}
+
+#[test]
 fn extended_replacement_is_invisible_until_commit_and_drop_preserves_destination() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

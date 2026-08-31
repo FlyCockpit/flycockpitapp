@@ -788,6 +788,18 @@ mod tests {
             .create_session("p", "/p", "Visible session title")
             .await
             .unwrap();
+        db.write({
+            let session_id = session.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET title = 'Visible session title' WHERE session_id = ?1",
+                    [session_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
         db.attach_session_to_knowledge_base("kb", ROOT_A, session.session_id)
             .await
             .unwrap();

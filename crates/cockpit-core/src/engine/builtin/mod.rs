@@ -1983,9 +1983,10 @@ pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) ->
     // `args.mcp_parent_reachable` is Some; copy the live admission ceiling
     // so a root-shaped rebuild (`None`) cannot widen the catalog.
     rebuilt.posture = agent.posture.clone();
-    if let Some(parent) = agent.mcp_resolver.parent_reachable() {
-        rebuilt.mcp_resolver = rebuilt.mcp_resolver.with_parent_reachable(parent);
-    }
+    // The resolver is an admission-time capability snapshot. Re-resolving it
+    // during a model/definition rebuild could restore catalog entries that
+    // were removed after the agent was admitted.
+    rebuilt.mcp_resolver = agent.mcp_resolver.clone();
     Ok(rebuilt)
 }
 

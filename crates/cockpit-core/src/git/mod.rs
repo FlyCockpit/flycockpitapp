@@ -50,9 +50,11 @@ pub fn find_worktree_root(path: &Path) -> Option<PathBuf> {
 
 /// Current branch name, or `None` if not in a git repo or detached HEAD.
 pub fn current_branch(worktree: &Path) -> Result<Option<String>> {
-    let Some(output) =
-        run_optional_command("git", worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
-    else {
+    let Some(output) = run_optional_command(
+        "git",
+        worktree,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    ) else {
         return Ok(None);
     };
 

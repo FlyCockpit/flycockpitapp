@@ -4671,19 +4671,19 @@ pub(crate) async fn attached_bundles(
             };
         }
         validate_registry_entry(&entry)?;
-        let attachment_id = entry.attachment_id();
-        if !seen_attachment_ids.insert(attachment_id) {
-            bail!(
-                "knowledge base registry contains duplicate attachment ID `{}`",
-                attachment_id
-            );
-        }
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
         if entry.trust_required && !executing_model_trusted {
             denied_knowledge_base_ids.push(entry.id.clone());
             continue;
+        }
+        let attachment_id = entry.attachment_id();
+        if !seen_attachment_ids.insert(attachment_id) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                attachment_id
+            );
         }
         let sealed_id = if let Some(local) = &mut local {
             let Some((snapshot, sealed_id)) =
@@ -4701,6 +4701,11 @@ pub(crate) async fn attached_bundles(
                 cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
                 local.sidecars = Some(KbSidecars::in_root(&cache_root.join(sealed_id.to_string())));
             }
+            let sidecars = local
+                .sidecars
+                .as_ref()
+                .context("local knowledge base has no sidecar paths")?;
+            cockpit_host::private_fs::ensure_private_dir(sidecars.root())?;
             local.snapshot = Some(snapshot);
             sealed_id
         } else {
@@ -4779,17 +4784,17 @@ fn prompt_snapshot_entries_from_registry(
             }
         }
         validate_registry_entry(&entry)?;
-        if !seen_attachment_ids.insert(entry.attachment_id()) {
-            bail!(
-                "knowledge base registry contains duplicate attachment ID `{}`",
-                entry.attachment_id()
-            );
-        }
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
         if entry.trust_required && trust_mode != WorkspaceTrustMode::Trust {
             continue;
+        }
+        if !seen_attachment_ids.insert(entry.attachment_id()) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                entry.attachment_id()
+            );
         }
         entries.push(entry);
     }
@@ -9083,7 +9088,7 @@ Inventory facts for warehouse operations.
         let add = Command::new("git")
             .arg("-C")
             .arg(tmp.path())
-            .args(["add", "--", EMBEDDINGS_FILE, INDEX_FILE])
+            .args(["add", "-f", "--", EMBEDDINGS_FILE, INDEX_FILE])
             .status()
             .unwrap();
         assert!(add.success());
@@ -9355,7 +9360,7 @@ Inventory facts for warehouse operations.
         conn.execute_batch("CREATE TABLE retained_identity_test (id INTEGER PRIMARY KEY);")
             .unwrap();
         let error = persist_private_sidecar_connection(&conn, &sidecars.index, &lock).unwrap_err();
-        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert!(!tmp.path().join("attacker.sqlite").exists());
     }
 
@@ -9554,6 +9559,7 @@ Inventory facts for warehouse operations.
     async fn executing_definition_snapshot_restricts_workspace_knowledge_registry() {
         let _env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
+        write_bundle(&tmp.path().join(".cockpit/knowledge"));
         let session = test_session(tmp.path()).await;
         let mut agent = crate::agents::embedded_default("Plan").unwrap();
         agent.vnext.as_mut().unwrap().allowed_knowledge_bases =

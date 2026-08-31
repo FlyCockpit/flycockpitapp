@@ -1199,7 +1199,7 @@ CREATE TABLE knowledge_dreamed_sessions (
     kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
     project_root TEXT NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
     consumer_id TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
-    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     dreamed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (kb_id, project_root, consumer_id, session_id)
 );
@@ -4419,10 +4419,13 @@ BEGIN
           ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
          WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
            AND a.kind = 'user_input_source' AND a.capture_reason = 'oversized_user_input'
-           AND a.content_bytes > 65536
+           AND a.content_bytes > 1024
            AND e.type = 'user_message'
            AND json_type(a.provenance_json, '$.event_seq') = 'integer'
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 1
+           AND json_extract(a.provenance_json, '$.source') = 'user_paste'
+           AND json_type(a.provenance_json, '$.blob_path') = 'text'
+           AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
            AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq
            AND json_type(e.data_json, '$.text') = 'text'
            AND json_extract(e.data_json, '$.text') = a.content
@@ -4436,7 +4439,9 @@ BEGIN
            AND json_type(a.provenance_json, '$.source_artifact_id') = 'text'
            AND json_type(a.provenance_json, '$.preprocessing_version') = 'integer'
            AND json_extract(a.provenance_json, '$.preprocessing_version') = 1
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 2
+           AND json_type(a.provenance_json, '$.blob_path') = 'text'
+           AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
            AND EXISTS (
                SELECT 1 FROM session_text_artifact_event_refs source_ref
                JOIN session_text_artifacts source ON source.session_id = source_ref.session_id AND source.artifact_id = source_ref.artifact_id
@@ -4649,7 +4654,7 @@ CREATE TABLE session_text_artifact_quota_reservations (
     operation_id BLOB NOT NULL CHECK(typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
     queue_item_id BLOB NOT NULL CHECK(typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
     source_digest BLOB NOT NULL CHECK(typeof(source_digest) = 'blob' AND length(source_digest) = 32),
-    source_bytes INTEGER NOT NULL CHECK(typeof(source_bytes) = 'integer' AND source_bytes BETWEEN 65537 AND 8388608),
+    source_bytes INTEGER NOT NULL CHECK(typeof(source_bytes) = 'integer' AND source_bytes BETWEEN 1025 AND 8388608),
     reserved_bytes INTEGER NOT NULL CHECK(typeof(reserved_bytes) = 'integer' AND reserved_bytes = source_bytes + 8388608),
     -- Set only by the atomic oversized-run phase-one composition. It makes
     -- terminalization ownership explicit instead of inferring it from a UUID
@@ -4945,7 +4950,7 @@ CREATE TABLE text_artifact_blob_cleanup_intents (
         AND blob_path NOT LIKE '%\n%'
         AND blob_path NOT LIKE '%\r%'
     ),
-    session_id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
 );
 

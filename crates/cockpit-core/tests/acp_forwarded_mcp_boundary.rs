@@ -17,6 +17,11 @@ fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn production_source(path: &Path) -> String {
+    // Unit-test sibling modules can contain literal forwarded-ingress
+    // fixtures; they are never production capability consumers.
+    if path.file_name().is_some_and(|name| name == "tests.rs") {
+        return String::new();
+    }
     let source = fs::read_to_string(path).expect("read Rust source");
     strip_test_only_items(&source)
 }

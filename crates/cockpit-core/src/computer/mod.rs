@@ -211,6 +211,10 @@ pub struct PixelRect {
 pub struct ComputerBatchReport {
     pub completed: Vec<ComputerActionOutcome>,
     pub failure: Option<ComputerFailure>,
+    /// Failure from terminal input neutralization, retained separately from a
+    /// dispatch failure so the coordinator can fence the physical lease even
+    /// when an action failed first.
+    pub release_failure: Option<ComputerError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -270,7 +274,14 @@ pub trait ComputerBackend: Send + Sync {
         &mut self,
         action: &ComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError>;
-    async fn release_all(&mut self) -> Result<(), ComputerError>;
+    /// Synchronously neutralize every backend-owned input state.
+    ///
+    /// This is deliberately non-async: the coordinator must run it before it
+    /// relinquishes a physical host lease on every terminal path, including
+    /// `Drop`. Implementations must attempt every relevant key/button release
+    /// and report a failure rather than silently handing the lease to another
+    /// owner with uncertain input state.
+    fn release_all(&mut self) -> Result<(), ComputerError>;
 
     async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
         let mut completed = Vec::new();
@@ -278,23 +289,36 @@ pub trait ComputerBackend: Send + Sync {
             match self.execute_one(action).await {
                 Ok(outcome) => completed.push(outcome),
                 Err(error) => {
-                    let _ = self.release_all().await;
+                    // Preserve the dispatch failure as the primary outcome,
+                    // but still make the mandatory best-effort neutralization
+                    // before returning to the coordinator.
+                    let release_failure = self.release_all().err();
                     return ComputerBatchReport {
                         completed,
                         failure: Some(ComputerFailure { index, error }),
+                        release_failure,
                     };
                 }
             }
         }
-        if self.release_all().await.is_err() {
-            // Release failures are deliberately not turned into action
-            // failures after all actions completed; backends log these in
-            // their concrete implementation. The important invariant is that
-            // release is attempted on every terminal path.
+        if let Err(error) = self.release_all() {
+            // Input neutralization is part of the physical operation. Do not
+            // report an otherwise-successful batch as complete when its
+            // terminal cleanup failed; the coordinator will preserve its
+            // lease until a later successful cleanup can hand it off.
+            return ComputerBatchReport {
+                completed,
+                failure: Some(ComputerFailure {
+                    index: actions.len().saturating_sub(1),
+                    error: error.clone(),
+                }),
+                release_failure: Some(error),
+            };
         }
         ComputerBatchReport {
             completed,
             failure: None,
+            release_failure: None,
         }
     }
 }
@@ -387,7 +411,7 @@ impl ComputerBackend for FakeBackend {
         }
     }
 
-    async fn release_all(&mut self) -> Result<(), ComputerError> {
+    fn release_all(&mut self) -> Result<(), ComputerError> {
         self.release_count += 1;
         Ok(())
     }
@@ -1047,30 +1071,41 @@ impl ComputerBackend for VirtualDisplayBackend {
     ) -> Result<ComputerActionOutcome, ComputerError> {
         let result = execute_virtual_action(self, action);
         if result.is_err() {
-            let _ = self.release_all().await;
+            let _ = self.release_all();
         }
         result
     }
 
-    async fn release_all(&mut self) -> Result<(), ComputerError> {
+    fn release_all(&mut self) -> Result<(), ComputerError> {
         #[cfg(target_os = "linux")]
         {
             let held_keys = std::mem::take(&mut self.held_keys);
+            let mut first_error = None;
+            let mut release = |args: &[OsString]| {
+                if let Err(error) = self.run_xdotool(args)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            };
             for key in held_keys {
-                let _ = self.run_xdotool(&[OsString::from("keyup"), OsString::from(key)]);
+                release(&[OsString::from("keyup"), OsString::from(key)]);
             }
             for key in ["Shift", "Control", "Alt", "Super_L"] {
-                let _ = self.run_xdotool(&[
+                release(&[
                     OsString::from("keyup"),
                     OsString::from("--clearmodifiers"),
                     OsString::from(key),
                 ]);
             }
             for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
-                let _ = self.run_xdotool(&[
+                release(&[
                     OsString::from("mouseup"),
                     OsString::from(mouse_button_number(button).to_string()),
                 ]);
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
         }
         Ok(())

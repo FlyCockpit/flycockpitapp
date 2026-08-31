@@ -181,6 +181,7 @@ mod tests {
             ComputerBatchReport {
                 completed: Vec::new(),
                 failure: None,
+                release_failure: None,
             }
         }
 
@@ -202,7 +203,7 @@ mod tests {
             }
         }
 
-        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
+        fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             Ok(())
         }
     }

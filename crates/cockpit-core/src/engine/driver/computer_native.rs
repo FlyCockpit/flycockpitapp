@@ -683,6 +683,7 @@ mod tests {
             ComputerBatchReport {
                 completed: Vec::new(),
                 failure: None,
+                release_failure: None,
             }
         }
 
@@ -704,7 +705,7 @@ mod tests {
             }
         }
 
-        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
+        fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             Ok(())
         }
     }
@@ -737,9 +738,9 @@ mod tests {
             self.inner.execute_one(action).await
         }
 
-        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
+        fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
             self.releases.fetch_add(1, Ordering::SeqCst);
-            self.inner.release_all().await
+            self.inner.release_all()
         }
     }
 

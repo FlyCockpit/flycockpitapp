@@ -211,10 +211,6 @@ pub struct PixelRect {
 pub struct ComputerBatchReport {
     pub completed: Vec<ComputerActionOutcome>,
     pub failure: Option<ComputerFailure>,
-    /// Failure from terminal input neutralization, retained separately from a
-    /// dispatch failure so the coordinator can fence the physical lease even
-    /// when an action failed first.
-    pub release_failure: Option<ComputerError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -276,11 +272,11 @@ pub trait ComputerBackend: Send + Sync {
     ) -> Result<ComputerActionOutcome, ComputerError>;
     /// Synchronously neutralize every backend-owned input state.
     ///
-    /// This is deliberately non-async: the coordinator must run it before it
-    /// relinquishes a physical host lease on every terminal path, including
-    /// `Drop`. Implementations must attempt every relevant key/button release
-    /// and report a failure rather than silently handing the lease to another
-    /// owner with uncertain input state.
+    /// This is deliberately non-async: the coordinator invokes it only after
+    /// re-proving its physical host lease, before it relinquishes that lease on
+    /// every terminal path (including `Drop`). Implementations must attempt
+    /// every relevant key/button release and report a failure rather than
+    /// silently handing the lease to another owner with uncertain input state.
     fn release_all(&mut self) -> Result<(), ComputerError>;
 
     async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
@@ -289,36 +285,16 @@ pub trait ComputerBackend: Send + Sync {
             match self.execute_one(action).await {
                 Ok(outcome) => completed.push(outcome),
                 Err(error) => {
-                    // Preserve the dispatch failure as the primary outcome,
-                    // but still make the mandatory best-effort neutralization
-                    // before returning to the coordinator.
-                    let release_failure = self.release_all().err();
                     return ComputerBatchReport {
                         completed,
                         failure: Some(ComputerFailure { index, error }),
-                        release_failure,
                     };
                 }
             }
         }
-        if let Err(error) = self.release_all() {
-            // Input neutralization is part of the physical operation. Do not
-            // report an otherwise-successful batch as complete when its
-            // terminal cleanup failed; the coordinator will preserve its
-            // lease until a later successful cleanup can hand it off.
-            return ComputerBatchReport {
-                completed,
-                failure: Some(ComputerFailure {
-                    index: actions.len().saturating_sub(1),
-                    error: error.clone(),
-                }),
-                release_failure: Some(error),
-            };
-        }
         ComputerBatchReport {
             completed,
             failure: None,
-            release_failure: None,
         }
     }
 }
@@ -456,7 +432,11 @@ pub struct VirtualDisplayBackend {
     xvfb: Mutex<Option<Child>>,
     geometry: DisplayGeometry,
     tools: LinuxTools,
+    /// Keys whose `keydown` may still be active. Real-desktop instances mirror
+    /// this to a private journal so a replacement daemon can neutralize an
+    /// arbitrary key left behind by a failed `keyup`.
     held_keys: Vec<String>,
+    held_key_journal: HeldKeyJournal,
     /// Private, owner-only directory under the Cockpit data root that contains
     /// any transient capture temp files. Never `$TMPDIR`. See
     /// [`private_capture_root`].
@@ -467,6 +447,84 @@ pub struct VirtualDisplayBackend {
 struct LinuxTools {
     xdotool: PathBuf,
     capture: CaptureTool,
+}
+
+/// Crash-persistent ownership record for X11 keys that Cockpit has pressed.
+///
+/// This is deliberately keyed to the X server, rather than to a delegation:
+/// injected keyboard state belongs to that server and must be recovered by the
+/// next real-desktop coordinator after a daemon replacement. The host lease
+/// serializes every caller that can consume this record.
+#[derive(Debug, Default)]
+struct HeldKeyJournal {
+    path: Option<PathBuf>,
+}
+
+impl HeldKeyJournal {
+    #[cfg(target_os = "linux")]
+    fn for_real_x11(display: &str) -> Result<Self, ComputerError> {
+        let root = crate::config::resolve::cockpit_data_dir()
+            .map_err(input_journal_error)?
+            .join("computer-input-state");
+        cockpit_host::private_fs::ensure_private_dir(&root).map_err(input_journal_error)?;
+        let digest = crate::computer::host_identity::domain_hash(
+            b"cockpit.x11.held-keys.v1",
+            &[display.as_bytes()],
+        );
+        let name = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(Self {
+            path: Some(root.join(format!("{name}.json"))),
+        })
+    }
+
+    fn load(&self) -> Result<Vec<String>, ComputerError> {
+        let Some(path) = &self.path else {
+            return Ok(Vec::new());
+        };
+        let Some(bytes) = cockpit_host::private_fs::read_private_file(path, "computer held-key")
+            .map_err(input_journal_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        let keys = serde_json::from_slice::<Vec<String>>(&bytes).map_err(|_| {
+            ComputerError::CommandFailed {
+                program: "computer input-state journal".to_string(),
+                detail: "held-key journal is malformed".to_string(),
+            }
+        })?;
+        if keys.iter().any(|key| key.is_empty()) {
+            return Err(ComputerError::CommandFailed {
+                program: "computer input-state journal".to_string(),
+                detail: "held-key journal contains an empty key".to_string(),
+            });
+        }
+        Ok(keys)
+    }
+
+    fn store(&self, keys: &[String]) -> Result<(), ComputerError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if keys.is_empty() {
+            return cockpit_host::private_fs::delete_private_file(path)
+                .map_err(input_journal_error);
+        }
+        let bytes = serde_json::to_vec(keys).map_err(|error| ComputerError::CommandFailed {
+            program: "computer input-state journal".to_string(),
+            detail: error.to_string(),
+        })?;
+        cockpit_host::private_fs::write_private_file(path, &bytes).map_err(input_journal_error)
+    }
+}
+
+fn input_journal_error(error: impl std::fmt::Display) -> ComputerError {
+    ComputerError::CommandFailed {
+        program: "computer input-state journal".to_string(),
+        detail: error.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +584,8 @@ impl VirtualDisplayBackend {
         let xdotool = require_capability("xdotool", "the `xdotool` package")?;
         let capture = require_capture_tool()?;
         let capture_root = private_capture_root()?;
+        let held_key_journal = HeldKeyJournal::for_real_x11(&display)?;
+        let held_keys = held_key_journal.load()?;
         let geometry = query_x11_display_geometry(&xdotool, &display)?;
         Ok(Self {
             display,
@@ -533,7 +593,8 @@ impl VirtualDisplayBackend {
             xvfb: Mutex::new(None),
             geometry,
             tools: LinuxTools { xdotool, capture },
-            held_keys: Vec::new(),
+            held_keys,
+            held_key_journal,
             capture_root,
         })
     }
@@ -590,6 +651,7 @@ impl VirtualDisplayBackend {
             geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
+            held_key_journal: HeldKeyJournal::default(),
             capture_root,
         })
     }
@@ -634,6 +696,50 @@ impl VirtualDisplayBackend {
             region,
             &self.capture_root,
         )
+    }
+
+    /// Merge state written by a predecessor that exited after this backend was
+    /// constructed. This is called only during terminal neutralization, which
+    /// the coordinator performs while it holds the physical host lease.
+    fn reload_held_keys(&mut self) -> Result<(), ComputerError> {
+        for key in self.held_key_journal.load()? {
+            if !self.held_keys.contains(&key) {
+                self.held_keys.push(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist intent before emitting `keydown`: if the external process
+    /// reports an ambiguous failure or the daemon dies, recovery must prefer a
+    /// harmless extra `keyup` over forgetting a potentially pressed key.
+    fn remember_held_key(&mut self, key: String) -> Result<(), ComputerError> {
+        if self.held_keys.contains(&key) {
+            // Re-publish even for a repeated key: a prior recovery attempt may
+            // have loaded the key before its journal was removed, and keydown
+            // must never proceed without a durable recovery record.
+            return self.held_key_journal.store(&self.held_keys);
+        }
+        let mut keys = self.held_keys.clone();
+        keys.push(key);
+        self.held_key_journal.store(&keys)?;
+        self.held_keys = keys;
+        Ok(())
+    }
+
+    /// Forget a key only after its `keyup` completed and the durable record
+    /// has been updated. A journal-write failure intentionally leaves the key
+    /// tracked, making a later cleanup retry it under the same lease.
+    fn forget_held_key(&mut self, key: &str) -> Result<(), ComputerError> {
+        let keys = self
+            .held_keys
+            .iter()
+            .filter(|held| held.as_str() != key)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.held_key_journal.store(&keys)?;
+        self.held_keys = keys;
+        Ok(())
     }
 }
 
@@ -1069,40 +1175,49 @@ impl ComputerBackend for VirtualDisplayBackend {
         &mut self,
         action: &ComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
-        let result = execute_virtual_action(self, action);
-        if result.is_err() {
-            let _ = self.release_all();
-        }
-        result
+        execute_virtual_action(self, action)
     }
 
     fn release_all(&mut self) -> Result<(), ComputerError> {
         #[cfg(target_os = "linux")]
         {
-            let held_keys = std::mem::take(&mut self.held_keys);
+            // A replacement backend can have been constructed before a
+            // predecessor's final failed `keyup`. Reload under the host lease
+            // so that late durable state is never missed during recovery.
+            self.reload_held_keys()?;
+            let held_keys = self.held_keys.clone();
             let mut first_error = None;
-            let mut release = |args: &[OsString]| {
-                if let Err(error) = self.run_xdotool(args)
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
-            };
             for key in held_keys {
-                release(&[OsString::from("keyup"), OsString::from(key)]);
+                match self.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)]) {
+                    Ok(()) => {
+                        if let Err(error) = self.forget_held_key(&key)
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
             }
             for key in ["Shift", "Control", "Alt", "Super_L"] {
-                release(&[
+                if let Err(error) = self.run_xdotool(&[
                     OsString::from("keyup"),
                     OsString::from("--clearmodifiers"),
                     OsString::from(key),
-                ]);
+                ]) && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
             for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
-                release(&[
+                if let Err(error) = self.run_xdotool(&[
                     OsString::from("mouseup"),
                     OsString::from(mouse_button_number(button).to_string()),
-                ]);
+                ]) && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
             if let Some(error) = first_error {
                 return Err(error);
@@ -1242,11 +1357,11 @@ fn execute_virtual_action(
         }
         ComputerAction::HoldKey { key, duration } => {
             checked_action_duration(*duration)?;
+            backend.remember_held_key(key.clone())?;
             backend.run_xdotool(&[OsString::from("keydown"), OsString::from(key)])?;
-            backend.held_keys.push(key.clone());
             std::thread::sleep(*duration);
             backend.run_xdotool(&[OsString::from("keyup"), OsString::from(key)])?;
-            backend.held_keys.retain(|held| held != key);
+            backend.forget_held_key(key)?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::Scroll {
@@ -3287,6 +3402,35 @@ mod tests {
     }
 
     #[test]
+    fn held_key_journal_retains_keys_until_explicitly_cleared() {
+        let temp = TempDir::new().expect("private test directory");
+        let journal = HeldKeyJournal {
+            path: Some(temp.path().join("held-keys.json")),
+        };
+
+        journal
+            .store(&["F13".to_string(), "a".to_string()])
+            .expect("persist held keys before keydown");
+        assert_eq!(
+            journal.load().expect("reload held keys"),
+            vec!["F13".to_string(), "a".to_string()]
+        );
+
+        // A partial cleanup may remove only the keys whose keyup succeeded;
+        // the remainder is what a retry or replacement daemon must see.
+        journal
+            .store(&["a".to_string()])
+            .expect("retain failed keyup key");
+        assert_eq!(
+            journal.load().expect("reload failed keyup key"),
+            vec!["a".to_string()]
+        );
+
+        journal.store(&[]).expect("clear after successful keyup");
+        assert!(journal.load().expect("empty journal").is_empty());
+    }
+
+    #[test]
     fn coordinator_config_excludes_geometry_but_preserves_policy_boundary() {
         let config = NativeComputerToolConfig {
             contract: ComputerToolContract::OpenAiResponses,
@@ -4076,7 +4220,9 @@ mod tests {
             report.completed[14],
             ComputerActionOutcome::Waited(Duration::from_millis(1))
         );
-        assert_eq!(backend.release_count, 1);
+        // Physical cleanup belongs to the coordinator, which can revalidate
+        // the OS host lease immediately before injecting terminal input.
+        assert_eq!(backend.release_count, 0);
     }
 
     #[tokio::test]
@@ -4089,7 +4235,7 @@ mod tests {
         assert_eq!(backend.recorded, actions[..=3]);
         assert_eq!(report.completed.len(), 3);
         assert_eq!(report.failure.as_ref().unwrap().index, 3);
-        assert_eq!(backend.release_count, 1);
+        assert_eq!(backend.release_count, 0);
     }
 
     #[test]
@@ -4181,12 +4327,12 @@ mod tests {
         let mut ok = FakeBackend::new();
         let ok_report = ok.execute(&actions).await;
         assert_eq!(ok_report.failure, None);
-        assert_eq!(ok.release_count, 1);
+        assert_eq!(ok.release_count, 0);
 
         let mut fail = FakeBackend::failing_at(1, ComputerError::Cancelled);
         let fail_report = fail.execute(&actions).await;
         assert_eq!(fail_report.failure.unwrap().error, ComputerError::Cancelled);
-        assert_eq!(fail.release_count, 1);
+        assert_eq!(fail.release_count, 0);
     }
 
     #[test]

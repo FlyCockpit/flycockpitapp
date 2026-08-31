@@ -1149,9 +1149,9 @@ impl HostInputArbiter {
 
     /// Detect OS lock loss without changing the logical lease state.
     ///
-    /// The coordinator must neutralize any injected input before a lost lease
-    /// is released or handed off. Removing the current lease here would allow
-    /// a queued waiter to become the owner before that cleanup finishes.
+    /// A caller that observes loss must never inject cleanup using the stale
+    /// token. It can relinquish this process-local token so a future owner can
+    /// acquire a fresh OS lock and neutralize durable input state safely.
     ///
     /// Returns `true` when the OS-level lock is absent for this lease.
     pub fn detect_lock_loss(&self, token: &HostLeaseToken) -> bool {
@@ -2411,6 +2411,11 @@ pub struct ComputerActionCoordinator {
     host_arbiter: Option<Arc<std::sync::Mutex<HostInputArbiter>>>,
     /// The current host lease token, if a physical target is involved.
     host_lease: Option<HostLeaseToken>,
+    /// Whether this coordinator still has proof that it exclusively owns the
+    /// physical target and may inject terminal `keyup`/`mouseup` events. Once
+    /// the OS lock is lost, only a newly acquired owner may neutralize the
+    /// durable input journal.
+    input_cleanup_permitted: bool,
     /// The central authorizer.
     authorizer: Arc<dyn ComputerAuthorizer>,
     /// The outcome journal for dedup/reconnect.
@@ -2853,6 +2858,7 @@ impl ComputerActionCoordinator {
             target_adapter,
             host_arbiter: params.host_arbiter,
             host_lease,
+            input_cleanup_permitted: true,
             authorizer: params.authorizer,
             journal: OutcomeJournal::new(),
             delegation_id: params.delegation_id,
@@ -2884,7 +2890,7 @@ impl ComputerActionCoordinator {
         // coordinator can advertise or dispatch any computer capability.
         if coordinator.host_lease.is_some() {
             coordinator
-                .neutralize_backend_input()
+                .neutralize_input_under_host_lease()
                 .map_err(CoordinatorOpenError::BackendInputCleanup)?;
         }
 
@@ -2942,17 +2948,18 @@ impl ComputerActionCoordinator {
         if let Some(arbiter) = &self.host_arbiter {
             let arbiter = lock_poison_safe(arbiter);
             if arbiter.detect_lock_loss(&token) {
-                // `detect_lock_loss` is intentionally observational. Keep
-                // the arbiter's logical lease installed until cleanup has
-                // neutralized input; otherwise a queued coordinator could be
-                // promoted and overlap old-owner keyup/mouseup injection.
+                // We no longer have proof that terminal cleanup is exclusive:
+                // another Cockpit process can acquire the physical target
+                // between lock loss and this observation. Do not inject a
+                // stale owner's keyup/mouseup events. Instead relinquish only
+                // this process's logical token, allowing the next owner that
+                // successfully acquires the OS lock to neutralize the durable
+                // input journal before it dispatches.
                 drop(arbiter);
                 self.invalidated = true;
                 self.host_effect_cancel.cancel();
                 self.revoke_ask_lease_for_delegation();
-                if let Err(error) = self.release_input_before_host_lease() {
-                    tracing::error!(error = %error, "computer backend input cleanup failed after host lock loss; retaining host lease");
-                }
+                self.abandon_host_lease_without_input();
                 return false;
             }
             if !arbiter.is_lease_valid(&token) {
@@ -2960,10 +2967,11 @@ impl ComputerActionCoordinator {
                 // cleanup with a stale token: doing so would itself violate
                 // physical-input serialization. Every physical coordinator
                 // neutralizes input while holding its newly acquired lease.
-                self.host_lease = None;
                 self.invalidated = true;
                 self.host_effect_cancel.cancel();
                 self.revoke_ask_lease_for_delegation();
+                drop(arbiter);
+                self.abandon_host_lease_without_input();
                 return false;
             }
         }
@@ -3147,12 +3155,11 @@ impl ComputerActionCoordinator {
 
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
-        let release_failure = report.release_failure.clone();
-        if let Some(error) = &release_failure {
-            // A backend reported that terminal key/button neutralization
-            // failed. Fence this coordinator immediately; retry cleanup while
-            // it still owns the lease, and hand the lease off only if that
-            // retry succeeds.
+        let cleanup_failure = self.neutralize_input_under_host_lease().err();
+        if let Some(error) = &cleanup_failure {
+            // Input neutralization failed after backend dispatch. Fence this
+            // coordinator immediately; retry cleanup while it still owns the
+            // lease, and hand the lease off only if that retry succeeds.
             self.backend_dead = true;
             self.host_effect_cancel.cancel();
             self.revoke_ask_lease_for_delegation();
@@ -3165,7 +3172,7 @@ impl ComputerActionCoordinator {
             }
         }
         let effective_failure = report.failure.clone().or_else(|| {
-            release_failure.map(|error| ComputerFailure {
+            cleanup_failure.map(|error| ComputerFailure {
                 index: actions.len().saturating_sub(1),
                 error,
             })
@@ -4198,7 +4205,21 @@ impl ComputerActionCoordinator {
     /// deliberately retained: handing it off with uncertain injected state
     /// would allow physical input from two ownership generations to overlap.
     fn release_input_before_host_lease(&mut self) -> Result<(), ComputerError> {
-        self.neutralize_backend_input()?;
+        if !self.input_cleanup_permitted {
+            return Ok(());
+        }
+        if let Err(error) = self.neutralize_input_under_host_lease() {
+            // Losing the lock is already safely fenced by the helper. Closing
+            // a stale coordinator must not turn that condition into an
+            // attempted cleanup or a normal lease handoff.
+            if !self.input_cleanup_permitted {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if !self.input_cleanup_permitted {
+            return Ok(());
+        }
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
         {
@@ -4212,6 +4233,50 @@ impl ComputerActionCoordinator {
     /// recover stale input from a predecessor before exposing a new owner.
     fn neutralize_backend_input(&mut self) -> Result<(), ComputerError> {
         self.backend.release_all()
+    }
+
+    /// Neutralize input without relinquishing a valid host lease.
+    ///
+    /// Every caller must pass through this proof boundary: the backend cannot
+    /// decide whether a physical cleanup is still exclusive across Cockpit
+    /// processes. A lost or stale lease is abandoned without injecting any
+    /// cleanup; the next fresh owner recovers the durable input journal.
+    fn neutralize_input_under_host_lease(&mut self) -> Result<(), ComputerError> {
+        if !self.input_cleanup_permitted {
+            return Err(ComputerError::Refused(
+                "host input lease is no longer exclusive for cleanup".to_string(),
+            ));
+        }
+        let has_exclusive_host_lease = match (&self.host_lease, &self.host_arbiter) {
+            (Some(token), Some(arbiter)) => {
+                let arbiter = lock_poison_safe(arbiter);
+                arbiter.is_lease_valid(token) && !arbiter.detect_lock_loss(token)
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !has_exclusive_host_lease {
+            self.abandon_host_lease_without_input();
+            return Err(ComputerError::Refused(
+                "host input lease lost before terminal cleanup".to_string(),
+            ));
+        }
+        self.neutralize_backend_input()
+    }
+
+    /// Relinquish a physical lease after its OS lock is already absent.
+    ///
+    /// The logical lease is process-local bookkeeping, so releasing it does
+    /// not inject input and lets a local waiter compete for a fresh OS lease.
+    /// Cleanup remains forbidden for this stale coordinator; a successful new
+    /// owner reloads and clears the backend's durable held-key journal first.
+    fn abandon_host_lease_without_input(&mut self) {
+        self.input_cleanup_permitted = false;
+        if let Some(token) = self.host_lease.take()
+            && let Some(arbiter) = &self.host_arbiter
+        {
+            lock_poison_safe(arbiter).release(&token);
+        }
     }
 
     /// Keep a failed-cleanup physical lease alive until process exit.
@@ -6394,12 +6459,17 @@ mod tests {
             Arc::new(FakeComputerAuthorizer::always_allow());
         let sinks = PhysicalTestSinks::new();
         let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut coordinator = ComputerActionCoordinator::open(
-            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            Box::new(CleanupRecordingPhysicalBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
             params,
         )
         .await
         .expect("coordinator open");
+        events.lock().expect("event log").clear();
 
         // Simulate OS lock loss by externally releasing the OS-level lock for
         // the coordinator's key while the arbiter still records it as holder.
@@ -6408,9 +6478,16 @@ mod tests {
             external.release(&key);
         }
 
-        // Detect lock loss — this drives the host-lease invalidation mechanism.
+        // Detection must not emit stale-owner cleanup. A competing process can
+        // acquire the physical target between loss and this observation; only
+        // its newly acquired coordinator may neutralize the durable journal.
         let valid = coordinator.check_host_lease();
-        let _ = valid;
+        assert!(!valid);
+        assert!(events.lock().expect("event log").is_empty());
+        assert!(!arbiter.lock().expect("arbiter").is_held(&key));
+
+        drop(coordinator);
+        assert!(events.lock().expect("event log").is_empty());
     }
 
     #[tokio::test]

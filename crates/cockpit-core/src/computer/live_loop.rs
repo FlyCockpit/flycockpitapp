@@ -181,7 +181,6 @@ mod tests {
             ComputerBatchReport {
                 completed: Vec::new(),
                 failure: None,
-                release_failure: None,
             }
         }
 

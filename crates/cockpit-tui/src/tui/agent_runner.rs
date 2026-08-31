@@ -5190,6 +5190,36 @@ mod tests {
                         protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
                         database_path: "test.db".to_string(),
+                        schema_version: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            let status = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request {
+                id: status_id,
+                request: Request::DaemonStatus,
+                ..
+            } = status.body
+            else {
+                panic!("expected daemon status handshake request");
+            };
+            proto
+                .send(&Envelope::response(
+                    status_id,
+                    Response::DaemonStatus {
+                        pid: 1,
+                        uptime_secs: 0,
+                        active_sessions: 0,
+                        socket_path: "test.sock".to_string(),
+                        daemon_version: "test".to_string(),
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: "test.db".to_string(),
                         // Handshake negotiation intentionally ignores database
                         // metadata; keep this socket fixture independent of
                         // cockpit-core's private storage implementation.
@@ -6579,18 +6609,9 @@ mod tests {
                                 cockpit_proto::PROTOCOL_VERSION,
                                 |request| async move {
                                     match request {
-                                        Request::Attach {
-                                            session_id: got_session_id,
-                                            since_seq,
-                                            project_root,
-                                            ..
-                                        } => {
-                                            assert_eq!(got_session_id, Some(session_id));
-                                            assert_eq!(since_seq, Some(4));
-                                            assert_eq!(
-                                                project_root.as_deref(),
-                                                Some("/tmp/project")
-                                            );
+                                        Request::AttachExistingCodeRootV1(request) => {
+                                            assert_eq!(request.root_id.0, session_id);
+                                            assert_eq!(request.since_seq, Some(4));
                                         }
                                         other => panic!("expected attach request, got {other:?}"),
                                     }
@@ -6680,11 +6701,8 @@ mod tests {
             |request| async move {
                 assert!(matches!(
                     request,
-                    Request::Attach {
-                        session_id: Some(actual),
-                        since_seq: Some(9),
-                        ..
-                    } if actual == session_id
+                    Request::AttachExistingCodeRootV1(request)
+                        if request.root_id.0 == session_id && request.since_seq == Some(9)
                 ));
                 Ok(Ok(response))
             },
@@ -6971,19 +6989,10 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         match &requests[0] {
-            Request::Attach {
-                session_id,
-                since_seq,
-                project_root,
-                no_sandbox,
-                interactive,
-                ..
-            } => {
-                assert_eq!(*session_id, None);
-                assert_eq!(*since_seq, None);
-                assert_eq!(project_root.as_deref(), Some("/tmp/project"));
-                assert!(*no_sandbox);
-                assert!(*interactive);
+            Request::CreateCodeRootV1(request) => {
+                assert_eq!(request.workspace_selector.path, "/tmp/project");
+                assert!(request.options.no_sandbox);
+                assert!(request.options.interactive);
             }
             other => panic!("expected one attach request, got {other:?}"),
         }

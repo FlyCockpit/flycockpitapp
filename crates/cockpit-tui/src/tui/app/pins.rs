@@ -1135,6 +1135,36 @@ mod tests {
                         protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
                         database_path: "test.db".to_string(),
+                        schema_version: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            let status = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request {
+                id: status_id,
+                request: Request::DaemonStatus,
+                ..
+            } = status.body
+            else {
+                panic!("expected daemon status handshake request");
+            };
+            proto
+                .send(&Envelope::response(
+                    status_id,
+                    Response::DaemonStatus {
+                        pid: 1,
+                        uptime_secs: 0,
+                        active_sessions: 0,
+                        socket_path: "test.sock".to_string(),
+                        daemon_version: "test".to_string(),
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: "test.db".to_string(),
                         // Handshake negotiation intentionally ignores database
                         // metadata; keep this socket fixture independent of
                         // cockpit-core's private storage implementation.

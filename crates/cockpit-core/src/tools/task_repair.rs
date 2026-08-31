@@ -106,6 +106,8 @@ const DELEGATE_KEYS: &[&str] = &[
     "cwd",
     "write_scope",
     "grant_tools",
+    "seed_reads",
+    "seed_reads_receipt",
     "todo_ids",
 ];
 
@@ -701,6 +703,28 @@ mod tests {
 
     fn known() -> BTreeSet<String> {
         ["real-id".to_string()].into_iter().collect()
+    }
+
+    #[test]
+    fn canonical_delegate_preserves_seed_reads() {
+        let parsed = parse_task_args(
+            &json!({
+                "intent": "delegate",
+                "payload": {
+                    "agent": "builder",
+                    "prompt": "implement",
+                    "seed_reads": [{"tool": "read", "args": {"path": "src/lib.rs"}}],
+                    "seed_reads_receipt": "host-issued-receipt"
+                }
+            }),
+            &known(),
+        )
+        .unwrap();
+        let ParsedTaskArgs::Delegate { args, .. } = parsed else {
+            panic!("expected delegate");
+        };
+        assert_eq!(args["seed_reads"][0]["tool"], "read");
+        assert_eq!(args["seed_reads_receipt"], "host-issued-receipt");
     }
 
     #[test]

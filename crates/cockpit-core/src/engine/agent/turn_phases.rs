@@ -1901,6 +1901,44 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 // Collected loosely here (trimmed, de-blanked, de-duplicated);
                 // role-invariant rejection happens at the single driver chokepoint.
                 let granted_tools = task_string_array(&args, "grant_tools");
+                let seed_reads =
+                    match crate::engine::seed_reads::parse_seed_reads(args.get("seed_reads")) {
+                        Ok(seed_reads) => seed_reads,
+                        Err(err) => {
+                            return_structural!(task_refusal(
+                                &tc.id,
+                                tc.provider
+                                    .as_ref()
+                                    .and_then(|provider| provider.item_id.clone()),
+                                tc.provider
+                                    .as_ref()
+                                    .map(|provider| provider.call_id.clone()),
+                                err
+                            ));
+                        }
+                    };
+                let seed_reads_receipt = args
+                    .get("seed_reads_receipt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Err(err) = crate::engine::seed_reads::authorize_handoff(
+                    session,
+                    agent,
+                    &child,
+                    &seed_reads,
+                    seed_reads_receipt.as_deref(),
+                ) {
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        err
+                    ));
+                }
                 let todo_ids = task_todo_ids(&args);
                 if !noninteractive {
                     // Timeline event (Part B): an interactive `task`
@@ -1986,6 +2024,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         model,
                         remaining_depth,
                         granted_tools,
+                        seed_reads,
+                        seed_reads_receipt,
                         todo_ids,
                         repair_notes,
                         task_call_id: tc.id.to_string(),
@@ -2011,6 +2051,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     workspace_lease,
                     context,
                     granted_tools,
+                    seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id: tc.id.to_string(),

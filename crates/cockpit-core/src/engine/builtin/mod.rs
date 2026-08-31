@@ -7154,7 +7154,13 @@ pub(crate) mod tests {
     fn explore_never_gets_removed_seed_tool() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
-        assert!(!explore(&args).tools.names().contains(&"seed"));
+        let explore_agent = explore(&args);
+        let tools = explore_agent.tools.names();
+        assert!(!tools.contains(&"seed"));
+        assert!(
+            tools.contains(&"mcp"),
+            "explore keeps Monty in its stable base toolbox"
+        );
     }
 
     #[test]

@@ -2029,6 +2029,7 @@ fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedCon
 /// Daemon-only effective loader. Existing settings/bootstrap callers remain
 /// advisory, while an explicitly present malformed response tokenizer in any
 /// participating (trust-filtered) readable layer rejects daemon adoption.
+#[derive(Debug)]
 pub struct DaemonExtendedConfigLoad {
     pub providers: crate::config::providers::ProvidersConfig,
     pub config: ExtendedConfig,
@@ -2168,7 +2169,7 @@ fn validate_local_knowledge_root_overlaps(
     cwd: &Path,
     entries: &[KnowledgeBaseRegistryEntry],
 ) -> Result<()> {
-    let mut roots = Vec::new();
+    let mut roots: Vec<(&str, PathBuf)> = Vec::new();
     for entry in entries {
         let KnowledgeBaseSource::Local { path } = &entry.source else {
             continue;
@@ -2186,9 +2187,12 @@ fn validate_local_knowledge_root_overlaps(
             )
         })?;
         for (existing_id, existing_root) in &roots {
-            if cockpit_host::path_containment::contained_under(existing_root, &root)
-                || cockpit_host::path_containment::contained_under(&root, existing_root)
-            {
+            // Both roots have already passed `resolve_effective_local_knowledge_root`,
+            // which resolves symlinks through their nearest existing ancestors and
+            // preserves only a normalized unresolved tail. Component-wise prefix
+            // matching therefore detects equality and nesting without making the
+            // config leaf depend upward on `cockpit-host`.
+            if existing_root.starts_with(&root) || root.starts_with(existing_root) {
                 anyhow::bail!(
                     "local knowledge bases `{}` and `{}` resolve to overlapping roots (`{}` and `{}`)",
                     existing_id,

@@ -1473,7 +1473,10 @@ fn commit_knowledge_dream(
             });
         }
     };
-    let paths: BTreeSet<_> = paths
+    // `BTreeSet` de-duplicates and orders the union before we hand the exact
+    // selected path list to Git. The commit boundary consumes a slice so its
+    // path set remains identical to the one used for staging.
+    let paths: Vec<_> = paths
         .union(before_paths.expect("worktree Git staging has a pre-mutation baseline"))
         .cloned()
         .collect();

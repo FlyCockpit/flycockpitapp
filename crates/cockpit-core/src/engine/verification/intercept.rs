@@ -1439,6 +1439,7 @@ mod tests {
     ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,
@@ -1448,6 +1449,7 @@ mod tests {
             dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_lease: None,
             current_tool_call_id: None,
+            current_tool_call_scope: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
             session,

@@ -23,6 +23,57 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         match event {
+            ScheduleEvent::EphemeralCompleted { job_id } => {
+                // No-op idle wakes intentionally have neither a transcript
+                // turn nor an inbox item; only their live registry row ends.
+                self.schedule.mark_completed(&job_id);
+            }
+            ScheduleEvent::IdleWakePublicationCancelled {
+                job_id,
+                label,
+                kind,
+            } => {
+                let _ = tx
+                    .send(TurnEvent::ScheduleCompleted {
+                        job_id,
+                        label,
+                        kind: kind.as_str().to_string(),
+                        failed: false,
+                    })
+                    .await;
+            }
+            ScheduleEvent::IdleWakeCompleted {
+                job_id,
+                kind,
+                result,
+                requests,
+            } => {
+                if self.persist_on_reentry_owns_started_unsettled_siblings() {
+                    anyhow::bail!(
+                        "persist-on-re-entry owns started-unsettled idle wake completion"
+                    );
+                }
+                // This is deliberately not `mark_completed`: each event is one
+                // acting wake, while the registry row owns the remaining
+                // bounded wakes. Its result is the only main-thread turn this
+                // wake produces.
+                let mut injected =
+                    format!("{}\n{result}", async_result_header(kind.as_str(), &job_id));
+                if !requests.is_empty() {
+                    injected.push_str(
+                        "\n\nThis loop requested new scheduled work (not started — you decide):",
+                    );
+                    for req in &requests {
+                        injected.push_str(&format!("\n- {}", req.summary()));
+                    }
+                }
+                self.run_user_input(
+                    scheduled_job_submission(injected, Some(job_id)),
+                    input_rx,
+                    tx,
+                )
+                .await?;
+            }
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
                 if self.persist_on_reentry_owns_started_unsettled_siblings() {
                     // Do not run the tick or call `iteration_finished`: keep-park
@@ -251,11 +302,12 @@ impl Driver {
                 if limit.is_none() {
                     self.ensure_unbounded_loop_allowed().await?;
                 }
-                let job_id = if parsed.keep_in_context {
-                    self.schedule.start_loop_in_context(parsed)
-                } else {
-                    self.schedule.start_loop_forked(parsed)
-                };
+                let job_id =
+                    if parsed.keep_in_context && !parsed.idle && parsed.watch_paths.is_empty() {
+                        self.schedule.start_loop_in_context(parsed)
+                    } else {
+                        self.schedule.start_loop_forked(parsed)
+                    };
                 let noun = if kind == ScheduleKind::Timer {
                     "timer"
                 } else {
@@ -427,34 +479,67 @@ impl Driver {
         // boundary: protected roots force zerobox confinement even when the
         // ordinary session sandbox is disabled.
         let denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots_for_model(
+            &self.session,
             &self.cwd,
             &self.config.extended(),
-            agent.model.is_trusted(),
+            agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases()),
+            !agent.delegated && agent.model.is_trusted(),
         )
+        .await
         .map_err(|error| {
             format!("Error: cannot resolve local knowledge-base access policy: {error}")
         })?;
-        let sandbox_on = self.session.sandbox_enabled() || !denied_knowledge_paths.is_empty();
+        let attached_knowledge_paths = crate::knowledge::attached_local_knowledge_roots_for_model(
+            &self.session,
+            &self.cwd,
+            &self.config.extended(),
+            agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases()),
+            !agent.delegated && agent.model.is_trusted(),
+        )
+        .await
+        .map_err(|error| {
+            format!("Error: cannot resolve local knowledge-base access policy: {error}")
+        })?;
+        let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+            &self.session,
+            &self.cwd,
+            &self.config.extended(),
+        )
+        .await;
+        let sandbox_on = self.session.sandbox_enabled()
+            || !denied_knowledge_paths.is_empty()
+            || !write_denied_knowledge_paths.is_empty();
         let availability = if sandbox_on {
             background_sandbox_availability(cwd).await
         } else {
             crate::tools::shell_sandbox::SandboxAvailability::Available
         };
-        match crate::engine::schedule::background::background_launch_gate(sandbox_on, &availability)
-        {
+        match crate::engine::schedule::background::background_launch_gate(
+            sandbox_on,
+            !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
+            &availability,
+        ) {
             crate::tools::shell_sandbox::SandboxGate::Unconfined => {
                 Ok(crate::engine::schedule::background::BackgroundLaunch::unconfined(session_env))
             }
             crate::tools::shell_sandbox::SandboxGate::Confine => Ok(
-                crate::engine::schedule::background::BackgroundLaunch::confined_with_denied_knowledge_paths(
+                crate::engine::schedule::background::BackgroundLaunch::confined_with_knowledge_paths(
                     self.session.tmp_dir(),
                     self.session.workspace_scratch_dir(),
                     session_env,
+                    attached_knowledge_paths,
                     denied_knowledge_paths,
+                    write_denied_knowledge_paths,
                 ),
             ),
             crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
-                if denied_knowledge_paths.is_empty() {
+                if denied_knowledge_paths.is_empty() && write_denied_knowledge_paths.is_empty() {
                     Err(background_sandbox_unavailable_refusal(&reason))
                 } else {
                     Err(background_knowledge_sandbox_unavailable_refusal(&reason))

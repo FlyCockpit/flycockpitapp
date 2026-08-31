@@ -621,6 +621,7 @@ fn history_render_signature(
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
     file_icons: bool,
+    hide_tool_calls: bool,
     sticky_user_message: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
@@ -635,6 +636,7 @@ fn history_render_signature(
     diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
     file_icons.hash(&mut hasher);
+    hide_tool_calls.hash(&mut hasher);
     sticky_user_message.hash(&mut hasher);
 
     if let HistoryEntry::User {
@@ -838,7 +840,11 @@ fn history_entry_gap_rows(
     history: &super::history_log::HistoryLog,
     idx: usize,
     entry: &HistoryEntry,
+    hide_tool_calls: bool,
 ) -> usize {
+    if hide_tool_calls && entry.is_tool_call_entry() {
+        return 0;
+    }
     let gap = match entry {
         HistoryEntry::User { .. }
         | HistoryEntry::ToolBox { .. }
@@ -2598,7 +2604,7 @@ impl App {
                 .get(&id)
                 .map(|cached| cached.prewrapped.height)
                 .unwrap_or(0);
-            let gap_rows = history_entry_gap_rows(&self.history, idx, entry);
+            let gap_rows = history_entry_gap_rows(&self.history, idx, entry, self.hide_tool_calls);
             let next = self
                 .chat_geometry
                 .offsets
@@ -2765,7 +2771,7 @@ impl App {
                 .get(&id)
                 .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
             lines.extend(cached.prewrapped.find_text.iter().cloned());
-            for _ in 0..history_entry_gap_rows(&self.history, idx, entry) {
+            for _ in 0..history_entry_gap_rows(&self.history, idx, entry, self.hide_tool_calls) {
                 lines.push(String::new());
             }
         }
@@ -2988,6 +2994,7 @@ impl App {
                     self.diff_style,
                     self.use_emojis,
                     self.file_icons,
+                    self.hide_tool_calls,
                     self.sticky_user_message,
                     &self.elided_event_ids,
                     preflight_dots_ms,
@@ -3000,21 +3007,36 @@ impl App {
                     }
                     _ => {
                         recached_from = Some(recached_from.map_or(idx, |dirty| dirty.min(idx)));
-                        let rendered = Rc::new(render_entry(
-                            entry,
-                            area.width,
-                            self.thinking_setting,
-                            self.markdown_opts,
-                            self.diff_style,
-                            self.use_emojis,
-                            self.file_icons,
-                            &self.elided_event_ids,
-                            // Same continuously-advancing clock the busy/Thinking spinner
-                            // reads, so a preflight-pending row's `Preflight...` dots animate
-                            // each 100ms tick (implementation note).
-                            preflight_dots_ms,
-                            pin,
-                        ));
+                        let rendered =
+                            Rc::new(if self.hide_tool_calls && entry.is_tool_call_entry() {
+                                Rendered {
+                                    lines: Vec::new(),
+                                    copy_body_start: None,
+                                    chip_row: None,
+                                    continuations: Vec::new(),
+                                    tool_call_rows: Vec::new(),
+                                    tool_result_scroll_regions: Vec::new(),
+                                    reasoning_scroll_region: None,
+                                    pin_region: None,
+                                    metric_region: None,
+                                }
+                            } else {
+                                render_entry(
+                                    entry,
+                                    area.width,
+                                    self.thinking_setting,
+                                    self.markdown_opts,
+                                    self.diff_style,
+                                    self.use_emojis,
+                                    self.file_icons,
+                                    &self.elided_event_ids,
+                                    // Same continuously-advancing clock the busy/Thinking spinner
+                                    // reads, so a preflight-pending row's `Preflight...` dots animate
+                                    // each 100ms tick (implementation note).
+                                    preflight_dots_ms,
+                                    pin,
+                                )
+                            });
                         let entry_row_meta = Self::row_meta_for_rendered_entry(
                             entry,
                             idx,
@@ -6051,9 +6073,9 @@ mod render_history_spacing_tests {
     }
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
-        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
-        ToolCallState, render_entry, render_entry_call_count, render_pending,
-        render_pending_incremental, reset_render_entry_call_count,
+        HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentOutcome,
+        SubagentRoutingChips, ToolCall, ToolCallState, render_entry, render_entry_call_count,
+        render_pending, render_pending_incremental, reset_render_entry_call_count,
     };
     use crate::tui::markdown::{
         render_byte_count as markdown_render_byte_count,
@@ -6258,6 +6280,25 @@ mod render_history_spacing_tests {
             spawned_at: std::time::Instant::now(),
             outcome: None,
             expanded: false,
+        }
+    }
+
+    fn completed_subagent(report: &str) -> HistoryEntry {
+        HistoryEntry::Subagent {
+            parent: "Build".to_string(),
+            child: "reporter".to_string(),
+            task_call_id: "completed-call".to_string(),
+            label: "default".to_string(),
+            model_trusted: true,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: std::time::Instant::now(),
+            outcome: Some(SubagentOutcome {
+                report: report.to_string(),
+                failed: false,
+                duration: std::time::Duration::from_secs(1),
+                status: None,
+            }),
+            expanded: true,
         }
     }
 
@@ -9769,6 +9810,106 @@ mod render_history_spacing_tests {
             app.chat_row_meta[diff_row].diff_path.as_deref(),
             Some("src/lib.rs")
         );
+    }
+
+    #[test]
+    fn hiding_tool_calls_filters_rendered_rows_and_interaction_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![
+            user("visible user message"),
+            HistoryEntry::ToolBox {
+                calls: vec![ToolCall {
+                    call_id: "tool-box-call".to_string(),
+                    tool: "bash".to_string(),
+                    summary: "tool-box-marker".to_string(),
+                    full_input: "printf tool-box-marker".to_string(),
+                    output: String::new(),
+                    expanded: false,
+                    result_offset: 0,
+                    state: ToolCallState::Success,
+                    hint: None,
+                    progress: None,
+                    mcp_child: None,
+                }],
+                view_offset: 0,
+                follow: true,
+            },
+            HistoryEntry::ToolLine {
+                call_id: "tool-line-call".to_string(),
+                tool: "write".to_string(),
+                summary: "tool-line-marker".to_string(),
+                icon_path: None,
+                state: ToolCallState::Success,
+            },
+            diff_entry("tool-diff-marker.rs"),
+            running_subagent(),
+            completed_subagent("completed-subagent-report-marker"),
+            agent("visible assistant message"),
+        ]
+        .into();
+        let history_ids = app.history.ids().to_vec();
+        let history_before = format!("{:?}", &*app.history);
+
+        let shown = buffer_text(&render_history_buffer(&mut app, 100, 40));
+        for marker in [
+            "tool-box-marker",
+            "tool-line-marker",
+            "tool-diff-marker.rs",
+            "delegated to explore",
+            "completed-subagent-report-marker",
+        ] {
+            assert!(
+                shown.contains(marker),
+                "fixture must render {marker}:\n{shown}"
+            );
+        }
+
+        app.handle_tool_calls_command("hide");
+        let hidden = buffer_text(&render_history_buffer(&mut app, 100, 40));
+        assert!(hidden.contains("visible user message"), "{hidden}");
+        assert!(hidden.contains("visible assistant message"), "{hidden}");
+        for marker in [
+            "tool-box-marker",
+            "tool-line-marker",
+            "tool-diff-marker.rs",
+            "delegated to explore",
+            "completed-subagent-report-marker",
+        ] {
+            assert!(
+                !hidden.contains(marker),
+                "hidden tool row {marker}:\n{hidden}"
+            );
+        }
+        assert!(
+            app.chat_row_meta.iter().all(|meta| {
+                meta.tool_box_target.is_none()
+                    && meta.tool_call_target.is_none()
+                    && meta.tool_result_scroll.is_none()
+                    && meta.diff_path.is_none()
+            }),
+            "hidden tool rows must not leave interaction targets: {:?}",
+            app.chat_row_meta
+        );
+
+        app.handle_tool_calls_command("show");
+        let restored = buffer_text(&render_history_buffer(&mut app, 100, 40));
+        for marker in [
+            "tool-box-marker",
+            "tool-line-marker",
+            "tool-diff-marker.rs",
+            "delegated to explore",
+            "completed-subagent-report-marker",
+        ] {
+            assert!(
+                restored.contains(marker),
+                "shown tool row {marker}:\n{restored}"
+            );
+        }
+        assert_eq!(app.history.ids(), history_ids);
+        assert_eq!(format!("{:?}", &*app.history), history_before);
     }
 
     fn row_has_hover_bg(buffer: &ratatui::buffer::Buffer, row: usize, width: u16) -> bool {

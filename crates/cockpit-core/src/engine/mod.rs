@@ -50,6 +50,7 @@ pub mod response_performance;
 pub mod retry;
 pub mod safety_gate;
 pub mod schedule;
+pub mod seed_reads;
 pub mod task_identity;
 pub mod text_artifact_frame;
 pub mod text_call;

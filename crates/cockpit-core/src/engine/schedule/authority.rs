@@ -26,19 +26,20 @@
 //!   runs the prompt as a real turn in **main history**, then tells the
 //!   authority the iteration finished ([`ScheduleCommand::IterationFinished`])
 //!   so it can schedule the next tick or terminate.
-//! - `keep_in_context = false`: the whole loop runs inside the spawned
-//!   task on an **ephemeral fork** ([`super::loop_runner`]); only `note`s
-//!   (live UI) and the terminal result (via [`ScheduleEvent::Completed`]) cross
-//!   to main.
+//! - `keep_in_context = false`: the whole loop runs inside the spawned task on
+//!   an **ephemeral fork** ([`super::loop_runner`]); ordinary loops promote
+//!   `note`s (live UI) and their terminal result, while idle loops promote
+//!   each acting wake independently and discard read-only wakes.
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures::FutureExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::engine::agent::{Agent, TurnEvent};
@@ -48,6 +49,10 @@ use crate::engine::schedule::spec::{
 };
 use crate::redact::RedactionTable;
 use crate::session::Session;
+use crate::tools::schedule::{
+    ActiveIdleWake, IdleWakeCancellationClaim, new_active_idle_wake,
+    take_active_idle_wake_for_cancellation,
+};
 
 use super::{background, swarm};
 
@@ -92,6 +97,26 @@ pub enum ScheduleEvent {
     /// main history. After the turn the driver posts
     /// [`ScheduleCommand::IterationFinished`].
     LoopIterationDue { job_id: String, prompt: String },
+    /// An idle wake finished in its fork without a visible action. The driver
+    /// releases the live slot without recording a transcript turn.
+    EphemeralCompleted { job_id: String },
+    /// Cancellation raced an acting idle wake after the runner acquired
+    /// publication ownership. The acting event is ordered ahead of this
+    /// lifecycle-only marker; no synthetic cancellation turn is needed.
+    IdleWakePublicationCancelled {
+        job_id: String,
+        label: String,
+        kind: ScheduleKind,
+    },
+    /// An idle wake took a visible action. Unlike [`Self::Completed`], this
+    /// settles one wake but leaves the bounded idle loop registered for its
+    /// later wakes. The driver injects this wake's result immediately.
+    IdleWakeCompleted {
+        job_id: String,
+        kind: ScheduleKind,
+        result: String,
+        requests: Vec<SpawnRequest>,
+    },
     /// A genuine recursive-`Swarm` child subagent (`bee` / `scout`) has just
     /// STARTED its background task. Emitted by the runner ([`super::swarm::run_swarm`])
     /// as its FIRST action — on the SAME authority→driver channel and by the
@@ -162,6 +187,10 @@ struct ScheduleEntry {
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
     background: Option<Arc<background::BackgroundHandle>>,
+    /// The currently executing idle wake, if this is an idle fork. The
+    /// authority claims it during cancellation so an already-recorded action
+    /// cannot be lost when aborting the runner task.
+    active_idle_wake: Option<ActiveIdleWake>,
 }
 
 /// Per-iteration scheduling state for a keep-in-context loop. The
@@ -239,6 +268,90 @@ impl ScheduleContext {
         self.write_scope
             .as_ref()
             .and_then(|cell| crate::sync::lock_or_recover(cell).clone())
+    }
+}
+
+/// The mutable owner context for scheduled work.  The authority keeps one
+/// handle for its whole lifetime, so a thread handoff can replace the complete
+/// context without recreating the registry, idle activity epoch, or workers.
+///
+/// Spawned runners deliberately hold this handle rather than a context clone:
+/// they snapshot it at their next execution boundary, ensuring a timer that
+/// survived compaction forks from the successor rather than its predecessor.
+#[derive(Clone)]
+pub struct LiveScheduleContext {
+    state: Arc<RwLock<LiveScheduleState>>,
+}
+
+/// The complete execution-boundary snapshot for a live scheduled runner.
+///
+/// `migration_generation` identifies the root session from which an
+/// ephemeral fork was created. It must be read with `ctx`: reading either
+/// independently could pair a successor context with its predecessor's
+/// generation and leave one wake on the retired fork.
+struct LiveScheduleState {
+    ctx: ScheduleContext,
+    migration_generation: u64,
+}
+
+impl LiveScheduleContext {
+    fn new(ctx: ScheduleContext) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(LiveScheduleState {
+                ctx,
+                migration_generation: 0,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(ctx: ScheduleContext) -> Self {
+        Self::new(ctx)
+    }
+
+    pub fn snapshot(&self) -> ScheduleContext {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ctx
+            .clone()
+    }
+
+    /// Atomically capture the live context and the identity generation of its
+    /// root session for one runner wake boundary.
+    pub(crate) fn snapshot_at_wake(&self) -> (u64, ScheduleContext) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.migration_generation, state.ctx.clone())
+    }
+
+    fn replace(&self, ctx: ScheduleContext) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // An in-place compaction refreshes this same root session. Its fork is
+        // still valid, including accumulated non-independent loop history.
+        // Only a different root session retires that fork.
+        if !Arc::ptr_eq(&state.ctx.session, &ctx.session) {
+            state.migration_generation = state.migration_generation.wrapping_add(1);
+        }
+        state.ctx = ctx;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_tests(&self, ctx: ScheduleContext) {
+        self.replace(ctx);
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ScheduleContext)) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut state.ctx);
     }
 }
 
@@ -368,7 +481,7 @@ pub struct ScheduleAuthority {
     turn_tx: mpsc::Sender<TurnEvent>,
     /// Shared per-session context for spawning ephemeral-fork loops +
     /// background jobs.
-    ctx: ScheduleContext,
+    ctx: LiveScheduleContext,
     /// Global cap on simultaneously-running recursive `Swarm` subagents
     /// across the whole tree (GOALS §24, `swarm.max_concurrency`). `0` =
     /// unlimited. This is a **separate** budget from [`Self::max_concurrent`]
@@ -381,6 +494,14 @@ pub struct ScheduleAuthority {
     /// Recursive `Swarm` spawns that arrived while at the concurrency cap
     /// (GOALS §24). Drained FIFO as running jobs complete and slots free.
     swarm_queue: std::collections::VecDeque<SpawnSpec>,
+    /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
+    /// user message resets their countdown without polling.
+    idle_activity_tx: watch::Sender<Instant>,
+    /// Serializes ingress acceptance with an idle timer deciding that its
+    /// deadline elapsed. The owner publishes the watch update before release.
+    idle_activity_gate: Arc<tokio::sync::Mutex<()>>,
+    /// True when daemon ingress publishes accepted inline/media activity.
+    ingress_activity_owned: bool,
 }
 
 impl ScheduleAuthority {
@@ -390,13 +511,38 @@ impl ScheduleAuthority {
         &mut self,
         compiler: crate::computer::guidance::service::GuidanceCompiler,
     ) {
-        self.ctx.guidance_compiler = Some(compiler);
+        self.ctx
+            .update(|ctx| ctx.guidance_compiler = Some(compiler));
     }
 
     /// Install the durable write-scope cell into the context this authority
     /// hands to every spawned job.
     pub fn set_write_scope_source(&mut self, write_scope: crate::write_scope::WriteScopeSource) {
-        self.ctx.write_scope = Some(write_scope);
+        self.ctx.update(|ctx| ctx.write_scope = Some(write_scope));
+    }
+
+    /// Rebind scheduled work to the context that remains live after a thread
+    /// compaction. The registry and the idle-activity sender deliberately stay
+    /// in this authority: replacing either would duplicate live timers or lose
+    /// an idle wake's accepted-user anchor.
+    ///
+    /// The replacement is the entire context, not merely the session: a
+    /// successor owns its locks, redaction table, cwd, configuration, agent,
+    /// and scope authorities as one coherent execution boundary.
+    pub(crate) fn migrate_to_live_context(&mut self, ctx: ScheduleContext) {
+        self.ctx.replace(ctx);
+    }
+
+    /// Bind the daemon-ingress activity epoch. The worker handle publishes to
+    /// this sender as soon as durable queue admission succeeds, independently
+    /// of whether the driver is currently executing a turn.
+    pub fn set_idle_activity_sender(&mut self, sender: watch::Sender<Instant>) {
+        self.idle_activity_tx = sender;
+        self.ingress_activity_owned = true;
+    }
+
+    pub fn set_idle_activity_gate(&mut self, gate: Arc<tokio::sync::Mutex<()>>) {
+        self.idle_activity_gate = gate;
     }
 
     /// Build an authority. `event_tx` is drained by the driver at the turn
@@ -409,16 +555,20 @@ impl ScheduleAuthority {
         ctx: ScheduleContext,
         max_concurrent: usize,
     ) -> Self {
+        let (idle_activity_tx, _) = watch::channel(Instant::now());
         Self {
             registry: BTreeMap::new(),
             max_concurrent: max_concurrent.max(1),
             event_tx,
             cmd_tx,
             turn_tx,
-            ctx,
+            ctx: LiveScheduleContext::new(ctx),
             swarm_max_concurrency: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
+            idle_activity_tx,
+            idle_activity_gate: Arc::new(tokio::sync::Mutex::new(())),
+            ingress_activity_owned: false,
         }
     }
 
@@ -441,12 +591,12 @@ impl ScheduleAuthority {
         self.running_swarm
     }
 
-    /// Refresh the redaction table cloned into newly spawned scheduled work.
-    /// Existing in-flight tasks keep the table they started with; every
-    /// schedule/loop/background task started after this boundary inherits the
-    /// new one.
+    /// Refresh the redaction table used by newly spawned scheduled work and by
+    /// the next wake of every live loop. An iteration already executing keeps
+    /// its snapshot until it completes; a successor migration is adopted at
+    /// the next wake boundary rather than aborting that iteration.
     pub fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
-        self.ctx.redact = table;
+        self.ctx.update(|ctx| ctx.redact = table);
     }
 
     /// Refresh the session config reader handed to async-job turns. In-flight
@@ -458,18 +608,19 @@ impl ScheduleAuthority {
         &mut self,
         config: crate::daemon::session_worker::SessionConfigHandle,
     ) {
-        self.ctx.config = config;
+        self.ctx.update(|ctx| ctx.config = config);
     }
 
     pub fn set_local_installations(
         &mut self,
         local_installations: crate::agents::LocalInstallationResolver,
     ) {
-        self.ctx.local_installations = local_installations;
+        self.ctx
+            .update(|ctx| ctx.local_installations = local_installations);
     }
 
     pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
-        self.ctx.redact.clone()
+        self.ctx.snapshot().redact
     }
 
     /// Number of recursive `Swarm` spawns waiting on a free slot.
@@ -531,7 +682,7 @@ impl ScheduleAuthority {
             job_id: job_id.clone(),
             label: label.clone(),
             spec,
-            ctx: self.ctx.clone(),
+            ctx: self.ctx.snapshot(),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
@@ -575,6 +726,7 @@ impl ScheduleAuthority {
             abort: Some(handle.abort_handle()),
             in_context: None,
             background: None,
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -665,6 +817,13 @@ impl ScheduleAuthority {
     /// Start a loop/timer that accumulates in the main context. Returns
     /// the registered job id (echoed back to the model so it can cancel).
     pub fn start_loop_in_context(&mut self, args: LoopStartArgs) -> String {
+        // These options are owned by the fork runner: an idle wake needs
+        // per-wake effect classification, and watch mode must suppress model
+        // inference while unchanged. Keep direct authority callers from
+        // bypassing that boundary.
+        if args.idle || !args.watch_paths.is_empty() {
+            return self.start_loop_forked(args);
+        }
         let job_id = new_job_id();
         let kind = args.kind();
         let label = loop_label(&args);
@@ -681,6 +840,7 @@ impl ScheduleAuthority {
                 timer_abort: None,
             }),
             background: None,
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         self.emit_started(&job_id, &label, kind);
@@ -697,6 +857,7 @@ impl ScheduleAuthority {
         let kind = args.kind();
         let label = loop_label(&args);
         self.emit_started(&job_id, &label, kind);
+        let active_idle_wake = args.idle.then(new_active_idle_wake);
 
         let run_ctx = LoopRunCtx {
             job_id: job_id.clone(),
@@ -705,6 +866,11 @@ impl ScheduleAuthority {
             ctx: self.ctx.clone(),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
+            idle_activity_rx: args.idle.then(|| self.idle_activity_tx.subscribe()),
+            idle_activity_gate: args.idle.then(|| self.idle_activity_gate.clone()),
+            active_idle_wake: active_idle_wake.clone(),
+            #[cfg(test)]
+            iteration_completed_tx: None,
         };
         let handle = tokio::spawn(loop_runner::run_forked_loop(run_ctx));
         let entry = ScheduleEntry {
@@ -716,9 +882,39 @@ impl ScheduleAuthority {
             abort: Some(handle.abort_handle()),
             in_context: None,
             background: None,
+            active_idle_wake,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
+    }
+
+    /// Reset this thread's idle schedules after an accepted external user
+    /// message. Scheduled work and rejected input never call this method.
+    pub fn record_user_activity(&self) {
+        if !self.ingress_activity_owned {
+            self.publish_user_activity();
+        }
+    }
+
+    /// The same admission gate used by daemon ingress. Phase-two artifact
+    /// materialization takes it before its durable acceptance/reset pair.
+    pub fn idle_activity_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.idle_activity_gate.clone()
+    }
+
+    /// Publish phase-two FCM2 activity while the caller holds
+    /// [`Self::idle_activity_gate`].
+    pub fn record_materialized_user_activity_after_acceptance(&self) {
+        self.publish_user_activity();
+    }
+
+    fn publish_user_activity(&self) {
+        let _ = self.idle_activity_tx.send(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn idle_activity_anchor_for_tests(&self) -> Instant {
+        *self.idle_activity_tx.borrow()
     }
 
     /// Start a background shell job. Returns the job id.
@@ -738,7 +934,7 @@ impl ScheduleAuthority {
             command: args.command.clone(),
             cwd,
             launch,
-            redact: self.ctx.redact.clone(),
+            redact: self.ctx.snapshot().redact,
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
         });
@@ -752,6 +948,7 @@ impl ScheduleAuthority {
             abort: Some(abort),
             in_context: None,
             background: Some(Arc::new(handle)),
+            active_idle_wake: None,
         };
         self.registry.insert(job_id.clone(), entry);
         job_id
@@ -767,13 +964,25 @@ impl ScheduleAuthority {
         let Some(mut entry) = self.registry.remove(job_id) else {
             return false;
         };
+        // Claim the active idle wake before aborting its task. Its tools write
+        // effect records synchronously into this authority-owned state, so a
+        // cancellation racing an in-flight wake cannot erase an action that
+        // already happened.
+        let idle_wake_claim = entry
+            .active_idle_wake
+            .as_ref()
+            .map(take_active_idle_wake_for_cancellation);
+        let publication_owned_by_runner = matches!(
+            &idle_wake_claim,
+            Some(IdleWakeCancellationClaim::Publishing)
+        );
         // Stop any armed tick timer + spawned task.
         if let Some(ic) = &mut entry.in_context
             && let Some(t) = ic.timer_abort.take()
         {
             t.abort();
         }
-        if let Some(a) = entry.abort.take() {
+        if !publication_owned_by_runner && let Some(a) = entry.abort.take() {
             a.abort();
         }
         if let Some(bg) = &entry.background {
@@ -798,15 +1007,51 @@ impl ScheduleAuthority {
         // Ephemeral loops + background: the spawned task is aborted; we
         // synthesize the terminal completion here since the task won't get
         // to send its own.
-        else {
+        else if !publication_owned_by_runner {
             let was_swarm = entry.kind == ScheduleKind::Swarm;
+            let (result, requests) =
+                if let Some(IdleWakeCancellationClaim::Running(state)) = idle_wake_claim {
+                    let notes = state.take_notes();
+                    let requests = state.take_requests();
+                    let actions = state.take_actions();
+                    if notes.is_empty() && requests.is_empty() && actions.is_empty() {
+                        (
+                            format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                            requests,
+                        )
+                    } else {
+                        let mut result = format!(
+                            "{} `{}` cancelled after an acting idle wake.",
+                            entry.kind.as_str(),
+                            entry.label
+                        );
+                        if !actions.is_empty() {
+                            result.push_str("\nActions:");
+                            for action in actions {
+                                result.push_str(&format!("\n- {action}"));
+                            }
+                        }
+                        if !notes.is_empty() {
+                            result.push_str("\nNotes:");
+                            for note in notes {
+                                result.push_str(&format!("\n- {note}"));
+                            }
+                        }
+                        (result, requests)
+                    }
+                } else {
+                    (
+                        format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                        Vec::new(),
+                    )
+                };
             self.send_terminal_event(ScheduleEvent::Completed {
                 job_id: entry.job_id.clone(),
                 label: entry.label.clone(),
                 kind: entry.kind,
-                result: format!("{} `{}` cancelled", entry.kind.as_str(), entry.label),
+                result,
                 failed: false,
-                requests: Vec::new(),
+                requests,
             });
             // A swarm runner may ALSO publish its own terminal `Completed`
             // (`abort()` is not synchronous). Free the concurrency slot HERE,
@@ -949,7 +1194,7 @@ impl ScheduleAuthority {
     /// Emit the UI-only `started` signal.
     fn emit_started(&self, job_id: &str, label: &str, kind: ScheduleKind) {
         let _ = self.turn_tx.try_send(TurnEvent::ScheduleStarted {
-            session_id: self.ctx.session.id,
+            session_id: self.ctx.snapshot().session.id,
             job_id: job_id.to_string(),
             label: label.to_string(),
             kind: kind.as_str().to_string(),
@@ -972,15 +1217,15 @@ impl ScheduleAuthority {
 
     /// Rebind the fork context's agent after a primary swap (`/plan` ↔
     /// `/build`, `plan.md §4.6.d`) so future ephemeral-fork loop iterations
-    /// run on the new primary's model/tool surface. Existing live jobs keep
-    /// the agent they were spawned with.
+    /// run on the new primary's model/tool surface. A live runner snapshots
+    /// this handle at each wake, so its next iteration adopts the new agent.
     pub fn set_agent(&mut self, agent: Arc<Agent>) {
-        self.ctx.agent = agent;
+        self.ctx.update(|ctx| ctx.agent = agent);
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_name_for_tests(&self) -> &str {
-        &self.ctx.agent.name
+    pub(crate) fn agent_name_for_tests(&self) -> String {
+        self.ctx.snapshot().agent.name.clone()
     }
 }
 
@@ -1187,6 +1432,25 @@ mod tests {
         assert!(!auth.has_loop());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn watch_paths_cannot_bypass_the_fork_runner() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 60,
+            "prompt": "watch status",
+            "watch_paths": ["status.json"]
+        }))
+        .unwrap();
+
+        // The default `keep_in_context = true` must still route through the
+        // runner that computes the digest before requesting inference.
+        let job_id = auth.start_loop_in_context(args);
+        let entry = auth.registry.get(&job_id).expect("registered watch loop");
+        assert!(entry.in_context.is_none());
+        assert!(entry.abort.is_some());
+        assert!(auth.cancel(&job_id));
+    }
+
     /// A timer (`limit = 1`) fires exactly one iteration then completes.
     #[tokio::test(start_paused = true)]
     async fn timer_fires_once() {
@@ -1209,6 +1473,119 @@ mod tests {
             other => panic!("expected timer Completed, got {other:?}"),
         }
         assert!(!auth.has_loop());
+    }
+
+    #[test]
+    fn in_place_context_refresh_does_not_retire_the_fork_generation() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let (before_generation, before_ctx) = auth.ctx.snapshot_at_wake();
+
+        // `apply_prepared_compaction` rebuilds the complete schedule context
+        // while retaining the same root session. That refresh must leave an
+        // existing non-independent fork and its accumulated history live.
+        let refreshed_context = auth.ctx.snapshot();
+        auth.migrate_to_live_context(refreshed_context);
+
+        let (after_generation, after_ctx) = auth.ctx.snapshot_at_wake();
+        assert_eq!(after_generation, before_generation);
+        assert!(Arc::ptr_eq(&after_ctx.session, &before_ctx.session));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn migration_keeps_a_bounded_timer_armed_once() {
+        let (mut auth, mut events, _ui, tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 5, "prompt": "fire", "limit": 1
+        }))
+        .unwrap();
+        let job_id = auth.start_loop_in_context(args);
+        let (predecessor_generation, _) = auth.ctx.snapshot_at_wake();
+        let db = auth.ctx.snapshot().session.db.clone();
+        let successor = Arc::new(
+            crate::session::Session::create_for_test(
+                db,
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+
+        let mut successor_context = auth.ctx.snapshot();
+        successor_context.session = successor.clone();
+        auth.migrate_to_live_context(successor_context);
+        let (successor_generation, live_ctx) = auth.ctx.snapshot_at_wake();
+        assert_eq!(successor_generation, predecessor_generation.wrapping_add(1));
+        assert_eq!(live_ctx.session.id, successor.id);
+        assert_eq!(
+            auth.snapshot().len(),
+            1,
+            "migration must not clone the timer"
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ScheduleEvent::LoopIterationDue { job_id: ref due, .. } if due == &job_id
+        ));
+        auth.iteration_finished(&job_id);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ScheduleEvent::Completed {
+                kind: ScheduleKind::Timer,
+                ..
+            }
+        ));
+        assert!(auth.snapshot().is_empty(), "the bound remains one firing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn migrated_idle_timer_forks_from_the_successor_once() {
+        let (mut auth, _events, _ui, tmp) = test_authority(8);
+        let args = parse_loop_start(&serde_json::json!({
+            "interval": 5, "prompt": "check", "limit": 1, "idle": true
+        }))
+        .unwrap();
+        let job_id = auth.start_loop_in_context(args);
+        let predecessor = auth.ctx.snapshot().session;
+        let successor = Arc::new(
+            crate::session::Session::create_for_test(
+                predecessor.db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+
+        let mut successor_context = auth.ctx.snapshot();
+        successor_context.session = successor.clone();
+        auth.migrate_to_live_context(successor_context);
+        assert_eq!(auth.snapshot().len(), 1, "migration retains one timer");
+        assert_eq!(auth.snapshot()[0].job_id, job_id);
+        assert_eq!(auth.snapshot()[0].limit, Some(1));
+
+        // Let the task reach its wait before advancing the paused clock, then
+        // prove the wake created its fork from the successor, not the context
+        // cloned when this timer was registered.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            predecessor
+                .db
+                .list_forks(predecessor.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the predecessor must not gain a post-migration timer fork"
+        );
+        assert_eq!(
+            successor.db.list_forks(successor.id).await.unwrap().len(),
+            1,
+            "the bounded idle timer fires exactly once in the successor context"
+        );
     }
 
     /// `loop.cancel` ends a live in-context loop early and emits a
@@ -1438,6 +1815,9 @@ mod tests {
                             "goal-supervision worker {worker:?} must not emit SwarmChildStopGateCompleted"
                         )
                     }
+                    ScheduleEvent::EphemeralCompleted { .. } => {}
+                    ScheduleEvent::IdleWakeCompleted { .. }
+                    | ScheduleEvent::IdleWakePublicationCancelled { .. } => {}
                     ScheduleEvent::Completed { .. } => break,
                     ScheduleEvent::LoopIterationDue { .. } => {}
                 }

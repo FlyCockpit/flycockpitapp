@@ -20,6 +20,7 @@
 
 #![allow(deprecated)]
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,6 +100,93 @@ pub struct SessionCompactionRecord<'a> {
     pub tail_kept: usize,
     pub tail_trimmed: usize,
     pub tail_messages: &'a [crate::engine::message::Message],
+}
+
+/// Retained KB source bytes addressed by opaque, session-local read paths.
+/// They intentionally stay in memory: a resumed daemon cannot honestly claim
+/// it can still serve a prior process's retained source snapshot.
+#[derive(Default)]
+pub(crate) struct KnowledgeReadSnapshotStore {
+    entries: std::collections::HashMap<Uuid, KnowledgeReadSnapshot>,
+    /// Least-recently-used at the front. Snapshot citations are a bounded
+    /// convenience cache, not durable session state: retaining a newer source
+    /// must never make later searches unavailable for the life of a session.
+    recency: VecDeque<Uuid>,
+    total_bytes: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct KnowledgeReadSnapshot {
+    pub contents: String,
+    pub trust_required: bool,
+}
+
+const MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+impl KnowledgeReadSnapshotStore {
+    fn mark_knowledge_read_snapshot_recent(&mut self, id: Uuid) {
+        if let Some(position) = self.recency.iter().position(|candidate| *candidate == id) {
+            self.recency.remove(position);
+        }
+        self.recency.push_back(id);
+    }
+
+    fn retain(&mut self, contents: String, trust_required: bool, capacity: usize) -> Result<Uuid> {
+        if let Some(id) = self
+            .entries
+            .iter()
+            .find(|(_, snapshot)| {
+                snapshot.contents == contents && snapshot.trust_required == trust_required
+            })
+            .map(|(id, _)| *id)
+        {
+            self.mark_knowledge_read_snapshot_recent(id);
+            return Ok(id);
+        }
+        anyhow::ensure!(
+            contents.len() <= capacity,
+            "knowledge search source is larger than the per-session {} MiB cited-read cache",
+            capacity / (1024 * 1024)
+        );
+        while self.total_bytes > capacity - contents.len() {
+            let evicted_id = self.recency.pop_front().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge read snapshot cache lost its eviction order while retaining a source"
+                )
+            })?;
+            let evicted = self.entries.remove(&evicted_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "knowledge read snapshot cache eviction order references a missing source"
+                )
+            })?;
+            self.total_bytes = self
+                .total_bytes
+                .checked_sub(evicted.contents.len())
+                .context("knowledge read snapshot byte count underflow during eviction")?;
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(contents.len())
+            .context("knowledge read snapshot byte count overflow")?;
+        let id = Uuid::new_v4();
+        self.entries.insert(
+            id,
+            KnowledgeReadSnapshot {
+                contents,
+                trust_required,
+            },
+        );
+        self.recency.push_back(id);
+        Ok(id)
+    }
+
+    fn get(&mut self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
+        let snapshot = self.entries.get(&id).cloned();
+        if snapshot.is_some() {
+            self.mark_knowledge_read_snapshot_recent(id);
+        }
+        snapshot
+    }
 }
 
 tokio::task_local! {
@@ -207,6 +295,65 @@ impl UnjournaledInferenceReason {
     }
 }
 
+const MAX_SEED_READ_RECEIPTS: usize = 64;
+const SEED_READ_RECEIPT_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+struct SeedReadReceiptEntry {
+    seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+    issued_at: std::time::Instant,
+    state: SeedReadReceiptState,
+}
+
+enum SeedReadReceiptState {
+    Available,
+    Claimed,
+}
+
+fn retire_stale_seed_read_receipts(
+    receipts: &mut std::collections::HashMap<Uuid, SeedReadReceiptEntry>,
+) {
+    receipts.retain(|_, entry| {
+        matches!(entry.state, SeedReadReceiptState::Claimed)
+            || entry.issued_at.elapsed() < SEED_READ_RECEIPT_TTL
+    });
+}
+
+pub(crate) struct SeedReadReceiptClaim {
+    session: Arc<Session>,
+    id: Uuid,
+    committed: bool,
+}
+
+impl SeedReadReceiptClaim {
+    pub(crate) fn commit(mut self) {
+        self.session
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+        self.committed = true;
+    }
+}
+
+impl Drop for SeedReadReceiptClaim {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut receipts = self
+            .session
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = receipts.get_mut(&self.id)
+            && matches!(entry.state, SeedReadReceiptState::Claimed)
+        {
+            entry.state = SeedReadReceiptState::Available;
+        }
+        retire_stale_seed_read_receipts(&mut receipts);
+    }
+}
+
 /// Per-conversation session state. Cloned through `Arc` into every
 /// tool invocation. Owns a clone of the `Db` handle (the underlying
 /// connection is shared).
@@ -244,6 +391,11 @@ pub struct Session {
     /// the same root-scoped epoch and no declaration enters durable session
     /// state.
     forwarded_mcp_catalog: Arc<crate::mcp::forwarded::ForwardedCatalogSlot>,
+    /// One-use host receipts for explore-selected seed reads.  The receipt is
+    /// deliberately memory-only: a resumed process fails closed and requires
+    /// a fresh explore selection rather than accepting model-synthesized seed
+    /// calls after losing the host provenance boundary.
+    seed_read_receipts: Mutex<std::collections::HashMap<Uuid, SeedReadReceiptEntry>>,
     /// Turn-pinned transcription egress composed from the same resolved
     /// provider credential, endpoint, capability metadata, and journal.
     transcription_dispatch: Mutex<
@@ -417,6 +569,9 @@ pub struct Session {
     /// set is a valid completed capture. A false value means worker startup
     /// was interrupted before the first root-definition-bound capture.
     knowledge_base_prompt_snapshot_captured: AtomicBool,
+    /// Exact KB files returned by search, retained only for follow-up native
+    /// `read` calls during this daemon lifetime.
+    knowledge_read_snapshots: Mutex<KnowledgeReadSnapshotStore>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet
     /// in this session — the next user message gets one. Lives in
@@ -540,6 +695,134 @@ pub struct Session {
 }
 
 impl Session {
+    /// Bind an explore fork's host-captured calls to one subsequent
+    /// `Build -> builder` handoff. The opaque receipt is not a capability on
+    /// its own: redemption also compares the exact validated calls.
+    pub(crate) fn issue_seed_read_receipt(
+        &self,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+    ) -> Option<String> {
+        let receipt = Uuid::new_v4();
+        let argument_bytes = seed_reads.iter().try_fold(0usize, |total, seed| {
+            serde_json::to_vec(&seed.args)
+                .ok()
+                .and_then(|encoded| total.checked_add(encoded.len()))
+        });
+        if seed_reads.len() > crate::engine::seed_reads::MAX_SEED_READ_CALLS
+            || argument_bytes
+                .is_none_or(|bytes| bytes > crate::engine::seed_reads::MAX_SEED_READ_ARGUMENT_BYTES)
+        {
+            return None;
+        }
+        let mut receipts = self
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retire_stale_seed_read_receipts(&mut receipts);
+        while receipts.len() >= MAX_SEED_READ_RECEIPTS {
+            let Some(oldest) = receipts
+                .iter()
+                .filter(|(_, entry)| matches!(entry.state, SeedReadReceiptState::Available))
+                .min_by_key(|(_, entry)| entry.issued_at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            receipts.remove(&oldest);
+        }
+        if receipts.len() >= MAX_SEED_READ_RECEIPTS {
+            // Every retained entry is in the narrow admission claim window.
+            // Fail closed without growing session memory. Callers omit the
+            // selection rather than reporting calls with an unusable receipt.
+            return None;
+        }
+        receipts.insert(
+            receipt,
+            SeedReadReceiptEntry {
+                seed_reads: seed_reads.to_vec(),
+                issued_at: std::time::Instant::now(),
+                state: SeedReadReceiptState::Available,
+            },
+        );
+        Some(receipt.to_string())
+    }
+
+    pub(crate) fn validate_seed_read_receipt(
+        &self,
+        receipt: &str,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+    ) -> std::result::Result<(), String> {
+        let receipt = Uuid::parse_str(receipt)
+            .map_err(|_| "seed_reads receipt is not a host-issued UUID".to_string())?;
+        let mut receipts = self
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retire_stale_seed_read_receipts(&mut receipts);
+        match receipts.get(&receipt) {
+            Some(entry) if entry.seed_reads != seed_reads => {
+                Err("seed_reads do not match their host-issued explore receipt".to_string())
+            }
+            Some(entry) if matches!(entry.state, SeedReadReceiptState::Available) => Ok(()),
+            Some(_) => Err("seed_reads receipt is already being redeemed".to_string()),
+            None => Err("seed_reads receipt is unknown, expired, or already used".to_string()),
+        }
+    }
+
+    pub(crate) fn claim_seed_read_receipt(
+        self: &Arc<Self>,
+        receipt: Option<&str>,
+        seed_reads: &[crate::engine::seed_reads::SeedRead],
+    ) -> std::result::Result<Option<SeedReadReceiptClaim>, String> {
+        if seed_reads.is_empty() {
+            return Ok(None);
+        }
+        let raw = receipt
+            .ok_or_else(|| "seed_reads require the host-issued explore receipt".to_string())?;
+        let id = Uuid::parse_str(raw)
+            .map_err(|_| "seed_reads receipt is not a host-issued UUID".to_string())?;
+        let mut receipts = self
+            .seed_read_receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retire_stale_seed_read_receipts(&mut receipts);
+        match receipts.get_mut(&id) {
+            Some(entry) if entry.seed_reads != seed_reads => {
+                Err("seed_reads do not match their host-issued explore receipt".to_string())
+            }
+            Some(entry) if matches!(entry.state, SeedReadReceiptState::Available) => {
+                entry.state = SeedReadReceiptState::Claimed;
+                Ok(Some(SeedReadReceiptClaim {
+                    session: self.clone(),
+                    id,
+                    committed: false,
+                }))
+            }
+            Some(_) => Err("seed_reads receipt is already being redeemed".to_string()),
+            None => Err("seed_reads receipt is unknown, expired, or already used".to_string()),
+        }
+    }
+
+    pub(crate) fn retain_knowledge_read_snapshot(
+        &self,
+        contents: String,
+        trust_required: bool,
+    ) -> Result<Uuid> {
+        let mut snapshots = self
+            .knowledge_read_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.retain(contents, trust_required, MAX_KNOWLEDGE_READ_SNAPSHOT_BYTES)
+    }
+
+    pub(crate) fn knowledge_read_snapshot(&self, id: Uuid) -> Option<KnowledgeReadSnapshot> {
+        let mut snapshots = self
+            .knowledge_read_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.get(id)
+    }
+
     /// The session-owned knowledge-dream attachment-consent cell.
     pub(crate) fn dream_read_scope(
         &self,
@@ -1363,7 +1646,7 @@ impl Session {
             if current.revision > entry.dream_completion_revision {
                 fresh.push((
                     entry.id.clone(),
-                    entry.name.clone(),
+                    entry.freshness_notice_name.clone(),
                     current.revision,
                     current.completed_at_unix_ms,
                 ));
@@ -2120,6 +2403,21 @@ mod tests {
             assert!(scope.read().unwrap().is_some());
         }
         assert!(scope.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn knowledge_read_snapshots_evict_the_least_recently_used_source() {
+        let mut snapshots = KnowledgeReadSnapshotStore::default();
+        let first = snapshots.retain("one".to_string(), false, 6).unwrap();
+        let second = snapshots.retain("two".to_string(), false, 6).unwrap();
+
+        assert_eq!(snapshots.get(first).unwrap().contents, "one");
+        let third = snapshots.retain("six".to_string(), false, 6).unwrap();
+
+        assert!(snapshots.get(second).is_none());
+        assert_eq!(snapshots.get(first).unwrap().contents, "one");
+        assert_eq!(snapshots.get(third).unwrap().contents, "six");
+        assert_eq!(snapshots.total_bytes, 6);
     }
 
     #[tokio::test]

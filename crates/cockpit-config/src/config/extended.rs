@@ -8,6 +8,7 @@
 //! (defaults apply).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -172,7 +173,14 @@ impl KnowledgeBaseRegistryEntry {
 /// Remote KBs are served to arbitrary third-party agents, so a local-model
 /// trust promise is unenforceable and must be rejected at config load time.
 pub fn validate_knowledge_base_local_policy(entries: &[KnowledgeBaseRegistryEntry]) -> Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
     for entry in entries {
+        if !ids.insert(&entry.id) {
+            anyhow::bail!(
+                "knowledge base registry contains duplicate ID `{}`",
+                entry.id
+            );
+        }
         if matches!(&entry.source, KnowledgeBaseSource::Remote { .. }) && entry.trust_required {
             anyhow::bail!(
                 "knowledge base `{}` is remote and cannot set trustRequired; trustRequired is only enforceable for local knowledge bases",
@@ -2050,6 +2058,7 @@ fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedCon
 /// Daemon-only effective loader. Existing settings/bootstrap callers remain
 /// advisory, while an explicitly present malformed response tokenizer in any
 /// participating (trust-filtered) readable layer rejects daemon adoption.
+#[derive(Debug)]
 pub struct DaemonExtendedConfigLoad {
     pub providers: crate::config::providers::ProvidersConfig,
     pub config: ExtendedConfig,
@@ -2119,6 +2128,8 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     let config = resolve_loaded_docs(&docs);
     validate_knowledge_base_registry(&config.knowledge_bases, &providers)
         .context("invalid knowledge-base trust configuration")?;
+    validate_local_knowledge_root_overlaps(cwd, &config.knowledge_bases)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
         config,
@@ -2173,12 +2184,104 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     let config = resolve_loaded_docs(&docs);
     validate_knowledge_base_registry(&config.knowledge_bases, &providers)
         .context("invalid knowledge-base trust configuration")?;
+    validate_local_knowledge_root_overlaps(cwd, &config.knowledge_bases)
+        .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
         config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
     })
+}
+
+fn validate_local_knowledge_root_overlaps(
+    cwd: &Path,
+    entries: &[KnowledgeBaseRegistryEntry],
+) -> Result<()> {
+    let mut roots: Vec<(&str, PathBuf)> = Vec::new();
+    for entry in entries {
+        let KnowledgeBaseSource::Local { path } = &entry.source else {
+            continue;
+        };
+        let root = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let root = resolve_effective_local_knowledge_root(&root).with_context(|| {
+            format!(
+                "resolving configured local knowledge base `{}` root `{}` for overlap validation",
+                entry.id,
+                root.display()
+            )
+        })?;
+        for (existing_id, existing_root) in &roots {
+            // Both roots have already passed `resolve_effective_local_knowledge_root`,
+            // which resolves symlinks through their nearest existing ancestors and
+            // preserves only a normalized unresolved tail. Component-wise prefix
+            // matching therefore detects equality and nesting without making the
+            // config leaf depend upward on `cockpit-host`.
+            if existing_root.starts_with(&root) || root.starts_with(existing_root) {
+                anyhow::bail!(
+                    "local knowledge bases `{}` and `{}` resolve to overlapping roots (`{}` and `{}`)",
+                    existing_id,
+                    entry.id,
+                    existing_root.display(),
+                    root.display()
+                );
+            }
+        }
+        roots.push((entry.id.as_str(), root));
+    }
+    Ok(())
+}
+
+fn resolve_effective_local_knowledge_root(path: &Path) -> Result<PathBuf> {
+    let mut current = path;
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(base) => return append_unresolved_tail(base, path, current),
+            Err(err) => {
+                if std::fs::symlink_metadata(current)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!("symlink `{}` cannot be resolved: {err}", current.display());
+                }
+                let Some(parent) = current.parent() else {
+                    anyhow::bail!("no existing parent for `{}`", path.display());
+                };
+                if parent == current {
+                    anyhow::bail!("no existing parent for `{}`", path.display());
+                }
+                current = parent;
+            }
+        }
+    }
+}
+
+fn append_unresolved_tail(
+    mut base: PathBuf,
+    original: &Path,
+    existing_prefix: &Path,
+) -> Result<PathBuf> {
+    let tail = original
+        .strip_prefix(existing_prefix)
+        .unwrap_or_else(|_| Path::new(""));
+    for component in tail.components() {
+        match component {
+            std::path::Component::Normal(part) => base.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::bail!("unresolved parent traversal in `{}`", original.display());
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if base.file_name() == Some(OsStr::new("..")) {
+        anyhow::bail!("unresolved parent traversal in `{}`", original.display());
+    }
+    Ok(base)
 }
 
 #[derive(Debug)]
@@ -2776,13 +2879,8 @@ impl ExtendedConfigDoc {
                     cfg.knowledge_bases = entries;
                 }
                 Ok(_) | Err(_) => {
-                    tracing::warn!(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                    );
-                    warnings.push(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                            .to_string(),
-                    );
+                    tracing::warn!("ignored invalid `knowledgeBases` policy");
+                    warnings.push("ignored invalid `knowledgeBases` policy".to_string());
                 }
             }
         }
@@ -2942,13 +3040,8 @@ impl ExtendedConfigDoc {
             match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
                 Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {}
                 Ok(_) | Err(_) => {
-                    tracing::warn!(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                    );
-                    warnings.push(
-                        "ignored `knowledgeBases`: remote knowledge bases cannot set trustRequired"
-                            .to_string(),
-                    );
+                    tracing::warn!("ignored invalid `knowledgeBases` policy");
+                    warnings.push("ignored invalid `knowledgeBases` policy".to_string());
                     // An invalid upper registry must not reveal a lower one.
                     obj.insert("knowledgeBases".into(), serde_json::json!([]));
                 }

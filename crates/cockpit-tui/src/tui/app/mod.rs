@@ -1862,6 +1862,10 @@ pub struct App {
     /// detection; `on`/`off` override). Threaded into the history
     /// renderers so write/edit tool lines can swap in a file-type icon.
     pub(super) file_icons: bool,
+    /// Presentation-only filter for the current main assistant transcript.
+    /// The entries remain in local display history and daemon-backed storage;
+    /// this controls only whether their tool-call rows are rendered.
+    pub(super) hide_tool_calls: bool,
     /// Cached args from `ToolStart` for edit tools that need them at
     /// `ToolEnd` time (to build the `Diff` history entry). Keyed by
     /// `call_id`; entries are popped at `ToolEnd`. Anything left
@@ -3247,6 +3251,7 @@ pub(super) struct SubagentViewMeta {
 #[derive(Clone)]
 pub(super) struct StoredTranscriptView {
     pub(super) meta: TranscriptViewMeta,
+    pub(super) hide_tool_calls: bool,
     pub(super) history: HistoryWindow,
     pub(super) pending: Option<PendingMsg>,
     pub(super) active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
@@ -3668,6 +3673,7 @@ impl App {
             diff_style,
             use_emojis,
             file_icons,
+            hide_tool_calls: false,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
             queue_focus: None,

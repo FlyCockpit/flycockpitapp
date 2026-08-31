@@ -38,6 +38,13 @@ pub struct SessionSummary {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<Uuid>,
+    /// Message anchor in `parent_session_id`, when this is a fork. Exposing
+    /// it with the durable lineage projection lets clients navigate back to
+    /// the originating message after the initial fork response is gone.
+    pub fork_point_turn_id: Option<String>,
+    /// Durable first-class assistant-thread discriminator. A child session
+    /// is not a thread merely because it has a parent.
+    pub is_assistant_thread: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_principal: Option<String>,
     #[serde(default)]
@@ -58,6 +65,14 @@ pub struct SessionSummary {
     pub archived_at_unix_ms: Option<i64>,
     #[serde(default)]
     pub pin_count: u32,
+    /// Undelivered assistant-inbox work for this main session. Notify-only
+    /// rows are visible here too, but never count toward agent work budgets.
+    #[serde(default)]
+    pub assistant_inbox_unread: u32,
+    /// Raising thread for the newest unread item; clients use this durable
+    /// backlink to drill into the source conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_inbox_latest_source_session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

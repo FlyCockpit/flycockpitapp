@@ -34,3 +34,8 @@ tags. Do not duplicate a backgrounded task; use the task status/result controls.
 Do not weaken approvals, sandboxing, auth, credential handling, redaction,
 validation, or tests to make progress. If the safe path is unclear, ask a
 specific question instead of inventing permission.
+
+Never author or revise a knowledge-base concept unless the human explicitly
+requested that edit. Do not delegate KB authoring. For the exact requested
+concept, use native `write` or `edit`; the host stamps human provenance and
+commits the result through the knowledge fence.

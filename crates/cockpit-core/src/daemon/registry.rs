@@ -1581,7 +1581,12 @@ impl SessionRegistry {
             .flatten();
         let available = crate::agents::chat_ownable_primaries(&project_root);
         let initial_agent =
-            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant {
+                // Assistant mode owns an explicit first-class primary. Do not let
+                // the Code session's last-used/default selection silently boot
+                // Build here.
+                "Assistant".to_string()
+            } else if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
                 "Computer".to_string()
             } else {
                 crate::agents::resolve_setup_default_agent(
@@ -1590,18 +1595,37 @@ impl SessionRegistry {
                     session_worker::initial_active_agent(&extended_cfg),
                 )
             };
+        let assistant_identity_name =
+            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant {
+                crate::assistants::ensure_primary_assistant(&self.inner.db)
+                    .await
+                    .context("provisioning built-in Assistant identity")?;
+                Some(crate::assistants::PRIMARY_ASSISTANT_IDENTITY_NAME)
+            } else {
+                None
+            };
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
         // durable lifecycle rows (agent-tree, write-scope) that foreign-key
         // to `sessions`.
-        let mut session = Session::create_deferred(
-            self.inner.db.clone(),
-            project_root,
-            &initial_agent,
-            self.redaction_key_resolver()?,
-            self.secret_vault()?,
-        )
+        let mut session = match assistant_identity_name {
+            Some(name) => Session::create_assistant_deferred(
+                self.inner.db.clone(),
+                project_root,
+                &initial_agent,
+                name,
+                self.redaction_key_resolver()?,
+                self.secret_vault()?,
+            ),
+            None => Session::create_deferred(
+                self.inner.db.clone(),
+                project_root,
+                &initial_agent,
+                self.redaction_key_resolver()?,
+                self.secret_vault()?,
+            ),
+        }
         .context("creating session")?;
         session.set_deferred_entry_mode(session_entry_mode)?;
         if is_dream_session {
@@ -1706,7 +1730,7 @@ impl SessionRegistry {
             _guard: &worker_publication_guard,
         };
         let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-        crate::assistants::validate_assistant_name(assistant_name)?;
+        crate::assistants::validate_named_assistant_name(assistant_name)?;
         crate::assistants::load_verified(&self.inner.db, assistant_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
@@ -2180,9 +2204,27 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        // Publish the initial local-KB LSP policy before this worker is made
+        // externally live. The guard moves into the worker task below: a
+        // failed spawn drops it here, a cancelled start permit drops it in the
+        // task, and a running worker retains it through normal teardown.
+        let protected_lsp_roots = crate::knowledge::configured_local_knowledge_roots(
+            &session,
+            &project_root,
+            &extended_cfg,
+        )
+        .await;
+        let initial_lsp_session_protection = self
+            .inner
+            .lsp
+            .protect_session(session_id, protected_lsp_roots)
+            .await;
+
         // A concurrent promotion either finishes its complete service bundle
         // before this snapshot, or this new session keeps the coherent
         // pre-promotion bundle. It can never retain an intermediate mix.
+        // Everything after acquiring this synchronous guard is synchronous,
+        // so session startup remains `Send` when spawned by the daemon.
         let _persistent_service_transition = self.lock_persistent_service_transition();
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
@@ -2225,6 +2267,7 @@ impl SessionRegistry {
             daemon_no_sandbox,
             &extended_cfg,
             self.inner.lsp.clone(),
+            Some(initial_lsp_session_protection),
             crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone(),
             self.scheduler_source(),
             self.write_scope_source(),

@@ -66,6 +66,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, Sleep},
 };
+use uuid::Uuid;
 
 use crate::{
     engine::{
@@ -630,6 +631,10 @@ enum SteeringInject {
     Aborted,
 }
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
+/// Deferred inbox items are folded into a fresh internal turn on the main
+/// session's periodic heartbeat. Immediate items use the shorter idle poll
+/// below because they are allowed to wake an otherwise idle main session.
+const ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// After a goal-supervision swarm spawn is refused, its control job stays leased
 /// for the 300s lease TTL. Wake the goal loop a bit past that so a QUIESCENT
 /// session (no completions to wake it) re-runs supervision, re-leases the
@@ -1113,6 +1118,11 @@ pub struct Driver {
     /// frames. The queue merely schedules a safe-boundary turn; its placeholder
     /// text is never authority for the recovered model input.
     recovered_interactive_continuations: std::collections::HashMap<uuid::Uuid, Message>,
+    /// Recovered interactive continuations whose durable initial snapshot
+    /// contains seed declarations that must run before their first inference.
+    /// The queue UUID is a scheduling key only; the declarations remain in the
+    /// task snapshot until ordinary dispatch records their tool results.
+    recovered_interactive_seed_replays: std::collections::HashSet<uuid::Uuid>,
     /// Reattached accepted late-steer checkpoints waiting for the worker's
     /// exact `ResumeAcceptedLateUserDecisionSteer` control.  Keeping this
     /// separate from the queue scheduler makes an accepted checkpoint
@@ -1984,6 +1994,8 @@ impl Driver {
             coordinator,
             contract,
             action_items,
+            &self.session,
+            self.approver.as_ref(),
         )
         .await;
         if wire.is_empty() && proposal_result.is_none() {
@@ -2239,6 +2251,7 @@ impl Driver {
             pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
+            recovered_interactive_seed_replays: std::collections::HashSet::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             time_injection_interval_minutes: self.time_injection_interval_minutes,
@@ -2616,6 +2629,7 @@ impl Driver {
             pending_scheduled_turn: Vec::new(),
             late_steer_continuation_outcome: None,
             recovered_interactive_continuations: std::collections::HashMap::new(),
+            recovered_interactive_seed_replays: std::collections::HashSet::new(),
             recovered_interactive_late_steer_continuations: std::collections::HashMap::new(),
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -4069,6 +4083,8 @@ impl Driver {
                 .context("recovered interactive task snapshot has no history")?,
         )
         .context("decoding recovered interactive task history")?;
+        let recovered_seed_replay =
+            !crate::engine::seed_reads::pending_declared_seed_calls(&history).is_empty();
         let snapshot_next_prompt = snapshot
             .get("next_prompt")
             .cloned()
@@ -4218,6 +4234,10 @@ impl Driver {
             .await;
         self.recovered_interactive_continuations
             .insert(queue_item_id, next_prompt);
+        if recovered_seed_replay {
+            self.recovered_interactive_seed_replays
+                .insert(queue_item_id);
+        }
         Ok(endpoint_generation)
     }
 
@@ -4462,13 +4482,19 @@ impl Driver {
                 .context("driver stack is empty")?
                 .history;
             ensure_or_restore_parked_tool_call(history, &payload)?;
-            if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
-                return Ok(());
-            }
+            // A crash may occur after this seed's paired result commits but
+            // before its remaining siblings execute. Do not return early for
+            // a completed seed: the continuation below derives those
+            // siblings from the declared history and closes that gap.
         }
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
             executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
             knowledge_access_trusted: agent.model.is_trusted(),
             caller_model: Some(crate::engine::tool::CallerModel::from_model(
@@ -4480,6 +4506,10 @@ impl Driver {
             dream_read_scope: self.dream_read_scope.clone(),
             workspace_lease: agent.workspace_lease.clone(),
             current_tool_call_id: None,
+            current_tool_call_scope: payload
+                .resume
+                .assistant_seq
+                .map(|seq| format!("parked-tool-start-{seq}")),
             tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),
@@ -4572,27 +4602,163 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            interrupt_id,
-            response,
-            question,
-            async {
-                let frame = self.stack.last_mut().context("driver stack is empty")?;
-                crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
-                    crate::engine::agent::tool_dispatch::execute_ordinary_call(
-                        &env,
-                        &mut frame.history,
-                        &call,
-                        &payload.tool,
-                        crate::db::tool_calls::Recovery::Clean,
-                        None,
-                    )
+        let call_completed = self.stack.last().is_some_and(|frame| {
+            crate::engine::agent::history_ends_with_tool_result_call(
+                &frame.history,
+                &payload.call_id,
+            )
+        });
+        if !call_completed {
+            crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                interrupt_id,
+                response,
+                question,
+                async {
+                    let frame = self.stack.last_mut().context("driver stack is empty")?;
+                    crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
+                        crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                            &env,
+                            &mut frame.history,
+                            &call,
+                            &payload.tool,
+                            crate::db::tool_calls::Recovery::Clean,
+                            None,
+                        )
+                        .await
+                    })
                     .await
-                })
-                .await
-            },
-        )
-        .await
+                },
+            )
+            .await?;
+        }
+        if payload.call_id.starts_with("seed-read-") {
+            let pending = self
+                .stack
+                .last()
+                .map(|frame| crate::engine::seed_reads::pending_declared_seed_calls(&frame.history))
+                .unwrap_or_default();
+            if !pending.is_empty() {
+                let frame = self.stack.last_mut().context("driver stack is empty")?;
+                crate::engine::seed_reads::execute_declared_seed_calls(
+                    &env,
+                    &mut frame.history,
+                    pending,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run seed calls that were declared in the interactive child's durable
+    /// history before its first model inference.  Recovery reuses the same
+    /// declarations and call IDs, so publication never depends on the
+    /// in-memory explore receipt remaining available.
+    async fn execute_interactive_declared_seed_reads(
+        &mut self,
+        brief: Message,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        let pending = self
+            .stack
+            .last()
+            .map(|frame| crate::engine::seed_reads::pending_declared_seed_calls(&frame.history))
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Ok(brief);
+        }
+        let agent = self
+            .stack
+            .last()
+            .context("driver stack is empty")?
+            .agent
+            .clone();
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
+                .await;
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
+            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
+            agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
+            lock_identity: agent.lock_identity.clone(),
+            write_scope: agent.write_scope.clone(),
+            dream_read_scope: self.dream_read_scope.clone(),
+            workspace_lease: agent.workspace_lease.clone(),
+            current_tool_call_id: None,
+            // Seed reads are host-selected, pre-inference calls. They have no
+            // model inference attempt to use as a durable effect scope.
+            current_tool_call_scope: None,
+            tool_steering: agent.tool_steering,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel,
+            shutdown_gate: agent.model.shutdown_gate(),
+            approver: self.approver.clone(),
+            image_generation_dispatch: self.session.image_generation_dispatch(),
+            transcription_dispatch: None,
+            deferred_log: self
+                .stack
+                .last()
+                .context("driver stack is empty")?
+                .deferred_log
+                .clone(),
+            root_agent_frame: false,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            has_tree: active_tools.get("code").is_some(),
+            has_bash: active_tools.get("bash").is_some(),
+            events: Some(tx.clone()),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            env_overlay: agent.env_overlay.clone(),
+            config: self.config.clone(),
+            mcp_resolver: agent.mcp_resolver.clone(),
+        };
+        let snapshot = self.config.snapshot();
+        let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+            agent: &agent,
+            session: &self.session,
+            model: &agent.model,
+            active_tools: &active_tools,
+            ctx: &ctx,
+            tx,
+            hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
+                &self.session,
+                &self.config,
+            ),
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: snapshot.hooks(),
+        };
+        let frame = self.stack.last_mut().context("driver stack is empty")?;
+        frame.history.push(brief);
+        crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
+            .await?;
+        Ok(crate::engine::seed_reads::completion_prompt())
     }
 
     async fn continue_after_parked_interrupt_replay(
@@ -4698,6 +4864,19 @@ impl Driver {
                 }
                 Ok(PendingScheduledReentry::Advanced(result)) => Some(result),
             };
+            // A replayed seed call is a pre-inference continuation rather
+            // than a model turn. Once every declared seed has a result, feed
+            // the same host notice used by the uninterrupted path into the
+            // first inference without first duplicating it in history.
+            let seed_reads_completed = crate::engine::agent::tool_result_call_id(&next_prompt)
+                .is_some_and(|call_id| call_id.starts_with("seed-read-"))
+                && self.stack.last().is_some_and(|frame| {
+                    crate::engine::seed_reads::pending_declared_seed_calls(&frame.history)
+                        .is_empty()
+                });
+            if seed_reads_completed {
+                next_prompt = crate::engine::seed_reads::completion_prompt();
+            }
             self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
             let is_root = self.stack.len() == 1;
@@ -5217,6 +5396,14 @@ impl Driver {
         }
 
         let mut goal_watchdog: Option<Pin<Box<Sleep>>> = None;
+        let mut assistant_inbox_idle_poll = tokio::time::interval(Duration::from_millis(250));
+        assistant_inbox_idle_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        assistant_inbox_idle_poll.tick().await;
+        let mut assistant_inbox_defer_heartbeat =
+            tokio::time::interval(ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL);
+        assistant_inbox_defer_heartbeat
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        assistant_inbox_defer_heartbeat.tick().await;
         loop {
             let active_target_id = self.active_queue_target_id();
             // Persist-on-re-entry owns started-unsettled keep-parked
@@ -5229,9 +5416,13 @@ impl Driver {
             // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
+            // Pending human input takes priority over a previously completed
+            // noninteractive result before the boundary select runs.
+            let human_input_already_pending =
+                input_queue.has_pending_for(Some(&active_target_id)).await;
             if !waiting_for_keep_parked_siblings
                 && !self.pending_noninteractive_completions.is_empty()
-                && !input_queue.has_pending_for(Some(&active_target_id)).await
+                && !human_input_already_pending
                 && self
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
@@ -5352,6 +5543,42 @@ impl Driver {
                                 .await
                         }
                         None => break,
+                    }
+                }
+                // Inbox timers deliberately follow foreground input and
+                // control. In a biased select, a timer that became ready
+                // while another turn was running must not start inference
+                // ahead of either already-ready boundary request.
+                _ = assistant_inbox_defer_heartbeat.tick(),
+                    if !waiting_for_keep_parked_siblings => {
+                    match self.claim_assistant_inbox_text(true).await {
+                        Ok(Some((text, inbox_item_ids))) => {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission =
+                                crate::engine::message::UserSubmission::text(text);
+                            submission.origin =
+                                crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(submission, &input_queue, tx).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
+                    }
+                }
+                _ = assistant_inbox_idle_poll.tick(),
+                    if !waiting_for_keep_parked_siblings => {
+                    match self.claim_assistant_inbox_text(false).await {
+                        Ok(Some((text, inbox_item_ids))) => {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission =
+                                crate::engine::message::UserSubmission::text(text);
+                            submission.origin =
+                                crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(submission, &input_queue, tx).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "assistant inbox immediate delivery failed"),
                     }
                 }
                 ev = self.job_event_rx.recv(),
@@ -7312,6 +7539,14 @@ impl Driver {
         fields: crate::engine::agent::hooks::ObserveFields<'_>,
     ) {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_observe_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                 self.session.process_containment(),
@@ -7328,6 +7563,7 @@ impl Driver {
             None,
             None,
             fields,
+            local_knowledge_write_fence_active,
         )
         .await;
     }
@@ -7363,10 +7599,15 @@ impl Driver {
         let session_id = self.session.id;
         let cwd = self.cwd.clone();
         let db = self.session.db.clone();
+        let session = self.session.clone();
         let subagent_type = subagent_type.to_string();
         let subagent_id = subagent_id.map(str::to_owned);
         let end_reason = end_reason.map(str::to_owned);
         async move {
+            let extended = snapshot.extended.clone();
+            let local_knowledge_write_fence_active =
+                crate::knowledge::local_knowledge_write_fence_active(&session, &cwd, &extended)
+                    .await;
             crate::engine::agent::hooks::run_observe_hooks(
                 &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
                     containment,
@@ -7387,6 +7628,7 @@ impl Driver {
                     end_reason: end_reason.as_deref(),
                     ..Default::default()
                 },
+                local_knowledge_write_fence_active,
             )
             .await;
         }
@@ -7583,6 +7825,14 @@ impl Driver {
         state: &mut crate::engine::agent::hooks::StopGateState,
     ) -> crate::engine::agent::hooks::StopHookOutcome {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         crate::engine::agent::hooks::run_stop_hooks(
             runner,
             process_env,
@@ -7597,6 +7847,7 @@ impl Driver {
             None,
             None,
             None,
+            local_knowledge_write_fence_active,
             state,
         )
         .await
@@ -7623,6 +7874,14 @@ impl Driver {
         end_reason: &str,
     ) {
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let mut discarded = crate::engine::agent::hooks::StopGateState::default();
         let _ = crate::engine::agent::hooks::run_stop_hooks(
             &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
@@ -7639,6 +7898,7 @@ impl Driver {
             Some(subagent_type),
             subagent_id,
             Some(end_reason),
+            local_knowledge_write_fence_active,
             &mut discarded,
         )
         .await;
@@ -7670,6 +7930,14 @@ impl Driver {
             .map(|pending| pending.call_id.clone());
         let mut state = std::mem::take(&mut frame.stop_gate);
         let snapshot = self.config.snapshot();
+        let extended = snapshot.extended.clone();
+        let local_knowledge_write_fence_active =
+            crate::knowledge::local_knowledge_write_fence_active(
+                &self.session,
+                &self.cwd,
+                &extended,
+            )
+            .await;
         let outcome = crate::engine::agent::hooks::run_stop_hooks(
             runner,
             process_env,
@@ -7682,6 +7950,7 @@ impl Driver {
             Some(&child_type),
             child_id.as_deref(),
             Some("completed"),
+            local_knowledge_write_fence_active,
             &mut state,
         )
         .await;
@@ -7940,17 +8209,33 @@ impl Driver {
     /// Message-only rebuilds (`build_user_message`) cannot move the gate:
     /// they keep origin as inventory metadata only.
     fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
-        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
-            self.keep_warm_armed_for_idle_window = false;
-        }
         let has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
             )
         );
+        if submission.origin == crate::engine::message::SubmissionOrigin::ExternalRoot {
+            self.keep_warm_armed_for_idle_window = false;
+            // Oversized submissions have not been accepted yet: phase-two
+            // materialization records activity only after its durable commit.
+            // This keeps rejected leases from resetting idle wakes and gives
+            // every accepted submission one, consistent activity timestamp.
+            if !has_oversized_artifact_lease {
+                self.schedule.record_user_activity();
+            }
+        }
         self.auto_compact_gate
             .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
+    pub(crate) fn set_idle_activity_sender(
+        &mut self,
+        sender: tokio::sync::watch::Sender<tokio::time::Instant>,
+        gate: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.schedule.set_idle_activity_sender(sender);
+        self.schedule.set_idle_activity_gate(gate);
     }
 
     /// Tools whose in-flight execution can be adopted by the
@@ -8752,12 +9037,33 @@ impl Driver {
 
     async fn run_prepared_queued_user_batch(
         &mut self,
-        submissions: Vec<UserSubmission>,
+        mut submissions: Vec<UserSubmission>,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         if submissions.is_empty() {
             return Ok(());
+        }
+        // A human message is both a main-turn boundary and a defer wake. Claim
+        // before prompt construction so inbox text is never appended to a warm
+        // prefix or injected into an already-running turn.
+        let mut inbox_item_ids = Vec::new();
+        let mut inbox_augmented_authored_text = None;
+        match self.claim_assistant_inbox_text(true).await {
+            Ok(Some((inbox, claimed_ids))) => {
+                inbox_item_ids = claimed_ids;
+                let first = submissions
+                    .first_mut()
+                    .expect("non-empty submission batch has a first item");
+                inbox_augmented_authored_text =
+                    Some((first.text.clone(), first.display_text.clone()));
+                first.text = format!("{inbox}\n\n{}", first.text);
+                if let Some(display) = first.display_text.as_mut() {
+                    *display = format!("{inbox}\n\n{display}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "assistant inbox user-turn delivery failed"),
         }
         // A phase-one FCM2 lease is tied to exactly one user event and must
         // survive to that event's phase-two materialization. Folding it into
@@ -8774,6 +9080,7 @@ impl Driver {
             for submission in submissions {
                 self.run_user_input(submission, input_rx, tx).await?;
             }
+            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
             return Ok(());
         }
         if submissions.len() == 1
@@ -8785,6 +9092,7 @@ impl Driver {
             for submission in submissions {
                 self.run_user_input(submission, input_rx, tx).await?;
             }
+            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
             return Ok(());
         }
 
@@ -8795,10 +9103,19 @@ impl Driver {
         let mut leading_history = Vec::with_capacity(pending.len());
         let mut leading_queue_item_ids = Vec::new();
         let mut leading_media_submission_ids = Vec::new();
+        let mut is_first = true;
         while let Some(submission) = pending.pop_front() {
+            let mut submission = submission;
             if self.record_queued_user_fold(&submission, tx).await.is_err() {
                 if let Some(top) = self.stack.last_mut() {
                     top.history.extend(leading_history);
+                }
+                if is_first
+                    && let Some((authored_text, authored_display_text)) =
+                        inbox_augmented_authored_text.take()
+                {
+                    submission.text = authored_text;
+                    submission.display_text = authored_display_text;
                 }
                 pending.push_front(submission);
                 pending.push_back(last);
@@ -8814,6 +9131,7 @@ impl Driver {
                 input_rx.finish(&leading_queue_item_ids).await;
                 return Ok(());
             }
+            is_first = false;
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
             leading_media_submission_ids.extend(
                 submission
@@ -8855,7 +9173,45 @@ impl Driver {
             )
             .await;
         input_rx.finish(&leading_queue_item_ids).await;
-        result
+        result?;
+        self.acknowledge_assistant_inbox(inbox_item_ids).await
+    }
+
+    async fn claim_assistant_inbox_text(
+        &self,
+        include_deferred: bool,
+    ) -> Result<Option<(String, Vec<Uuid>)>> {
+        let items = self
+            .session
+            .db
+            .claim_assistant_inbox_for_delivery(self.session.id, include_deferred)
+            .await?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let inbox_item_ids = items.iter().map(|item| item.inbox_item_id).collect();
+        let payload = items
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.inbox_item_id,
+                    "source_session_id": item.raising_session_id,
+                    "delivery": item.delivery.as_str(),
+                    "summary": item.summary,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Some((
+            format!("[assistant inbox]\n{}", serde_json::to_string(&payload)?),
+            inbox_item_ids,
+        )))
+    }
+
+    async fn acknowledge_assistant_inbox(&self, inbox_item_ids: Vec<Uuid>) -> Result<()> {
+        self.session
+            .db
+            .acknowledge_assistant_inbox_delivery(self.session.id, inbox_item_ids)
+            .await
     }
 
     async fn run_folded_submission_commands(
@@ -11332,6 +11688,11 @@ impl Driver {
             self.recovered_interactive_continuations
                 .remove(queue_item_id)
         });
+        let recovered_seed_replay = recovered_next_prompt.is_some()
+            && submission.queue_item_ids.iter().any(|queue_item_id| {
+                self.recovered_interactive_seed_replays
+                    .remove(queue_item_id)
+            });
         let submission_has_oversized_artifact_lease = matches!(
             submission.pending_terminal_disposition,
             Some(
@@ -11802,9 +12163,16 @@ impl Driver {
                         // turn start because the oversized lease was still
                         // unmaterialized; this is the delayed ExternalRoot
                         // gate advance for that path.
+                        // Materialization is this path's acceptance boundary.
+                        // Keep the durable reset and in-memory epoch in the
+                        // same admission interval as ordinary ingress.
+                        let idle_activity_gate = self.schedule.idle_activity_gate();
+                        let _idle_activity_admission = idle_activity_gate.lock().await;
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
-                            scheduler.record_user_activity().await;
+                            scheduler.record_user_activity_after_acceptance().await;
                         }
+                        self.schedule
+                            .record_materialized_user_activity_after_acceptance();
                         self.auto_compact_gate.external_activity();
                     }
                     if !queue_item_ids.is_empty() {
@@ -12373,6 +12741,11 @@ impl Driver {
                 delivery_class: Default::default(),
             })
         };
+        if recovered_seed_replay {
+            next_prompt = self
+                .execute_interactive_declared_seed_reads(next_prompt, tx, cancel.clone())
+                .await?;
+        }
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
         // ROOT stop-gate latch for THIS user turn (`tool-hooks-lifecycle-
@@ -13225,6 +13598,8 @@ impl Driver {
                     model,
                     remaining_depth,
                     granted_tools,
+                    seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13321,6 +13696,7 @@ impl Driver {
                         "model": model_selector_json(&model),
                         "remaining_depth": remaining_depth,
                         "granted_tools": &granted_tools,
+                        "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,
                         "provider_item_id": &task_provider_item_id,
                         "function_call_id": &task_function_call_id,
@@ -13414,9 +13790,45 @@ impl Driver {
                             continue;
                         }
                     };
+                    // Declare every seed before publishing the child. The
+                    // declaration is durable executor state: after the
+                    // one-use receipt is committed, restart replays these
+                    // exact calls through the implementation child's normal
+                    // tool boundary before it permits any inference.
+                    let declared_seed_calls =
+                        match crate::engine::seed_reads::declare_seed_read_calls(&seed_reads) {
+                            Ok(calls) => calls,
+                            Err(error) => {
+                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                                continue;
+                            }
+                        };
+                    let mut snapshot_history = delegation_payload_history.clone();
+                    if !declared_seed_calls.is_empty() {
+                        snapshot_history.push(Message::Assistant {
+                            id: None,
+                            content: declared_seed_calls
+                                .iter()
+                                .cloned()
+                                .map(crate::engine::message::AssistantContent::ToolCall)
+                                .collect(),
+                        });
+                    }
                     let snapshot_json = match serde_json::to_string(&serde_json::json!({
-                        "version": 1,
-                        "history": &delegation_payload_history,
+                        "version": 2,
+                        "history": &snapshot_history,
+                        // This is also the recovery continuation when no
+                        // seed was selected. When declarations are present,
+                        // reattachment records it in history before replaying
+                        // the calls and supplies the completion notice next.
+                        "next_prompt": Message::user(brief.clone()),
+                        "late_user_steer_continuation_id": serde_json::Value::Null,
                     })) {
                         Ok(snapshot_json) => snapshot_json,
                         Err(error) => {
@@ -13438,7 +13850,23 @@ impl Driver {
                     // publish together.  A restart can therefore observe
                     // either an unstarted task child or a fully-addressable
                     // interactive executor, never the old orphaned middle.
-                    let child_agent_instance_id = match self
+                    let seed_read_claim = match self
+                        .session
+                        .claim_seed_read_receipt(seed_reads_receipt.as_deref(), &seed_reads)
+                    {
+                        Ok(claim) => claim,
+                        Err(error) => {
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                            continue;
+                        }
+                    };
+                    let publication = match self
                         .session
                         .db
                         .publish_task_delegation_children_and_agents(
@@ -13459,16 +13887,9 @@ impl Driver {
                         )
                         .await
                     {
-                        Ok(publication) if publication.children.len() == 1 => {
-                            publication
-                                .children
-                                .into_iter()
-                                .next()
-                                .expect("one published interactive child")
-                                .agent_instance_id
-                        }
-                        Ok(_) => {
-                            tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
+                        Ok(publication) => publication,
+                        Err(error) => {
+                            tracing::warn!(%error, %task_call_id, "atomically publishing interactive task child and agent tree identity failed");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -13481,8 +13902,37 @@ impl Driver {
                             );
                             continue;
                         }
-                        Err(error) => {
-                            tracing::warn!(%error, %task_call_id, "atomically publishing interactive task child and agent tree identity failed");
+                    };
+                    // Publication commits the recovery descriptor before the
+                    // fallible policy reduction and child builtin load below.
+                    // From this point a restart can recover the child, so the
+                    // receipt must not be made claimable again.
+                    if let Some(claim) = seed_read_claim {
+                        claim.commit();
+                    }
+                    if let Some(error) = publication.post_publication_error() {
+                        tracing::warn!(%error, %task_call_id, "interactive task child published but automatic-answer policy application failed");
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                &repair_notes,
+                            ),
+                        );
+                        continue;
+                    }
+                    let child_agent_instance_id = match publication.into_children() {
+                        mut children if children.len() == 1 => {
+                            children
+                                .pop()
+                                .expect("one published interactive child")
+                                .agent_instance_id
+                        }
+                        _ => {
+                            tracing::error!(%task_call_id, "interactive task publication returned an invalid child count");
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -13572,7 +14022,7 @@ impl Driver {
                         pending_computer_continuations: Vec::new(),
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),
-                        history: delegation_payload_history,
+                        history: snapshot_history,
                         answering: Some(PendingTaskCall {
                             call_id: task_call_id.clone(),
                             provider_item_id: task_provider_item_id,
@@ -13655,7 +14105,13 @@ impl Driver {
                             &brief,
                         )
                     };
-                    next_prompt = Message::user(brief);
+                    next_prompt = self
+                        .execute_interactive_declared_seed_reads(
+                            Message::user(brief),
+                            tx,
+                            cancel.clone(),
+                        )
+                        .await?;
                     continue;
                 }
                 TurnOutcome::SpawnNoninteractive {
@@ -13670,6 +14126,8 @@ impl Driver {
                     workspace_lease,
                     context,
                     granted_tools,
+                    seed_reads,
+                    seed_reads_receipt,
                     todo_ids,
                     repair_notes,
                     task_call_id,
@@ -13938,6 +14396,8 @@ impl Driver {
                             .as_ref()
                             .map(|lease| lease.id.to_string()),
                         granted_tools,
+                        seed_reads,
+                        seed_reads_receipt,
                         todo_ids,
                         child_recursion,
                         repair_notes,

@@ -41,6 +41,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("code"),
     ToolTimeoutSafety::abandon_safe("context_pack"),
     ToolTimeoutSafety::abandon_safe("defer_to_orchestrator"),
+    ToolTimeoutSafety::abandon_safe("delete"),
     ToolTimeoutSafety::abandon_safe("delegation_payload_retrieve"),
     ToolTimeoutSafety::abandon_safe("edit"),
     ToolTimeoutSafety::human_blocking("escalate"),
@@ -62,16 +63,21 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("list-packages"),
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
-    ToolTimeoutSafety::abandon_safe("knowledge_retrieve"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
     // Knowledge dreams hand the guarded transaction and completion-ledger
     // continuation to an owned task. A dispatcher timeout may stop waiting,
     // but cannot abandon that owner before its commit/defer boundary.
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("knowledge_dream_apply"),
     ToolTimeoutSafety::abandon_safe("knowledge_dream_sources"),
-    ToolTimeoutSafety::abandon_safe("memory_search"),
+    ToolTimeoutSafety::abandon_safe("semantic_search"),
+    ToolTimeoutSafety::abandon_safe("structured_search"),
     ToolTimeoutSafety::abandon_safe("note"),
     ToolTimeoutSafety::human_blocking("question"),
+    // `raise` crosses a durable SQLite commit boundary. It observes dispatcher
+    // cancellation and uses the tool-call id as its replay identity, so an
+    // ambiguous timeout is retried against the same inbox row rather than
+    // creating a second human/agent-visible effect.
+    ToolTimeoutSafety::honors_cancel("raise"),
     ToolTimeoutSafety::abandon_safe("read"),
     ToolTimeoutSafety::abandon_safe("read_image"),
     ToolTimeoutSafety::abandon_safe("ask_image"),
@@ -370,6 +376,7 @@ async fn dispatch_tool_with_policy_unscoped(
     // before traversing. Keep trust-required KB sources out of those model
     // operations at the common production dispatcher boundary.
     crate::knowledge::ensure_workspace_tool_access(&ctx, name)
+        .await
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
@@ -696,6 +703,47 @@ mod tests {
             "tool `slow` did not return within 120s and was abandoned"
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_allows_grep_when_a_sibling_local_kb_is_withheld() {
+        let (workspace, mut ctx) = test_ctx();
+        let attached = workspace.path().join("attached");
+        let withheld = workspace.path().join("withheld");
+        ctx.allowed_knowledge_bases = Some(BTreeSet::from(["attached".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        for (id, path) in [("attached", attached), ("withheld", withheld)] {
+            extended.knowledge_bases.push(
+                crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                    id.to_string(),
+                    id.to_string(),
+                    format!("{id} local knowledge"),
+                    crate::config::extended::KnowledgeBaseSource::Local { path },
+                    crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                    None,
+                    None,
+                    false,
+                    crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                ),
+            );
+        }
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let output = run_test_tool(
+            TimedTestTool::new("grep", Some(Duration::ZERO), Arc::new(AtomicUsize::new(0))),
+            &ctx,
+            &policy_with_default(Duration::from_secs(1)),
+        )
+        .await
+        .expect("the dispatcher must let native grep apply its per-entry KB fence");
+
+        assert_eq!(output.content, "finished");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1207,6 +1255,19 @@ mod tests {
         let policy = ToolTimeoutPolicy::default();
 
         assert!(policy.lookup("mcp") > policy.lookup("read"));
+    }
+
+    #[test]
+    fn raise_timeout_boundary_waits_for_cancel_aware_durable_outcome() {
+        let policy = ToolTimeoutPolicy::default();
+        let tool = crate::tools::raise::RaiseTool;
+        let safety = TOOL_TIMEOUT_SAFETY
+            .iter()
+            .find(|entry| entry.name == tool.name())
+            .map(|entry| entry.safety);
+
+        assert_eq!(safety, Some(ToolAbandonSafety::HonorsCancel));
+        assert_eq!(policy.cancel_grace(&tool), Some(TOOL_ABANDON_HOOK_TIMEOUT));
     }
 
     #[test]

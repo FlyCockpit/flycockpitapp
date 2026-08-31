@@ -648,6 +648,8 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) write_scope: Option<String>,
     pub(in crate::engine::driver) workspace_lease: Option<String>,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
+    pub(in crate::engine::driver) seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+    pub(in crate::engine::driver) seed_reads_receipt: Option<String>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
     pub(in crate::engine::driver) child_recursion:
         crate::engine::builtin::DelegationRecursionContext,
@@ -1340,6 +1342,7 @@ pub(in crate::engine::driver) fn single_noninteractive_original_args_json(
         "write_scope": &task.write_scope,
         "workspace_lease": &task.workspace_lease,
         "granted_tools": &task.granted_tools,
+        "seed_reads": &task.seed_reads,
         "todo_ids": &task.todo_ids,
         "repair_notes": &task.repair_notes,
         "provider_item_id": &task.task_provider_item_id,
@@ -2087,6 +2090,9 @@ impl Driver {
                 .map(str::to_owned),
             workspace_lease,
             granted_tools,
+            seed_reads: crate::engine::seed_reads::parse_seed_reads(entry.get("seed_reads"))
+                .map_err(anyhow::Error::msg)?,
+            seed_reads_receipt: None,
             todo_ids: entry
                 .get("todo_ids")
                 .and_then(serde_json::Value::as_array)
@@ -2243,6 +2249,9 @@ impl Driver {
                 .map(str::to_owned),
             workspace_lease,
             granted_tools,
+            seed_reads: crate::engine::seed_reads::parse_seed_reads(entry.get("seed_reads"))
+                .map_err(anyhow::Error::msg)?,
+            seed_reads_receipt: None,
             todo_ids: entry
                 .get("todo_ids")
                 .and_then(serde_json::Value::as_array)
@@ -3009,6 +3018,25 @@ impl Driver {
                     ));
                 }
             };
+            let seed_read_claim = match self
+                .session
+                .claim_seed_read_receipt(task.seed_reads_receipt.as_deref(), &task.seed_reads)
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            &task.repair_notes,
+                            error,
+                        )
+                        .await,
+                    ));
+                }
+            };
             let Some(parent_agent_instance_id) =
                 self.stack.last().and_then(|frame| frame.agent_instance_id)
             else {
@@ -3025,7 +3053,7 @@ impl Driver {
                     .await,
                 ));
             };
-            if let Err(error) = self
+            let publication = match self
                 .session
                 .db
                 .publish_task_delegation_children_and_agents(
@@ -3043,7 +3071,29 @@ impl Driver {
                 )
                 .await
             {
-                tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
+                Ok(publication) => publication,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            &task.repair_notes,
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        )
+                        .await,
+                    ));
+                }
+            };
+            // The child descriptor is durable before policy reduction. Retire
+            // the one-shot seed receipt before any subsequent fallible work.
+            if let Some(claim) = seed_read_claim {
+                claim.commit();
+            }
+            if let Some(error) = publication.post_publication_error() {
+                tracing::warn!(%error, %task_call_id, "single task child published but automatic-answer policy application failed");
                 return Ok(Some(
                     self.refuse_minted_noninteractive_workspace_leases(
                         [task.workspace_lease.clone()],
@@ -3178,6 +3228,8 @@ impl Driver {
             workspace_lease,
             context,
             granted_tools,
+            seed_reads,
+            seed_reads_receipt,
             todo_ids,
             repair_notes,
             task_call_id,
@@ -3219,6 +3271,8 @@ impl Driver {
             write_scope,
             workspace_lease,
             granted_tools,
+            seed_reads,
+            seed_reads_receipt,
             todo_ids,
             child_recursion,
             repair_notes,
@@ -3912,6 +3966,8 @@ impl Driver {
             write_scope,
             workspace_lease,
             granted_tools,
+            seed_reads,
+            seed_reads_receipt: _,
             todo_ids,
             child_recursion,
             repair_notes,
@@ -4076,6 +4132,8 @@ impl Driver {
             };
             let child_routing = ChildRoutingMetadata::from_model(&child.model);
             let recovered_next_prompt = recovery.next_prompt;
+            let recovered_seed_reads =
+                crate::engine::seed_reads::remaining_seed_reads(&recovery.history, seed_reads);
             let target = NoninteractiveSteerTarget::new(task_call_id.clone(), recovery.label)
                 .with_agent_instance_id(recovery.agent_instance_id)
                 .with_recovered_late_user_steer_continuation(
@@ -4106,6 +4164,7 @@ impl Driver {
                 recovery.start_gate,
                 recovery.endpoint_collector,
                 recovery.pending_recursive,
+                recovered_seed_reads,
             )
             .await;
             let retire = if let Some(lease) = recovered_workspace_lease.as_ref() {
@@ -4923,6 +4982,7 @@ impl Driver {
                         None,
                         None,
                         None,
+                        seed_reads,
                     )
                     .await
                     {
@@ -6584,7 +6644,7 @@ impl Driver {
                 }
             })
             .collect();
-        if let Err(error) = self
+        let publication = match self
             .session
             .db
             .publish_task_delegation_children_and_agents(
@@ -6596,7 +6656,23 @@ impl Driver {
             )
             .await
         {
-            tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
+            Ok(publication) => publication,
+            Err(error) => {
+                tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        minted_workspace_leases.clone(),
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await);
+            }
+        };
+        if let Some(error) = publication.post_publication_error() {
+            tracing::warn!(%error, %task_call_id, "batch task children published but automatic-answer policy application failed");
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
                     minted_workspace_leases.clone(),
@@ -7711,6 +7787,7 @@ impl Driver {
                         None,
                         None,
                         None,
+                        Vec::new(),
                     )
                     .await
                     {
@@ -8523,6 +8600,7 @@ pub(crate) async fn run_noninteractive(
         None,
         None,
         None,
+        Vec::new(),
     )
     .await?;
     Ok(out.report)
@@ -9788,6 +9866,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         start_gate,
         endpoint_collector,
         snapshot.pending_recursive,
+        Vec::new(),
     )
     .await
     .map(|outcome| outcome.report)
@@ -10274,6 +10353,11 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
     }
     let ctx = crate::engine::tool::ToolCtx {
         agent_id: agent.name.clone(),
+        allowed_knowledge_bases: agent
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.allowed_knowledge_bases())
+            .cloned(),
         executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
         knowledge_access_trusted: agent.model.is_trusted(),
         caller_model: Some(crate::engine::tool::CallerModel::from_model(
@@ -10285,6 +10369,10 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         dream_read_scope: session.dream_read_scope(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
+        current_tool_call_scope: payload
+            .resume
+            .assistant_seq
+            .map(|seq| format!("parked-tool-start-{seq}")),
         tool_steering: agent.tool_steering,
         locks: locks.clone(),
         session: session.clone(),
@@ -10420,6 +10508,7 @@ pub(crate) async fn run_noninteractive_resumable(
     start_gate: Option<NoninteractiveStartGate>,
     endpoint_collector: Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
     pending_recursive: Option<PendingRecursiveContinuation>,
+    seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
     use crate::engine::agent::turn_with_backup;
 
@@ -10768,6 +10857,91 @@ pub(crate) async fn run_noninteractive_resumable(
     // that hold `defer_to_orchestrator` get their deferred items folded into
     // the leaf report they return up; agents without it keep this buffer empty.
     let deferred_log = crate::engine::deferred::DeferredLog::new();
+    if !seed_reads.is_empty() {
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &session, &cwd, &config).await;
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
+            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
+            agent_instance_id,
+            lock_identity: agent.lock_identity.clone(),
+            write_scope: agent.write_scope.clone(),
+            dream_read_scope: session.dream_read_scope(),
+            workspace_lease: agent.workspace_lease.clone(),
+            current_tool_call_id: None,
+            // Seed reads are host-selected, pre-inference calls. They have no
+            // model inference attempt to use as a durable effect scope.
+            current_tool_call_scope: None,
+            tool_steering: agent.tool_steering,
+            locks: locks.clone(),
+            session: session.clone(),
+            cwd: cwd.clone(),
+            redact: redact.clone(),
+            interrupts: interrupts.clone(),
+            cancel: cancel.clone(),
+            shutdown_gate: agent.model.shutdown_gate(),
+            approver: approver.clone(),
+            image_generation_dispatch: session.image_generation_dispatch(),
+            transcription_dispatch: None,
+            deferred_log: deferred_log.clone(),
+            root_agent_frame: false,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: Some(crate::engine::tool::ContextUsageSnapshot::unavailable()),
+            available_tools: Arc::new(
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            has_tree: active_tools.get("code").is_some(),
+            has_bash: active_tools.get("bash").is_some(),
+            events: Some(child_tx.clone()),
+            lsp: None,
+            resource_scheduler: resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            env_overlay: agent.env_overlay.clone(),
+            config: config.clone(),
+            mcp_resolver: agent.mcp_resolver.clone(),
+        };
+        history.push(next_prompt);
+        crate::engine::seed_reads::execute_before_first_inference(
+            &agent,
+            &active_tools,
+            &ctx,
+            &child_tx,
+            &mut history,
+            &seed_reads,
+            &session,
+            &config,
+            &cwd,
+            loop_guard_threshold,
+        )
+        .await
+        .map_err(|error| {
+            NoninteractiveRunError::new(
+                error.context("executing seed_reads before first inference"),
+                history.clone(),
+                fallback_decision.clone(),
+                fallback_tried.clone(),
+            )
+        })?;
+        next_prompt = Message::user(
+            "The host executed the explore-selected read-only seed calls above. Use their fresh results and continue with the delegated implementation brief without rediscovering them.",
+        );
+    }
     // Unlike an ordinary child turn, an accepted AgentTree steer spans every
     // model/tool continuation round until this executor reaches `Done` or
     // `Return`. Keep its immutable provider permit, first-handoff identity,
@@ -11849,6 +12023,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 coordinator,
                 contract,
                 action_items,
+                &session,
+                approver.as_ref(),
             )
             .await;
             if !wire.is_empty() || proposal_result.is_some() {
@@ -11926,6 +12102,25 @@ pub(crate) async fn run_noninteractive_resumable(
                 // (envelope-holding agents only — the `docs` pipeline keeps its
                 // plain answer). `None` selects the fallback path.
                 let report = assemble_subagent_report(&agent, &history, &deferred_log, None);
+                let seed_reads = crate::engine::seed_reads::select_from_explore_fork(
+                    session.clone(),
+                    agent.model.clone(),
+                    &agent.system,
+                    &agent.name,
+                    agent.params.clone(),
+                    &history,
+                    agent.tools.definitions(agent.tool_steering),
+                    cwd.clone(),
+                    config.clone(),
+                    cancel.clone(),
+                    agent.model.session_redact_table(),
+                )
+                .await;
+                let report = if agent.name == "explore" {
+                    crate::engine::seed_reads::append_to_report(report, &seed_reads)
+                } else {
+                    report
+                };
                 return Ok(NoninteractiveOutcome {
                     report,
                     history,
@@ -11954,6 +12149,25 @@ pub(crate) async fn run_noninteractive_resumable(
                 let _ = forwarder.await;
                 let report =
                     assemble_subagent_report(&agent, &history, &deferred_log, Some(&fields));
+                let seed_reads = crate::engine::seed_reads::select_from_explore_fork(
+                    session.clone(),
+                    agent.model.clone(),
+                    &agent.system,
+                    &agent.name,
+                    agent.params.clone(),
+                    &history,
+                    agent.tools.definitions(agent.tool_steering),
+                    cwd.clone(),
+                    config.clone(),
+                    cancel.clone(),
+                    agent.model.session_redact_table(),
+                )
+                .await;
+                let report = if agent.name == "explore" {
+                    crate::engine::seed_reads::append_to_report(report, &seed_reads)
+                } else {
+                    report
+                };
                 return Ok(NoninteractiveOutcome {
                     report,
                     history,
@@ -11972,6 +12186,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 workspace_lease: requested_lease,
                 context: _,
                 granted_tools,
+                seed_reads,
+                seed_reads_receipt: _,
                 todo_ids: _,
                 repair_notes,
                 task_call_id,
@@ -12423,6 +12639,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         None,
                         None,
                         None,
+                        seed_reads,
                     ))
                     .await
                     .map(|outcome| outcome.report)
@@ -13130,6 +13347,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             None,
                             None,
                             None,
+                            Vec::new(),
                         ))
                         .await
                         .map(|outcome| outcome.report)

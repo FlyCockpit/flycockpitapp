@@ -1007,8 +1007,8 @@ const requestParamSchemas = {
         env_policy: envDriftPolicySchema.optional(),
       })
       .strict(),
-    // A resume is keyed by durable session identity. The daemon reloads the
-    // mode; a caller may only provide an exact value for explicit checking.
+    // A resume is keyed by durable session identity. The daemon reloads and
+    // verifies this immutable mode assertion before attaching.
     z
       .object({
         session_id: uuidSchema,
@@ -1016,7 +1016,7 @@ const requestParamSchemas = {
         project_root: z.string().optional(),
         no_sandbox: z.boolean().optional(),
         interactive: z.boolean().optional(),
-        session_entry_mode: sessionEntryModeSchema.optional(),
+        session_entry_mode: sessionEntryModeSchema,
         initial_model: activeModelRefSchema.optional(),
         model_override: activeModelRefSchema.optional(),
         client_protocol_version: z.number().int().nonnegative().optional(),
@@ -1032,6 +1032,7 @@ const requestParamSchemas = {
       parent_session_id: uuidSchema,
       fork_point_turn_id: z.string().nullable().optional(),
       ephemeral: z.boolean().optional(),
+      fresh_thread: z.boolean(),
     })
     .strict(),
   fs_create_dir: z.object({ project_root: projectRootSchema, path: z.string() }).strict(),
@@ -1085,6 +1086,19 @@ const requestParamSchemas = {
       session_id: uuidSchema,
       before_seq: safeI64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
+    })
+    .strict(),
+  read_assistant_inbox: z
+    .object({
+      main_session_id: uuidSchema,
+      include_delivered: z.boolean().optional(),
+      limit: z.number().int().positive(),
+    })
+    .strict(),
+  acknowledge_assistant_inbox_human_read: z
+    .object({
+      main_session_id: uuidSchema,
+      inbox_item_ids: z.array(uuidSchema).min(1).max(100),
     })
     .strict(),
   read_subagent_history_page: z
@@ -1431,6 +1445,11 @@ const clientRequestVariants = [
   requestVariant("review_guidance_proposal", requestParamSchemas.review_guidance_proposal),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
+  requestVariant("read_assistant_inbox", requestParamSchemas.read_assistant_inbox),
+  requestVariant(
+    "acknowledge_assistant_inbox_human_read",
+    requestParamSchemas.acknowledge_assistant_inbox_human_read,
+  ),
   requestVariant("read_agent_tree", requestParamSchemas.read_agent_tree),
   requestVariant("read_agent_attention", requestParamSchemas.read_agent_attention),
   requestVariant("read_session_messages", requestParamSchemas.read_session_messages),
@@ -1561,6 +1580,7 @@ export const responseNameSchema = z.enum([
   "app_flag",
   "app_flag_seen",
   "assistant_session_resolved",
+  "assistant_inbox",
   "config_refreshed",
   "attached",
   "code_root_created",
@@ -1628,6 +1648,22 @@ export const sessionMessageSchema = z
   })
   .passthrough();
 export type SessionMessage = z.infer<typeof sessionMessageSchema>;
+
+export const assistantInboxItemWireSchema = z
+  .object({
+    inboxItemId: uuidSchema,
+    assistantName: z.string(),
+    mainSessionId: uuidSchema,
+    raisingSessionId: uuidSchema,
+    operationId: z.string(),
+    summary: z.string(),
+    delivery: z.enum(["immediate", "defer", "notify"]),
+    createdAtUnixMs: safeI64NumberSchema,
+    deliveredAtUnixMs: safeI64NumberSchema.nullable(),
+    humanReadAtUnixMs: safeI64NumberSchema.nullable(),
+  })
+  .strict();
+export type AssistantInboxItemWire = z.infer<typeof assistantInboxItemWireSchema>;
 
 const interruptDecisionSchema = z
   .object({
@@ -2083,6 +2119,15 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   responseVariant(
     "assistant_session_resolved",
     z.object({ session: sessionSummaryWireSchema, created: z.boolean() }).strict(),
+  ),
+  responseVariant(
+    "assistant_inbox",
+    z
+      .object({
+        main_session_id: uuidSchema,
+        items: z.array(assistantInboxItemWireSchema),
+      })
+      .strict(),
   ),
   responseVariant(
     "startup_disclosures",
@@ -3047,6 +3092,8 @@ export const sessionSummarySchema = z
     title: z.string().nullable().optional(),
     description: z.string().nullable().optional(),
     parent_session_id: uuidSchema.nullable().optional(),
+    fork_point_turn_id: z.string().nullable(),
+    is_assistant_thread: z.boolean(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),
   })

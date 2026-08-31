@@ -151,6 +151,11 @@ pub(crate) fn resolve_root_agent_conn(
     if row.session_entry_mode == "computer" {
         return "Computer".to_string();
     }
+    if row.assistant_name.as_deref() == Some(crate::assistants::PRIMARY_ASSISTANT_IDENTITY_NAME)
+        && row.active_agent == "Assistant"
+    {
+        return "Assistant".to_string();
+    }
     if let Some(assistant_name) = row.assistant_name.as_deref() {
         if conn
             .query_row(

@@ -378,6 +378,7 @@
   "fork_session": {
     "params": {
       "ephemeral": true,
+      "fresh_thread": false,
       "fork_point_turn_id": "fork_point_turn_id-fixture",
       "parent_session_id": "11111111-1111-4111-8111-111111111111"
     },
@@ -612,6 +613,21 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "read_history_page"
+  },
+  "read_assistant_inbox": {
+    "params": {
+      "include_delivered": true,
+      "limit": 7,
+      "main_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "read_assistant_inbox"
+  },
+  "acknowledge_assistant_inbox_human_read": {
+    "params": {
+      "inbox_item_ids": ["11111111-1111-4111-8111-111111111111"],
+      "main_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "acknowledge_assistant_inbox_human_read"
   },
   "read_session_messages": {
     "params": {

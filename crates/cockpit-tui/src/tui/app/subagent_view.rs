@@ -21,6 +21,7 @@ impl App {
         let history_render_cache = self.take_history_render_cache();
         StoredTranscriptView {
             meta: std::mem::take(&mut self.transcript_view),
+            hide_tool_calls: self.hide_tool_calls,
             history: std::mem::take(&mut self.history),
             pending: self.pending.take(),
             active_display_attempt_id: self.active_display_attempt_id.take(),
@@ -38,6 +39,7 @@ impl App {
     fn restore_transcript_view(&mut self, mut view: StoredTranscriptView) {
         self.cancel_older_history_page_request();
         self.transcript_view = std::mem::take(&mut view.meta);
+        self.hide_tool_calls = view.hide_tool_calls;
         self.history = std::mem::take(&mut view.history);
         self.pending = view.pending.take();
         self.active_display_attempt_id = view.active_display_attempt_id.take();
@@ -111,6 +113,7 @@ impl App {
         let previous = self.capture_transcript_view();
         self.transcript_view_stack.push(previous);
         self.transcript_view = TranscriptViewMeta::Subagent(meta);
+        self.hide_tool_calls = false;
         self.history = Vec::new().into();
         self.pending = None;
         self.history_render_versions = std::collections::HashMap::new();

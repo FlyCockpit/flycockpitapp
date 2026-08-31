@@ -213,6 +213,7 @@ pub(super) async fn fork_session(
     parent_session_id: Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
+    fresh_thread: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     // Guard rail: refuse forks of unknown parents with the typed
     // `UnknownSession` code so the TUI can surface a friendlier error
@@ -230,8 +231,24 @@ pub(super) async fn fork_session(
     }
     let created_by = principal.tag();
     // `/side` forks land ephemeral (excluded from lists, never auto-titled,
-    // discarded on end/exit); `/fork` forks persist normally.
-    let row = if ephemeral {
+    // discarded on end/exit); fresh threads persist with only an anchor.
+    let row = if fresh_thread {
+        if ephemeral {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "a fresh thread cannot be ephemeral".to_string(),
+            });
+        }
+        let Some(anchor_turn_id) = fork_point_turn_id.clone() else {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "a fresh thread requires a message anchor".to_string(),
+            });
+        };
+        ctx.db
+            .create_thread(parent_session_id, anchor_turn_id)
+            .await
+    } else if ephemeral {
         ctx.db
             .create_ephemeral_fork(parent_session_id, fork_point_turn_id.clone())
             .await
@@ -766,6 +783,8 @@ mod sessions_activity_tests {
             title: None,
             description: None,
             parent_session_id: None,
+            fork_point_turn_id: None,
+            is_assistant_thread: false,
             created_by_principal: None,
             shared_with_collaborators: false,
             fork_count: 0,

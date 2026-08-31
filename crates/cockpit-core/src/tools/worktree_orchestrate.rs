@@ -127,6 +127,11 @@ impl Tool for WorktreeOrchestrateTool {
             .ok_or_else(|| invalid_input("`action` is required"))?;
         let action =
             OrchestrationAction::parse(action).map_err(|err| invalid_input(err.to_string()))?;
+        // This tool may create or operate managed worktrees through host
+        // processes.  Retain the dispatcher fence for direct callers too.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
         match action {
             OrchestrationAction::EditInPlace => Ok(ToolOutput::text(
                 "edit_in_place: continue in the current worktree. Commit remains an explicit user/agent action; cancelling preserves already-visible edits.",
@@ -534,6 +539,42 @@ mod tests {
             .unwrap();
         assert!(out.content.contains("edit_in_place"), "{}", out.content);
         assert!(out.content.contains("preserves"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn direct_call_keeps_local_knowledge_host_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig {
+                    knowledge_bases: vec![
+                        crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                            "private".to_string(),
+                            "Private".to_string(),
+                            "Private local knowledge".to_string(),
+                            crate::config::extended::KnowledgeBaseSource::Local {
+                                path: tmp.path().join("knowledge"),
+                            },
+                            crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                            None,
+                            None,
+                            false,
+                            crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let error = WorktreeOrchestrateTool
+            .call(serde_json::json!({"action": "edit_in_place"}), &ctx)
+            .await
+            .expect_err("direct worktree calls must not receive a local KB host path");
+        assert!(error.to_string().contains("knowledge bases are read-only"));
     }
 
     #[tokio::test]

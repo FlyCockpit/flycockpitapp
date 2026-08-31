@@ -313,6 +313,9 @@ impl Tool for EditTool {
         // native knowledge write does not grant that host KB write access.
         if let Some(lsp) = &ctx.lsp
             && !is_human_knowledge_target
+            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
+                .await
+                .is_empty()
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }

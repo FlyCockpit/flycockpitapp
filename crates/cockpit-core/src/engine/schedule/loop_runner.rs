@@ -9,11 +9,10 @@
 //! - `independent = true`: each iteration is a fresh fork from the
 //!   snapshot, no prior-iteration history.
 //!
-//! Nothing crosses to main during the loop **except notes**. Notes are
-//! shown live in the UI (a [`TurnEvent::ScheduleNote`]) but enter main context
-//! only at termination, bundled with the terminal result. Termination =
-//! `limit` reached or the model called `loop.cancel` on its own loop. Only
-//! the terminal iteration's full result is promoted to main.
+//! Ordinary loops promote their accumulated notes and terminal result only at
+//! termination. Idle loops instead classify each wake independently: a pure
+//! read-only wake is discarded, while that wake's notes, spawn requests, or
+//! terminal assistant report are promoted immediately.
 //!
 //! Forks **cannot** spawn async work: `loop.start`/`background.start`
 //! called inside a fork do not execute — they record a
@@ -21,7 +20,8 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use crate::engine::agent::{Agent, TurnEvent, TurnOutcome, turn};
 use crate::engine::message::{Message, extract_text};
@@ -29,7 +29,11 @@ use crate::engine::schedule::authority::{ScheduleContext, ScheduleEvent};
 use crate::engine::schedule::spec::{LoopStartArgs, ScheduleKind};
 use crate::engine::tool::ToolBox;
 use crate::intel::budget::BudgetedWriter;
-use crate::tools::schedule::{ForkScheduleState, ForkScheduleTool, NoteTool};
+use crate::tools::schedule::{
+    ActiveIdleWake, ForkScheduleState, ForkScheduleTool, IdleWakeActionTool, NoteTool,
+    begin_active_idle_wake_publication, finish_active_idle_wake_publication,
+    finish_active_idle_wake_without_publication, install_active_idle_wake,
+};
 
 use super::{ASYNC_RESULT_TOKEN_CAP, FORK_HISTORY_BYTE_CAP, FORK_HISTORY_MESSAGE_CAP};
 
@@ -43,6 +47,16 @@ pub struct LoopRunCtx {
     pub turn_tx: mpsc::Sender<TurnEvent>,
     /// Authority→driver channel — the terminal completion.
     pub event_tx: mpsc::Sender<ScheduleEvent>,
+    /// An accepted parent-thread user message publishes its instant here and
+    /// restarts an idle timer's countdown from the actual activity time.
+    pub idle_activity_rx: Option<watch::Receiver<Instant>>,
+    /// Shared admission gate. Ingress holds it from queue insertion through
+    /// watch publication, while a due timer holds it before committing to a
+    /// wake; this gives those events a real ordering boundary.
+    pub idle_activity_gate: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// The authority owns this handoff while a wake runs. It can promote an
+    /// already-recorded action if external cancellation aborts the runner.
+    pub active_idle_wake: Option<ActiveIdleWake>,
 }
 
 /// Max turns one fork iteration may take before we cut it off (bounds a
@@ -50,9 +64,10 @@ pub struct LoopRunCtx {
 /// caps in `run_noninteractive`).
 const MAX_ITERATION_TURNS: usize = 8;
 
-/// Drive an ephemeral-fork loop to termination. Always sends exactly one
-/// [`ScheduleEvent::Completed`] at the end (limit reached, self-cancel, or
-/// error) so the authority's registry entry is reconciled.
+/// Drive an ephemeral-fork loop to termination. Normal loops send one
+/// [`ScheduleEvent::Completed`]; successful idle loops emit one
+/// [`ScheduleEvent::IdleWakeCompleted`] for every acting wake, then one
+/// [`ScheduleEvent::EphemeralCompleted`] to reconcile the registry entry.
 pub async fn run_forked_loop(run: LoopRunCtx) {
     let LoopRunCtx {
         job_id,
@@ -61,6 +76,9 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         ctx,
         turn_tx,
         event_tx,
+        mut idle_activity_rx,
+        idle_activity_gate,
+        active_idle_wake,
     } = run;
 
     // Branch a fork from main as of registration (tail snapshot). The fork
@@ -99,15 +117,23 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         }
     };
 
-    // Shared state the fork's `note` / re-routed create-actions write into.
-    let state = Arc::new(ForkScheduleState::new(job_id.clone()));
-
-    // Build the fork agent: the main agent's tool surface, plus `note` and
-    // a fork-scoped `schedule` meta-tool (cancel-own-loop + create→request).
-    let fork_agent = Arc::new(build_fork_agent(&ctx.agent, state.clone(), turn_tx.clone()));
+    // Ordinary forked loops retain their state until terminal promotion. Idle
+    // loops instead get a fresh state and toolbox for every wake, so their
+    // action accounting is local to that one wake.
+    let persistent_state = (!args.idle).then(|| Arc::new(ForkScheduleState::new(job_id.clone())));
+    let persistent_agent = persistent_state.as_ref().map(|state| {
+        Arc::new(build_fork_agent(
+            &ctx.agent,
+            state.clone(),
+            turn_tx.clone(),
+            false,
+        ))
+    });
 
     let limit = args.limit.unwrap_or(u64::MAX);
     let mut delay = args.interval_secs;
+    let mut watch_digest =
+        (!args.watch_paths.is_empty()).then(|| local_change_digest(&ctx.cwd, &args.watch_paths));
 
     // Accumulated history for `independent = false`. Reset each iteration
     // for `independent = true`.
@@ -115,14 +141,49 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     let mut last_result = String::new();
     let mut iteration: u64 = 0;
     let mut errored = false;
+    let mut cancelled = false;
+    let mut failed_idle_notes = Vec::new();
+    let mut failed_idle_requests = Vec::new();
+    let mut failed_idle_actions = Vec::new();
+    let wake_prompt = args.idle.then(|| {
+        format!(
+            "[idle wake] Do not invent work. Inspect only what is needed to determine whether a real change requires action. If nothing changed, take no action and send no message.\n\n{}",
+            args.prompt
+        )
+    });
 
     while iteration < limit {
         // Wait the interval before each iteration (a timer with limit=1
         // therefore fires after one interval — matching "one-shot delayed
         // prompt").
-        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        match wait_for_next_wake(
+            delay,
+            args.interval_secs,
+            idle_activity_rx.as_mut(),
+            idle_activity_gate.as_ref(),
+        )
+        .await
+        {
+            WakeWait::Elapsed { activity_seen } => {
+                // Activity restarts both this countdown and any backoff. The
+                // next wake therefore fires after the configured interval from
+                // the last accepted user message, never an old deadline.
+                if activity_seen {
+                    delay = args.interval_secs;
+                }
+            }
+            WakeWait::ActivityChannelClosed => {
+                // An idle timer without its authority must never degrade into
+                // an immediate loop. It cannot observe a future reset, so end
+                // visibly and let the driver's normal failed-completion path
+                // reconcile the bounded registry entry.
+                last_result = "idle activity authority closed".to_string();
+                errored = true;
+                break;
+            }
+        }
 
-        if state.is_cancelled() {
+        if cancelled {
             break;
         }
 
@@ -130,10 +191,40 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             fork_history.clear();
         }
 
+        if let Some(previous_digest) = watch_digest.as_mut() {
+            let current_digest = local_change_digest(&ctx.cwd, &args.watch_paths);
+            if current_digest == *previous_digest {
+                iteration += 1;
+                if args.backoff {
+                    delay = (delay.saturating_mul(2)).min(super::spec::BACKOFF_CEILING_SECS);
+                }
+                continue;
+            }
+            *previous_digest = current_digest;
+            delay = args.interval_secs;
+        }
+
+        let state = persistent_state
+            .clone()
+            .unwrap_or_else(|| Arc::new(ForkScheduleState::new(job_id.clone())));
+        if let Some(active_idle_wake) = active_idle_wake.as_ref() {
+            if !install_active_idle_wake(active_idle_wake, state.clone()) {
+                return;
+            }
+        }
+        let fork_agent = persistent_agent.clone().unwrap_or_else(|| {
+            Arc::new(build_fork_agent(
+                &ctx.agent,
+                state.clone(),
+                turn_tx.clone(),
+                true,
+            ))
+        });
+
         match run_iteration(
             &fork_agent,
             &mut fork_history,
-            &args.prompt,
+            wake_prompt.as_deref().unwrap_or(&args.prompt),
             fork_session.clone(),
             &ctx,
             &turn_tx,
@@ -144,6 +235,20 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             Err(e) => {
                 last_result = format!("loop iteration error: {e:#}");
                 errored = true;
+                // A failed idle wake still fails closed. Preserve any action
+                // it recorded before the failure in the terminal completion
+                // rather than silently dropping it with this wake's fork.
+                if args.idle {
+                    if !active_idle_wake
+                        .as_ref()
+                        .is_some_and(|active| begin_active_idle_wake_publication(active, &state))
+                    {
+                        return;
+                    }
+                    failed_idle_notes = state.take_notes();
+                    failed_idle_requests = state.take_requests();
+                    failed_idle_actions = state.take_actions();
+                }
                 break;
             }
         }
@@ -151,8 +256,67 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         cap_fork_history(&mut fork_history);
         iteration += 1;
 
+        if args.idle {
+            let acted = wake_has_durable_dispatch(&state);
+            // Only explicit effect channels make a wake durable: `note`
+            // sends to the user, create-requests raise inbox work, and wrapped
+            // non-read-only tools record mutation. A model conclusion after a
+            // read-only inspection is deliberately discarded.
+            if acted {
+                // Claim publication before draining action records. If
+                // cancellation wins first, it owns the terminal promotion; if
+                // it arrives later, this runner owns exactly this event.
+                if !active_idle_wake
+                    .as_ref()
+                    .is_some_and(|active| begin_active_idle_wake_publication(active, &state))
+                {
+                    return;
+                }
+                let notes = state.take_notes();
+                let requests = state.take_requests();
+                let actions = state.take_actions();
+                let result = bundle_terminal(
+                    &label,
+                    args.kind(),
+                    iteration,
+                    &last_result,
+                    &notes,
+                    &actions,
+                );
+                let _ = event_tx
+                    .send(ScheduleEvent::IdleWakeCompleted {
+                        job_id: job_id.clone(),
+                        kind: args.kind(),
+                        result,
+                        requests,
+                    })
+                    .await;
+                if active_idle_wake
+                    .as_ref()
+                    .is_some_and(finish_active_idle_wake_publication)
+                {
+                    let _ = event_tx
+                        .send(ScheduleEvent::IdleWakePublicationCancelled {
+                            job_id,
+                            label,
+                            kind: args.kind(),
+                        })
+                        .await;
+                    return;
+                }
+            } else if !active_idle_wake
+                .as_ref()
+                .is_some_and(|active| finish_active_idle_wake_without_publication(active, &state))
+            {
+                // Cancellation claimed the no-op before it was released. It
+                // owns the terminal marker; this runner must remain silent.
+                return;
+            }
+        }
+
         // The fork may have asked to cancel its own loop mid-iteration.
         if state.is_cancelled() {
+            cancelled = true;
             break;
         }
 
@@ -161,10 +325,34 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         }
     }
 
+    // An idle loop's successful terminal state is only a registry lifecycle
+    // event: every acting wake already emitted its own durable result above.
+    if args.idle && !errored {
+        let _ = event_tx
+            .send(ScheduleEvent::EphemeralCompleted { job_id })
+            .await;
+        return;
+    }
+
     // Promote the terminal iteration's result + accumulated notes to main.
-    let notes = state.take_notes();
-    let requests = state.take_requests();
-    let result = bundle_terminal(&label, args.kind(), iteration, &last_result, &notes);
+    let (notes, requests, actions) = if args.idle {
+        (failed_idle_notes, failed_idle_requests, failed_idle_actions)
+    } else {
+        let state = persistent_state.expect("non-idle loops retain one fork state");
+        (
+            state.take_notes(),
+            state.take_requests(),
+            state.take_actions(),
+        )
+    };
+    let result = bundle_terminal(
+        &label,
+        args.kind(),
+        iteration,
+        &last_result,
+        &notes,
+        &actions,
+    );
 
     let _ = event_tx
         .send(ScheduleEvent::Completed {
@@ -176,6 +364,148 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             requests,
         })
         .await;
+}
+
+fn wake_has_durable_dispatch(state: &ForkScheduleState) -> bool {
+    state.has_persistent_action()
+}
+
+enum WakeWait {
+    /// The timer elapsed. `activity_seen` means the deadline was rebuilt from
+    /// an accepted user message at least once while we waited.
+    Elapsed { activity_seen: bool },
+    /// The authority that owns the activity epoch went away. This is terminal
+    /// for an idle job; returning it prevents a closed watch channel from
+    /// making the outer loop spin.
+    ActivityChannelClosed,
+}
+
+async fn wait_for_next_wake(
+    delay_secs: u64,
+    reset_delay_secs: u64,
+    activity_rx: Option<&mut watch::Receiver<Instant>>,
+    activity_gate: Option<&Arc<tokio::sync::Mutex<()>>>,
+) -> WakeWait {
+    let Some(activity_rx) = activity_rx else {
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        return WakeWait::Elapsed {
+            activity_seen: false,
+        };
+    };
+    let mut activity_seen = false;
+    let mut deadline = Instant::now() + std::time::Duration::from_secs(delay_secs);
+    match activity_rx.has_changed() {
+        Ok(true) => {
+            deadline =
+                *activity_rx.borrow_and_update() + std::time::Duration::from_secs(reset_delay_secs);
+            activity_seen = true;
+        }
+        Ok(false) => {}
+        Err(_) => return WakeWait::ActivityChannelClosed,
+    }
+    loop {
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
+        tokio::select! {
+            biased;
+            changed = activity_rx.changed() => {
+                if changed.is_err() {
+                    return WakeWait::ActivityChannelClosed;
+                }
+                // The timestamp also covers activity that arrived while an
+                // inference was running: the next sleep is measured from the
+                // actual user activity, not from when this function noticed it.
+                deadline = *activity_rx.borrow_and_update()
+                    + std::time::Duration::from_secs(reset_delay_secs);
+                activity_seen = true;
+            }
+            _ = &mut sleep => {
+                // The timer may become due while a different worker thread
+                // is accepting a user message. Wait for that admission to
+                // finish, then inspect the watch epoch one last time before
+                // committing to a wake. If the timer wins this gate, it is
+                // ordered before the later acceptance; if ingress wins, its
+                // reset is observed here.
+                let _admission = match activity_gate {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
+                match activity_rx.has_changed() {
+                    Ok(true) => {
+                        deadline = *activity_rx.borrow_and_update()
+                            + std::time::Duration::from_secs(reset_delay_secs);
+                        activity_seen = true;
+                        continue;
+                    }
+                    Ok(false) => return WakeWait::Elapsed { activity_seen },
+                    Err(_) => return WakeWait::ActivityChannelClosed,
+                }
+            }
+        }
+    }
+}
+
+/// Cheap local metadata digest. A file appearing, disappearing, or changing
+/// metadata counts as a change without an inference request. Directory watch
+/// roots include every descendant so ordinary in-place file edits do not rely
+/// on the platform's directory mtime behaviour.
+fn local_change_digest(root: &std::path::Path, paths: &[String]) -> String {
+    let mut entries = Vec::new();
+    for path in paths {
+        let absolute = root.join(path);
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => {
+                for entry in walkdir::WalkDir::new(&absolute)
+                    .follow_links(false)
+                    .sort_by_file_name()
+                {
+                    match entry {
+                        Ok(entry) => {
+                            let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                            match entry.metadata() {
+                                Ok(metadata) => entries
+                                    .push(metadata_digest(&relative.to_string_lossy(), &metadata)),
+                                Err(error) => entries.push(format!(
+                                    "{path}:metadata-error:{}:{}",
+                                    relative.to_string_lossy(),
+                                    error
+                                )),
+                            }
+                        }
+                        Err(error) => entries.push(format!(
+                            "{path}:walk-error:{}:{}",
+                            error.path().map_or_else(
+                                || "unknown".to_string(),
+                                |path| path.to_string_lossy().into_owned()
+                            ),
+                            error
+                        )),
+                    }
+                }
+            }
+            Ok(metadata) => entries.push(metadata_digest(path, &metadata)),
+            Err(error) => entries.push(format!("{path}:missing:{}", error.kind())),
+        }
+    }
+    entries.sort();
+    entries.join("|")
+}
+
+fn metadata_digest(path: &str, metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let kind = if metadata.is_dir() {
+        "dir"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else {
+        "file"
+    };
+    format!("{path}:{}:{kind}:{modified}", metadata.len())
 }
 
 /// Run one iteration's turn loop in the fork. Returns the iteration's
@@ -327,12 +657,22 @@ fn build_fork_agent(
     parent: &Arc<Agent>,
     state: Arc<ForkScheduleState>,
     turn_tx: mpsc::Sender<TurnEvent>,
+    idle: bool,
 ) -> Agent {
+    // Idle no-op classification is sound only if every possible side effect
+    // crosses state owned below. Retain the parent's ordinary mutation surface
+    // and wrap every non-read-only operation so its invocation is durably
+    // recorded before external cancellation can abort the wake.
     let mut tools: ToolBox = parent
         .tools
         .clone()
         .without("question")
         .without_direct_native_media();
+    if idle {
+        tools = tools.map_non_read_only_operations(|tool| {
+            Arc::new(IdleWakeActionTool::new(tool, state.clone()))
+        });
+    }
     tools = tools.with(Arc::new(NoteTool::new(state.clone(), turn_tx)));
     tools = tools.with(Arc::new(ForkScheduleTool::new(state)));
     let mut params = parent.params.clone();
@@ -375,6 +715,7 @@ fn bundle_terminal(
     iterations: u64,
     last_result: &str,
     notes: &[String],
+    actions: &[String],
 ) -> String {
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
     let _ = writer.writeln(&format!(
@@ -385,6 +726,12 @@ fn bundle_terminal(
         let _ = writer.writeln("Notes:");
         for n in notes {
             let _ = writer.writeln(&format!("- {n}"));
+        }
+    }
+    if !actions.is_empty() {
+        let _ = writer.writeln("Actions:");
+        for action in actions {
+            let _ = writer.writeln(&format!("- {action}"));
         }
     }
     let trimmed = last_result.trim();
@@ -420,6 +767,17 @@ fn fork_history_bytes(history: &[Message]) -> usize {
         .iter()
         .map(|m| serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0))
         .sum()
+}
+
+#[cfg(test)]
+mod idle_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_conclusion_has_no_durable_dispatch() {
+        let state = ForkScheduleState::new("idle-read-only".into());
+        assert!(!wake_has_durable_dispatch(&state));
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +821,7 @@ mod tests {
             role_prompt: "role".into(),
             tools: ToolBox::new()
                 .with(Arc::new(crate::tools::question::QuestionTool))
+                .with(Arc::new(crate::tools::write::WriteTool))
                 .with(Arc::new(crate::tools::read::ReadTool)),
             model: test_model(),
             params: crate::engine::model::ModelParams::default(),
@@ -489,20 +848,147 @@ mod tests {
     }
 
     #[test]
-    fn question_absent_from_loop_fork_toolbox() {
+    fn idle_fork_keeps_mutation_tools_but_not_question() {
         let parent = parent_agent_with_question();
         assert!(parent.tools.names().contains(&"question"));
+        assert!(parent.tools.names().contains(&"write"));
         let state = Arc::new(ForkScheduleState::new("job-1".into()));
         let (turn_tx, _turn_rx) = mpsc::channel(8);
 
-        let fork = build_fork_agent(&parent, state, turn_tx);
+        let fork = build_fork_agent(&parent, state, turn_tx, true);
         let names = fork.tools.names();
 
         assert!(!names.contains(&"question"), "{names:?}");
+        assert!(names.contains(&"write"), "{names:?}");
         assert!(names.contains(&"note"), "{names:?}");
         assert!(names.contains(&"schedule"), "{names:?}");
         assert!(names.contains(&"read"), "{names:?}");
         assert_eq!(fork.context_policy, parent.context_policy);
+    }
+
+    #[test]
+    fn directory_watch_digest_observes_descendant_file_modification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watched = tmp.path().join("watched");
+        std::fs::create_dir(&watched).unwrap();
+        let child = watched.join("status.txt");
+        std::fs::write(&child, "old").unwrap();
+        let before = local_change_digest(tmp.path(), &["watched".to_string()]);
+
+        // Rewriting an existing child does not reliably update the watched
+        // directory's own metadata; the recursive digest must still change.
+        std::fs::write(child, "updated").unwrap();
+        let after = local_change_digest(tmp.path(), &["watched".to_string()]);
+
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_activity_restarts_a_backed_off_idle_deadline() {
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
+        let wait = tokio::spawn(async move {
+            let mut activity_rx = activity_rx;
+            wait_for_next_wake(300, 60, Some(&mut activity_rx), None).await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        activity_tx.send(Instant::now()).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            wait.await.unwrap(),
+            WakeWait::Elapsed {
+                activity_seen: true
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_idle_wake_observes_activity_accepted_before_gate_release() {
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        // This models the production ingress interval: queue insertion has
+        // completed and the reset is about to be published, while the idle
+        // timer is already due on another worker thread.
+        let admission = gate.lock().await;
+        let wait_gate = gate.clone();
+        let wait = tokio::spawn(async move {
+            let mut activity_rx = activity_rx;
+            wait_for_next_wake(1, 60, Some(&mut activity_rx), Some(&wait_gate)).await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "a due wake must wait for an in-progress accepted ingress"
+        );
+
+        activity_tx.send(Instant::now()).unwrap();
+        drop(admission);
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "accepted activity must reset the deadline"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            wait.await.unwrap(),
+            WakeWait::Elapsed {
+                activity_seen: true
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_idle_activity_channel_is_terminal() {
+        let (activity_tx, mut activity_rx) = watch::channel(Instant::now());
+        drop(activity_tx);
+
+        assert!(matches!(
+            wait_for_next_wake(60, 60, Some(&mut activity_rx), None).await,
+            WakeWait::ActivityChannelClosed
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_seen_after_inference_uses_its_original_timestamp() {
+        let (activity_tx, mut activity_rx) = watch::channel(Instant::now());
+
+        // This send models activity accepted while a model iteration is still
+        // executing, before the runner gets back to its next wait.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        activity_tx.send(Instant::now()).unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(45)).await;
+
+        let wait =
+            tokio::spawn(
+                async move { wait_for_next_wake(300, 60, Some(&mut activity_rx), None).await },
+            );
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            wait.await.unwrap(),
+            WakeWait::Elapsed {
+                activity_seen: true
+            }
+        ));
     }
 
     #[test]

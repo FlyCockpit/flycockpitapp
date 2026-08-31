@@ -304,6 +304,9 @@ impl Tool for WriteTool {
         // native knowledge write does not grant that host KB write access.
         if let Some(lsp) = &ctx.lsp
             && !is_human_knowledge_target
+            && crate::knowledge::configured_local_knowledge_roots(&ctx.session, &ctx.cwd, &config)
+                .await
+                .is_empty()
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
@@ -1777,6 +1780,7 @@ mod tests {
         crate::assistants::identity::seed_identity_files(&canonical).unwrap();
         let db = Db::open_in_memory().unwrap();
         let cfg = crate::assistants::AssistantConfig {
+            installation_id: uuid::Uuid::new_v4(),
             agent_source: canonical.join("assistant.md").display().to_string(),
             soul_edit_mode: crate::assistants::identity::SoulEditMode::HumanOnly,
             soul_hash: crate::assistants::identity::hash_optional_file(
@@ -1831,6 +1835,7 @@ mod tests {
         );
         let ctx = ToolCtx {
             agent_id: "helper".to_string(),
+            allowed_knowledge_bases: None,
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,

@@ -24,7 +24,7 @@ use cockpit_db::db::{
         ImportedArchiveDelegationPayload as ImportedDelegationPayload,
         ImportedArchiveDelegationSteer as ImportedDelegationSteer,
         ImportedArchiveEvent as ImportedEvent, ImportedArchiveSession as ImportedSession,
-        ImportedArchiveTextArtifact as ImportedTextArtifact,
+        ImportedArchiveTextArtifact as ImportedTextArtifact, validate_thread_anchors,
     },
     session_log::SessionEventKind,
     text_artifacts::{
@@ -213,6 +213,10 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
         .iter()
         .map(|value| parse_event(value, &mut archive))
         .collect::<Result<Vec<_>>>()?;
+    // The anchor event and relational fork fields are two durable projections
+    // of one originating parent message. Reject a malformed graph before any
+    // blob staging or database work.
+    validate_thread_anchors(&sessions, &events)?;
     let text_artifacts = parse_text_artifacts(&mut archive, &archive_paths)?;
     validate_text_artifact_graph(&sessions, &events, &text_artifacts)?;
     let delegation_jobs = parse_delegation_jobs(&mut archive)?;
@@ -1176,17 +1180,36 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
         ),
         "import manifest session has invalid session_entry_mode"
     );
+    let parent_source_id = optional_uuid(object.get("parent_session_id"), "parent_session_id")?;
+    let fork_point_turn_id =
+        optional_string(object.get("fork_point_turn_id"), "fork_point_turn_id")?;
+    let assistant_name = optional_string(
+        Some(
+            object
+                .get("assistant_name")
+                .ok_or_else(|| anyhow!("import manifest session lacks assistant_name"))?,
+        ),
+        "assistant_name",
+    )?;
+    let is_assistant_thread =
+        required_bool(object, "is_assistant_thread", "import manifest session")?;
+    anyhow::ensure!(
+        !is_assistant_thread
+            || (parent_source_id.is_some()
+                && fork_point_turn_id.is_some()
+                && assistant_name.is_some()),
+        "import manifest assistant thread lacks its parent, anchor, or assistant owner"
+    );
     Ok(ImportedSession {
         source_id: parse_uuid(
             required_string(object, "session_id", "import manifest session")?,
             "session_id",
         )?,
-        parent_source_id: optional_uuid(object.get("parent_session_id"), "parent_session_id")?,
+        parent_source_id,
         short_id: optional_string(object.get("short_id"), "short_id")?,
-        fork_point_turn_id: optional_string(
-            object.get("fork_point_turn_id"),
-            "fork_point_turn_id",
-        )?,
+        fork_point_turn_id,
+        assistant_name,
+        is_assistant_thread,
         active_model: match object.get("active_model") {
             Some(Value::Null) => None,
             Some(value) => {
@@ -1397,6 +1420,8 @@ mod tests {
                 parent_source_id: None,
                 short_id: Some("mprt01".into()),
                 fork_point_turn_id: None,
+                assistant_name: None,
+                is_assistant_thread: false,
                 active_model: None,
                 session_entry_mode: "code".into(),
                 active_agent: "Build".into(),
@@ -1461,6 +1486,8 @@ mod tests {
             "short_id": "ab3def",
             "parent_session_id": parent,
             "fork_point_turn_id": null,
+            "assistant_name": null,
+            "is_assistant_thread": false,
             "active_model": {
                 "provider": "test-provider",
                 "model": "test-model",

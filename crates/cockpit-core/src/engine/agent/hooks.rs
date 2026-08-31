@@ -112,6 +112,10 @@ pub(crate) const REASON_UNEXPECTED_PRE_TOOL_BLOCK: &str =
 pub(crate) const REASON_UNEXPECTED_STOP_DENY: &str = "unexpected decision 'deny' for stop event";
 /// A pre-tool hook produced an unknown or missing `decision`.
 pub(crate) const REASON_UNKNOWN_OR_MISSING_DECISION: &str = "unknown or missing decision";
+/// An arbitrary hook command would receive ambient host write authority while
+/// a local knowledge base is attached. Hooks fail open, but their process is
+/// never launched because attached KB access is read-only.
+pub(crate) const REASON_LOCAL_KNOWLEDGE_WRITE_FENCE: &str = "local_knowledge_write_fence";
 
 /// Bounded deadline for the post-run empty barrier. A single `terminate` +
 /// single `await_empty` actor round-trip already bounds the common case; this
@@ -1584,10 +1588,25 @@ pub(crate) async fn run_pre_tool_hooks(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
+    local_knowledge_write_fence_active: bool,
 ) -> PreHookOutcome {
     let event = HookEvent::PreToolUse;
     let hooks = matching_hooks(registry, event, tool_name);
     if hooks.is_empty() {
+        return PreHookOutcome::Allow;
+    }
+    if local_knowledge_write_fence_active {
+        record_knowledge_write_fence(
+            db,
+            session_id,
+            event,
+            hooks,
+            None,
+            Some(tool_name),
+            Some(tool_call_id),
+            None,
+        )
+        .await;
         return PreHookOutcome::Allow;
     }
 
@@ -1726,9 +1745,24 @@ pub(crate) async fn run_post_tool_hooks(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
+    local_knowledge_write_fence_active: bool,
 ) {
     let hooks = matching_hooks(registry, event, tool_name);
     if hooks.is_empty() {
+        return;
+    }
+    if local_knowledge_write_fence_active {
+        record_knowledge_write_fence(
+            db,
+            session_id,
+            event,
+            hooks,
+            None,
+            Some(tool_name),
+            Some(tool_call_id),
+            None,
+        )
+        .await;
         return;
     }
 
@@ -1893,6 +1927,39 @@ async fn record_hook_run(
     }
 }
 
+/// Audit every matching hook that the local-knowledge write fence prevents
+/// from launching. This preserves the ordinary fail-open hook contract while
+/// making the skipped host effect visible in the durable ledger.
+#[allow(clippy::too_many_arguments)]
+async fn record_knowledge_write_fence(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    event: HookEvent,
+    hooks: Vec<&ResolvedHook>,
+    turn_id: Option<&str>,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    subagent_id: Option<&str>,
+) {
+    for hook in hooks {
+        record_hook_run(
+            db,
+            session_id,
+            event,
+            hook,
+            &HookDecision::Failed {
+                reason: REASON_LOCAL_KNOWLEDGE_WRITE_FENCE.to_string(),
+            },
+            0,
+            turn_id,
+            tool_name,
+            tool_call_id,
+            subagent_id,
+        )
+        .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stop-gate state machine
 // ---------------------------------------------------------------------------
@@ -2027,8 +2094,19 @@ pub(crate) async fn run_stop_hooks(
     subagent_type: Option<&str>,
     subagent_id: Option<&str>,
     end_reason: Option<&str>,
+    local_knowledge_write_fence_active: bool,
     state: &mut StopGateState,
 ) -> StopHookOutcome {
+    if local_knowledge_write_fence_active {
+        let hooks = matching_hooks(registry, event, match_value);
+        if hooks.is_empty() {
+            return StopHookOutcome::End;
+        }
+        record_knowledge_write_fence(db, session_id, event, hooks, None, None, None, subagent_id)
+            .await;
+        return StopHookOutcome::End;
+    }
+
     // If already at the continuation cap, force end without reconsulting hooks.
     if state.capped() {
         emit_forced_end_notice(
@@ -2290,9 +2368,24 @@ pub(crate) async fn run_observe_hooks(
     subagent_type: Option<&str>,
     subagent_id: Option<&str>,
     fields: ObserveFields<'_>,
+    local_knowledge_write_fence_active: bool,
 ) {
     let hooks = matching_hooks(registry, event, match_value);
     if hooks.is_empty() {
+        return;
+    }
+    if local_knowledge_write_fence_active {
+        record_knowledge_write_fence(
+            db,
+            session_id,
+            event,
+            hooks,
+            None,
+            tool_name,
+            tool_call_id,
+            subagent_id,
+        )
+        .await;
         return;
     }
 

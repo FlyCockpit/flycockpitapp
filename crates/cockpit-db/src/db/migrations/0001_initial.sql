@@ -1226,7 +1226,7 @@ CREATE INDEX idx_knowledge_dream_schedule_state_last
 -- UUID, rather than the mutable registry id, prevents a replacement source
 -- from inheriting the predecessor's dream state.
 CREATE TABLE knowledge_dream_ledger (
-    project_uuid BLOB NOT NULL UNIQUE CHECK (
+    project_uuid BLOB NOT NULL CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
         AND project_uuid <> zeroblob(16)
     ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,

@@ -746,9 +746,10 @@ struct ArbiterWaiter {
     target_key: PhysicalTargetKey,
     owner_instance: OwnerInstance,
     delegation: DelegationId,
-    /// Set to true when this waiter has been cancelled. Cancelled waiters
-    /// are removed without transferring their generation.
-    cancelled: bool,
+    /// Set when this waiter has been cancelled. The shared flag lets an
+    /// interrupted async opener safely abandon a queued handle without a
+    /// ghost lease being promoted later.
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Delivery channel for the promoted lease token. `release` sends the
     /// minted token here; the owning [`WaitHandle::await_token`] receives it.
     /// `None` once the token (or a failure) has been delivered.
@@ -780,8 +781,8 @@ impl std::error::Error for WaitFailed {}
 
 /// A handle to a queued FIFO waiter. The holder either [`await_token`]s the
 /// promoted lease after the current holder releases, or abandons the wait by
-/// dropping the handle (and, for in-process abandonment, having the arbiter
-/// [`cancel_waiter_by_id`] it so no ghost lease is promoted).
+/// dropping the handle. Dropping marks its FIFO entry cancelled, so no ghost
+/// lease can be promoted if an opener task is interrupted.
 ///
 /// [`await_token`]: WaitHandle::await_token
 /// [`cancel_waiter_by_id`]: HostInputArbiter::cancel_waiter_by_id
@@ -791,19 +792,23 @@ pub struct WaitHandle {
     target_key: PhysicalTargetKey,
     delegation: DelegationId,
     receiver: oneshot::Receiver<Result<HostLeaseToken, WaitFailed>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    completed: bool,
 }
 
 impl WaitHandle {
     /// Await promotion. Resolves to the promoted [`HostLeaseToken`] (with a new
     /// generation) once the prior holder releases, or [`WaitFailed`] if the
     /// waiter was cancelled/abandoned, invalidated, or the OS lock failed.
-    pub async fn await_token(self) -> Result<HostLeaseToken, WaitFailed> {
-        match self.receiver.await {
+    pub async fn await_token(mut self) -> Result<HostLeaseToken, WaitFailed> {
+        let result = match (&mut self.receiver).await {
             Ok(result) => result,
             // The sender was dropped without delivering — the waiter was
             // removed (cancelled/abandoned) without a promotion.
             Err(_) => Err(WaitFailed::Cancelled),
-        }
+        };
+        self.completed = true;
+        result
     }
 
     /// The physical key this waiter is queued on.
@@ -814,6 +819,15 @@ impl WaitHandle {
     /// The delegation this waiter serves.
     pub fn delegation(&self) -> &DelegationId {
         &self.delegation
+    }
+}
+
+impl Drop for WaitHandle {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -909,7 +923,10 @@ impl HostInputArbiter {
         let has_live_waiters = self
             .queues
             .get(&key_str)
-            .map(|q| q.iter().any(|w| !w.cancelled))
+            .map(|q| {
+                q.iter()
+                    .any(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
+            })
             .unwrap_or(false);
         if self.current_lease.contains_key(&key_str) || has_live_waiters {
             let waiter_id = {
@@ -917,6 +934,7 @@ impl HostInputArbiter {
                 WaiterId(self.next_waiter_id)
             };
             let (sender, receiver) = oneshot::channel();
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.queues
                 .entry(key_str.clone())
                 .or_default()
@@ -925,7 +943,7 @@ impl HostInputArbiter {
                     target_key: *target_key,
                     owner_instance: self.owner_instance,
                     delegation: delegation.clone(),
-                    cancelled: false,
+                    cancelled: Arc::clone(&cancelled),
                     sender: Some(sender),
                 });
             return AcquireResult::Queued(WaitHandle {
@@ -933,6 +951,8 @@ impl HostInputArbiter {
                 target_key: *target_key,
                 delegation,
                 receiver,
+                cancelled,
+                completed: false,
             });
         }
 
@@ -988,7 +1008,7 @@ impl HostInputArbiter {
         // waiters are skipped WITHOUT transferring a generation.
         if let Some(waiters) = self.queues.get_mut(&key_str) {
             while let Some(next) = waiters.first() {
-                if next.cancelled {
+                if next.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     waiters.remove(0);
                     continue;
                 }
@@ -1071,8 +1091,12 @@ impl HostInputArbiter {
         };
         // Mark the first matching waiter as cancelled.
         for waiter in waiters.iter_mut() {
-            if &waiter.delegation == delegation && !waiter.cancelled {
-                waiter.cancelled = true;
+            if &waiter.delegation == delegation
+                && !waiter.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            {
+                waiter
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
                 return true;
             }
         }
@@ -1097,7 +1121,10 @@ impl HostInputArbiter {
         };
         if let Some(pos) = waiters.iter().position(|w| w.id == id) {
             // Remove outright (dropping the sender) so no promotion targets it.
-            waiters.remove(pos);
+            let waiter = waiters.remove(pos);
+            waiter
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
             if waiters.is_empty() {
                 self.queues.remove(&key_str);
             }
@@ -1146,7 +1173,11 @@ impl HostInputArbiter {
         let key_str = Self::key_string(target_key);
         self.queues
             .get(&key_str)
-            .map(|q| q.iter().filter(|w| !w.cancelled).count())
+            .map(|q| {
+                q.iter()
+                    .filter(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -1184,6 +1215,43 @@ fn lock_poison_safe(
     arbiter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Await a host lease without holding the arbiter mutex across an await.
+/// Process-local holders use the arbiter FIFO; independently composed
+/// production arbiters observe OS-lock contention and retry until the current
+/// process releases the lease. This is what makes separate daemon processes
+/// serialize rather than reject a valid concurrent caller.
+async fn acquire_host_lease(
+    arbiter: &Arc<std::sync::Mutex<HostInputArbiter>>,
+    physical_key: &PhysicalTargetKey,
+    delegation: DelegationId,
+) -> Result<HostLeaseToken, CoordinatorOpenError> {
+    const CONTENTION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    loop {
+        let acquired = {
+            let mut arbiter = lock_poison_safe(arbiter);
+            arbiter.try_acquire(physical_key, delegation.clone())
+        };
+        match acquired {
+            AcquireResult::Acquired(token) => return Ok(token),
+            AcquireResult::Queued(handle) => {
+                return handle.await_token().await.map_err(|failure| match failure {
+                    WaitFailed::OsLockFailed(error) => CoordinatorOpenError::HostLockFailed(error),
+                    WaitFailed::Cancelled | WaitFailed::Invalidated => {
+                        CoordinatorOpenError::HostLockFailed(HostLockError::LockLost)
+                    }
+                });
+            }
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess) => {
+                tokio::time::sleep(CONTENTION_POLL).await;
+            }
+            AcquireResult::OsLockFailed(error) => {
+                return Err(CoordinatorOpenError::HostLockFailed(error));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2751,26 +2819,14 @@ impl ComputerActionCoordinator {
                                 "a FileAdvisoryLock-backed host lease",
                             ),
                         )?;
-                        let mut arbiter = lock_poison_safe(arbiter);
-                        match arbiter.try_acquire(&physical_key, params.delegation_id.clone()) {
-                            AcquireResult::Acquired(token) => {
-                                host_lease = Some(token);
-                            }
-                            AcquireResult::Queued(handle) => {
-                                // SECURITY-CRITICAL fail-closed: production
-                                // `open` never awaits the FIFO. Abandon the
-                                // waiter before returning — remove its FIFO
-                                // entry and drop the handle — so a later
-                                // `release` cannot promote a ghost lease into
-                                // `current_lease` with no owner.
-                                arbiter.cancel_waiter_handle(&handle);
-                                drop(handle);
-                                return Err(CoordinatorOpenError::HostLockQueued);
-                            }
-                            AcquireResult::OsLockFailed(err) => {
-                                return Err(CoordinatorOpenError::HostLockFailed(err));
-                            }
-                        }
+                        host_lease = Some(
+                            acquire_host_lease(
+                                arbiter,
+                                &physical_key,
+                                params.delegation_id.clone(),
+                            )
+                            .await?,
+                        );
                     }
                 }
                 Err(reason) => {
@@ -5688,13 +5744,10 @@ mod tests {
         assert_eq!(handle_c.await_token().await, Err(WaitFailed::Cancelled));
     }
 
-    /// AC19: production `open` fails closed on a contended host lock. When
-    /// `open` maps contention to `HostLockQueued` it must abandon the FIFO
-    /// waiter before returning, so after the first holder releases there is no
-    /// ghost promotion and `current_lease` is not left held by an unowned
-    /// token.
+    /// AC19: a contended production open waits in FIFO order and receives the
+    /// lease after the current holder releases it.
     #[tokio::test]
-    async fn computer_host_lock_open_queued_cancels_waiter() {
+    async fn computer_host_lock_open_queued_serializes_waiter() {
         let tmp = tempfile::tempdir().expect("temp data root");
         let os_lock =
             FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
@@ -5748,8 +5801,7 @@ mod tests {
         .expect("first open acquires the host lease");
         assert!(arbiter.lock().unwrap().is_held(&key));
 
-        // Second delegation contends: `open` maps it to `HostLockQueued` and
-        // must remove the FIFO waiter before returning.
+        // Second delegation contends and remains queued until A releases.
         let params_b = CoordinatorParams {
             session_id: DURABLE_COMPUTER_SESSION_ID.to_string(),
             delegation_id: DelegationId("delegation-b".to_string()),
@@ -5765,28 +5817,24 @@ mod tests {
             outcome_store: Some(outcome_store),
             handoff_journal: Some(handoff_journal),
         };
-        let result_b = ComputerActionCoordinator::open(
+        let mut opening_b = Box::pin(ComputerActionCoordinator::open(
             Box::new(PhysicalFakeBackend(FakeBackend::new())),
             params_b,
-        )
-        .await;
-        assert!(matches!(
-            result_b,
-            Err(CoordinatorOpenError::HostLockQueued)
         ));
-
-        // The FIFO entry is GONE — the abandoned waiter was removed.
-        assert_eq!(arbiter.lock().unwrap().waiter_count(&key), 0);
-
-        // The first holder releases: there must be NO ghost promotion and no
-        // unowned lease left installed.
-        coordinator_a.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
-        let arb = arbiter.lock().unwrap();
         assert!(
-            !arb.is_held(&key),
-            "no unowned lease may remain after the holder releases"
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut opening_b)
+                .await
+                .is_err()
         );
-        assert_eq!(arb.waiter_count(&key), 0);
+        assert_eq!(arbiter.lock().unwrap().waiter_count(&key), 1);
+
+        // Release the first holder, then the waiting open owns the promoted
+        // lease rather than being refused for ordinary contention.
+        coordinator_a.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
+        let mut coordinator_b = opening_b.await.expect("queued open acquires after release");
+        assert!(arbiter.lock().unwrap().is_held(&key));
+        coordinator_b.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
+        assert!(!arbiter.lock().unwrap().is_held(&key));
     }
 
     /// A test OS lock that grants the first `ok_count` acquisitions and then

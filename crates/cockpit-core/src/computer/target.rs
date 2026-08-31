@@ -210,6 +210,9 @@ pub struct TargetIdentityEvidence {
     pub title_hint: FieldEvidence<RedactedHint>,
     pub class_hint: FieldEvidence<RedactedHint>,
     pub geometry: FieldEvidence<TargetGeometry>,
+    /// Current root-desktop geometry.  This is distinct from the focused
+    /// window bounds: RandR can resize the desktop without moving focus.
+    pub desktop_geometry: FieldEvidence<TargetGeometry>,
     /// Monotonic generation allocated whenever any identity/geometry component changes.
     pub focus_generation: u64,
     /// Adapter-observed epoch (never labeled `os_focus_sequence`).
@@ -372,6 +375,8 @@ struct GenerationFingerprint {
     app: Option<String>,
     geometry: Option<(i32, i32, u32, u32)>,
     scale_bits: Option<u64>,
+    desktop_geometry: Option<(i32, i32, u32, u32)>,
+    desktop_scale_bits: Option<u64>,
 }
 
 impl FocusGenerationReducer {
@@ -396,6 +401,9 @@ impl FocusGenerationReducer {
             app: field_value(&evidence.stable_application_id).map(|a| a.value.clone()),
             geometry: field_value(&evidence.geometry).map(|g| (g.x, g.y, g.width, g.height)),
             scale_bits: field_value(&evidence.geometry).map(|g| g.scale.to_bits()),
+            desktop_geometry: field_value(&evidence.desktop_geometry)
+                .map(|g| (g.x, g.y, g.width, g.height)),
+            desktop_scale_bits: field_value(&evidence.desktop_geometry).map(|g| g.scale.to_bits()),
         };
         match &self.last {
             None => {
@@ -800,6 +808,10 @@ pub fn empty_unavailable(backend_kind: BackendKind) -> TargetIdentityEvidence {
         title_hint: FieldEvidence::unavailable(TargetUnavailableReason::PartialEvidence, None),
         class_hint: FieldEvidence::unavailable(TargetUnavailableReason::PartialEvidence, None),
         geometry: FieldEvidence::unavailable(TargetUnavailableReason::PartialEvidence, None),
+        desktop_geometry: FieldEvidence::unavailable(
+            TargetUnavailableReason::PartialEvidence,
+            None,
+        ),
         focus_generation: 0,
         adapter_observed_epoch: 0,
         synchronous_recheck: false,
@@ -861,6 +873,16 @@ pub fn sample_physical_evidence(
             },
             EvidenceSource::InjectedTest,
         ),
+        desktop_geometry: FieldEvidence::available(
+            TargetGeometry {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 2.0,
+            },
+            EvidenceSource::InjectedTest,
+        ),
         // Injected-test fixture carries a live focus generation so coordinator
         // paths that dispatch focus-gated actions can pass the focus gate.
         focus_generation: 1,
@@ -901,6 +923,7 @@ pub fn sample_virtual_evidence(uuid: [u8; 16], generation: u64) -> TargetIdentit
         },
         EvidenceSource::VirtualEngine,
     );
+    e.desktop_geometry = e.geometry.clone();
     e.adapter_observed_epoch = 1;
     e
 }

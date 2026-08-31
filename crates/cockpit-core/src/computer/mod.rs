@@ -230,6 +230,12 @@ pub enum ComputerError {
     CommandFailed { program: String, detail: String },
 }
 
+/// Provider-controlled action durations are intentionally bounded so a
+/// physical-host lease and any pressed key cannot be held indefinitely.
+pub const MAX_COMPUTER_ACTION_DURATION: Duration = Duration::from_secs(60);
+/// One scroll action maps to one external `xdotool` process per click.
+pub const MAX_SCROLL_CLICK_REPETITIONS: u32 = 1_000;
+
 impl std::fmt::Display for ComputerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -481,6 +487,7 @@ impl VirtualDisplayBackend {
     fn new_real_desktop() -> Result<Self, ComputerError> {
         if std::env::var("XDG_SESSION_TYPE")
             .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
+            || std::env::var("WAYLAND_DISPLAY").is_ok_and(|display| !display.trim().is_empty())
         {
             return Err(ComputerError::UnsupportedPlatform {
                 platform: "linux-wayland".to_string(),
@@ -495,48 +502,12 @@ impl VirtualDisplayBackend {
         let xdotool = require_capability("xdotool", "the `xdotool` package")?;
         let capture = require_capture_tool()?;
         let capture_root = private_capture_root()?;
-        let output = Command::new(&xdotool)
-            .env("DISPLAY", &display)
-            .arg("getdisplaygeometry")
-            .output()
-            .map_err(|error| ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-        let dimensions = String::from_utf8_lossy(&output.stdout);
-        let mut dimensions = dimensions.split_whitespace();
-        let width = dimensions.next().and_then(|value| value.parse().ok());
-        let height = dimensions.next().and_then(|value| value.parse().ok());
-        let (Some(width), Some(height), None) = (width, height, dimensions.next()) else {
-            return Err(ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: "getdisplaygeometry returned malformed dimensions".to_string(),
-            });
-        };
-        if width == 0 || height == 0 {
-            return Err(ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: "getdisplaygeometry returned an empty desktop".to_string(),
-            });
-        }
+        let geometry = query_x11_display_geometry(&xdotool, &display)?;
         Ok(Self {
             display,
             backend_kind: target::BackendKind::RealDesktopX11,
             xvfb: Mutex::new(None),
-            geometry: DisplayGeometry {
-                physical: PixelSize { width, height },
-                logical: LogicalSize {
-                    width: f64::from(width),
-                    height: f64::from(height),
-                },
-                scale_factor: ScaleFactor(1.0),
-            },
+            geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
             capture_root,
@@ -640,6 +611,51 @@ impl VirtualDisplayBackend {
             &self.capture_root,
         )
     }
+}
+
+#[cfg(target_os = "linux")]
+fn query_x11_display_geometry(
+    xdotool: &std::path::Path,
+    display: &str,
+) -> Result<DisplayGeometry, ComputerError> {
+    let output = Command::new(xdotool)
+        .env("DISPLAY", display)
+        .arg("getdisplaygeometry")
+        .output()
+        .map_err(|error| ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let dimensions = String::from_utf8_lossy(&output.stdout);
+    let mut dimensions = dimensions.split_whitespace();
+    let width = dimensions.next().and_then(|value| value.parse().ok());
+    let height = dimensions.next().and_then(|value| value.parse().ok());
+    let (Some(width), Some(height), None) = (width, height, dimensions.next()) else {
+        return Err(ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: "getdisplaygeometry returned malformed dimensions".to_string(),
+        });
+    };
+    if width == 0 || height == 0 {
+        return Err(ComputerError::CommandFailed {
+            program: "xdotool".to_string(),
+            detail: "getdisplaygeometry returned an empty desktop".to_string(),
+        });
+    }
+    Ok(DisplayGeometry {
+        physical: PixelSize { width, height },
+        logical: LogicalSize {
+            width: f64::from(width),
+            height: f64::from(height),
+        },
+        scale_factor: ScaleFactor(1.0),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,6 +1034,10 @@ impl ComputerBackend for VirtualDisplayBackend {
         self.backend_kind
     }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+        #[cfg(target_os = "linux")]
+        if self.backend_kind == target::BackendKind::RealDesktopX11 {
+            self.geometry = query_x11_display_geometry(&self.tools.xdotool, &self.display)?;
+        }
         Ok(self.geometry.clone())
     }
 
@@ -1107,6 +1127,7 @@ fn execute_virtual_action(
             duration,
             easing,
         } => {
+            checked_action_duration(*duration)?;
             let point = checked_point(*to, &backend.geometry)?;
             move_cursor_with_timing(backend, point, *duration, *easing)?;
             Ok(ComputerActionOutcome::Completed)
@@ -1152,6 +1173,7 @@ fn execute_virtual_action(
             }
             let mut checked_path = Vec::with_capacity(path.len());
             for step in path {
+                checked_action_duration(step.duration)?;
                 checked_path.push((
                     checked_point(step.point, &backend.geometry)?,
                     step.duration,
@@ -1184,6 +1206,7 @@ fn execute_virtual_action(
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::HoldKey { key, duration } => {
+            checked_action_duration(*duration)?;
             backend.run_xdotool(&[OsString::from("keydown"), OsString::from(key)])?;
             backend.held_keys.push(key.clone());
             std::thread::sleep(*duration);
@@ -1196,6 +1219,8 @@ fn execute_virtual_action(
             delta_y,
             modifiers,
         } => {
+            checked_scroll_delta(*delta_x)?;
+            checked_scroll_delta(*delta_y)?;
             run_modifiers(backend, *modifiers, true)?;
             let vertical = if *delta_y < 0 { "5" } else { "4" };
             for _ in 0..delta_y.unsigned_abs() {
@@ -1209,6 +1234,7 @@ fn execute_virtual_action(
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::Wait { duration } => {
+            checked_action_duration(*duration)?;
             std::thread::sleep(*duration);
             Ok(ComputerActionOutcome::Waited(*duration))
         }
@@ -2427,16 +2453,40 @@ fn key_text_to_chord(text: String) -> Vec<String> {
 }
 
 fn secs(seconds: f64) -> Duration {
-    Duration::from_secs_f64(seconds.max(0.0))
+    if !seconds.is_finite() {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(seconds.clamp(0.0, MAX_COMPUTER_ACTION_DURATION.as_secs_f64()))
 }
 
 fn scroll_delta(direction: ScrollDirection, amount: i32) -> (i32, i32) {
+    let amount = amount.clamp(0, MAX_SCROLL_CLICK_REPETITIONS as i32);
     match direction {
         ScrollDirection::Up => (0, -amount),
         ScrollDirection::Down => (0, amount),
         ScrollDirection::Left => (-amount, 0),
         ScrollDirection::Right => (amount, 0),
     }
+}
+
+fn checked_action_duration(duration: Duration) -> Result<(), ComputerError> {
+    if duration > MAX_COMPUTER_ACTION_DURATION {
+        return Err(ComputerError::Refused(format!(
+            "computer action duration exceeds {} seconds",
+            MAX_COMPUTER_ACTION_DURATION.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+fn checked_scroll_delta(delta: i32) -> Result<(), ComputerError> {
+    if delta.unsigned_abs() > MAX_SCROLL_CLICK_REPETITIONS {
+        return Err(ComputerError::Refused(format!(
+            "scroll magnitude exceeds {} clicks",
+            MAX_SCROLL_CLICK_REPETITIONS
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]

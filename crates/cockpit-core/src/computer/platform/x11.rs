@@ -1,7 +1,8 @@
 //! X11/RandR target-evidence pure logic.
 //!
-//! Session identity is a domain hash over transport/display/screen plus
-//! length-delimited server setup vendor/release and root-window identity.
+//! Session identity is a domain hash over display/screen plus length-delimited
+//! server setup vendor/release and root-window identity. Transport spellings
+//! are deliberately excluded: `:0` and `unix:0` can name the same server.
 //! Xauthority cookie bytes never enter the identity.
 
 use crate::computer::host_identity::domain_hash;
@@ -33,7 +34,6 @@ pub fn x11_session_or_seat_id(parts: &X11SessionParts) -> [u8; 32] {
     domain_hash(
         b"cockpit.x11.session.v1",
         &[
-            parts.transport.as_bytes(),
             &parts.display_number.to_le_bytes(),
             &parts.screen.to_le_bytes(),
             parts.vendor.as_bytes(),
@@ -101,18 +101,33 @@ pub enum X11EvidenceError {
 
 pub fn stable_output_identity(output: &RandrOutputSnapshot) -> Result<[u8; 32], X11EvidenceError> {
     match validate_edid(output.edid.as_deref()) {
-        EdidValidation::Valid { .. } => {}
-        _ => return Err(X11EvidenceError::InvalidEdid),
+        EdidValidation::Valid { .. } => {
+            let edid = output.edid.as_deref().expect("validated EDID is present");
+            return Ok(domain_hash(
+                b"cockpit.x11.output.v1",
+                &[
+                    &output.screen_index.to_le_bytes(),
+                    output.connector_name.as_bytes(),
+                    edid,
+                ],
+            ));
+        }
+        // Virtual and remote RandR outputs commonly have no EDID.  The
+        // connector is still stable within the X server session, which is
+        // already independently part of the physical-target key.
+        EdidValidation::Missing => {
+            return Ok(domain_hash(
+                b"cockpit.x11.output-without-edid.v1",
+                &[
+                    &output.screen_index.to_le_bytes(),
+                    output.connector_name.as_bytes(),
+                ],
+            ));
+        }
+        EdidValidation::NonIntegralBlockCount | EdidValidation::BadChecksum => {
+            return Err(X11EvidenceError::InvalidEdid);
+        }
     }
-    let edid = output.edid.as_deref().unwrap();
-    Ok(domain_hash(
-        b"cockpit.x11.output.v1",
-        &[
-            &output.screen_index.to_le_bytes(),
-            output.connector_name.as_bytes(),
-            edid,
-        ],
-    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,18 +161,35 @@ pub fn build_mirror_groups(
     outputs: &[RandrOutputSnapshot],
 ) -> Result<Vec<MirrorGroup>, X11EvidenceError> {
     let mut usable = Vec::new();
+    let mut invalid_edid = false;
     for o in outputs {
-        if !o.connected {
+        // Connected-but-disabled outputs have no active CRTC. They must not
+        // poison evidence for the active output containing the focused window.
+        if !o.connected || o.crtc_id.is_none() || o.mode_id.is_none() || o.geometry.is_none() {
             continue;
         }
-        let crtc = o.crtc_id.ok_or(X11EvidenceError::NoConnectedCrtc)?;
-        let mode = o.mode_id.ok_or(X11EvidenceError::NoMode)?;
-        let geom = o.geometry.ok_or(X11EvidenceError::MissingGeometry)?;
-        let id = stable_output_identity(o)?;
+        let id = match stable_output_identity(o) {
+            Ok(id) => id,
+            Err(X11EvidenceError::InvalidEdid) => {
+                // An unrelated malformed EDID is not a reason to reject a
+                // working desktop. If it is the focused output, selection
+                // below fails closed because that group is absent.
+                invalid_edid = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (Some(crtc), Some(mode), Some(geom)) = (o.crtc_id, o.mode_id, o.geometry) else {
+            unreachable!("active output fields were checked above");
+        };
         usable.push((crtc, mode, geom, o.rotation, o.clone_group, id));
     }
     if usable.is_empty() {
-        return Err(X11EvidenceError::NoConnectedCrtc);
+        return Err(if invalid_edid {
+            X11EvidenceError::InvalidEdid
+        } else {
+            X11EvidenceError::NoConnectedCrtc
+        });
     }
 
     // Group by (crtc) first, then merge clone-compatible distinct CRTCs.
@@ -169,22 +201,33 @@ pub fn build_mirror_groups(
             continue;
         }
         used[i] = true;
-        let (crtc_i, mode_i, geom_i, rot_i, clone_i, id_i) = usable[i];
+        let (_, _, geom_i, _, _, id_i) = usable[i];
         let mut ids = vec![id_i];
-        for j in (i + 1)..usable.len() {
-            if used[j] {
-                continue;
-            }
-            let (crtc_j, mode_j, geom_j, rot_j, clone_j, id_j) = usable[j];
-            let same_crtc = crtc_i == crtc_j;
-            let clone_compatible = mode_i == mode_j
-                && geom_i == geom_j
-                && rot_i == rot_j
-                && clone_i.is_some()
-                && clone_i == clone_j;
-            if same_crtc || clone_compatible {
-                used[j] = true;
-                ids.push(id_j);
+        let mut members = vec![i];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for j in 0..usable.len() {
+                if used[j] {
+                    continue;
+                }
+                let (_, _, _, _, _, id_j) = usable[j];
+                let compatible = members.iter().any(|member| {
+                    let (crtc_a, mode_a, geom_a, rot_a, clone_a, _) = usable[*member];
+                    let (crtc_b, mode_b, geom_b, rot_b, clone_b, _) = usable[j];
+                    crtc_a == crtc_b
+                        || (mode_a == mode_b
+                            && geom_a == geom_b
+                            && rot_a == rot_b
+                            && clone_a.is_some()
+                            && clone_a == clone_b)
+                });
+                if compatible {
+                    used[j] = true;
+                    members.push(j);
+                    ids.push(id_j);
+                    changed = true;
+                }
             }
         }
         ids.sort();
@@ -403,6 +446,11 @@ impl X11TargetEvidenceAdapter {
             .get(screen_index)
             .ok_or(TargetUnavailableReason::MissingCapability)?;
         let root = screen.root;
+        let root_geometry = connection
+            .get_geometry(root)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
 
         let randr_version = connection
             .randr_query_version(1, 3)
@@ -458,6 +506,7 @@ impl X11TargetEvidenceAdapter {
             .reply()
             .map_err(unavailable)?;
         let mut outputs = Vec::with_capacity(resources.outputs.len());
+        let mut output_clone_peers = Vec::with_capacity(resources.outputs.len());
         for output in &resources.outputs {
             let info = connection
                 .randr_get_output_info(*output, resources.config_timestamp)
@@ -489,6 +538,7 @@ impl X11TargetEvidenceAdapter {
                 && edid_reply.bytes_after == 0
                 && !edid_reply.data.is_empty())
             .then_some(edid_reply.data);
+            output_clone_peers.push(info.clones.clone());
             outputs.push(RandrOutputSnapshot {
                 screen_index: screen_index as u32,
                 connector_name: String::from_utf8_lossy(&info.name).into_owned(),
@@ -507,6 +557,7 @@ impl X11TargetEvidenceAdapter {
                 clone_group: None,
             });
         }
+        assign_production_clone_groups(&mut outputs, &resources.outputs, &output_clone_peers);
         let groups = build_mirror_groups(&outputs).map_err(map_evidence_error)?;
         let focused_group =
             select_mirror_group(&groups, focused_geometry).map_err(map_evidence_error)?;
@@ -549,6 +600,18 @@ impl X11TargetEvidenceAdapter {
             .reply()
             .map_err(unavailable)?;
         if resources_after.config_timestamp != resources.config_timestamp {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+        let root_geometry_after = connection
+            .get_geometry(root)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)?;
+        if root_geometry_after.x != root_geometry.x
+            || root_geometry_after.y != root_geometry.y
+            || root_geometry_after.width != root_geometry.width
+            || root_geometry_after.height != root_geometry.height
+        {
             return Err(TargetUnavailableReason::StaleTarget);
         }
         let active_window_after = connection
@@ -636,8 +699,55 @@ impl X11TargetEvidenceAdapter {
             },
             EvidenceSource::X11NetActiveWindow,
         );
+        snapshot.desktop_geometry = FieldEvidence::available(
+            TargetGeometry {
+                x: i32::from(root_geometry.x),
+                y: i32::from(root_geometry.y),
+                width: u32::from(root_geometry.width),
+                height: u32::from(root_geometry.height),
+                scale: 1.0,
+            },
+            EvidenceSource::X11Randr,
+        );
         snapshot.synchronous_recheck = true;
         Ok(snapshot)
+    }
+}
+
+/// Populate the pure-logic clone token from RandR's production `clones`
+/// output IDs. RandR reports a graph, so every connected component receives
+/// its smallest output ID as a deterministic token.
+#[cfg(target_os = "linux")]
+fn assign_production_clone_groups(
+    outputs: &mut [RandrOutputSnapshot],
+    output_ids: &[u32],
+    output_clone_peers: &[Vec<u32>],
+) {
+    let mut peers = std::collections::HashMap::<u32, Vec<u32>>::new();
+    for (output, clones) in output_ids.iter().zip(output_clone_peers) {
+        peers.entry(*output).or_default().extend(clones);
+    }
+    for (index, output) in outputs.iter_mut().enumerate() {
+        let output_id = output_ids[index];
+        let mut seen = std::collections::BTreeSet::from([output_id]);
+        let mut pending = vec![output_id];
+        while let Some(current) = pending.pop() {
+            for (candidate, candidate_peers) in &peers {
+                if (*candidate == current || candidate_peers.contains(&current))
+                    && seen.insert(*candidate)
+                {
+                    pending.push(*candidate);
+                }
+                if *candidate == current {
+                    for peer in candidate_peers {
+                        if seen.insert(*peer) {
+                            pending.push(*peer);
+                        }
+                    }
+                }
+            }
+        }
+        output.clone_group = (seen.len() > 1).then(|| *seen.first().expect("non-empty clone set"));
     }
 }
 
@@ -744,7 +854,10 @@ pub fn authorized_atspi_present() -> bool {
 
 #[cfg(all(test, target_os = "linux"))]
 mod production_adapter_tests {
-    use super::parse_display_identity;
+    use super::{
+        RandrOutputSnapshot, X11SessionParts, assign_production_clone_groups,
+        parse_display_identity, x11_session_or_seat_id,
+    };
 
     #[test]
     fn display_identity_parses_local_remote_and_default_screen() {
@@ -767,5 +880,41 @@ mod production_adapter_tests {
         assert_eq!(parse_display_identity(":desktop", 0), None);
         assert_eq!(parse_display_identity(":0.screen", 0), None);
         assert_eq!(parse_display_identity("missing-colon", 0), None);
+    }
+
+    #[test]
+    fn local_display_aliases_share_one_session_identity() {
+        let parts = |transport| X11SessionParts {
+            transport: transport.to_string(),
+            display_number: 0,
+            screen: 0,
+            vendor: "X.Org".to_string(),
+            release: 1,
+            root_window_id: 42,
+            xauthority_cookie: Vec::new(),
+        };
+        assert_eq!(
+            x11_session_or_seat_id(&parts("")),
+            x11_session_or_seat_id(&parts("unix"))
+        );
+    }
+
+    #[test]
+    fn randr_clone_output_ids_reach_mirror_group_logic() {
+        let output = |name| RandrOutputSnapshot {
+            screen_index: 0,
+            connector_name: name.to_string(),
+            edid: None,
+            crtc_id: Some(1),
+            mode_id: Some(1),
+            geometry: Some((0, 0, 1280, 720)),
+            rotation: 0,
+            connected: true,
+            clone_group: None,
+        };
+        let mut outputs = vec![output("DP-1"), output("HDMI-1")];
+        assign_production_clone_groups(&mut outputs, &[10, 20], &[vec![20], vec![10]]);
+        assert_eq!(outputs[0].clone_group, outputs[1].clone_group);
+        assert!(outputs[0].clone_group.is_some());
     }
 }

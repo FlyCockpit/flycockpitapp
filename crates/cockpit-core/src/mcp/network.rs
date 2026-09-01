@@ -114,10 +114,13 @@ pub async fn effective_policy(host: &HostContext) -> Result<EffectiveNetworkPoli
         .native_tool_ctx
         .as_ref()
         .context("governed network requires a live agent context")?;
+    let agent_instance_id = ctx
+        .agent_instance_id
+        .context("governed network requires a daemon-owned agent instance")?;
     let agent = ctx
         .session
         .db
-        .monty_network_agent_policy(&ctx.agent_id)
+        .monty_network_agent_policy(agent_instance_id)
         .await?;
     let session = ctx.session.monty_session_network_grant_snapshot();
     Ok(EffectiveNetworkPolicy {
@@ -237,6 +240,7 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .context("invalid governed request method")?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -255,7 +259,7 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     let agent_fence = ctx
         .session
         .db
-        .monty_network_agent_fence_is_current(&ctx.agent_id, policy.agent_generation)
+        .monty_network_agent_fence_is_current(agent_instance_id, policy.agent_generation)
         .await?;
     let session_fence = ctx
         .session
@@ -310,7 +314,7 @@ fn validate_canonical_host(host: &str) -> Result<()> {
         || host != host.to_ascii_lowercase()
         || host
             .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@' | ':'))
     {
         bail!("network grant host is not canonical");
     }

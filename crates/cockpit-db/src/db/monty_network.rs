@@ -4,14 +4,15 @@
 //! requested hosts for prompt prefill, but only these explicit user-action
 //! mutations create durable authority.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
+use uuid::Uuid;
 
 use super::Db;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MontyNetworkAgentPolicy {
-    pub agent_id: String,
+    pub agent_instance_id: Uuid,
     pub requests_enabled: bool,
     pub approval_required: bool,
     pub generation: u64,
@@ -19,9 +20,9 @@ pub struct MontyNetworkAgentPolicy {
 }
 
 impl MontyNetworkAgentPolicy {
-    pub fn deny_all(agent_id: impl Into<String>) -> Self {
+    pub fn deny_all(agent_instance_id: Uuid) -> Self {
         Self {
-            agent_id: agent_id.into(),
+            agent_instance_id,
             requests_enabled: false,
             approval_required: false,
             generation: 0,
@@ -43,25 +44,32 @@ pub enum MontyNetworkAgentMutation {
     RevokeAllHosts,
 }
 
-fn read_policy(conn: &rusqlite::Connection, agent_id: &str) -> Result<MontyNetworkAgentPolicy> {
+fn read_policy(
+    conn: &rusqlite::Connection,
+    agent_instance_id: Uuid,
+) -> Result<MontyNetworkAgentPolicy> {
+    let agent_instance_id = agent_instance_id.to_string();
     let header = conn
         .query_row(
-            "SELECT requests_enabled, approval_required, generation FROM monty_network_agent_policies WHERE agent_id=?1",
-            [agent_id],
+            "SELECT requests_enabled, approval_required, generation FROM monty_network_agent_policies WHERE agent_instance_id=?1",
+            [&agent_instance_id],
             |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, i64>(2)?)),
         )
         .optional()?;
     let Some((requests_enabled, approval_required, generation)) = header else {
-        return Ok(MontyNetworkAgentPolicy::deny_all(agent_id));
+        return Ok(MontyNetworkAgentPolicy::deny_all(Uuid::parse_str(
+            &agent_instance_id,
+        )?));
     };
     let generation = u64::try_from(generation)?;
-    let mut statement = conn
-        .prepare("SELECT host FROM monty_network_agent_grants WHERE agent_id=?1 ORDER BY host")?;
+    let mut statement = conn.prepare(
+        "SELECT host FROM monty_network_agent_grants WHERE agent_instance_id=?1 ORDER BY host",
+    )?;
     let hosts = statement
-        .query_map([agent_id], |row| row.get::<_, String>(0))?
+        .query_map([&agent_instance_id], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
     Ok(MontyNetworkAgentPolicy {
-        agent_id: agent_id.to_string(),
+        agent_instance_id: Uuid::parse_str(&agent_instance_id)?,
         requests_enabled,
         approval_required,
         generation,
@@ -72,64 +80,60 @@ fn read_policy(conn: &rusqlite::Connection, agent_id: &str) -> Result<MontyNetwo
 impl Db {
     pub async fn monty_network_agent_policy(
         &self,
-        agent_id: &str,
+        agent_instance_id: Uuid,
     ) -> Result<MontyNetworkAgentPolicy> {
-        let agent_id = agent_id.to_string();
-        self.read(move |conn| read_policy(conn, &agent_id)).await
+        self.read(move |conn| read_policy(conn, agent_instance_id))
+            .await
     }
 
     /// Apply one explicit owner action and advance the revocation generation.
     pub async fn mutate_monty_network_agent_policy(
         &self,
-        agent_id: &str,
+        agent_instance_id: Uuid,
         mutation: MontyNetworkAgentMutation,
         now_unix_ms: i64,
     ) -> Result<MontyNetworkAgentPolicy> {
-        ensure!(
-            !agent_id.is_empty() && agent_id.len() <= 255,
-            "invalid agent id"
-        );
-        let agent_id = agent_id.to_string();
+        let agent_instance_id = agent_instance_id.to_string();
         self.transaction(move |conn| {
             conn.execute(
-                "INSERT INTO monty_network_agent_policies(agent_id,requests_enabled,approval_required,generation,updated_at_unix_ms) VALUES(?1,0,0,1,?2) ON CONFLICT(agent_id) DO UPDATE SET generation=generation+1,updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![agent_id, now_unix_ms],
+                "INSERT INTO monty_network_agent_policies(agent_instance_id,requests_enabled,approval_required,generation,updated_at_unix_ms) VALUES(?1,0,0,1,?2) ON CONFLICT(agent_instance_id) DO UPDATE SET generation=generation+1,updated_at_unix_ms=excluded.updated_at_unix_ms",
+                params![agent_instance_id, now_unix_ms],
             )?;
             match mutation {
                 MontyNetworkAgentMutation::SetRequestsEnabled(enabled) => {
                     conn.execute(
-                        "UPDATE monty_network_agent_policies SET requests_enabled=?2 WHERE agent_id=?1",
-                        params![agent_id, enabled],
+                        "UPDATE monty_network_agent_policies SET requests_enabled=?2 WHERE agent_instance_id=?1",
+                        params![agent_instance_id, enabled],
                     )?;
                 }
                 MontyNetworkAgentMutation::SetApprovalRequired(required) => {
                     conn.execute(
-                        "UPDATE monty_network_agent_policies SET approval_required=?2 WHERE agent_id=?1",
-                        params![agent_id, required],
+                        "UPDATE monty_network_agent_policies SET approval_required=?2 WHERE agent_instance_id=?1",
+                        params![agent_instance_id, required],
                     )?;
                 }
                 MontyNetworkAgentMutation::GrantHost(host) => {
                     validate_canonical_host(&host)?;
                     conn.execute(
-                        "INSERT INTO monty_network_agent_grants(agent_id,host,granted_at_unix_ms) VALUES(?1,?2,?3) ON CONFLICT(agent_id,host) DO UPDATE SET granted_at_unix_ms=excluded.granted_at_unix_ms",
-                        params![agent_id, host, now_unix_ms],
+                        "INSERT INTO monty_network_agent_grants(agent_instance_id,host,granted_at_unix_ms) VALUES(?1,?2,?3) ON CONFLICT(agent_instance_id,host) DO UPDATE SET granted_at_unix_ms=excluded.granted_at_unix_ms",
+                        params![agent_instance_id, host, now_unix_ms],
                     )?;
                 }
                 MontyNetworkAgentMutation::RevokeHost(host) => {
                     validate_canonical_host(&host)?;
                     conn.execute(
-                        "DELETE FROM monty_network_agent_grants WHERE agent_id=?1 AND host=?2",
-                        params![agent_id, host],
+                        "DELETE FROM monty_network_agent_grants WHERE agent_instance_id=?1 AND host=?2",
+                        params![agent_instance_id, host],
                     )?;
                 }
                 MontyNetworkAgentMutation::RevokeAllHosts => {
                     conn.execute(
-                        "DELETE FROM monty_network_agent_grants WHERE agent_id=?1",
-                        [&agent_id],
+                        "DELETE FROM monty_network_agent_grants WHERE agent_instance_id=?1",
+                        [&agent_instance_id],
                     )?;
                 }
             }
-            read_policy(conn, &agent_id)
+            read_policy(conn, Uuid::parse_str(&agent_instance_id)?)
         })
         .await
     }
@@ -137,15 +141,15 @@ impl Db {
     /// Final generation fence immediately before transport dispatch.
     pub async fn monty_network_agent_fence_is_current(
         &self,
-        agent_id: &str,
+        agent_instance_id: Uuid,
         expected_generation: u64,
     ) -> Result<bool> {
-        let agent_id = agent_id.to_string();
+        let agent_instance_id = agent_instance_id.to_string();
         self.read(move |conn| {
             let generation = i64::try_from(expected_generation)?;
             Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM monty_network_agent_policies WHERE agent_id=?1 AND requests_enabled=1 AND generation=?2)",
-                params![agent_id, generation],
+                "SELECT EXISTS(SELECT 1 FROM monty_network_agent_policies WHERE agent_instance_id=?1 AND requests_enabled=1 AND generation=?2)",
+                params![agent_instance_id, generation],
                 |row| row.get::<_, bool>(0),
             )?)
         })
@@ -159,7 +163,7 @@ fn validate_canonical_host(host: &str) -> Result<()> {
         || host != host.to_ascii_lowercase()
         || host
             .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@' | ':'))
     {
         bail!("network grant host is not canonical");
     }
@@ -173,8 +177,9 @@ mod tests {
     #[tokio::test]
     async fn agent_policy_is_deny_by_default_and_revocation_advances_fence() {
         let db = Db::open_in_memory().unwrap();
+        let agent_instance_id = Uuid::new_v4();
         let absent = db
-            .monty_network_agent_policy("authored/demo")
+            .monty_network_agent_policy(agent_instance_id)
             .await
             .unwrap();
         assert!(!absent.requests_enabled);
@@ -182,7 +187,7 @@ mod tests {
 
         let enabled = db
             .mutate_monty_network_agent_policy(
-                "authored/demo",
+                agent_instance_id,
                 MontyNetworkAgentMutation::SetRequestsEnabled(true),
                 10,
             )
@@ -190,7 +195,7 @@ mod tests {
             .unwrap();
         let granted = db
             .mutate_monty_network_agent_policy(
-                "authored/demo",
+                agent_instance_id,
                 MontyNetworkAgentMutation::GrantHost("api.example.test".to_string()),
                 11,
             )
@@ -199,14 +204,14 @@ mod tests {
         assert!(granted.generation > enabled.generation);
         assert!(granted.permits("api.example.test"));
         assert!(
-            db.monty_network_agent_fence_is_current("authored/demo", granted.generation)
+            db.monty_network_agent_fence_is_current(agent_instance_id, granted.generation)
                 .await
                 .unwrap()
         );
 
         let revoked = db
             .mutate_monty_network_agent_policy(
-                "authored/demo",
+                agent_instance_id,
                 MontyNetworkAgentMutation::RevokeHost("api.example.test".to_string()),
                 12,
             )
@@ -215,7 +220,7 @@ mod tests {
         assert!(revoked.generation > granted.generation);
         assert!(!revoked.permits("api.example.test"));
         assert!(
-            !db.monty_network_agent_fence_is_current("authored/demo", granted.generation)
+            !db.monty_network_agent_fence_is_current(agent_instance_id, granted.generation)
                 .await
                 .unwrap()
         );

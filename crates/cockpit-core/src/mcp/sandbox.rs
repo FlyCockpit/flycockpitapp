@@ -17,6 +17,8 @@
 //!   plus full `input_schema` on demand.
 //! - `mcp.invoke(server, tool, args) -> result` — call a tool; the result
 //!   returns *into the sandbox*, not into model context.
+//! - `mcp.network_configure(action, host=None) -> policy` — an explicit
+//!   human-approved owner action for this executor's governed network policy.
 //!
 //! **Lockdown (deny-by-default).** No mount points (filesystem), raw network,
 //! or env: any `OsCall` (which is how `open`/`os.getenv`/etc. surface) is
@@ -502,6 +504,9 @@ async fn dispatch(
                 .map(response_to_monty)
                 .map_err(|error| format!("requests.{name} failed: {error:#}"))
         }
+        "network_configure" => configure_network_policy(host, args, kwargs)
+            .await
+            .map(json_to_monty),
         "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent" | "b64encode"
         | "b64decode" | "sha256" | "sha512" => dispatch_pure_host_module(name, args, kwargs),
         "search" => {
@@ -680,7 +685,7 @@ async fn dispatch(
             let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
             observe_child(host, dispatch, async {
                 match super::catalog::invoke(cfg, host, &server, &tool, call_args).await {
-                    Ok(v) => Ok(v),
+                    Ok(v) => scrub_invoke_result_for_sandbox(host, v),
                     Err(e) => Err(format!("mcp.invoke failed: {e}")),
                 }
             })
@@ -689,6 +694,249 @@ async fn dispatch(
         }
         other => Err(format!("unknown MCP sandbox function `mcp.{other}`")),
     }
+}
+
+/// The sandbox is a custody boundary, not merely a model-output boundary.
+/// Scrub invoke results before they become VM values so no script can encode
+/// or structurally transform an unredacted secret before it reaches governed
+/// egress. This is deliberately recursive over keys and scalar leaves too.
+fn scrub_invoke_result_for_sandbox(host: &HostContext, value: Value) -> Result<Value, String> {
+    let Some(ctx) = host.native_tool_ctx.as_ref() else {
+        return Ok(value);
+    };
+    let table = ctx
+        .redact
+        .enforced_checked()
+        .map_err(|error| format!("mcp.invoke redaction view failed closed: {error:#}"))?;
+    Ok(scrub_json_for_sandbox(&value, &table))
+}
+
+fn scrub_json_for_sandbox(value: &Value, table: &crate::redact::RedactionTable) -> Value {
+    match value {
+        Value::String(value) => Value::String(table.scrub(value)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| scrub_json_for_sandbox(value, table))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (table.scrub(key), scrub_json_for_sandbox(value, table)))
+                .collect(),
+        ),
+        Value::Bool(_) | Value::Number(_) => {
+            let canonical = value.to_string();
+            let scrubbed = table.scrub(&canonical);
+            if scrubbed == canonical {
+                value.clone()
+            } else {
+                Value::String(scrubbed)
+            }
+        }
+        Value::Null => Value::Null,
+    }
+}
+
+/// Owner-facing network configuration is deliberately a separate governed
+/// host function. It never treats an authored definition or an agent display
+/// name as authority; each mutation is attached to the daemon-issued executor
+/// UUID and requires an approver decision before it reaches SQLite/session
+/// state. Onboarding UI can call this same boundary later without a second,
+/// looser policy path.
+async fn configure_network_policy(
+    host: &HostContext,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+) -> Result<Value, String> {
+    let kwargs = monty_kwargs(kwargs)?;
+    let action = str_arg(args, 0, "action", "mcp.network_configure")?;
+    let host_name = kwargs
+        .get("host")
+        .or_else(|| args.get(1))
+        .map(|value| {
+            str_arg(
+                std::slice::from_ref(value),
+                0,
+                "host",
+                "mcp.network_configure",
+            )
+        })
+        .transpose()?;
+    let ctx = host
+        .native_tool_ctx
+        .as_ref()
+        .ok_or_else(|| "network configuration requires a live agent context".to_string())?;
+    let agent_instance_id = ctx.agent_instance_id.ok_or_else(|| {
+        "network configuration requires a daemon-owned agent instance".to_string()
+    })?;
+    let label = match action.as_str() {
+        "enable_requests" => format!("Enable governed requests for agent {}", ctx.agent_id),
+        "disable_requests" => format!("Disable governed requests for agent {}", ctx.agent_id),
+        "require_approval" => format!(
+            "Require approval for Monty network requests from agent {}",
+            ctx.agent_id
+        ),
+        "allow_unprompted_requests" => format!(
+            "Stop requiring approval for Monty network requests from agent {}",
+            ctx.agent_id
+        ),
+        "grant_host" => format!(
+            "Grant Monty network host `{}` to agent {}",
+            host_name.as_deref().unwrap_or("<missing>"),
+            ctx.agent_id
+        ),
+        "revoke_host" => format!(
+            "Revoke Monty network host `{}` from agent {}",
+            host_name.as_deref().unwrap_or("<missing>"),
+            ctx.agent_id
+        ),
+        "revoke_all_hosts" => format!("Revoke all Monty network hosts for agent {}", ctx.agent_id),
+        "grant_session_host" => format!(
+            "Grant Monty network host `{}` for this session",
+            host_name.as_deref().unwrap_or("<missing>")
+        ),
+        "revoke_session_host" => format!(
+            "Revoke Monty network host `{}` for this session",
+            host_name.as_deref().unwrap_or("<missing>")
+        ),
+        "revoke_all_session_hosts" => "Revoke all session Monty network hosts".to_string(),
+        _ => return Err("unknown mcp.network_configure action".to_string()),
+    };
+    let approver = ctx.approver.as_ref().ok_or_else(|| {
+        "network configuration requires an interactive owner approver".to_string()
+    })?;
+    if !approver
+        .approve_tool_call(&label)
+        .await
+        .map_err(|error| format!("network configuration approval failed: {error:#}"))?
+        .is_accept()
+    {
+        return Err("network configuration was not approved".to_string());
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let policy = match action.as_str() {
+        "enable_requests" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
+                    now,
+                )
+                .await
+        }
+        "disable_requests" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(false),
+                    now,
+                )
+                .await
+        }
+        "require_approval" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::SetApprovalRequired(true),
+                    now,
+                )
+                .await
+        }
+        "allow_unprompted_requests" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::SetApprovalRequired(false),
+                    now,
+                )
+                .await
+        }
+        "grant_host" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
+                        host_name.ok_or_else(|| "grant_host requires host".to_string())?,
+                    ),
+                    now,
+                )
+                .await
+        }
+        "revoke_host" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::RevokeHost(
+                        host_name.ok_or_else(|| "revoke_host requires host".to_string())?,
+                    ),
+                    now,
+                )
+                .await
+        }
+        "revoke_all_hosts" => {
+            ctx.session
+                .db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    crate::db::monty_network::MontyNetworkAgentMutation::RevokeAllHosts,
+                    now,
+                )
+                .await
+        }
+        "grant_session_host" => {
+            ctx.session
+                .mutate_monty_session_network_grants(
+                    super::network::SessionNetworkMutation::GrantHost(
+                        host_name.ok_or_else(|| "grant_session_host requires host".to_string())?,
+                    ),
+                )
+                .map_err(|error| format!("network configuration failed: {error:#}"))?;
+            ctx.session
+                .db
+                .monty_network_agent_policy(agent_instance_id)
+                .await
+        }
+        "revoke_session_host" => {
+            ctx.session
+                .mutate_monty_session_network_grants(
+                    super::network::SessionNetworkMutation::RevokeHost(
+                        host_name.ok_or_else(|| "revoke_session_host requires host".to_string())?,
+                    ),
+                )
+                .map_err(|error| format!("network configuration failed: {error:#}"))?;
+            ctx.session
+                .db
+                .monty_network_agent_policy(agent_instance_id)
+                .await
+        }
+        "revoke_all_session_hosts" => {
+            ctx.session
+                .mutate_monty_session_network_grants(
+                    super::network::SessionNetworkMutation::RevokeAllHosts,
+                )
+                .map_err(|error| format!("network configuration failed: {error:#}"))?;
+            ctx.session
+                .db
+                .monty_network_agent_policy(agent_instance_id)
+                .await
+        }
+        _ => unreachable!("action was validated before approval"),
+    }
+    .map_err(|error| format!("network configuration failed: {error:#}"))?;
+    Ok(serde_json::json!({
+        "requests_enabled": policy.requests_enabled,
+        "approval_required": policy.approval_required,
+        "hosts": policy.hosts,
+        "generation": policy.generation,
+    }))
 }
 
 fn governed_request_from_monty(
@@ -2282,11 +2530,13 @@ mod tests {
     async fn requests_package_requires_agent_toggle_and_scoped_fork_guard() {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let agent_instance_id = uuid::Uuid::new_v4();
+        ctx.agent_instance_id = Some(agent_instance_id);
         ctx.session
             .db
             .mutate_monty_network_agent_policy(
-                &ctx.agent_id,
+                agent_instance_id,
                 crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
                 1,
             )
@@ -2303,6 +2553,153 @@ mod tests {
         ));
         let error = run_with_host("requests", &cfg, &scoped).await.unwrap_err();
         assert!(error.to_string().contains("requests"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn network_configuration_is_an_approved_owner_action_for_the_live_executor() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut ctx, db, hub) = approvable_ctx(tmp.path());
+        let agent_instance_id = uuid::Uuid::new_v4();
+        ctx.agent_instance_id = Some(agent_instance_id);
+        let session_id = ctx.session.id;
+        let host = HostContext::from_tool_ctx(&ctx);
+
+        let task = tokio::spawn(async move {
+            run_with_host(
+                "mcp.network_configure('enable_requests')\nmcp.network_configure('grant_host', 'api.example.test')",
+                &cfg,
+                &host,
+            )
+            .await
+        });
+        let first = resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        assert!(first.description.contains("Enable governed requests"));
+        let second = resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        assert!(second.description.contains("api.example.test"));
+        task.await.unwrap().unwrap();
+
+        let policy = db
+            .monty_network_agent_policy(agent_instance_id)
+            .await
+            .unwrap();
+        assert!(policy.requests_enabled);
+        assert!(policy.hosts.contains("api.example.test"));
+    }
+
+    #[test]
+    fn invoke_results_are_scrubbed_before_the_vm_can_transform_them() {
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: false,
+            min_secret_length: 4,
+            ..Default::default()
+        };
+        let table = crate::redact::RedactionTable::build_with_env_and_secrets(
+            &cfg,
+            std::path::Path::new("."),
+            &std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "mcp-invoke-secret".to_string(),
+            )]),
+            Vec::<(String, String)>::new(),
+        )
+        .unwrap()
+        .enforced_checked()
+        .unwrap();
+        let scrubbed = scrub_json_for_sandbox(
+            &serde_json::json!({
+                "mcp-invoke-secret": ["mcp-invoke-secret", 123],
+            }),
+            &table,
+        );
+        let rendered = scrubbed.to_string();
+        assert!(!rendered.contains("mcp-invoke-secret"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn governed_requests_reaches_only_the_granted_endpoint_and_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::Mutex::new(String::new()));
+        let received_by_server = received.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let size = stream.read(&mut request).await.unwrap();
+            *received_by_server.lock().unwrap() = String::from_utf8_lossy(&request[..size]).into();
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://ungranted.example.test/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let agent_instance_id = uuid::Uuid::new_v4();
+        ctx.agent_instance_id = Some(agent_instance_id);
+        ctx.session
+            .db
+            .mutate_monty_network_agent_policy(
+                agent_instance_id,
+                crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
+                1,
+            )
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .mutate_monty_network_agent_policy(
+                agent_instance_id,
+                crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
+                    "127.0.0.1".to_string(),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let host = HostContext::from_tool_ctx(&ctx);
+        let output = run_with_host(
+            &format!(
+                "import requests\nr = requests.post('http://{address}/governed', headers={{'x-egress-test':'yes'}}, data='bounded')\n[r.status_code, r.ok]"
+            ),
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output, "[302,true]");
+        let received = received.lock().unwrap();
+        assert!(
+            received.starts_with("POST /governed HTTP/1.1"),
+            "{received}"
+        );
+        assert!(received.contains("x-egress-test: yes"), "{received}");
+        assert!(received.contains("bounded"), "{received}");
     }
 
     #[tokio::test]

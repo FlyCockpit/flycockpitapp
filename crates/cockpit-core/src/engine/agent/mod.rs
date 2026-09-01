@@ -429,6 +429,23 @@ pub(crate) async fn turn_toolbox(
 ) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
+    // `mcp` is rendered per executing daemon-owned agent instance.  Do this
+    // at the turn construction seam so delegated frames cannot inherit the
+    // root session's advertised package set.
+    if toolbox.names().contains(&"mcp") {
+        let requests_enabled = match current_agent_instance_id() {
+            Some(agent_instance_id) => session
+                .db
+                .monty_network_agent_policy(agent_instance_id)
+                .await
+                .map(|policy| policy.requests_enabled)
+                .unwrap_or(false),
+            None => false,
+        };
+        toolbox = toolbox.with(std::sync::Arc::new(
+            crate::tools::mcp_tool::McpTool::for_requests_enabled(requests_enabled),
+        ));
+    }
     let env = agent
         .env_overlay
         .read()

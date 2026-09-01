@@ -326,7 +326,9 @@ CREATE TABLE sessions (
 -- generation changes on every mutation so dispatch can fence a request after
 -- redaction and immediately observe revocation before egress.
 CREATE TABLE monty_network_agent_policies (
-    agent_id TEXT PRIMARY KEY CHECK (length(CAST(agent_id AS BLOB)) BETWEEN 1 AND 255),
+    -- The daemon-issued executor UUID is the authority subject. Display names
+    -- and authored agent ids are recyclable and must never inherit grants.
+    agent_instance_id TEXT PRIMARY KEY,
     requests_enabled INTEGER NOT NULL DEFAULT 0 CHECK (requests_enabled IN (0, 1)),
     approval_required INTEGER NOT NULL DEFAULT 0 CHECK (approval_required IN (0, 1)),
     generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
@@ -334,15 +336,15 @@ CREATE TABLE monty_network_agent_policies (
 );
 
 CREATE TABLE monty_network_agent_grants (
-    agent_id TEXT NOT NULL REFERENCES monty_network_agent_policies(agent_id)
+    agent_instance_id TEXT NOT NULL REFERENCES monty_network_agent_policies(agent_instance_id)
         ON DELETE CASCADE ON UPDATE RESTRICT,
     host TEXT NOT NULL CHECK (
         length(CAST(host AS BLOB)) BETWEEN 1 AND 253
         AND host = lower(host)
-        AND host NOT GLOB '*[/?#@]*'
+        AND host NOT GLOB '*[/:?#@]*'
     ),
     granted_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, host)
+    PRIMARY KEY (agent_instance_id, host)
 );
 
 -- Parent links form an acyclic ownership graph. The recursive UNION is also

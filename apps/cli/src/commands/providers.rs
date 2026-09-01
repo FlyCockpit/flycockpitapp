@@ -116,6 +116,7 @@ pub(crate) fn logout_configured_provider(
     let credential_ref = oauth_credential_ref(provider_id, entry)?;
     let was_present = credential_record_exists(credential_ref, store_path)?;
     match credential_ref {
+        #[cfg(feature = "grok-subscription")]
         crate::auth::xai_oauth::CREDENTIAL_KEY => match store_path {
             Some(path) => crate::auth::xai_oauth::logout_at(Some(path))?,
             None => {
@@ -304,6 +305,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[test]
     fn provider_logout_preserves_unrelated_credentials() {
         let tmp = tempfile::tempdir().unwrap();

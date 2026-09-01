@@ -266,6 +266,10 @@ impl HttpDeepfetchProbeClient {
     pub fn new(resolved: BTreeMap<String, ResolvedRequest>, timeout: Duration) -> Self {
         Self { resolved, timeout }
     }
+
+    pub fn replace_resolved(&mut self, provider_id: String, request: ResolvedRequest) {
+        self.resolved.insert(provider_id, request);
+    }
 }
 
 impl DeepfetchProbeClient for HttpDeepfetchProbeClient {

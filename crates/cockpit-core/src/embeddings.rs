@@ -26,6 +26,7 @@ pub struct OpenAiCompatEmbedder {
     model: String,
     expected_dimensions: Option<u32>,
     guard: OutboundGuard,
+    command_refresh: Option<(String, ProviderEntry, crate::credentials::CredentialStore)>,
 }
 
 impl OpenAiCompatEmbedder {
@@ -108,7 +109,7 @@ impl OpenAiCompatEmbedder {
         session_redact: Arc<RedactionTable>,
         store: Option<crate::credentials::CredentialStore>,
     ) -> Result<Self> {
-        let request = match store {
+        let request = match store.clone() {
             Some(store) => {
                 models_fetch::resolve_provider_request_async_with_store(
                     provider_id,
@@ -133,12 +134,14 @@ impl OpenAiCompatEmbedder {
             session_redact,
         );
         let guard = OutboundGuard::new(effective_redact);
-        Ok(Self::from_resolved_request(
-            request,
-            model.to_string(),
-            expected_dimensions,
-            guard,
-        ))
+        Ok(
+            Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)
+                .with_command_refresh(
+                    store
+                        .filter(|_| entry.auth_command.is_some())
+                        .map(|store| (provider_id.to_string(), entry.clone(), store)),
+                ),
+        )
     }
 
     #[allow(dead_code)]
@@ -155,11 +158,40 @@ impl OpenAiCompatEmbedder {
             model,
             expected_dimensions,
             guard,
+            command_refresh: None,
         }
     }
 
-    fn embeddings_url(&self) -> String {
-        format!("{}/embeddings", self.base_url.trim_end_matches('/'))
+    fn with_command_refresh(
+        mut self,
+        command_refresh: Option<(String, ProviderEntry, crate::credentials::CredentialStore)>,
+    ) -> Self {
+        self.command_refresh = command_refresh;
+        self
+    }
+
+    fn request<'a>(
+        &self,
+        body: &EmbeddingsRequest<'a>,
+        base_url: &str,
+        headers: &[models_fetch::ResolvedHeader],
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(format!("{}/embeddings", base_url.trim_end_matches('/')))
+            .json(body);
+        let effective_ua = headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
+            .map(|header| header.value.as_str())
+            .unwrap_or_else(crate::user_agent::user_agent);
+        req = req.header(reqwest::header::USER_AGENT, effective_ua);
+        for header in headers {
+            if !header.name.eq_ignore_ascii_case("user-agent") {
+                req = req.header(&header.name, &header.value);
+            }
+        }
+        req
     }
 }
 
@@ -172,25 +204,40 @@ impl Embedder for OpenAiCompatEmbedder {
             model: &self.model,
             input: &redacted_refs,
         };
-        let mut req = self.client.post(self.embeddings_url()).json(&body);
-        // Canonical UA unless the provider configuration supplies one.
-        // Emit exactly once, then skip every case-insensitive User-Agent when
-        // applying the remaining resolved headers (matches catalog/auth/usage).
-        let effective_ua = self
-            .headers
-            .iter()
-            .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
-            .map(|header| header.value.as_str())
-            .unwrap_or_else(|| crate::user_agent::user_agent());
-        req = req.header(reqwest::header::USER_AGENT, effective_ua);
-        for header in &self.headers {
-            if header.name.eq_ignore_ascii_case("user-agent") {
-                continue;
+        let response = self
+            .request(&body, &self.base_url, &self.headers)
+            .send()
+            .await
+            .context("sending embeddings request")?;
+        let refreshed = if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.command_refresh
+                .as_ref()
+                .map(|(provider_id, entry, store)| (provider_id, entry, store))
+        } else {
+            None
+        };
+        let response = if let Some((provider_id, entry, store)) = refreshed {
+            let request = models_fetch::refresh_provider_request_async_with_store(
+                provider_id,
+                entry,
+                store.clone(),
+                |name| std::env::var(name).ok(),
+            )
+            .await?;
+            if let Some(request) = request {
+                self.request(&body, &request.base_url, &request.headers)
+                    .send()
+                    .await
+                    .context("retrying embeddings request after credential refresh")?
+            } else {
+                response
             }
-            req = req.header(&header.name, &header.value);
-        }
-
-        let response = req.send().await.context("sending embeddings request")?;
+        } else {
+            response
+        };
         let status = response.status();
         let text = response
             .text()

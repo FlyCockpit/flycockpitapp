@@ -1467,6 +1467,7 @@ impl Session {
         &self,
         providers: &crate::config::providers::ProvidersConfig,
         provider_id: &str,
+        env: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<bool> {
         let Some(entry) = providers.providers.get(provider_id) else {
             return Ok(false);
@@ -1479,7 +1480,7 @@ impl Session {
             provider_id,
             entry,
             store,
-            &|name| std::env::var(name).ok(),
+            &|name| env.get(name).cloned(),
             true,
         )
         .await

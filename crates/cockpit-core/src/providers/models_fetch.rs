@@ -212,11 +212,47 @@ pub async fn resolve_provider_request_async_with_store(
     store: crate::credentials::CredentialStore,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    resolve_provider_request_async_with_store_refresh(provider_id, entry, store, &env_lookup, false)
+        .await
+}
+
+/// Re-resolve a command-authenticated request after an explicit provider
+/// rejection.  The environment lookup is deliberately supplied by the caller:
+/// it is part of the resolved command argv and therefore part of the command
+/// credential's configuration identity.  Do not replace it with the daemon's
+/// ambient environment on refresh.
+pub async fn refresh_provider_request_async_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<ResolvedRequest>> {
+    if entry.auth_command.is_none() {
+        return Ok(None);
+    }
+    resolve_provider_request_async_with_store_refresh(provider_id, entry, store, &env_lookup, true)
+        .await
+        .map(Some)
+}
+
+async fn resolve_provider_request_async_with_store_refresh(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    force_refresh: bool,
+) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match entry.auth_command.as_deref() {
         Some(_) => Some(
-            crate::auth::command::resolve(provider_id, entry, store.clone(), &env_lookup, false)
-                .await?,
+            crate::auth::command::resolve(
+                provider_id,
+                entry,
+                store.clone(),
+                env_lookup,
+                force_refresh,
+            )
+            .await?,
         ),
         None => None,
     };
@@ -234,14 +270,13 @@ pub async fn resolve_provider_request_async_with_store(
             None => None,
         }
     };
-    let env_lookup = |name: &str| env_lookup(name);
     let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
     resolve_provider_request_inner_with_sources(
         provider_id,
         entry,
         credential,
         registry.provider_for(provider_id, entry).request_kind(),
-        &env_lookup,
+        env_lookup,
         &secret_lookup,
     )
 }
@@ -251,7 +286,10 @@ async fn resolve_model_list_request_async(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
 ) -> Result<ResolvedRequest> {
-    resolve_model_list_request_async_with_store(provider_id, entry, resolved, None).await
+    resolve_model_list_request_async_with_store(provider_id, entry, resolved, None, &|name| {
+        std::env::var(name).ok()
+    })
+    .await
 }
 
 async fn resolve_model_list_request_async_with_store(
@@ -259,18 +297,13 @@ async fn resolve_model_list_request_async_with_store(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
     store: Option<crate::credentials::CredentialStore>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
         (Some(_), Some(store)) => Some(
-            crate::auth::command::resolve(
-                provider_id,
-                entry,
-                store.clone(),
-                &|name| std::env::var(name).ok(),
-                false,
-            )
-            .await?,
+            crate::auth::command::resolve(provider_id, entry, store.clone(), env_lookup, false)
+                .await?,
         ),
         (Some(_), None) => {
             anyhow::bail!(
@@ -303,9 +336,7 @@ async fn resolve_model_list_request_async_with_store(
     };
     registry
         .provider_for(provider_id, entry)
-        .model_list_request(provider_id, entry, resolved, credential, &|name| {
-            std::env::var(name).ok()
-        })
+        .model_list_request(provider_id, entry, resolved, credential, env_lookup)
 }
 
 pub fn resolve_provider_request_blocking(
@@ -828,7 +859,10 @@ pub async fn fetch_models_for_provider(
     resolved: &ResolvedRequest,
     timeout: Duration,
 ) -> Result<FetchOutcome> {
-    fetch_models_for_provider_with_store(provider_id, entry, resolved, timeout, None).await
+    fetch_models_for_provider_with_store(provider_id, entry, resolved, timeout, None, |name| {
+        std::env::var(name).ok()
+    })
+    .await
 }
 
 pub async fn fetch_models_for_provider_with_store(
@@ -837,10 +871,17 @@ pub async fn fetch_models_for_provider_with_store(
     resolved: &ResolvedRequest,
     timeout: Duration,
     store: Option<crate::credentials::CredentialStore>,
+    env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<FetchOutcome> {
     let auth_store = store.clone();
-    let request =
-        resolve_model_list_request_async_with_store(provider_id, entry, resolved, store).await?;
+    let request = resolve_model_list_request_async_with_store(
+        provider_id,
+        entry,
+        resolved,
+        store,
+        &env_lookup,
+    )
+    .await?;
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     let url = provider.models_url(entry, &request.base_url);
@@ -859,21 +900,16 @@ pub async fn fetch_models_for_provider_with_store(
         .is_err_and(|error| auth_rejection_error(error))
         && let (Some(_), Some(store)) = (entry.auth_command.as_deref(), auth_store)
     {
-        let credential = crate::auth::command::resolve(
-            provider_id,
-            entry,
-            store.clone(),
-            &|name| std::env::var(name).ok(),
-            true,
-        )
-        .await?;
+        let credential =
+            crate::auth::command::resolve(provider_id, entry, store.clone(), &env_lookup, true)
+                .await?;
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
         let refreshed = resolve_provider_request_inner_with_sources(
             provider_id,
             entry,
             Some(OAuthCredential::Command(credential)),
             ProviderRequestKind::Template,
-            &|name| std::env::var(name).ok(),
+            &env_lookup,
             &secret_lookup,
         )?;
         let refreshed_url = provider.models_url(entry, &refreshed.base_url);
@@ -3407,6 +3443,7 @@ mod tests {
                 &resolved,
                 Duration::from_secs(5),
                 Some(crate::credentials::CredentialStore::open_default().unwrap()),
+                |_| None,
             )
             .await
             .unwrap();
@@ -3505,6 +3542,7 @@ mod tests {
             &resolved,
             Duration::from_secs(5),
             Some(crate::credentials::CredentialStore::open_default().unwrap()),
+            |_| None,
         )
         .await
         .unwrap();
@@ -3547,6 +3585,7 @@ mod tests {
                 &resolved,
                 Duration::from_secs(5),
                 Some(crate::credentials::CredentialStore::open_default().unwrap()),
+                |_| None,
             )
             .await
             .unwrap_err();

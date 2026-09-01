@@ -11,10 +11,10 @@
 //! logs, or error text.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
 
 use super::dispatch::{
@@ -51,7 +51,7 @@ pub(crate) async fn resolve_vetted_egress(
     let request = crate::providers::models_fetch::resolve_provider_request_async_with_store(
         provider_id,
         entry,
-        store,
+        store.clone(),
         |name| env.get(name).cloned().or_else(|| std::env::var(name).ok()),
     )
     .await
@@ -61,7 +61,7 @@ pub(crate) async fn resolve_vetted_egress(
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("authorization"))?
         .value
-        .strip_prefix("Bearer ")?;
+        .as_str();
     if authorization.is_empty() {
         return None;
     }
@@ -73,14 +73,21 @@ pub(crate) async fn resolve_vetted_egress(
         return None;
     }
     let fingerprint = crate::image_sidecar::CredentialFingerprint::from_identity(authorization);
-    VettedTranscriptionEgress::new(
+    let command_refresh = entry.auth_command.as_ref().map(|_| CommandRefresh {
+        provider_id: provider_id.to_string(),
+        entry: entry.clone(),
+        store,
+        env: env.clone(),
+    });
+    VettedTranscriptionEgress::new_with_headers_and_refresh(
         provider_id.to_string(),
         origin.as_str(),
         "public_network".to_string(),
-        authorization,
+        &request.headers,
         super::authorization::CredentialFingerprintDigest::from_fingerprint(&fingerprint),
         config.generation(),
         Arc::new(crate::image_generation_runtime::TokioDnsResolver),
+        command_refresh,
     )
     .ok()
 }
@@ -88,11 +95,20 @@ pub(crate) async fn resolve_vetted_egress(
 /// Production HTTPS transport for OpenAI-compatible `/v1/audio/transcriptions`.
 pub struct TranscriptionHttpTransport {
     origin: Url,
-    authorization: HeaderValue,
+    headers: Mutex<HeaderMap>,
+    command_refresh: Option<CommandRefresh>,
     dns: Arc<dyn DnsResolver>,
     body_limit: usize,
     required_location: AddressClass,
     path: &'static str,
+}
+
+#[derive(Clone)]
+struct CommandRefresh {
+    provider_id: String,
+    entry: crate::config::providers::ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    env: std::collections::HashMap<String, String>,
 }
 
 /// A fully vetted provider route.  Keeping the transport and its audit
@@ -115,6 +131,48 @@ impl VettedTranscriptionEgress {
     ) -> Result<Self, ProviderTransportConfigError> {
         let transport =
             TranscriptionHttpTransport::vetted_default_limit(origin, bearer_token, dns)?;
+        Self::from_transport(
+            provider_id,
+            transport,
+            resolved_location,
+            credential_fingerprint,
+            endpoint_config_generation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_headers_and_refresh(
+        provider_id: String,
+        origin: &str,
+        resolved_location: String,
+        headers: &[crate::providers::models_fetch::ResolvedHeader],
+        credential_fingerprint: super::authorization::CredentialFingerprintDigest,
+        endpoint_config_generation: u64,
+        dns: Arc<dyn DnsResolver>,
+        command_refresh: Option<CommandRefresh>,
+    ) -> Result<Self, ProviderTransportConfigError> {
+        let transport = TranscriptionHttpTransport::vetted_headers_default_limit_with_refresh(
+            origin,
+            headers,
+            dns,
+            command_refresh,
+        )?;
+        Self::from_transport(
+            provider_id,
+            transport,
+            resolved_location,
+            credential_fingerprint,
+            endpoint_config_generation,
+        )
+    }
+
+    fn from_transport(
+        provider_id: String,
+        transport: TranscriptionHttpTransport,
+        resolved_location: String,
+        credential_fingerprint: super::authorization::CredentialFingerprintDigest,
+        endpoint_config_generation: u64,
+    ) -> Result<Self, ProviderTransportConfigError> {
         let identity = super::journal::TranscriptionDestinationIdentity {
             provider_id,
             origin: transport.origin().to_string(),
@@ -143,7 +201,7 @@ impl fmt::Debug for TranscriptionHttpTransport {
         formatter
             .debug_struct("TranscriptionHttpTransport")
             .field("origin", &self.origin.as_str())
-            .field("authorization", &"<redacted>")
+            .field("headers", &"<redacted>")
             .field("body_limit", &self.body_limit)
             .field("required_location", &self.required_location)
             .field("path", &self.path)
@@ -168,6 +226,62 @@ impl TranscriptionHttpTransport {
         dns: Arc<dyn DnsResolver>,
         body_limit: usize,
     ) -> Result<Self, ProviderTransportConfigError> {
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
+            .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
+        authorization.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, authorization);
+        Self::vetted_header_map(origin, headers, dns, body_limit, None)
+    }
+
+    pub(crate) fn vetted_headers_default_limit(
+        origin: &str,
+        headers: &[crate::providers::models_fetch::ResolvedHeader],
+        dns: Arc<dyn DnsResolver>,
+    ) -> Result<Self, ProviderTransportConfigError> {
+        let mut resolved = HeaderMap::new();
+        for header in headers {
+            let name = HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
+            let mut value = HeaderValue::from_str(&header.value)
+                .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
+            value.set_sensitive(true);
+            resolved.insert(name, value);
+        }
+        Self::vetted_header_map(origin, resolved, dns, MAX_RESPONSE_BODY_BYTES, None)
+    }
+
+    fn vetted_headers_default_limit_with_refresh(
+        origin: &str,
+        headers: &[crate::providers::models_fetch::ResolvedHeader],
+        dns: Arc<dyn DnsResolver>,
+        command_refresh: Option<CommandRefresh>,
+    ) -> Result<Self, ProviderTransportConfigError> {
+        let mut resolved = HeaderMap::new();
+        for header in headers {
+            let name = HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
+            let mut value = HeaderValue::from_str(&header.value)
+                .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
+            value.set_sensitive(true);
+            resolved.insert(name, value);
+        }
+        Self::vetted_header_map(
+            origin,
+            resolved,
+            dns,
+            MAX_RESPONSE_BODY_BYTES,
+            command_refresh,
+        )
+    }
+
+    fn vetted_header_map(
+        origin: &str,
+        headers: HeaderMap,
+        dns: Arc<dyn DnsResolver>,
+        body_limit: usize,
+        command_refresh: Option<CommandRefresh>,
+    ) -> Result<Self, ProviderTransportConfigError> {
         if body_limit == 0 {
             return Err(ProviderTransportConfigError::EmptyBodyLimit);
         }
@@ -175,12 +289,10 @@ impl TranscriptionHttpTransport {
         if origin.path() != "/" {
             return Err(ProviderTransportConfigError::ForbiddenOriginComponent);
         }
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
-            .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
-        authorization.set_sensitive(true);
         Ok(Self {
             origin,
-            authorization,
+            headers: Mutex::new(headers),
+            command_refresh,
             dns,
             body_limit,
             required_location: AddressClass::PublicNetwork,
@@ -228,20 +340,79 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let content_type_value =
             HeaderValue::from_str(&content_type).map_err(|_| TranscriptionEgressError::Connect)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, self.authorization.clone());
-        headers.insert(CONTENT_TYPE, content_type_value);
+        let mut headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        headers.insert(CONTENT_TYPE, content_type_value.clone());
 
-        match VettedHttpClient::new(self.dns.clone(), self.required_location)
-            .execute(Method::POST, &url, headers, Some(body), self.body_limit)
+        let outcome = VettedHttpClient::new(self.dns.clone(), self.required_location)
+            .execute(
+                Method::POST,
+                &url,
+                headers,
+                Some(body.clone()),
+                self.body_limit,
+            )
             .await
+            .map_err(Self::map_error)?;
+        if matches!(
+            outcome.status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) && let Some(refresh) = &self.command_refresh
         {
-            Ok(outcome) => Ok(TranscriptionHttpResponse {
-                status: outcome.status,
-                body: outcome.body,
-            }),
-            Err(error) => Err(Self::map_error(error)),
+            let refreshed =
+                crate::providers::models_fetch::refresh_provider_request_async_with_store(
+                    &refresh.provider_id,
+                    &refresh.entry,
+                    refresh.store.clone(),
+                    |name| {
+                        refresh
+                            .env
+                            .get(name)
+                            .cloned()
+                            .or_else(|| std::env::var(name).ok())
+                    },
+                )
+                .await
+                .map_err(|_| TranscriptionEgressError::Connect)?;
+            if let Some(refreshed) = refreshed {
+                let mut refreshed_headers = HeaderMap::new();
+                for header in &refreshed.headers {
+                    let name = HeaderName::from_bytes(header.name.as_bytes())
+                        .map_err(|_| TranscriptionEgressError::Connect)?;
+                    let mut value = HeaderValue::from_str(&header.value)
+                        .map_err(|_| TranscriptionEgressError::Connect)?;
+                    value.set_sensitive(true);
+                    refreshed_headers.insert(name, value);
+                }
+                let mut request_headers = refreshed_headers.clone();
+                request_headers.insert(CONTENT_TYPE, content_type_value);
+                let retry = VettedHttpClient::new(self.dns.clone(), self.required_location)
+                    .execute(
+                        Method::POST,
+                        &url,
+                        request_headers,
+                        Some(body),
+                        self.body_limit,
+                    )
+                    .await
+                    .map_err(Self::map_error)?;
+                *self
+                    .headers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed_headers;
+                return Ok(TranscriptionHttpResponse {
+                    status: retry.status,
+                    body: retry.body,
+                });
+            }
         }
+        Ok(TranscriptionHttpResponse {
+            status: outcome.status,
+            body: outcome.body,
+        })
     }
 }
 

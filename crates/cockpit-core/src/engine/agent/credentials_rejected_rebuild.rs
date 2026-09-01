@@ -109,11 +109,15 @@ pub(crate) async fn rebuild_model_for_credentials(
 ) -> anyhow::Result<Option<RebuiltCredentialsModel>> {
     let (extended, providers) = config.configs();
     let provider_id = current_model.provider_id();
+    let env = env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     // (a) Eligibility + provider-scoped re-resolution: invalidate + re-resolve
     // ONLY the failing provider's owner-scoped command secret(s). Returns false
     // (⇒ no rebuild/retry) when this provider is not command-backed.
     let reresolved = if session
-        .refresh_provider_auth_command(&providers, provider_id)
+        .refresh_provider_auth_command(&providers, provider_id, &env)
         .await?
     {
         true
@@ -130,10 +134,6 @@ pub(crate) async fn rebuild_model_for_credentials(
     // (b) Refreshed redaction table: union the current table with one built from
     // the refreshed store (which injects the fresh command output), so the NEW
     // token is scrubbed everywhere on the retry. In-memory only.
-    let env = env_overlay
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
     let refreshed_secrets = RedactionTable::build_with_env_and_credential_store(
         &extended.redact,
         &session.project_root,

@@ -67,6 +67,7 @@ pub async fn check_provider_auth_with_store(
                 &resolved,
                 timeout,
                 fetch_store,
+                |name| std::env::var(name).ok(),
             )
             .await
             .map_err(classify_error)?;
@@ -83,7 +84,7 @@ pub async fn check_provider_auth_with_store(
             model,
             docs_url,
         } => {
-            post_chat_completion_probe(
+            let outcome = post_chat_completion_probe(
                 &resolved.base_url,
                 &resolved.headers,
                 path,
@@ -91,7 +92,31 @@ pub async fn check_provider_auth_with_store(
                 docs_url,
                 timeout,
             )
-            .await
+            .await;
+            if matches!(&outcome, Err(AuthCheckError::CredentialsRejected(_)))
+                && let Some(store) = fetch_store
+            {
+                let refreshed = models_fetch::refresh_provider_request_async_with_store(
+                    provider_id,
+                    entry,
+                    store,
+                    |name| std::env::var(name).ok(),
+                )
+                .await
+                .map_err(|error| AuthCheckError::Other(error.to_string()))?;
+                if let Some(refreshed) = refreshed {
+                    return post_chat_completion_probe(
+                        &refreshed.base_url,
+                        &refreshed.headers,
+                        path,
+                        model,
+                        docs_url,
+                        timeout,
+                    )
+                    .await;
+                }
+            }
+            outcome
         }
     }
 }

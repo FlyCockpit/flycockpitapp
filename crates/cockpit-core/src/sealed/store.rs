@@ -21,7 +21,7 @@ use cockpit_db::db::Db;
 use cockpit_db::db::sealed_scope::{
     NewSealedActionGrant, NewSealedValueRecord, SealedSagaKind, SealedSagaPhase, SealedSagaRow,
     SealedScopeKind, SealedValueRecordRow, create_session_sealed_value_conn,
-    rotate_session_sealed_value_conn,
+    promote_session_sealed_value_conn, rotate_session_sealed_value_conn,
 };
 use cockpit_db::secret_vault::SecretVaultKind;
 use uuid::Uuid;
@@ -741,6 +741,97 @@ impl SealedValueDirectory {
             .commit_sealed_value_rotate(ticket.record_id.to_string(), now_ms)
             .await?;
         SealedValueSummary::from_row(&row)
+    }
+
+    /// Promote a session-scoped sealed value into Project or Global scope.
+    ///
+    /// The Owner capability binds the source version. The current session
+    /// literal is copied to a fresh opaque compartment locator and the record
+    /// is moved in the same SQLite transaction that removes its session vault
+    /// generations, legacy metadata, and stale action grants. A promoted value
+    /// therefore cannot be reclaimed by the session-end purge.
+    pub async fn promote_session_at_version(
+        &self,
+        _owner: OwnerAuthority,
+        record_id: SealedRecordId,
+        target_scope: SealedScopeRef,
+        now_ms: i64,
+        expected_version: u32,
+    ) -> Result<SealedValueSummary> {
+        if !target_scope.kind().is_persistent_compartment() {
+            bail!("session sealed values may only be promoted to project or global scope");
+        }
+        let row = self
+            .db
+            .sealed_value_record(record_id.to_string())
+            .await?
+            .context("sealed value record does not exist")?;
+        if row.scope != SealedScopeKind::Session
+            || !row.is_resolvable()
+            || row.active_version != i64::from(expected_version)
+        {
+            bail!("sealed value changed before promotion");
+        }
+        let vault = self
+            .compartment
+            .vault()
+            .cloned()
+            .context("session sealed value promotion requires a vault-backed compartment")?;
+        let source_item_id = crate::secure_key::session_sealed_item_id(
+            &row.scope_key,
+            &row.name,
+            row.active_version,
+        );
+        let literal = vault
+            .get_item(SecretVaultKind::SessionSealedValue, &source_item_id)
+            .map_err(|error| {
+                anyhow::anyhow!("reading session sealed value for promotion: {error}")
+            })?;
+        let target_key = SealedCompartmentKey::generate();
+        let record_id_str = record_id.to_string();
+        let target_scope_kind = target_scope.kind();
+        let target_scope_key = target_scope.scope_key();
+        let promoted = self
+            .db
+            .transaction(move |conn| {
+                vault
+                    .put_item_on_conn(
+                        conn,
+                        SecretVaultKind::SealedCompartment,
+                        target_key.as_str(),
+                        literal.as_slice(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("staging promoted sealed literal: {error}"))?;
+                promote_session_sealed_value_conn(
+                    conn,
+                    &record_id_str,
+                    i64::from(expected_version),
+                    target_scope_kind,
+                    &target_scope_key,
+                    target_key.as_str(),
+                    now_ms,
+                )
+            })
+            .await?;
+        SealedValueSummary::from_row(&promoted)
+    }
+
+    /// Explicitly reset a session-scoped value. The version check is fused with
+    /// the deletion so a stale owner capability cannot erase a later rotation.
+    pub async fn reset_session_at_version(
+        &self,
+        _owner: OwnerAuthority,
+        record_id: SealedRecordId,
+        now_ms: i64,
+        expected_version: u32,
+    ) -> Result<bool> {
+        self.db
+            .delete_session_sealed_value_at_version(
+                record_id.to_string(),
+                i64::from(expected_version),
+                now_ms,
+            )
+            .await
     }
 
     /// Delete a sealed value, running the whole lifecycle to completion.

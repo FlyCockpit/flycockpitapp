@@ -96,6 +96,8 @@ pub enum SensitiveOwnerDisposition {
     Create,
     Replace,
     Rotate,
+    Reset,
+    Promote,
     Recover,
 }
 
@@ -105,6 +107,7 @@ impl SensitiveOwnerDisposition {
     pub fn frame_kind(self) -> SensitiveFrameKind {
         match self {
             Self::Create | Self::Replace | Self::Rotate => SensitiveFrameKind::Write,
+            Self::Reset | Self::Promote => SensitiveFrameKind::Control,
             Self::Recover => SensitiveFrameKind::Recover,
         }
     }
@@ -141,6 +144,13 @@ pub enum BeginSensitiveInput {
     Rotate { record_id: SealedRecordId },
     /// Recover addresses an existing record by id only.
     Recover { record_id: SealedRecordId },
+    /// Reset removes one session-scoped value by id.
+    Reset { record_id: SealedRecordId },
+    /// Promote moves one session-scoped value into a persistent target scope.
+    Promote {
+        record_id: SealedRecordId,
+        target_scope: SealedScopeRef,
+    },
 }
 
 /// The closed, daemon-bound operation a capability permits.
@@ -158,6 +168,8 @@ pub struct SensitiveOwnerOperation {
     pub name: Option<SealedName>,
     /// Required for create; the safe description.
     pub description: Option<SealedDescription>,
+    /// Required only for a session-to-persistent promotion.
+    pub target_scope: Option<SealedScopeRef>,
 }
 
 impl SensitiveOwnerOperation {
@@ -170,6 +182,7 @@ impl SensitiveOwnerOperation {
             version: VersionBinding::Create,
             name: Some(name),
             description: Some(description),
+            target_scope: None,
         }
     }
 
@@ -212,7 +225,28 @@ impl SensitiveOwnerOperation {
             version: VersionBinding::Exact(version),
             name: None,
             description: None,
+            target_scope: None,
         }
+    }
+
+    pub fn reset(record_id: SealedRecordId, scope: SealedScopeRef, version: u32) -> Self {
+        Self::bound(SensitiveOwnerDisposition::Reset, record_id, scope, version)
+    }
+
+    pub fn promote(
+        record_id: SealedRecordId,
+        scope: SealedScopeRef,
+        version: u32,
+        target_scope: SealedScopeRef,
+    ) -> Self {
+        let mut operation = Self::bound(
+            SensitiveOwnerDisposition::Promote,
+            record_id,
+            scope,
+            version,
+        );
+        operation.target_scope = Some(target_scope);
+        operation
     }
 }
 
@@ -382,6 +416,40 @@ impl BeginSensitiveOwnerOperation {
                 )
                 .await?
             }
+            BeginSensitiveInput::Reset { record_id } => {
+                let operation = load_and_bind(
+                    owner,
+                    directory,
+                    SensitiveOwnerDisposition::Reset,
+                    record_id,
+                )
+                .await?;
+                if operation.scope.kind() != SealedScopeKind::Session {
+                    bail!("only session-scoped sealed values can be reset");
+                }
+                operation
+            }
+            BeginSensitiveInput::Promote {
+                record_id,
+                target_scope,
+            } => {
+                validate_ambient_scope(&target_scope)?;
+                if !target_scope.kind().is_persistent_compartment() {
+                    bail!("session sealed values may only be promoted to project or global scope");
+                }
+                let mut operation = load_and_bind(
+                    owner,
+                    directory,
+                    SensitiveOwnerDisposition::Promote,
+                    record_id,
+                )
+                .await?;
+                if operation.scope.kind() != SealedScopeKind::Session {
+                    bail!("only session-scoped sealed values can be promoted");
+                }
+                operation.target_scope = Some(target_scope);
+                operation
+            }
         };
 
         let capability = OneUseCapability {
@@ -431,6 +499,7 @@ async fn load_and_bind(
         version: VersionBinding::Exact(active),
         name: None,
         description: None,
+        target_scope: None,
     })
 }
 
@@ -471,6 +540,7 @@ fn validate_ambient_scope(scope: &SealedScopeRef) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitiveFrameKind {
     Write,
+    Control,
     Recover,
 }
 
@@ -481,6 +551,9 @@ pub enum SensitiveFrameOutcome {
     /// The write/replace/rotate succeeded. No literal is returned. Carries the
     /// updated safe summary.
     Contained { summary: SealedValueSummary },
+    /// A reset succeeded and removed the record; no literal or metadata is
+    /// returned because the value no longer exists.
+    Reset,
     /// The recover succeeded. The literal is available in an ephemeral
     /// zeroizing frame that is zeroized on drop. Never terminal output.
     Revealed { literal: Zeroizing<String> },
@@ -493,6 +566,7 @@ impl std::fmt::Debug for SensitiveFrameOutcome {
                 .debug_struct("Contained")
                 .field("summary", summary)
                 .finish(),
+            Self::Reset => f.write_str("Reset"),
             // The revealed literal is ephemeral plaintext; never print it.
             Self::Revealed { literal } => f
                 .debug_struct("Revealed")
@@ -544,6 +618,16 @@ impl<'a> SensitiveOwnerFrame<'a> {
             literal: None,
             kind: SensitiveFrameKind::Recover,
             minting_session: Some(minting_session.into()),
+        }
+    }
+
+    /// Create a literal-free frame for reset and promotion.
+    pub fn for_control(capability: &'a OneUseCapability) -> Self {
+        Self {
+            capability,
+            literal: None,
+            kind: SensitiveFrameKind::Control,
+            minting_session: None,
         }
     }
 
@@ -600,10 +684,13 @@ impl<'a> SensitiveOwnerFrame<'a> {
         if self.capability.operation.disposition.frame_kind() != self.kind {
             bail!("sensitive owner frame kind does not match the bound operation disposition");
         }
-        // A write frame must carry a literal; a recover frame must not.
+        // A write frame must carry a literal; control and recover frames must
+        // not, so reset/promotion never expose or accept plaintext.
         match (self.kind, self.literal.is_some()) {
             (SensitiveFrameKind::Write, true) => {}
             (SensitiveFrameKind::Write, false) => bail!("write frame requires a literal"),
+            (SensitiveFrameKind::Control, false) => {}
+            (SensitiveFrameKind::Control, true) => bail!("control frame must not carry a literal"),
             (SensitiveFrameKind::Recover, false) => {}
             (SensitiveFrameKind::Recover, true) => {
                 bail!("recover frame must not carry a literal")
@@ -662,6 +749,9 @@ impl<'a> SensitiveOwnerFrame<'a> {
                     SensitiveOwnerDisposition::Recover => {
                         bail!("recover disposition cannot be applied as a write frame")
                     }
+                    SensitiveOwnerDisposition::Reset | SensitiveOwnerDisposition::Promote => {
+                        bail!("reset/promotion disposition cannot be applied as a write frame")
+                    }
                 };
                 Ok(SensitiveFrameOutcome::Contained { summary })
             }
@@ -703,6 +793,37 @@ impl<'a> SensitiveOwnerFrame<'a> {
                     .await
                     .context("recovery audit must commit before the literal is revealed")?;
                 Ok(SensitiveFrameOutcome::Revealed { literal })
+            }
+            SensitiveFrameKind::Control => {
+                let record_id = op
+                    .record_id
+                    .context("control operation requires a record id")?;
+                let expected = exact_version(op.version)?;
+                revalidate_scope_and_owner(directory, owner, &record_id, &op.scope).await?;
+                let summary = match op.disposition {
+                    SensitiveOwnerDisposition::Reset => {
+                        directory
+                            .reset_session_at_version(owner, record_id, now_ms, expected)
+                            .await?;
+                        return Ok(SensitiveFrameOutcome::Reset);
+                    }
+                    SensitiveOwnerDisposition::Promote => {
+                        let target_scope = op
+                            .target_scope
+                            .context("promotion requires a target scope")?;
+                        directory
+                            .promote_session_at_version(
+                                owner,
+                                record_id,
+                                target_scope,
+                                now_ms,
+                                expected,
+                            )
+                            .await?
+                    }
+                    _ => bail!("write/recover disposition cannot be applied as a control frame"),
+                };
+                Ok(SensitiveFrameOutcome::Contained { summary })
             }
         }
     }

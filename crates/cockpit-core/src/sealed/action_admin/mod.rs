@@ -744,15 +744,14 @@ impl SealedActionDirectory {
         request: CreateSealedAction,
         now_ms: i64,
     ) -> Result<SealedActionInstanceSummary> {
-        request.kind.validate()?;
+        let mut kind = request.kind;
+        pin_local_executables(&mut kind)?;
+        kind.validate()?;
         // The daemon mints the id; no caller input can choose or collide with it.
         let action_id = uuid::Uuid::new_v4().to_string();
         // Compile the descriptor to validate the id + revision before persisting.
-        request
-            .kind
-            .compile_descriptor(&action_id, 1, request.description.as_str())?;
-        let kind_json =
-            serde_json::to_string(&request.kind).context("serializing sealed action kind")?;
+        kind.compile_descriptor(&action_id, 1, request.description.as_str())?;
+        let kind_json = serde_json::to_string(&kind).context("serializing sealed action kind")?;
         self.db
             .insert_sealed_action_instance(
                 cockpit_db::db::sealed_actions::NewSealedActionInstance {
@@ -888,6 +887,23 @@ impl SealedActionDirectory {
             Some(row) => Ok(Some(snapshot_from_row(&row)?)),
             None => Ok(None),
         }
+    }
+}
+
+/// Convert local action executables into canonical absolute paths before the
+/// immutable owner snapshot is written. This is intentionally at the sole
+/// persistence entry point, so direct internal callers cannot bypass it.
+fn pin_local_executables(kind: &mut SealedActionKind) -> Result<()> {
+    match kind {
+        SealedActionKind::Command { argv_template, .. } => {
+            local_executor::pin_argv_executable(argv_template)
+        }
+        SealedActionKind::File { consumer_argv, .. } if !consumer_argv.is_empty() => {
+            local_executor::pin_argv_executable(consumer_argv)
+        }
+        SealedActionKind::File { .. }
+        | SealedActionKind::Https { .. }
+        | SealedActionKind::KnowledgeBaseCopy { .. } => Ok(()),
     }
 }
 

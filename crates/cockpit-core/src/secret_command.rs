@@ -219,6 +219,10 @@ pub(crate) async fn run_injected_process(
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
+        // The action snapshot has already pinned an absolute executable. Do
+        // not donate the daemon's PATH, credentials, proxy configuration, or
+        // other ambient state to the plaintext consumer.
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -226,25 +230,21 @@ pub(crate) async fn run_injected_process(
     if let Some((name, value)) = environment {
         command.env(name, value);
     }
-    let output = tokio::time::timeout(COMMAND_SECRET_TIMEOUT, command.output())
-        .await
-        .map_err(|_| CommandSecretError::Timeout)?
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
-                CommandSecretError::NotFound
-            }
-            kind => CommandSecretError::Io(io_kind_label(kind)),
-        })?;
-    if output.stdout.len() > COMMAND_SECRET_STDOUT_CAP {
-        return Err(CommandSecretError::OutputTooLarge);
-    }
-    if output.stderr.len() > COMMAND_SECRET_STDERR_CAP {
-        return Err(CommandSecretError::StderrTooLarge);
-    }
+    let mut child = command.spawn().map_err(map_spawn_error)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CommandSecretError::Io("stdout_unavailable".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CommandSecretError::Io("stderr_unavailable".to_string()))?;
+    let (stdout, stderr, status) =
+        drain_capped_child(&mut child, stdout, stderr, COMMAND_SECRET_TIMEOUT).await?;
     Ok(InjectedCommandCapture {
-        success: output.status.success(),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        success: status.success(),
+        stdout,
+        stderr,
     })
 }
 
@@ -270,21 +270,7 @@ async fn run_subprocess_inner(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        // NotFound (missing argv[0]) and PermissionDenied (non-executable
-        // argv[0]) both read as "cannot run this program"; fold both into
-        // NotFound so callers get one "cannot spawn" signal without a path.
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return Err(CommandSecretError::NotFound);
-        }
-        Err(error) => return Err(CommandSecretError::Io(io_kind_label(error.kind()))),
-    };
+    let mut child = command.spawn().map_err(map_spawn_error)?;
 
     let stdout = child
         .stdout
@@ -295,6 +281,46 @@ async fn run_subprocess_inner(
         .take()
         .ok_or_else(|| CommandSecretError::Io("stderr_unavailable".to_string()))?;
 
+    let (out_bytes, err_bytes, status) =
+        drain_capped_child(&mut child, stdout, stderr, timeout).await?;
+
+    if !status.success() {
+        return Err(CommandSecretError::NonZeroExit {
+            code: status.code(),
+            stderr_excerpt: sanitize_stderr(&err_bytes),
+        });
+    }
+
+    let value = String::from_utf8(trim_trailing_newline(&out_bytes))
+        .map_err(|_| CommandSecretError::Io("output_not_utf8".to_string()))?;
+    if value.is_empty() {
+        return Err(CommandSecretError::EmptyOutput);
+    }
+    Ok(value)
+}
+
+fn map_spawn_error(error: std::io::Error) -> CommandSecretError {
+    match error.kind() {
+        // NotFound (missing argv[0]) and PermissionDenied (non-executable
+        // argv[0]) both read as "cannot run this program"; fold both into
+        // NotFound so callers get one "cannot spawn" signal without a path.
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            CommandSecretError::NotFound
+        }
+        kind => CommandSecretError::Io(io_kind_label(kind)),
+    }
+}
+
+/// Drain a child with bounded readers and return only after it is reaped.
+/// The first cap/IO/timeout outcome kills the child immediately. This common
+/// implementation deliberately serves both command-secret resolution and
+/// sealed-value injection so neither path can regress to `Command::output()`.
+async fn drain_capped_child(
+    child: &mut tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    timeout: std::time::Duration,
+) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus), CommandSecretError> {
     // Drain both pipes in independent tasks and RACE them: the first task to
     // cross its cap (or error) short-circuits so we can kill+reap immediately
     // instead of waiting for the other pipe's EOF or the 30s timeout.
@@ -344,11 +370,11 @@ async fn run_subprocess_inner(
             // A cap was crossed (or a drain errored): kill+reap NOW and return
             // the distinct error. The abandoned drain task ends on its own once
             // the killed child closes its pipe.
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(cap_or_io);
         }
         Err(_elapsed) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(CommandSecretError::Timeout);
         }
     };
@@ -359,24 +385,12 @@ async fn run_subprocess_inner(
         Ok(Ok(status)) => status,
         Ok(Err(error)) => return Err(CommandSecretError::Io(io_kind_label(error.kind()))),
         Err(_elapsed) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(CommandSecretError::Timeout);
         }
     };
 
-    if !status.success() {
-        return Err(CommandSecretError::NonZeroExit {
-            code: status.code(),
-            stderr_excerpt: sanitize_stderr(&err_bytes),
-        });
-    }
-
-    let value = String::from_utf8(trim_trailing_newline(&out_bytes))
-        .map_err(|_| CommandSecretError::Io("output_not_utf8".to_string()))?;
-    if value.is_empty() {
-        return Err(CommandSecretError::EmptyOutput);
-    }
-    Ok(value)
+    Ok((out_bytes, err_bytes, status))
 }
 
 /// The outcome of draining one capped pipe. On `Overflow` no bytes are

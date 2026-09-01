@@ -29261,7 +29261,71 @@ fn resolve_sealed_action_kind(
 ) -> anyhow::Result<crate::sealed::action_admin::SealedActionKind> {
     use crate::sealed::action_admin::{
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
+        local_executor::{
+            CommandInjection, FileDestination, FilePersistence, SEALED_FILE_PATH_PLACEHOLDER,
+            SEALED_VALUE_ARG_PLACEHOLDER,
+        },
     };
+
+    // These local sinks are independently selectable owner declarations. The
+    // wire remains a closed identifier lookup: untrusted callers cannot supply
+    // an executable, environment key, destination, or arbitrary path. The
+    // values are deliberately absolute executable snapshots, so launching does
+    // not depend on the daemon PATH.
+    match kind_id {
+        "command.arg" => {
+            require_local_action_selectors(kind_id, origin_id, projection_id)?;
+            return Ok(SealedActionKind::Command {
+                argv_template: vec![
+                    "/usr/bin/true".to_string(),
+                    SEALED_VALUE_ARG_PLACEHOLDER.to_string(),
+                ],
+                injection: CommandInjection::Argument,
+                parameters: std::collections::BTreeMap::new(),
+            });
+        }
+        "command.env" => {
+            require_local_action_selectors(kind_id, origin_id, projection_id)?;
+            return Ok(SealedActionKind::Command {
+                argv_template: vec!["/usr/bin/true".to_string()],
+                injection: CommandInjection::Environment {
+                    variable: "FLYCOCKPIT_SEALED_VALUE".to_string(),
+                },
+                parameters: std::collections::BTreeMap::new(),
+            });
+        }
+        "https.body" => {
+            // The body sink shares the fixed notification origin and route;
+            // the action snapshot differs only in its immutable placement.
+            if origin_id != "0" {
+                anyhow::bail!("origin id `{origin_id}` is out of range for kind `{kind_id}`");
+            }
+            let origins = HttpsOriginAllowlist::from_raw(&["https://api.deploy.example.com"])?;
+            return Ok(SealedActionKind::Https {
+                origins,
+                credential_placement: HttpsCredentialPlacement::Body {
+                    content_type: "application/octet-stream".to_string(),
+                },
+                path_template: "/v1/notify".to_string(),
+                projection: SealedProjectionId::parse(projection_id)?,
+                parameters: std::collections::BTreeMap::new(),
+            });
+        }
+        "file.ephemeral" => {
+            require_local_action_selectors(kind_id, origin_id, projection_id)?;
+            return Ok(SealedActionKind::File {
+                destination: FileDestination::PrivateRuntime {
+                    filename: "sealed-value".to_string(),
+                },
+                persistence: FilePersistence::Ephemeral,
+                consumer_argv: vec![
+                    "/usr/bin/true".to_string(),
+                    SEALED_FILE_PATH_PLACEHOLDER.to_string(),
+                ],
+            });
+        }
+        _ => {}
+    }
 
     // Closed builtin kind templates. Each entry is a fixed, host-owned template;
     // the wire never supplies an origin URL, header, or path.
@@ -29301,6 +29365,19 @@ fn resolve_sealed_action_kind(
         projection,
         parameters: std::collections::BTreeMap::new(),
     })
+}
+
+fn require_local_action_selectors(
+    kind_id: &str,
+    origin_id: &str,
+    projection_id: &str,
+) -> anyhow::Result<()> {
+    if origin_id != "none" || projection_id != "none" {
+        anyhow::bail!(
+            "local sealed action kind `{kind_id}` requires origin-id and projection-id `none`"
+        );
+    }
+    Ok(())
 }
 
 async fn ensure_project_note_member(

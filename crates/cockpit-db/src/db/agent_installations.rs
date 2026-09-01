@@ -587,6 +587,7 @@ fn default_redacted_verification_tool_categories() -> Vec<RedactedVerificationTo
 #[serde(deny_unknown_fields)]
 pub struct RedactedVerificationExecutionPlan {
     pub mode: String,
+    pub candidate_dispatch: String,
     pub generators: Vec<RedactedVerificationGenerator>,
     pub on_budget_exceeded: String,
     pub on_adjudication_failure: String,
@@ -4468,6 +4469,7 @@ mod tests {
     fn verification_execution_plan() -> RedactedVerificationExecutionPlan {
         RedactedVerificationExecutionPlan {
             mode: "gate".into(),
+            candidate_dispatch: "parallel".into(),
             generators: vec![RedactedVerificationGenerator {
                 slot: "primary".into(),
                 recipe: RedactedVerificationRecipe::Inherit,

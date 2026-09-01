@@ -20,7 +20,7 @@
 
 #![allow(deprecated)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -642,11 +642,11 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// The configured endpoint that reported the last real prompt-cache hit.
-    /// This is deliberately separate from `last_usage`: context chrome may use
-    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// Configured endpoints that reported a real prompt-cache hit. This is
+    /// deliberately separate from `last_usage`: context chrome may use a
+    /// session-wide estimate, but cache work is authorized only by a hit from
     /// the endpoint it is about to refresh.
-    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
+    observed_cache_hit_endpoints: Mutex<BTreeSet<(String, String)>>,
     /// Monotonic instant and durable identity of the most recent inference
     /// send. The cache-cold predicate uses the monotonic instant, while the
     /// daemon-scheduled keep-warm callback carries the unique identity across

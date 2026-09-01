@@ -2,11 +2,15 @@
 //! verification. Candidate bodies are persisted only as
 //! [`RedactedVerificationJson`]; they never enter the tool-call audit path.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
+use futures::future::join_all;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::agents::{GeneratorSpec, VerificationRecipe};
+use crate::agents::{GeneratorSpec, VerificationCandidateDispatch, VerificationRecipe};
+use crate::config::providers::CacheMode;
 use crate::db::verification_ledger::{
     CandidateTransitionOutcome, NewVerificationCandidate, RedactedVerificationJson,
     VerificationArtifactKind, VerificationCandidateState, VerificationDigest,
@@ -148,6 +152,7 @@ pub struct CollectionInput<'a> {
     pub resolved_name: &'a str,
     pub args: &'a Value,
     pub generators: &'a [GeneratorSpec],
+    pub candidate_dispatch: VerificationCandidateDispatch,
     pub max_candidates: u16,
     pub operation_id: Uuid,
     pub expected_revision: i64,
@@ -176,22 +181,10 @@ fn candidate_is_adjudicable(
         && matches!(accepted, Ok(CandidateTransitionOutcome::Transitioned))
 }
 
-pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
-    let now = chrono::Utc::now().timestamp_millis();
-    let started = input
-        .session
-        .db
-        .start_verification_collection(
-            input.session.id,
-            input.operation_id,
-            input.expected_revision,
-            now,
-        )
-        .await?;
-    if started.budget_action.is_some() {
-        return Ok(Vec::new());
-    }
-    let mut collected = Vec::new();
+async fn collect_one_candidate(
+    input: &CollectionInput<'_>,
+    spec: &GeneratorSpec,
+) -> Result<Option<CollectedCandidate>> {
     let guidance_names = input.ctx.config.extended().agent_guidance_files.clone();
     let target = input
         .args
@@ -207,239 +200,424 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         });
     let target_ref = target.as_deref();
     let placeholder = input.ctx.redact.placeholder().to_string();
+    if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
+        return Ok(None);
+    }
+    let generator_model = if input.profile_snapshot_id.is_nil() {
+        // Compiled definition grant path: no profile snapshot is bound
+        // (local CLI/TUI dispatch). Run the generator on the author's
+        // live model, matching intercept's grant-path estimate.
+        input.agent.model.clone()
+    } else {
+        let Ok(model) = super::models::resolve_profile_utility_model(
+            input.session,
+            input.ctx,
+            input.profile_snapshot_id,
+            &spec.slot,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        model
+    };
+    let mut generator_model = generator_model.as_ref().clone();
+    generator_model
+        .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone());
+    // Slot identity, not provider/model equality, decides cache-prefix
+    // inheritance. Two distinct slots may intentionally bind the same
+    // provider model but have different custody and prompt identities.
+    let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
+    let recipe = generator_recipe_for_slot(&spec.recipe, same_as_author);
+    let (include_linked, last_n) = match recipe.as_ref() {
+        VerificationRecipe::Inherit => (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS),
+        VerificationRecipe::CleanRoom {
+            include_linked_files,
+            last_n_reads,
+            ..
+        } => (*include_linked_files, *last_n_reads),
+    };
+    let assembled = assemble_recipe(RecipeAssemblyInput {
+        recipe: recipe.as_ref(),
+        session: input.session,
+        workspace_root: input.workspace_root,
+        cwd: &input.ctx.cwd,
+        target_path: target_ref,
+        tool_name: input.resolved_name,
+        original_args: input.args,
+        guidance_file_names: &guidance_names,
+        last_n_reads: last_n,
+        include_linked_files: include_linked,
+        inherit_framing: "Produce an alternative implementation of the proposed write/edit. \
+                 Answer through the candidate tool only.",
+    })
+    .await?;
+    let tools = generator_tools(input, spec, same_as_author);
+    let initial_history = if inherit_uses_author_context(spec, same_as_author) {
+        input.history
+    } else {
+        &[]
+    };
+    let Ok(reservation_body) =
+        generator_budget_text(&generator_model, &assembled.prompt, initial_history, &tools)
+    else {
+        return Ok(None);
+    };
+    let reservation_digest = VerificationDigest::of(reservation_body.as_bytes());
+    let prices = crate::db::stats::PriceTable::load_default();
+    let price = super::estimate::model_prices(&prices, generator_model.model_id_ref());
+    let reservation = super::estimate::estimate_multi_turn_candidate(
+        &reservation_body,
+        super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
+        price.map(|price| price.0),
+        price.map(|price| price.1),
+        spec.max_turns,
+    );
+    let reservation_tokens = reservation.tokens;
+    let reserved_cost = reservation.cost_microusd.unwrap_or(0);
+    let now = chrono::Utc::now().timestamp_millis();
+    let reserved = match input
+        .session
+        .db
+        .reserve_verification_candidate(
+            input.session.id,
+            input.operation_id,
+            NewVerificationCandidate {
+                artifact_kind: VerificationArtifactKind::ProposedCall,
+                canonical_call_digest: reservation_digest.clone(),
+                artifact_union_digest: reservation_digest.clone(),
+                redacted_summary: RedactedVerificationJson::candidate_summary(
+                    reservation_digest.clone(),
+                ),
+                reserved_tokens: i64::try_from(reservation_tokens).unwrap_or(i64::MAX),
+                reserved_cost_microunits: i64::try_from(reserved_cost).unwrap_or(i64::MAX),
+                artifact_members: Vec::new(),
+            },
+            now,
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(_) => return Ok(None),
+    };
+    let Ok(running) = input
+        .session
+        .db
+        .transition_verification_candidate(
+            input.session.id,
+            input.operation_id,
+            reserved.candidate_id,
+            reserved.revision,
+            VerificationCandidateState::Running,
+            reservation_digest.clone(),
+            now,
+        )
+        .await
+    else {
+        return Ok(None);
+    };
+    if running != CandidateTransitionOutcome::Transitioned {
+        return Ok(None);
+    }
+    let generated = if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
+        GenerationOutcome::TimedOut
+    } else {
+        generate_with_turns(
+            input,
+            &generator_model,
+            spec,
+            &assembled.prompt,
+            same_as_author,
+            reservation_tokens,
+            reserved_cost,
+        )
+        .await
+    };
+    let (mut answer, forced_terminal) = materialize_generation(generated);
+    // Candidate arguments cross the same schema-repair/path-normalization
+    // boundary as an authored call before they can become adjudicable.
+    // Dispatch repeats this check as a TOCTOU defense; canonicalizing here
+    // also makes the candidate digest describe the exact selected call.
+    let invalid_arguments = if answer.kind == CandidateKind::Revision {
+        match answer.args.take() {
+            Some(args) => match canonical_candidate_args(input, args) {
+                Ok(args) => {
+                    answer.args = Some(args);
+                    false
+                }
+                Err(_) => true,
+            },
+            None => true,
+        }
+    } else {
+        false
+    };
+    let answer_json = serde_json::to_string(&serde_json::json!({
+        "args": &answer.args,
+        "critique": &answer.critique,
+    }))
+    .unwrap_or_default();
+    let invalid_placeholder = !placeholder.is_empty() && answer_json.contains(&placeholder);
+    let args_json = answer
+        .args
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let digest = VerificationDigest::of(args_json.as_bytes());
+    let now = chrono::Utc::now().timestamp_millis();
+    let terminal = if let Some(terminal) = forced_terminal {
+        terminal
+    } else if invalid_placeholder || invalid_arguments {
+        VerificationCandidateState::Invalid
+    } else if answer.args.is_none() && answer.kind != CandidateKind::ApproveOriginal {
+        VerificationCandidateState::Malformed
+    } else {
+        VerificationCandidateState::Valid
+    };
+    let descriptor = candidate_descriptor(input, &answer, digest.clone());
+    let finalized = input
+        .session
+        .db
+        .finalize_verification_candidate_descriptor(
+            input.session.id,
+            input.operation_id,
+            reserved.candidate_id,
+            reserved.revision + 1,
+            descriptor,
+            now,
+        )
+        .await;
+    let terminal_revision = match finalized {
+        Ok(row) => row.revision,
+        Err(_) => {
+            let _ = input
+                .session
+                .db
+                .transition_verification_candidate(
+                    input.session.id,
+                    input.operation_id,
+                    reserved.candidate_id,
+                    reserved.revision + 1,
+                    terminal,
+                    digest,
+                    now,
+                )
+                .await;
+            return Ok(None);
+        }
+    };
+    let accepted = input
+        .session
+        .db
+        .transition_verification_candidate(
+            input.session.id,
+            input.operation_id,
+            reserved.candidate_id,
+            terminal_revision,
+            terminal,
+            digest,
+            now + 2,
+        )
+        .await;
+    Ok(
+        candidate_is_adjudicable(terminal, &accepted).then_some(CollectedCandidate {
+            candidate_id: reserved.candidate_id,
+            answer,
+        }),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateDispatchPlan {
+    actual_mode: VerificationCandidateDispatch,
+    warm_candidate: Option<usize>,
+    /// Requests which follow a completed warm request and therefore carry the
+    /// slot's shared prefix as provider cache reads.
+    cache_read_candidates: Vec<usize>,
+}
+
+fn candidate_dispatch_plan(
+    requested: VerificationCandidateDispatch,
+    candidates: &[usize],
+    slot_supports_observed_cache_hits: bool,
+) -> CandidateDispatchPlan {
+    if requested == VerificationCandidateDispatch::WarmThenFanout
+        && candidates.len() > 1
+        && slot_supports_observed_cache_hits
+    {
+        CandidateDispatchPlan {
+            actual_mode: VerificationCandidateDispatch::WarmThenFanout,
+            warm_candidate: candidates.first().copied(),
+            cache_read_candidates: candidates[1..].to_vec(),
+        }
+    } else {
+        CandidateDispatchPlan {
+            actual_mode: VerificationCandidateDispatch::Parallel,
+            warm_candidate: None,
+            cache_read_candidates: Vec::new(),
+        }
+    }
+}
+
+async fn slot_supports_observed_cache_hits(
+    input: &CollectionInput<'_>,
+    spec: &GeneratorSpec,
+) -> bool {
+    let model = if input.profile_snapshot_id.is_nil() {
+        input.agent.model.clone()
+    } else {
+        let Ok(model) = super::models::resolve_profile_utility_model(
+            input.session,
+            input.ctx,
+            input.profile_snapshot_id,
+            &spec.slot,
+        )
+        .await
+        else {
+            return false;
+        };
+        model
+    };
+    cache_warm_is_eligible(
+        input
+            .ctx
+            .config
+            .providers()
+            .resolve_cache(model.provider_id(), model.model_id_ref())
+            .mode,
+        input
+            .session
+            .has_observed_cache_hit_for_endpoint(model.provider_id(), model.model_id_ref()),
+    )
+}
+
+fn cache_warm_is_eligible(cache_mode: CacheMode, observed_cache_hit: bool) -> bool {
+    cache_mode != CacheMode::None && observed_cache_hit
+}
+
+async fn collect_dispatch_group(
+    input: &CollectionInput<'_>,
+    candidates: Vec<(usize, &GeneratorSpec)>,
+    plan: &CandidateDispatchPlan,
+) -> Result<Vec<(usize, CollectedCandidate)>> {
+    let mut collected = Vec::new();
+    if let Some(warm_index) = plan.warm_candidate {
+        let (index, spec) = candidates
+            .iter()
+            .find(|(index, _)| *index == warm_index)
+            .expect("warm candidate must belong to its dispatch group");
+        if let Some(candidate) = collect_one_candidate(input, spec).await? {
+            collected.push((*index, candidate));
+        }
+    }
+    let fanout = candidates
+        .into_iter()
+        .filter(|(index, _)| plan.warm_candidate != Some(*index));
+    for result in join_all(fanout.map(|(index, spec)| async move {
+        Ok::<_, anyhow::Error>(
+            collect_one_candidate(input, spec)
+                .await?
+                .map(|candidate| (index, candidate)),
+        )
+    }))
+    .await
+    {
+        if let Some(candidate) = result? {
+            collected.push(candidate);
+        }
+    }
+    Ok(collected)
+}
+
+/// Collect candidates concurrently by slot. A warm group completes its first
+/// request before the remaining same-slot requests begin; distinct slots make
+/// their own warm/fan-out decision and proceed independently.
+pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let started = input
+        .session
+        .db
+        .start_verification_collection(
+            input.session.id,
+            input.operation_id,
+            input.expected_revision,
+            now,
+        )
+        .await?;
+    if started.budget_action.is_some() {
+        return Ok(Vec::new());
+    }
+
     let effective_candidate_count = input
         .generators
         .len()
         .min(usize::from(input.max_candidates))
         .min(usize::from(crate::agents::MAX_VERIFICATION_CANDIDATES));
-    for spec in input.generators.iter().take(effective_candidate_count) {
-        if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
-            break;
-        }
-        let generator_model = if input.profile_snapshot_id.is_nil() {
-            // Compiled definition grant path: no profile snapshot is bound
-            // (local CLI/TUI dispatch). Run the generator on the author's
-            // live model, matching intercept's grant-path estimate.
-            input.agent.model.clone()
-        } else {
-            let Ok(model) = super::models::resolve_profile_utility_model(
-                input.session,
-                input.ctx,
-                input.profile_snapshot_id,
-                &spec.slot,
-            )
-            .await
-            else {
-                continue;
-            };
-            model
-        };
-        let mut generator_model = generator_model.as_ref().clone();
-        generator_model
-            .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone());
-        // Slot identity, not provider/model equality, decides cache-prefix
-        // inheritance. Two distinct slots may intentionally bind the same
-        // provider model but have different custody and prompt identities.
-        let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
-        let recipe = generator_recipe_for_slot(&spec.recipe, same_as_author);
-        let (include_linked, last_n) = match recipe.as_ref() {
-            VerificationRecipe::Inherit => (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS),
-            VerificationRecipe::CleanRoom {
-                include_linked_files,
-                last_n_reads,
-                ..
-            } => (*include_linked_files, *last_n_reads),
-        };
-        let assembled = assemble_recipe(RecipeAssemblyInput {
-            recipe: recipe.as_ref(),
-            session: input.session,
-            workspace_root: input.workspace_root,
-            cwd: &input.ctx.cwd,
-            target_path: target_ref,
-            tool_name: input.resolved_name,
-            original_args: input.args,
-            guidance_file_names: &guidance_names,
-            last_n_reads: last_n,
-            include_linked_files: include_linked,
-            inherit_framing: "Produce an alternative implementation of the proposed write/edit. \
-                 Answer through the candidate tool only.",
-        })
-        .await?;
-        let tools = generator_tools(input, spec, same_as_author);
-        let initial_history = if inherit_uses_author_context(spec, same_as_author) {
-            input.history
-        } else {
-            &[]
-        };
-        let Ok(reservation_body) =
-            generator_budget_text(&generator_model, &assembled.prompt, initial_history, &tools)
-        else {
-            continue;
-        };
-        let reservation_digest = VerificationDigest::of(reservation_body.as_bytes());
-        let prices = crate::db::stats::PriceTable::load_default();
-        let price = super::estimate::model_prices(&prices, generator_model.model_id_ref());
-        let reservation = super::estimate::estimate_multi_turn_candidate(
-            &reservation_body,
-            super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
-            price.map(|price| price.0),
-            price.map(|price| price.1),
-            spec.max_turns,
-        );
-        let reservation_tokens = reservation.tokens;
-        let reserved_cost = reservation.cost_microusd.unwrap_or(0);
-        let now = chrono::Utc::now().timestamp_millis();
-        let reserved = match input
-            .session
-            .db
-            .reserve_verification_candidate(
-                input.session.id,
-                input.operation_id,
-                NewVerificationCandidate {
-                    artifact_kind: VerificationArtifactKind::ProposedCall,
-                    canonical_call_digest: reservation_digest.clone(),
-                    artifact_union_digest: reservation_digest.clone(),
-                    redacted_summary: RedactedVerificationJson::candidate_summary(
-                        reservation_digest.clone(),
-                    ),
-                    reserved_tokens: i64::try_from(reservation_tokens).unwrap_or(i64::MAX),
-                    reserved_cost_microunits: i64::try_from(reserved_cost).unwrap_or(i64::MAX),
-                    artifact_members: Vec::new(),
-                },
-                now,
-            )
-            .await
-        {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let Ok(running) = input
-            .session
-            .db
-            .transition_verification_candidate(
-                input.session.id,
-                input.operation_id,
-                reserved.candidate_id,
-                reserved.revision,
-                VerificationCandidateState::Running,
-                reservation_digest.clone(),
-                now,
-            )
-            .await
-        else {
-            continue;
-        };
-        if running != CandidateTransitionOutcome::Transitioned {
-            continue;
-        }
-        let generated =
-            if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
-                GenerationOutcome::TimedOut
-            } else {
-                generate_with_turns(
-                    input,
-                    &generator_model,
-                    spec,
-                    &assembled.prompt,
-                    same_as_author,
-                    reservation_tokens,
-                    reserved_cost,
-                )
-                .await
-            };
-        let (mut answer, forced_terminal) = materialize_generation(generated);
-        // Candidate arguments cross the same schema-repair/path-normalization
-        // boundary as an authored call before they can become adjudicable.
-        // Dispatch repeats this check as a TOCTOU defense; canonicalizing here
-        // also makes the candidate digest describe the exact selected call.
-        let invalid_arguments = if answer.kind == CandidateKind::Revision {
-            match answer.args.take() {
-                Some(args) => match canonical_candidate_args(input, args) {
-                    Ok(args) => {
-                        answer.args = Some(args);
-                        false
-                    }
-                    Err(_) => true,
-                },
-                None => true,
-            }
-        } else {
-            false
-        };
-        let answer_json = serde_json::to_string(&serde_json::json!({
-            "args": &answer.args,
-            "critique": &answer.critique,
-        }))
-        .unwrap_or_default();
-        let invalid_placeholder = !placeholder.is_empty() && answer_json.contains(&placeholder);
-        let args_json = answer
-            .args
-            .as_ref()
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        let digest = VerificationDigest::of(args_json.as_bytes());
-        let now = chrono::Utc::now().timestamp_millis();
-        let terminal = if let Some(terminal) = forced_terminal {
-            terminal
-        } else if invalid_placeholder || invalid_arguments {
-            VerificationCandidateState::Invalid
-        } else if answer.args.is_none() && answer.kind != CandidateKind::ApproveOriginal {
-            VerificationCandidateState::Malformed
-        } else {
-            VerificationCandidateState::Valid
-        };
-        let descriptor = candidate_descriptor(input, &answer, digest.clone());
-        let finalized = input
-            .session
-            .db
-            .finalize_verification_candidate_descriptor(
-                input.session.id,
-                input.operation_id,
-                reserved.candidate_id,
-                reserved.revision + 1,
-                descriptor,
-                now,
-            )
-            .await;
-        let terminal_revision = match finalized {
-            Ok(row) => row.revision,
-            Err(_) => {
-                let _ = input
-                    .session
-                    .db
-                    .transition_verification_candidate(
-                        input.session.id,
-                        input.operation_id,
-                        reserved.candidate_id,
-                        reserved.revision + 1,
-                        terminal,
-                        digest,
-                        now,
-                    )
-                    .await;
-                continue;
-            }
-        };
-        let accepted = input
-            .session
-            .db
-            .transition_verification_candidate(
-                input.session.id,
-                input.operation_id,
-                reserved.candidate_id,
-                terminal_revision,
-                terminal,
-                digest,
-                now + 2,
-            )
-            .await;
-        if candidate_is_adjudicable(terminal, &accepted) {
-            collected.push(CollectedCandidate {
-                candidate_id: reserved.candidate_id,
-                answer,
-            });
-        }
+    let mut groups = BTreeMap::<&str, Vec<(usize, &GeneratorSpec)>>::new();
+    for (index, spec) in input
+        .generators
+        .iter()
+        .take(effective_candidate_count)
+        .enumerate()
+    {
+        groups.entry(&spec.slot).or_default().push((index, spec));
     }
+
+    let mut scheduled = Vec::with_capacity(groups.len());
+    let mut telemetry = Vec::with_capacity(groups.len());
+    for (slot, candidates) in groups {
+        let supports_cache = match candidates.first() {
+            Some((_, spec)) => slot_supports_observed_cache_hits(input, spec).await,
+            None => false,
+        };
+        let indices = candidates
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let plan = candidate_dispatch_plan(input.candidate_dispatch, &indices, supports_cache);
+        telemetry.push(serde_json::json!({
+            "slot": slot,
+            "actual_mode": match plan.actual_mode {
+                VerificationCandidateDispatch::Parallel => "parallel",
+                VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
+            },
+            "candidate_count": candidates.len(),
+            "cache_read_candidate_count": plan.cache_read_candidates.len(),
+        }));
+        scheduled.push((candidates, plan));
+    }
+    if let Err(error) = input
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::InferenceRequest,
+            None,
+            None,
+            &serde_json::json!({
+                "purpose": "verification_candidate_dispatch",
+                "requested_mode": match input.candidate_dispatch {
+                    VerificationCandidateDispatch::Parallel => "parallel",
+                    VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
+                },
+                "slot_groups": telemetry,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(%error, "record verification candidate dispatch telemetry failed");
+    }
+
+    let mut indexed = Vec::new();
+    for group in join_all(
+        scheduled
+            .iter()
+            .map(|(candidates, plan)| collect_dispatch_group(input, candidates.clone(), plan)),
+    )
+    .await
+    {
+        indexed.extend(group?);
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+
     input
         .session
         .db
@@ -450,7 +628,10 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             chrono::Utc::now().timestamp_millis(),
         )
         .await?;
-    Ok(collected)
+    Ok(indexed
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect())
 }
 
 /// Read-only investigation tools: `ToolEffect::ReadOnly` names minus session
@@ -858,6 +1039,58 @@ pub fn parse_candidate_payload(value: &Value) -> Result<GeneratorAnswer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_then_fanout_marks_each_same_slot_sibling_as_a_cache_read() {
+        let plan = candidate_dispatch_plan(
+            VerificationCandidateDispatch::WarmThenFanout,
+            &[0, 1, 2],
+            true,
+        );
+
+        assert_eq!(
+            plan.actual_mode,
+            VerificationCandidateDispatch::WarmThenFanout
+        );
+        assert_eq!(plan.warm_candidate, Some(0));
+        assert_eq!(
+            plan.cache_read_candidates,
+            vec![1, 2],
+            "the N-1 fan-out requests must carry the prefix warmed by candidate 1 as cache reads"
+        );
+    }
+
+    #[test]
+    fn warm_then_fanout_falls_back_to_parallel_without_cache_hits_or_siblings() {
+        for (candidates, observed_cache_hit) in [(&[0, 1][..], false), (&[0][..], true)] {
+            let plan = candidate_dispatch_plan(
+                VerificationCandidateDispatch::WarmThenFanout,
+                candidates,
+                observed_cache_hit,
+            );
+            assert_eq!(plan.actual_mode, VerificationCandidateDispatch::Parallel);
+            assert_eq!(plan.warm_candidate, None);
+            assert!(plan.cache_read_candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn cache_mode_none_never_arms_a_warm_then_fanout() {
+        let plan = candidate_dispatch_plan(
+            VerificationCandidateDispatch::WarmThenFanout,
+            &[0, 1],
+            cache_warm_is_eligible(CacheMode::None, true),
+        );
+        assert_eq!(plan.actual_mode, VerificationCandidateDispatch::Parallel);
+        assert!(plan.cache_read_candidates.is_empty());
+    }
+
+    #[test]
+    fn parallel_never_serializes_a_cache_warm() {
+        let plan = candidate_dispatch_plan(VerificationCandidateDispatch::Parallel, &[0, 1], true);
+        assert_eq!(plan.actual_mode, VerificationCandidateDispatch::Parallel);
+        assert_eq!(plan.warm_candidate, None);
+    }
 
     #[test]
     fn investigation_loop_budget_is_positive_and_hard_bounded() {

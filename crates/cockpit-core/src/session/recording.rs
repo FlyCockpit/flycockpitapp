@@ -2363,7 +2363,10 @@ impl Session {
         usage: crate::tokens::TokenUsage,
     ) {
         if usage.hit_rate().is_some_and(|rate| rate > 0.0) {
-            *self.last_cache_hit_endpoint.lock().unwrap() = Some((provider.into(), model.into()));
+            self.observed_cache_hit_endpoints
+                .lock()
+                .unwrap()
+                .insert((provider.into(), model.into()));
         }
     }
 
@@ -2371,17 +2374,16 @@ impl Session {
     /// during the current live session. Estimates and utility bookkeeping do
     /// not establish this gate.
     pub fn has_observed_cache_hit_for_endpoint(&self, provider: &str, model: &str) -> bool {
-        self.last_cache_hit_endpoint
+        self.observed_cache_hit_endpoints
             .lock()
             .unwrap()
-            .as_ref()
-            .is_some_and(|(hit_provider, hit_model)| hit_provider == provider && hit_model == model)
+            .contains(&(provider.to_string(), model.to_string()))
     }
 
     /// A model switch changes the prompt-cache key. Forget all prior evidence
     /// rather than allowing a switch-away-and-back race to arm an old window.
     pub fn clear_observed_cache_hit(&self) {
-        *self.last_cache_hit_endpoint.lock().unwrap() = None;
+        self.observed_cache_hit_endpoints.lock().unwrap().clear();
     }
 
     /// Seed the in-memory `last_usage` **without** writing an
@@ -2421,8 +2423,21 @@ mod keep_warm_endpoint_tests {
         );
         assert!(session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
         assert!(!session.has_observed_cache_hit_for_endpoint("provider-b", "model-b"));
+        session.note_cache_hit_for_endpoint(
+            "provider-b",
+            "model-b",
+            crate::tokens::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                cached_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        assert!(session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
+        assert!(session.has_observed_cache_hit_for_endpoint("provider-b", "model-b"));
         session.clear_observed_cache_hit();
         assert!(!session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
+        assert!(!session.has_observed_cache_hit_for_endpoint("provider-b", "model-b"));
     }
 }
 

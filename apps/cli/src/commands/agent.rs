@@ -990,8 +990,8 @@ mod tests {
             "workspace",
             "--workspace",
             "workspace",
-            "--execution-kind",
-            "coding",
+            "--role",
+            "code",
         ])
         .expect("parse create");
         Cli::try_parse_from([

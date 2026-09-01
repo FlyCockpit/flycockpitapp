@@ -975,10 +975,11 @@ impl ProviderSetupActions {
         let snapshot = daemon
             .client
             .request(Request::GetProviderCatalogSnapshot {
-                project_root: global_config_dir()
-                    .context("resolving global config for provider setup")?
-                    .display()
-                    .to_string(),
+                // The daemon resolves the layer from the setup invocation's
+                // workspace, while retaining that workspace's trust policy.
+                // The global config directory is a write target, not a
+                // workspace root; on a fresh installation it need not exist.
+                project_root: self.cwd.display().to_string(),
                 // A first-time provider has no catalog row to filter by. The
                 // full layer snapshot still issues the exact CAS capability
                 // needed for an add or replacement.
@@ -1778,8 +1779,8 @@ mod tests {
         trust_workspace_via_daemon(tmp.path()).await;
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
         let mut io = ScriptIo::new(&[
-            "p", "p:m", "frontier", "trusted", "images", "", "", "none", "y", "skip", "", "", "",
-            "", "", "", "", "",
+            "p", "p:m", "frontier", "trusted", "images", "", "", "inherit", "y", "skip", "", "",
+            "", "", "", "", "", "",
         ]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 

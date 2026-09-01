@@ -663,7 +663,7 @@ fn secret_store_migrate_resumes_after_activation() {
     assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
     resume_kek_migrate(
         &db,
-        file_kek.clone(),
+        Some(file_kek.clone()),
         keyring_kek.clone(),
         SecretVaultPlacement::Keyring,
         &available_probe(),
@@ -693,7 +693,7 @@ fn secret_store_migrate_resumes_after_source_delete() {
     .unwrap_err();
     resume_kek_migrate(
         &db,
-        file_kek.clone(),
+        Some(file_kek.clone()),
         keyring_kek.clone(),
         SecretVaultPlacement::Keyring,
         &available_probe(),
@@ -745,7 +745,7 @@ fn resume_activated_database_migrate_rejects_available_keyring() {
     assert_eq!(file_kek.len(), 1);
     let err = resume_kek_migrate(
         &db,
-        keyring_kek.clone(),
+        Some(keyring_kek.clone()),
         file_kek.clone(),
         SecretVaultPlacement::Database,
         &available_probe(),
@@ -1431,6 +1431,57 @@ fn prepared_passphrase_to_keyring_migration_recovers_with_the_passphrase() {
         .expect("activated authority");
     assert_eq!(authority.active_placement, SecretVaultPlacement::Keyring);
     assert_eq!(authority.file_kek_mode, None);
+    assert!(
+        db.blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn activated_passphrase_to_keyring_migration_recovers_without_retired_passphrase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let keyring = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring.clone()),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(Passphrase::from_bytes(b"retired passphrase".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    let error = migrate_kek_placement(
+        first.vault.as_ref(),
+        keyring.clone(),
+        SecretVaultPlacement::Keyring,
+        &available_probe(),
+        &VaultFault::at(VaultFaultPoint::AfterActivation),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("AfterActivation"));
+
+    let recovered = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.placement, SecretStorePlacement::Keyring);
     assert!(
         db.blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
             .unwrap()

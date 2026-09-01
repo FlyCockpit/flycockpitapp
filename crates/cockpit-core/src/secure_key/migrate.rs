@@ -277,10 +277,13 @@ fn run_migrate_from_prepared(
 }
 
 /// Resume an incomplete migrate saga. Destination is authoritative only after
-/// the activation row says so.
+/// the activation row says so. `source` is required while the source can
+/// still contain a durable KEK; an activated passphrase source is already
+/// retired after a process restart and therefore needs no passphrase-derived
+/// store.
 pub fn resume_kek_migrate(
     db: &Db,
-    source: Arc<dyn KekStore>,
+    source: Option<Arc<dyn KekStore>>,
     dest: Arc<dyn KekStore>,
     dest_placement: SecretVaultPlacement,
     probe: &KeyringProbeResult,
@@ -295,11 +298,6 @@ pub fn resume_kek_migrate(
     if saga.dest_placement != dest_placement {
         return Err(SecureKeyError::Corrupt(
             "migration recovery destination does not match the durable saga".into(),
-        ));
-    }
-    if validate_store_mode(saga.source_placement, source.as_ref())? != saga.source_file_kek_mode {
-        return Err(SecureKeyError::Corrupt(
-            "migration recovery source KEK mode does not match the durable saga".into(),
         ));
     }
     if validate_store_mode(saga.dest_placement, dest.as_ref())? != saga.dest_file_kek_mode {
@@ -325,6 +323,7 @@ pub fn resume_kek_migrate(
     let kek_version = authority.kek_version;
     match saga.phase {
         SecretVaultSagaPhase::Prepared => {
+            let source = required_recovery_source(source, &saga)?;
             let kek = source.read_kek(kek_version)?.into_key_bytes()?;
             let vault = run_migrate_from_prepared(
                 db,
@@ -344,11 +343,14 @@ pub fn resume_kek_migrate(
             Ok(Some(vault))
         }
         SecretVaultSagaPhase::Activated => {
-            source.delete_kek(kek_version)?;
-            if source.kek_present(kek_version)? {
-                return Err(SecureKeyError::Corrupt(
-                    "source KEK still present after delete".into(),
-                ));
+            if !passphrase_source_is_already_retired(&saga) {
+                let source = required_recovery_source(source, &saga)?;
+                source.delete_kek(kek_version)?;
+                if source.kek_present(kek_version)? {
+                    return Err(SecureKeyError::Corrupt(
+                        "source KEK still present after delete".into(),
+                    ));
+                }
             }
             db.blocking_write_for_sync_maintenance({
                 let op_id = saga.op_id.clone();
@@ -366,6 +368,30 @@ pub fn resume_kek_migrate(
             Ok(Some(SecretVault::open(db.clone(), dest, installation)?))
         }
     }
+}
+
+fn passphrase_source_is_already_retired(
+    saga: &cockpit_db::secret_vault::SecretVaultSagaRow,
+) -> bool {
+    saga.source_placement == SecretVaultPlacement::Database
+        && saga.source_file_kek_mode == Some(SecretVaultFileKekMode::Passphrase)
+}
+
+fn required_recovery_source(
+    source: Option<Arc<dyn KekStore>>,
+    saga: &cockpit_db::secret_vault::SecretVaultSagaRow,
+) -> Result<Arc<dyn KekStore>, SecureKeyError> {
+    let source = source.ok_or_else(|| {
+        SecureKeyError::Corrupt(
+            "migration recovery requires the source KEK store for this saga phase".into(),
+        )
+    })?;
+    if validate_store_mode(saga.source_placement, source.as_ref())? != saga.source_file_kek_mode {
+        return Err(SecureKeyError::Corrupt(
+            "migration recovery source KEK mode does not match the durable saga".into(),
+        ));
+    }
+    Ok(source)
 }
 
 fn complete_saga_and_cleanup_passphrase_kdf(

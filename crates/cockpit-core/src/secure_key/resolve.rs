@@ -551,16 +551,6 @@ fn resume_open_kek_migrate(
     let Some(saga) = open.into_iter().next() else {
         return Ok(());
     };
-    let source = kek_store_for_vault(
-        db,
-        saga.source_placement,
-        saga.source_file_kek_mode,
-        kek_dir,
-        installation,
-        injected,
-        false,
-        passphrase,
-    )?;
     let dest = kek_store_for_vault(
         db,
         saga.dest_placement,
@@ -571,6 +561,41 @@ fn resume_open_kek_migrate(
         false,
         passphrase,
     )?;
+    // Before activation the source is still authoritative and must be opened
+    // to recover the KEK. After activation, a passphrase source has no
+    // durable KEK to retire: its `delete_kek` only clears a process-local
+    // derived value, which cannot survive the crash being recovered from.
+    // Other source stores still need opening in Activated to delete their
+    // durable KEK. SourceDeleted and Complete never need the retired store.
+    let source = match saga.phase {
+        cockpit_db::secret_vault::SecretVaultSagaPhase::Prepared => Some(kek_store_for_vault(
+            db,
+            saga.source_placement,
+            saga.source_file_kek_mode,
+            kek_dir,
+            installation,
+            injected,
+            false,
+            passphrase,
+        )?),
+        cockpit_db::secret_vault::SecretVaultSagaPhase::Activated
+            if !passphrase_source_is_already_retired(&saga) =>
+        {
+            Some(kek_store_for_vault(
+                db,
+                saga.source_placement,
+                saga.source_file_kek_mode,
+                kek_dir,
+                installation,
+                injected,
+                false,
+                passphrase,
+            )?)
+        }
+        cockpit_db::secret_vault::SecretVaultSagaPhase::Activated
+        | cockpit_db::secret_vault::SecretVaultSagaPhase::SourceDeleted
+        | cockpit_db::secret_vault::SecretVaultSagaPhase::Complete => None,
+    };
     super::migrate::resume_kek_migrate(
         db,
         source,
@@ -588,6 +613,13 @@ fn resume_open_kek_migrate(
         intent: placement_intent(saga.dest_placement),
     })?;
     Ok(())
+}
+
+fn passphrase_source_is_already_retired(
+    saga: &cockpit_db::secret_vault::SecretVaultSagaRow,
+) -> bool {
+    saga.source_placement == SecretVaultPlacement::Database
+        && saga.source_file_kek_mode == Some(SecretVaultFileKekMode::Passphrase)
 }
 
 fn kek_store_for_placement(

@@ -847,8 +847,10 @@ impl App {
             ControlApplied::ResponseMetricsTokenizer { confirm_id } => Some(confirm_id),
             _ => None,
         };
-        let refresh_session_setup_on_failure =
-            matches!(pending.applied, ControlApplied::SessionSetupToolSurface);
+        let refresh_session_setup_on_failure = matches!(
+            pending.applied,
+            ControlApplied::SessionSetupToolSurface { .. }
+        );
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -1108,7 +1110,10 @@ impl App {
                 self.record_primary_switch_confirmation(&name);
                 self.request_session_setup_snapshot_refresh();
             }
-            ControlApplied::SessionSetupToolSurface => {
+            ControlApplied::SessionSetupToolSurface { cache_break } => {
+                if cache_break && let Some(warning) = self.cache_break_warning() {
+                    self.push_plain(warning);
+                }
                 self.request_session_setup_snapshot_refresh();
             }
             ControlApplied::Multireview { kickoff } => {

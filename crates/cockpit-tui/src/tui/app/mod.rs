@@ -435,7 +435,9 @@ pub(crate) enum ControlApplied {
     PrimaryAgentSwitch {
         name: String,
     },
-    SessionSetupToolSurface,
+    SessionSetupToolSurface {
+        cache_break: bool,
+    },
     Multireview {
         kickoff: String,
     },

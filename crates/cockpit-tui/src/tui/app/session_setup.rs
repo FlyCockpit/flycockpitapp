@@ -121,13 +121,16 @@ impl App {
                 }
                 self.submit_session_setup_model_override(slot_id, choice_id);
             }
-            SessionSetupOutcome::SetToolSurface { override_json } => {
+            SessionSetupOutcome::SetToolSurface {
+                override_json,
+                cache_break,
+            } => {
                 if as_overlay {
                     self.overlay = Overlay::SessionSetup(pane);
                 } else {
                     self.session_setup_inline = Some(pane);
                 }
-                self.submit_session_setup_tool_surface(override_json);
+                self.submit_session_setup_tool_surface(override_json, cache_break);
             }
             SessionSetupOutcome::AddMcp {
                 scope,
@@ -194,16 +197,16 @@ impl App {
         self.request_session_setup_snapshot_refresh();
     }
 
-    fn submit_session_setup_tool_surface(&mut self, override_json: String) {
+    fn submit_session_setup_tool_surface(&mut self, override_json: String, cache_break: bool) {
         self.send_daemon_request(
             "/session-setup",
             cockpit_proto::Request::SetToolSurfaceOverride {
                 override_json,
                 persist_session: true,
-                prune_after_switch: false,
+                prune_after_switch: cache_break,
                 monty_nudge: None,
             },
-            ControlApplied::SessionSetupToolSurface,
+            ControlApplied::SessionSetupToolSurface { cache_break },
         );
     }
 

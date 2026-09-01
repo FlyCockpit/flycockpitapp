@@ -78,6 +78,7 @@ pub(crate) async fn resolve_vetted_egress(
         entry: entry.clone(),
         store,
         env: env.clone(),
+        rejected_refresh_generation: request.command_credential_generation(),
     });
     VettedTranscriptionEgress::new_with_headers_and_refresh(
         provider_id.to_string(),
@@ -109,6 +110,7 @@ struct CommandRefresh {
     entry: crate::config::providers::ProviderEntry,
     store: crate::credentials::CredentialStore,
     env: std::collections::HashMap<String, String>,
+    rejected_refresh_generation: Option<u64>,
 }
 
 /// A fully vetted provider route.  Keeping the transport and its audit
@@ -374,6 +376,7 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
                             .cloned()
                             .or_else(|| std::env::var(name).ok())
                     },
+                    refresh.rejected_refresh_generation,
                 )
                 .await
                 .map_err(|_| TranscriptionEgressError::Connect)?;

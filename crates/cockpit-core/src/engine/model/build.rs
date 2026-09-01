@@ -20,7 +20,7 @@ impl Model {
         lookup: F,
     ) -> Result<Self>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<String> + Send,
     {
         Self::from_config_with_sources(cfg, redact, lookup, |_| None, None)
     }
@@ -32,7 +32,7 @@ impl Model {
         store: crate::credentials::CredentialStore,
     ) -> Result<Self>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<String> + Send,
     {
         let secret_lookup = {
             let store = store.clone();
@@ -49,7 +49,7 @@ impl Model {
         store: Option<crate::credentials::CredentialStore>,
     ) -> Result<Self>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<String> + Send,
         S: Fn(&str) -> Option<String>,
     {
         let active: &ActiveModelRef = cfg.active_model.as_ref().context(
@@ -203,7 +203,7 @@ impl Model {
         lookup: F,
     ) -> Result<Self>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<String> + Send,
     {
         Self::for_provider_with_sources(cfg, provider_id, model_id, redact, lookup, |_| None, None)
     }
@@ -217,7 +217,7 @@ impl Model {
         store: crate::credentials::CredentialStore,
     ) -> Result<Self>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<String> + Send,
     {
         let secret_lookup = {
             let store = store.clone();
@@ -244,7 +244,7 @@ impl Model {
         store: Option<crate::credentials::CredentialStore>,
     ) -> Result<Self>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<String> + Send,
         S: Fn(&str) -> Option<String>,
     {
         let entry = cfg
@@ -325,7 +325,7 @@ pub(super) fn build_model(
     subagent_invokable: bool,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: impl Fn(&str) -> Option<String> + Send,
 ) -> Result<Model> {
     build_model_with_can_delegate(
         provider_id,
@@ -372,7 +372,7 @@ pub(super) fn build_model_with_can_delegate(
     computer_use: Option<crate::config::providers::ComputerUseCapability>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: impl Fn(&str) -> Option<String> + Send,
     secret_lookup: impl Fn(&str) -> Option<String>,
     store: Option<crate::credentials::CredentialStore>,
 ) -> Result<Model> {
@@ -605,6 +605,8 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         model: completion,
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        #[cfg(not(test))]
+        command_credential_generation: resolved.command_credential_generation,
         max_tokens,
         base_url: resolved.base_url.clone(),
         timeout: timeout.clone(),
@@ -747,6 +749,8 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         model: chatgpt::ResponsesCompletionModel::new(client, model_id).with_strict_tools(),
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        #[cfg(not(test))]
+        command_credential_generation: resolved.command_credential_generation,
         utility_token_limit,
         base_url: resolved.base_url.clone(),
         timeout: timeout.clone(),
@@ -949,6 +953,8 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         client,
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        #[cfg(not(test))]
+        command_credential_generation: resolved.command_credential_generation,
         utility_token_limit,
         wire_api: resolved_wire_api,
         // Set by production build sites via `Model::with_config_path`; absent

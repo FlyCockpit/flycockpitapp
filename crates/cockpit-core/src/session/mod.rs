@@ -1468,6 +1468,7 @@ impl Session {
         providers: &crate::config::providers::ProvidersConfig,
         provider_id: &str,
         env: &std::collections::HashMap<String, String>,
+        rejected_refresh_generation: Option<u64>,
     ) -> anyhow::Result<bool> {
         let Some(entry) = providers.providers.get(provider_id) else {
             return Ok(false);
@@ -1475,6 +1476,18 @@ impl Session {
         if entry.auth_command.is_none() {
             return Ok(false);
         }
+        let rejected_refresh_generation = {
+            #[cfg(not(test))]
+            {
+                Some(rejected_refresh_generation.context(
+                    "command-authenticated model is missing the credential generation used for its rejection",
+                )?)
+            }
+            #[cfg(test)]
+            {
+                rejected_refresh_generation
+            }
+        };
         let store = self.provider_credential_store(providers)?;
         crate::auth::command::resolve(
             provider_id,
@@ -1482,6 +1495,7 @@ impl Session {
             store,
             &|name| env.get(name).cloned(),
             true,
+            rejected_refresh_generation,
         )
         .await
         .map_err(crate::auth::command::refresh_failure)?;

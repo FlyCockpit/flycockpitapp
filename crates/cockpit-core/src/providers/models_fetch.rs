@@ -76,6 +76,12 @@ pub struct ResolvedRequest {
     /// request. Header names are request data and must not be used to infer
     /// credential ownership.
     pub(crate) is_codex_credential: bool,
+    /// Generation of the command credential that authenticated this exact
+    /// request. A 401/403 retry must present this value to the refresh path so
+    /// a late rejection can reuse a concurrent winner instead of re-running
+    /// the user's command.
+    #[cfg(not(test))]
+    pub(crate) command_credential_generation: Option<u64>,
     #[cfg(not(test))]
     pub(crate) origin: ResolvedProviderOrigin,
 }
@@ -90,6 +96,21 @@ impl fmt::Debug for ResolvedRequest {
         #[cfg(not(test))]
         debug.field("origin", &self.origin);
         debug.finish()
+    }
+}
+
+impl ResolvedRequest {
+    /// Returns the command-credential generation bound to this request. Unit
+    /// test literals intentionally omit production-only request provenance.
+    pub(crate) fn command_credential_generation(&self) -> Option<u64> {
+        #[cfg(not(test))]
+        {
+            self.command_credential_generation
+        }
+        #[cfg(test)]
+        {
+            None
+        }
     }
 }
 
@@ -212,8 +233,15 @@ pub async fn resolve_provider_request_async_with_store(
     store: crate::credentials::CredentialStore,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
-    resolve_provider_request_async_with_store_refresh(provider_id, entry, store, &env_lookup, false)
-        .await
+    resolve_provider_request_async_with_store_refresh(
+        provider_id,
+        entry,
+        store,
+        &env_lookup,
+        false,
+        None,
+    )
+    .await
 }
 
 /// Re-resolve a command-authenticated request after an explicit provider
@@ -226,13 +254,24 @@ pub async fn refresh_provider_request_async_with_store(
     entry: &ProviderEntry,
     store: crate::credentials::CredentialStore,
     env_lookup: impl Fn(&str) -> Option<String>,
+    rejected_refresh_generation: Option<u64>,
 ) -> Result<Option<ResolvedRequest>> {
     if entry.auth_command.is_none() {
         return Ok(None);
     }
-    resolve_provider_request_async_with_store_refresh(provider_id, entry, store, &env_lookup, true)
-        .await
-        .map(Some)
+    let rejected_refresh_generation = rejected_refresh_generation.context(
+        "command-authenticated request is missing the credential generation used for its rejection",
+    )?;
+    resolve_provider_request_async_with_store_refresh(
+        provider_id,
+        entry,
+        store,
+        &env_lookup,
+        true,
+        Some(rejected_refresh_generation),
+    )
+    .await
+    .map(Some)
 }
 
 async fn resolve_provider_request_async_with_store_refresh(
@@ -241,6 +280,7 @@ async fn resolve_provider_request_async_with_store_refresh(
     store: crate::credentials::CredentialStore,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match entry.auth_command.as_deref() {
@@ -251,11 +291,16 @@ async fn resolve_provider_request_async_with_store_refresh(
                 store.clone(),
                 env_lookup,
                 force_refresh,
+                rejected_refresh_generation,
             )
             .await?,
         ),
         None => None,
     };
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential
+        .as_ref()
+        .map(|credential| credential.refresh_generation);
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = if let Some(credential) = command_credential {
         Some(OAuthCredential::Command(credential))
@@ -271,14 +316,19 @@ async fn resolve_provider_request_async_with_store_refresh(
         }
     };
     let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
-    resolve_provider_request_inner_with_sources(
+    let mut request = resolve_provider_request_inner_with_sources(
         provider_id,
         entry,
         credential,
         registry.provider_for(provider_id, entry).request_kind(),
         env_lookup,
         &secret_lookup,
-    )
+    )?;
+    #[cfg(not(test))]
+    {
+        request.command_credential_generation = command_credential_generation;
+    }
+    Ok(request)
 }
 
 async fn resolve_model_list_request_async(
@@ -302,8 +352,15 @@ async fn resolve_model_list_request_async_with_store(
     let registry = ProviderRegistry::standard();
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
         (Some(_), Some(store)) => Some(
-            crate::auth::command::resolve(provider_id, entry, store.clone(), env_lookup, false)
-                .await?,
+            crate::auth::command::resolve(
+                provider_id,
+                entry,
+                store.clone(),
+                env_lookup,
+                false,
+                None,
+            )
+            .await?,
         ),
         (Some(_), None) => {
             anyhow::bail!(
@@ -312,6 +369,10 @@ async fn resolve_model_list_request_async_with_store(
         }
         (None, _) => None,
     };
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential
+        .as_ref()
+        .map(|credential| credential.refresh_generation);
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = if let Some(credential) = command_credential {
         Some(OAuthCredential::Command(credential))
@@ -334,9 +395,14 @@ async fn resolve_model_list_request_async_with_store(
             (None, _) => None,
         }
     };
-    registry
+    let mut request = registry
         .provider_for(provider_id, entry)
-        .model_list_request(provider_id, entry, resolved, credential, env_lookup)
+        .model_list_request(provider_id, entry, resolved, credential, env_lookup)?;
+    #[cfg(not(test))]
+    {
+        request.command_credential_generation = command_credential_generation;
+    }
+    Ok(request)
 }
 
 pub fn resolve_provider_request_blocking(
@@ -423,7 +489,7 @@ pub fn resolve_provider_request_blocking_with_store<F>(
     store: crate::credentials::CredentialStore,
 ) -> Result<ResolvedRequest>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&str) -> Option<String> + Send,
 {
     let registry = ProviderRegistry::standard();
     if entry.auth_command.is_none()
@@ -448,20 +514,23 @@ where
                 ))
             })
         }
-        Ok(_) => std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("build subscription-auth runtime")?
-                .block_on(resolve_provider_request_async_with_store(
-                    &provider_id_owned,
-                    &entry,
-                    store,
-                    |name| std::env::var(name).ok(),
-                ))
-        })
-        .join()
-        .map_err(|_| anyhow!("subscription-auth worker panicked"))?,
+        Ok(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("build subscription-auth runtime")?
+                        .block_on(resolve_provider_request_async_with_store(
+                            &provider_id_owned,
+                            &entry,
+                            store,
+                            |name| lookup(name),
+                        ))
+                })
+                .join()
+                .map_err(|_| anyhow!("subscription-auth worker panicked"))?
+        }),
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -645,6 +714,8 @@ fn resolve_provider_request_inner_with_sources(
         headers,
         is_codex_credential,
         #[cfg(not(test))]
+        command_credential_generation: None,
+        #[cfg(not(test))]
         origin,
     })
 }
@@ -701,6 +772,8 @@ pub(crate) fn resolve_codex_model_list_request(
         base_url: resolve_provider_base_url_with_env(provider_id, entry, false, lookup)?,
         headers,
         is_codex_credential: true,
+        #[cfg(not(test))]
+        command_credential_generation: None,
         #[cfg(not(test))]
         origin: ProviderRegistry::standard().resolve_origin(provider_id, entry)?,
     })
@@ -900,9 +973,18 @@ pub async fn fetch_models_for_provider_with_store(
         .is_err_and(|error| auth_rejection_error(error))
         && let (Some(_), Some(store)) = (entry.auth_command.as_deref(), auth_store)
     {
-        let credential =
-            crate::auth::command::resolve(provider_id, entry, store.clone(), &env_lookup, true)
-                .await?;
+        let rejected_generation = request.command_credential_generation().context(
+            "command-authenticated model-list request is missing its credential generation",
+        )?;
+        let credential = crate::auth::command::resolve(
+            provider_id,
+            entry,
+            store.clone(),
+            &env_lookup,
+            true,
+            Some(rejected_generation),
+        )
+        .await?;
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
         let refreshed = resolve_provider_request_inner_with_sources(
             provider_id,

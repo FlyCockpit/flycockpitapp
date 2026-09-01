@@ -1012,6 +1012,7 @@ impl SessionRegistry {
                 store.clone(),
                 &|name| std::env::var(name).ok(),
                 false,
+                None,
             )
             .await
             {

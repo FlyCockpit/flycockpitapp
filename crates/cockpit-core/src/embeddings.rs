@@ -26,7 +26,12 @@ pub struct OpenAiCompatEmbedder {
     model: String,
     expected_dimensions: Option<u32>,
     guard: OutboundGuard,
-    command_refresh: Option<(String, ProviderEntry, crate::credentials::CredentialStore)>,
+    command_refresh: Option<(
+        String,
+        ProviderEntry,
+        crate::credentials::CredentialStore,
+        Option<u64>,
+    )>,
 }
 
 impl OpenAiCompatEmbedder {
@@ -134,13 +139,19 @@ impl OpenAiCompatEmbedder {
             session_redact,
         );
         let guard = OutboundGuard::new(effective_redact);
+        let command_credential_generation = request.command_credential_generation();
         Ok(
             Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)
-                .with_command_refresh(
-                    store
-                        .filter(|_| entry.auth_command.is_some())
-                        .map(|store| (provider_id.to_string(), entry.clone(), store)),
-                ),
+                .with_command_refresh(store.filter(|_| entry.auth_command.is_some()).map(
+                    |store| {
+                        (
+                            provider_id.to_string(),
+                            entry.clone(),
+                            store,
+                            command_credential_generation,
+                        )
+                    },
+                )),
         )
     }
 
@@ -164,7 +175,12 @@ impl OpenAiCompatEmbedder {
 
     fn with_command_refresh(
         mut self,
-        command_refresh: Option<(String, ProviderEntry, crate::credentials::CredentialStore)>,
+        command_refresh: Option<(
+            String,
+            ProviderEntry,
+            crate::credentials::CredentialStore,
+            Option<u64>,
+        )>,
     ) -> Self {
         self.command_refresh = command_refresh;
         self
@@ -215,16 +231,19 @@ impl Embedder for OpenAiCompatEmbedder {
         ) {
             self.command_refresh
                 .as_ref()
-                .map(|(provider_id, entry, store)| (provider_id, entry, store))
+                .map(|(provider_id, entry, store, generation)| {
+                    (provider_id, entry, store, generation)
+                })
         } else {
             None
         };
-        let response = if let Some((provider_id, entry, store)) = refreshed {
+        let response = if let Some((provider_id, entry, store, generation)) = refreshed {
             let request = models_fetch::refresh_provider_request_async_with_store(
                 provider_id,
                 entry,
                 store.clone(),
                 |name| std::env::var(name).ok(),
+                *generation,
             )
             .await?;
             if let Some(request) = request {

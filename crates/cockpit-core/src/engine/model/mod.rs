@@ -485,6 +485,11 @@ pub enum Model {
         /// backup fallback (implementation note) exactly,
         /// regardless of any plan-level model override.
         provider_id: String,
+        /// Command-credential generation that authenticated this model's
+        /// outbound requests. Retained so a 401/403 can be bound to the
+        /// credential actually sent rather than whatever is cached later.
+        #[cfg(not(test))]
+        command_credential_generation: Option<u64>,
         /// Known upper bound for utility `max_tokens`, resolved from model or
         /// provider max-output/context capability metadata when available.
         utility_token_limit: Option<u64>,
@@ -560,6 +565,8 @@ pub enum Model {
         model_id: String,
         /// The configured provider id this model was built from.
         provider_id: String,
+        #[cfg(not(test))]
+        command_credential_generation: Option<u64>,
         /// Known upper bound for utility `max_tokens`, resolved from model or
         /// provider max-output/context capability metadata when available.
         utility_token_limit: Option<u64>,
@@ -602,6 +609,8 @@ pub enum Model {
         /// on [`Model::OpenAi`] — exact per-`(provider, model)` backup
         /// resolution (implementation note).
         provider_id: String,
+        #[cfg(not(test))]
+        command_credential_generation: Option<u64>,
         /// Explicit output limit resolved from catalog metadata, a model
         /// override, or a provider default. Native Anthropic rejects requests
         /// without this field, so construction fails before this can be absent.
@@ -947,6 +956,28 @@ impl Model {
             Model::OpenAi { provider_id, .. } => provider_id,
             Model::ChatGpt { provider_id, .. } => provider_id,
             Model::Anthropic { provider_id, .. } => provider_id,
+        }
+    }
+
+    /// The command credential generation sent by this model, if command
+    /// authentication constructed it. This is deliberately model-owned:
+    /// rejections can arrive after another request has refreshed the shared
+    /// credential store.
+    #[cfg(not(test))]
+    pub(crate) fn command_credential_generation(&self) -> Option<u64> {
+        match self {
+            Model::OpenAi {
+                command_credential_generation,
+                ..
+            }
+            | Model::ChatGpt {
+                command_credential_generation,
+                ..
+            }
+            | Model::Anthropic {
+                command_credential_generation,
+                ..
+            } => *command_credential_generation,
         }
     }
 

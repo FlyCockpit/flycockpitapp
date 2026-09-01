@@ -116,8 +116,18 @@ pub(crate) async fn rebuild_model_for_credentials(
     // (a) Eligibility + provider-scoped re-resolution: invalidate + re-resolve
     // ONLY the failing provider's owner-scoped command secret(s). Returns false
     // (⇒ no rebuild/retry) when this provider is not command-backed.
+    let rejected_refresh_generation = {
+        #[cfg(not(test))]
+        {
+            current_model.command_credential_generation()
+        }
+        #[cfg(test)]
+        {
+            None
+        }
+    };
     let reresolved = if session
-        .refresh_provider_auth_command(&providers, provider_id, &env)
+        .refresh_provider_auth_command(&providers, provider_id, &env, rejected_refresh_generation)
         .await?
     {
         true

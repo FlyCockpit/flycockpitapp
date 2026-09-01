@@ -270,6 +270,12 @@ impl HttpDeepfetchProbeClient {
     pub fn replace_resolved(&mut self, provider_id: String, request: ResolvedRequest) {
         self.resolved.insert(provider_id, request);
     }
+
+    pub fn command_credential_generation(&self, provider_id: &str) -> Option<u64> {
+        self.resolved
+            .get(provider_id)
+            .and_then(ResolvedRequest::command_credential_generation)
+    }
 }
 
 impl DeepfetchProbeClient for HttpDeepfetchProbeClient {

@@ -22117,17 +22117,31 @@ async fn daemon_deep_provider_fetch(
             &probe,
             Ok(crate::providers::deepfetch::DeepfetchApplyReport::Entitlement { .. })
         ) && let Some(entry) = config.providers.get(&target.provider_id)
-            && let Ok(Some(request)) =
-                crate::providers::models_fetch::refresh_provider_request_async_with_store(
-                    &target.provider_id,
-                    entry,
-                    store.clone(),
-                    |name| env.get(name).cloned(),
-                )
-                .await
         {
-            client.replace_resolved(target.provider_id.clone(), request);
-            probe = probe_target(&mut client, config, target).await;
+            match crate::providers::models_fetch::refresh_provider_request_async_with_store(
+                &target.provider_id,
+                entry,
+                store.clone(),
+                |name| env.get(name).cloned(),
+                client.command_credential_generation(&target.provider_id),
+            )
+            .await
+            {
+                Ok(Some(request)) => {
+                    client.replace_resolved(target.provider_id.clone(), request);
+                    probe = probe_target(&mut client, config, target).await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failures.insert(
+                        target.provider_id.clone(),
+                        crate::config::providers::redact_model_fetch_reason(
+                            crate::auth::command::refresh_failure(error).to_string(),
+                        ),
+                    );
+                    continue;
+                }
+            }
         }
         if let Err(error) = probe {
             failures.insert(

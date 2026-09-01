@@ -101,6 +101,7 @@ pub async fn check_provider_auth_with_store(
                     entry,
                     store,
                     |name| std::env::var(name).ok(),
+                    resolved.command_credential_generation(),
                 )
                 .await
                 .map_err(|error| AuthCheckError::Other(error.to_string()))?;

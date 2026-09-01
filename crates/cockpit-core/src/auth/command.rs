@@ -50,6 +50,11 @@ pub(crate) struct CommandCredential {
     pub expires_at: Option<i64>,
     #[serde(default)]
     pub headers: Option<BTreeMap<String, String>>,
+    /// The monotonically increasing generation of this cached command result.
+    /// This is process-local request metadata, never part of the command JSON
+    /// contract or persisted credential payload.
+    #[serde(skip)]
+    pub(crate) refresh_generation: u64,
 }
 
 /// The persisted command result is bound to the fully resolved argv and the
@@ -100,6 +105,7 @@ pub(crate) async fn resolve(
     store: CredentialStore,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
 ) -> Result<CommandCredential> {
     let command = entry
         .auth_command
@@ -114,6 +120,7 @@ pub(crate) async fn resolve(
         store,
         env_lookup,
         force_refresh,
+        rejected_refresh_generation,
         Arc::new(SubprocessCommandExecutor),
     )
     .await
@@ -127,6 +134,7 @@ async fn resolve_with_executor(
     store: CredentialStore,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
     executor: Arc<dyn CommandSecretExecutor>,
 ) -> Result<CommandCredential> {
     resolve_with_executor_for_configuration(
@@ -136,6 +144,7 @@ async fn resolve_with_executor(
         store,
         env_lookup,
         force_refresh,
+        rejected_refresh_generation,
         executor,
     )
     .await
@@ -148,22 +157,29 @@ async fn resolve_with_executor_for_configuration(
     store: CredentialStore,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
     executor: Arc<dyn CommandSecretExecutor>,
 ) -> Result<CommandCredential> {
     let argv = resolve_argv(command, &store, env_lookup)?;
     let configuration_identity = configuration_identity(&argv, provider_configuration);
     let key = provider_id.to_string();
-    let prior_refresh_generation = load_cached(&store, &key, &configuration_identity)?
-        .map(|credential| credential.refresh_generation);
     crate::auth::refresh_guard::serialized_refresh(&key, move || async move {
         let current = store.reopen()?;
         if let Some(cached) = load_cached(&current, &key, &configuration_identity)? {
-            let another_waiter_refreshed =
-                force_refresh && prior_refresh_generation != Some(cached.refresh_generation);
+            // A rejection is tied to the credential generation that actually
+            // left the process. A late 401 for generation N must reuse the
+            // winner's N+1 credential, even if it enters this lock after the
+            // winner has already completed.
+            let another_waiter_refreshed = force_refresh
+                && rejected_refresh_generation
+                    .is_some_and(|rejected| rejected != cached.refresh_generation);
             if another_waiter_refreshed
                 || (!force_refresh && !cached.credential.is_expired(unix_now()))
             {
-                return Ok(cached.credential);
+                return Ok(CommandCredential {
+                    refresh_generation: cached.refresh_generation,
+                    ..cached.credential
+                });
             }
         }
 
@@ -171,11 +187,12 @@ async fn resolve_with_executor_for_configuration(
             .run(&argv)
             .await
             .map_err(|error| anyhow::anyhow!("auth command failed: {}", error.code()))?;
-        let credential: CommandCredential =
+        let mut credential: CommandCredential =
             serde_json::from_str(&stdout).context("auth command returned malformed JSON")?;
         credential.validate()?;
         let refresh_generation = load_cached(&current, &key, &configuration_identity)?
             .map_or(1, |cached| cached.refresh_generation.saturating_add(1));
+        credential.refresh_generation = refresh_generation;
         let cached = CachedCommandCredential {
             configuration_identity,
             refresh_generation,
@@ -321,6 +338,7 @@ mod tests {
             store.clone(),
             &|_| None,
             false,
+            None,
             executor.clone(),
         )
         .await
@@ -345,6 +363,7 @@ mod tests {
             store.clone(),
             &|_| None,
             false,
+            None,
             malformed,
         )
         .await
@@ -362,6 +381,7 @@ mod tests {
             store,
             &|_| None,
             false,
+            None,
             failed,
         )
         .await
@@ -395,6 +415,7 @@ mod tests {
                     store,
                     &|_| None,
                     false,
+                    None,
                     executor,
                 )
                 .await
@@ -408,7 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_forced_refresh_reuses_the_winning_refresh() {
+    async fn late_rejection_for_prior_generation_reuses_the_winning_refresh() {
         let (_temp, mut store) = store();
         store.set(
             "custom-401",
@@ -432,12 +453,17 @@ mod tests {
                     store,
                     &|_| None,
                     true,
+                    Some(1),
                     executor,
                 )
                 .await
             }
         };
-        let (first, second) = tokio::join!(run(), run());
+        // Simulate request A refreshing while request B (sent with generation
+        // 1) is still in flight. B only observes its 401 after A has finished;
+        // its rejected-generation identity must still suppress another exec.
+        let first = run().await;
+        let second = run().await;
 
         assert_eq!(first.unwrap().token, "rejected");
         assert_eq!(second.unwrap().token, "rejected");
@@ -459,6 +485,7 @@ mod tests {
             store.clone(),
             &|_| None,
             false,
+            None,
             executor.clone(),
         )
         .await
@@ -470,6 +497,7 @@ mod tests {
             store,
             &|_| None,
             false,
+            None,
             executor.clone(),
         )
         .await

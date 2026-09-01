@@ -395,6 +395,7 @@ pub(super) fn build_model_with_can_delegate(
         crate::config::providers::WireApi::Responses => build_chatgpt_model_with_utility_limit(
             provider_id,
             &resolved,
+            resolved.is_codex_credential,
             model_id,
             utility_token_limit,
             timeout,
@@ -580,10 +581,10 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     let extra_headers = resolved
         .headers
         .iter()
-        .filter(|h| {
-            h.name
-                .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
-        })
+        // Rig owns the `x-api-key` it builds from below. Every other resolved
+        // header, including Authorization, is part of the configured native
+        // Anthropic request and must reach compatible gateways unchanged.
+        .filter(|h| !h.name.eq_ignore_ascii_case("x-api-key"))
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
     let client = builder
@@ -645,6 +646,7 @@ pub(super) fn build_chatgpt_model(
     build_chatgpt_model_with_utility_limit(
         provider_id,
         resolved,
+        resolved.is_codex_credential,
         model_id,
         None,
         timeout,
@@ -664,6 +666,7 @@ pub(super) fn build_chatgpt_model(
 pub(super) fn build_chatgpt_model_with_utility_limit(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
+    is_codex_credential: bool,
     model_id: &str,
     utility_token_limit: Option<u64>,
     timeout: &crate::config::providers::TimeoutConfig,
@@ -691,13 +694,19 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         .map(str::to_string)
         .context("Responses provider resolved request is missing Authorization bearer token")?;
 
-    let account_id = resolved
-        .headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case("chatgpt-account-id"))
-        .map(|h| h.value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let is_codex_credential = account_id.is_some();
+    let account_id = if is_codex_credential {
+        Some(
+            resolved
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("chatgpt-account-id"))
+                .map(|h| h.value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .context("Codex OAuth resolved request is missing chatgpt-account-id")?,
+        )
+    } else {
+        None
+    };
 
     // Rig's ChatGPT provider supplies Responses serialization. Codex
     // credential resolution adds its account and compatibility headers; a
@@ -705,7 +714,13 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     let extra_headers = resolved
         .headers
         .iter()
-        .filter(|h| !h.name.eq_ignore_ascii_case("authorization"))
+        // `session_id` is deliberately left to Rig, which generates a new
+        // request identifier for every request. A resolver-owned value would
+        // otherwise overwrite that per-request identifier.
+        .filter(|h| {
+            !h.name.eq_ignore_ascii_case("authorization")
+                && !h.name.eq_ignore_ascii_case("session_id")
+        })
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
@@ -940,10 +955,7 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         // here so the endpoint fallback's persist is best-effort/skipped for
         // tests + utility models.
         config_path: None,
-        live_wire_api: Arc::new(Mutex::new(LiveWireApiState::new(
-            wire_api,
-            wire_api_explicit,
-        ))),
+        live_wire_api: Arc::new(Mutex::new(LiveWireApiState::new(wire_api_explicit))),
         timeout: timeout.clone(),
         hard_timeout_on_stall,
         client_side_tools,

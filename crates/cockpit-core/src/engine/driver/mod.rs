@@ -2779,22 +2779,6 @@ impl Driver {
         self.schedule.set_redaction_table(table);
     }
 
-    fn refresh_wire_api_for_turn(&mut self) {
-        let providers = match self.live_providers_config() {
-            Ok(providers) => providers,
-            Err(error) => {
-                tracing::warn!(error = %error, "providers config unavailable while refreshing wire_api");
-                return;
-            }
-        };
-        for frame in &self.stack {
-            frame.agent.model.refresh_wire_api_config(&providers);
-        }
-        if let Some(model) = &self.model_override {
-            model.refresh_wire_api_config(&providers);
-        }
-    }
-
     fn active_frame_index(&self) -> Option<usize> {
         self.stack.len().checked_sub(1)
     }
@@ -4793,7 +4777,6 @@ impl Driver {
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_frame_for_turn(tx).await;
-        self.refresh_wire_api_for_turn();
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
@@ -11747,7 +11730,6 @@ impl Driver {
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_frame_for_turn(tx).await;
-        self.refresh_wire_api_for_turn();
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,
         // time prelude) and are reattached when the prompt `Message` is

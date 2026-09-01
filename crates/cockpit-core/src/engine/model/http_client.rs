@@ -110,6 +110,9 @@ fn apply_extra_headers<T>(
     strip_codex_headers: bool,
 ) -> rig::http_client::Request<T> {
     let (mut parts, body) = req.into_parts();
+    for (name, value) in headers {
+        parts.headers.insert(name.clone(), value.clone());
+    }
     if strip_codex_headers {
         for name in [
             "chatgpt-account-id",
@@ -119,9 +122,6 @@ fn apply_extra_headers<T>(
         ] {
             parts.headers.remove(name);
         }
-    }
-    for (name, value) in headers {
-        parts.headers.insert(name.clone(), value.clone());
     }
     rig::http_client::Request::from_parts(parts, body)
 }

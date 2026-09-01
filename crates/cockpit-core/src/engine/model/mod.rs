@@ -452,15 +452,13 @@ pub(crate) fn has_retained_native_computer_items() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct LiveWireApiState {
-    configured: crate::config::providers::WireApi,
     explicit: bool,
     session_confirmed: HashMap<String, crate::config::providers::WireApi>,
 }
 
 impl LiveWireApiState {
-    fn new(configured: crate::config::providers::WireApi, explicit: bool) -> Self {
+    fn new(explicit: bool) -> Self {
         Self {
-            configured,
             explicit,
             session_confirmed: HashMap::new(),
         }
@@ -506,10 +504,9 @@ pub enum Model {
         /// most once. `None` (tests / utility models) skips the persist; the
         /// fallback itself still works.
         config_path: Option<PathBuf>,
-        /// Live per-session endpoint state. The build-time `wire_api` remains
-        /// the diagnostic/default endpoint, but dispatch resolves through this
-        /// cell every turn so a confirmed self-heal and turn-boundary config
-        /// refresh apply without rebuilding the model.
+        /// Per-session endpoint-recovery state. The concrete `wire_api` stays
+        /// immutable for this model instance; a config change takes effect by
+        /// rebuilding at the turn boundary, including across `Model` variants.
         live_wire_api: LiveWireApi,
         /// Resolved inference-stream timeouts (TTFT + idle) for this
         /// `(provider, model)`
@@ -1171,26 +1168,6 @@ impl Model {
         }
     }
 
-    pub(crate) fn refresh_wire_api_config(
-        &self,
-        providers: &crate::config::providers::ProvidersConfig,
-    ) {
-        let Model::OpenAi {
-            provider_id,
-            model_id,
-            live_wire_api,
-            ..
-        } = self
-        else {
-            return;
-        };
-        let mut state = live_wire_api
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.configured = providers.resolve_wire_api(provider_id, model_id);
-        state.explicit = providers.is_wire_api_explicit(provider_id, model_id);
-    }
-
     pub(crate) fn with_live_wire_api(mut self, donor: &Self) -> Self {
         let Model::OpenAi {
             live_wire_api: fresh_live_wire_api,
@@ -1206,17 +1183,16 @@ impl Model {
         else {
             return self;
         };
-        let (configured, explicit) = {
+        let explicit = {
             let fresh_state = fresh_live_wire_api
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (fresh_state.configured, fresh_state.explicit)
+            fresh_state.explicit
         };
         {
             let mut donor_state = donor_live_wire_api
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            donor_state.configured = configured;
             donor_state.explicit = explicit;
         }
         *fresh_live_wire_api = donor_live_wire_api.clone();

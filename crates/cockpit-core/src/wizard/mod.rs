@@ -1099,7 +1099,8 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                         SelectOption {
                             id: "copy-detected-env".into(),
                             label: "Copy detected value".into(),
-                            description: "Copy a detected shell value into Cockpit's encrypted vault".into(),
+                            description:
+                                "Copy a detected shell value into Cockpit's encrypted vault".into(),
                         },
                     ],
                 },

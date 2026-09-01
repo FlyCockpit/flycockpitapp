@@ -1094,9 +1094,10 @@ impl SettingsDialog {
             .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
             .filter(|name| !name.starts_with("secret:"))
             .collect::<Vec<_>>();
-        let daemon_visibility_guidance = result.as_ref().err().and_then(|error| {
-            daemon_visibility_guidance(&referenced_environment, error)
-        });
+        let daemon_visibility_guidance = result
+            .as_ref()
+            .err()
+            .and_then(|error| daemon_visibility_guidance(&referenced_environment, error));
         let onboarding_validation = self
             .page
             .downcast_ref::<ProvidersPage>()
@@ -3585,10 +3586,7 @@ impl SettingsCx {
                         &self.host_capabilities,
                     );
                     let mut options = vec![
-                        (
-                            "Paste key".to_string(),
-                            format!("copy into {vault}"),
-                        ),
+                        ("Paste key".to_string(), format!("copy into {vault}")),
                         (
                             "Use env var".to_string(),
                             "keep a $VAR reference; the daemon validates visibility".to_string(),

@@ -862,9 +862,7 @@ impl ProviderSetupActions {
                     )
                 })?;
                 let value = zeroize::Zeroizing::new(std::env::var(variable).map_err(|_| {
-                    anyhow!(
-                        "${variable} disappeared before it could be copied; choose Paste key"
-                    )
+                    anyhow!("${variable} disappeared before it could be copied; choose Paste key")
                 })?);
                 if value.trim().is_empty() {
                     bail!("${variable} is empty; choose Paste key");
@@ -1116,7 +1114,9 @@ impl ProviderSetupActions {
                 allow_fallback: false,
             })
             .await?
-            .map_err(|error| anyhow!("daemon rejected provider credential validation: {error}{visibility_hint}"))?;
+            .map_err(|error| {
+                anyhow!("daemon rejected provider credential validation: {error}{visibility_hint}")
+            })?;
         let Response::ProviderModelsFetched { results, .. } = response else {
             bail!("daemon returned unexpected provider key test response: {response:?}");
         };

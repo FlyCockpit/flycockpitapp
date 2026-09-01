@@ -1974,6 +1974,26 @@ pub fn write_private_file_in_dir_fd(
     )
 }
 
+/// Same fd-anchored private publication as [`write_private_file_in_dir_fd`],
+/// but fail if `name` already exists. Callers that retain a directory authority
+/// across an ephemeral secret's full lifetime use this to avoid re-resolving
+/// the parent pathname.
+#[cfg(unix)]
+pub fn write_private_file_exclusive_in_dir_fd(
+    dir_fd: &std::fs::File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    write_private_file_in_held_dir(
+        dir_fd,
+        name,
+        display_path,
+        bytes,
+        PrivateWritePublish::Exclusive,
+    )
+}
+
 #[cfg(unix)]
 fn write_private_file_in_held_dir(
     dir_handle: &std::fs::File,

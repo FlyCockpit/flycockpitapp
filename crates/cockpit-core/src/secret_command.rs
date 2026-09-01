@@ -255,9 +255,10 @@ pub(crate) async fn run_injected_process(
 }
 
 /// Open the approved executable without following its final component and
-/// prove its persisted object identity. The returned descriptor remains alive
-/// until the child has been spawned; Linux executes it through `/proc/self/fd`,
-/// so replacing the stored pathname after approval cannot redirect the child.
+/// prove its persisted object identity and content digest. The returned
+/// descriptor remains alive until the child has been spawned; Linux executes
+/// it through `/proc/self/fd`, so replacing the stored pathname after approval
+/// cannot redirect the child.
 fn open_identity_pinned_executable(
     program: &str,
     identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
@@ -265,13 +266,13 @@ fn open_identity_pinned_executable(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(program)
             .map_err(map_spawn_error)?;
         if !identity
-            .matches(&file)
+            .matches(&mut file)
             .map_err(|error| CommandSecretError::Io(error.to_string()))?
         {
             return Err(CommandSecretError::Io("identity_pin_changed".to_string()));
@@ -284,14 +285,14 @@ fn open_identity_pinned_executable(
 
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(program)
             .map_err(map_spawn_error)?;
         if !identity
-            .matches(&file)
+            .matches(&mut file)
             .map_err(|error| CommandSecretError::Io(error.to_string()))?
         {
             return Err(CommandSecretError::Io("identity_pin_changed".to_string()));

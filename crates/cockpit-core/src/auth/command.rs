@@ -211,8 +211,7 @@ where
             .context("serializing provider auth-command configuration")?;
         let argv = resolve_argv(command, &store, env_lookup)?;
         let configuration_identity = configuration_identity(&argv, &provider_configuration);
-        let current = store.reopen()?;
-        if let Some(cached) = load_cached(&current, &refresh_key, &configuration_identity)? {
+        if let Some(cached) = load_cached(&store, &refresh_key, &configuration_identity)? {
             // A rejection is tied to the credential generation that actually
             // left the process. A late 401 for generation N must reuse the
             // winner's N+1 credential, even if it enters this lock after the
@@ -240,7 +239,7 @@ where
         let mut credential: CommandCredential =
             serde_json::from_str(&stdout).context("auth command returned malformed JSON")?;
         credential.validate()?;
-        let refresh_generation = load_cached(&current, &refresh_key, &configuration_identity)?
+        let refresh_generation = load_cached(&store, &refresh_key, &configuration_identity)?
             .map_or(1, |cached| cached.refresh_generation.saturating_add(1));
         credential.refresh_generation = refresh_generation;
         let cached = CachedCommandCredential {
@@ -248,7 +247,7 @@ where
             refresh_generation,
             credential: credential.clone(),
         };
-        current.save_record_merged(&refresh_key, serde_json::json!({ "auth_command": cached }))?;
+        store.save_record_merged(&refresh_key, serde_json::json!({ "auth_command": cached }))?;
         Ok((entry, credential))
     })
     .await
@@ -260,9 +259,8 @@ fn load_cached(
     configuration_identity: &str,
 ) -> Result<Option<CachedCommandCredential>> {
     store
-        .get(provider_id)
-        .and_then(|record| record.get("auth_command"))
-        .cloned()
+        .get_owned(provider_id)?
+        .and_then(|record| record.get("auth_command").cloned())
         .map(serde_json::from_value::<CachedCommandCredential>)
         .transpose()
         .context("cached auth-command credential is malformed")

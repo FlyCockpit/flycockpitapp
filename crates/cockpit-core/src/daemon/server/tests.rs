@@ -9652,6 +9652,214 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
 }
 
 #[tokio::test]
+async fn configured_legacy_logout_rejects_descriptor_record_without_deleting_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let victim = crate::auth::descriptor::credential_record_id("victim");
+    let providers = crate::config::providers::ProvidersConfig {
+        providers: std::collections::BTreeMap::from([(
+            "attacker".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "https://attacker.example.test/v1".into(),
+                auth: Some(crate::config::providers::AuthKind::OAuth),
+                credential_ref: Some(victim.clone()),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let ctx = Arc::new(
+        DaemonContext::new(
+            db,
+            locks,
+            unique_test_paths(false),
+            crate::daemon::terminal::test_host_factory(),
+            crate::daemon::config_source::ConfigSource::fixed(
+                providers,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        )
+        .with_credential_store_path(tmp.path().join("credentials.json")),
+    );
+
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set(&victim, serde_json::json!({"access_token": "victim-token"}));
+    store.save().unwrap();
+
+    trust_workspace_root(&ctx, tmp.path()).await;
+
+    let result = handle_request(
+        Request::DeleteProviderCredential {
+            client_operation_id: "reserved-legacy-logout".into(),
+            provider_id: "attacker".into(),
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+        },
+        &mut owner_state(),
+        &ctx,
+    )
+    .await;
+
+    let error =
+        result.expect_err("configured legacy logout must reject a descriptor record reference");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("reserved namespace"), "{error:?}");
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .get(&victim),
+        Some(&serde_json::json!({"access_token": "victim-token"})),
+        "the rejected logout must leave the descriptor record untouched"
+    );
+}
+
+fn provider_layer_revision_for_test(
+    ctx: &Arc<DaemonContext>,
+    target_path: &std::path::Path,
+    config: &crate::config::providers::ProvidersConfig,
+) -> String {
+    let bytes = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(target_path.to_string_lossy().as_ref(), config)).unwrap(),
+    );
+    crate::intel::hex_lower(
+        &ctx.secret_vault
+            .keyed_request_identity(b"flycockpit.provider-layer-revision.v1\0", bytes.as_slice()),
+    )
+}
+
+#[tokio::test]
+async fn provider_journal_recovery_preserves_reserved_descriptor_cleanup_single() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+    trust_workspace_root(&ctx, tmp.path()).await;
+
+    let victim = crate::auth::descriptor::credential_record_id("victim");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set(&victim, serde_json::json!({"access_token": "victim-token"}));
+    store.save().unwrap();
+
+    let target = cockpit_dir.join("config.json");
+    let intended = provider_layer_revision_for_test(
+        &ctx,
+        &target,
+        &crate::config::providers::ConfigDoc::load(&target)
+            .unwrap()
+            .providers(),
+    );
+    let journal_id = Uuid::now_v7().to_string();
+    let root_owned = root.clone();
+    let target_owned = target.to_string_lossy().into_owned();
+    let intended_owned = intended.clone();
+    let victim_cleanup = victim.clone();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO provider_config_journals
+                 (journal_id, project_root, provider_id, action, config_path,
+                  consumed_revision, intended_revision, consumed_config_generation,
+                  intended_config_generation, cleanup_named_json,
+                  cleanup_credential_json, created_at)
+                 VALUES (?1, ?2, 'victim', 'delete', ?3, ?4, ?4, 1, 2, '[]', ?5, ?6)",
+                rusqlite::params![
+                    journal_id,
+                    root_owned,
+                    target_owned,
+                    intended_owned,
+                    serde_json::to_string(&vec![victim_cleanup]).unwrap(),
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    recover_provider_config_journals(&ctx, &root, Some("victim"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .get(&victim),
+        Some(&serde_json::json!({"access_token": "victim-token"})),
+        "single-journal recovery must not delete reserved descriptor records from cleanup data"
+    );
+}
+
+#[tokio::test]
+async fn provider_journal_recovery_preserves_reserved_descriptor_cleanup_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+    trust_workspace_root(&ctx, tmp.path()).await;
+
+    let victim = crate::auth::descriptor::credential_record_id("victim");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set(&victim, serde_json::json!({"access_token": "victim-token"}));
+    store.save().unwrap();
+
+    let target = std::fs::canonicalize(cockpit_dir.join("config.json")).unwrap();
+    let config = crate::config::providers::ConfigDoc::load(&target)
+        .unwrap()
+        .providers();
+    let intended = provider_layer_revision_for_test(&ctx, &target, &config);
+    let payload = serde_json::json!({
+        "config": config,
+        "cleanup_credentials": { "victim": [victim.clone()] },
+        "inserted_named_claims": [],
+        "inserted_credential_claims": {}
+    });
+    let journal_id = Uuid::now_v7().to_string();
+    let root_owned = root.clone();
+    let intended_owned = intended.clone();
+    let target_owned = target.to_string_lossy().into_owned();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO provider_config_journals
+                 (journal_id, project_root, provider_id, action, config_path, consumed_revision,
+                  intended_revision, consumed_config_generation, intended_config_generation,
+                  entry_json, cleanup_named_json, cleanup_credential_json, created_at)
+                 VALUES (?1, ?2, '__provider_batch__', 'batch', ?3, ?4, ?4, 1, 2, ?5, '[]', '[]', ?6)",
+                rusqlite::params![
+                    journal_id,
+                    root_owned,
+                    target_owned,
+                    intended_owned,
+                    payload.to_string(),
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    recover_provider_config_journals(&ctx, &root, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .get(&victim),
+        Some(&serde_json::json!({"access_token": "victim-token"})),
+        "batch-journal recovery must not delete reserved descriptor records from cleanup data"
+    );
+}
+
+#[tokio::test]
 async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     let tmp = tempfile::tempdir().unwrap();
     let cockpit_dir = tmp.path().join(".cockpit");

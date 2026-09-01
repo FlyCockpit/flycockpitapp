@@ -39,6 +39,7 @@ pub(crate) enum OAuthCredential {
     Bearer(String),
     Codex(crate::auth::codex_oauth::StoredTokens),
     Command(crate::auth::command::CommandCredential),
+    Descriptor(crate::auth::descriptor::DescriptorCredential),
 }
 
 impl OAuthCredential {
@@ -47,6 +48,9 @@ impl OAuthCredential {
             OAuthCredential::Bearer(token) => token,
             OAuthCredential::Codex(tokens) => &tokens.access_token,
             OAuthCredential::Command(credential) => &credential.token,
+            OAuthCredential::Descriptor(_) => {
+                unreachable!("descriptor credentials map headers directly")
+            }
         }
     }
 }
@@ -337,7 +341,10 @@ impl ProviderRegistry {
         // stays on the OpenAI-compatible template path. A custom entry may
         // reuse a well-known id or URL without accidentally selecting one of
         // Cockpit's built-in OAuth implementations.
-        if entry.auth_command.is_some() || matches!(entry.auth, Some(AuthKind::Command)) {
+        if entry.auth_command.is_some()
+            || entry.oauth.is_some()
+            || matches!(entry.auth, Some(AuthKind::Command))
+        {
             return self.template.as_ref();
         }
         let mut matches = self

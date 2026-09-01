@@ -1,7 +1,9 @@
 use super::*;
 
 const OAUTH_BEGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const OAUTH_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+// Descriptor device-code grants can remain pending for fifteen minutes. Leave
+// a small bounded margin for the last token response and durable commit.
+const OAUTH_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
 const OAUTH_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OAUTH_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OAUTH_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -209,10 +211,12 @@ async fn complete_provider_oauth(
         input: input
             .map(|mut value| cockpit_proto::SensitiveWirePayload::new(std::mem::take(&mut *value))),
     };
-    let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
-    let response = match response {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => Ok(
+    let response = match client
+        .request_with_timeout(request, OAUTH_COMPLETE_TIMEOUT)
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(_) => Ok(
             match oauth_settlement(&client, client_operation_id.clone()).await {
                 Ok(response @ Ok(_)) => response,
                 Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),

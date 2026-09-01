@@ -48,6 +48,21 @@ pub fn provider_named_secret_references(
         .collect()
 }
 
+/// Every public provider credential-record id referenced by this config.
+/// Reserved descriptor/OAuth ids are excluded; those resolve only through the
+/// typed auth paths for their owning provider kind.
+pub fn provider_credential_record_references(
+    providers: &ProvidersConfig,
+) -> std::collections::BTreeSet<String> {
+    providers
+        .providers
+        .values()
+        .filter_map(|entry| entry.credential_ref.as_ref())
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
+        .cloned()
+        .collect()
+}
+
 /// Every named-secret id (`$secret:NAME`) referenced by the headers of ONLY the
 /// `provider_id` entry. Scoped to a single provider so a credentials failure on
 /// one provider re-resolves that provider's command secret(s) and never a
@@ -130,7 +145,8 @@ pub fn redact_provider_view(
             .map(|(id, entry)| {
                 let credential_configured = entry.credential_ref.is_some()
                     || !entry.headers.is_empty()
-                    || entry.auth_command.is_some();
+                    || entry.auth_command.is_some()
+                    || entry.oauth.is_some();
                 let headers = entry
                     .headers
                     .iter()

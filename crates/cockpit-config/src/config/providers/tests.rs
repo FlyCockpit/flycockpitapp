@@ -984,6 +984,7 @@ fn round_trips_a_provider_entry() {
             credential_ref: None,
             auth: Some(AuthKind::ApiKey),
             auth_command: None,
+            oauth: None,
             trust: None,
             location: None,
             quality_rank: None,
@@ -2197,6 +2198,34 @@ fn backup_skipped_on_serialize_when_unset_and_round_trips() {
     assert!(json.contains("\"backup\""));
     let back: ProviderEntry = serde_json::from_str(&json).unwrap();
     assert_eq!(back.backup, set.backup);
+}
+
+#[test]
+fn declarative_oauth_descriptor_round_trips() {
+    let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+        "url": "https://api.example.test/v1",
+        "auth": "oauth",
+        "oauth": {
+            "flow": "pkce_browser",
+            "authorize_endpoint": "https://login.example.test/authorize",
+            "token_endpoint": "https://login.example.test/token",
+            "refresh_endpoint": "https://login.example.test/refresh",
+            "client_id": "native-client",
+            "scopes": ["openid", "offline_access"],
+            "redirect_uri": "http://127.0.0.1:8765/callback",
+            "headers": [
+                {"name": "Authorization", "value": "Bearer {access_token}"},
+                {"name": "X-Account", "value": "{account_id}"}
+            ]
+        }
+    }))
+    .unwrap();
+
+    let descriptor = entry.oauth.as_ref().unwrap();
+    assert_eq!(descriptor.flow, OAuthFlowKind::PkceBrowser);
+    assert!(descriptor.validate().is_ok());
+    let serialized = serde_json::to_value(&entry).unwrap();
+    assert_eq!(serialized["oauth"]["scopes"][1], "offline_access");
 }
 
 /// Minimal `ModelEntry` for the merge tests.

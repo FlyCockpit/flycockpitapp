@@ -161,6 +161,9 @@ pub fn resolve_provider_request(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
+    if entry.oauth.is_some() {
+        anyhow::bail!("provider `{provider_id}` OAuth requires an injected credential store");
+    }
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     if let Some(message) = provider.auth_resolution_error(false) {
@@ -177,6 +180,9 @@ pub fn resolve_provider_request_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    if entry.oauth.is_some() {
+        anyhow::bail!("provider `{provider_id}` OAuth requires an injected credential store");
+    }
     resolve_provider_request_with_sources(provider_id, entry, lookup, |_| None)
 }
 
@@ -209,14 +215,16 @@ pub async fn resolve_provider_request_async(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
-    if entry.auth_command.is_some() {
+    if entry.auth_command.is_some() || entry.oauth.is_some() {
         anyhow::bail!(
-            "provider `{provider_id}` auth_command requires an injected credential store"
+            "provider `{provider_id}` configured authentication requires an injected credential store"
         );
     }
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.auth_resolution_error(false) {
+    if entry.oauth.is_none()
+        && let Some(message) = provider.auth_resolution_error(false)
+    {
         anyhow::bail!(message);
     }
     if provider.credential_kind().is_some() {
@@ -242,11 +250,9 @@ pub async fn resolve_provider_request_async_with_store(
     .await
 }
 
-/// Re-resolve a command-authenticated request after an explicit provider
-/// rejection.  The environment lookup is deliberately supplied by the caller:
-/// it is part of the resolved command argv and therefore part of the command
-/// credential's configuration identity.  Do not replace it with the daemon's
-/// ambient environment on refresh.
+/// Re-resolve a dynamically authenticated request after an explicit provider
+/// rejection. The environment lookup remains caller-supplied because it is
+/// part of an auth-command argv identity; descriptors ignore it.
 pub async fn refresh_provider_request_async_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
@@ -254,19 +260,28 @@ pub async fn refresh_provider_request_async_with_store(
     env_lookup: impl Fn(&str) -> Option<String> + Sync,
     rejected_refresh_generation: Option<u64>,
 ) -> Result<Option<ResolvedRequest>> {
-    if entry.auth_command.is_none() {
+    if entry.auth_command.is_none() && entry.oauth.is_none() {
         return Ok(None);
     }
-    let rejected_refresh_generation = rejected_refresh_generation.context(
-        "command-authenticated request is missing the credential generation used for its rejection",
-    )?;
+    let rejected_refresh_generation = {
+        #[cfg(not(test))]
+        {
+            Some(rejected_refresh_generation.context(
+                "dynamically authenticated request is missing the credential generation used for its rejection",
+            )?)
+        }
+        #[cfg(test)]
+        {
+            rejected_refresh_generation
+        }
+    };
     resolve_provider_request_async_with_store_refresh(
         provider_id,
         entry,
         store,
         &env_lookup,
         true,
-        Some(rejected_refresh_generation),
+        rejected_refresh_generation,
     )
     .await
     .map(Some)
@@ -327,9 +342,15 @@ async fn resolve_provider_request_async_with_store_refresh(
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
 ) -> Result<ResolvedRequest> {
+    anyhow::ensure!(
+        entry.auth_command.is_none() || entry.oauth.is_none(),
+        "provider `{provider_id}` cannot configure both auth_command and oauth"
+    );
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.auth_resolution_error(true) {
+    if entry.oauth.is_none()
+        && let Some(message) = provider.auth_resolution_error(true)
+    {
         anyhow::bail!(message);
     }
     let command_credential = match entry.auth_command.as_deref() {
@@ -346,13 +367,33 @@ async fn resolve_provider_request_async_with_store_refresh(
         ),
         None => None,
     };
+    let descriptor_credential = match entry.oauth.as_ref() {
+        Some(descriptor) if command_credential.is_none() => Some(
+            crate::auth::descriptor::resolve(
+                provider_id,
+                descriptor,
+                store.clone(),
+                force_refresh,
+                rejected_refresh_generation,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     #[cfg(not(test))]
     let command_credential_generation = command_credential
         .as_ref()
-        .map(|credential| credential.refresh_generation);
+        .map(|credential| credential.refresh_generation)
+        .or_else(|| {
+            descriptor_credential
+                .as_ref()
+                .map(|credential| credential.refresh_generation)
+        });
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = if let Some(credential) = command_credential {
         Some(OAuthCredential::Command(credential))
+    } else if let Some(credential) = descriptor_credential {
+        Some(OAuthCredential::Descriptor(credential))
     } else {
         match credential_kind {
             Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
@@ -400,9 +441,10 @@ async fn resolve_model_list_request_async_with_store(
     env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if let Some(message) = registry
-        .provider_for(provider_id, entry)
-        .auth_resolution_error(store.is_some())
+    if entry.oauth.is_none()
+        && let Some(message) = registry
+            .provider_for(provider_id, entry)
+            .auth_resolution_error(store.is_some())
     {
         anyhow::bail!(message);
     }
@@ -425,13 +467,36 @@ async fn resolve_model_list_request_async_with_store(
         }
         (None, _) => None,
     };
+    let descriptor_credential = match (entry.oauth.as_ref(), store.as_ref()) {
+        (Some(descriptor), Some(store)) if command_credential.is_none() => Some(
+            crate::auth::descriptor::resolve(
+                provider_id,
+                descriptor,
+                (*store).clone(),
+                false,
+                None,
+            )
+            .await?,
+        ),
+        (Some(_), None) => {
+            anyhow::bail!("provider `{provider_id}` OAuth requires an injected credential store")
+        }
+        _ => None,
+    };
     #[cfg(not(test))]
     let command_credential_generation = command_credential
         .as_ref()
-        .map(|credential| credential.refresh_generation);
+        .map(|credential| credential.refresh_generation)
+        .or_else(|| {
+            descriptor_credential
+                .as_ref()
+                .map(|credential| credential.refresh_generation)
+        });
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = if let Some(credential) = command_credential {
         Some(OAuthCredential::Command(credential))
+    } else if let Some(credential) = descriptor_credential {
+        Some(OAuthCredential::Descriptor(credential))
     } else {
         match (credential_kind, store) {
             (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => {
@@ -469,6 +534,7 @@ pub fn resolve_provider_request_blocking(
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     if entry.auth_command.is_none()
+        && entry.oauth.is_none()
         && registry
             .provider_for(provider_id, entry)
             .credential_kind()
@@ -530,6 +596,7 @@ where
 {
     let registry = ProviderRegistry::standard();
     if entry.auth_command.is_none()
+        && entry.oauth.is_none()
         && registry
             .provider_for(provider_id, entry)
             .credential_kind()
@@ -551,6 +618,7 @@ where
 {
     let registry = ProviderRegistry::standard();
     if entry.auth_command.is_none()
+        && entry.oauth.is_none()
         && registry
             .provider_for(provider_id, entry)
             .credential_kind()
@@ -627,6 +695,9 @@ fn resolve_provider_request_inner_with_sources(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    if let Some(reference) = entry.credential_ref.as_deref() {
+        crate::auth::descriptor::ensure_public_credential_record_id(reference)?;
+    }
     if matches!(
         entry.auth,
         Some(crate::config::providers::AuthKind::Command)
@@ -693,7 +764,11 @@ fn resolve_provider_request_inner_with_sources(
     }
 
     let is_codex_credential = matches!(&oauth_credential, Some(OAuthCredential::Codex(_)));
-    if let Some(credential) = oauth_credential {
+    if let Some(OAuthCredential::Descriptor(credential)) = oauth_credential {
+        for (name, value) in credential.headers {
+            merge_header_override(&mut headers, ResolvedHeader { name, value });
+        }
+    } else if let Some(credential) = oauth_credential {
         let token = credential.access_token().to_string();
         headers.push(ResolvedHeader {
             name: "Authorization".to_string(),
@@ -725,6 +800,7 @@ fn resolve_provider_request_inner_with_sources(
                 }
             }
             OAuthCredential::Bearer(_) => {}
+            OAuthCredential::Descriptor(_) => unreachable!(),
         }
     } else if let Some(auth) = auth_header {
         headers.push(auth);
@@ -1029,12 +1105,13 @@ pub async fn fetch_models_for_provider_with_store(
     if outcome
         .as_ref()
         .is_err_and(|error| auth_rejection_error(error))
-        && let (Some(_), Some(store)) = (entry.auth_command.as_deref(), auth_store)
+        && (entry.auth_command.is_some() || entry.oauth.is_some())
+        && let Some(store) = auth_store
     {
         let rejected_generation = request.command_credential_generation().context(
-            "command-authenticated model-list request is missing its credential generation",
+            "dynamically authenticated model-list request is missing its credential generation",
         )?;
-        let credential = crate::auth::command::resolve(
+        let refreshed = resolve_provider_request_async_with_store_refresh(
             provider_id,
             entry,
             store.clone(),
@@ -1043,15 +1120,6 @@ pub async fn fetch_models_for_provider_with_store(
             Some(rejected_generation),
         )
         .await?;
-        let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
-        let refreshed = resolve_provider_request_inner_with_sources(
-            provider_id,
-            entry,
-            Some(OAuthCredential::Command(credential)),
-            ProviderRequestKind::Template,
-            &env_lookup,
-            &secret_lookup,
-        )?;
         let refreshed_url = provider.models_url(entry, &refreshed.base_url);
         outcome = fetch_models_at_detailed(
             &refreshed_url,
@@ -3398,6 +3466,46 @@ mod tests {
         assert!(
             !crate::credentials::default_path().unwrap().exists(),
             "models_fetch must read named secrets from the vault"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_request_rejects_legacy_reserved_ref_without_loading_reserved_victim() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        let victim = crate::auth::descriptor::credential_record_id("victim");
+        vault
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                &victim,
+                b"{not-json-reserved-victim",
+            )
+            .unwrap();
+        let entry = crate::config::providers::ProviderEntry {
+            url: "https://example.test/v1".into(),
+            auth: Some(crate::config::providers::AuthKind::OAuth),
+            credential_ref: Some(victim.clone()),
+            ..crate::config::providers::ProviderEntry::default()
+        };
+        let providers = crate::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([("attacker".into(), entry.clone())]),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
+            vault,
+            "/ws/test",
+            &crate::secret_ref::provider_named_secret_references(&providers),
+            Some(&std::collections::BTreeSet::new()),
+            &crate::secret_ref::provider_credential_record_references(&providers),
+        )
+        .unwrap();
+
+        let error = resolve_provider_request_async_with_store("attacker", &entry, store, |_| None)
+            .await
+            .expect_err("legacy reserved refs must be rejected at the request boundary");
+        assert!(
+            error.to_string().contains("reserved namespace"),
+            "request must fail on the reserved ref, not while loading an unrelated reserved record: {error:#}"
         );
     }
 

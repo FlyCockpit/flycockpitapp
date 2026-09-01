@@ -85,17 +85,18 @@ pub(crate) async fn resolve_vetted_egress(
         return Ok(None);
     }
     let fingerprint = crate::image_sidecar::CredentialFingerprint::from_identity(authorization);
-    let command_refresh = entry.auth_command.as_ref().map(|_| CommandRefresh {
-        provider_id: provider_id.to_string(),
-        config: config.live(),
-        configured_generation: config_generation,
-        store,
-        env: env.clone(),
-        state: Arc::new(Mutex::new(CommandRequestState {
-            headers: HeaderMap::new(),
-            rejected_refresh_generation: request.command_credential_generation(),
-        })),
-    });
+    let command_refresh =
+        (entry.auth_command.is_some() || entry.oauth.is_some()).then(|| CommandRefresh {
+            provider_id: provider_id.to_string(),
+            config: config.live(),
+            configured_generation: config_generation,
+            store,
+            env: env.clone(),
+            state: Arc::new(Mutex::new(CommandRequestState {
+                headers: HeaderMap::new(),
+                rejected_refresh_generation: request.command_credential_generation(),
+            })),
+        });
     VettedTranscriptionEgress::new_with_headers_and_refresh(
         provider_id.to_string(),
         origin.as_str(),
@@ -149,11 +150,11 @@ impl CommandRefresh {
             .providers
             .providers
             .get(&self.provider_id)
-            .filter(|entry| entry.auth_command.is_some())
+            .filter(|entry| entry.auth_command.is_some() || entry.oauth.is_some())
             .cloned()
             .with_context(|| {
                 format!(
-                    "provider `{}` no longer has a global auth_command authorized for transcription refresh",
+                    "provider `{}` no longer has global dynamic authentication authorized for transcription refresh",
                     self.provider_id
                 )
             })

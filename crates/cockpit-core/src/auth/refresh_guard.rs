@@ -23,6 +23,13 @@ fn lock_for(key: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Acquire the shared credential mutation lock for a caller that must keep a
+/// larger transaction (such as an OAuth flow fence plus credential write)
+/// atomic with refresh. Callers reload the record after acquiring it.
+pub(crate) async fn serialized_refresh_lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    lock_for(key).lock_owned().await
+}
+
 /// Serialize an arbitrary credential refresh by credential-store key. The
 /// caller must re-open and re-check its credential after entering `refresh`;
 /// that double-check is what lets concurrent waiters reuse the winner's value.
@@ -31,8 +38,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
-    let lock = lock_for(key);
-    let _guard = lock.lock().await;
+    let _guard = serialized_refresh_lock(key).await;
     refresh().await
 }
 
@@ -161,7 +167,6 @@ where
     let lock = lock_for(key);
     let _guard = lock.lock().await;
 
-    let store = store.reopen()?;
     let tokens = load_tokens_from_store(&store, key, parse_context, missing_auth_error)?;
     let now = unix_now();
     if !needs_refresh(&tokens, now) {
@@ -171,7 +176,6 @@ where
     let attempted_refresh_token = refresh_token(&tokens).to_string();
     match refresh(tokens.clone()).await {
         Ok(fresh) => {
-            let store = store.reopen()?;
             let latest =
                 load_tokens_from_store(&store, key, parse_context, missing_auth_error).ok();
             let previous = latest.as_ref().unwrap_or(&tokens);
@@ -180,10 +184,11 @@ where
             Ok(merged)
         }
         Err(e) if is_terminal_refresh_error(&e) => {
-            let store = store.reopen()?;
             let latest = store
-                .get(key)
-                .and_then(|raw| serde_json::from_value::<T>(raw.clone()).ok());
+                .get_owned(key)
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_value::<T>(raw).ok());
             if let Some(latest) = latest
                 && refresh_token(&latest) != attempted_refresh_token
             {
@@ -210,8 +215,8 @@ where
     T: DeserializeOwned,
     Missing: Fn() -> anyhow::Error,
 {
-    let raw = store.get(key).ok_or_else(missing_auth_error)?;
-    serde_json::from_value(raw.clone()).context(parse_context)
+    let raw = store.get_owned(key)?.ok_or_else(missing_auth_error)?;
+    serde_json::from_value(raw).context(parse_context)
 }
 
 fn unix_now() -> i64 {

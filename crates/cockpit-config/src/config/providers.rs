@@ -79,6 +79,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "credential_ref",
     "auth",
     "auth_command",
+    "oauth",
     "trust",
     "location",
     "quality_rank",
@@ -492,6 +493,13 @@ pub struct ProviderEntry {
         deserialize_with = "deserialize_optional_nonempty_argv"
     )]
     pub auth_command: Option<Vec<String>>,
+
+    /// Declarative OAuth flow for custom subscription providers. Unlike
+    /// `auth_command`, this contains only data: Cockpit owns the device-code
+    /// or PKCE exchange, persists the returned token document in the
+    /// credential store, and renders selected response fields into headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthDescriptor>,
 
     /// Product-facing trust policy. `trusted` disables outbound request
     /// redaction for models inheriting it; `untrusted` keeps the session
@@ -1057,6 +1065,83 @@ impl CacheRetentionProfile {
 pub struct HeaderSpec {
     pub name: String,
     pub value: String,
+}
+
+/// OAuth flows supported by the declarative provider runner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlowKind {
+    DeviceCode,
+    PkceBrowser,
+}
+
+/// Pure-data description of a custom provider's OAuth endpoints and token
+/// projection. Header values interpolate top-level token-response fields with
+/// `{field_name}` placeholders, for example `Bearer {access_token}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthDescriptor {
+    pub flow: OAuthFlowKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_endpoint: Option<String>,
+    pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_endpoint: Option<String>,
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+    pub headers: Vec<OAuthHeaderMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthHeaderMapping {
+    pub name: String,
+    pub value: String,
+}
+
+impl OAuthDescriptor {
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.client_id.is_empty() || self.token_endpoint.is_empty() {
+            return Err("OAuth client_id and token_endpoint must not be empty");
+        }
+        match self.flow {
+            OAuthFlowKind::DeviceCode
+                if self.device_endpoint.as_deref().unwrap_or("").is_empty() =>
+            {
+                return Err("device-code OAuth requires device_endpoint");
+            }
+            OAuthFlowKind::PkceBrowser
+                if self.authorize_endpoint.as_deref().unwrap_or("").is_empty()
+                    || self.redirect_uri.as_deref().unwrap_or("").is_empty() =>
+            {
+                return Err("PKCE browser OAuth requires authorize_endpoint and redirect_uri");
+            }
+            _ => {}
+        }
+        if self.headers.is_empty()
+            || self
+                .headers
+                .iter()
+                .any(|header| header.name.is_empty() || header.value.is_empty())
+        {
+            return Err("OAuth headers must contain non-empty name/value mappings");
+        }
+        let mut normalized_header_names = std::collections::BTreeSet::new();
+        for header in &self.headers {
+            if reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
+                || reqwest::header::HeaderValue::from_str(&header.value).is_err()
+            {
+                return Err("OAuth headers must contain valid HTTP header mappings");
+            }
+            if !normalized_header_names.insert(header.name.to_ascii_lowercase()) {
+                return Err("OAuth headers must not contain duplicate names");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

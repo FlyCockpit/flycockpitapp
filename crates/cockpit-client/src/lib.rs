@@ -710,6 +710,21 @@ impl DaemonClient {
         &self,
         request: Request,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        self.request_with_timeout(request, REQUEST_TIMEOUT).await
+    }
+
+    /// Send a request with a caller-selected response deadline.
+    ///
+    /// Most daemon operations use [`Self::request`]'s short default deadline.
+    /// Operations whose protocol explicitly includes a user wait, such as a
+    /// device-code approval poll, must opt into a deadline that covers their
+    /// documented lifetime. Timing out here only stops waiting for the reply;
+    /// it does not cancel daemon-side work.
+    pub async fn request_with_timeout(
+        &self,
+        request: Request,
+        response_timeout: Duration,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let (tx, rx) = oneshot::channel();
         #[cfg(unix)]
         let id = Uuid::now_v7();
@@ -724,12 +739,12 @@ impl DaemonClient {
                     })))
                     .await
                     .map_err(|_| anyhow!("daemon client task has stopped"))?;
-                match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                match tokio::time::timeout(response_timeout, rx).await {
                     Ok(Ok(result)) => Ok(result),
                     Ok(Err(_)) => Err(anyhow!("daemon client dropped reply channel")),
                     Err(_) => {
                         let _ = request_tx.send(IoCommand::Cancel { id }).await;
-                        Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT))
+                        Err(anyhow!("request timed out after {:?}", response_timeout))
                     }
                 }
             }
@@ -738,10 +753,10 @@ impl DaemonClient {
                     .send(InProcessRequest { request, reply: tx })
                     .await
                     .map_err(|_| anyhow!("in-process daemon client task has stopped"))?;
-                match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                match tokio::time::timeout(response_timeout, rx).await {
                     Ok(Ok(result)) => Ok(result),
                     Ok(Err(_)) => Err(anyhow!("in-process daemon client dropped reply channel")),
-                    Err(_) => Err(anyhow!("request timed out after {:?}", REQUEST_TIMEOUT)),
+                    Err(_) => Err(anyhow!("request timed out after {:?}", response_timeout)),
                 }
             }
         }
@@ -1581,6 +1596,46 @@ mod tests {
             .expect("full event queue must not block request handling");
         assert!(matches!(response, Response::DaemonStatus { .. }));
         daemon_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_selected_request_timeout_outlives_the_default_deadline() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let (received_tx, received_rx) = oneshot::channel();
+
+        let daemon_task = tokio::spawn(async move {
+            let id = recv_request_id(&mut daemon).await;
+            received_tx.send(()).expect("test receives request");
+            tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            daemon
+                .send(&Envelope::response(id, daemon_status_response()))
+                .await
+                .expect("test daemon sends delayed response");
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_with_timeout(
+                        Request::DaemonStatus,
+                        REQUEST_TIMEOUT + Duration::from_secs(2),
+                    )
+                    .await
+            }
+        });
+
+        received_rx.await.expect("request reaches daemon");
+        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+
+        let response = request
+            .await
+            .expect("request task joins")
+            .expect("custom deadline accepts delayed response")
+            .expect("daemon response succeeds");
+        assert!(matches!(response, Response::DaemonStatus { .. }));
+        daemon_task.await.expect("daemon task joins");
     }
 
     #[tokio::test(start_paused = true)]

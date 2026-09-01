@@ -1349,6 +1349,10 @@ pub const MAX_OWNER_SECRET_VALUE_BYTES: usize = 256 * 1024;
 pub const MAX_OWNER_PROVIDER_ID_BYTES: usize = 256;
 pub const MAX_OWNER_PROVIDER_RECORD_BYTES: usize = 512 * 1024;
 pub const RESERVED_OWNER_PROVIDER_ID_PREFIX: &str = "subscription-oauth-ack:";
+/// Reserved for daemon-owned declarative OAuth token records. Generic provider
+/// credential mutations receive user-facing provider ids and must not reach
+/// this private record namespace.
+pub const RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX: &str = "descriptor-oauth:";
 /// Inventory item ids include the reserved subscription-ack prefix. Keep the
 /// cursor decoder large enough for the longest valid id in any inventory kind.
 pub const MAX_OWNER_INVENTORY_ITEM_ID_BYTES: usize =

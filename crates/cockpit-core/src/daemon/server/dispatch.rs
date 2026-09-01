@@ -887,6 +887,20 @@ enum ProviderOAuthReady {
     #[cfg(feature = "grok-subscription")]
     Grok(crate::auth::xai_oauth::ManualLogin),
     Codex(crate::auth::codex_oauth::DeviceLogin),
+    Descriptor(DescriptorOAuthLogin),
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DescriptorOAuthLogin {
+    provider_id: String,
+    login: DescriptorOAuthLoginState,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "flow", rename_all = "snake_case")]
+enum DescriptorOAuthLoginState {
+    DeviceCode(crate::auth::descriptor::DeviceCodeLogin),
+    PkceBrowser(crate::auth::descriptor::PkceBrowserLogin),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -911,6 +925,7 @@ enum DurableOAuthFlow {
         completion_request_hash: [u8; 32],
         completion_fencing_generation: i64,
         claimed_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
     },
     Mcp {
         owner: String,
@@ -1006,9 +1021,9 @@ fn durable_oauth_expired(flow: &DurableOAuthFlow, now_unix_ms: i64) -> bool {
             expires_at_unix_ms, ..
         } => now_unix_ms >= *expires_at_unix_ms,
         DurableOAuthFlow::ProviderExchanging {
-            claimed_at_unix_ms, ..
-        }
-        | DurableOAuthFlow::McpExchanging {
+            expires_at_unix_ms, ..
+        } => now_unix_ms >= *expires_at_unix_ms,
+        DurableOAuthFlow::McpExchanging {
             claimed_at_unix_ms, ..
         } => now_unix_ms >= oauth_expiry_ms(*claimed_at_unix_ms),
         DurableOAuthFlow::ProviderCommitted {
@@ -1257,7 +1272,7 @@ async fn purge_durable_oauth_flows(
     }
     flows.sort_by_key(|(_, _, created, _, _, _, _)| *created);
 
-    // A Ready flow has a hard ten-minute lifetime. Its begin receipt is
+    // A Ready flow has a hard device-code-compatible lifetime. Its begin receipt is
     // rewritten to the exact terminal expiry outcome in the same transaction
     // that removes the sealed verifier, so an abandoned receipt cannot protect
     // capacity forever or replay a dead authorize instruction.
@@ -2022,7 +2037,10 @@ fn delete_oauth_flow(ctx: &DaemonContext, flow_id: &str) -> std::result::Result<
     Ok(())
 }
 
-const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+// Provider device-code descriptors may poll for up to fifteen minutes. Keep
+// their daemon-owned state alive through that advertised lifetime plus a
+// bounded final token/commit margin.
+const OAUTH_FLOW_TTL: Duration = Duration::from_secs(16 * 60);
 const OAUTH_FLOW_GLOBAL_CAPACITY: usize = 64;
 const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
 
@@ -2084,9 +2102,21 @@ impl OAuthFlowStore {
         }
     }
 
+    fn trip_provider_cancellation(flow: &ProviderOAuthFlow) {
+        if let ProviderOAuthFlow::Completing { cancelled } = flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn purge_provider(flows: &mut std::collections::HashMap<String, StoredProviderOAuthFlow>) {
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+        flows.retain(|_, flow| {
+            let keep = now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL;
+            if !keep {
+                Self::trip_provider_cancellation(&flow.flow);
+            }
+            keep
+        });
     }
 
     fn trip_mcp_cancellation(flow: &McpOAuthFlow) {
@@ -2124,7 +2154,9 @@ impl OAuthFlowStore {
             .min_by_key(|(_, flow)| flow.created_at)
             .map(|(id, _)| id.clone())
         {
-            flows.remove(&id);
+            if let Some(evicted) = flows.remove(&id) {
+                Self::trip_provider_cancellation(&evicted.flow);
+            }
         }
     }
 
@@ -2163,7 +2195,9 @@ impl OAuthFlowStore {
                 .min_by_key(|(_, flow)| flow.created_at)
                 .map(|(id, _)| id.clone())
         {
-            flows.remove(&id);
+            if let Some(evicted) = flows.remove(&id) {
+                Self::trip_provider_cancellation(&evicted.flow);
+            }
         }
         flows.insert(
             id,
@@ -14670,16 +14704,25 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            let supported_provider = provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY || {
-                #[cfg(feature = "grok-subscription")]
-                {
-                    provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
-                }
-                #[cfg(not(feature = "grok-subscription"))]
-                {
-                    false
-                }
-            };
+            let oauth_config_root = ctx.canonical_cwd.to_string_lossy().into_owned();
+            let descriptor = daemon_provider_config(ctx, &oauth_config_root)
+                .await?
+                .2
+                .providers
+                .get(&provider_id)
+                .and_then(|entry| entry.oauth.clone());
+            let supported_provider = descriptor.is_some()
+                || provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY
+                || {
+                    #[cfg(feature = "grok-subscription")]
+                    {
+                        provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
+                    }
+                    #[cfg(not(feature = "grok-subscription"))]
+                    {
+                        false
+                    }
+                };
             if !supported_provider {
                 return Err(bad_request("unsupported provider OAuth flow"));
             }
@@ -14852,9 +14895,9 @@ async fn handle_serialized_request_impl(
                     return Ok(response);
                 }
                 let flow_id = uuid::Uuid::new_v4().to_string();
-                let (flow, authorize_url, user_code) = match provider_id.as_str() {
+                let (flow, authorize_url, user_code) = match (provider_id.as_str(), descriptor) {
                     #[cfg(feature = "grok-subscription")]
-                    crate::auth::xai_oauth::CREDENTIAL_KEY => {
+                    (crate::auth::xai_oauth::CREDENTIAL_KEY, _) => {
                         let login = match crate::auth::xai_oauth::begin_manual_login().await {
                             Ok(login) => login,
                             Err(cause) => return Err(internal(cause)),
@@ -14866,7 +14909,7 @@ async fn handle_serialized_request_impl(
                             None,
                         )
                     }
-                    crate::auth::codex_oauth::CREDENTIAL_KEY => {
+                    (crate::auth::codex_oauth::CREDENTIAL_KEY, _) => {
                         let login = match crate::auth::codex_oauth::begin_device_code_login().await
                         {
                             Ok(login) => login,
@@ -14880,6 +14923,42 @@ async fn handle_serialized_request_impl(
                             user_code,
                         )
                     }
+                    (_, Some(descriptor)) => match descriptor.flow {
+                        crate::config::providers::OAuthFlowKind::DeviceCode => {
+                            let login =
+                                crate::auth::descriptor::begin_device_code_login(&descriptor)
+                                    .await
+                                    .map_err(internal)?;
+                            let authorize_url = login.verification_uri.clone();
+                            let user_code = Some(login.user_code.clone());
+                            (
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Descriptor(
+                                    DescriptorOAuthLogin {
+                                        provider_id: provider_id.clone(),
+                                        login: DescriptorOAuthLoginState::DeviceCode(login),
+                                    },
+                                )),
+                                authorize_url,
+                                user_code,
+                            )
+                        }
+                        crate::config::providers::OAuthFlowKind::PkceBrowser => {
+                            let login =
+                                crate::auth::descriptor::begin_pkce_browser_login(&descriptor)
+                                    .map_err(internal)?;
+                            let authorize_url = login.authorize_url.clone();
+                            (
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Descriptor(
+                                    DescriptorOAuthLogin {
+                                        provider_id: provider_id.clone(),
+                                        login: DescriptorOAuthLoginState::PkceBrowser(login),
+                                    },
+                                )),
+                                authorize_url,
+                                None,
+                            )
+                        }
+                    },
                     _ => unreachable!("provider OAuth kind was validated before ledger admission"),
                 };
                 let ProviderOAuthFlow::Ready(durable_ready) = &flow else {
@@ -15034,18 +15113,22 @@ async fn handle_serialized_request_impl(
                     }
                     return Ok(terminal_response.as_ref().clone());
                 }
-                let durable_begin_client_operation_id = match &durable_flow {
-                    Some(DurableOAuthFlow::Provider {
-                        owner: durable_owner,
-                        begin_client_operation_id,
-                        ..
-                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
-                    _ => {
-                        return Err(bad_request(
-                            "provider OAuth flow is unknown or belongs to another owner",
-                        ));
-                    }
-                };
+                let (durable_begin_client_operation_id, durable_expires_at_unix_ms) =
+                    match &durable_flow {
+                        Some(DurableOAuthFlow::Provider {
+                            owner: durable_owner,
+                            begin_client_operation_id,
+                            expires_at_unix_ms,
+                            ..
+                        }) if durable_owner == &owner => {
+                            (begin_client_operation_id.clone(), *expires_at_unix_ms)
+                        }
+                        _ => {
+                            return Err(bad_request(
+                                "provider OAuth flow is unknown or belongs to another owner",
+                            ));
+                        }
+                    };
                 // Atomically claim the one-shot flow before any provider network
                 // exchange. A second concurrent completion therefore fails at
                 // lookup instead of issuing another token set. Restore only when
@@ -15088,6 +15171,18 @@ async fn handle_serialized_request_impl(
                     #[cfg(feature = "grok-subscription")]
                     ProviderOAuthReady::Grok(_) => crate::auth::xai_oauth::CREDENTIAL_KEY,
                     ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
+                    ProviderOAuthReady::Descriptor(login) => login.provider_id.as_str(),
+                };
+                // Descriptor initial login, refresh, and logout share one
+                // fence. Acquire it before the network exchange as well as
+                // the durable flow/credential transaction, so a logout
+                // acknowledged while this login is in flight cannot be
+                // overwritten afterward.
+                let _descriptor_lock = match &ready {
+                    ProviderOAuthReady::Descriptor(_) => {
+                        Some(crate::auth::descriptor::credential_mutation_lock(provider_id).await)
+                    }
+                    _ => None,
                 };
                 claim_oauth_exchange(
                     ctx,
@@ -15105,6 +15200,7 @@ async fn handle_serialized_request_impl(
                         completion_request_hash: request_hash,
                         completion_fencing_generation: fencing_generation,
                         claimed_at_unix_ms: oauth_wall_ms(),
+                        expires_at_unix_ms: durable_expires_at_unix_ms,
                     },
                 )
                 .await?;
@@ -15121,7 +15217,13 @@ async fn handle_serialized_request_impl(
                             .map_err(internal)
                             .and_then(|tokens| {
                                 serde_json::to_vec(&tokens)
-                                    .map(|record| (crate::auth::xai_oauth::CREDENTIAL_KEY, record))
+                                    .map(|record| {
+                                        (
+                                            crate::auth::xai_oauth::CREDENTIAL_KEY.to_string(),
+                                            record,
+                                            None,
+                                        )
+                                    })
                                     .map_err(internal)
                             })
                     }
@@ -15137,17 +15239,105 @@ async fn handle_serialized_request_impl(
                             .and_then(|tokens| {
                                 serde_json::to_vec(&tokens)
                                     .map(|record| {
-                                        (crate::auth::codex_oauth::CREDENTIAL_KEY, record)
+                                        (
+                                            crate::auth::codex_oauth::CREDENTIAL_KEY.to_string(),
+                                            record,
+                                            None,
+                                        )
                                     })
                                     .map_err(internal)
                             })
                     }
+                    ProviderOAuthReady::Descriptor(login) => {
+                        let oauth_config_root = ctx.canonical_cwd.to_string_lossy().into_owned();
+                        let descriptor = daemon_provider_config(ctx, &oauth_config_root)
+                            .await
+                            .and_then(|(_, _, config)| {
+                                config
+                                    .providers
+                                    .get(&login.provider_id)
+                                    .and_then(|entry| entry.oauth.clone())
+                                    .ok_or_else(|| {
+                                        bad_request(format!(
+                                            "provider `{}` no longer has an OAuth descriptor",
+                                            login.provider_id
+                                        ))
+                                    })
+                            });
+                        let descriptor = descriptor?;
+                        let token = match login.login {
+                            DescriptorOAuthLoginState::DeviceCode(login) => {
+                                if input.is_some() {
+                                    return Err(bad_request(
+                                        "device-code OAuth does not accept callback input",
+                                    ));
+                                }
+                                let remaining = Duration::from_millis(
+                                    u64::try_from(
+                                        durable_expires_at_unix_ms.saturating_sub(oauth_wall_ms()),
+                                    )
+                                    .unwrap_or(0),
+                                );
+                                crate::auth::descriptor::complete_device_code_login_unpersisted_for(
+                                    &descriptor,
+                                    &login,
+                                    remaining,
+                                    Some(cancellation_fence.as_ref()),
+                                )
+                                .await
+                                .map_err(internal)?
+                            }
+                            DescriptorOAuthLoginState::PkceBrowser(login) => {
+                                let callback = input.as_deref().ok_or_else(|| {
+                                    bad_request(
+                                        "PKCE OAuth completion requires a callback URL or code",
+                                    )
+                                })?;
+                                crate::auth::descriptor::complete_pkce_browser_login_unpersisted(
+                                    &descriptor,
+                                    &login,
+                                    callback,
+                                )
+                                .await
+                                .map_err(internal)?
+                            }
+                        };
+                        serde_json::to_vec(&token)
+                            .map(|record| (login.provider_id, record, Some(descriptor)))
+                            .map_err(internal)
+                    }
                 };
-                let (provider_id, record) = exchange?;
-                let record = zeroize::Zeroizing::new(record);
+                let (provider_id, record, descriptor) = exchange?;
+                let credential_record_id = descriptor.as_ref().map_or_else(
+                    || provider_id.clone(),
+                    |_| crate::auth::descriptor::credential_record_id(&provider_id),
+                );
+                let record = match descriptor {
+                    Some(descriptor) => {
+                        let store = crate::credentials::CredentialStore::from_vault(
+                            ctx.secret_vault.clone(),
+                        )
+                        .map_err(internal)?;
+                        let token = serde_json::from_slice(&record).map_err(internal)?;
+                        let record = crate::auth::descriptor::initial_record(
+                            &provider_id,
+                            &descriptor,
+                            &store,
+                            token,
+                        )
+                        .map_err(internal)?;
+                        zeroize::Zeroizing::new(serde_json::to_vec(&record).map_err(internal)?)
+                    }
+                    None => zeroize::Zeroizing::new(record),
+                };
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("provider OAuth completion was cancelled"));
+                }
+                if oauth_wall_ms() >= durable_expires_at_unix_ms {
+                    return Err(conflict(
+                        "the OAuth flow expired before token persistence; start a new login",
+                    ));
                 }
                 let terminal_response = Response::ProviderOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
@@ -15172,11 +15362,15 @@ async fn handle_serialized_request_impl(
                 let vault = ctx.secret_vault.clone();
                 let flow_vault_id = oauth_flow_vault_id(&flow_id);
                 let provider_id_owned = provider_id.to_owned();
+                let credential_record_id_owned = credential_record_id;
                 let receipt_owner = owner.clone();
                 let receipt_operation_id = client_operation_id.clone();
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        if chrono::Utc::now().timestamp_millis() >= durable_expires_at_unix_ms {
+                            anyhow::bail!("provider OAuth flow expired before token persistence");
+                        }
                         let marker = vault
                             .get_item_on_conn(
                                 conn,
@@ -15193,12 +15387,14 @@ async fn handle_serialized_request_impl(
                                 completion_client_operation_id: marker_operation,
                                 completion_request_hash: marker_hash,
                                 completion_fencing_generation: marker_fence,
+                                expires_at_unix_ms: marker_expiry,
                                 ..
                             } if marker_owner == receipt_owner
                                 && marker_provider == provider_id_owned
                                 && marker_operation == receipt_operation_id
                                 && marker_hash == request_hash
                                 && marker_fence == fencing_generation
+                                && marker_expiry == durable_expires_at_unix_ms
                         );
                         if !owns_exact_exchange {
                             anyhow::bail!(
@@ -15209,7 +15405,7 @@ async fn handle_serialized_request_impl(
                             .mutate_item_on_conn(
                                 conn,
                                 cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                                &provider_id_owned,
+                                &credential_record_id_owned,
                                 Some(&record),
                             )
                             .map_err(|error| anyhow::anyhow!(error))?;
@@ -16565,6 +16761,14 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+            // Provider-model resolution runs under the config-publication lock
+            // and can refresh a descriptor credential. Keep that order, then
+            // take the descriptor fence before the secret-owner lock. This
+            // makes an acknowledged logout the last mutation of a descriptor
+            // record: a refresh either finishes before this delete or reloads
+            // after it and fails closed as logged out.
+            let _descriptor_lock =
+                crate::auth::descriptor::credential_mutation_lock(&provider_id).await;
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             // A CLI identifies a configured provider, never a hidden vault
             // record name. Resolve that reference only inside the daemon so a
@@ -16586,15 +16790,25 @@ async fn handle_serialized_request_impl(
                     let provider = config.providers.get(&provider_id).ok_or_else(|| {
                         bad_request(format!("provider `{provider_id}` is not configured"))
                     })?;
-                    if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
-                        return Err(bad_request(
-                            "provider credential logout is only available for OAuth providers",
-                        ));
-                    }
-                    let credential_record_id =
-                        provider.credential_ref.clone().ok_or_else(|| {
+                    // Declarative OAuth owns a reserved record derived from
+                    // the configured provider id. Legacy OAuth uses an
+                    // explicit credential reference, so preserve that
+                    // separate path.
+                    let credential_record_id = if provider.oauth.is_some() {
+                        crate::auth::descriptor::credential_record_id(&provider_id)
+                    } else {
+                        if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
+                            return Err(bad_request(
+                                "provider credential logout is only available for OAuth providers",
+                            ));
+                        }
+                        let reference = provider.credential_ref.clone().ok_or_else(|| {
                             bad_request(format!("provider `{provider_id}` has no credential_ref"))
                         })?;
+                        crate::auth::descriptor::ensure_public_credential_record_id(&reference)
+                            .map_err(|error| bad_request(error.to_string()))?;
+                        reference
+                    };
                     let credential_present = match ctx.secret_vault.get_item(
                         cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                         &credential_record_id,
@@ -16825,7 +17039,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
-            if entry.auth_command.is_some()
+            if (entry.auth_command.is_some() || entry.oauth.is_some())
                 && !is_local_owner_action(
                     state,
                     #[cfg(feature = "remote")]
@@ -16833,7 +17047,7 @@ async fn handle_serialized_request_impl(
                 )
             {
                 return Err(bad_request(
-                    "provider auth_command may only be configured by the local host owner",
+                    "provider dynamic authentication may only be configured by the local host owner",
                 ));
             }
             #[cfg(feature = "remote")]
@@ -16871,7 +17085,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
-            if entry.auth_command.is_some()
+            if (entry.auth_command.is_some() || entry.oauth.is_some())
                 && !is_local_owner_action(
                     state,
                     #[cfg(feature = "remote")]
@@ -16879,7 +17093,7 @@ async fn handle_serialized_request_impl(
                 )
             {
                 return Err(bad_request(
-                    "provider auth_command may only be configured by the local host owner",
+                    "provider dynamic authentication may only be configured by the local host owner",
                 ));
             }
             #[cfg(feature = "remote")]
@@ -19760,6 +19974,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id contains NUL")
             } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+                || crate::auth::descriptor::is_credential_record_id(provider_id)
             {
                 Some("provider id is reserved")
             } else if serde_json::from_str::<serde_json::Value>(record.as_str()).is_err() {
@@ -19775,6 +19990,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id contains NUL")
             } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+                || crate::auth::descriptor::is_credential_record_id(provider_id)
             {
                 Some("provider id is reserved")
             } else {
@@ -21916,12 +22132,12 @@ async fn provider_models_fetch(
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
-    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
-        crate::secret_ownership::OWNER_KIND_PROVIDER,
         &canonical_root,
         &crate::secret_ref::provider_named_secret_references(&config),
         foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
     let selected_policy = on_unlisted
@@ -22276,12 +22492,12 @@ async fn provider_usage_snapshot(
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
-    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
-        crate::secret_ownership::OWNER_KIND_PROVIDER,
         &canonical_root,
         &crate::secret_ref::provider_named_secret_references(&config),
         foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
     let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
@@ -22655,6 +22871,64 @@ mod provider_atomic_authority_tests {
     }
 
     #[test]
+    fn descriptor_credential_mutations_use_a_private_record_namespace() {
+        let source = include_str!("dispatch.rs");
+        let completion = source
+            .split("Request::CompleteProviderOAuth {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::CancelProviderOAuth {").next())
+            .expect("complete-provider-oauth dispatch arm");
+        let completion_descriptor_lock = completion
+            .find("credential_mutation_lock(provider_id)")
+            .expect("descriptor completion shares the credential fence");
+        let claim_exchange = completion
+            .find("claim_oauth_exchange(")
+            .expect("descriptor completion claims its exchange");
+        assert!(
+            completion_descriptor_lock < claim_exchange,
+            "descriptor completion must take the credential fence before its exchange"
+        );
+        assert!(
+            completion.contains("credential_record_id(&provider_id)"),
+            "descriptor completion must persist under its private record id"
+        );
+
+        let put = source
+            .split("Request::PutProviderCredential {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::GetLocalOperationSettlement").next())
+            .expect("put-provider-credential dispatch arm");
+        assert!(
+            !put.contains("credential_mutation_lock(&provider_id)"),
+            "generic provider writes must not reach descriptor-owned records"
+        );
+
+        let delete = source
+            .split("Request::DeleteProviderCredential {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::GetProviderCatalogSnapshot").next())
+            .expect("delete-provider-credential dispatch arm");
+        let delete_config_lock = delete
+            .find("CONFIG_PUBLICATION_RPC_LOCK.lock().await")
+            .expect("delete takes the config-publication lock");
+        let delete_descriptor_lock = delete
+            .find("credential_mutation_lock(&provider_id)")
+            .expect("delete shares the descriptor credential fence");
+        let delete_secret_owner_lock = delete
+            .find("SECRET_OWNER_RPC_LOCK.lock().await")
+            .expect("delete takes the secret-owner lock");
+        assert!(
+            delete_config_lock < delete_descriptor_lock
+                && delete_descriptor_lock < delete_secret_owner_lock,
+            "delete lock order must be config publication, descriptor fence, then secret owner"
+        );
+        assert!(
+            delete.contains("credential_record_id(&provider_id)"),
+            "configured descriptor logout must resolve the private record id"
+        );
+    }
+
+    #[test]
     fn provider_batch_journal_is_the_only_prepublication_durable_intent() {
         let source = include_str!("dispatch.rs");
         let batch = source
@@ -22922,7 +23196,15 @@ fn provider_owned_secret_references(
         .flat_map(|header| crate::envref::referenced_names(&header.value))
         .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
         .collect();
-    let credentials = entry.credential_ref.iter().cloned().collect();
+    // A manually authored legacy config must never grant cleanup ownership of
+    // a descriptor token record. Descriptor records are selected exclusively
+    // from `oauth` plus the provider id at their dedicated mutation boundary.
+    let credentials = entry
+        .credential_ref
+        .iter()
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
+        .cloned()
+        .collect();
     (named, credentials)
 }
 
@@ -22985,18 +23267,21 @@ async fn ensure_provider_credential_reference_available(
     ctx: &DaemonContext,
     entry: &crate::config::providers::ProviderEntry,
 ) -> std::result::Result<(), ErrorPayload> {
-    if let Some(reference) = entry.credential_ref.as_deref()
-        && ctx
+    if let Some(reference) = entry.credential_ref.as_deref() {
+        crate::auth::descriptor::ensure_public_credential_record_id(reference)
+            .map_err(|error| bad_request(error.to_string()))?;
+        if ctx
             .secret_vault
             .get_item(
                 cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                 reference,
             )
             .is_err()
-    {
-        return Err(bad_request(format!(
-            "provider credential reference `{reference}` is not present in the daemon vault"
-        )));
+        {
+            return Err(bad_request(format!(
+                "provider credential reference `{reference}` is not present in the daemon vault"
+            )));
+        }
     }
     Ok(())
 }
@@ -23284,6 +23569,9 @@ async fn recover_provider_config_journals_inner(
             delete_owned_named_secret(ctx, &name, "provider", &project_root).await?;
         }
         for reference in credentials {
+            if crate::auth::descriptor::is_credential_record_id(&reference) {
+                continue;
+            }
             let sole_claim =
                 release_credential_ownership(ctx, &reference, &journal.provider_id, &project_root)
                     .await?;
@@ -23313,6 +23601,9 @@ async fn recover_provider_config_journals_inner(
                     .map(|entry| provider_owned_secret_references(entry).1)
                     .unwrap_or_default();
                 for reference in references {
+                    if crate::auth::descriptor::is_credential_record_id(&reference) {
+                        continue;
+                    }
                     if retained_by_same_pair.contains(&reference) {
                         continue;
                     }
@@ -25199,6 +25490,7 @@ fn provider_credential_references_for_root(
         .providers
         .values()
         .filter_map(|provider| provider.credential_ref.clone())
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
         .collect())
 }
 

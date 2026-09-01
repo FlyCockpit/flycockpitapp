@@ -1109,6 +1109,8 @@ pub enum ProvidersCommand {
     List,
     /// Add a provider using the terminal setup wizard.
     Add(ProviderAddArgs),
+    /// Log in to a configured declarative OAuth provider.
+    Login(ProviderLoginArgs),
     /// Sign out of an OAuth-backed provider without deleting its config entry.
     Logout(ProviderLogoutArgs),
     /// Show vendor plan limits and quota for configured providers.
@@ -1120,6 +1122,13 @@ pub struct ProviderAddArgs {
     /// Optional built-in provider template id to preselect.
     #[arg(value_name = "TEMPLATE")]
     pub template: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ProviderLoginArgs {
+    /// Configured provider id with an `oauth` descriptor.
+    #[arg(value_name = "ID")]
+    pub provider: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1969,6 +1978,17 @@ mod tests {
                 assert_eq!(args.template.as_deref(), Some("openai"));
             }
             other => panic!("expected providers add command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_login_command_parses_provider_id() {
+        let cli = Cli::try_parse_from(["cockpit", "provider", "login", "custom-oauth"]).unwrap();
+        match cli.command {
+            Some(Command::Provider(ProvidersCommand::Login(args))) => {
+                assert_eq!(args.provider, "custom-oauth");
+            }
+            other => panic!("expected provider login command, got {other:?}"),
         }
     }
 

@@ -171,9 +171,17 @@ fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry)
     } else if !provider.wire_api.is_auto() {
         provider.wire_api
     } else {
-        cockpit_config::providers::default_wire_api_for_template(
+        let template_default = cockpit_config::providers::default_wire_api_for_template(
             provider.effective_template(provider_id),
-        )
+        );
+        if template_default.is_auto() {
+            model
+                .capabilities
+                .preferred_wire_api()
+                .unwrap_or(cockpit_config::providers::WireApi::Completions)
+        } else {
+            template_default
+        }
     };
     let native_anthropic = wire_api == cockpit_config::providers::WireApi::Anthropic;
     let reasoning_effort = if native_anthropic

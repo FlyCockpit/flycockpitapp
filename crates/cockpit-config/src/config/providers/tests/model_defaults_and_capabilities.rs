@@ -1497,6 +1497,7 @@ fn wire_api_template_defaults_are_total_and_identity_based() {
         default_wire_api_for_template(Some("codex-oauth")),
         WireApi::Responses
     );
+    assert_eq!(default_wire_api_for_template(Some("crofai")), WireApi::Auto);
     assert_eq!(
         default_wire_api_for_template(Some("openai-compatible")),
         WireApi::Completions
@@ -1518,6 +1519,36 @@ fn wire_api_template_defaults_are_total_and_identity_based() {
         );
         assert_eq!(cfg.resolve_wire_api(id, "any-model"), expected);
     }
+}
+
+#[test]
+fn crofai_auto_template_uses_catalog_wire_capabilities() {
+    let mut cfg = ProvidersConfig::default();
+    let mut responses_model = model("responses-model", false);
+    responses_model.capabilities.supported_wire_apis = vec![WireApi::Responses];
+    let mut completions_model = model("completions-model", false);
+    completions_model.capabilities.supported_wire_apis = vec![WireApi::Completions];
+    cfg.providers.insert(
+        "renamed-crofai".into(),
+        ProviderEntry {
+            template: Some("crofai".into()),
+            models: vec![responses_model, completions_model],
+            ..ProviderEntry::default()
+        },
+    );
+
+    assert_eq!(
+        cfg.resolve_wire_api("renamed-crofai", "responses-model"),
+        WireApi::Responses
+    );
+    assert_eq!(
+        cfg.resolve_wire_api("renamed-crofai", "completions-model"),
+        WireApi::Completions
+    );
+    assert_eq!(
+        cfg.resolve_wire_api("renamed-crofai", "metadata-free-model"),
+        WireApi::Completions
+    );
 }
 
 /// `opposite` is the bidirectional swap target the fallback retries.

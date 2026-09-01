@@ -986,6 +986,7 @@ fn round_trips_a_provider_entry() {
             allow_computer_guidance_proposals: None,
             default_thinking_mode: Some(ThinkingMode::High),
             embeddings: None,
+            usage_probe: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
             shrink: ShrinkConfig::default(),

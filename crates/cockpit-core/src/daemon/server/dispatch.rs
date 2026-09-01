@@ -22187,7 +22187,7 @@ fn validate_unique_provider_header_names(
     Ok(())
 }
 
-fn provider_usage_view(
+pub(super) fn provider_usage_view(
     row: crate::providers::usage::ProviderUsageSnapshot,
     store: &crate::credentials::CredentialStore,
     config: &crate::config::providers::ProvidersConfig,

@@ -170,7 +170,10 @@ impl Session {
                     "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
                     rusqlite::params![session_id.to_string()],
                 )?;
-                anyhow::ensure!(updated == 1, "agent-acquired sealed value requires a live persisted session");
+                anyhow::ensure!(
+                    updated == 1,
+                    "agent-acquired sealed value requires a live persisted session"
+                );
                 let table_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
                 vault
                     .put_item_on_conn(
@@ -203,7 +206,10 @@ impl Session {
                     &prepared,
                     &[],
                 )?;
-                anyhow::ensure!(row.active_version == 1, "agent-acquired create did not publish version one");
+                anyhow::ensure!(
+                    row.active_version == 1,
+                    "agent-acquired create did not publish version one"
+                );
                 Ok(())
             })
             .await?;

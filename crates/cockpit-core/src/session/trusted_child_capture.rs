@@ -139,7 +139,7 @@ pub struct SealedCaptureValue {
 
 impl SealedCaptureValue {
     /// Wrap a candidate literal. No validation happens here; the value is
-/// consumed into a zeroizing frame and parsed only on the success path.
+    /// consumed into a zeroizing frame and parsed only on the success path.
     pub fn new(literal: String) -> Self {
         Self {
             literal: Zeroizing::new(literal),

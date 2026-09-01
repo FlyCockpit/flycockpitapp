@@ -880,7 +880,8 @@ fn sealed_acquisition_def() -> AgentDef {
     );
     def.scan_tool_results = Some(false);
     if let Some(vnext) = &mut def.vnext {
-        vnext.capabilities
+        vnext
+            .capabilities
             .insert(AgentCapability::SealedAcquisitionCapture);
         vnext.allowed_knowledge_bases = Some(std::collections::BTreeSet::new());
     }

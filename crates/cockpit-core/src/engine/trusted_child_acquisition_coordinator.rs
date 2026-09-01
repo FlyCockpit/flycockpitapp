@@ -51,8 +51,9 @@ pub struct AcquisitionRequest<'a> {
     /// Create-only sealed-value version. This is not a daemon protocol version.
     pub value_version: i64,
     pub now_ms: i64,
-    /// Command/task brief only. It must not include destination metadata.
-    pub child_brief: String,
+    /// Parent-supplied untrusted command. Destination metadata is a separate
+    /// host-only concern and cannot be placed in the child brief by this API.
+    pub command: String,
     /// Exact sealed references required to perform acquisition, usually empty.
     pub allowed_sealed_record_ids: BTreeSet<String>,
 }
@@ -88,6 +89,7 @@ pub async fn run_trusted_child_acquisition(
         || crate::sealed::identity::SealedName::canonical(request.value_name).is_err()
         || crate::sealed::identity::SealedDescription::parse(request.description).is_err()
         || request.acquisition_id.trim().is_empty()
+        || request.command.trim().is_empty()
         || request.value_version != 1
     {
         return AcquisitionOutcome::Failed;
@@ -196,11 +198,14 @@ pub async fn run_trusted_child_acquisition(
         Ok(child)
             if child.definition.as_ref().is_some_and(|definition| {
                 definition.vnext.as_ref().is_some_and(|vnext| {
-                    vnext.capabilities.contains(
-                        &crate::agents::AgentCapability::SealedAcquisitionCapture,
-                    )
+                    vnext
+                        .capabilities
+                        .contains(&crate::agents::AgentCapability::SealedAcquisitionCapture)
                 })
-            }) => child,
+            }) =>
+        {
+            child
+        }
         _ => {
             terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms)
                 .await;
@@ -212,7 +217,10 @@ pub async fn run_trusted_child_acquisition(
     let runtime = AcquisitionRuntime::new(request.allowed_sealed_record_ids, request.caller_mode);
     let mut agent = child;
     let mut history = Vec::new();
-    let mut prompt = Message::user(request.child_brief);
+    let mut prompt = Message::user(format!(
+        "Run this untrusted acquisition command under the normal sandbox and approval policy, then choose one terminal move. Do not repeat its output:\n{}",
+        request.command
+    ));
     let mut run_failed = false;
     for nudge in 0..=MAX_TERMINAL_NUDGES {
         let result = with_acquisition_runtime(
@@ -273,12 +281,7 @@ pub async fn run_trusted_child_acquisition(
 
     if run_failed {
         let completed_at_ms = completion_time_ms(request.now_ms, started_at);
-        terminalize_audit_failed(
-            &execution.session,
-            request.acquisition_id,
-            completed_at_ms,
-        )
-        .await;
+        terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms).await;
         registry.cancel(&session_id);
         return AcquisitionOutcome::Failed;
     }
@@ -288,11 +291,9 @@ pub async fn run_trusted_child_acquisition(
         Some(AcquisitionTerminalMove::Capture {
             source_tool_call_id,
         }) => {
-            let Some(authority) = registry.bind_source_tool_call(
-                &session_id,
-                &source_tool_call_id,
-                completed_at_ms,
-            ) else {
+            let Some(authority) =
+                registry.bind_source_tool_call(&session_id, &source_tool_call_id, completed_at_ms)
+            else {
                 terminalize_audit_failed(
                     &execution.session,
                     request.acquisition_id,

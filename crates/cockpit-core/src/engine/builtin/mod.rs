@@ -2251,7 +2251,13 @@ pub(crate) fn is_docs_pipeline(name: &str) -> bool {
 fn is_internal_agent_def_name(name: &str) -> bool {
     matches!(
         name,
-        "Computer" | "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker" | "sealed-acquisition"
+        "Computer"
+            | "computer"
+            | "docs-resolver"
+            | "docs-answerer"
+            | "Dream"
+            | "dream-worker"
+            | "sealed-acquisition"
     )
 }
 

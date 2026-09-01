@@ -2062,29 +2062,32 @@ mod tests {
                 revealed_literal: None,
             },
             Response::SealedOwnerOperationCancelled { spent: true },
-            Response::sealed_owner_inventory(vec![crate::SealedOwnerInventoryItem {
-                record_id: "rec-1".into(),
-                name: "deploy_token".into(),
-                description: "safe description".into(),
-                scope_kind: crate::SealedOwnerScopeKind::Global,
-                scope_key: String::new(),
-                active_version: 1,
-                created_at_ms: 0,
-                namespace: crate::SealedOwnerNamespace::OwnerAuthored,
-            }], vec![crate::SealedAcquisitionAuditItem {
-                acquisition_id: "acq-1".into(),
-                record_id: "rec-1".into(),
-                session_id: "session-1".into(),
-                project_key: "project-1".into(),
-                name: "deploy_token".into(),
-                description: "safe acquisition audit".into(),
-                child_agent: "sealed-acquisition".into(),
-                source_tool_call_id: Some("call-1".into()),
-                consent_mode: "audit_only".into(),
-                outcome: "sealed".into(),
-                created_at_ms: 0,
-                completed_at_ms: Some(1),
-            }]),
+            Response::sealed_owner_inventory(
+                vec![crate::SealedOwnerInventoryItem {
+                    record_id: "rec-1".into(),
+                    name: "deploy_token".into(),
+                    description: "safe description".into(),
+                    scope_kind: crate::SealedOwnerScopeKind::Global,
+                    scope_key: String::new(),
+                    active_version: 1,
+                    created_at_ms: 0,
+                    namespace: crate::SealedOwnerNamespace::OwnerAuthored,
+                }],
+                vec![crate::SealedAcquisitionAuditItem {
+                    acquisition_id: "acq-1".into(),
+                    record_id: "rec-1".into(),
+                    session_id: "session-1".into(),
+                    project_key: "project-1".into(),
+                    name: "deploy_token".into(),
+                    description: "safe acquisition audit".into(),
+                    child_agent: "sealed-acquisition".into(),
+                    source_tool_call_id: Some("call-1".into()),
+                    consent_mode: "audit_only".into(),
+                    outcome: "sealed".into(),
+                    created_at_ms: 0,
+                    completed_at_ms: Some(1),
+                }],
+            ),
             Response::SealedOwnerDescriptionEdited {
                 record_id: "rec-1".into(),
             },
@@ -2166,10 +2169,7 @@ mod tests {
                 acquisitions,
             } => {
                 assert_eq!(items.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
-                assert_eq!(
-                    acquisitions.len(),
-                    crate::MAX_SEALED_OWNER_INVENTORY_ROWS
-                );
+                assert_eq!(acquisitions.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
             }
             other => panic!("expected inventory, got {}", other.wire_tag()),
         }

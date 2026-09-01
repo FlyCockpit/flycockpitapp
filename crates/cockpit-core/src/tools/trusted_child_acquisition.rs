@@ -90,11 +90,7 @@ where
 /// dispatch and before hooks, audit rows, artifacts, timeline events, or model
 /// history can observe the result. Only the task-local coordinator can later
 /// resolve the exact call id; every durable/model lane receives the placeholder.
-pub(crate) fn quarantine_bash_result(
-    call_id: &str,
-    tool: &str,
-    output: &mut ToolOutput,
-) -> bool {
+pub(crate) fn quarantine_bash_result(call_id: &str, tool: &str, output: &mut ToolOutput) -> bool {
     let Ok(runtime) = CURRENT_ACQUISITION_RUNTIME.try_with(|runtime| runtime.clone()) else {
         return false;
     };
@@ -139,7 +135,9 @@ fn set_terminal(move_: AcquisitionTerminalMove) -> Result<()> {
         .map_err(|_| invalid_input("acquisition capability is not active"))?;
     let mut state = runtime.state.lock().unwrap();
     if state.terminal.is_some() {
-        return Err(invalid_input("an acquisition terminal move was already selected"));
+        return Err(invalid_input(
+            "an acquisition terminal move was already selected",
+        ));
     }
     if let AcquisitionTerminalMove::Capture {
         source_tool_call_id,
@@ -158,10 +156,18 @@ pub struct CaptureSealedValueTool;
 
 #[async_trait]
 impl Tool for CaptureSealedValueTool {
-    fn name(&self) -> &str { "capture_sealed_value" }
-    fn description(&self) -> &str { "Capture quarantined command output by source tool-call reference" }
-    fn effect(&self) -> ToolEffect { ToolEffect::Mutating }
-    fn authorizes_own_effects(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "capture_sealed_value"
+    }
+    fn description(&self) -> &str {
+        "Capture quarantined command output by source tool-call reference"
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutating
+    }
+    fn authorizes_own_effects(&self) -> bool {
+        true
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -171,10 +177,14 @@ impl Tool for CaptureSealedValueTool {
         })
     }
     async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-        let source = args.get("source_tool_call_id").and_then(Value::as_str)
+        let source = args
+            .get("source_tool_call_id")
+            .and_then(Value::as_str)
             .filter(|source| !source.is_empty())
             .ok_or_else(|| invalid_input("source_tool_call_id is required"))?;
-        set_terminal(AcquisitionTerminalMove::Capture { source_tool_call_id: source.to_owned() })?;
+        set_terminal(AcquisitionTerminalMove::Capture {
+            source_tool_call_id: source.to_owned(),
+        })?;
         Ok(ToolOutput::text("capture accepted"))
     }
 }
@@ -183,9 +193,15 @@ pub struct AcquisitionRequiresUserTool;
 
 #[async_trait]
 impl Tool for AcquisitionRequiresUserTool {
-    fn name(&self) -> &str { "acquisition_requires_user" }
-    fn description(&self) -> &str { "End acquisition with one bounded owner question" }
-    fn effect(&self) -> ToolEffect { ToolEffect::ReadOnly }
+    fn name(&self) -> &str {
+        "acquisition_requires_user"
+    }
+    fn description(&self) -> &str {
+        "End acquisition with one bounded owner question"
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -202,9 +218,16 @@ impl Tool for AcquisitionRequiresUserTool {
         let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
         match crate::engine::trusted_child_acquisition::RequiresUser::parse(reason, prompt) {
             crate::engine::trusted_child_acquisition::AcquisitionOutcome::RequiresUser(_) => {}
-            _ => return Err(invalid_input("reason or prompt is not a valid owner question")),
+            _ => {
+                return Err(invalid_input(
+                    "reason or prompt is not a valid owner question",
+                ));
+            }
         }
-        set_terminal(AcquisitionTerminalMove::RequiresUser { reason: reason.to_owned(), prompt: prompt.to_owned() })?;
+        set_terminal(AcquisitionTerminalMove::RequiresUser {
+            reason: reason.to_owned(),
+            prompt: prompt.to_owned(),
+        })?;
         Ok(ToolOutput::text("owner question accepted"))
     }
 }
@@ -213,10 +236,18 @@ pub struct AcquisitionFailTool;
 
 #[async_trait]
 impl Tool for AcquisitionFailTool {
-    fn name(&self) -> &str { "acquisition_fail" }
-    fn description(&self) -> &str { "End acquisition without capturing a value" }
-    fn effect(&self) -> ToolEffect { ToolEffect::ReadOnly }
-    fn parameters(&self) -> Value { serde_json::json!({ "type": "object", "additionalProperties": false }) }
+    fn name(&self) -> &str {
+        "acquisition_fail"
+    }
+    fn description(&self) -> &str {
+        "End acquisition without capturing a value"
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({ "type": "object", "additionalProperties": false })
+    }
     async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
         if args.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(invalid_input("acquisition_fail takes no arguments"));
@@ -234,10 +265,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_bash_stdout_is_replaced_before_any_consumer_sees_it() {
-        let runtime = AcquisitionRuntime::new(
-            BTreeSet::new(),
-            crate::config::extended::ApprovalMode::Auto,
-        );
+        let runtime =
+            AcquisitionRuntime::new(BTreeSet::new(), crate::config::extended::ApprovalMode::Auto);
         let inspect = runtime.clone();
         with_acquisition_runtime(runtime, async move {
             let mut output = ToolOutput::text(format!(
@@ -271,13 +300,15 @@ mod tests {
         );
         let inspect = runtime.clone();
         with_acquisition_runtime(runtime, async move {
-            assert!(set_terminal(AcquisitionTerminalMove::Capture {
-                source_tool_call_id: "missing".to_owned(),
-            })
-            .is_err());
+            assert!(
+                set_terminal(AcquisitionTerminalMove::Capture {
+                    source_tool_call_id: "missing".to_owned(),
+                })
+                .is_err()
+            );
 
-            let mut output = ToolOutput::text(format!("stdout:\n{SECRET}\nexit: 0\n"))
-                .with_exit_code(0);
+            let mut output =
+                ToolOutput::text(format!("stdout:\n{SECRET}\nexit: 0\n")).with_exit_code(0);
             assert!(quarantine_bash_result("exact", "bash", &mut output));
             set_terminal(AcquisitionTerminalMove::Capture {
                 source_tool_call_id: "exact".to_owned(),

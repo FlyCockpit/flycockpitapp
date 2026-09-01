@@ -348,7 +348,8 @@ pub(crate) fn format_sealed_inventory(items: &[SealedOwnerInventoryItem]) -> Str
     if items.is_empty() {
         return "/sealed: no sealed values".to_string();
     }
-    let mut out = String::from("/sealed: record_id | name | namespace | scope | key | version | description");
+    let mut out =
+        String::from("/sealed: record_id | name | namespace | scope | key | version | description");
     for item in items {
         out.push('\n');
         out.push_str(&format!(
@@ -369,7 +370,9 @@ fn append_acquisition_audit(out: &mut String, acquisitions: &[SealedAcquisitionA
     if acquisitions.is_empty() {
         return;
     }
-    out.push_str("\n/sealed acquisitions: acquisition_id | name | outcome | consent | child | created");
+    out.push_str(
+        "\n/sealed acquisitions: acquisition_id | name | outcome | consent | child | created",
+    );
     for acquisition in acquisitions {
         out.push('\n');
         out.push_str(&format!(

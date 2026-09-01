@@ -4222,30 +4222,20 @@ fn delegated_trust_cartesian_matrix() {
 
         let child = dmh_build_host_selected_child(&driver, "explore", "lmstudio:probe");
         assert_eq!(child.model.model_id_ref(), "probe", "cell {trust_str}");
-        // Trust axis: the ACTUAL raw-vs-redacted WIRE egress follows trust
-        // only. Scrub a sentinel-bearing payload through the child model's
-        // effective outbound redaction table — the table that scrubs its
-        // provider request body — and confirm the sentinel is removed iff
-        // the child is untrusted.
+        // Every child uses the same reference-only wire egress, regardless of
+        // trust. Confirm its effective outbound table removes the sentinel.
         let wire = child
             .model
             .redact_table()
             .scrub(&format!("deploy with {DMH_WIRE_SECRET} now"));
-        if trusted {
-            assert!(
-                wire.contains(DMH_WIRE_SECRET),
-                "trusted child egress rides raw (trust={trust_str}): {wire}"
-            );
-        } else {
-            assert!(
-                !wire.contains(DMH_WIRE_SECRET),
-                "untrusted child egress scrubs the sentinel (trust={trust_str}): {wire}"
-            );
-        }
+        assert!(
+            !wire.contains(DMH_WIRE_SECRET),
+            "child egress scrubs the sentinel (trust={trust_str}): {wire}"
+        );
         assert_eq!(
             child.model.is_trusted(),
             trusted,
-            "egress class follows trust only (trust={trust_str})"
+            "configured trust remains model metadata (trust={trust_str})"
         );
     }
 }
@@ -4369,17 +4359,13 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
         .unwrap()
 }
 
-/// AC4 (wire egress, end-to-end): drive a trusted and an untrusted child through
-/// the REAL delegated turn against a request-capturing provider — the CAPTURED
-/// request body carries the sentinel RAW only for the TRUSTED target and SCRUBBED
-/// for the untrusted one. This fails if production stopped applying the redaction
-/// table at network egress. Two trust cells are driven end-to-end here because
-/// full dispatch per cell is slow.
+/// AC4 (wire egress, end-to-end): trusted and untrusted delegated children both
+/// receive a scrubbed captured request body.
 #[test]
-fn delegated_trust_wire_egress_is_raw_only_for_trusted() {
+fn delegated_trust_wire_egress_is_reference_only_for_all_models() {
     assert!(
-        dmh_captured_request_has_sentinel("trusted"),
-        "a trusted child's captured request carries the sentinel RAW"
+        !dmh_captured_request_has_sentinel("trusted"),
+        "a trusted child's captured request must not carry the sentinel"
     );
     assert!(
         !dmh_captured_request_has_sentinel("untrusted"),

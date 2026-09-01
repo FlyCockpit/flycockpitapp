@@ -1815,8 +1815,8 @@ mod backup_fallback_tests {
         assert!(matches!(outcome, TurnOutcome::Done));
         let _ = drain(&mut rx);
 
-        // Per-target wire capture (real HTTP boundary): the untrusted primary's
-        // body is redacted, the trusted failover's body is raw.
+        // Per-target wire capture (real HTTP boundary): both the primary and
+        // trusted failover bodies are redacted.
         let primary_body = serde_json::to_string(&primary_provider.captured()[0].body).unwrap();
         let backup_body = serde_json::to_string(&backup_provider.captured()[0].body).unwrap();
         assert!(
@@ -1824,8 +1824,8 @@ mod backup_fallback_tests {
             "untrusted primary wire body is redacted: {primary_body}"
         );
         assert!(
-            backup_body.contains(sentinel),
-            "trusted failover wire body is raw: {backup_body}"
+            !backup_body.contains(sentinel),
+            "trusted failover wire body is redacted: {backup_body}"
         );
 
         // Two immutable attempt rows under one call_id, whose stored payloads

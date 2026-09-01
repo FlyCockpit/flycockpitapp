@@ -10,10 +10,8 @@
 //! - [`Model::for_provider_with_env`] — configured utility/background targets.
 //!
 //! Both obtain their redaction posture from a
-//! [`ResolvedSensitiveModelPolicy`], and raw provider bytes are released only
-//! by a `TrustedCustodyGrant` minted for that exact `(provider, model)`. There
-//! is no trust-by-name lookup left on these paths, so a caller that never
-//! routed custody cannot reach the raw table at all — it falls closed.
+//! [`ResolvedSensitiveModelPolicy`]. Every model receives the enforced table;
+//! a trusted grant never releases sealed literals to a provider wire.
 
 use std::sync::Arc;
 
@@ -73,8 +71,7 @@ fn active(provider: &str) -> ActiveModelRef {
 /// It therefore declares custody through the typed request API, and the model
 /// it produces carries exactly the table that custody released.
 ///
-/// Trusted (self-hosted / no-log) keeps raw content — that is the supported
-/// outcome, not a leak. Untrusted (cloud, may retain logs) is always redacted.
+/// Trusted and untrusted targets are both always redacted on model egress.
 #[test]
 fn model_policy_custody_requirements_are_type_enforced_on_the_active_model_path() {
     let mut cfg = config();
@@ -91,9 +88,8 @@ fn model_policy_custody_requirements_are_type_enforced_on_the_active_model_path(
     let trusted = Model::from_config_with_env(&cfg, secret_table(), |_| Some("k".into()))
         .expect("keyless openai-compat build");
     assert_eq!(
-        trusted.redact_table().scrub(SECRET),
-        SECRET,
-        "a trusted active model's raw custody must survive the custody route"
+        !trusted.redact_table().scrub(SECRET).contains(SECRET),
+        "a trusted active model must be redacted too"
     );
 }
 
@@ -116,19 +112,15 @@ fn model_policy_custody_requirements_are_type_enforced_on_the_utility_model_path
     })
     .expect("keyless openai-compat build");
     assert_eq!(
-        trusted.redact_table().scrub(SECRET),
-        SECRET,
-        "a trusted utility target keeps raw custody"
+        !trusted.redact_table().scrub(SECRET).contains(SECRET),
+        "a trusted utility target must be redacted too"
     );
 }
 
-/// The grant is destination-bound. A completed trusted selection for one target
-/// is not a licence to send raw bytes to a *different* one, so a route may not
-/// be carried sideways onto another model build. Without this binding the raw
-/// table would be reachable by resolving custody once for any trusted model and
-/// reusing the result.
+/// A trusted grant does not alter model egress, including for the exact target
+/// that minted it.
 #[test]
-fn raw_custody_requires_a_grant_minted_for_this_exact_target() {
+fn trusted_custody_grants_never_release_provider_literals() {
     let mut cfg = config();
     // A second trusted model on the same provider: the provider class matches,
     // only the model id differs.
@@ -149,21 +141,22 @@ fn raw_custody_requires_a_grant_minted_for_this_exact_target() {
     assert!(route.trusted_custody_grant().is_some());
 
     assert_eq!(
-        Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone()).scrub(SECRET),
-        SECRET,
-        "the grant releases raw bytes for the target it was minted for"
+        !Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone())
+            .scrub(SECRET)
+            .contains(SECRET),
+        "the grant never releases raw bytes for its target"
     );
     assert!(
         !Model::effective_redact_table_for(&route, "selfhosted", "other", table.clone())
             .scrub(SECRET)
             .contains(SECRET),
-        "a grant minted for `selfhosted:m` must not release raw bytes to `selfhosted:other`"
+        "a trusted grant never releases raw bytes to another target"
     );
     assert!(
         !Model::effective_redact_table_for(&route, "cloud", "m", table)
             .scrub(SECRET)
             .contains(SECRET),
-        "a grant minted for one provider must not release raw bytes to another"
+        "a trusted grant never releases raw bytes to another provider"
     );
 }
 
@@ -298,39 +291,35 @@ fn an_untrusted_route_redacts_even_when_redaction_is_disabled_in_config() {
     );
 }
 
-/// The other direction of the same decision: the opt-out is still honored where
-/// the user is entitled to it. A trusted target is a sink the user vouched for,
-/// so `redact.enabled = false` means raw there — that is the supported way to
-/// send raw content to a model, and it must keep working. Without this, the fix
-/// above would have silently removed the opt-out entirely.
+/// The config-level opt-out never releases sealed values to a model, including
+/// a trusted target.
 #[test]
-fn a_trusted_route_still_receives_raw_when_redaction_is_disabled_in_config() {
+fn a_trusted_route_redacts_when_redaction_is_disabled_in_config() {
     let mut cfg = config();
     let (_tmp, table) = disabled_config_table();
 
     let route = Model::configured_custody_route(&cfg, "selfhosted", "m", &table)
         .expect("a configured trusted target routes");
     assert_eq!(
-        Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone()).scrub(SECRET),
-        SECRET,
-        "a trusted route must still honor the redaction opt-out"
+        !Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone())
+            .scrub(SECRET)
+            .contains(SECRET),
+        "a trusted route must ignore the redaction opt-out"
     );
 
     cfg.active_model = Some(active("selfhosted"));
     let trusted = Model::from_config_with_env(&cfg, table.clone(), |_| Some("k".into()))
         .expect("keyless openai-compat build");
     assert_eq!(
-        trusted.redact_table().scrub(SECRET),
-        SECRET,
-        "trusted active model must receive raw content"
+        !trusted.redact_table().scrub(SECRET).contains(SECRET),
+        "trusted active model must be redacted"
     );
 
     let utility =
         Model::for_provider_with_env(&cfg, "selfhosted", "m", table, |_| Some("k".into()))
             .expect("keyless openai-compat build");
     assert_eq!(
-        utility.redact_table().scrub(SECRET),
-        SECRET,
-        "trusted utility target must receive raw content"
+        !utility.redact_table().scrub(SECRET).contains(SECRET),
+        "trusted utility target must be redacted"
     );
 }

@@ -1968,9 +1968,8 @@ impl RedactionTable {
         }
     }
 
-    /// A no-op table that scrubs nothing, because it has no entries. Used as
-    /// the raw-custody token a trusted route receives, as a fallback when a
-    /// redaction chokepoint object is needed but the table couldn't be built
+    /// A no-op table that scrubs nothing, because it has no entries. Used as a
+    /// fallback when a redaction chokepoint object is needed but the table couldn't be built
     /// (the chokepoint still *runs* — it just has an empty table), and as the
     /// accumulation base for sealed values and approved secret-file reads.
     ///

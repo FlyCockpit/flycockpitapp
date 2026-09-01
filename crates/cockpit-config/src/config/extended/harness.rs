@@ -94,15 +94,16 @@ pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> 
 
 /// The custody posture of one external OS harness.
 ///
-/// This carries the same meaning as a model's data-custody class — `Trusted`
-/// may hold raw prompt content including sensitive/sealed literals, `Untrusted`
-/// must be handed a redacted rendering — but it is an explicitly configured
+/// This is an explicitly configured harness-local trust class. Every harness
+/// is handed a redacted rendering; `Trusted` may participate in host-mediated
+/// capture while `Untrusted` may not.
+///
+/// It is
 /// harness-local policy. It is never inferred from provider/model
 /// configuration, locality, or command. An external harness is an
 /// OS process, not a trusted inference provider: it defaults to `Untrusted`,
-/// and only an explicit `trust: "trusted"` field opts into raw prompt
-/// delivery. Even a trusted harness receives no Cockpit-provided secret
-/// environment value.
+/// and no trust setting opts into raw prompt delivery. Even a trusted harness
+/// receives no Cockpit-provided secret environment value.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessTrust {

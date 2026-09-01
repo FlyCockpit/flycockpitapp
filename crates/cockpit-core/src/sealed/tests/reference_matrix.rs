@@ -437,13 +437,13 @@ async fn built_in_and_monty_sealed_reference_matrix() {
     );
 
     // =====================================================================
-    // Trusted callers gain no literal-returning tool API.
+    // Trusted callers remain reference-only and gain no literal-returning API.
     // =====================================================================
     assert!(
         SealedCustodyRequest::new(ModelTrust::Trusted)
             .custody()
-            .permits_raw_literal(),
-        "a trusted caller keeps its ordinary raw inference custody"
+            .is_reference_only(),
+        "a trusted caller is reference-only too"
     );
     // …but the tool surface is identical for both, and there is no sibling
     // tool that returns a literal.

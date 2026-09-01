@@ -767,25 +767,11 @@ impl DelegationCustody {
 
     /// Render the child's brief for the resolved destination.
     ///
-    /// A trusted destination is a self-hosted / no-log endpoint, so with a
-    /// grant bound to this exact route the brief passes through unchanged —
-    /// that is the intended outcome. An untrusted destination has exactly one
-    /// rendering: the session redaction-table scrub. Anything that is neither
-    /// falls back to scrubbing, so the failure mode is closed.
+    /// Every destination receives the enforced session-redaction rendering.
+    /// A trusted grant can authorize host-mediated capture, but never lets a
+    /// model receive a sealed literal in its brief.
     pub fn render_brief(&self, brief: &str) -> String {
-        if let Some(grant) = self.grant.as_ref()
-            && let Some(raw) = self.payload.raw_provider_bytes(grant, &self.route, brief)
-        {
-            return raw.to_string();
-        }
-        // Fail-closed arm: reached only when the payload claims raw but no
-        // matching grant authorizes this route. Scrub against the enforced
-        // view so `redact.enabled = false` cannot turn the fallback into a
-        // passthrough — the raw door is the grant branch above, and nothing
-        // else.
-        self.payload
-            .render_for_untrusted(&self.route, brief)
-            .unwrap_or_else(|| self.session_redact.enforced().scrub(brief))
+        self.session_redact.enforced().scrub(brief)
     }
 
     /// Routing diagnostics for this delegation: trust, the explicit custody
@@ -2190,8 +2176,8 @@ mod tests {
             "an untrusted destination keeps the session table"
         );
         assert!(
-            trusted_model.redact_table().is_empty(),
-            "a trusted destination resolves to the pass-through table"
+            !trusted_model.redact_table().is_empty(),
+            "a trusted destination keeps the enforced session table"
         );
 
         // (b) Dispatch a real delegation and render its brief through the
@@ -2219,9 +2205,7 @@ mod tests {
             "{untrusted_render}"
         );
 
-        // Trusted is host-authored (an agent file naming a self-hosted
-        // endpoint): the brief reaches it unchanged, which is the intended
-        // outcome for a no-log destination.
+        // Trusted is host-authored, but the brief remains reference-only.
         let (trusted_child, trusted_custody) = resolve_delegated_model_with_custody(
             "explore",
             Some("minimax:trusted-code"),
@@ -2235,7 +2219,7 @@ mod tests {
         assert_eq!(trusted_child.model_id_ref(), "trusted-code");
         assert_eq!(trusted_custody.custody(), ModelCustody::Trusted);
         let trusted_render = trusted_custody.render_brief(&brief);
-        assert_eq!(trusted_render, brief);
+        assert!(!trusted_render.contains(REDACTION_TEST_SECRET));
     }
 
     /// F1/AC7 (spawn surface). `spawn.model` is a model-authored selector, so
@@ -2344,7 +2328,7 @@ mod tests {
             custody.diagnostics().first().map(|d| d.stage),
             Some("host_config_spawn_model")
         );
-        // Its brief is not scrubbed: the destination is a self-hosted endpoint.
+        // Its brief is scrubbed even though the destination is trusted.
         assert_eq!(custody.render_brief("raw brief"), "raw brief");
 
         // Host provenance is not a bypass of the other checks.
@@ -2710,10 +2694,7 @@ mod tests {
         }
     }
 
-    /// The raw path a downstream sealed-acquisition coordinator would take: the
-    /// grant unlocks the planted secret only for the exact route it was minted
-    /// for. Asserting the secret flows here is the positive control that proves
-    /// a deny is a *real* deny, not a vacuous "nothing ever routes".
+    /// A trusted-child grant is not a raw egress capability.
     fn raw_bytes_released_by(grant: &TrustedCustodyGrant, model: &Arc<Model>) -> Option<String> {
         let route = ResolvedModelPolicy {
             provider: model.provider_id().to_string(),
@@ -2762,9 +2743,8 @@ mod tests {
         }
     }
 
-    /// AC5 positive control. A trusted, host-`Local` child mints a grant and the
-    /// grant releases the planted raw bytes. Guards the deny tests against a
-    /// vacuous deny-everything regression.
+    /// AC5 positive control. A trusted, host-`Local` child mints a grant, but
+    /// the grant cannot release the planted bytes to that model.
     #[test]
     fn trusted_child_local_receives_raw_custody() {
         let providers = trusted_child_providers(Some(ModelLocation::Local));
@@ -2784,8 +2764,8 @@ mod tests {
         assert_eq!(grant.model(), "trusted-reasoning");
         assert_eq!(
             raw_bytes_released_by(&grant, &model).as_deref(),
-            Some(PLANTED_SECRET),
-            "a host-local trusted child must release raw provider bytes"
+            None,
+            "a host-local trusted child must remain reference-only"
         );
     }
 
@@ -2855,8 +2835,8 @@ mod tests {
         );
     }
 
-    /// AC5. `ModelTrust`, not harness posture, controls custody: a trusted
-    /// `Local` child gets raw bytes, and a trusted `Remote` child fails closed.
+    /// AC5. Trusted selection is independent of harness posture, and neither
+    /// local nor remote selection gains a raw egress capability.
     #[test]
     fn trusted_child_custody_ignores_harness_mode() {
         let providers = trusted_child_providers(Some(ModelLocation::Local));
@@ -2872,8 +2852,8 @@ mod tests {
         .expect("a local trusted child must route");
         assert_eq!(
             raw_bytes_released_by(&grant, &model).as_deref(),
-            Some(PLANTED_SECRET),
-            "a host-local trusted child must release raw bytes"
+            None,
+            "a host-local trusted child must remain reference-only"
         );
 
         let providers = trusted_child_providers(Some(ModelLocation::Remote));

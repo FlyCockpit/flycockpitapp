@@ -440,7 +440,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
         .unwrap();
     assert_eq!(non_sensitive.custody_filter, None);
 
-    // A trusted selection mints the grant that unlocks raw provider bytes.
+    // A trusted selection mints a capture grant, never a raw egress grant.
     let trusted = cfg
         .resolve_sensitive_model_policy(
             &SensitiveModelPolicyRequest::new(
@@ -465,8 +465,8 @@ fn model_policy_custody_requirements_are_type_enforced() {
             &trusted.policy,
             CUSTODY_TEST_SECRET
         ),
-        Some(CUSTODY_TEST_SECRET),
-        "raw bytes are reachable only after a trusted selection"
+        None,
+        "raw bytes are never reachable after a trusted selection"
     );
     assert_eq!(
         SensitivePayload::raw_for_trusted_custody()

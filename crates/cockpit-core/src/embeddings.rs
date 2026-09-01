@@ -120,12 +120,8 @@ impl OpenAiCompatEmbedder {
             }
             None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
         };
-        // AC4: the embedding send boundary is a potentially sensitive caller.
-        // Its custody class is host-owned (the *configured* embedding model
-        // fixes it, no caller may ask for `Trusted`), but it still may not
-        // decide raw-vs-redacted by reading a trust flag: it routes custody
-        // through the typed request API and takes the raw table only from the
-        // grant that route mints. An unroutable target falls closed.
+        // The embedding send boundary uses the same enforced table as every
+        // other model egress. Trust never releases sealed literals.
         let effective_redact = Model::effective_redact_table_for_configured(
             providers,
             provider_id,
@@ -387,13 +383,8 @@ mod tests {
         )
     }
 
-    fn guard(trusted: bool) -> OutboundGuard {
-        let redact = if trusted {
-            Arc::new(RedactionTable::empty())
-        } else {
-            secret_table()
-        };
-        OutboundGuard::new(redact)
+    fn guard(_trusted: bool) -> OutboundGuard {
+        OutboundGuard::new(secret_table())
     }
 
     fn embedder(base_url: String, guard: OutboundGuard) -> OpenAiCompatEmbedder {
@@ -413,21 +404,13 @@ mod tests {
 
     /// AC4, embeddings send boundary. The embedding path is a potentially
     /// sensitive caller — it ships user text to a provider — so it may not
-    /// pick raw-vs-redacted by reading a trust flag. It routes custody through
-    /// the typed request API and takes the raw table only from the grant that
-    /// route mints.
-    ///
-    /// Custody here is host-owned: the *configured* embedding model fixes the
-    /// class and no caller may ask for `Trusted`. What this pins is the
-    /// outcome on the wire, built through the production constructor
-    /// [`OpenAiCompatEmbedder::for_provider_entry`]: an untrusted (cloud)
-    /// endpoint receives the placeholder, a trusted (self-hosted / no-log)
-    /// endpoint receives the value — and neither changes with harness posture.
+    /// uses the enforced table regardless of configured trust. This pins the
+    /// production constructor [`OpenAiCompatEmbedder::for_provider_entry`].
     #[tokio::test]
     async fn embedding_send_boundary_routes_custody_before_the_wire() {
         use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
 
-        for (trust, raw_expected) in [(ModelTrust::Trusted, true), (ModelTrust::Untrusted, false)] {
+        for trust in [ModelTrust::Trusted, ModelTrust::Untrusted] {
             let (base_url, capture_rx) = capture_embedding_server_with_response(
                 r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
             )
@@ -460,24 +443,16 @@ mod tests {
                 .unwrap();
 
             let captured = capture_rx.await.unwrap();
-            if raw_expected {
-                assert!(
-                    captured.body.contains(SECRET),
-                    "{trust:?}: a trusted embedding endpoint keeps raw custody: {}",
-                    captured.body
-                );
-            } else {
-                assert!(
-                    !captured.body.contains(SECRET),
-                    "{trust:?}: an untrusted embedding endpoint must never receive the secret: {}",
-                    captured.body
-                );
-                assert!(
-                    captured.body.contains(PLACEHOLDER),
-                    "{trust:?}: the redacted rendering must have reached the wire: {}",
-                    captured.body
-                );
-            }
+            assert!(
+                !captured.body.contains(SECRET),
+                "{trust:?}: an embedding endpoint must never receive the secret: {}",
+                captured.body
+            );
+            assert!(
+                captured.body.contains(PLACEHOLDER),
+                "{trust:?}: the redacted rendering must have reached the wire: {}",
+                captured.body
+            );
         }
     }
 
@@ -621,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embed_trusted_provider_skips_redaction() {
+    async fn embed_trusted_provider_redacts() {
         let (base_url, capture_rx) = capture_embedding_server_with_response(
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
         )
@@ -633,12 +608,12 @@ mod tests {
 
         let raw = capture_rx.await.unwrap().body;
         assert!(
-            raw.contains(SECRET),
-            "trusted provider should see original text: {raw}"
+            !raw.contains(SECRET),
+            "trusted provider must not see sealed text: {raw}"
         );
         assert!(
-            !raw.contains(PLACEHOLDER),
-            "trusted provider should skip redaction: {raw}"
+            raw.contains(PLACEHOLDER),
+            "trusted provider must receive the redacted rendering: {raw}"
         );
     }
 

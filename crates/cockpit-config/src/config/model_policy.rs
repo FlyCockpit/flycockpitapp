@@ -2,12 +2,9 @@
 //!
 //! Trust is a provider/model data-custody classification and stays that way:
 //!
-//! - [`ModelTrust`] is a provider/model **data-custody** classification.
-//!   `Trusted` marks a self-hosted / no-log endpoint that may hold raw
-//!   secret/environment values; raw content reaching it is the intended,
-//!   supported outcome. `Untrusted` marks a cloud endpoint that must receive a
-//!   redacted rendering. The enforced invariant is one-directional:
-//!   unredacted content must never reach an untrusted endpoint.
+//! - [`ModelTrust`] is a provider/model **capture/write** classification.
+//!   `Trusted` may participate in host-mediated capture; `Untrusted` may not.
+//!   Every model receives a redacted, reference-only sealed-value rendering.
 //! - Harness-steering posture is agent-definition-scoped and is no longer a
 //!   dimension of model routing; it never filtered provider eligibility,
 //!   custody, or redaction here.
@@ -188,7 +185,7 @@ impl<'a> ModelPolicyCriteria<'a> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelCustody {
-    /// The selected endpoint may receive raw secret/environment values.
+    /// The selected endpoint is eligible for host-mediated capture.
     Trusted,
     /// The selected endpoint must receive a redacted rendering.
     Untrusted,
@@ -214,11 +211,9 @@ impl ModelCustody {
 
 /// Custody posture of an **external OS harness**.
 ///
-/// It carries the same meaning as [`ModelCustody`] — trusted may hold raw
-/// secrets, untrusted must be handed redacted material — but it is a separate
-/// type on purpose: an external harness is not a provider/model route, so this
-/// value must never reach model routing. There is deliberately no conversion
-/// into [`ModelCustody`] or [`ModelTrust`].
+/// It is a separate type on purpose: an external harness is not a provider/
+/// model route, so this value must never reach model routing. There is
+/// deliberately no conversion into [`ModelCustody`] or [`ModelTrust`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessCustodyTrust {
@@ -311,27 +306,17 @@ impl SensitivePayload {
         self.custody
     }
 
-    /// Raw provider bytes, unlocked by the grant routing mints after a
-    /// `Trusted` selection.
-    ///
-    /// The grant is bound to the destination it was minted for: it unlocks raw
-    /// bytes only for that exact `(provider, model)`. A grant for one trusted
-    /// route can therefore never be replayed to send raw bytes to a different
-    /// route. Always `None` for an untrusted payload — a redacted rendering has
-    /// no raw-byte conversion.
+    /// Raw provider bytes are never released to a model. Trusted selection
+    /// grants may authorize host-mediated capture, but cannot become an egress
+    /// capability.
     pub fn raw_provider_bytes<'s>(
         &self,
         grant: &TrustedCustodyGrant,
         route: &ResolvedModelPolicy,
         source: &'s str,
     ) -> Option<&'s str> {
-        if !grant.authorizes(route) {
-            return None;
-        }
-        match self.rendering {
-            PayloadRendering::Raw => Some(source),
-            PayloadRendering::Redacted(_) => None,
-        }
+        let _ = (self, grant, route, source);
+        None
     }
 
     /// Target-specific redacted rendering for the resolved untrusted target.
@@ -1184,8 +1169,8 @@ impl ProvidersConfig {
     }
 
     /// Route a potentially sensitive payload under its required custody class.
-    /// A `Trusted` selection mints the [`TrustedCustodyGrant`] that unlocks raw
-    /// provider bytes; an `Untrusted` selection never does.
+    /// A `Trusted` selection mints a [`TrustedCustodyGrant`] for host-mediated
+    /// capture; it never unlocks provider bytes.
     #[allow(dead_code)]
     pub fn resolve_sensitive_model_policy(
         &self,

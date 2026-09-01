@@ -2406,23 +2406,22 @@ pub(crate) async fn run_turn(
     // export's file-per-call pass picks up the record either way without
     // double-counting. Best-effort: auditing must never break a live turn (same
     // posture as the existing post-success write).
-    // Sealed marker wired to real grants (`sealed-value-untrusted-inference-
-    // marker`): derive the per-attempt egress table so that a sealed literal an
-    // untrusted interactive turn received renders the actionable
+    // Sealed marker wired to real grants: derive the per-attempt egress table
+    // so that a sealed literal in any interactive turn renders the actionable
     // `use_sealed_value` marker instead of the generic placeholder. All gating
     // and derivation live in ONE production seam
-    // (`derive_untrusted_interactive_sealed_egress`, extracted so the chokepoint
+    // (`derive_interactive_sealed_egress`, extracted so the chokepoint
     // is drivable end-to-end in tests — removing the derivation there fails a
-    // test): it fires ONLY when untrusted custody, an interactive attachment, a
+    // test): it fires ONLY when an interactive attachment, a
     // callable `use_sealed_value` in THIS request's tool roster, and a live exact
     // grant for that value in this session generation all hold. Derivation is
     // fresh per attempt (a grant revoked between primary and failover renders the
     // marker then generic), the `Model` never gets a DB handle (we derive here
     // and pass the table to `prepare_completion_request`), and a DB error falls
     // back to `None` / the generic table — fail closed to safe rendering, never
-    // to a stale marker, a raw literal, or a dispatch error. Trusted targets and
-    // noninteractive egress (utility/tandem/embeddings, which never reach here)
-    // are untouched.
+    // to a stale marker, a raw literal, or a dispatch error. Trust does not
+    // bypass sealed egress; noninteractive egress (utility/tandem/embeddings,
+    // which never reach here) keeps generic redaction.
     // Rebuild the live sealed-action registry from this session's database,
     // scoped to this session's project (no install-once OnceLock; cross-project
     // actions are never resolvable). A build failure falls back to an empty
@@ -2435,7 +2434,7 @@ pub(crate) async fn run_turn(
     .await
     .unwrap_or_else(|_| crate::sealed::action::SealedActionRegistry::empty());
     let sealed_egress: Option<Arc<RedactionTable>> =
-        crate::sealed::egress::derive_untrusted_interactive_sealed_egress(
+        crate::sealed::egress::derive_interactive_sealed_egress(
             model,
             interrupts.is_interactive_attached(),
             &tools,

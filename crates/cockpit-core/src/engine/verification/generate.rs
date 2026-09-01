@@ -252,7 +252,6 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         };
         let assembled = assemble_recipe(RecipeAssemblyInput {
             recipe: recipe.as_ref(),
-            history: input.history,
             session: input.session,
             workspace_root: input.workspace_root,
             cwd: &input.ctx.cwd,

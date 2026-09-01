@@ -15,12 +15,26 @@ use crate::agents::{VerificationRecipe, VerificationToolCategory};
 use crate::db::tool_calls::ToolCallEvent;
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::engine::guidance_diff::unified_diff;
-use crate::engine::message::Message;
-use crate::engine::message::extract_user_text;
 use crate::session::Session;
 
 const MAX_LINKED_FILES: usize = 8;
 const MAX_LINKED_BYTES: usize = 256 * 1024;
+
+/// A clean-room projection cannot safely proceed without its durable goal.
+///
+/// Keep this typed so the intercept can distinguish a custody failure from
+/// ordinary candidate-collection failures when applying failure policy.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CleanRoomSessionGoalError {
+    #[error("loading persisted session goal for clean-room verification: {0}")]
+    Load(anyhow::Error),
+    #[error("clean-room verification requires a persisted session goal")]
+    Missing,
+}
+
+pub(crate) fn is_clean_room_session_goal_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CleanRoomSessionGoalError>().is_some()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssembledRecipe {
@@ -35,7 +49,6 @@ pub struct AssembledRecipe {
 #[derive(Clone)]
 pub struct RecipeAssemblyInput<'a> {
     pub recipe: &'a VerificationRecipe,
-    pub history: &'a [Message],
     pub session: &'a Session,
     pub workspace_root: &'a Path,
     pub cwd: &'a Path,
@@ -102,9 +115,8 @@ async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<Assembled
         last_n
     };
     let mut stable = String::new();
-    if let Some(goal) = session_goal_or_task(input.session, input.history).await {
-        stable.push_str(&format!("## Session goal\n\n{goal}\n"));
-    }
+    let goal = stored_session_goal(input.session).await?;
+    stable.push_str(&format!("## Session goal\n\n{goal}\n"));
     if let Some((path, body)) = select_guidance_for_target(
         input.session,
         input.workspace_root,
@@ -415,22 +427,19 @@ struct CuratedToolResult {
     output: String,
 }
 
-async fn session_goal_or_task(session: &Session, history: &[Message]) -> Option<String> {
-    if let Ok(Some(goal)) = session.db.current_session_goal(session.id, false).await {
-        let mut task = goal.objective;
-        if let Some(context) = goal.context.filter(|context| !context.trim().is_empty()) {
-            task.push_str("\n\nContext:\n");
-            task.push_str(&context);
-        }
-        return Some(task);
+async fn stored_session_goal(session: &Session) -> Result<String> {
+    let goal = session
+        .db
+        .current_session_goal(session.id, false)
+        .await
+        .map_err(CleanRoomSessionGoalError::Load)?
+        .ok_or(CleanRoomSessionGoalError::Missing)?;
+    let mut task = goal.objective;
+    if let Some(context) = goal.context.filter(|context| !context.trim().is_empty()) {
+        task.push_str("\n\nContext:\n");
+        task.push_str(&context);
     }
-    history.iter().rev().find_map(|message| match message {
-        Message::User { content } => {
-            let text = extract_user_text(content);
-            (!text.trim().is_empty()).then_some(text)
-        }
-        _ => None,
-    })
+    Ok(task)
 }
 
 async fn curated_tool_results(
@@ -653,7 +662,6 @@ mod tests {
         let args = serde_json::json!({ "path": "src.rs", "content": "fn new() {}\n" });
         let assembled = assemble_recipe(RecipeAssemblyInput {
             recipe: &VerificationRecipe::clean_room_default(),
-            history: &[],
             session: &session,
             workspace_root: tmp.path(),
             cwd: tmp.path(),
@@ -678,6 +686,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_room_fails_closed_without_a_persisted_session_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
+        let session = session_at(tmp.path());
+        let args = serde_json::json!({ "path": "src.rs", "content": "fn new() {}\n" });
+
+        let error = assemble_recipe(RecipeAssemblyInput {
+            recipe: &VerificationRecipe::clean_room_default(),
+            session: &session,
+            workspace_root: tmp.path(),
+            cwd: tmp.path(),
+            target_path: Some(&tmp.path().join("src.rs")),
+            tool_name: "write",
+            original_args: &args,
+            guidance_file_names: &[],
+            last_n_reads: 5,
+            include_linked_files: false,
+            inherit_framing: "",
+        })
+        .await
+        .expect_err("clean-room verification must require a stored goal");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a persisted session goal"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn inherit_recipe_remains_a_full_history_generator_path() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
@@ -685,7 +724,6 @@ mod tests {
         let args = serde_json::json!({ "path": "src.rs", "content": "fn new() {}\n" });
         let assembled = assemble_recipe(RecipeAssemblyInput {
             recipe: &VerificationRecipe::Inherit,
-            history: &[],
             session: &session,
             workspace_root: tmp.path(),
             cwd: tmp.path(),
@@ -794,6 +832,17 @@ mod tests {
         std::fs::write(tmp.path().join("AGENTS.md"), "# rules\nbe careful\n").unwrap();
         std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
         let session = session_at(tmp.path());
+        session
+            .db
+            .create_session_goal(
+                session.id,
+                &session.project_id,
+                "Keep the change safe.",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let args = serde_json::json!({
             "path": "src.rs",
             "content": "fn new() {}\n"
@@ -801,7 +850,6 @@ mod tests {
         let names = vec!["AGENTS.md".to_string()];
         let assembled = assemble_recipe(RecipeAssemblyInput {
             recipe: &VerificationRecipe::clean_room_default(),
-            history: &[],
             session: &session,
             workspace_root: tmp.path(),
             cwd: tmp.path(),

@@ -40,7 +40,8 @@ use super::{
     },
     generate::{CollectedCandidate, CollectionInput, collect_candidates},
     recipe::{
-        RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot, select_guidance_for_target,
+        RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot,
+        is_clean_room_session_goal_error, select_guidance_for_target,
     },
 };
 
@@ -88,6 +89,16 @@ pub(crate) struct InterceptInput<'a> {
     pub resolved_name: &'a str,
     pub args: &'a Value,
     pub call_id: &'a str,
+}
+
+fn trusted_minimal_projection_ready(
+    resolved_name: &str,
+    args: &Value,
+    collected: &[CollectedCandidate],
+    collection_error: Option<&anyhow::Error>,
+) -> bool {
+    !collection_error.is_some_and(is_clean_room_session_goal_error)
+        && super::adjudicate::adjudication_prompt(resolved_name, args, collected).is_ok()
 }
 
 fn snapshot_budget(
@@ -340,7 +351,6 @@ async fn run_verification(
         };
         let recipe = assemble_recipe(RecipeAssemblyInput {
             recipe: generator_recipe.as_ref(),
-            history: input.history,
             session: input.session,
             workspace_root: input.session.project_root.as_path(),
             cwd: input.ctx.cwd.as_path(),
@@ -630,12 +640,12 @@ async fn run_verification(
         // policy below can consider dispatching anything. In particular, an
         // `on_adjudication_failure = dispatch_original` policy must never turn
         // an unbuildable projection into an automatic allow.
-        let projection_ready = super::adjudicate::adjudication_prompt(
+        let projection_ready = trusted_minimal_projection_ready(
             input.resolved_name,
             input.args,
             &collected,
-        )
-        .is_ok();
+            collection_error.as_ref(),
+        );
         let adjudicator = match adjudicator_model {
             Some(model) => Ok(model),
             None if !profile_snapshot_id.is_nil() => {
@@ -1593,6 +1603,23 @@ mod tests {
         assert_eq!(
             rows[0].estimate_state,
             VerificationEstimateState::EstimateUnavailable
+        );
+    }
+
+    #[test]
+    fn clean_room_goal_collection_failure_disables_original_only_projection() {
+        let args = serde_json::json!({ "path": "src/lib.rs", "content": "fn x() {}" });
+        let error = anyhow::Error::new(
+            crate::engine::verification::recipe::CleanRoomSessionGoalError::Missing,
+        );
+
+        assert!(
+            super::adjudicate::adjudication_prompt("edit", &args, &[]).is_ok(),
+            "the regression requires an otherwise-valid original-only projection"
+        );
+        assert!(
+            !trusted_minimal_projection_ready("edit", &args, &[], Some(&error)),
+            "a clean-room goal failure during collection must not reach a dispatch-original policy"
         );
     }
 

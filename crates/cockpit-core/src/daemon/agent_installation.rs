@@ -6560,9 +6560,11 @@ fn automatic_binding_choice(
 }
 
 /// Reduce positional/recommendation choice aliases to the durable route set.
-/// The submitted choice selects a route, but a concrete ModelSlot retains its
-/// authored explicit/first default. Open slots retain the historical submitted
-/// choice default.
+/// The submitted choice selects a route, while a concrete ModelSlot normally
+/// retains its authored explicit/first default. A trusted authored default is
+/// different: it may become active only when the user submits that exact route;
+/// otherwise the submitted route is the active default. Open slots retain the
+/// historical submitted choice default.
 fn binding_inputs_for_submission(
     choice_set: &BindChoiceSet,
     slot_id: &str,
@@ -6636,7 +6638,20 @@ fn binding_inputs_for_submission(
         !choice_set.authored_default_required || authored_defaults.len() == 1,
         "concrete model slot has no unique durable authored default route"
     );
-    let default_key = authored_defaults.first().cloned().unwrap_or(submitted_key);
+    let default_key = authored_defaults
+        .first()
+        .filter(|default_key| {
+            let default_key = *default_key;
+            // The wire choice is the user-confirmation boundary. Do not make
+            // an unsubmitted trusted authored route live merely because it is
+            // the slot's authored default.
+            default_key == &submitted_key
+                || !durable
+                    .get(default_key)
+                    .is_some_and(|(_, choice)| choice.requires_trust_confirmation)
+        })
+        .cloned()
+        .unwrap_or(submitted_key);
     let bindings = durable
         .into_iter()
         .map(|(key, (route, slot_choice))| {
@@ -11541,6 +11556,33 @@ mod tests {
                 .find(|binding| binding.model_id == "model-a")
                 .is_some_and(|binding| binding.is_default),
             "selecting an alternate route must not redefine the authored default"
+        );
+
+        choice_set.choices[0].requires_trust_confirmation = true;
+        let bindings =
+            binding_inputs_for_submission(&choice_set, "primary", &choices[0].choice_id).unwrap();
+        assert!(
+            bindings
+                .iter()
+                .find(|binding| binding.model_id == "model-a")
+                .is_some_and(|binding| binding.is_default),
+            "submitting the trusted authored default explicitly confirms that route"
+        );
+        let bindings =
+            binding_inputs_for_submission(&choice_set, "primary", &choices[1].choice_id).unwrap();
+        assert!(
+            bindings
+                .iter()
+                .find(|binding| binding.model_id == "model-b")
+                .is_some_and(|binding| binding.is_default),
+            "an unsubmitted trusted authored default must not become live"
+        );
+        assert!(
+            !bindings
+                .iter()
+                .find(|binding| binding.model_id == "model-a")
+                .is_some_and(|binding| binding.is_default),
+            "selecting a different choice does not confirm the trusted default"
         );
 
         let alias_slot = slot(

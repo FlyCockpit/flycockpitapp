@@ -2609,9 +2609,9 @@ fn derive_parallel_read_only_eligible(child: &Agent, args: &SpawnArgs) -> bool {
 /// returning a structured summary envelope, so it holds `return` from session
 /// start (cache-safe; the tools array is never mutated mid-session). The `docs`
 /// pipeline stages are **exempt** (their answer is the payload), so they never
-/// get it; a chat-owning primary (`Build`/`Plan`/`Multireview`) is never
-/// delegated to and finishes via `Done`, so it is excluded too. `name` is the
-/// agent's own name.
+/// get it; bundled primaries finish via `Done`, so their names are excluded.
+/// A dual-role custom definition gets it only for its delegated coding launch.
+/// `name` is the agent's own name.
 fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
     if name == "deepthink" {
         return tb;
@@ -2653,7 +2653,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     let is_assistant = effective_def.vnext.as_ref().map_or(
         args.assistant_identity_prefix.is_some()
             && crate::agents::embedded_default(&effective_def.name).is_none(),
-        |definition| definition.has_role(crate::agents::AgentRole::Assistant),
+        |definition| vnext_uses_assistant_surface(definition, args.delegated),
     );
     if effective_def.vnext.is_some() {
         if effective_def.tools.is_none() {
@@ -2814,10 +2814,13 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         // -return-summary.md`): a delegated subagent finishes by returning a
         // structured summary. An on-disk override of a bundled agent keeps its name,
         // so `with_return_tool`'s name guards exclude a bundled primary/docs
-        // override; a custom agent is gated on its `mode` here (a `Primary`-only
-        // custom agent is chat-owning, never delegated to, so it gets no `return`).
+        // override; a vNext custom agent is gated on the actual delegated
+        // launch plus its `code` role. A dual-role definition is a chat-owning
+        // primary at the root and a normal coding child when delegated.
         let delegated_return = match def.vnext.as_ref() {
-            Some(definition) => !definition.has_role(crate::agents::AgentRole::Assistant),
+            Some(definition) => {
+                args.delegated && definition.has_role(crate::agents::AgentRole::Code)
+            }
             None => def.mode.is_subagent(),
         };
         if crate::agents::embedded_default(&def.name).is_some() || delegated_return {
@@ -2880,6 +2883,17 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
         mcp_resolver: mcp_resolver_for(args, def, grant_allows_external_mcp_servers(&grant, args)),
     })
+}
+
+/// Select assistant defaults only for an assistant-only definition or for a
+/// dual-role definition at the root. A delegated dual-role agent fills its
+/// coding role, so it must receive the coding surface and completion protocol.
+fn vnext_uses_assistant_surface(
+    definition: &crate::agents::VnextAgentDef,
+    delegated: bool,
+) -> bool {
+    definition.has_role(crate::agents::AgentRole::Assistant)
+        && (!delegated || !definition.has_role(crate::agents::AgentRole::Code))
 }
 
 fn emit_model_override_warning(def: &crate::agents::AgentDef, args: &SpawnArgs, model: &Model) {
@@ -3094,8 +3108,8 @@ pub(crate) async fn unknown_agent_rejection(
     }
 }
 
-/// The bundled reachable subagent set for `Plan` plus any user-authored
-/// custom subagent (`mode` `subagent`/`all`).
+/// The bundled reachable subagent set for `Plan` plus user-authored coding
+/// agents (legacy `mode` or unified `code` role).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
     let mut out: Vec<String> = vec!["explore".to_string(), "history".to_string()];
     append_custom_subagents(&mut out, cwd);
@@ -3103,10 +3117,9 @@ fn plan_subagents(cwd: &Path) -> Vec<String> {
 }
 
 /// The bundled reachable subagent set (`builder`/`explore`/`docs`) plus any
-/// user-authored custom agent whose `mode` makes it reachable as a
-/// subagent (`subagent`/`all`). Shared by the bundled `Build` factory and
-/// the generic [`reachable_subagents`] so both honor the `mode` field for
-/// reachability (implementation note). Each name appears
+/// user-authored coding agent. Shared by the bundled `Build` factory and the
+/// generic [`reachable_subagents`] so both honor legacy `mode` and unified
+/// roles for reachability. Each name appears
 /// once; the bundled set leads so the cached prefix stays stable when no
 /// custom agents are present.
 fn build_subagents(
@@ -3150,21 +3163,20 @@ fn recursive_targets(
     out
 }
 
-/// Append every user-authored custom agent whose `mode` makes it reachable
-/// as a subagent (`subagent`/`all`) to `out`, skipping names already
-/// present. Shared by [`build_subagents`] and [`plan_subagents`] so both
-/// honor the `mode` field for reachability the same way
-/// (implementation note).
+/// Append every user-authored coding agent to `out`, skipping names already
+/// present. Legacy definitions use `mode`; unified definitions use their
+/// `code` role so a dual-role definition can serve as both a chat primary and
+/// a coding child. Shared by [`build_subagents`] and [`plan_subagents`].
 fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
     for listing in crate::agents::list_all(cwd) {
         if !matches!(listing.kind, crate::agents::AgentKind::Custom) {
             continue;
         }
         if let Ok(custom) = &listing.def
-            && (custom.mode.is_subagent()
-                || custom.vnext.as_ref().is_some_and(|definition| {
-                    !definition.has_role(crate::agents::AgentRole::Assistant)
-                }))
+            && custom.vnext.as_ref().map_or_else(
+                || custom.mode.is_subagent(),
+                |definition| definition.has_role(crate::agents::AgentRole::Code),
+            )
             && !out.contains(&listing.name)
         {
             out.push(listing.name);
@@ -5139,6 +5151,56 @@ pub(crate) mod tests {
             crate::mcp::builtin::search(&host, "search")
                 .iter()
                 .all(|hit| hit.tool != "search")
+        );
+    }
+
+    #[test]
+    fn dual_role_vnext_agent_is_discoverable_and_uses_its_coding_child_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("dual-role.md"),
+            "---\ndescription: dual role\nschemaVersion: 1\nagentId: authored/dual-role\nroles: [code, assistant]\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        )
+        .unwrap();
+        let mut reachable = Vec::new();
+        append_custom_subagents(&mut reachable, tmp.path());
+        assert!(
+            reachable.iter().any(|name| name == "dual-role"),
+            "a definition with the code role must be a normal coding child"
+        );
+
+        let mut definition = crate::agents::embedded_default("Assistant").unwrap();
+        definition.name = "dual-role".into();
+        definition.tools = None;
+        let vnext = definition.vnext.as_mut().unwrap();
+        vnext.agent_id = "authored/dual-role".into();
+        vnext.roles = vec![
+            crate::agents::AgentRole::Code,
+            crate::agents::AgentRole::Assistant,
+        ];
+
+        let root = agent_from_def(&definition, &test_spawn_args(tmp.path())).unwrap();
+        assert!(
+            root.tools.names().contains(&"skill_manage"),
+            "the root launch fills the assistant role"
+        );
+        assert!(
+            !root.tools.names().contains(&"return"),
+            "a root launch does not use the child completion protocol"
+        );
+
+        let mut child_args = test_spawn_args(tmp.path());
+        child_args.delegated = true;
+        let child = agent_from_def(&definition, &child_args).unwrap();
+        assert!(
+            !child.tools.names().contains(&"skill_manage"),
+            "the delegated launch uses coding, not assistant, defaults"
+        );
+        assert!(
+            child.tools.names().contains(&"return"),
+            "a delegated coding launch receives the subagent completion protocol"
         );
     }
 

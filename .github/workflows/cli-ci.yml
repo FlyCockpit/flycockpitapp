@@ -73,7 +73,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         if: matrix.toolchain == 'stable'
@@ -83,7 +83,7 @@ jobs:
 
       - name: Install MSRV Rust
         if: matrix.toolchain == '1.95.0'
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy, rustfmt
 
@@ -173,7 +173,7 @@ jobs:
     runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -213,7 +213,7 @@ jobs:
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -261,7 +261,7 @@ jobs:
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable

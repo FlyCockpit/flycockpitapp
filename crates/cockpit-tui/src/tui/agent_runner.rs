@@ -6993,6 +6993,7 @@ mod tests {
                         active_model_state: None,
                         session_entry_mode: proto::SessionEntryMode::Code,
                         history: Vec::new(),
+                        removed_user_message_seqs: Vec::new(),
                         paused_work: Vec::new(),
                         repair_required: None,
                         resume_compaction_offer: None,

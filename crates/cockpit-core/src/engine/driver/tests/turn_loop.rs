@@ -2530,7 +2530,7 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     let mut driver = run.await.unwrap();
     let first_request = provider.captured()[0].body.clone();
     assert!(
-        first_request.contains("[time:"),
+        first_request.to_string().contains("[time:"),
         "the first request must consume a time prelude for this rollback regression"
     );
     let _ = drain_events(&mut rx);

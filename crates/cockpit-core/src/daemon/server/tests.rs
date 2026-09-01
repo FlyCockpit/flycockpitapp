@@ -35450,7 +35450,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: proto::NonCodeSessionEntryMode::Code,
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,

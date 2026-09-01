@@ -1822,26 +1822,21 @@ mod tests {
     }
 
     #[test]
-    fn modes_session_setup_mode_entries_and_legacy_assistant_management_parse_distinctly() {
+    fn public_modes_and_legacy_assistant_management_map_to_runtime_commands() {
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "code"]).unwrap().command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "code"]).unwrap()).command,
             Some(Command::Code)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistant"])
-                .unwrap()
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "assistant"]).unwrap()).command,
             Some(Command::Assistant)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "computer"])
-                .unwrap()
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "computer"]).unwrap()).command,
             Some(Command::Computer)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistants", "list"])
-                .unwrap()
+            Cli::from(PublicCli::try_parse_from(["cockpit", "assistants", "list"]).unwrap())
                 .command,
             Some(Command::Assistants(AssistantCommand::List))
         ));

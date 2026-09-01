@@ -801,7 +801,7 @@ fn store_secrets_join_redaction_table() {
     let trusted =
         Model::effective_redact_table_for_configured(&providers, "trusted", "model", table);
     assert!(!untrusted.scrub(secret).contains(secret));
-    assert_eq!(trusted.scrub(secret), secret);
+    assert!(!trusted.scrub(secret).contains(secret));
 }
 
 #[test]
@@ -2175,9 +2175,10 @@ fn redaction_destination_renderer_is_explicit() {
     // Interactive-without-capability: no active grant → generic (same as above).
     // (Already covered by `generic`.)
 
-    // Trusted-raw: an empty table is the raw-custody token; it scrubs nothing.
-    let trusted = crate::redact::RedactionTable::empty();
-    assert_eq!(trusted.scrub(sealed_literal), sealed_literal);
+    // An empty table has no registered literal to scrub. This is a table
+    // property, not a trusted-model egress mode.
+    let empty = crate::redact::RedactionTable::empty();
+    assert_eq!(empty.scrub(sealed_literal), sealed_literal);
 
     // The Replacement descriptor types are exhaustive: Generic and Sealed.
     let generic_repl = Replacement::Generic;

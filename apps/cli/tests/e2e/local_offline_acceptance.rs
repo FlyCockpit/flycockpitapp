@@ -19,6 +19,17 @@ fn public_commands() -> Vec<String> {
         .collect()
 }
 
+fn help_lists_root(help: &str, root: &str) -> bool {
+    help.lines()
+        .any(|line| line.split_whitespace().next() == Some(root))
+}
+
+fn completion_lists_root(completion: &str, root: &str) -> bool {
+    completion
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .any(|token| token == root)
+}
+
 fn run(session: &HermeticCockpit, args: &[&str]) -> Output {
     run_with_env(session, args, std::iter::empty::<(String, String)>())
 }
@@ -75,17 +86,12 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
     let text = output_text(&help);
     let public = public_commands();
     for command in &public {
-        assert!(
-            text.lines()
-                .any(|line| line.trim_start().starts_with(command)),
-            "missing {command}: {text}"
-        );
+        assert!(help_lists_root(&text, command), "missing {command}: {text}");
     }
     for hidden in [
         "account",
         "sync",
         "connect",
-        "assistant",
         "invocation",
         "mcp",
         "schedule",
@@ -93,12 +99,7 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
         "stats",
         "completion",
     ] {
-        assert!(
-            !text
-                .lines()
-                .any(|line| line.trim_start().starts_with(hidden)),
-            "leaked {hidden}: {text}"
-        );
+        assert!(!help_lists_root(&text, hidden), "leaked {hidden}: {text}");
     }
     for allowed in &public {
         let output = run(&session, &[allowed.as_str(), "--help"]);
@@ -111,7 +112,6 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
     for rejected in [
         "providers",
         "auth",
-        "assistant",
         "invocation",
         "mcp",
         "schedule",
@@ -138,11 +138,14 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
     );
     let completion = String::from_utf8(completion).unwrap();
     for command in &public {
-        assert!(completion.contains(command), "completion omitted {command}");
-    }
-    for hidden in ["account", "sync", "connect", "assistant", "mcp", "schedule"] {
         assert!(
-            !completion.contains(&format!(" {hidden}")),
+            completion_lists_root(&completion, command),
+            "completion omitted {command}"
+        );
+    }
+    for hidden in ["account", "sync", "connect", "mcp", "schedule"] {
+        assert!(
+            !completion_lists_root(&completion, hidden),
             "completion leaked {hidden}"
         );
     }

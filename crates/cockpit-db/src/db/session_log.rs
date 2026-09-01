@@ -171,10 +171,14 @@ pub enum SessionEventKind {
     /// prompted it. The payload carries identifiers only, never copied parent
     /// text, and does not enter the child's model context.
     ThreadAnchor,
+    /// A user message was retracted after an interactive cancellation while
+    /// only reasoning had streamed. This is an audit/remote-sync tombstone;
+    /// it never enters transcript or model history.
+    UserMessageRetracted,
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -205,6 +209,7 @@ impl SessionEventKind {
         Self::ToolCallScheduling,
         Self::AgentTree,
         Self::ThreadAnchor,
+        Self::UserMessageRetracted,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -239,6 +244,7 @@ impl SessionEventKind {
             SessionEventKind::ToolCallScheduling => "tool_call_scheduling",
             SessionEventKind::AgentTree => "agent_tree",
             SessionEventKind::ThreadAnchor => "thread_anchor",
+            SessionEventKind::UserMessageRetracted => "user_message_retracted",
         }
     }
 }
@@ -1374,6 +1380,88 @@ impl Db {
             .await
     }
 
+    /// Remove exactly the latest user event in a session when it is the named
+    /// message. This is the sole narrow exception to the append-only ledger:
+    /// the caller has proved that the directly answering turn emitted neither
+    /// response text nor a tool call. The predicate and delete are one SQL
+    /// transaction so the cascade, durable remote tombstone, and every
+    /// external-blob cleanup intent commit together. The tombstone lets an
+    /// already-uploaded message be retracted remotely while AUTOINCREMENT
+    /// keeps global cursors strictly monotonic under concurrent sessions.
+    pub async fn remove_latest_user_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
+        self.transaction(move |conn| {
+            let mut blob_paths = std::collections::BTreeSet::new();
+            {
+                let mut statement = conn.prepare(
+                    "SELECT provenance_json FROM session_text_artifacts
+                      WHERE session_id=?1 AND owner_event_seq=?2",
+                )?;
+                for provenance in statement
+                    .query_map(params![session_id.to_string(), seq], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                {
+                    let provenance = provenance?;
+                    let value: Value = serde_json::from_str(&provenance)
+                        .context("parsing retract artifact provenance")?;
+                    if let Some(path) = value.get("blob_path").and_then(Value::as_str) {
+                        blob_paths.insert(path.to_owned());
+                    }
+                }
+            }
+            let removed = conn
+                .execute(
+                    "DELETE FROM session_events
+                      WHERE session_id = ?1
+                        AND seq = ?2
+                        AND type = 'user_message'
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM session_events AS newer
+                             WHERE newer.session_id = ?1
+                               AND newer.type = 'user_message'
+                               AND newer.seq > ?2
+                        )",
+                    params![session_id.to_string(), seq],
+                )
+                .context("removing latest retractable user message")?;
+            if removed == 1 {
+                let retract_data = serde_json::json!({ "retracted_seq": seq }).to_string();
+                Self::insert_session_event_json_conn(
+                    conn,
+                    session_id,
+                    SessionEventKind::UserMessageRetracted,
+                    None,
+                    None,
+                    SessionEventContext::default(),
+                    chrono::Utc::now().timestamp_millis(),
+                    &retract_data,
+                )?;
+                for path in blob_paths {
+                    let has_survivor: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM session_text_artifacts
+                          WHERE json_extract(provenance_json, '$.blob_path')=?1)",
+                        [&path],
+                        |row| row.get(0),
+                    )?;
+                    if !has_survivor {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO text_artifact_blob_cleanup_intents
+                             (blob_path,session_id,created_at_unix_ms) VALUES(?1,?2,?3)",
+                            params![
+                                path,
+                                session_id.to_string(),
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                    }
+                }
+            }
+            Ok(removed == 1)
+        })
+        .await
+    }
+
     /// Return the durable user-message row for a client idempotency key.
     /// One folded row can represent multiple accepted submissions.
     pub async fn client_submission_receipt(
@@ -2012,6 +2100,90 @@ fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retract_keeps_global_sequences_monotonic_across_concurrent_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let other_session = db.create_session("p", "/y", "Build").await.unwrap();
+        let first = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "first"}),
+            )
+            .await
+            .unwrap();
+        let concurrent = db
+            .insert_session_event(
+                other_session.session_id,
+                SessionEventKind::Notice,
+                Some("Build"),
+                None,
+                &json!({"text": "other session"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.remove_latest_user_message(session.session_id, first)
+                .await
+                .unwrap()
+        );
+        let after_retract = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(after_retract.len(), 1);
+        assert_eq!(after_retract[0].kind, "user_message_retracted");
+        assert_eq!(after_retract[0].data["retracted_seq"], first);
+        assert!(
+            after_retract[0].seq > concurrent,
+            "the retraction must occupy a fresh global cursor slot"
+        );
+        let resent = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "first"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resent > after_retract[0].seq,
+            "a re-send must use a fresh global sequence after the tombstone"
+        );
+        let visible_users = db
+            .list_session_events(session.session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "user_message")
+            .collect::<Vec<_>>();
+        assert_eq!(visible_users.len(), 1);
+        assert_eq!(visible_users[0].data["text"], "first");
+
+        let newer = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "newer"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.remove_latest_user_message(session.session_id, resent)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.remove_latest_user_message(session.session_id, newer)
+                .await
+                .unwrap()
+        );
+    }
     use serde_json::json;
 
     fn hook_audit(status: HookRunStatus) -> HookRunAudit {
@@ -2062,6 +2234,7 @@ mod tests {
             "tool_call_scheduling",
             "agent_tree",
             "thread_anchor",
+            "user_message_retracted",
         ];
         let actual = SessionEventKind::ALL.map(SessionEventKind::as_str);
         assert_eq!(actual, expected);
@@ -2087,9 +2260,9 @@ mod tests {
             SessionEventKind::ToolCallScheduling.as_str(),
             "tool_call_scheduling"
         );
-        // The closed inventory has 30 kinds (appended, not substituted) and
+        // The closed inventory has 31 kinds (appended, not substituted) and
         // every wire string is distinct.
-        assert_eq!(SessionEventKind::ALL.len(), 30);
+        assert_eq!(SessionEventKind::ALL.len(), 31);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
         assert_eq!(
             unique.len(),

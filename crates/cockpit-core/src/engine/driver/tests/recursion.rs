@@ -23,7 +23,7 @@ fn agent_vnext_runtime_uses_effective_grant_not_legacy_recursion_context() {
     let definition = crate::agents::parse_agent(
         r#"---
 description: Bounded root delegate
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/root
 executionKind: coding
 modelSlots:
@@ -57,7 +57,7 @@ body
         .unwrap();
     let mut agent = (*driver.stack[0].agent).clone();
     agent.delegated = true;
-    // A v2 frame can carry a deliberately hostile legacy context without
+    // A launch-v1 frame can carry a deliberately hostile legacy context without
     // changing its authority: task admission uses the effective grant below.
     agent.delegation_recursion = crate::engine::builtin::DelegationRecursionContext {
         enabled: false,
@@ -70,7 +70,7 @@ body
 
     let recursion = driver
         .resolve_task_recursion("child", Some(99), &None)
-        .expect("v2 does not consult legacy recursion context");
+        .expect("launch-v1 does not consult legacy recursion context");
     assert_eq!(
         recursion,
         crate::engine::builtin::DelegationRecursionContext::default()

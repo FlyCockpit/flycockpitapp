@@ -291,7 +291,10 @@ impl PersistentDaemonSession {
 /// Product CLI commands that need installation state must go through this
 /// helper. Spawn failure is fail-closed: callers must not open SQLite.
 pub async fn ensure_persistent_daemon() -> Result<PersistentDaemonSession> {
-    let connected = probe_or_spawn(LifecycleMode::AttachOrPersistent).await?;
+    // Attaching to an ephemeral owner would leave this caller with a client
+    // whose daemon disappears when the original lifetime guard is released.
+    // Persistence is the contract of this API, so promote before returning.
+    let connected = probe_or_spawn(LifecycleMode::PromoteToPersistent).await?;
     if connected.owns_daemon {
         anyhow::bail!(
             "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"

@@ -6,9 +6,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::cli::SetupArgs;
-use crate::config::dirs::CONFIG_FILE;
 #[cfg(test)]
 use crate::config::dirs::most_specific_config_write_target;
+use crate::config::dirs::{global_config_dir, global_config_file};
 #[cfg(test)]
 use crate::config::providers::ConfigDoc;
 use crate::config::providers::HeaderSpec;
@@ -28,9 +28,21 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
     let mut io = StdTerminalIo;
     let host_capabilities = compose_wizard_host_capabilities(&cwd).await;
+    let wizard_cwd = global_config_dir().context("resolving global config for setup")?;
     let wizard = match args.wizard.as_deref() {
-        Some(id) => descriptor_for_cwd_with_caps(id, &cwd, Some(&host_capabilities))
-            .ok_or_else(|| anyhow!("unknown setup wizard `{id}`; run `cockpit setup` to list"))?,
+        Some(id) => descriptor_for_cwd_with_caps(
+            id,
+            if matches!(
+                id,
+                cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID
+            ) {
+                &wizard_cwd
+            } else {
+                &cwd
+            },
+            Some(&host_capabilities),
+        )
+        .ok_or_else(|| anyhow!("unknown setup wizard `{id}`; run `cockpit setup` to list"))?,
         None => choose_wizard(&mut io, stdin_tty, &cwd, &host_capabilities).await?,
     };
     let mut actions = ProviderSetupActions::new(cwd).with_host_capabilities(host_capabilities);
@@ -86,11 +98,19 @@ fn resolve_wizard_choice(
     cwd: &std::path::Path,
     caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
 ) -> Option<WizardDescriptor> {
-    if let Ok(number) = input.parse::<usize>() {
-        let id = crate::wizard::registry().get(number.checked_sub(1)?)?.id;
-        return descriptor_for_cwd_with_caps(id, cwd, caps);
-    }
-    descriptor_for_cwd_with_caps(input, cwd, caps)
+    let id = if let Ok(number) = input.parse::<usize>() {
+        crate::wizard::registry().get(number.checked_sub(1)?)?.id
+    } else {
+        input
+    };
+    let config_root = global_config_dir().ok()?;
+    let descriptor_root = matches!(
+        id,
+        cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID
+    )
+    .then_some(config_root.as_path())
+    .unwrap_or(cwd);
+    descriptor_for_cwd_with_caps(id, descriptor_root, caps)
 }
 
 pub(crate) trait TerminalIo {
@@ -466,11 +486,14 @@ fn is_provider_revision(value: &str) -> bool {
 }
 
 #[cfg(not(test))]
-async fn apply_security_wizard_via_daemon(cwd: &std::path::Path, run: &WizardRun) -> Result<bool> {
+async fn apply_security_wizard_via_daemon(_cwd: &std::path::Path, run: &WizardRun) -> Result<bool> {
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for security setup")?;
-    let project_root = cwd.display().to_string();
+    let project_root = global_config_dir()
+        .context("resolving global config for security setup")?
+        .display()
+        .to_string();
     let snapshot_session_id = uuid::Uuid::new_v4().to_string();
     let response = daemon
         .client
@@ -603,7 +626,7 @@ fn provider_view_matches_entry(
 
 #[cfg(not(test))]
 async fn apply_model_wizard_via_daemon(
-    cwd: &std::path::Path,
+    _cwd: &std::path::Path,
     run: &WizardRun,
 ) -> Result<(bool, bool, Option<String>)> {
     use cockpit_config::config::providers::{ActiveModelRef, CapabilityStatus};
@@ -617,7 +640,10 @@ async fn apply_model_wizard_via_daemon(
     let response = daemon
         .client
         .request(Request::GetProviderCatalogSnapshot {
-            project_root: cwd.display().to_string(),
+            project_root: global_config_dir()
+                .context("resolving global config for model setup")?
+                .display()
+                .to_string(),
             provider_id: Some(provider_id.clone()),
             snapshot_session_id: snapshot_session_id.clone(),
         })
@@ -820,6 +846,7 @@ impl ProviderSetupActions {
                     selected_provider_template(run).context("provider template answer")?;
                 self.headers = crate::providers::default_headers_for(template);
             }
+            #[cfg(feature = "grok-subscription")]
             "grok-oauth" => {
                 require_oauth_acknowledgement("grok-oauth", io).await?;
                 io.write_line("Starting Grok OAuth login.")?;
@@ -834,6 +861,12 @@ impl ProviderSetupActions {
                 let input = io.read_line().context("reading Grok OAuth callback")?;
                 complete_provider_oauth_via_daemon(flow_id, Some(input.trim().to_string())).await?;
                 io.write_line("Grok OAuth login complete.")?;
+            }
+            #[cfg(not(feature = "grok-subscription"))]
+            "grok-oauth" => {
+                anyhow::bail!(
+                    "Grok (SuperGrok) is disabled pending xAI authorization; use a custom OpenAI-compatible provider with auth_command instead"
+                )
             }
             "codex-oauth" => {
                 require_oauth_acknowledgement("codex-oauth", io).await?;
@@ -869,8 +902,7 @@ impl ProviderSetupActions {
                 #[cfg(not(test))]
                 let result = apply_security_wizard_via_daemon(&self.cwd, run).await?;
                 if result {
-                    self.security_saved =
-                        Some(cockpit_core::wizard::security_config_path(&self.cwd));
+                    self.security_saved = Some(global_config_file()?);
                     io.write_line("Saved security settings through the daemon.")?;
                 } else {
                     io.write_line("Security settings unchanged.")?;
@@ -890,7 +922,7 @@ impl ProviderSetupActions {
                 let (changed, model_file_written, default_scope) =
                     apply_model_wizard_via_daemon(&self.cwd, run).await?;
                 if model_file_written {
-                    self.model_saved = Some(self.cwd.join(CONFIG_FILE));
+                    self.model_saved = Some(global_config_file()?);
                     io.write_line("Saved model settings through the daemon.")?;
                 }
                 if let Some(scope) = default_scope {
@@ -943,7 +975,10 @@ impl ProviderSetupActions {
         let snapshot = daemon
             .client
             .request(Request::GetProviderCatalogSnapshot {
-                project_root: self.cwd.display().to_string(),
+                project_root: global_config_dir()
+                    .context("resolving global config for provider setup")?
+                    .display()
+                    .to_string(),
                 // A first-time provider has no catalog row to filter by. The
                 // full layer snapshot still issues the exact CAS capability
                 // needed for an add or replacement.
@@ -1023,7 +1058,7 @@ impl ProviderSetupActions {
                     .is_some_and(|view| provider_view_matches_entry(view, &expected_entry)) => {}
             other => bail!("daemon returned an unbound provider configuration receipt: {other:?}"),
         }
-        self.saved = Some((id.clone(), self.cwd.join(".cockpit").join(CONFIG_FILE)));
+        self.saved = Some((id.clone(), global_config_file()?));
         io.write_line(&format!("Saved provider `{id}`."))?;
         if let Some(message) = header_reference_notice {
             io.write_line(&message)?;
@@ -1115,11 +1150,14 @@ async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<Strin
         .context("starting persistent daemon for OAuth login")?;
     match daemon
         .client
-        .request(Request::CompleteProviderOAuth {
-            client_operation_id: uuid::Uuid::new_v4().to_string(),
-            flow_id,
-            input: input.map(cockpit_proto::SensitiveWirePayload::new),
-        })
+        .request_with_timeout(
+            Request::CompleteProviderOAuth {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                flow_id,
+                input: input.map(cockpit_proto::SensitiveWirePayload::new),
+            },
+            crate::commands::providers::OAUTH_COMPLETION_REQUEST_TIMEOUT,
+        )
         .await?
     {
         Ok(Response::ProviderOAuthCompleted {
@@ -1191,6 +1229,7 @@ impl TerminalActionHandler for ProviderSetupActions {
 fn subscription_oauth_provider(step_id: &str) -> Option<&'static str> {
     match step_id {
         "codex-oauth" => Some(crate::auth::subscription_ack::CODEX_OAUTH_PROVIDER),
+        #[cfg(feature = "grok-subscription")]
         "grok-oauth" => Some(crate::auth::subscription_ack::GROK_OAUTH_PROVIDER),
         _ => None,
     }
@@ -1584,6 +1623,7 @@ mod tests {
         assert!(io.output.contains("may result in account suspension"));
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[tokio::test]
     async fn grok_oauth_requires_acknowledgement() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1633,16 +1673,19 @@ mod tests {
         assert_eq!(second.reads, 0);
         assert!(second.output.is_empty());
 
-        let mut grok = ScriptIo::default();
-        let error = require_oauth_acknowledgement("grok-oauth", &mut grok)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("reading subscription OAuth acknowledgement")
-        );
-        assert_eq!(grok.reads, 1);
+        #[cfg(feature = "grok-subscription")]
+        {
+            let mut grok = ScriptIo::default();
+            let error = require_oauth_acknowledgement("grok-oauth", &mut grok)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reading subscription OAuth acknowledgement")
+            );
+            assert_eq!(grok.reads, 1);
+        }
     }
 
     #[test]

@@ -2,12 +2,9 @@
 //!
 //! Trust is a provider/model data-custody classification and stays that way:
 //!
-//! - [`ModelTrust`] is a provider/model **data-custody** classification.
-//!   `Trusted` marks a self-hosted / no-log endpoint that may hold raw
-//!   secret/environment values; raw content reaching it is the intended,
-//!   supported outcome. `Untrusted` marks a cloud endpoint that must receive a
-//!   redacted rendering. The enforced invariant is one-directional:
-//!   unredacted content must never reach an untrusted endpoint.
+//! - [`ModelTrust`] is a provider/model **capture/write** classification.
+//!   `Trusted` may participate in host-mediated capture; `Untrusted` may not.
+//!   Every model receives a redacted, reference-only sealed-value rendering.
 //! - Harness-steering posture is agent-definition-scoped and is no longer a
 //!   dimension of model routing; it never filtered provider eligibility,
 //!   custody, or redaction here.
@@ -188,7 +185,7 @@ impl<'a> ModelPolicyCriteria<'a> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelCustody {
-    /// The selected endpoint may receive raw secret/environment values.
+    /// The selected endpoint is eligible for host-mediated capture.
     Trusted,
     /// The selected endpoint must receive a redacted rendering.
     Untrusted,
@@ -214,11 +211,9 @@ impl ModelCustody {
 
 /// Custody posture of an **external OS harness**.
 ///
-/// It carries the same meaning as [`ModelCustody`] — trusted may hold raw
-/// secrets, untrusted must be handed redacted material — but it is a separate
-/// type on purpose: an external harness is not a provider/model route, so this
-/// value must never reach model routing. There is deliberately no conversion
-/// into [`ModelCustody`] or [`ModelTrust`].
+/// It is a separate type on purpose: an external harness is not a provider/
+/// model route, so this value must never reach model routing. There is
+/// deliberately no conversion into [`ModelCustody`] or [`ModelTrust`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessCustodyTrust {
@@ -240,7 +235,7 @@ impl HarnessCustodyTrust {
     }
 }
 
-/// Renders potentially sensitive material for exactly one untrusted target.
+/// Renders potentially sensitive material for exactly one model target.
 ///
 /// Implementations own the redaction. There is no raw passthrough: the trait
 /// only ever returns an owned, target-specific rendering.
@@ -248,27 +243,16 @@ pub trait RedactedRendering: Send + Sync {
     fn render_redacted(&self, provider: &str, model: &str, source: &str) -> String;
 }
 
-#[derive(Clone)]
-enum PayloadRendering {
-    /// Raw provider bytes. Reachable only through
-    /// [`SensitivePayload::raw_for_trusted_custody`] and only unlockable with a
-    /// [`TrustedCustodyGrant`].
-    Raw,
-    /// Target-specific redacted rendering. Has no raw-byte conversion.
-    Redacted(Arc<dyn RedactedRendering>),
-}
-
 /// The rendering policy for a payload that may contain sensitive material.
 ///
 /// The custody class is part of the value, so a caller cannot construct a
-/// sensitive request without first deciding custody. `Trusted` construction
-/// yields raw provider bytes only after routing hands back a
-/// [`TrustedCustodyGrant`]; `Untrusted` construction requires a
-/// target-specific redacted rendering and exposes no raw-byte conversion.
+/// sensitive request without first deciding capture eligibility. Every payload
+/// has exactly one rendering: target-specific redaction. No payload API can
+/// expose its source bytes to a model.
 #[derive(Clone)]
 pub struct SensitivePayload {
     custody: ModelCustody,
-    rendering: PayloadRendering,
+    rendering: Arc<dyn RedactedRendering>,
 }
 
 impl std::fmt::Debug for SensitivePayload {
@@ -276,83 +260,36 @@ impl std::fmt::Debug for SensitivePayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SensitivePayload")
             .field("custody", &self.custody)
-            .field(
-                "rendering",
-                &match self.rendering {
-                    PayloadRendering::Raw => "raw",
-                    PayloadRendering::Redacted(_) => "redacted",
-                },
-            )
+            .field("rendering", &"redacted")
             .finish()
     }
 }
 
 #[allow(dead_code)]
 impl SensitivePayload {
-    /// Raw provider bytes may reach the selected endpoint. Fixes custody to
-    /// [`ModelCustody::Trusted`].
-    pub fn raw_for_trusted_custody() -> Self {
-        Self {
-            custody: ModelCustody::Trusted,
-            rendering: PayloadRendering::Raw,
-        }
-    }
-
-    /// The payload exists only as a target-specific redacted rendering. Fixes
-    /// custody to [`ModelCustody::Untrusted`].
-    pub fn redacted_for_untrusted_custody(rendering: Arc<dyn RedactedRendering>) -> Self {
-        Self {
-            custody: ModelCustody::Untrusted,
-            rendering: PayloadRendering::Redacted(rendering),
-        }
+    /// A sensitive payload is always target-specifically redacted. `custody`
+    /// records whether the selected model is capture-capable; it never changes
+    /// the bytes dispatched to that model.
+    pub fn redacted_for_custody(
+        custody: ModelCustody,
+        rendering: Arc<dyn RedactedRendering>,
+    ) -> Self {
+        Self { custody, rendering }
     }
 
     pub fn custody(&self) -> ModelCustody {
         self.custody
     }
 
-    /// Raw provider bytes, unlocked by the grant routing mints after a
-    /// `Trusted` selection.
-    ///
-    /// The grant is bound to the destination it was minted for: it unlocks raw
-    /// bytes only for that exact `(provider, model)`. A grant for one trusted
-    /// route can therefore never be replayed to send raw bytes to a different
-    /// route. Always `None` for an untrusted payload — a redacted rendering has
-    /// no raw-byte conversion.
-    pub fn raw_provider_bytes<'s>(
-        &self,
-        grant: &TrustedCustodyGrant,
-        route: &ResolvedModelPolicy,
-        source: &'s str,
-    ) -> Option<&'s str> {
-        if !grant.authorizes(route) {
-            return None;
-        }
-        match self.rendering {
-            PayloadRendering::Raw => Some(source),
-            PayloadRendering::Redacted(_) => None,
-        }
-    }
-
-    /// Target-specific redacted rendering for the resolved untrusted target.
-    /// Always `None` for a raw/trusted payload.
-    pub fn render_for_untrusted(
-        &self,
-        resolved: &ResolvedModelPolicy,
-        source: &str,
-    ) -> Option<String> {
-        match &self.rendering {
-            PayloadRendering::Raw => None,
-            PayloadRendering::Redacted(rendering) => {
-                Some(rendering.render_redacted(&resolved.provider, &resolved.model, source))
-            }
-        }
+    /// Target-specific redacted rendering for every model target.
+    pub fn render(&self, resolved: &ResolvedModelPolicy, source: &str) -> String {
+        self.rendering
+            .render_redacted(&resolved.provider, &resolved.model, source)
     }
 }
 
-/// Proof that routing selected a provider/model under `Trusted` custody. Only
-/// [`ProvidersConfig::resolve_sensitive_model_policy`] mints one, so raw
-/// provider bytes cannot be produced without a completed trusted selection.
+/// Proof that routing selected a provider/model eligible for host-mediated
+/// capture. Only [`ProvidersConfig::resolve_sensitive_model_policy`] mints one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedCustodyGrant {
     provider: String,
@@ -369,8 +306,7 @@ impl TrustedCustodyGrant {
         &self.model
     }
 
-    /// Whether this grant was minted for `route`. Raw bytes are unlocked only
-    /// for the exact destination the trusted selection resolved to.
+    /// Whether this grant was minted for `route`.
     pub fn authorizes(&self, route: &ResolvedModelPolicy) -> bool {
         self.provider == route.provider && self.model == route.model && route.trust.is_trusted()
     }
@@ -378,11 +314,8 @@ impl TrustedCustodyGrant {
 
 /// The single place a [`TrustedCustodyGrant`] comes into existence.
 ///
-/// Every custody-routing entry point funnels through here, so "raw provider
-/// bytes were released" and "a custody selection completed under
-/// [`ModelCustody::Trusted`]" are the same event by construction. An
-/// `Untrusted` selection never mints one, which is what makes a missing grant
-/// mean *redact*, not *unknown*.
+/// Every custody-routing entry point funnels through here. An `Untrusted`
+/// selection never mints a capture grant; all model egress remains redacted.
 fn seal_custody_selection(
     policy: ResolvedModelPolicy,
     custody: ModelCustody,
@@ -400,12 +333,9 @@ fn seal_custody_selection(
 
 /// Custody rule for backup/failover routing.
 ///
-/// Failover is **upgrade-only**. An untrusted primary may fail over to an
-/// untrusted or a trusted candidate — moving work onto a self-hosted/no-log
-/// endpoint is never a regression. A trusted primary may fail over only to
-/// another trusted candidate; a downgrade would push content that was routed
-/// under raw custody onto a cloud endpoint, so it is a typed refusal rather
-/// than a silent substitution.
+/// Failover preserves capture eligibility: a capture-capable primary may only
+/// fail over to another capture-capable candidate. Model egress is redacted
+/// for both classes.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FailoverCustody {
@@ -569,7 +499,7 @@ impl ResolvedModelPolicy {
             custody_filter: self.custody_filter.map(ModelCustody::as_str),
             custody_filter_reason: match self.custody_filter {
                 Some(ModelCustody::Trusted) => {
-                    "explicit trusted-custody filter: caller requested raw-custody routing"
+                    "explicit trusted-custody filter: caller requested capture-capable routing"
                 }
                 Some(ModelCustody::Untrusted) => {
                     "explicit untrusted-custody filter: caller requested redacted routing"
@@ -1184,8 +1114,8 @@ impl ProvidersConfig {
     }
 
     /// Route a potentially sensitive payload under its required custody class.
-    /// A `Trusted` selection mints the [`TrustedCustodyGrant`] that unlocks raw
-    /// provider bytes; an `Untrusted` selection never does.
+    /// A `Trusted` selection mints a [`TrustedCustodyGrant`] for host-mediated
+    /// capture; it never unlocks provider bytes.
     #[allow(dead_code)]
     pub fn resolve_sensitive_model_policy(
         &self,
@@ -1201,13 +1131,10 @@ impl ProvidersConfig {
     /// the host's provider configuration assigns it.
     ///
     /// Custody for a configured target is a **host** decision: the caller does
-    /// not get to ask for `Trusted`. What the caller also does not get is a way
-    /// *around* this call. The only artifact that releases raw provider bytes
-    /// is the [`TrustedCustodyGrant`] on the returned route, nothing else mints
-    /// one, and a grant unlocks raw bytes only for the exact `(provider,
-    /// model)` it names. A caller that skips custody routing therefore has
-    /// nothing to unlock raw bytes with and falls closed to the redacted
-    /// rendering.
+    /// not get to ask for `Trusted`. The returned `TrustedCustodyGrant`, when
+    /// present, authorizes only host-mediated capture for that exact
+    /// `(provider, model)` route. It does not affect the mandatory redacted
+    /// model rendering.
     ///
     /// Unlike discovery routing this does not require the model to appear in
     /// the provider's model list: a configured target names a real endpoint
@@ -1230,10 +1157,7 @@ impl ProvidersConfig {
             ModelTrust::Trusted => ModelCustody::Trusted,
             ModelTrust::Untrusted => ModelCustody::Untrusted,
         };
-        let payload = match custody {
-            ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
-            ModelCustody::Untrusted => SensitivePayload::redacted_for_untrusted_custody(redacted),
-        };
+        let payload = SensitivePayload::redacted_for_custody(custody, redacted);
         let selector = format!("{provider}:{model}");
         let criteria = ModelPolicyCriteria {
             selector: ModelPolicySelector::Exact(&selector),

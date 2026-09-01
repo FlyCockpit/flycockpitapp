@@ -980,7 +980,11 @@ impl SessionRegistry {
         providers_cfg: &ProvidersConfig,
     ) {
         let referenced = crate::secret_ref::provider_named_secret_references(providers_cfg);
-        if referenced.is_empty() {
+        let has_dynamic_auth = providers_cfg
+            .providers
+            .values()
+            .any(|entry| entry.auth_command.is_some() || entry.oauth.is_some());
+        if referenced.is_empty() && !has_dynamic_auth {
             return;
         }
         let store = match session.provider_credential_store(providers_cfg) {
@@ -993,6 +997,44 @@ impl SessionRegistry {
                 return;
             }
         };
+        // Resolve global provider auth commands and declarative OAuth refreshes
+        // before redaction and model construction. Successful token/header output is now in the
+        // CredentialStore when the session redaction table inventories it;
+        // malformed/failed commands remain uncached and the selected model's
+        // request build surfaces the same auth error fail-closed.
+        for (provider_id, entry) in &providers_cfg.providers {
+            let result = if entry.auth_command.is_some() {
+                crate::auth::command::resolve(
+                    provider_id,
+                    entry,
+                    store.clone(),
+                    &|name| std::env::var(name).ok(),
+                    false,
+                    None,
+                )
+                .await
+                .map(|_| ())
+            } else if let Some(descriptor) = entry.oauth.as_ref() {
+                crate::auth::descriptor::resolve(
+                    provider_id,
+                    descriptor,
+                    store.clone(),
+                    false,
+                    None,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                continue;
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    provider = %provider_id,
+                    %error,
+                    "provider dynamic-auth pre-resolution failed"
+                );
+            }
+        }
         self.resolve_referenced_from_store(&store, &referenced, false)
             .await;
     }
@@ -2834,7 +2876,9 @@ impl SessionRegistry {
         let Some(mut join) = join else {
             let _ = tokio::time::timeout_at(
                 deadline,
-                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+                }),
             )
             .await;
             let _ = tokio::time::timeout_at(
@@ -2857,7 +2901,9 @@ impl SessionRegistry {
 
         let _ = tokio::time::timeout_at(
             deadline,
-            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+            }),
         )
         .await;
         let _ = tokio::time::timeout_at(
@@ -3652,7 +3698,7 @@ mod tests {
         assert_invalid_tokenizer_blocks_snapshot(resume_error, "configuration value is invalid");
         let assistant_home = crate::assistants::default_home_dir("helper").unwrap();
         std::fs::create_dir_all(&assistant_home).unwrap();
-        let assistant_md = "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Test helper\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\n\nHelp with tests.\n";
+        let assistant_md = "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Test helper\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\n\nHelp with tests.\n";
         std::fs::write(assistant_home.join("assistant.md"), assistant_md).unwrap();
         let content_hash =
             crate::assistants::markdown_content_identity(&reg.inner.db, assistant_md).unwrap();
@@ -4922,7 +4968,9 @@ mod tests {
         loop {
             if tokio::time::timeout(
                 Duration::from_millis(50),
-                handle.send_work(session_worker::SessionWork::Cancel),
+                handle.send_work(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Noninteractive,
+                }),
             )
             .await
             .is_err()

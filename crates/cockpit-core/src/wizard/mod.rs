@@ -416,6 +416,7 @@ impl WizardRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderWizardStep {
     Template,
+    WireApi,
     ProviderId,
     Url,
     Headers,
@@ -434,8 +435,9 @@ pub enum ProviderWizardStep {
 }
 
 impl ProviderWizardStep {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Template,
+        Self::WireApi,
         Self::ProviderId,
         Self::Url,
         Self::Headers,
@@ -455,6 +457,7 @@ impl ProviderWizardStep {
     pub const fn source_id(self) -> &'static str {
         match self {
             Self::Template => "template",
+            Self::WireApi => "wire-api",
             Self::ProviderId => "id",
             Self::Url => "url",
             Self::Headers => "headers",
@@ -476,6 +479,7 @@ impl ProviderWizardStep {
     fn from_source_id(id: &str) -> Self {
         match id {
             "template" => Self::Template,
+            "wire-api" => Self::WireApi,
             "id" => Self::ProviderId,
             "url" => Self::Url,
             "headers" => Self::Headers,
@@ -568,7 +572,7 @@ pub fn model_descriptor_with_selection(
             StepDescriptor {
                 id: "trust",
                 prompt: "Provider trust (data custody)",
-                help: "Data custody only, independent of locality. untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values. Warning: marking an external provider trusted sends that provider raw secrets and environment values. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
+                help: "Capture policy only, independent of locality. All inference requests use reference-only redaction for sealed values. trusted: may participate in host-mediated secret capture; untrusted: cannot capture secrets. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
                 help_hook: Some(model_trust_help),
                 kind: StepKind::Select {
                     options: vec![
@@ -581,7 +585,7 @@ pub fn model_descriptor_with_selection(
                             id: "trusted".into(),
                             label: "trusted".into(),
                             description:
-                                "Send inference requests raw, including secrets and environment values; meant for self-hosted or no-log endpoints"
+                                "Permit host-mediated secret capture; inference requests remain reference-only"
                                     .into(),
                         },
                     ],
@@ -881,8 +885,12 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         .iter()
         .map(|template| SelectOption {
             id: template.id.into(),
-            label: template.display.into(),
-            description: template.hint.unwrap_or("Provider template").into(),
+            label: template.display_label(),
+            description: template
+                .disabled_reason()
+                .or(template.display_hint())
+                .unwrap_or("Provider template")
+                .into(),
         })
         .collect();
     WizardDescriptor {
@@ -902,7 +910,42 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 },
                 default_answer: default_template.map(|id| WizardAnswer::Select(id.to_string())),
                 prefill: None,
-                validate: Some(validate_select),
+                validate: Some(validate_provider_template),
+                write: None,
+                branch: Some(provider_template_branch),
+            },
+            StepDescriptor {
+                id: ProviderWizardStep::WireApi.source_id(),
+                prompt: "Choose request wire",
+                help: "Choose the API shape your endpoint accepts. Auto keeps Cockpit's normal endpoint detection and fallback behavior.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "auto".into(),
+                            label: "Auto".into(),
+                            description: "Let Cockpit select the request wire".into(),
+                        },
+                        SelectOption {
+                            id: "completions".into(),
+                            label: "Chat Completions".into(),
+                            description: "Use the OpenAI-compatible /chat/completions API".into(),
+                        },
+                        SelectOption {
+                            id: "responses".into(),
+                            label: "Responses".into(),
+                            description: "Use the OpenAI Responses API".into(),
+                        },
+                        SelectOption {
+                            id: "anthropic".into(),
+                            label: "Anthropic".into(),
+                            description: "Use Anthropic's native Messages API".into(),
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("auto".to_string())),
+                prefill: None,
+                validate: Some(validate_provider_wire_api),
                 write: None,
                 branch: None,
             },
@@ -1465,6 +1508,37 @@ fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<
     }
 }
 
+fn validate_provider_template(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(id) = answer else {
+        return Err("choose an option".to_string());
+    };
+    if id.is_empty() {
+        return Err("choose an option".to_string());
+    }
+    let Some(template) = crate::providers::template_by_id(id) else {
+        return Err("choose a listed provider template".to_string());
+    };
+    match template.disabled_reason() {
+        Some(reason) => Err(reason.to_string()),
+        None => Ok(()),
+    }
+}
+
+fn validate_provider_wire_api(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(value) = answer else {
+        return Err("choose auto, completions, responses, or anthropic".to_string());
+    };
+    provider_wire_api_from_id(value)
+        .map(|_| ())
+        .ok_or_else(|| "choose auto, completions, responses, or anthropic".to_string())
+}
+
 fn validate_model_trust_answer(
     _: &WizardRun,
     answer: &WizardAnswer,
@@ -1668,7 +1742,37 @@ pub fn provider_entry_from_answers(
     headers: Vec<crate::config::providers::HeaderSpec>,
 ) -> Option<crate::config::providers::ProviderEntry> {
     let template = selected_provider_template(run)?;
-    provider_entry_for_template(template, provider_url_answer(run)?, headers).into()
+    let wire_api = provider_wire_api_for_template(run, template);
+    provider_entry_for_template_with_wire_api(
+        template,
+        provider_url_answer(run)?,
+        headers,
+        wire_api,
+    )
+    .into()
+}
+
+fn provider_wire_api_answer(run: &WizardRun) -> Option<crate::config::providers::WireApi> {
+    let WizardAnswer::Select(value) = run.answer(ProviderWizardStep::WireApi.source_id())? else {
+        return None;
+    };
+    provider_wire_api_from_id(value)
+}
+
+/// Resolve the wire for a template from this run's answers.
+///
+/// A wire-picker answer is authoritative only for templates that expose that
+/// picker. `WizardRun::back` deliberately retains answers, so an answer from a
+/// previously selected custom template must not override a pinned template.
+pub fn provider_wire_api_for_template(
+    run: &WizardRun,
+    template: &crate::providers::ProviderTemplate,
+) -> crate::config::providers::WireApi {
+    if provider_template_exposes_wire_api_picker(template) {
+        provider_wire_api_answer(run).unwrap_or(template.default_wire_api)
+    } else {
+        template.default_wire_api
+    }
 }
 
 pub fn provider_entry_for_template(
@@ -1676,17 +1780,31 @@ pub fn provider_entry_for_template(
     url: String,
     headers: Vec<crate::config::providers::HeaderSpec>,
 ) -> crate::config::providers::ProviderEntry {
-    use crate::auth::{codex_oauth, xai_oauth};
-    use crate::config::providers::{AuthKind, ProviderEntry, ProviderModelCatalog};
+    provider_entry_for_template_with_wire_api(template, url, headers, template.default_wire_api)
+}
 
-    let auth =
-        if template.id == xai_oauth::CREDENTIAL_KEY || template.id == codex_oauth::CREDENTIAL_KEY {
-            Some(AuthKind::OAuth)
-        } else {
-            Some(template.auth)
-        };
-    let credential_ref = if template.id == xai_oauth::CREDENTIAL_KEY {
-        Some(xai_oauth::CREDENTIAL_KEY.to_string())
+pub fn provider_entry_for_template_with_wire_api(
+    template: &'static crate::providers::ProviderTemplate,
+    url: String,
+    headers: Vec<crate::config::providers::HeaderSpec>,
+    wire_api: crate::config::providers::WireApi,
+) -> crate::config::providers::ProviderEntry {
+    use crate::auth::codex_oauth;
+    use crate::config::providers::{
+        AnthropicFeatures, AuthKind, ProviderEntry, ProviderModelCatalog,
+    };
+
+    #[cfg(feature = "grok-subscription")]
+    let is_grok_oauth = template.id == crate::auth::xai_oauth::CREDENTIAL_KEY;
+    #[cfg(not(feature = "grok-subscription"))]
+    let is_grok_oauth = false;
+    let auth = if is_grok_oauth || template.id == codex_oauth::CREDENTIAL_KEY {
+        Some(AuthKind::OAuth)
+    } else {
+        Some(template.auth)
+    };
+    let credential_ref = if is_grok_oauth {
+        Some("grok-oauth".to_string())
     } else if template.id == codex_oauth::CREDENTIAL_KEY {
         Some(codex_oauth::CREDENTIAL_KEY.to_string())
     } else {
@@ -1704,6 +1822,8 @@ pub fn provider_entry_for_template(
         allow_insecure_http: false,
         credential_ref,
         auth,
+        auth_command: None,
+        oauth: None,
         trust: None,
         location: None,
         quality_rank: None,
@@ -1716,11 +1836,12 @@ pub fn provider_entry_for_template(
         embeddings: None,
         availability: Default::default(),
         cache: Default::default(),
+        anthropic: (template.id == "anthropic").then(AnthropicFeatures::first_party),
         shrink: Default::default(),
         context: Default::default(),
         auto_prune: None,
         timeout: Default::default(),
-        wire_api: template.default_wire_api,
+        wire_api,
         backup: None,
         inline_think: None,
         hint_tool_call_corrections: None,
@@ -1777,7 +1898,7 @@ fn model_trust_help(run: &WizardRun) -> Option<String> {
     let provider = model_provider_answer(run)?;
     let trust = *model_context(run)?.provider_trust_defaults.get(&provider)?;
     Some(format!(
-        "provider default: {} · data custody only, independent of locality · untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values · exports and client display stay redacted either way.",
+        "provider default: {} · capture policy only, independent of locality · all inference requests use reference-only redaction for sealed values · trusted: host-mediated capture capable · untrusted: capture disabled · exports and client display stay redacted either way.",
         model_trust_id(trust)
     ))
 }
@@ -1904,6 +2025,33 @@ fn provider_auth_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static st
     })
 }
 
+fn provider_template_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    let template = selected_provider_template(run)?;
+    Some(if provider_template_exposes_wire_api_picker(template) {
+        ProviderWizardStep::WireApi.source_id()
+    } else {
+        ProviderWizardStep::ProviderId.source_id()
+    })
+}
+
+fn provider_template_exposes_wire_api_picker(
+    template: &crate::providers::ProviderTemplate,
+) -> bool {
+    template.id == "openai-compatible" || template.default_wire_api.is_auto()
+}
+
+fn provider_wire_api_from_id(value: &str) -> Option<crate::config::providers::WireApi> {
+    use crate::config::providers::WireApi;
+
+    Some(match value {
+        "auto" => WireApi::Auto,
+        "completions" => WireApi::Completions,
+        "responses" => WireApi::Responses,
+        "anthropic" => WireApi::Anthropic,
+        _ => return None,
+    })
+}
+
 fn provider_auth_method_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
     Some(match answer {
         WizardAnswer::Select(value) if value == "paste-key" => "api-key",
@@ -1969,9 +2117,8 @@ mod tests {
         }
     }
 
-    /// The model wizard must present data custody as its own decision, warn
-    /// that a trusted external provider receives raw secrets, and never
-    /// suggest that locality implies trust.
+    /// The model wizard must present capture policy as its own decision and
+    /// never suggest that locality implies trust.
     #[test]
     fn model_setup_presents_custody_independently() {
         let descriptor =
@@ -1993,22 +2140,22 @@ mod tests {
         assert!(
             trust
                 .help
-                .contains("Data custody only, independent of locality"),
+                .contains("Capture policy only, independent of locality"),
             "trust help: {}",
             trust.help
         );
         assert!(
             trust
                 .help
-                .contains("may be sent raw, including secrets and environment values"),
+                .contains("All inference requests use reference-only redaction"),
             "trust help: {}",
             trust.help
         );
         assert!(
-            trust.help.contains(
-                "marking an external provider trusted sends that provider raw secrets and environment values"
-            ),
-            "trust help must carry the explicit warning: {}",
+            trust
+                .help
+                .contains("trusted: may participate in host-mediated secret capture"),
+            "trust help must state the capture capability: {}",
             trust.help
         );
         assert!(
@@ -2032,8 +2179,8 @@ mod tests {
             .find(|option| option.id == "trusted")
             .expect("trusted option");
         assert!(
-            trusted.description.contains("raw"),
-            "trusted option must state the custody effect: {}",
+            trusted.description.contains("capture"),
+            "trusted option must state the capture effect: {}",
             trusted.description
         );
         let untrusted = options
@@ -2290,6 +2437,143 @@ mod tests {
         assert_eq!(
             run.prefill(),
             Some(WizardAnswer::Text("openai".to_string()))
+        );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn provider_wizard_shows_and_rejects_the_disabled_grok_template() {
+        let descriptor = provider_descriptor();
+        let template_step = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "template")
+            .expect("template step");
+        let StepKind::Select { options } = &template_step.kind else {
+            panic!("template step must be a select")
+        };
+        let grok = options
+            .iter()
+            .find(|option| option.id == "grok-oauth")
+            .expect("disabled Grok entry remains visible");
+        assert!(grok.label.contains("disabled pending xAI authorization"));
+        assert!(grok.description.contains("auth_command"));
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        let error = run
+            .submit(WizardAnswer::Select("grok-oauth".to_string()))
+            .unwrap_err();
+        assert!(error.contains("disabled pending xAI authorization"));
+    }
+
+    fn custom_provider_entry_for_wire(wire: &str) -> crate::config::providers::ProviderEntry {
+        let mut run = WizardRun::new(provider_descriptor()).unwrap();
+        run.submit(WizardAnswer::Select("openai-compatible".to_string()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("wire-api"));
+        run.submit(WizardAnswer::Select(wire.to_string())).unwrap();
+        run.submit(WizardAnswer::Text("custom".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Text("https://example.test/v1".to_string()))
+            .unwrap();
+        provider_entry_from_answers(&run, Vec::new()).expect("custom provider entry")
+    }
+
+    #[test]
+    fn custom_provider_wire_picker_materializes_selected_wire() {
+        use crate::config::providers::WireApi;
+
+        for (selection, expected) in [
+            ("completions", WireApi::Completions),
+            ("responses", WireApi::Responses),
+            ("anthropic", WireApi::Anthropic),
+        ] {
+            let entry = custom_provider_entry_for_wire(selection);
+            assert_eq!(entry.wire_api, expected, "selection {selection}");
+            assert!(
+                entry.effective_anthropic_features().is_empty(),
+                "custom provider `{selection}` must not enable Anthropic extensions"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_provider_wire_picker_defaults_to_auto() {
+        use crate::config::providers::WireApi;
+
+        let mut run = WizardRun::new(provider_descriptor()).unwrap();
+        run.submit(WizardAnswer::Select("openai-compatible".to_string()))
+            .unwrap();
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("auto".to_string()))
+        );
+        run.submit(run.prefill().expect("wire picker default"))
+            .unwrap();
+        run.submit(WizardAnswer::Text("custom".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Text("https://example.test/v1".to_string()))
+            .unwrap();
+        assert_eq!(
+            provider_entry_from_answers(&run, Vec::new())
+                .expect("custom provider entry")
+                .wire_api,
+            WireApi::Auto
+        );
+    }
+
+    #[test]
+    fn pinned_provider_templates_skip_wire_picker_and_keep_their_wire() {
+        use crate::config::providers::WireApi;
+
+        let mut run = WizardRun::new(provider_descriptor_with_template(Some("anthropic"))).unwrap();
+        run.submit(WizardAnswer::Select("anthropic".to_string()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("id"));
+        run.submit(WizardAnswer::Text("anthropic".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Text(
+            "https://api.anthropic.com/v1".to_string(),
+        ))
+        .unwrap();
+        let entry =
+            provider_entry_from_answers(&run, Vec::new()).expect("Anthropic provider entry");
+        assert_eq!(entry.wire_api, WireApi::Anthropic);
+        assert_eq!(
+            entry.anthropic,
+            Some(crate::config::providers::AnthropicFeatures::first_party())
+        );
+    }
+
+    #[test]
+    fn pinned_provider_template_ignores_retained_custom_wire_answer_after_backtracking() {
+        use crate::config::providers::WireApi;
+
+        let mut run = WizardRun::new(provider_descriptor()).unwrap();
+        run.submit(WizardAnswer::Select("openai-compatible".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("responses".to_string()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("id"));
+        assert!(run.back());
+        assert!(run.back());
+        assert_eq!(run.current_step_id(), Some("template"));
+
+        run.submit(WizardAnswer::Select("anthropic".to_string()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("id"));
+        run.submit(WizardAnswer::Text("anthropic".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Text(
+            "https://api.anthropic.com/v1".to_string(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            provider_entry_from_answers(&run, Vec::new())
+                .expect("Anthropic provider entry")
+                .wire_api,
+            WireApi::Anthropic
         );
     }
 

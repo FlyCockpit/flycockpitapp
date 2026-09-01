@@ -309,6 +309,7 @@ pub(super) enum WizardTestChoice {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum WizardControlId {
     Template(String),
+    WireApi(String),
     AuthMethod(WizardAuthMethod),
     TestChoice(WizardTestChoice),
     OAuth(super::providers::OAuthOption),

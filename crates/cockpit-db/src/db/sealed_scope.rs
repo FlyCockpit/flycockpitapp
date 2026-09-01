@@ -1138,6 +1138,12 @@ impl Db {
                    FROM sealed_value_records
                   WHERE deleted_at_ms IS NULL
                     AND active_version >= 1
+                    AND EXISTS (
+                        SELECT 1
+                          FROM sessions
+                         WHERE session_id = ?1
+                           AND project_id = ?2
+                    )
                     AND (
                         (scope = 'session' AND scope_key = ?1)
                         OR (scope = 'project' AND scope_key = ?2 AND compartment_key IS NOT NULL)
@@ -1934,6 +1940,18 @@ mod tests {
             .unwrap();
         assert_eq!(other_visible.len(), 1);
         assert_eq!(other_visible[0].record_id, other_project.record_id);
+
+        let mismatched_scope = db
+            .list_referenceable_sealed_value_metadata(
+                other_session.session_id.to_string(),
+                "project-a".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            mismatched_scope.is_empty(),
+            "a session cannot be paired with another project's scope or grants"
+        );
     }
 
     /// The saga carries only compartment locators, and a session record has

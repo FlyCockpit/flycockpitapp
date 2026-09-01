@@ -1008,15 +1008,12 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
-    let http_client = if resolved_wire_api == crate::config::providers::WireApi::Responses {
-        // Generic Responses endpoints must not receive headers that identify a
-        // ChatGPT/Codex subscription, even if they were supplied in custom
-        // provider configuration. Those headers belong exclusively to the
-        // native Codex credential path above.
-        UsageAliasHttpClient::without_codex_headers(extra_headers)?
-    } else {
-        UsageAliasHttpClient::new(extra_headers)?
-    };
+    // A `CompletionsClient` can recover between the Chat Completions and
+    // Responses endpoints without being rebuilt. Keep the generic client
+    // fenced for its whole lifetime instead of tying the header policy to its
+    // initially resolved endpoint. The policy filters Codex subscription
+    // headers whenever this generic client selects `/responses`.
+    let http_client = UsageAliasHttpClient::without_codex_headers(extra_headers)?;
     let client = openai::CompletionsClient::builder()
         .api_key(token)
         .base_url(&resolved.base_url)

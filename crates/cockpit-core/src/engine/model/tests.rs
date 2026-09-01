@@ -2018,6 +2018,7 @@ fn native_anthropic_dispatch_capture_matches_shared_assembly() {
     let expected = assembled_request(
         model.model_id(),
         model.provider_label(),
+        WireApi::Anthropic,
         "system",
         &history,
         &prompt,
@@ -2201,6 +2202,7 @@ fn assembled_request_carries_sanitized_additional_params() {
     let body = assembled_request(
         "deepseek-reasoner",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2222,6 +2224,7 @@ fn assembled_request_additional_params_null_when_absent() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2486,6 +2489,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let body = assembled_request(
             "claude",
             "anthropic",
+            WireApi::Anthropic,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2523,6 +2527,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let body = assembled_request(
             "claude",
             "anthropic",
+            WireApi::Anthropic,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2557,6 +2562,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
         let body = assembled_request(
             "gpt",
             "openai-compatible",
+            WireApi::Responses,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2578,6 +2584,7 @@ fn computer_live_opened_geometry_is_not_sufficient_to_advertise() {
     let body = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Responses,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2720,6 +2727,7 @@ fn assembled_request_task_tool_advertises_intent_envelope() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2760,6 +2768,7 @@ fn assembled_request_carries_trailing_system_injection() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYSTEM PROMPT",
         &history,
         &prompt,
@@ -3194,6 +3203,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let openai = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3207,6 +3217,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let anthropic = assembled_request(
         "claude",
         "anthropic",
+        WireApi::Anthropic,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3219,6 +3230,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let chatgpt = assembled_request(
         "gpt-5.3-codex",
         "codex-oauth",
+        WireApi::Responses,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3268,6 +3280,7 @@ fn captured_request_carries_prompt_cache_retention() {
     let openai = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3286,6 +3299,7 @@ fn captured_request_carries_prompt_cache_retention() {
     let anthropic = assembled_request(
         "claude",
         "anthropic",
+        WireApi::Anthropic,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -7085,6 +7099,35 @@ async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
     ));
     assert_eq!(model.provider_label(), "openai-compatible");
 
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "reasoning_effort": "high",
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+        })),
+        ..ModelParams::default()
+    };
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &[Message::user("earlier turn")],
+            &Message::user("hi"),
+            &[],
+            &params,
+        )
+        .expect("custom Responses dispatch record must assemble");
+    assert_eq!(captured["additional_params"]["store"], json!(false));
+    assert_eq!(
+        captured["additional_params"]["reasoning"]["effort"],
+        json!("high")
+    );
+    assert!(
+        captured["additional_params"]
+            .get("reasoning_effort")
+            .is_none()
+    );
+
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
     // The scripted Responses stream contains output text and completion items
     // only: no reasoning output item is required for a successful turn.
@@ -7094,15 +7137,7 @@ async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
             &[Message::user("earlier turn")],
             Message::user("hi"),
             &[],
-            ModelParams {
-                additional_params: Some(json!({
-                    "reasoning_effort": "high",
-                    "store": true,
-                    "previous_response_id": "response-123",
-                    "background": true,
-                })),
-                ..ModelParams::default()
-            },
+            params,
             "Build",
             Some(&tx),
             &CancellationToken::new(),

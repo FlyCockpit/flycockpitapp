@@ -68,9 +68,11 @@ impl UsageAliasHttpClient {
         Self::with_header_policy(extra_headers, false, true)
     }
 
-    /// Generic Responses providers must not receive headers that identify a
-    /// ChatGPT/Codex subscription, whether they originate in rig or provider
-    /// configuration.
+    /// Requests sent over the generic Responses wire must not receive headers
+    /// that identify a ChatGPT/Codex subscription, whether they originate in
+    /// rig or provider configuration. A generic client may recover between
+    /// Completions and Responses without being rebuilt, so this is enforced
+    /// per request rather than at construction time.
     pub(super) fn without_codex_headers(
         extra_headers: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {
@@ -126,7 +128,7 @@ fn apply_extra_headers<T>(
     for (name, value) in headers {
         parts.headers.insert(name.clone(), value.clone());
     }
-    if strip_codex_headers {
+    if strip_codex_headers && parts.uri.path().ends_with("/responses") {
         for name in [
             "chatgpt-account-id",
             "originator",

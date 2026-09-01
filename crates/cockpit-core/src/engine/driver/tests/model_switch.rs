@@ -3017,9 +3017,12 @@ async fn turn_refresh_rebuilds_when_wire_api_changes_model_variant() {
     assert!(
         matches!(
             refreshed.as_ref(),
-            crate::engine::model::Model::ChatGpt { .. }
+            crate::engine::model::Model::OpenAi {
+                wire_api: WireApi::Responses,
+                ..
+            }
         ),
-        "a Responses configuration must rebuild the active model into the Responses variant"
+        "a non-Codex Responses configuration must rebuild into the generic OpenAI Responses variant"
     );
 }
 

@@ -40,7 +40,7 @@ const COPILOT_DIRECT_API_TOKEN_ENV: &str = "GITHUB_COPILOT_API_TOKEN";
 pub const COPILOT_TOKEN_CREDENTIAL_KEY: &str = "copilot-github-token";
 const COPILOT_API_URL_ENV: &str = "COPILOT_API_URL";
 const ERROR_BODY_SNIPPET_CHARS: usize = 256;
-const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_MODEL_LIST_CLIENT_VERSION: &str = "0.0.0";
 
 pub(crate) fn codex_model_list_client_version() -> &'static str {
@@ -993,7 +993,7 @@ async fn fetch_models_at_detailed(
         anyhow::bail!("{url} returned {status}: {}", response_body_snippet(&body));
     }
 
-    let body = read_success_body_limited(resp).await?;
+    let body = read_success_body_limited(resp, "/models").await?;
     let body_nonempty = !body.trim().is_empty();
     let models = parse_models_body_with_abi(&body, catalog_abi)?;
     Ok(FetchModelsAtResult {
@@ -1217,17 +1217,32 @@ fn validate_anthropic_fetch_result(
     Ok(result)
 }
 
-async fn read_success_body_limited(mut resp: reqwest::Response) -> Result<String> {
+/// Read a provider success response while retaining a strict upper bound for
+/// both declared and chunked bodies. Configurable provider endpoints must not
+/// be able to exhaust the daemon before their response is parsed.
+pub(crate) async fn read_success_body_limited(
+    mut resp: reqwest::Response,
+    response_name: &str,
+) -> Result<String> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!(
+            "{response_name} response body exceeded {} byte limit",
+            MAX_PROVIDER_RESPONSE_BYTES
+        );
+    }
     let mut body = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .context("reading /models response body")?
+        .with_context(|| format!("reading {response_name} response body"))?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
             anyhow::bail!(
-                "/models response body exceeded {} byte limit",
-                MAX_MODELS_RESPONSE_BYTES
+                "{response_name} response body exceeded {} byte limit",
+                MAX_PROVIDER_RESPONSE_BYTES
             );
         }
         body.extend_from_slice(&chunk);
@@ -1463,6 +1478,7 @@ fn context_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
 
 fn max_output_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
     numeric_field(obj, "max_output_tokens")
+        .or_else(|| numeric_field(obj, "max_completion_tokens"))
         .or_else(|| numeric_field(obj, "output_token_limit"))
         .or_else(|| numeric_field(obj, "max_tokens"))
 }
@@ -1964,7 +1980,7 @@ fn resolve_provider_base_url_with_env(
     Ok(url)
 }
 
-fn validate_provider_base_url(
+pub(crate) fn validate_provider_base_url(
     provider_id: &str,
     base_url: &str,
     allow_insecure_http: bool,
@@ -2127,6 +2143,43 @@ mod tests {
         let body = r#"[{"id":"foo"},{"id":"bar"}]"#;
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parses_crofai_models_metadata_and_completion_limit() {
+        let body = r#"{
+            "data": [{
+                "id": "crofai/example-model",
+                "name": "Example Model",
+                "context_length": 262144,
+                "max_completion_tokens": 16384,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                "quantization": "fp8",
+                "speed": "fast"
+            }]
+        }"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = &entries[0];
+        assert_eq!(model.context_length, Some(262144));
+        assert_eq!(model.capabilities.context_tokens, Some(262144));
+        assert_eq!(model.capabilities.max_output_tokens, Some(16384));
+        assert_eq!(
+            model
+                .provider_metadata
+                .get("pricing")
+                .and_then(Value::as_object)
+                .and_then(|pricing| pricing.get("prompt"))
+                .and_then(Value::as_str),
+            Some("0.000001")
+        );
+        assert_eq!(
+            model
+                .provider_metadata
+                .get("quantization")
+                .and_then(Value::as_str),
+            Some("fp8")
+        );
     }
 
     #[test]
@@ -3903,7 +3956,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_success_response_body_errors_before_parse() {
         let mut body = String::from(r#"{"data":[]}"#);
-        body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
+        body.push_str(&" ".repeat(MAX_PROVIDER_RESPONSE_BYTES));
         let (base_url, request_handle) = serve_models_once(body).await;
         let entry = ProviderEntry {
             url: base_url.clone(),
@@ -3927,7 +3980,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains(&MAX_MODELS_RESPONSE_BYTES.to_string()),
+            message.contains(&MAX_PROVIDER_RESPONSE_BYTES.to_string()),
             "{message}"
         );
     }
@@ -4040,6 +4093,7 @@ mod tests {
                 format_hint: "synthetic key",
                 console_url: "https://synthetic.example/keys",
             }),
+            usage_probe: None,
             auth_check: crate::providers::AuthCheckKind::ModelsEndpoint,
         };
         let entry = ProviderEntry {
@@ -4284,7 +4338,7 @@ mod tests {
         // Bounded success body: oversized payloads error before parse/merge.
         {
             let mut body = String::from(r#"{"data":[{"id":"too-big"}]}"#);
-            body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
+            body.push_str(&" ".repeat(MAX_PROVIDER_RESPONSE_BYTES));
             let (base_url, _) = serve_models_once(body).await;
             let mut entry = ProviderEntry {
                 url: base_url.clone(),

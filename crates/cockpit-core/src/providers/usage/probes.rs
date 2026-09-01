@@ -4,9 +4,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
+use reqwest::Url;
 use serde_json::Value;
 
-use crate::config::providers::{ProviderEntry, ProvidersConfig};
+use crate::config::providers::{
+    ProviderEntry, ProvidersConfig, UsageProbeFieldKind, UsageProbeMethod, UsageProbeSpec,
+};
 use crate::providers::ProviderRegistry;
 use crate::providers::models_fetch;
 
@@ -98,7 +101,11 @@ async fn fetch_all_provider_usage_with_registry_and_store(
         let env = env.clone();
         pending.push(async move {
             let usage = async {
-                if registry.provider_for(&provider_id, &entry).id()
+                if let Some(spec) = resolved_usage_probe_spec(&entry) {
+                    DeclarativeUsageProbe::new(spec)
+                        .fetch_with_store(&provider_id, &entry, store, env)
+                        .await
+                } else if registry.provider_for(&provider_id, &entry).id()
                     == crate::auth::codex_oauth::CREDENTIAL_KEY
                 {
                     match fetch_codex_usage_with_store(&provider_id, &entry, store, env).await {
@@ -140,6 +147,197 @@ async fn fetch_all_provider_usage_with_registry_and_store(
     }
     out.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
     Ok(out)
+}
+
+/// Resolve an entry-level usage probe first, then inherit the built-in
+/// template default. Template identity is persisted separately from the
+/// editable provider id, so renamed built-in providers retain their probe.
+fn resolved_usage_probe_spec(entry: &ProviderEntry) -> Option<UsageProbeSpec> {
+    entry.usage_probe.clone().or_else(|| {
+        entry
+            .template
+            .as_deref()
+            .and_then(crate::providers::template_by_id)
+            .and_then(|template| template.usage_probe.cloned())
+    })
+}
+
+/// Generic JSON usage endpoint probe for API-key and simple OAuth-backed
+/// providers. It deliberately reuses the fully resolved inference headers,
+/// avoiding a second credential configuration surface.
+pub struct DeclarativeUsageProbe {
+    spec: UsageProbeSpec,
+}
+
+impl DeclarativeUsageProbe {
+    pub fn new(spec: UsageProbeSpec) -> Self {
+        Self { spec }
+    }
+
+    async fn fetch_with_store(
+        &self,
+        provider_id: &str,
+        entry: &ProviderEntry,
+        store: Option<crate::credentials::CredentialStore>,
+        env: std::collections::HashMap<String, String>,
+    ) -> ProviderUsageSnapshot {
+        match self
+            .fetch_result_with_store(provider_id, entry, store, env)
+            .await
+        {
+            Ok((windows, details)) => fetched_snapshot(
+                provider_id,
+                entry,
+                "declarative_usage_api",
+                None,
+                windows,
+                details,
+            ),
+            Err(error) => error_snapshot(provider_id, entry, &error.to_string()),
+        }
+    }
+
+    async fn fetch_result_with_store(
+        &self,
+        provider_id: &str,
+        entry: &ProviderEntry,
+        store: Option<crate::credentials::CredentialStore>,
+        env: std::collections::HashMap<String, String>,
+    ) -> Result<(Vec<UsageWindow>, Vec<String>)> {
+        let resolved = match store {
+            Some(store) => {
+                models_fetch::resolve_provider_request_async_with_store(
+                    provider_id,
+                    entry,
+                    store,
+                    |name| env.get(name).cloned(),
+                )
+                .await?
+            }
+            None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
+        };
+        let url = resolve_usage_endpoint(
+            &self.spec.endpoint,
+            &resolved.base_url,
+            provider_id,
+            entry.allow_insecure_http,
+        )?;
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            // Usage specs reuse arbitrary inference headers, including custom
+            // credential headers that reqwest cannot prove safe to retain on a
+            // redirect. The resolved endpoint is the only transport target
+            // validated against the provider's HTTPS/local/opt-in policy, so
+            // reject redirects rather than allowing a credential-bearing
+            // request to leave that boundary.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut request = (match self.spec.method {
+            UsageProbeMethod::Get => client.get(&url),
+        })
+        .header(reqwest::header::ACCEPT, "application/json");
+        for header in &resolved.headers {
+            request = request.header(&header.name, &header.value);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("fetching declarative usage endpoint {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("usage API returned {status}");
+        }
+        let body = models_fetch::read_success_body_limited(response, "usage API").await?;
+        let body =
+            serde_json::from_str::<Value>(&body).context("parsing declarative usage JSON")?;
+        extract_usage_fields(&body, &self.spec)
+    }
+}
+
+#[async_trait]
+impl ProviderUsageProbe for DeclarativeUsageProbe {
+    async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
+        self.fetch_with_store(provider_id, entry, None, std::env::vars().collect())
+            .await
+    }
+}
+
+fn resolve_usage_endpoint(
+    endpoint: &str,
+    provider_base_url: &str,
+    provider_id: &str,
+    allow_insecure_http: bool,
+) -> Result<String> {
+    let endpoint = endpoint.trim();
+    let url = if endpoint.starts_with('/') {
+        if endpoint.starts_with("//") {
+            anyhow::bail!("usage probe endpoint path must not replace the provider origin");
+        }
+        let provider_url = Url::parse(provider_base_url)
+            .with_context(|| format!("parsing provider URL {provider_base_url}"))?;
+        let origin = provider_url.origin().ascii_serialization();
+        if origin == "null" {
+            anyhow::bail!("provider URL has no HTTP origin for usage probe");
+        }
+        Url::parse(&origin)?.join(endpoint)?
+    } else {
+        Url::parse(endpoint).context("usage probe endpoint must be an absolute URL or root path")?
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("usage probe endpoint must not include credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("usage probe endpoint must not include a query string or fragment");
+    }
+    models_fetch::validate_provider_base_url(provider_id, url.as_str(), allow_insecure_http)?;
+    Ok(url.to_string())
+}
+
+fn extract_usage_fields(
+    body: &Value,
+    spec: &UsageProbeSpec,
+) -> Result<(Vec<UsageWindow>, Vec<String>)> {
+    let mut windows = Vec::new();
+    let mut details = Vec::new();
+    for field in spec.fields.iter() {
+        let value = body.pointer(&field.pointer).ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage response missing field at JSON Pointer `{}`",
+                field.pointer
+            )
+        })?;
+        match field.kind {
+            UsageProbeFieldKind::Credits => {
+                details.push(format!("{}: {}", field.label, compact_json(value)));
+            }
+            UsageProbeFieldKind::RequestsRemaining => {
+                let rendered = if value.is_null() {
+                    "pay-as-you-go".to_string()
+                } else {
+                    compact_json(value)
+                };
+                details.push(format!("{}: {rendered}", field.label));
+            }
+            UsageProbeFieldKind::Percent => {
+                let used_percent = value.as_f64().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "usage response field `{}` must be a numeric percent",
+                        field.pointer
+                    )
+                })?;
+                windows.push(UsageWindow {
+                    label: field.label.to_string(),
+                    used_percent: Some(used_percent),
+                    reset_at: None,
+                    detail: None,
+                });
+            }
+            UsageProbeFieldKind::Text => {
+                details.push(format!("{}: {}", field.label, compact_json(value)));
+            }
+        }
+    }
+    Ok((windows, details))
 }
 
 pub struct CodexOAuthUsageProbe;
@@ -415,7 +613,9 @@ fn display_name(provider_id: &str, entry: &ProviderEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::providers::ProvidersConfig;
+    use crate::config::providers::{
+        HeaderSpec, ProvidersConfig, UsageProbeField, UsageProbeFieldKind, UsageProbeSpec,
+    };
     use crate::providers::registry::Provider;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -424,7 +624,8 @@ mod tests {
     struct TestUsageResponse {
         status: u16,
         headers: Vec<(&'static str, &'static str)>,
-        body: &'static str,
+        body: String,
+        chunked: bool,
     }
 
     impl TestUsageResponse {
@@ -432,7 +633,8 @@ mod tests {
             Self {
                 status: 200,
                 headers: Vec::new(),
-                body,
+                body: body.to_string(),
+                chunked: false,
             }
         }
 
@@ -440,7 +642,17 @@ mod tests {
             Self {
                 status,
                 headers: Vec::new(),
+                body: body.to_string(),
+                chunked: false,
+            }
+        }
+
+        fn oversized_chunked(body: String) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
                 body,
+                chunked: true,
             }
         }
 
@@ -481,11 +693,14 @@ mod tests {
                     "ERROR"
                 };
                 let mut raw = format!(
-                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-                    response.status,
-                    status_text,
-                    response.body.len()
+                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\nconnection: close\r\n",
+                    response.status, status_text,
                 );
+                if response.chunked {
+                    raw.push_str("transfer-encoding: chunked\r\n");
+                } else {
+                    raw.push_str(&format!("content-length: {}\r\n", response.body.len()));
+                }
                 for (name, value) in response.headers {
                     raw.push_str(name);
                     raw.push_str(": ");
@@ -493,7 +708,15 @@ mod tests {
                     raw.push_str("\r\n");
                 }
                 raw.push_str("\r\n");
-                raw.push_str(response.body);
+                if response.chunked {
+                    raw.push_str(&format!(
+                        "{:X}\r\n{}\r\n0\r\n\r\n",
+                        response.body.len(),
+                        response.body
+                    ));
+                } else {
+                    raw.push_str(&response.body);
+                }
                 socket.write_all(raw.as_bytes()).await.unwrap();
             }
             requests
@@ -502,10 +725,58 @@ mod tests {
         (format!("http://{addr}/usage"), handle)
     }
 
+    fn request_header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().skip(1).find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header
+                .trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim())
+        })
+    }
+
     fn entry(name: &str) -> ProviderEntry {
         ProviderEntry {
             name: Some(name.to_string()),
             url: "https://example.com/v1".to_string(),
+            ..ProviderEntry::default()
+        }
+    }
+
+    fn declarative_spec(endpoint: &str) -> UsageProbeSpec {
+        UsageProbeSpec {
+            endpoint: endpoint.to_string().into(),
+            method: UsageProbeMethod::Get,
+            fields: vec![
+                UsageProbeField {
+                    pointer: "/credits".into(),
+                    label: "credits".into(),
+                    kind: UsageProbeFieldKind::Credits,
+                },
+                UsageProbeField {
+                    pointer: "/usable_requests".into(),
+                    label: "requests left today".into(),
+                    kind: UsageProbeFieldKind::RequestsRemaining,
+                },
+            ]
+            .into(),
+        }
+    }
+
+    fn declarative_entry(name: &str, usage_url: &str, spec: UsageProbeSpec) -> ProviderEntry {
+        let origin = Url::parse(usage_url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        ProviderEntry {
+            name: Some(name.to_string()),
+            url: format!("{origin}/v1"),
+            allow_insecure_http: true,
+            headers: vec![HeaderSpec {
+                name: "Authorization".to_string(),
+                value: "Bearer usage-test-key".to_string(),
+            }],
+            usage_probe: Some(spec),
             ..ProviderEntry::default()
         }
     }
@@ -587,6 +858,208 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(handle.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_fetches_subscription_credits_and_requests_from_origin_path() {
+        let (usage_url, handle) = serve_usage_responses(vec![TestUsageResponse::ok(
+            r#"{"credits":12.5,"usable_requests":42}"#,
+        )])
+        .await;
+        let entry = declarative_entry("Custom usage", &usage_url, declarative_spec("/usage"));
+        let mut providers = BTreeMap::new();
+        providers.insert("custom-usage".to_string(), entry);
+        let config = ProvidersConfig {
+            providers,
+            ..ProvidersConfig::default()
+        };
+
+        let snapshots = fetch_all_provider_usage_with_registry(
+            &config,
+            None,
+            ProviderRegistry::new(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        match &snapshots[0].availability {
+            UsageAvailability::Fetched {
+                source, details, ..
+            } => {
+                assert_eq!(*source, "declarative_usage_api");
+                assert_eq!(
+                    details,
+                    &vec![
+                        "credits: 12.5".to_string(),
+                        "requests left today: 42".to_string()
+                    ]
+                );
+            }
+            other => panic!("unexpected availability: {other:?}"),
+        }
+        let requests = handle.await.unwrap();
+        assert!(requests[0].starts_with("GET /usage HTTP/1.1"));
+        assert_eq!(
+            request_header_value(&requests[0], "authorization"),
+            Some("Bearer usage-test-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_renders_null_requests_as_pay_as_you_go() {
+        let (usage_url, _handle) = serve_usage_responses(vec![TestUsageResponse::ok(
+            r#"{"credits":3,"usable_requests":null}"#,
+        )])
+        .await;
+        let entry = declarative_entry("PAYG", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("payg", &entry)
+            .await;
+
+        match snapshot.availability {
+            UsageAvailability::Fetched { details, .. } => {
+                assert_eq!(
+                    details,
+                    vec!["credits: 3", "requests left today: pay-as-you-go"]
+                );
+            }
+            other => panic!("unexpected availability: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_surfaces_http_errors() {
+        let (usage_url, _handle) = serve_usage_responses(vec![TestUsageResponse::status(
+            401,
+            r#"{"error":"unauthorized"}"#,
+        )])
+        .await;
+        let entry = declarative_entry("Unauthorized", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("unauthorized", &entry)
+            .await;
+
+        match snapshot.availability {
+            UsageAvailability::Error { message } => {
+                assert!(message.contains("usage API returned 401"));
+            }
+            other => panic!("unexpected availability: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_rejects_redirects_without_replaying_inference_headers() {
+        let (usage_url, handle) = serve_usage_responses(vec![
+            TestUsageResponse::status(302, r#"{"error":"moved"}"#)
+                .with_header("Location", "http://credential-leak.invalid/usage"),
+        ])
+        .await;
+        let entry = declarative_entry("Redirect", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("redirect", &entry)
+            .await;
+
+        let UsageAvailability::Error { message } = snapshot.availability else {
+            panic!("redirected usage probe must fail closed");
+        };
+        assert!(message.contains("usage API returned 302"), "{message}");
+
+        // The only accepted connection was the validated endpoint. In
+        // particular, no request can be sent to the redirect target with the
+        // declarative probe's arbitrary inference headers.
+        assert_eq!(handle.await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn declarative_usage_endpoint_rejects_credentials_query_and_unsafe_http() {
+        for endpoint in [
+            "https://user:secret@example.test/usage",
+            "https://example.test/usage?key=secret",
+            "/usage?key=secret",
+        ] {
+            let error =
+                resolve_usage_endpoint(endpoint, "https://example.test/v1", "custom", false)
+                    .expect_err("credential-bearing endpoint must be rejected");
+            assert!(
+                error.to_string().contains("credentials")
+                    || error.to_string().contains("query string"),
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains("secret"), "{error:#}");
+        }
+
+        let error = resolve_usage_endpoint(
+            "http://api.example.test/usage",
+            "https://example.test/v1",
+            "custom",
+            false,
+        )
+        .expect_err("unsafe HTTP endpoint must require an explicit opt-in");
+        assert!(error.to_string().contains("unsafe non-HTTPS"), "{error:#}");
+
+        resolve_usage_endpoint(
+            "http://127.0.0.1/usage",
+            "https://example.test/v1",
+            "custom",
+            false,
+        )
+        .expect("loopback HTTP endpoint remains available for local development");
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_rejects_oversized_content_length_before_json_parse() {
+        let mut body = String::from(r#"{"credits":1}"#);
+        body.push_str(&" ".repeat(models_fetch::MAX_PROVIDER_RESPONSE_BYTES));
+        let (usage_url, _handle) = serve_usage_responses(vec![TestUsageResponse {
+            status: 200,
+            headers: Vec::new(),
+            body,
+            chunked: false,
+        }])
+        .await;
+        let entry = declarative_entry("oversized", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("oversized", &entry)
+            .await;
+
+        let UsageAvailability::Error { message } = snapshot.availability else {
+            panic!("expected oversized response to fail");
+        };
+        assert!(
+            message.contains("usage API response body exceeded"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_rejects_oversized_chunked_response_before_json_parse() {
+        let mut body = String::from(r#"{"credits":1}"#);
+        body.push_str(&" ".repeat(models_fetch::MAX_PROVIDER_RESPONSE_BYTES));
+        let (usage_url, _handle) =
+            serve_usage_responses(vec![TestUsageResponse::oversized_chunked(body)]).await;
+        let entry = declarative_entry("oversized", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("oversized", &entry)
+            .await;
+
+        let UsageAvailability::Error { message } = snapshot.availability else {
+            panic!("expected oversized response to fail");
+        };
+        assert!(
+            message.contains("usage API response body exceeded"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn template_usage_probe_is_inherited_when_the_entry_has_no_override() {
+        let entry = ProviderEntry {
+            template: Some("crofai".to_string()),
+            ..ProviderEntry::default()
+        };
+        let spec = resolved_usage_probe_spec(&entry).expect("CrofAI usage probe");
+        assert_eq!(spec.endpoint, "/usage_api/");
+        assert_eq!(spec.fields.len(), 2);
     }
 
     #[tokio::test]

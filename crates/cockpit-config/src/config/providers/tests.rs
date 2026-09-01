@@ -2,6 +2,38 @@ use super::*;
 use tempfile::TempDir;
 
 #[test]
+fn provider_usage_probe_round_trips_as_user_authored_config() {
+    let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/v1",
+        "usage_probe": {
+            "endpoint": "/usage",
+            "fields": [
+                {"pointer": "/credits", "label": "credits", "kind": "credits"},
+                {
+                    "pointer": "/requests_remaining",
+                    "label": "requests left today",
+                    "kind": "requests_remaining"
+                }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let probe = entry.usage_probe.as_ref().expect("usage probe");
+    assert_eq!(probe.endpoint, "/usage");
+    assert_eq!(probe.method, UsageProbeMethod::Get);
+    assert_eq!(probe.fields.len(), 2);
+    assert_eq!(probe.fields[1].kind, UsageProbeFieldKind::RequestsRemaining);
+    assert_eq!(
+        serde_json::to_value(&entry)
+            .unwrap()
+            .pointer("/usage_probe/fields/0/pointer")
+            .and_then(Value::as_str),
+        Some("/credits")
+    );
+}
+
+#[test]
 fn anthropic_features_require_an_explicit_provider_gate() {
     let template_without_gate = ProviderEntry {
         template: Some("anthropic".to_string()),
@@ -995,6 +1027,7 @@ fn round_trips_a_provider_entry() {
             allow_computer_guidance_proposals: None,
             default_thinking_mode: Some(ThinkingMode::High),
             embeddings: None,
+            usage_probe: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
             anthropic: Default::default(),

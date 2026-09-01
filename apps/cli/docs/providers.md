@@ -40,10 +40,31 @@ cockpit models
 - Codex OAuth: browser/device-code login for ChatGPT Plus/Pro quota; no API key.
 - Grok xAI API: API key from the xAI console; defaults to `$XAI_API_KEY`.
 - Grok SuperGrok: shown as disabled pending xAI authorization. Follow the petition/learn-more link in the picker; the official binary does not include its browser OAuth flow.
+- CrofAI (`crofai`): OpenAI Chat Completions and Responses at `https://crof.ai/v1`; defaults to `Authorization: Bearer $CROF_API_KEY` and also recognizes `CROFAI_API_KEY`. Models are fetched from `/v1/models`; select the Responses wire explicitly for a model that uses it. CrofAI's Anthropic host (`https://anthropic.nahcrof.com`) is documented as a setup hint, not a separate provider template.
 - z.ai, MiniMax, OpenCode Zen, OpenRouter, DeepSeek, Anthropic, Xiaomi MiMo, and Nous Research: API-key templates with provider-specific default environment variable names and headers.
 - Nous Research (`nous-research`): Chat Completions at `https://inference-api.nousresearch.com/v1` with `NOUS_API_KEY` / `Authorization: Bearer $NOUS_API_KEY`. There is no published `/models` endpoint — add models with `cockpit provider add nous-research` or `/setup model`. Failed credential checks report a sanitized status and the portal docs link (`https://portal.nousresearch.com/api-docs`), never a raw provider response body or key material. Automatic x402 payment and non-chat Nous services are not supported.
 - Baseten Model APIs (`baseten`): Chat Completions at `https://inference.baseten.co/v1` with `BASETEN_API_KEY` / `Authorization: Bearer $BASETEN_API_KEY`. Live catalog via `cockpit fetch-models baseten` (`GET /v1/models`). Input capabilities (vision/audio) stay model-dependent and conservatively Unknown until mapped; custom Baseten deployments use a separate custom/OpenAI-compatible provider entry, not this template.
 - GitHub Copilot: OAuth-backed provider setup.
+
+## Declarative Usage Probes
+
+Providers can declare a `usage_probe` in their provider config to show API credits or quota with `cockpit provider usage` and `/usage`. The probe reuses the provider's resolved inference headers, so it must not contain a key or other credential. `endpoint` is either an absolute HTTP(S) URL or a root-relative path joined to the provider URL origin; endpoint URLs cannot contain userinfo, a query string, or a fragment. Absolute HTTP endpoints follow the provider's insecure-HTTP policy: use HTTPS unless the provider explicitly opts into insecure HTTP or the endpoint is local/loopback. `method` currently supports `get` and defaults to it. `fields` are JSON Pointer extractions in display order. Supported kinds are `credits`, `requests_remaining`, `percent`, and `text`; a `null` `requests_remaining` value is shown as pay-as-you-go.
+
+```json
+{
+  "url": "https://api.example.com/v1",
+  "headers": [{ "name": "Authorization", "value": "Bearer $EXAMPLE_API_KEY" }],
+  "usage_probe": {
+    "endpoint": "/usage",
+    "fields": [
+      { "pointer": "/credits", "label": "credits", "kind": "credits" },
+      { "pointer": "/requests_remaining", "label": "requests left today", "kind": "requests_remaining" }
+    ]
+  }
+}
+```
+
+The CrofAI template includes this descriptor for `GET https://crof.ai/usage_api/`, displaying `credits` and `usable_requests`. A pay-as-you-go CrofAI account reports `usable_requests: null` and is rendered accordingly.
 
 ## Anthropic-Compatible Endpoints
 

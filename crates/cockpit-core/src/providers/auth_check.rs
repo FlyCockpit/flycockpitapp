@@ -277,6 +277,7 @@ mod tests {
                 format_hint: "Z.AI key",
                 console_url: "https://z.ai/manage-apikey/apikey-list",
             }),
+            usage_probe: None,
             auth_check: AuthCheckKind::ChatCompletions {
                 path: "/chat/completions",
                 model: "glm-5.1",

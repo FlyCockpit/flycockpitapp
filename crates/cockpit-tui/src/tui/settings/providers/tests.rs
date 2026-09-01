@@ -19,6 +19,19 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+#[test]
+fn missing_daemon_environment_gets_copy_to_vault_guidance() {
+    let references = vec!["OPENAI_API_KEY".to_string()];
+    let guidance = daemon_visibility_guidance(
+        &references,
+        "Authorization references missing environment variable(s): OPENAI_API_KEY",
+    )
+    .expect("missing daemon environment must be actionable");
+    assert!(guidance.contains("daemon cannot resolve $OPENAI_API_KEY"));
+    assert!(guidance.contains("Copy detected value into vault"));
+    assert!(daemon_visibility_guidance(&references, "credentials rejected").is_none());
+}
+
 thread_local! {
     static PROVIDER_DAEMON_FIXTURE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }

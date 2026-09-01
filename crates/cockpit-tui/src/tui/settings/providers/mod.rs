@@ -1085,6 +1085,18 @@ impl SettingsDialog {
         provider_id: &str,
         result: Result<FetchOutcome, String>,
     ) {
+        let referenced_environment = self
+            .config
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .flat_map(|entry| &entry.headers)
+            .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
+            .filter(|name| !name.starts_with("secret:"))
+            .collect::<Vec<_>>();
+        let daemon_visibility_guidance = result.as_ref().err().and_then(|error| {
+            daemon_visibility_guidance(&referenced_environment, error)
+        });
         let onboarding_validation = self
             .page
             .downcast_ref::<ProvidersPage>()
@@ -1196,6 +1208,10 @@ impl SettingsDialog {
                         entry.mark_model_fetch_failed_kept_existing(reason.clone());
                     }
                     message = match self.save_config() {
+                        Ok(()) if daemon_visibility_guidance.is_some() => format!(
+                            "{}; saving failure status…",
+                            daemon_visibility_guidance.as_deref().unwrap_or_default()
+                        ),
                         Ok(()) => format!("fetch failed: {reason}; saving failure status…"),
                         Err(error) => {
                             format!("fetch failed: {reason}; status save failed: {error}")
@@ -1283,6 +1299,23 @@ impl SettingsDialog {
             _ => {}
         }
     }
+}
+
+fn daemon_visibility_guidance(referenced: &[String], error: &str) -> Option<String> {
+    if referenced.is_empty()
+        || !(error.contains("references missing environment variable")
+            || error.contains("Configured Authorization refs were unset"))
+    {
+        return None;
+    }
+    Some(format!(
+        "The daemon cannot resolve {}. Go back and choose ‘Copy detected value into vault’, or export the variable where the daemon starts",
+        referenced
+            .iter()
+            .map(|name| format!("${name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 impl SettingsCx {
     /// All provider side effects use the project selected for this dialog;
@@ -1750,21 +1783,39 @@ impl SettingsCx {
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         let choice = AUTH_METHODS[s.auth_method_cursor];
                         if choice == "copy-detected-env" {
+                            if let Err(error) =
+                                s.run.submit(WizardAnswer::Select(choice.to_string()))
+                            {
+                                s.error = Some(error);
+                                return Nav::Stay;
+                            }
                             let env_var = s
                                 .detected_env_offer
                                 .as_deref()
                                 .expect("copy choice requires detected env");
                             let template = s.template.expect("template chosen");
                             let id = s.id_field.text().trim().to_string();
-                            let headers = templates::headers_for_pasted_key(template, "");
+                            // This process detected the variable, so it owns
+                            // the fallback copy. Asking the daemon to read it
+                            // again would make this option useless precisely
+                            // when a long-lived daemon cannot see a shell-local
+                            // export. Keep the bytes zeroizing while building
+                            // the same staged-secret mutation as a pasted key.
+                            let value = match std::env::var(env_var) {
+                                Ok(value) if !value.trim().is_empty() => {
+                                    zeroize::Zeroizing::new(value)
+                                }
+                                _ => {
+                                    s.error = Some(format!(
+                                        "${env_var} is no longer available in this process; paste the key instead"
+                                    ));
+                                    return Nav::Stay;
+                                }
+                            };
+                            let headers =
+                                templates::headers_for_pasted_key(template, value.as_str());
                             let entry = provider_entry_from_add(s, template, headers);
-                            self.save_and_fetch_provider_with_detected_env(
-                                s,
-                                id,
-                                entry,
-                                template,
-                                Some(env_var.to_string()),
-                            );
+                            self.save_and_fetch_provider(s, id, entry, template);
                             return Nav::Stay;
                         }
                         if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
@@ -3530,15 +3581,27 @@ impl SettingsCx {
                 }
                 if s.is_step("auth-method") {
                     lines.push(Line::default());
+                    let vault = crate::tui::capability_gate::secret_store_row_value(
+                        &self.host_capabilities,
+                    );
                     let mut options = vec![
-                        ("Paste key", "store masked key as $secret:"),
-                        ("Use env var", "write a $VAR reference"),
-                        ("Advanced headers", "edit raw HTTP headers"),
+                        (
+                            "Paste key".to_string(),
+                            format!("copy into {vault}"),
+                        ),
+                        (
+                            "Use env var".to_string(),
+                            "keep a $VAR reference; the daemon validates visibility".to_string(),
+                        ),
+                        (
+                            "Advanced headers".to_string(),
+                            "edit raw HTTP headers".to_string(),
+                        ),
                     ];
                     if s.detected_env_offer.is_some() {
                         options.push((
-                            "Copy detected value into vault",
-                            "daemon reads the detected variable and stores a $secret: reference",
+                            "Copy detected value into vault".to_string(),
+                            format!("copy this process's value into {vault}"),
                         ));
                     }
                     for (index, (label, description)) in options.iter().enumerate() {
@@ -3555,15 +3618,23 @@ impl SettingsCx {
                         controls.push((lines.len(), index));
                         lines.push(Line::from(vec![
                             Span::raw(marker),
-                            Span::styled((*label).to_string(), style),
+                            Span::styled(label.clone(), style),
                             Span::raw(" — "),
-                            Span::styled((*description).to_string(), muted),
+                            Span::styled(description.clone(), muted),
                         ]));
                     }
                 }
                 if let Some(detected) = &s.detected_env_offer {
                     lines.push(Line::from(Span::styled(
                         format!("Detected ${detected}; keep the reference or copy its value into the daemon vault."),
+                        muted,
+                    )));
+                }
+                if self.host_capabilities.secret_store.effective_placement
+                    == cockpit_proto::SecretStorePlacement::Database
+                {
+                    lines.push(Line::from(Span::styled(
+                        "Local vault mode is machine-bound; losing its private wrapping-key file makes stored credentials unrecoverable.",
                         muted,
                     )));
                 }

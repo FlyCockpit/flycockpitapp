@@ -803,6 +803,7 @@ struct ProviderSetupActions {
     cwd: PathBuf,
     headers: Vec<HeaderSpec>,
     saved: Option<(String, PathBuf)>,
+    referenced_env: Vec<String>,
     security_saved: Option<PathBuf>,
     model_saved: Option<PathBuf>,
     host_capabilities: Option<cockpit_proto::HostCapabilitySnapshot>,
@@ -814,6 +815,7 @@ impl ProviderSetupActions {
             cwd,
             headers: Vec::new(),
             saved: None,
+            referenced_env: Vec::new(),
             security_saved: None,
             model_saved: None,
             host_capabilities: None,
@@ -849,6 +851,29 @@ impl ProviderSetupActions {
                 let template =
                     selected_provider_template(run).context("provider template answer")?;
                 self.headers = crate::providers::default_headers_for(template);
+            }
+            "copy-detected-env" => {
+                let template =
+                    selected_provider_template(run).context("provider template answer")?;
+                let variable = crate::providers::detected_env_var(template).ok_or_else(|| {
+                    anyhow!(
+                        "none of the declared credential variables for {} is available; choose Use env var or Paste key",
+                        template.display
+                    )
+                })?;
+                let value = zeroize::Zeroizing::new(std::env::var(variable).map_err(|_| {
+                    anyhow!(
+                        "${variable} disappeared before it could be copied; choose Paste key"
+                    )
+                })?);
+                if value.trim().is_empty() {
+                    bail!("${variable} is empty; choose Paste key");
+                }
+                self.headers = crate::providers::headers_for_pasted_key(template, value.as_str());
+                io.write_line(&format!(
+                    "Copying ${variable} into {}.",
+                    secret_store_description(self.host_capabilities.as_ref())
+                ))?;
             }
             #[cfg(feature = "grok-subscription")]
             "grok-oauth" => {
@@ -953,7 +978,8 @@ impl ProviderSetupActions {
         // The daemon stages vault bytes and the reference-only config entry
         // under one recoverable journal.  The CLI never allocates predictable
         // vault names or performs a secret/config two-step.
-        let header_reference_notice = env_var_reference_notice(&entry.headers);
+        self.referenced_env = env_var_reference_names(&entry.headers);
+        let header_reference_notice = env_var_reference_notice(&self.referenced_env);
         let header_secrets = entry
             .headers
             .iter_mut()
@@ -1078,6 +1104,7 @@ impl ProviderSetupActions {
         let daemon = ensure_persistent_daemon()
             .await
             .context("starting persistent daemon for provider test")?;
+        let visibility_hint = daemon_visibility_hint(&self.referenced_env);
         let response = daemon
             .client
             .request(Request::FetchProviderModels {
@@ -1089,7 +1116,7 @@ impl ProviderSetupActions {
                 allow_fallback: false,
             })
             .await?
-            .map_err(|error| anyhow!("daemon rejected provider key test: {error}"))?;
+            .map_err(|error| anyhow!("daemon rejected provider credential validation: {error}{visibility_hint}"))?;
         let Response::ProviderModelsFetched { results, .. } = response else {
             bail!("daemon returned unexpected provider key test response: {response:?}");
         };
@@ -1099,21 +1126,21 @@ impl ProviderSetupActions {
                 io.write_line(&format!("key verified · {} models", models.len()))?
             }
             Some(crate::daemon::proto::ProviderModelFetchOutcome::Unsupported) => {
-                io.write_line("key test unavailable: provider does not support model discovery")?
+                io.write_line("credential verified with the provider")?
             }
             Some(crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
                 unlisted_count,
             }) => io.write_line(&format!(
-                "Model fetch needs a keep/remove decision for {unlisted_count} configured model(s)."
+                "credential verified · model fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
             ))?,
             Some(crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
                 reason,
                 ..
-            }) => io.write_line(&format!("Model fetch fallback available: {reason}"))?,
+            }) => bail!("live provider credential validation failed: {reason}{visibility_hint}"),
             Some(crate::daemon::proto::ProviderModelFetchOutcome::Error { message }) => {
-                io.write_line(&format!("key test failed: {message}"))?
+                bail!("live provider credential validation failed: {message}{visibility_hint}")
             }
-            None => io.write_line("key test failed: daemon returned no provider result")?,
+            None => bail!("live provider credential validation failed: daemon returned no provider result"),
         }
         Ok(())
     }
@@ -1198,7 +1225,7 @@ fn provider_headers_for_answers(
     }
 }
 
-fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
+fn env_var_reference_names(headers: &[HeaderSpec]) -> Vec<String> {
     // Setup is a daemon client.  Inspecting process environment values here
     // would make the CLI a second secret resolver; syntax metadata is enough
     // to remind the user which variables the daemon will resolve later.
@@ -1210,6 +1237,10 @@ fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
             }
         }
     }
+    referenced
+}
+
+fn env_var_reference_notice(referenced: &[String]) -> Option<String> {
     if referenced.is_empty() {
         None
     } else {
@@ -1217,6 +1248,35 @@ fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
             "Environment variable reference detected; make sure to set it before use: {}",
             referenced.join(", ")
         ))
+    }
+}
+
+fn daemon_visibility_hint(referenced: &[String]) -> String {
+    if referenced.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ". The daemon must be able to resolve {}; if it cannot, go back and copy the detected value into Cockpit's encrypted vault",
+            referenced
+                .iter()
+                .map(|name| format!("${name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn secret_store_description(
+    capabilities: Option<&cockpit_proto::HostCapabilitySnapshot>,
+) -> &'static str {
+    match capabilities.map(|snapshot| snapshot.secret_store.effective_placement) {
+        Some(cockpit_proto::SecretStorePlacement::Keyring) => {
+            "Cockpit's encrypted vault (wrapping key in the OS keyring)"
+        }
+        Some(cockpit_proto::SecretStorePlacement::Database) => {
+            "Cockpit's encrypted vault (machine-bound local wrapping-key file)"
+        }
+        _ => "Cockpit's encrypted vault (the daemon will select the configured placement)",
     }
 }
 
@@ -2167,6 +2227,28 @@ mod tests {
         assert!(
             io.output
                 .contains("key saved but unverified — it will be tested on your first message.")
+        );
+    }
+
+    #[test]
+    fn referenced_environment_failure_explains_daemon_visibility_fallback() {
+        let referenced = vec!["OPENAI_API_KEY".to_string()];
+        let hint = daemon_visibility_hint(&referenced);
+        assert!(hint.contains("daemon must be able to resolve $OPENAI_API_KEY"));
+        assert!(hint.contains("copy the detected value"));
+        assert_eq!(
+            secret_store_description(Some(&cockpit_proto::HostCapabilitySnapshot {
+                generation: 1,
+                features: Vec::new(),
+                dependencies: Vec::new(),
+                secret_store: cockpit_proto::SecretStoreSnapshot {
+                    intent: cockpit_proto::SecretStoreIntent::Database,
+                    effective_placement: cockpit_proto::SecretStorePlacement::Database,
+                    fail_closed_reason: None,
+                    fix_command: None,
+                },
+            })),
+            "Cockpit's encrypted vault (machine-bound local wrapping-key file)"
         );
     }
 

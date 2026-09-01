@@ -432,6 +432,7 @@ pub enum ProviderWizardStep {
     AuthMethod,
     ApiKey,
     EnvVar,
+    CopyDetectedEnv,
     CopilotAuth,
     GrokOAuth,
     CodexOAuth,
@@ -444,7 +445,7 @@ pub enum ProviderWizardStep {
 }
 
 impl ProviderWizardStep {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Template,
         Self::WireApi,
         Self::ProviderId,
@@ -453,6 +454,7 @@ impl ProviderWizardStep {
         Self::AuthMethod,
         Self::ApiKey,
         Self::EnvVar,
+        Self::CopyDetectedEnv,
         Self::CopilotAuth,
         Self::GrokOAuth,
         Self::CodexOAuth,
@@ -473,6 +475,7 @@ impl ProviderWizardStep {
             Self::AuthMethod => "auth-method",
             Self::ApiKey => "api-key",
             Self::EnvVar => "env-var",
+            Self::CopyDetectedEnv => "copy-detected-env",
             Self::CopilotAuth => "copilot-auth",
             Self::GrokOAuth => "grok-oauth",
             Self::CodexOAuth => "codex-oauth",
@@ -495,6 +498,7 @@ impl ProviderWizardStep {
             "auth-method" => Self::AuthMethod,
             "api-key" => Self::ApiKey,
             "env-var" => Self::EnvVar,
+            "copy-detected-env" => Self::CopyDetectedEnv,
             "copilot-auth" => Self::CopilotAuth,
             "grok-oauth" => Self::GrokOAuth,
             "codex-oauth" => Self::CodexOAuth,
@@ -1092,10 +1096,15 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                             label: "Advanced headers".into(),
                             description: "Edit HTTP headers directly".into(),
                         },
+                        SelectOption {
+                            id: "copy-detected-env".into(),
+                            label: "Copy detected value".into(),
+                            description: "Copy a detected shell value into Cockpit's encrypted vault".into(),
+                        },
                     ],
                 },
                 default_answer: Some(WizardAnswer::Select("paste-key".to_string())),
-                prefill: None,
+                prefill: Some(provider_auth_method_prefill),
                 validate: Some(validate_select),
                 write: None,
                 branch: Some(provider_auth_method_branch),
@@ -1138,6 +1147,11 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::CodexOAuth.source_id(),
                 "Sign in to Codex",
                 "Waiting for device authorization…",
+            ),
+            action_step(
+                ProviderWizardStep::CopyDetectedEnv.source_id(),
+                "Copy detected environment credential",
+                "Copying detected credential into Cockpit's encrypted vault…",
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Saving.source_id(),
@@ -2037,6 +2051,16 @@ fn provider_env_var_prefill(run: &WizardRun) -> Option<WizardAnswer> {
     ))
 }
 
+/// Prefer a reference when this onboarding process can see one of the
+/// template's declared credential variables. The daemon still proves that it
+/// can resolve the reference during the mandatory live check; detection here
+/// never reads or copies the credential bytes.
+fn provider_auth_method_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let template = selected_provider_template(run)?;
+    crate::providers::detected_env_var(template)
+        .map(|_| WizardAnswer::Select("env-var".to_string()))
+}
+
 fn model_context(run: &WizardRun) -> Option<&ModelWizardContext> {
     run.descriptor.model_context.as_ref()
 }
@@ -2218,6 +2242,7 @@ fn provider_auth_method_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&
         WizardAnswer::Select(value) if value == "paste-key" => "api-key",
         WizardAnswer::Select(value) if value == "env-var" => "env-var",
         WizardAnswer::Select(value) if value == "advanced-headers" => "headers",
+        WizardAnswer::Select(value) if value == "copy-detected-env" => "copy-detected-env",
         _ => "auth-method",
     })
 }
@@ -2630,6 +2655,36 @@ mod tests {
             run.prefill(),
             Some(WizardAnswer::Text("openai".to_string()))
         );
+    }
+
+    #[test]
+    fn provider_wizard_offers_detected_environment_copy_before_saving() {
+        let descriptor = provider_descriptor_with_template(Some("openai"));
+        let auth = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "auth-method")
+            .expect("auth method step");
+        let StepKind::Select { options } = &auth.kind else {
+            panic!("auth method must be a select")
+        };
+        assert!(options.iter().any(|option| option.id == "env-var"));
+        assert!(
+            options
+                .iter()
+                .any(|option| option.id == "copy-detected-env")
+        );
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("openai".into())).unwrap();
+        run.submit(WizardAnswer::Text("openai".into())).unwrap();
+        run.submit(WizardAnswer::Text("https://api.openai.com/v1".into()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("copy-detected-env".into()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("copy-detected-env"));
+        run.submit(WizardAnswer::Acknowledged).unwrap();
+        assert_eq!(run.current_step_id(), Some("saving"));
     }
 
     #[cfg(not(feature = "grok-subscription"))]

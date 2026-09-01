@@ -690,9 +690,9 @@ mod tests {
         FakeComputerAuthorizer, ModelId, NativeComputerContinuation, OwnerInstance, ProviderId,
     };
     use crate::computer::{
-        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
-        ComputerToolContract, DisplayGeometry, DisplayTarget, LogicalSize,
-        NativeComputerCoordinatorConfig, NativeComputerToolConfig, PixelSize, ScaleFactor,
+        ComputerActionOutcome, ComputerBackend, ComputerToolContract, DisplayGeometry,
+        DisplayTarget, LogicalSize, NativeComputerCoordinatorConfig, NativeComputerToolConfig,
+        NormalizedComputerAction, NormalizedComputerEffect, PixelSize, ScaleFactor,
     };
     use async_trait::async_trait;
     use std::sync::{
@@ -732,18 +732,11 @@ mod tests {
             Ok(self.geometry.clone())
         }
 
-        async fn execute(&mut self, _actions: &[ComputerAction]) -> ComputerBatchReport {
-            ComputerBatchReport {
-                completed: Vec::new(),
-                failure: None,
-            }
-        }
-
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
-            if matches!(action, ComputerAction::CaptureFull) {
+            if matches!(action.effect(), NormalizedComputerEffect::CaptureFull) {
                 Ok(ComputerActionOutcome::Captured(
                     crate::computer::CaptureFrame {
                         png: vec![0x89, 0x50, 0x4e, 0x47],
@@ -779,15 +772,11 @@ mod tests {
             self.inner.geometry().await
         }
 
-        async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
-            self.inner.execute(actions).await
-        }
-
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
-            self.inner.execute_one(action).await
+            self.inner.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {

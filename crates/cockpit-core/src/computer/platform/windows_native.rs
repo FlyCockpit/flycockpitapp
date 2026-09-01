@@ -41,6 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
+#[cfg(test)]
+use crate::computer::ComputerAction;
 use crate::computer::host_identity::{
     RealHostIdentityFs, SysHostIdentityRng, domain_hash, load_or_create_host_installation_id,
 };
@@ -50,10 +52,10 @@ use crate::computer::target::{
     TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
 };
 use crate::computer::{
-    CaptureFrame, ClickCount, ComputerAction, ComputerActionOutcome, ComputerBackend,
-    ComputerError, CoordinateSpace, DisplayGeometry, DisplayTarget, Easing, LogicalSize, Modifiers,
-    MouseButton, PixelRect, PixelSize, Point, RealDesktopGrantStore, ScaleFactor,
-    checked_action_duration, checked_rect, checked_scroll_delta,
+    CaptureFrame, ClickCount, ComputerActionOutcome, ComputerBackend, ComputerError,
+    DisplayGeometry, DisplayTarget, Easing, LogicalSize, Modifiers, MouseButton,
+    NormalizedComputerAction, NormalizedComputerEffect, NormalizedKeyCode, PixelPoint, PixelRect,
+    PixelSize, RealDesktopGrantStore, ScaleFactor,
 };
 
 #[derive(Debug)]
@@ -75,15 +77,11 @@ enum HeldKeyboardInput {
     Unicode(u16),
 }
 
-/// The exact Win32 input required for one logical key. A character resolved by
-/// the active keyboard layout can require modifiers in addition to its virtual
-/// key; those modifiers must be kept distinct from the caller's chord so the
-/// injected effect remains the requested character.
+/// The exact Win32 input required for one layout-independent key identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VirtualKeyInput {
     key: VIRTUAL_KEY,
     extended: bool,
-    character_modifiers: CharacterModifiers,
 }
 
 impl VirtualKeyInput {
@@ -91,34 +89,7 @@ impl VirtualKeyInput {
         Self {
             key,
             extended: is_extended_key(key),
-            character_modifiers: CharacterModifiers::NONE,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CharacterModifiers {
-    shift: bool,
-    control: bool,
-    alt: bool,
-}
-
-impl CharacterModifiers {
-    const NONE: Self = Self {
-        shift: false,
-        control: false,
-        alt: false,
-    };
-
-    const fn from_vk_key_scan(shift_state: u8) -> Option<Self> {
-        if shift_state & !0x07 != 0 {
-            return None;
-        }
-        Some(Self {
-            shift: shift_state & 0x01 != 0,
-            control: shift_state & 0x02 != 0,
-            alt: shift_state & 0x04 != 0,
-        })
     }
 }
 
@@ -271,40 +242,12 @@ impl WindowsDesktopBackend {
         Ok(())
     }
 
-    fn send_character_modifiers(
-        &mut self,
-        modifiers: CharacterModifiers,
-        up: bool,
-    ) -> Result<(), ComputerError> {
-        let keys = [
-            (modifiers.shift, VirtualKeyInput::plain(VK_SHIFT)),
-            (modifiers.control, VirtualKeyInput::plain(VK_CONTROL)),
-            (modifiers.alt, VirtualKeyInput::plain(VK_MENU)),
-        ];
-        if up {
-            for (enabled, key) in keys.iter().rev() {
-                if *enabled {
-                    self.key_up(*key)?;
-                }
-            }
-        } else {
-            for (enabled, key) in keys {
-                if enabled {
-                    self.key_down(key)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn key_input_down(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
-        self.send_character_modifiers(key.character_modifiers, false)?;
         self.key_down(key)
     }
 
     fn key_input_up(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
-        self.key_up(key)?;
-        self.send_character_modifiers(key.character_modifiers, true)
+        self.key_up(key)
     }
 
     fn refresh_geometry(&mut self) -> Result<(), ComputerError> {
@@ -407,8 +350,8 @@ impl WindowsDesktopBackend {
         }
     }
 
-    fn move_cursor(&self, point: Point) -> Result<(), ComputerError> {
-        let (x, y) = checked_windows_point(point, &self.geometry)?;
+    fn move_cursor(&self, point: PixelPoint) -> Result<(), ComputerError> {
+        let (x, y) = (point.x, point.y);
         let width = self.geometry.physical.width.saturating_sub(1).max(1);
         let height = self.geometry.physical.height.saturating_sub(1).max(1);
         send_mouse(
@@ -441,50 +384,44 @@ impl ComputerBackend for WindowsDesktopBackend {
         Ok(self.geometry.clone())
     }
 
-    async fn execute_one(
+    async fn execute_normalized_one(
         &mut self,
-        action: &ComputerAction,
+        action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
-        match action {
-            ComputerAction::CaptureFull => Ok(captured(self, None, None)?),
-            ComputerAction::CaptureRegion { rect } => {
-                let region = checked_rect(*rect, &self.geometry)?;
-                Ok(captured(self, Some(region), None)?)
+        match action.effect() {
+            NormalizedComputerEffect::CaptureFull => Ok(captured(self, None, None)?),
+            NormalizedComputerEffect::CaptureRegion { rect } => {
+                Ok(captured(self, Some(*rect), None)?)
             }
-            ComputerAction::CaptureNativeZoom { rect, scale } => {
-                let region = checked_rect(*rect, &self.geometry)?;
-                if !scale.0.is_finite() || scale.0 <= 0.0 {
-                    return Err(win_input_error("native zoom scale must be positive"));
-                }
-                let png = self.capture(Some(region))?;
+            NormalizedComputerEffect::CaptureNativeZoom {
+                rect,
+                scale,
+                output,
+            } => {
+                let png = self.capture(Some(*rect))?;
                 let profile = crate::media_image::ImageProfile::screenshot();
                 let decoded = crate::media_image::decode_and_orient(&png, &profile)
                     .map_err(|error| win_input_error(error.to_string()))?;
-                let width = (f64::from(region.width) * scale.0).round() as u32;
-                let height = (f64::from(region.height) * scale.0).round() as u32;
-                if width == 0 || height == 0 {
-                    return Err(win_input_error("native zoom produced zero geometry"));
-                }
-                let scaled = crate::media_image::scale(decoded, width, height, &profile);
+                let scaled =
+                    crate::media_image::scale(decoded, output.width, output.height, &profile);
                 let png = crate::media_image::encode_png(&scaled, &profile)
                     .map_err(|error| win_input_error(error.to_string()))?;
                 Ok(ComputerActionOutcome::Captured(CaptureFrame {
                     png,
                     geometry: self.geometry.clone(),
-                    region: Some(region),
+                    region: Some(*rect),
                     native_zoom: Some(*scale),
                 }))
             }
-            ComputerAction::MoveCursor {
+            NormalizedComputerEffect::MoveCursor {
                 to,
                 duration,
                 easing,
             } => {
-                checked_action_duration(*duration)?;
                 move_with_timing(self, *to, *duration, *easing)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Click {
+            NormalizedComputerEffect::Click {
                 button,
                 count,
                 modifiers,
@@ -497,29 +434,23 @@ impl ComputerBackend for WindowsDesktopBackend {
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::MouseDown { button } => {
+            NormalizedComputerEffect::MouseDown { button } => {
                 send_button(*button, false)?;
                 if !self.held_buttons.contains(button) {
                     self.held_buttons.push(*button);
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::MouseUp { button } => {
+            NormalizedComputerEffect::MouseUp { button } => {
                 send_button(*button, true)?;
                 self.held_buttons.retain(|held| held != button);
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Drag {
+            NormalizedComputerEffect::Drag {
                 button,
                 path,
                 modifiers,
             } => {
-                if path.is_empty() {
-                    return Err(win_input_error("drag path must not be empty"));
-                }
-                for step in path {
-                    checked_action_duration(step.duration)?;
-                }
                 self.send_modifiers(*modifiers, false)?;
                 move_with_timing(self, path[0].point, path[0].duration, path[0].easing)?;
                 send_button(*button, false)?;
@@ -532,19 +463,15 @@ impl ComputerBackend for WindowsDesktopBackend {
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::TypeText { text } => {
+            NormalizedComputerEffect::TypeText { text } => {
                 for unit in text.encode_utf16() {
                     self.unicode_down(unit)?;
                     self.unicode_up(unit)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::KeyChord { chord } => {
-                let keys = chord
-                    .keys
-                    .iter()
-                    .map(|key| virtual_key(key))
-                    .collect::<Result<Vec<_>, _>>()?;
+            NormalizedComputerEffect::KeyChord { chord } => {
+                let keys = chord.keys().iter().map(virtual_key).collect::<Vec<_>>();
                 for key in &keys {
                     self.key_input_down(*key)?;
                 }
@@ -553,21 +480,18 @@ impl ComputerBackend for WindowsDesktopBackend {
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::HoldKey { key, duration } => {
-                checked_action_duration(*duration)?;
-                let key = virtual_key(key)?;
+            NormalizedComputerEffect::HoldKey { key, duration } => {
+                let key = virtual_key(key);
                 self.key_input_down(key)?;
                 thread::sleep(*duration);
                 self.key_input_up(key)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Scroll {
+            NormalizedComputerEffect::Scroll {
                 delta_x,
                 delta_y,
                 modifiers,
             } => {
-                checked_scroll_delta(*delta_x)?;
-                checked_scroll_delta(*delta_y)?;
                 self.send_modifiers(*modifiers, false)?;
                 if *delta_y != 0 {
                     send_mouse(0, 0, (*delta_y * 120) as u32, MOUSEEVENTF_WHEEL)?;
@@ -578,8 +502,7 @@ impl ComputerBackend for WindowsDesktopBackend {
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Wait { duration } => {
-                checked_action_duration(*duration)?;
+            NormalizedComputerEffect::Wait { duration } => {
                 thread::sleep(*duration);
                 Ok(ComputerActionOutcome::Waited(*duration))
             }
@@ -597,7 +520,6 @@ impl ComputerBackend for WindowsDesktopBackend {
                     VirtualKeyInput {
                         key: VIRTUAL_KEY(key),
                         extended,
-                        character_modifiers: CharacterModifiers::NONE,
                     },
                     true,
                 ),
@@ -672,32 +594,9 @@ fn query_geometry() -> Result<(DisplayGeometry, i32, i32), ComputerError> {
     ))
 }
 
-fn checked_windows_point(
-    point: Point,
-    geometry: &DisplayGeometry,
-) -> Result<(u32, u32), ComputerError> {
-    let (x, y) = match point.space {
-        CoordinateSpace::Physical => (point.x, point.y),
-        CoordinateSpace::Logical => (
-            point.x * geometry.scale_factor.0,
-            point.y * geometry.scale_factor.0,
-        ),
-    };
-    if !x.is_finite()
-        || !y.is_finite()
-        || x < 0.0
-        || y < 0.0
-        || x >= f64::from(geometry.physical.width)
-        || y >= f64::from(geometry.physical.height)
-    {
-        return Err(win_input_error("point is outside the virtual desktop"));
-    }
-    Ok((x.round() as u32, y.round() as u32))
-}
-
 fn move_with_timing(
     backend: &WindowsDesktopBackend,
-    point: Point,
+    point: PixelPoint,
     duration: Duration,
     easing: Easing,
 ) -> Result<(), ComputerError> {
@@ -719,17 +618,9 @@ fn move_with_timing(
                 1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
             };
         }
-        let (target_x, target_y) = match point.space {
-            CoordinateSpace::Physical => (point.x, point.y),
-            CoordinateSpace::Logical => (
-                point.x * backend.geometry.scale_factor.0,
-                point.y * backend.geometry.scale_factor.0,
-            ),
-        };
-        backend.move_cursor(Point {
-            x: start_x + (target_x - start_x) * progress,
-            y: start_y + (target_y - start_y) * progress,
-            space: CoordinateSpace::Physical,
+        backend.move_cursor(PixelPoint {
+            x: (start_x + (f64::from(point.x) - start_x) * progress).round() as u32,
+            y: (start_y + (f64::from(point.y) - start_y) * progress).round() as u32,
         })?;
         thread::sleep(duration / steps);
     }
@@ -821,107 +712,11 @@ fn send_unicode(unit: u16, up: bool) -> Result<(), ComputerError> {
     }])
 }
 
-fn virtual_key(key: &str) -> Result<VirtualKeyInput, ComputerError> {
-    let upper = key.to_ascii_uppercase();
-    if let Some(input) = named_virtual_key(&upper) {
-        return Ok(input);
+fn virtual_key(key: &NormalizedKeyCode) -> VirtualKeyInput {
+    VirtualKeyInput {
+        key: VIRTUAL_KEY(key.windows_virtual_key()),
+        extended: key.windows_extended(),
     }
-    let mut characters = key.chars();
-    let Some(character) = characters.next() else {
-        return Err(win_input_error(format!("unsupported Windows key: {key}")));
-    };
-    if characters.next().is_some() {
-        return Err(win_input_error(format!("unsupported Windows key: {key}")));
-    }
-    let utf16 = u16::try_from(character as u32)
-        .map_err(|_| win_input_error(format!("unsupported Windows key: {key}")))?;
-    // SAFETY: GetForegroundWindow/GetWindowThreadProcessId/GetKeyboardLayout
-    // have no caller-owned pointers. The foreground window's layout, rather
-    // than the daemon thread's layout, determines the character the target
-    // application observes.
-    let keyboard_layout = unsafe {
-        let window = GetForegroundWindow();
-        if window.is_invalid() {
-            return Err(win_input_error("no foreground window for keyboard input"));
-        }
-        let thread_id = GetWindowThreadProcessId(window, None);
-        if thread_id == 0 {
-            return Err(win_input_error(
-                "could not determine foreground keyboard layout",
-            ));
-        }
-        GetKeyboardLayout(thread_id)
-    };
-    // SAFETY: VkKeyScanExW has no pointers and translates one UTF-16 code unit
-    // through the captured foreground-window keyboard layout.
-    let scan = unsafe { VkKeyScanExW(utf16, keyboard_layout) };
-    virtual_key_from_layout_scan(scan)
-        .ok_or_else(|| win_input_error(format!("unsupported Windows key: {key}")))
-}
-
-fn named_virtual_key(key: &str) -> Option<VirtualKeyInput> {
-    let key = match key {
-        "SHIFT" => VK_SHIFT,
-        "CONTROL" | "CTRL" => VK_CONTROL,
-        "LEFTCONTROL" | "LEFTCTRL" => VK_LCONTROL,
-        "RIGHTCONTROL" | "RIGHTCTRL" => VK_RCONTROL,
-        "ALT" => VK_MENU,
-        "LEFTALT" => VK_LMENU,
-        "RIGHTALT" => VK_RMENU,
-        "META" | "WIN" | "SUPER" | "LEFTMETA" | "LEFTWIN" | "LEFTSUPER" => VK_LWIN,
-        "RIGHTMETA" | "RIGHTWIN" | "RIGHTSUPER" => VK_RWIN,
-        "ENTER" | "RETURN" => VK_RETURN,
-        "TAB" => VK_TAB,
-        "ESC" | "ESCAPE" => VK_ESCAPE,
-        "BACKSPACE" => VK_BACK,
-        "DELETE" | "DEL" => VK_DELETE,
-        "INSERT" | "INS" => VK_INSERT,
-        "SPACE" | "SPACEBAR" => VK_SPACE,
-        "UP" | "ARROWUP" => VK_UP,
-        "DOWN" | "ARROWDOWN" => VK_DOWN,
-        "LEFT" | "ARROWLEFT" => VK_LEFT,
-        "RIGHT" | "ARROWRIGHT" => VK_RIGHT,
-        "HOME" => VK_HOME,
-        "END" => VK_END,
-        "PAGEUP" | "PAGE_UP" | "PGUP" => VK_PRIOR,
-        "PAGEDOWN" | "PAGE_DOWN" | "PGDN" => VK_NEXT,
-        "CAPSLOCK" => VK_CAPITAL,
-        "NUMLOCK" => VK_NUMLOCK,
-        "SCROLLLOCK" => VK_SCROLL,
-        "PRINTSCREEN" | "PRINT" | "PRTSC" => VK_SNAPSHOT,
-        "PAUSE" | "BREAK" => VK_PAUSE,
-        "APPS" | "CONTEXTMENU" => VK_APPS,
-        "F1" => VK_F1,
-        "F2" => VK_F2,
-        "F3" => VK_F3,
-        "F4" => VK_F4,
-        "F5" => VK_F5,
-        "F6" => VK_F6,
-        "F7" => VK_F7,
-        "F8" => VK_F8,
-        "F9" => VK_F9,
-        "F10" => VK_F10,
-        "F11" => VK_F11,
-        "F12" => VK_F12,
-        _ => return None,
-    };
-    Some(VirtualKeyInput::plain(key))
-}
-
-fn virtual_key_from_layout_scan(scan: i16) -> Option<VirtualKeyInput> {
-    if scan == -1 {
-        return None;
-    }
-    let scan = scan as u16;
-    let key = VIRTUAL_KEY(scan & 0x00ff);
-    (key.0 != 0)
-        .then_some(CharacterModifiers::from_vk_key_scan((scan >> 8) as u8))
-        .flatten()
-        .map(|character_modifiers| VirtualKeyInput {
-            key,
-            extended: is_extended_key(key),
-            character_modifiers,
-        })
 }
 
 const fn is_extended_key(key: VIRTUAL_KEY) -> bool {
@@ -1415,33 +1210,24 @@ unsafe fn uia_window_identity(hwnd: HWND) -> Result<[u8; 16], TargetUnavailableR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::computer::KeyCode;
 
-    #[test]
-    fn named_virtual_key_mapping_covers_approval_actions() {
-        assert_eq!(
-            virtual_key("ctrl").unwrap(),
-            VirtualKeyInput::plain(VK_CONTROL)
-        );
-        assert_eq!(
-            virtual_key_from_layout_scan(0x0041).unwrap().key,
-            VIRTUAL_KEY(b'A' as u16)
-        );
-        assert!(virtual_key("not-a-key").is_err());
+    fn translated(key: &str) -> VirtualKeyInput {
+        virtual_key(&NormalizedKeyCode::new(&KeyCode::parse(key).unwrap()).unwrap())
     }
 
     #[test]
-    fn layout_character_mapping_preserves_required_modifiers() {
-        let exclamation = virtual_key_from_layout_scan(0x0131).unwrap();
-        assert_eq!(exclamation.key, VIRTUAL_KEY(b'1' as u16));
-        assert!(exclamation.character_modifiers.shift);
-        assert!(!exclamation.character_modifiers.control);
-        assert!(!exclamation.character_modifiers.alt);
+    fn named_virtual_key_mapping_covers_approval_actions() {
+        assert_eq!(translated("ctrl"), VirtualKeyInput::plain(VK_CONTROL));
+        assert!(KeyCode::parse("not-a-key").is_err());
+    }
 
-        let slash = virtual_key_from_layout_scan(0x00bf).unwrap();
-        assert_eq!(slash.key, VK_OEM_2);
-        assert_eq!(slash.character_modifiers, CharacterModifiers::NONE);
-        assert!(virtual_key_from_layout_scan(-1).is_none());
-        assert!(virtual_key_from_layout_scan(0x08bf).is_none());
+    #[test]
+    fn alphabetic_key_identity_is_case_insensitive_without_implicit_shift() {
+        let lower = translated("a");
+        let upper = translated("A");
+        assert_eq!(lower, upper);
+        assert_eq!(upper, VirtualKeyInput::plain(VIRTUAL_KEY(b'A' as u16)));
     }
 
     #[test]
@@ -1449,12 +1235,12 @@ mod tests {
         for key in [
             "delete", "up", "down", "left", "right", "pageup", "pagedown",
         ] {
-            let input = virtual_key(key).unwrap();
+            let input = translated(key);
             assert!(input.extended, "{key}");
             assert_eq!(key_event_flags(input, true).0, 3, "{key}");
         }
-        assert!(!virtual_key("enter").unwrap().extended);
-        assert!(virtual_key("not-a-key").is_err());
+        assert!(!translated("enter").extended);
+        assert!(KeyCode::parse("not-a-key").is_err());
     }
 
     #[test]
@@ -1472,8 +1258,11 @@ mod tests {
         let store = RealDesktopGrantStore::for_cockpit_data_dir().unwrap();
         let mut backend =
             WindowsDesktopBackend::construct(DisplayTarget::RealDesktop, Some(&store)).unwrap();
-        let frame =
-            futures::executor::block_on(backend.execute_one(&ComputerAction::CaptureFull)).unwrap();
+        let frame = futures::executor::block_on(super::super::execute_backend_action(
+            &mut backend,
+            &ComputerAction::CaptureFull,
+        ))
+        .unwrap();
         assert!(
             matches!(frame, ComputerActionOutcome::Captured(frame) if frame.png.starts_with(&[137, 80, 78, 71]))
         );

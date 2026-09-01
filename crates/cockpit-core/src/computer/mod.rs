@@ -132,6 +132,185 @@ pub struct KeyChord {
     pub keys: Vec<String>,
 }
 
+/// A layout-independent physical key identity.
+///
+/// Provider text is resolved to this type before a canonical action is
+/// created. In particular, `a` and `A` identify the same key; producing an
+/// uppercase character is exclusively a [`ComputerAction::TypeText`] concern.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyCode(String);
+
+impl KeyCode {
+    pub fn parse(value: &str) -> Result<Self, ComputerError> {
+        let value = value.trim().to_ascii_uppercase();
+        let canonical = match value.as_str() {
+            "CTRL" => "CONTROL",
+            "LEFTCTRL" => "LEFTCONTROL",
+            "RIGHTCTRL" => "RIGHTCONTROL",
+            "META" | "WIN" | "SUPER" | "LEFTWIN" | "LEFTSUPER" => "LEFTMETA",
+            "RIGHTWIN" | "RIGHTSUPER" => "RIGHTMETA",
+            "RETURN" => "ENTER",
+            "ESC" => "ESCAPE",
+            "DEL" => "DELETE",
+            "INS" => "INSERT",
+            "SPACEBAR" => "SPACE",
+            "UP" => "ARROWUP",
+            "DOWN" => "ARROWDOWN",
+            "LEFT" => "ARROWLEFT",
+            "RIGHT" => "ARROWRIGHT",
+            "PAGE_UP" | "PGUP" => "PAGEUP",
+            "PAGE_DOWN" | "PGDN" => "PAGEDOWN",
+            "PRINT" | "PRTSC" => "PRINTSCREEN",
+            "BREAK" => "PAUSE",
+            "CONTEXTMENU" => "APPS",
+            other => other,
+        };
+        let is_letter_or_digit = canonical.len() == 1
+            && canonical
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric);
+        let is_function = canonical
+            .strip_prefix('F')
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=12).contains(&number));
+        let is_named = matches!(
+            canonical,
+            "SHIFT"
+                | "CONTROL"
+                | "LEFTCONTROL"
+                | "RIGHTCONTROL"
+                | "ALT"
+                | "LEFTALT"
+                | "RIGHTALT"
+                | "META"
+                | "LEFTMETA"
+                | "RIGHTMETA"
+                | "ENTER"
+                | "TAB"
+                | "ESCAPE"
+                | "BACKSPACE"
+                | "DELETE"
+                | "INSERT"
+                | "SPACE"
+                | "ARROWUP"
+                | "ARROWDOWN"
+                | "ARROWLEFT"
+                | "ARROWRIGHT"
+                | "HOME"
+                | "END"
+                | "PAGEUP"
+                | "PAGEDOWN"
+                | "CAPSLOCK"
+                | "NUMLOCK"
+                | "SCROLLLOCK"
+                | "PRINTSCREEN"
+                | "PAUSE"
+                | "APPS"
+        );
+        if !is_letter_or_digit && !is_function && !is_named {
+            return Err(ComputerError::Refused(format!(
+                "unsupported key identity `{value}`; use TypeText for characters"
+            )));
+        }
+        Ok(Self(canonical.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalKeyChord {
+    keys: Vec<KeyCode>,
+}
+
+impl CanonicalKeyChord {
+    pub fn new(keys: Vec<KeyCode>) -> Result<Self, ComputerError> {
+        if keys.is_empty() {
+            return Err(ComputerError::Refused(
+                "key chord must contain at least one key identity".to_string(),
+            ));
+        }
+        Ok(Self { keys })
+    }
+
+    pub fn keys(&self) -> &[KeyCode] {
+        &self.keys
+    }
+}
+
+/// Platform spellings/codes resolved before a batch performs its first host
+/// effect. Keeping these values in the normalized action makes keyboard
+/// execution infallible with respect to the accepted [`KeyCode`] set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedKeyCode {
+    x11_name: String,
+    windows_virtual_key: u16,
+    windows_extended: bool,
+}
+
+impl NormalizedKeyCode {
+    fn new(key: &KeyCode) -> Result<Self, ComputerError> {
+        Ok(Self {
+            x11_name: translate_x11_key(key)?,
+            windows_virtual_key: translate_windows_key(key)?,
+            windows_extended: windows_key_is_extended(key),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn x11_name(&self) -> &str {
+        &self.x11_name
+    }
+
+    #[doc(hidden)]
+    pub fn windows_virtual_key(&self) -> u16 {
+        self.windows_virtual_key
+    }
+
+    #[doc(hidden)]
+    pub fn windows_extended(&self) -> bool {
+        self.windows_extended
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedKeyChord {
+    keys: Vec<NormalizedKeyCode>,
+}
+
+impl NormalizedKeyChord {
+    fn new(chord: &CanonicalKeyChord) -> Result<Self, ComputerError> {
+        Ok(Self {
+            keys: chord
+                .keys()
+                .iter()
+                .map(NormalizedKeyCode::new)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    pub fn keys(&self) -> &[NormalizedKeyCode] {
+        &self.keys
+    }
+}
+
+impl TryFrom<&KeyChord> for CanonicalKeyChord {
+    type Error = ComputerError;
+
+    fn try_from(chord: &KeyChord) -> Result<Self, Self::Error> {
+        Self::new(
+            chord
+                .keys
+                .iter()
+                .map(|key| KeyCode::parse(key))
+                .collect::<Result<_, _>>()?,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComputerAction {
     CaptureFull,
@@ -167,10 +346,10 @@ pub enum ComputerAction {
         text: String,
     },
     KeyChord {
-        chord: KeyChord,
+        chord: CanonicalKeyChord,
     },
     HoldKey {
-        key: String,
+        key: KeyCode,
         duration: Duration,
     },
     Scroll {
@@ -188,6 +367,82 @@ pub enum ComputerActionOutcome {
     Captured(CaptureFrame),
     Completed,
     Waited(Duration),
+}
+
+/// Fully checked, physical-pixel action accepted by platform effect code.
+/// Instances can only be produced by the backend handoff after it obtains the
+/// backend's current geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedComputerAction {
+    effect: NormalizedComputerEffect,
+}
+
+impl NormalizedComputerAction {
+    #[doc(hidden)]
+    pub fn effect(&self) -> &NormalizedComputerEffect {
+        &self.effect
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum NormalizedComputerEffect {
+    CaptureFull,
+    CaptureRegion {
+        rect: PixelRect,
+    },
+    CaptureNativeZoom {
+        rect: PixelRect,
+        scale: ScaleFactor,
+        output: PixelSize,
+    },
+    MoveCursor {
+        to: PixelPoint,
+        duration: Duration,
+        easing: Easing,
+    },
+    Click {
+        button: MouseButton,
+        count: ClickCount,
+        modifiers: Modifiers,
+    },
+    MouseDown {
+        button: MouseButton,
+    },
+    MouseUp {
+        button: MouseButton,
+    },
+    Drag {
+        button: MouseButton,
+        path: Vec<NormalizedTimedPoint>,
+        modifiers: Modifiers,
+    },
+    TypeText {
+        text: String,
+    },
+    KeyChord {
+        chord: NormalizedKeyChord,
+    },
+    HoldKey {
+        key: NormalizedKeyCode,
+        duration: Duration,
+    },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: Modifiers,
+    },
+    Wait {
+        duration: Duration,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalizedTimedPoint {
+    pub point: PixelPoint,
+    pub duration: Duration,
+    pub easing: Easing,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -270,9 +525,10 @@ pub trait ComputerBackend: Send + Sync {
         None
     }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
-    async fn execute_one(
+    #[doc(hidden)]
+    async fn execute_normalized_one(
         &mut self,
-        action: &ComputerAction,
+        action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError>;
     /// Synchronously neutralize every backend-owned input state.
     ///
@@ -282,31 +538,70 @@ pub trait ComputerBackend: Send + Sync {
     /// every relevant key/button release and report a failure rather than
     /// silently handing the lease to another owner with uncertain input state.
     fn release_all(&mut self) -> Result<(), ComputerError>;
+}
 
-    async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
-        let mut completed = Vec::new();
-        for (index, action) in actions.iter().enumerate() {
-            match self.execute_one(action).await {
-                Ok(outcome) => completed.push(outcome),
-                Err(error) => {
-                    return ComputerBatchReport {
-                        completed,
-                        failure: Some(ComputerFailure { index, error }),
-                    };
-                }
+/// Single-action form of [`execute_backend_batch`].
+pub async fn execute_backend_action<B: ComputerBackend + ?Sized>(
+    backend: &mut B,
+    action: &ComputerAction,
+) -> Result<ComputerActionOutcome, ComputerError> {
+    let geometry = backend.geometry().await?;
+    let action = normalize_action(action, &geometry)?;
+    backend.execute_normalized_one(&action).await
+}
+
+/// Coordinator-safe canonical-to-platform handoff. This free function cannot
+/// be overridden by a backend implementation.
+pub async fn execute_backend_batch<B: ComputerBackend + ?Sized>(
+    backend: &mut B,
+    actions: &[ComputerAction],
+) -> ComputerBatchReport {
+    let geometry = match backend.geometry().await {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            return ComputerBatchReport {
+                completed: Vec::new(),
+                failure: Some(ComputerFailure { index: 0, error }),
+            };
+        }
+    };
+    // Normalize the entire batch before the first platform effect. This
+    // guarantees a malformed tail (for example a late drag point) cannot
+    // fail after an earlier action has already changed host state.
+    let mut normalized = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        match normalize_action(action, &geometry) {
+            Ok(action) => normalized.push(action),
+            Err(error) => {
+                return ComputerBatchReport {
+                    completed: Vec::new(),
+                    failure: Some(ComputerFailure { index, error }),
+                };
             }
         }
-        ComputerBatchReport {
-            completed,
-            failure: None,
+    }
+    let mut completed = Vec::new();
+    for (index, action) in normalized.iter().enumerate() {
+        match backend.execute_normalized_one(action).await {
+            Ok(outcome) => completed.push(outcome),
+            Err(error) => {
+                return ComputerBatchReport {
+                    completed,
+                    failure: Some(ComputerFailure { index, error }),
+                };
+            }
         }
+    }
+    ComputerBatchReport {
+        completed,
+        failure: None,
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct FakeBackend {
     pub geometry: DisplayGeometry,
-    pub recorded: Vec<ComputerAction>,
+    pub recorded: Vec<NormalizedComputerEffect>,
     pub release_count: usize,
     pub fail_at: Option<usize>,
     pub fail_with: ComputerError,
@@ -357,36 +652,44 @@ impl ComputerBackend for FakeBackend {
         Ok(self.geometry.clone())
     }
 
-    async fn execute_one(
+    async fn execute_normalized_one(
         &mut self,
-        action: &ComputerAction,
+        normalized: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
         let index = self.recorded.len();
-        self.recorded.push(action.clone());
+        let effect = normalized.effect();
+        self.recorded.push(effect.clone());
         if self.fail_at == Some(index) {
             return Err(self.fail_with.clone());
         }
-        match action {
-            ComputerAction::CaptureFull => Ok(ComputerActionOutcome::Captured(CaptureFrame {
-                png: vec![137, 80, 78, 71],
-                geometry: self.geometry.clone(),
-                region: None,
-                native_zoom: None,
-            })),
-            ComputerAction::CaptureRegion { rect }
-            | ComputerAction::CaptureNativeZoom { rect, .. } => {
-                let region = checked_rect(*rect, &self.geometry)?;
+        match effect {
+            NormalizedComputerEffect::CaptureFull => {
                 Ok(ComputerActionOutcome::Captured(CaptureFrame {
                     png: vec![137, 80, 78, 71],
                     geometry: self.geometry.clone(),
-                    region: Some(region),
-                    native_zoom: match action {
-                        ComputerAction::CaptureNativeZoom { scale, .. } => Some(*scale),
-                        _ => None,
-                    },
+                    region: None,
+                    native_zoom: None,
                 }))
             }
-            ComputerAction::Wait { duration } => Ok(ComputerActionOutcome::Waited(*duration)),
+            NormalizedComputerEffect::CaptureRegion { rect } => {
+                Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                    png: vec![137, 80, 78, 71],
+                    geometry: self.geometry.clone(),
+                    region: Some(*rect),
+                    native_zoom: None,
+                }))
+            }
+            NormalizedComputerEffect::CaptureNativeZoom { rect, scale, .. } => {
+                Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                    png: vec![137, 80, 78, 71],
+                    geometry: self.geometry.clone(),
+                    region: Some(*rect),
+                    native_zoom: Some(*scale),
+                }))
+            }
+            NormalizedComputerEffect::Wait { duration } => {
+                Ok(ComputerActionOutcome::Waited(*duration))
+            }
             _ => Ok(ComputerActionOutcome::Completed),
         }
     }
@@ -925,6 +1228,13 @@ fn capture_contained(
     // the filesystem. A hard tool/display failure propagates here.
     let streamed = runner.capture_to_stdout(tool, display, region)?;
     if !streamed.is_empty() {
+        if streamed.len()
+            > usize::try_from(crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES).unwrap_or(usize::MAX)
+        {
+            return Err(ComputerError::Refused(
+                "encoded capture exceeds the screenshot allocation limit".to_string(),
+            ));
+        }
         return Ok(streamed);
     }
     // The tool wrote nothing to stdout: it cannot stream. Fall back to a
@@ -1010,7 +1320,6 @@ fn capture_via_contained_file(
 /// happen on the held, verified fd, so there is no path-reresolution TOCTOU.
 #[cfg(unix)]
 fn assert_owner_only_and_read(path: &std::path::Path) -> Result<Vec<u8>, ComputerError> {
-    use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let io_fail = |error: std::io::Error| ComputerError::CommandFailed {
@@ -1040,6 +1349,11 @@ fn assert_owner_only_and_read(path: &std::path::Path) -> Result<Vec<u8>, Compute
     if meta.nlink() != 1 {
         return Err(deny("capture file is hardlinked"));
     }
+    if meta.len() > crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES {
+        return Err(ComputerError::Refused(
+            "encoded capture exceeds the screenshot allocation limit".to_string(),
+        ));
+    }
     // SAFETY: `geteuid` is always safe to call.
     let euid = unsafe { libc::geteuid() };
     if meta.uid() != euid {
@@ -1055,9 +1369,33 @@ fn assert_owner_only_and_read(path: &std::path::Path) -> Result<Vec<u8>, Compute
             return Err(deny("could not tighten capture file to 0o600"));
         }
     }
-    // Only now, with the file proven owner-only, read the bytes.
+    // Only now, with the file proven owner-only, read through a hard byte
+    // ceiling. The metadata check above is only an early rejection: the file
+    // can grow after `fstat`, so the held fd itself must be bounded as it is
+    // consumed.
+    read_capture_bytes_bounded(&mut file, crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES)
+}
+
+#[cfg(unix)]
+fn read_capture_bytes_bounded(
+    reader: &mut dyn std::io::Read,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ComputerError> {
+    use std::io::Read as _;
+
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(io_fail)?;
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ComputerError::CommandFailed {
+            program: "capture".to_string(),
+            detail: error.to_string(),
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ComputerError::Refused(
+            "encoded capture exceeds the screenshot allocation limit".to_string(),
+        ));
+    }
     Ok(bytes)
 }
 
@@ -1130,21 +1468,69 @@ impl CaptureRunner for RealCaptureRunner {
         display: &str,
         region: Option<PixelRect>,
     ) -> Result<Vec<u8>, ComputerError> {
-        let output = capture_command(tool, display, region, CaptureDest::Stdout)
+        use std::io::Read as _;
+
+        let mut child = capture_command(tool, display, region, CaptureDest::Stdout)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|error| ComputerError::CommandFailed {
                 program: "capture".to_string(),
                 detail: error.to_string(),
             })?;
-        if !output.status.success() {
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ComputerError::CommandFailed {
+                program: "capture".to_string(),
+                detail: "capture stdout pipe was unavailable".to_string(),
+            })?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ComputerError::CommandFailed {
+                program: "capture".to_string(),
+                detail: "capture stderr pipe was unavailable".to_string(),
+            })?;
+        // Drain stderr concurrently so a noisy failed tool cannot deadlock on
+        // its pipe while stdout is being read. Retain only a bounded diagnostic.
+        let stderr_reader = std::thread::spawn(move || {
+            let mut diagnostic = Vec::new();
+            let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut diagnostic);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            diagnostic
+        });
+        let read_limit = crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES + 1;
+        let mut bytes = Vec::new();
+        let read_result = (&mut stdout).take(read_limit).read_to_end(&mut bytes);
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+            > crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES
+        {
+            let _ = child.kill();
+        }
+        let status = child.wait().map_err(|error| ComputerError::CommandFailed {
+            program: "capture".to_string(),
+            detail: error.to_string(),
+        })?;
+        let stderr = stderr_reader.join().unwrap_or_default();
+        read_result.map_err(|error| ComputerError::CommandFailed {
+            program: "capture".to_string(),
+            detail: error.to_string(),
+        })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+            > crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES
+        {
+            return Err(ComputerError::Refused(
+                "encoded capture exceeds the screenshot allocation limit".to_string(),
+            ));
+        }
+        if !status.success() {
             return Err(ComputerError::CommandFailed {
                 program: "capture".to_string(),
-                detail: String::from_utf8_lossy(&output.stderr).to_string(),
+                detail: String::from_utf8_lossy(&stderr).to_string(),
             });
         }
-        Ok(output.stdout)
+        Ok(bytes)
     }
 
     fn capture_to_path(
@@ -1187,9 +1573,9 @@ impl ComputerBackend for VirtualDisplayBackend {
         Ok(self.geometry.clone())
     }
 
-    async fn execute_one(
+    async fn execute_normalized_one(
         &mut self,
-        action: &ComputerAction,
+        action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
         execute_virtual_action(self, action)
     }
@@ -1259,46 +1645,47 @@ impl Drop for VirtualDisplayBackend {
 #[cfg(target_os = "linux")]
 fn execute_virtual_action(
     backend: &mut VirtualDisplayBackend,
-    action: &ComputerAction,
+    action: &NormalizedComputerAction,
 ) -> Result<ComputerActionOutcome, ComputerError> {
-    match action {
-        ComputerAction::CaptureFull => Ok(ComputerActionOutcome::Captured(CaptureFrame {
-            png: backend.capture_png(None)?,
-            geometry: backend.geometry.clone(),
-            region: None,
-            native_zoom: None,
-        })),
-        ComputerAction::CaptureRegion { rect } => {
-            let region = checked_rect(*rect, &backend.geometry)?;
+    match action.effect() {
+        NormalizedComputerEffect::CaptureFull => {
             Ok(ComputerActionOutcome::Captured(CaptureFrame {
-                png: backend.capture_png(Some(region))?,
+                png: backend.capture_png(None)?,
                 geometry: backend.geometry.clone(),
-                region: Some(region),
+                region: None,
                 native_zoom: None,
             }))
         }
-        ComputerAction::CaptureNativeZoom { rect, scale } => {
-            let region = checked_rect(*rect, &backend.geometry)?;
-            let scale = checked_zoom_scale(*scale)?;
-            let png = backend.capture_png(Some(region))?;
+        NormalizedComputerEffect::CaptureRegion { rect: region } => {
             Ok(ComputerActionOutcome::Captured(CaptureFrame {
-                png: scale_png(png, scale)?,
+                png: backend.capture_png(Some(*region))?,
                 geometry: backend.geometry.clone(),
-                region: Some(region),
-                native_zoom: Some(scale),
+                region: Some(*region),
+                native_zoom: None,
             }))
         }
-        ComputerAction::MoveCursor {
+        NormalizedComputerEffect::CaptureNativeZoom {
+            rect: region,
+            scale,
+            output,
+        } => {
+            let png = backend.capture_png(Some(*region))?;
+            Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                png: scale_png(png, *output)?,
+                geometry: backend.geometry.clone(),
+                region: Some(*region),
+                native_zoom: Some(*scale),
+            }))
+        }
+        NormalizedComputerEffect::MoveCursor {
             to,
             duration,
             easing,
         } => {
-            checked_action_duration(*duration)?;
-            let point = checked_point(*to, &backend.geometry)?;
-            move_cursor_with_timing(backend, point, *duration, *easing)?;
+            move_cursor_with_timing(backend, *to, *duration, *easing)?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::Click {
+        NormalizedComputerEffect::Click {
             button,
             count,
             modifiers,
@@ -1313,48 +1700,34 @@ fn execute_virtual_action(
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::MouseDown { button } => {
+        NormalizedComputerEffect::MouseDown { button } => {
             backend.run_xdotool(&[
                 OsString::from("mousedown"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::MouseUp { button } => {
+        NormalizedComputerEffect::MouseUp { button } => {
             backend.run_xdotool(&[
                 OsString::from("mouseup"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::Drag {
+        NormalizedComputerEffect::Drag {
             button,
             path,
             modifiers,
         } => {
-            if path.is_empty() {
-                return Err(ComputerError::InvalidCoordinates(
-                    "drag path must contain at least one point".to_string(),
-                ));
-            }
-            let mut checked_path = Vec::with_capacity(path.len());
-            for step in path {
-                checked_action_duration(step.duration)?;
-                checked_path.push((
-                    checked_point(step.point, &backend.geometry)?,
-                    step.duration,
-                    step.easing,
-                ));
-            }
-            let (first, first_duration, first_easing) = checked_path[0];
-            move_cursor_with_timing(backend, first, first_duration, first_easing)?;
+            let first = path[0];
+            move_cursor_with_timing(backend, first.point, first.duration, first.easing)?;
             run_modifiers(backend, *modifiers, true)?;
             backend.run_xdotool(&[
                 OsString::from("mousedown"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
-            for (point, duration, easing) in checked_path.into_iter().skip(1) {
-                move_cursor_with_timing(backend, point, duration, easing)?;
+            for step in path.iter().skip(1) {
+                move_cursor_with_timing(backend, step.point, step.duration, step.easing)?;
             }
             backend.run_xdotool(&[
                 OsString::from("mouseup"),
@@ -1363,30 +1736,34 @@ fn execute_virtual_action(
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::TypeText { text } => {
+        NormalizedComputerEffect::TypeText { text } => {
             backend.run_xdotool(&[OsString::from("type"), OsString::from(text)])?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::KeyChord { chord } => {
-            backend.run_xdotool(&[OsString::from("key"), OsString::from(chord.keys.join("+"))])?;
+        NormalizedComputerEffect::KeyChord { chord } => {
+            let chord = chord
+                .keys()
+                .iter()
+                .map(NormalizedKeyCode::x11_name)
+                .collect::<Vec<_>>()
+                .join("+");
+            backend.run_xdotool(&[OsString::from("key"), OsString::from(chord)])?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::HoldKey { key, duration } => {
-            checked_action_duration(*duration)?;
+        NormalizedComputerEffect::HoldKey { key, duration } => {
+            let key = key.x11_name().to_string();
             backend.remember_held_key(key.clone())?;
-            backend.run_xdotool(&[OsString::from("keydown"), OsString::from(key)])?;
+            backend.run_xdotool(&[OsString::from("keydown"), OsString::from(&key)])?;
             std::thread::sleep(*duration);
-            backend.run_xdotool(&[OsString::from("keyup"), OsString::from(key)])?;
-            backend.forget_held_key(key)?;
+            backend.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)])?;
+            backend.forget_held_key(&key)?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::Scroll {
+        NormalizedComputerEffect::Scroll {
             delta_x,
             delta_y,
             modifiers,
         } => {
-            checked_scroll_delta(*delta_x)?;
-            checked_scroll_delta(*delta_y)?;
             run_modifiers(backend, *modifiers, true)?;
             let vertical = if *delta_y < 0 { "5" } else { "4" };
             for _ in 0..delta_y.unsigned_abs() {
@@ -1399,12 +1776,138 @@ fn execute_virtual_action(
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
         }
-        ComputerAction::Wait { duration } => {
-            checked_action_duration(*duration)?;
+        NormalizedComputerEffect::Wait { duration } => {
             std::thread::sleep(*duration);
             Ok(ComputerActionOutcome::Waited(*duration))
         }
     }
+}
+
+fn translate_x11_key(key: &KeyCode) -> Result<String, ComputerError> {
+    let canonical = key.as_str();
+    if canonical.len() == 1 && canonical.as_bytes()[0].is_ascii_alphabetic() {
+        return Ok(canonical.to_ascii_lowercase());
+    }
+    if canonical.len() == 1 && canonical.as_bytes()[0].is_ascii_digit() {
+        return Ok(canonical.to_string());
+    }
+    if canonical
+        .strip_prefix('F')
+        .and_then(|number| number.parse::<u8>().ok())
+        .is_some_and(|number| (1..=12).contains(&number))
+    {
+        return Ok(canonical.to_string());
+    }
+    let translated = match canonical {
+        "CONTROL" => "Control",
+        "LEFTCONTROL" => "Control_L",
+        "RIGHTCONTROL" => "Control_R",
+        "SHIFT" => "Shift",
+        "ALT" => "Alt",
+        "LEFTALT" => "Alt_L",
+        "RIGHTALT" => "Alt_R",
+        "META" | "LEFTMETA" => "Super_L",
+        "RIGHTMETA" => "Super_R",
+        "ENTER" => "Return",
+        "TAB" => "Tab",
+        "ESCAPE" => "Escape",
+        "BACKSPACE" => "BackSpace",
+        "DELETE" => "Delete",
+        "INSERT" => "Insert",
+        "SPACE" => "space",
+        "ARROWUP" => "Up",
+        "ARROWDOWN" => "Down",
+        "ARROWLEFT" => "Left",
+        "ARROWRIGHT" => "Right",
+        "HOME" => "Home",
+        "END" => "End",
+        "PAGEUP" => "Page_Up",
+        "PAGEDOWN" => "Page_Down",
+        "CAPSLOCK" => "Caps_Lock",
+        "NUMLOCK" => "Num_Lock",
+        "SCROLLLOCK" => "Scroll_Lock",
+        "PRINTSCREEN" => "Print",
+        "PAUSE" => "Pause",
+        "APPS" => "Menu",
+        _ => {
+            return Err(ComputerError::Refused(format!(
+                "unsupported X11 key identity `{canonical}`"
+            )));
+        }
+    };
+    Ok(translated.to_string())
+}
+
+fn translate_windows_key(key: &KeyCode) -> Result<u16, ComputerError> {
+    let canonical = key.as_str();
+    if canonical.len() == 1 && canonical.as_bytes()[0].is_ascii_alphanumeric() {
+        return Ok(u16::from(canonical.as_bytes()[0]));
+    }
+    if let Some(number) = canonical
+        .strip_prefix('F')
+        .and_then(|number| number.parse::<u8>().ok())
+        .filter(|number| (1..=12).contains(number))
+    {
+        return Ok(0x6f + u16::from(number));
+    }
+    match canonical {
+        "BACKSPACE" => Ok(0x08),
+        "TAB" => Ok(0x09),
+        "ENTER" => Ok(0x0d),
+        "SHIFT" => Ok(0x10),
+        "CONTROL" => Ok(0x11),
+        "ALT" => Ok(0x12),
+        "PAUSE" => Ok(0x13),
+        "CAPSLOCK" => Ok(0x14),
+        "ESCAPE" => Ok(0x1b),
+        "SPACE" => Ok(0x20),
+        "PAGEUP" => Ok(0x21),
+        "PAGEDOWN" => Ok(0x22),
+        "END" => Ok(0x23),
+        "HOME" => Ok(0x24),
+        "ARROWLEFT" => Ok(0x25),
+        "ARROWUP" => Ok(0x26),
+        "ARROWRIGHT" => Ok(0x27),
+        "ARROWDOWN" => Ok(0x28),
+        "PRINTSCREEN" => Ok(0x2c),
+        "INSERT" => Ok(0x2d),
+        "DELETE" => Ok(0x2e),
+        "LEFTMETA" => Ok(0x5b),
+        "RIGHTMETA" => Ok(0x5c),
+        "APPS" => Ok(0x5d),
+        "NUMLOCK" => Ok(0x90),
+        "SCROLLLOCK" => Ok(0x91),
+        "LEFTCONTROL" => Ok(0xa2),
+        "RIGHTCONTROL" => Ok(0xa3),
+        "LEFTALT" => Ok(0xa4),
+        "RIGHTALT" => Ok(0xa5),
+        _ => Err(ComputerError::Refused(format!(
+            "unsupported Windows key identity `{canonical}`"
+        ))),
+    }
+}
+
+fn windows_key_is_extended(key: &KeyCode) -> bool {
+    matches!(
+        key.as_str(),
+        "RIGHTCONTROL"
+            | "RIGHTALT"
+            | "INSERT"
+            | "DELETE"
+            | "HOME"
+            | "END"
+            | "PAGEUP"
+            | "PAGEDOWN"
+            | "ARROWUP"
+            | "ARROWDOWN"
+            | "ARROWLEFT"
+            | "ARROWRIGHT"
+            | "NUMLOCK"
+            | "PRINTSCREEN"
+            | "LEFTMETA"
+            | "RIGHTMETA"
+            | "APPS"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1501,10 +2004,7 @@ fn checked_zoom_scale(scale: ScaleFactor) -> Result<ScaleFactor, ComputerError> 
 }
 
 #[cfg(target_os = "linux")]
-fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError> {
-    if (scale.0 - 1.0).abs() < f64::EPSILON {
-        return Ok(png);
-    }
+fn scale_png(png: Vec<u8>, output: PixelSize) -> Result<Vec<u8>, ComputerError> {
     let profile = crate::media_image::ImageProfile::screenshot();
     let image = crate::media_image::decode_and_orient(&png, &profile).map_err(|error| {
         ComputerError::CommandFailed {
@@ -1512,9 +2012,10 @@ fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError>
             detail: error.to_string(),
         }
     })?;
-    let width = scaled_dimension(image.width(), scale)?;
-    let height = scaled_dimension(image.height(), scale)?;
-    let scaled = crate::media_image::scale(image, width, height, &profile);
+    if image.width() == output.width && image.height() == output.height {
+        return Ok(png);
+    }
+    let scaled = crate::media_image::scale(image, output.width, output.height, &profile);
     crate::media_image::encode_png(&scaled, &profile).map_err(|error| {
         ComputerError::CommandFailed {
             program: "image".to_string(),
@@ -1523,7 +2024,6 @@ fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError>
     })
 }
 
-#[cfg(target_os = "linux")]
 fn scaled_dimension(value: u32, scale: ScaleFactor) -> Result<u32, ComputerError> {
     let scaled = (f64::from(value) * scale.0).round();
     if !scaled.is_finite() || scaled < 1.0 || scaled > f64::from(u32::MAX) {
@@ -1537,7 +2037,7 @@ fn scaled_dimension(value: u32, scale: ScaleFactor) -> Result<u32, ComputerError
 #[cfg(not(target_os = "linux"))]
 fn execute_virtual_action(
     _backend: &VirtualDisplayBackend,
-    _action: &ComputerAction,
+    _action: &NormalizedComputerAction,
 ) -> Result<ComputerActionOutcome, ComputerError> {
     Err(unsupported_platform())
 }
@@ -1570,7 +2070,13 @@ fn checked_point(point: Point, geometry: &DisplayGeometry) -> Result<PixelPoint,
             point.y * geometry.scale_factor.0,
         ),
     };
-    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x > f64::from(u32::MAX)
+        || y > f64::from(u32::MAX)
+    {
         return Err(ComputerError::InvalidCoordinates(format!(
             "point ({x}, {y}) is not finite and non-negative"
         )));
@@ -1608,8 +2114,21 @@ fn checked_rect(rect: Rect, geometry: &DisplayGeometry) -> Result<PixelRect, Com
         CoordinateSpace::Physical => 1.0,
         CoordinateSpace::Logical => geometry.scale_factor.0,
     };
-    let width = (rect.width * scale).round() as u32;
-    let height = (rect.height * scale).round() as u32;
+    let scaled_width = (rect.width * scale).round();
+    let scaled_height = (rect.height * scale).round();
+    if !scaled_width.is_finite()
+        || !scaled_height.is_finite()
+        || scaled_width < 1.0
+        || scaled_height < 1.0
+        || scaled_width > f64::from(u32::MAX)
+        || scaled_height > f64::from(u32::MAX)
+    {
+        return Err(ComputerError::InvalidCoordinates(
+            "rect rounds to invalid physical dimensions".to_string(),
+        ));
+    }
+    let width = scaled_width as u32;
+    let height = scaled_height as u32;
     let Some(right) = origin.x.checked_add(width) else {
         return Err(ComputerError::InvalidCoordinates(
             "rect x + width overflows".to_string(),
@@ -1635,9 +2154,171 @@ fn checked_rect(rect: Rect, geometry: &DisplayGeometry) -> Result<PixelRect, Com
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PixelPoint {
-    x: u32,
-    y: u32,
+pub struct PixelPoint {
+    pub x: u32,
+    pub y: u32,
+}
+
+fn checked_geometry(geometry: &DisplayGeometry) -> Result<(), ComputerError> {
+    if geometry.physical.width == 0
+        || geometry.physical.height == 0
+        || !geometry.logical.width.is_finite()
+        || !geometry.logical.height.is_finite()
+        || geometry.logical.width <= 0.0
+        || geometry.logical.height <= 0.0
+        || !geometry.scale_factor.0.is_finite()
+        || geometry.scale_factor.0 <= 0.0
+    {
+        return Err(ComputerError::InvalidCoordinates(
+            "backend display geometry is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_action(
+    action: &ComputerAction,
+    geometry: &DisplayGeometry,
+) -> Result<NormalizedComputerAction, ComputerError> {
+    checked_geometry(geometry)?;
+    let effect = match action {
+        ComputerAction::CaptureFull => {
+            checked_capture_allocation(
+                geometry.physical.width,
+                geometry.physical.height,
+                "full capture source",
+            )?;
+            NormalizedComputerEffect::CaptureFull
+        }
+        ComputerAction::CaptureRegion { rect } => {
+            let rect = checked_rect(*rect, geometry)?;
+            checked_capture_allocation(rect.width, rect.height, "region capture source")?;
+            NormalizedComputerEffect::CaptureRegion { rect }
+        }
+        ComputerAction::CaptureNativeZoom { rect, scale } => {
+            let rect = checked_rect(*rect, geometry)?;
+            checked_capture_allocation(rect.width, rect.height, "native zoom source")?;
+            let scale = checked_zoom_scale(*scale)?;
+            let output = PixelSize {
+                width: scaled_dimension(rect.width, scale)?,
+                height: scaled_dimension(rect.height, scale)?,
+            };
+            checked_capture_allocation(output.width, output.height, "native zoom output")?;
+            NormalizedComputerEffect::CaptureNativeZoom {
+                rect,
+                scale,
+                output,
+            }
+        }
+        ComputerAction::MoveCursor {
+            to,
+            duration,
+            easing,
+        } => {
+            checked_action_duration(*duration)?;
+            NormalizedComputerEffect::MoveCursor {
+                to: checked_point(*to, geometry)?,
+                duration: *duration,
+                easing: *easing,
+            }
+        }
+        ComputerAction::Click {
+            button,
+            count,
+            modifiers,
+        } => NormalizedComputerEffect::Click {
+            button: *button,
+            count: *count,
+            modifiers: *modifiers,
+        },
+        ComputerAction::MouseDown { button } => {
+            NormalizedComputerEffect::MouseDown { button: *button }
+        }
+        ComputerAction::MouseUp { button } => NormalizedComputerEffect::MouseUp { button: *button },
+        ComputerAction::Drag {
+            button,
+            path,
+            modifiers,
+        } => {
+            if path.is_empty() {
+                return Err(ComputerError::InvalidCoordinates(
+                    "drag path must contain at least one point".to_string(),
+                ));
+            }
+            let path = path
+                .iter()
+                .map(|step| {
+                    checked_action_duration(step.duration)?;
+                    Ok(NormalizedTimedPoint {
+                        point: checked_point(step.point, geometry)?,
+                        duration: step.duration,
+                        easing: step.easing,
+                    })
+                })
+                .collect::<Result<_, ComputerError>>()?;
+            NormalizedComputerEffect::Drag {
+                button: *button,
+                path,
+                modifiers: *modifiers,
+            }
+        }
+        ComputerAction::TypeText { text } => {
+            NormalizedComputerEffect::TypeText { text: text.clone() }
+        }
+        ComputerAction::KeyChord { chord } => {
+            // CanonicalKeyChord construction enforces this invariant. Keep the
+            // mandatory normalization gate defensive against any future
+            // internal representation change.
+            let chord = CanonicalKeyChord::new(chord.keys().to_vec())?;
+            let chord = NormalizedKeyChord::new(&chord)?;
+            NormalizedComputerEffect::KeyChord { chord }
+        }
+        ComputerAction::HoldKey { key, duration } => {
+            checked_action_duration(*duration)?;
+            NormalizedComputerEffect::HoldKey {
+                key: NormalizedKeyCode::new(key)?,
+                duration: *duration,
+            }
+        }
+        ComputerAction::Scroll {
+            delta_x,
+            delta_y,
+            modifiers,
+        } => {
+            checked_scroll_delta(*delta_x)?;
+            checked_scroll_delta(*delta_y)?;
+            NormalizedComputerEffect::Scroll {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+                modifiers: *modifiers,
+            }
+        }
+        ComputerAction::Wait { duration } => {
+            checked_action_duration(*duration)?;
+            NormalizedComputerEffect::Wait {
+                duration: *duration,
+            }
+        }
+    };
+    Ok(NormalizedComputerAction { effect })
+}
+
+fn checked_capture_allocation(
+    width: u32,
+    height: u32,
+    allocation: &str,
+) -> Result<(), ComputerError> {
+    crate::media_image::checked_rgba_allocation_bytes(
+        width,
+        height,
+        &crate::media_image::ImageProfile::screenshot(),
+    )
+    .map(|_| ())
+    .map_err(|_| {
+        ComputerError::Refused(format!(
+            "{allocation} exceeds the screenshot allocation limit"
+        ))
+    })
 }
 
 fn mouse_button_number(button: MouseButton) -> u8 {
@@ -2067,8 +2748,8 @@ impl Anthropic20251124ComputerAction {
         ]
     }
 
-    pub fn to_backend(&self) -> ComputerAction {
-        match self {
+    pub fn to_backend(&self) -> Result<ComputerAction, ComputerError> {
+        Ok(match self {
             Self::Screenshot => ComputerAction::CaptureFull,
             Self::Zoom { rect, scale } => ComputerAction::CaptureNativeZoom {
                 rect: *rect,
@@ -2110,10 +2791,10 @@ impl Anthropic20251124ComputerAction {
             },
             Self::TypeText(text) => ComputerAction::TypeText { text: text.clone() },
             Self::KeyChord(chord) => ComputerAction::KeyChord {
-                chord: chord.clone(),
+                chord: CanonicalKeyChord::try_from(chord)?,
             },
             Self::HoldKey { key, duration } => ComputerAction::HoldKey {
-                key: key.clone(),
+                key: KeyCode::parse(key)?,
                 duration: *duration,
             },
             Self::Scroll {
@@ -2129,10 +2810,10 @@ impl Anthropic20251124ComputerAction {
             Self::Wait(duration) => ComputerAction::Wait {
                 duration: *duration,
             },
-        }
+        })
     }
 
-    pub fn to_backend_actions(&self) -> Vec<ComputerAction> {
+    pub fn to_backend_actions(&self) -> Result<Vec<ComputerAction>, ComputerError> {
         let mut actions = Vec::new();
         match self {
             Self::Click { at, .. } | Self::Scroll { at, .. } => {
@@ -2146,8 +2827,8 @@ impl Anthropic20251124ComputerAction {
             }
             _ => {}
         }
-        actions.push(self.to_backend());
-        actions
+        actions.push(self.to_backend()?);
+        Ok(actions)
     }
 }
 
@@ -2208,8 +2889,8 @@ impl Anthropic20250124ComputerAction {
         ]
     }
 
-    pub fn to_backend(&self) -> ComputerAction {
-        match self {
+    pub fn to_backend(&self) -> Result<ComputerAction, ComputerError> {
+        Ok(match self {
             Self::Screenshot => ComputerAction::CaptureFull,
             Self::MouseMove {
                 to,
@@ -2247,10 +2928,10 @@ impl Anthropic20250124ComputerAction {
             },
             Self::TypeText(text) => ComputerAction::TypeText { text: text.clone() },
             Self::KeyChord(chord) => ComputerAction::KeyChord {
-                chord: chord.clone(),
+                chord: CanonicalKeyChord::try_from(chord)?,
             },
             Self::HoldKey { key, duration } => ComputerAction::HoldKey {
-                key: key.clone(),
+                key: KeyCode::parse(key)?,
                 duration: *duration,
             },
             Self::Scroll {
@@ -2266,10 +2947,10 @@ impl Anthropic20250124ComputerAction {
             Self::Wait(duration) => ComputerAction::Wait {
                 duration: *duration,
             },
-        }
+        })
     }
 
-    pub fn to_backend_actions(&self) -> Vec<ComputerAction> {
+    pub fn to_backend_actions(&self) -> Result<Vec<ComputerAction>, ComputerError> {
         let mut actions = Vec::new();
         match self {
             Self::Click { at, .. } | Self::Scroll { at, .. } => {
@@ -2283,8 +2964,8 @@ impl Anthropic20250124ComputerAction {
             }
             _ => {}
         }
-        actions.push(self.to_backend());
-        actions
+        actions.push(self.to_backend()?);
+        Ok(actions)
     }
 }
 
@@ -2787,8 +3468,8 @@ pub enum OpenAiComputerWireError {
 }
 
 impl OpenAiComputerAction {
-    pub fn to_backend(&self) -> ComputerAction {
-        match self {
+    pub fn to_backend(&self) -> Result<ComputerAction, ComputerError> {
+        Ok(match self {
             Self::Screenshot => ComputerAction::CaptureFull,
             Self::Move { to } => ComputerAction::MoveCursor {
                 to: *to,
@@ -2825,13 +3506,13 @@ impl OpenAiComputerAction {
                 modifiers: *modifiers,
             },
             Self::KeyChord(chord) => ComputerAction::KeyChord {
-                chord: chord.clone(),
+                chord: CanonicalKeyChord::try_from(chord)?,
             },
             Self::TypeText(text) => ComputerAction::TypeText { text: text.clone() },
-        }
+        })
     }
 
-    pub fn to_backend_actions(&self) -> Vec<ComputerAction> {
+    pub fn to_backend_actions(&self) -> Result<Vec<ComputerAction>, ComputerError> {
         let mut actions = Vec::new();
         match self {
             Self::Click { at, .. } | Self::DoubleClick { at, .. } | Self::Scroll { at, .. } => {
@@ -2845,8 +3526,8 @@ impl OpenAiComputerAction {
             }
             _ => {}
         }
-        actions.push(self.to_backend());
-        actions
+        actions.push(self.to_backend()?);
+        Ok(actions)
     }
 }
 
@@ -3120,24 +3801,41 @@ pub async fn execute_openai_computer_call<B: ComputerBackend>(
     actions: &[OpenAiComputerAction],
 ) -> OpenAiComputerCallResult {
     let call_id = call_id.into();
-    let mut completed = Vec::new();
+    let mut backend_actions = Vec::new();
+    let mut provider_indices = Vec::new();
     for (index, action) in actions.iter().enumerate() {
-        let report = backend.execute(&action.to_backend_actions()).await;
-        completed.extend(report.completed);
-        if let Some(mut failure) = report.failure {
-            failure.index = index;
-            return OpenAiComputerCallResult {
-                output: OpenAiComputerCallOutput {
-                    call_id,
-                    completed,
-                    failure: Some(failure),
-                    screenshot: None,
-                },
-                live_frame: None,
-            };
-        }
+        let converted = match action.to_backend_actions() {
+            Ok(actions) => actions,
+            Err(error) => {
+                return OpenAiComputerCallResult {
+                    output: OpenAiComputerCallOutput {
+                        call_id,
+                        completed: Vec::new(),
+                        failure: Some(ComputerFailure { index, error }),
+                        screenshot: None,
+                    },
+                    live_frame: None,
+                };
+            }
+        };
+        provider_indices.extend(std::iter::repeat_n(index, converted.len()));
+        backend_actions.extend(converted);
     }
-    let capture = backend.execute_one(&ComputerAction::CaptureFull).await;
+    let report = execute_backend_batch(backend, &backend_actions).await;
+    let completed = report.completed;
+    if let Some(mut failure) = report.failure {
+        failure.index = provider_indices.get(failure.index).copied().unwrap_or(0);
+        return OpenAiComputerCallResult {
+            output: OpenAiComputerCallOutput {
+                call_id,
+                completed,
+                failure: Some(failure),
+                screenshot: None,
+            },
+            live_frame: None,
+        };
+    }
+    let capture = execute_backend_action(backend, &ComputerAction::CaptureFull).await;
     let (screenshot, live_frame) = match capture {
         Ok(ComputerActionOutcome::Captured(capture_frame)) => {
             let dims = frame::FrameDimensions::from_capture(&capture_frame);
@@ -3190,6 +3888,7 @@ mod capture_containment_tests {
     use super::{
         CaptureRunner, CaptureTool, ComputerError, PixelRect, assert_owner_only_and_read,
         capture_contained, create_private_capture_file, ensure_owner_only_dir,
+        read_capture_bytes_bounded,
     };
     use std::cell::{Cell, RefCell};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -3433,6 +4132,52 @@ mod capture_containment_tests {
         assert!(matches!(err, ComputerError::CommandFailed { .. }));
     }
 
+    #[test]
+    fn computer_screenshot_capture_rejects_oversized_encoded_file_before_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shot.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::media_image::SCREENSHOT_MAX_ALLOC_BYTES + 1)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = assert_owner_only_and_read(&path).unwrap_err();
+        assert!(matches!(err, ComputerError::Refused(_)));
+    }
+
+    #[test]
+    fn computer_screenshot_capture_bounds_growth_beyond_metadata_size_during_read() {
+        struct MetadataUnderreportingReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+            bytes_read: usize,
+        }
+
+        impl std::io::Read for MetadataUnderreportingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = std::io::Read::read(&mut self.bytes, buf)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let advertised_metadata_len = 2_u64;
+        let max_bytes = 8_u64;
+        let mut reader = MetadataUnderreportingReader {
+            // Model a file that passed an earlier two-byte metadata check, then
+            // grew before/during the held-fd read.
+            bytes: std::io::Cursor::new(vec![0_u8; 32]),
+            bytes_read: 0,
+        };
+        assert!(advertised_metadata_len <= max_bytes);
+
+        let error = read_capture_bytes_bounded(&mut reader, max_bytes).unwrap_err();
+        assert!(matches!(error, ComputerError::Refused(_)));
+        assert_eq!(
+            reader.bytes_read, 9,
+            "the reader must stop at max + 1 bytes"
+        );
+    }
+
     /// A cleanup that cannot remove the plaintext artifact makes the whole
     /// capture fail closed — the bytes are NOT returned. Fails against a version
     /// that discards the cleanup error and returns the screenshot anyway.
@@ -3504,6 +4249,16 @@ mod tests {
             },
             scale_factor: ScaleFactor(2.0),
         }
+    }
+
+    fn normalized_effects(
+        actions: &[ComputerAction],
+        geometry: &DisplayGeometry,
+    ) -> Vec<NormalizedComputerEffect> {
+        actions
+            .iter()
+            .map(|action| normalize_action(action, geometry).unwrap().effect().clone())
+            .collect()
     }
 
     #[test]
@@ -3660,12 +4415,14 @@ mod tests {
                 text: "hello; rm -rf nope".to_string(),
             },
             ComputerAction::KeyChord {
-                chord: KeyChord {
-                    keys: vec!["Control".to_string(), "L".to_string()],
-                },
+                chord: CanonicalKeyChord::new(vec![
+                    KeyCode::parse("Control").unwrap(),
+                    KeyCode::parse("L").unwrap(),
+                ])
+                .unwrap(),
             },
             ComputerAction::HoldKey {
-                key: "Shift".to_string(),
+                key: KeyCode::parse("Shift").unwrap(),
                 duration: Duration::from_millis(1),
             },
             ComputerAction::Scroll {
@@ -3926,7 +4683,7 @@ mod tests {
             "modifiers": {"shift": true}
         }))
         .unwrap();
-        let backend_actions = parsed_click.to_backend_actions();
+        let backend_actions = parsed_click.to_backend_actions().unwrap();
         assert!(matches!(
             backend_actions[0],
             ComputerAction::MoveCursor {
@@ -3997,14 +4754,19 @@ mod tests {
         let proj_json = serde_json::to_string(sanitized).unwrap();
         assert!(!proj_json.contains("base64"));
         assert!(!proj_json.contains("data:image"));
+        let canonical = actions
+            .iter()
+            .map(OpenAiComputerAction::to_backend)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(
             backend.recorded[..3],
-            actions
-                .iter()
-                .map(OpenAiComputerAction::to_backend)
-                .collect::<Vec<_>>()
+            normalized_effects(&canonical, &backend.geometry)
         );
-        assert!(matches!(backend.recorded[3], ComputerAction::CaptureFull));
+        assert!(matches!(
+            backend.recorded[3],
+            NormalizedComputerEffect::CaptureFull
+        ));
         // The transient wire payload is built from the live frame via a scoped
         // borrow, not from a serializable field on the output.
         let transient = result.transient_wire().unwrap();
@@ -4057,18 +4819,14 @@ mod tests {
         assert_eq!(backend.recorded.len(), 3);
         assert!(matches!(
             backend.recorded[0],
-            ComputerAction::MoveCursor {
-                to: Point {
-                    x: 100.0,
-                    y: 200.0,
-                    space: CoordinateSpace::Physical,
-                },
+            NormalizedComputerEffect::MoveCursor {
+                to: PixelPoint { x: 100, y: 200 },
                 ..
             }
         ));
         assert!(matches!(
             backend.recorded[1],
-            ComputerAction::Click {
+            NormalizedComputerEffect::Click {
                 button: MouseButton::Left,
                 modifiers: Modifiers { shift: true, .. },
                 ..
@@ -4236,7 +4994,8 @@ mod tests {
                 ..Modifiers::default()
             },
         }
-        .to_backend();
+        .to_backend()
+        .unwrap();
         let ComputerAction::Drag {
             path, modifiers, ..
         } = action
@@ -4253,7 +5012,8 @@ mod tests {
             rect: provider_rect(CoordinateSpace::Physical),
             scale: ScaleFactor(2.0),
         }
-        .to_backend();
+        .to_backend()
+        .unwrap();
         assert!(matches!(
             anthropic,
             ComputerAction::CaptureNativeZoom {
@@ -4310,9 +5070,12 @@ mod tests {
     async fn computer_backend_action_matrix() {
         let actions = sample_actions();
         let mut backend = FakeBackend::new();
-        let report = backend.execute(&actions).await;
+        let report = execute_backend_batch(&mut backend, &actions).await;
 
-        assert_eq!(backend.recorded, actions);
+        assert_eq!(
+            backend.recorded,
+            normalized_effects(&actions, &backend.geometry)
+        );
         assert_eq!(report.failure, None);
         assert!(matches!(
             report.completed[0],
@@ -4352,9 +5115,12 @@ mod tests {
         let actions = sample_actions();
         let mut backend =
             FakeBackend::failing_at(3, ComputerError::Refused("blocked by policy".to_string()));
-        let report = backend.execute(&actions).await;
+        let report = execute_backend_batch(&mut backend, &actions).await;
 
-        assert_eq!(backend.recorded, actions[..=3]);
+        assert_eq!(
+            backend.recorded,
+            normalized_effects(&actions[..=3], &backend.geometry)
+        );
         assert_eq!(report.completed.len(), 3);
         assert_eq!(report.failure.as_ref().unwrap().index, 3);
         assert_eq!(backend.release_count, 0);
@@ -4399,12 +5165,14 @@ mod tests {
                 text: "Control+L is literal text".to_string(),
             },
             ComputerAction::KeyChord {
-                chord: KeyChord {
-                    keys: vec!["Control".to_string(), "L".to_string()],
-                },
+                chord: CanonicalKeyChord::new(vec![
+                    KeyCode::parse("Control").unwrap(),
+                    KeyCode::parse("L").unwrap(),
+                ])
+                .unwrap(),
             },
             ComputerAction::HoldKey {
-                key: "L".to_string(),
+                key: KeyCode::parse("L").unwrap(),
                 duration: Duration::from_millis(5),
             },
             ComputerAction::Click {
@@ -4417,22 +5185,323 @@ mod tests {
             },
         ];
         let mut backend = FakeBackend::new();
-        let report = backend.execute(&actions).await;
+        let report = execute_backend_batch(&mut backend, &actions).await;
 
         assert_eq!(report.failure, None);
         assert!(matches!(
             backend.recorded[0],
-            ComputerAction::TypeText { .. }
+            NormalizedComputerEffect::TypeText { .. }
         ));
         assert!(matches!(
             backend.recorded[1],
-            ComputerAction::KeyChord { .. }
+            NormalizedComputerEffect::KeyChord { .. }
         ));
         assert!(matches!(
             backend.recorded[2],
-            ComputerAction::HoldKey { .. }
+            NormalizedComputerEffect::HoldKey { .. }
         ));
-        assert!(matches!(backend.recorded[3], ComputerAction::Click { .. }));
+        assert!(matches!(
+            backend.recorded[3],
+            NormalizedComputerEffect::Click { .. }
+        ));
+    }
+
+    #[test]
+    fn provider_key_tokens_canonicalize_as_case_insensitive_identities() {
+        let anthropic_new = Anthropic20251124ComputerAction::KeyChord(KeyChord {
+            keys: vec!["Control".to_string(), "a".to_string()],
+        })
+        .to_backend()
+        .unwrap();
+        let anthropic_old = Anthropic20250124ComputerAction::HoldKey {
+            key: "A".to_string(),
+            duration: Duration::ZERO,
+        }
+        .to_backend()
+        .unwrap();
+        let openai = OpenAiComputerAction::KeyChord(KeyChord {
+            keys: vec!["A".to_string()],
+        })
+        .to_backend()
+        .unwrap();
+
+        let ComputerAction::KeyChord { chord } = anthropic_new else {
+            panic!("expected canonical chord");
+        };
+        assert_eq!(chord.keys[1].as_str(), "A");
+        let ComputerAction::HoldKey { key, .. } = anthropic_old else {
+            panic!("expected canonical held key");
+        };
+        assert_eq!(key.as_str(), "A");
+        let ComputerAction::KeyChord { chord } = openai else {
+            panic!("expected canonical chord");
+        };
+        assert_eq!(chord.keys[0].as_str(), "A");
+
+        for alias in ["META", "WIN", "SUPER", "LEFTMETA"] {
+            assert_eq!(KeyCode::parse(alias).unwrap().as_str(), "LEFTMETA");
+        }
+
+        assert!(
+            OpenAiComputerAction::KeyChord(KeyChord {
+                keys: vec!["!".to_string()],
+            })
+            .to_backend()
+            .is_err(),
+            "character production belongs to TypeText"
+        );
+    }
+
+    #[test]
+    fn every_accepted_key_identity_has_total_platform_translations() {
+        let mut accepted = (b'A'..=b'Z')
+            .map(|key| char::from(key).to_string())
+            .chain((b'0'..=b'9').map(|key| char::from(key).to_string()))
+            .chain((1..=12).map(|number| format!("F{number}")))
+            .collect::<Vec<_>>();
+        accepted.extend(
+            [
+                "SHIFT",
+                "CONTROL",
+                "LEFTCONTROL",
+                "RIGHTCONTROL",
+                "ALT",
+                "LEFTALT",
+                "RIGHTALT",
+                "LEFTMETA",
+                "RIGHTMETA",
+                "ENTER",
+                "TAB",
+                "ESCAPE",
+                "BACKSPACE",
+                "DELETE",
+                "INSERT",
+                "SPACE",
+                "ARROWUP",
+                "ARROWDOWN",
+                "ARROWLEFT",
+                "ARROWRIGHT",
+                "HOME",
+                "END",
+                "PAGEUP",
+                "PAGEDOWN",
+                "CAPSLOCK",
+                "NUMLOCK",
+                "SCROLLLOCK",
+                "PRINTSCREEN",
+                "PAUSE",
+                "APPS",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+
+        for identity in accepted {
+            let key = KeyCode::parse(&identity).unwrap();
+            let translated = NormalizedKeyCode::new(&key)
+                .unwrap_or_else(|error| panic!("{identity} failed translation: {error}"));
+            assert!(!translated.x11_name.is_empty(), "{identity}");
+            assert_ne!(translated.windows_virtual_key, 0, "{identity}");
+        }
+    }
+
+    #[test]
+    fn x11_named_key_spellings_are_not_uppercase_canonical_tokens() {
+        for (identity, x11) in [
+            ("TAB", "Tab"),
+            ("BACKSPACE", "BackSpace"),
+            ("DELETE", "Delete"),
+            ("INSERT", "Insert"),
+            ("HOME", "Home"),
+            ("END", "End"),
+            ("PAUSE", "Pause"),
+            ("APPS", "Menu"),
+        ] {
+            let translated = NormalizedKeyCode::new(&KeyCode::parse(identity).unwrap()).unwrap();
+            assert_eq!(translated.x11_name, x11, "{identity}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_normalizes_whole_batch_before_any_effect() {
+        let mut backend = FakeBackend::new();
+        let actions = vec![
+            ComputerAction::Click {
+                button: MouseButton::Left,
+                count: ClickCount::Single,
+                modifiers: Modifiers::default(),
+            },
+            ComputerAction::MoveCursor {
+                // In-range before rounding, out-of-range after rounding.
+                to: Point {
+                    x: 1279.6,
+                    y: 10.0,
+                    space: CoordinateSpace::Physical,
+                },
+                duration: Duration::ZERO,
+                easing: Easing::Linear,
+            },
+        ];
+
+        let report = execute_backend_batch(&mut backend, &actions).await;
+        assert_eq!(report.failure.unwrap().index, 1);
+        assert!(backend.recorded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_rejects_empty_canonical_chord_before_any_effect() {
+        let mut backend = FakeBackend::new();
+        let actions = [
+            ComputerAction::Click {
+                button: MouseButton::Left,
+                count: ClickCount::Single,
+                modifiers: Modifiers::default(),
+            },
+            // Exercise the mandatory normalization defense. Public callers
+            // cannot construct this state because `keys` is private.
+            ComputerAction::KeyChord {
+                chord: CanonicalKeyChord { keys: Vec::new() },
+            },
+        ];
+
+        let report = execute_backend_batch(&mut backend, &actions).await;
+        assert_eq!(report.failure.unwrap().index, 1);
+        assert!(backend.recorded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_pretranslates_every_key_before_any_effect() {
+        let mut backend = FakeBackend::new();
+        let actions = [
+            ComputerAction::Click {
+                button: MouseButton::Left,
+                count: ClickCount::Single,
+                modifiers: Modifiers::default(),
+            },
+            ComputerAction::HoldKey {
+                // Exercise the normalization defense against a future internal
+                // constructor that bypasses KeyCode::parse.
+                key: KeyCode("NOT_A_PLATFORM_KEY".to_string()),
+                duration: Duration::ZERO,
+            },
+        ];
+
+        let report = execute_backend_batch(&mut backend, &actions).await;
+        assert_eq!(report.failure.unwrap().index, 1);
+        assert!(backend.recorded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_zoom_output_dimensions_are_checked_before_capture() {
+        let mut backend = FakeBackend::new();
+        let report = execute_backend_batch(
+            &mut backend,
+            &[ComputerAction::CaptureNativeZoom {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1280.0,
+                    height: 720.0,
+                    space: CoordinateSpace::Physical,
+                },
+                scale: ScaleFactor(f64::from(u32::MAX)),
+            }],
+        )
+        .await;
+
+        assert!(report.failure.is_some());
+        assert!(backend.recorded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_zoom_rejects_valid_dimensions_with_catastrophic_allocation() {
+        let mut backend = FakeBackend::new();
+        let report = execute_backend_batch(
+            &mut backend,
+            &[ComputerAction::CaptureNativeZoom {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1280.0,
+                    height: 720.0,
+                    space: CoordinateSpace::Physical,
+                },
+                // Both scaled edges fit in u32, but the RGBA output would
+                // require multiple terabytes.
+                scale: ScaleFactor(1_000.0),
+            }],
+        )
+        .await;
+
+        assert_eq!(report.failure.unwrap().index, 0);
+        assert!(backend.recorded.is_empty());
+    }
+
+    fn huge_capture_backend() -> FakeBackend {
+        let mut backend = FakeBackend::new();
+        backend.geometry = DisplayGeometry {
+            physical: PixelSize {
+                width: 20_000,
+                height: 10_000,
+            },
+            logical: LogicalSize {
+                width: 20_000.0,
+                height: 10_000.0,
+            },
+            scale_factor: ScaleFactor(1.0),
+        };
+        backend
+    }
+
+    #[tokio::test]
+    async fn native_zoom_source_allocation_is_checked_before_downscale_or_effects() {
+        let mut backend = huge_capture_backend();
+        let report = execute_backend_batch(
+            &mut backend,
+            &[
+                ComputerAction::Click {
+                    button: MouseButton::Left,
+                    count: ClickCount::Single,
+                    modifiers: Modifiers::default(),
+                },
+                ComputerAction::CaptureNativeZoom {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 20_000.0,
+                        height: 10_000.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                    // The small output is safe; the 800 MB RGBA source is not.
+                    scale: ScaleFactor(0.1),
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(report.failure.unwrap().index, 1);
+        assert!(backend.recorded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_and_region_capture_source_allocations_share_the_same_ceiling() {
+        for action in [
+            ComputerAction::CaptureFull,
+            ComputerAction::CaptureRegion {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 20_000.0,
+                    height: 10_000.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+        ] {
+            let mut backend = huge_capture_backend();
+            let report = execute_backend_batch(&mut backend, &[action]).await;
+            assert_eq!(report.failure.unwrap().index, 0);
+            assert!(backend.recorded.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -4442,17 +5511,17 @@ mod tests {
                 button: MouseButton::Left,
             },
             ComputerAction::HoldKey {
-                key: "Shift".to_string(),
+                key: KeyCode::parse("Shift").unwrap(),
                 duration: Duration::from_millis(1),
             },
         ];
         let mut ok = FakeBackend::new();
-        let ok_report = ok.execute(&actions).await;
+        let ok_report = execute_backend_batch(&mut ok, &actions).await;
         assert_eq!(ok_report.failure, None);
         assert_eq!(ok.release_count, 0);
 
         let mut fail = FakeBackend::failing_at(1, ComputerError::Cancelled);
-        let fail_report = fail.execute(&actions).await;
+        let fail_report = execute_backend_batch(&mut fail, &actions).await;
         assert_eq!(fail_report.failure.unwrap().error, ComputerError::Cancelled);
         assert_eq!(fail.release_count, 0);
     }
@@ -4534,8 +5603,7 @@ mod tests {
             Ok(mut backend) => {
                 let geometry = backend.geometry().await.unwrap();
                 assert!(geometry.physical.width > 0);
-                let capture = backend
-                    .execute_one(&ComputerAction::CaptureFull)
+                let capture = execute_backend_action(&mut backend, &ComputerAction::CaptureFull)
                     .await
                     .unwrap();
                 let ComputerActionOutcome::Captured(frame) = capture else {

@@ -40,6 +40,11 @@ pub struct ImageProfile {
     pub jpeg_quality: u8,
 }
 
+/// Maximum single RGBA allocation accepted by screenshot decode and resize
+/// paths. Keep native computer zoom preflight on the same resource boundary as
+/// the image pipeline that performs the allocation.
+pub const SCREENSHOT_MAX_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+
 impl ImageProfile {
     /// Read-image tool: 64 MiB in/out, Default/Adaptive PNG, Lanczos3 scale.
     pub fn read_image() -> Self {
@@ -84,7 +89,7 @@ impl ImageProfile {
             max_width: None,
             max_height: None,
             max_pixels: None,
-            max_alloc: Some(512 * 1024 * 1024),
+            max_alloc: Some(SCREENSHOT_MAX_ALLOC_BYTES),
             png_compression: CompressionType::Default,
             png_filter: FilterType::Adaptive,
             resize_filter: ResizeFilter::Nearest,
@@ -109,6 +114,23 @@ impl ImageProfile {
             jpeg_quality: 90,
         }
     }
+}
+
+/// Check the allocation required for an RGBA8 image before an image operation
+/// is allowed to allocate it.
+pub fn checked_rgba_allocation_bytes(
+    width: u32,
+    height: u32,
+    profile: &ImageProfile,
+) -> Result<usize> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow!("resource_limit"))?;
+    if profile.max_alloc.is_some_and(|limit| bytes > limit) {
+        bail!("resource_limit");
+    }
+    usize::try_from(bytes).map_err(|_| anyhow!("resource_limit"))
 }
 
 pub fn browser_thumbnail(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {

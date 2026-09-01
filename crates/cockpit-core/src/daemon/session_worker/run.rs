@@ -3195,6 +3195,18 @@ pub(super) fn tool_surface_override_control(
     }
 }
 
+pub(super) fn validate_tool_surface_override_control(
+    selection: crate::agents::ToolSurfaceSelection,
+    cache_break_acknowledged: bool,
+    respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+) -> crate::engine::driver::DriverControl {
+    crate::engine::driver::DriverControl::ValidateToolSurfaceOverride {
+        selection,
+        cache_break_acknowledged,
+        respond_to,
+    }
+}
+
 pub(super) fn stored_tool_surface_override(
     session: &Session,
 ) -> Option<crate::agents::ToolSurfaceSelection> {
@@ -13093,6 +13105,45 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     };
+                    // Validate on the live driver before changing the durable
+                    // row, but do not install yet. A failed persistence then
+                    // leaves both the driver and session snapshot untouched.
+                    let (validation_respond_to, validation_result) =
+                        tokio::sync::oneshot::channel();
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        validate_tool_surface_override_control(
+                            selection.clone(),
+                            cache_break_acknowledged,
+                            validation_respond_to,
+                        ),
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to
+                            .send(Err("driver stopped before tool update validation".into()));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let validated = validation_result
+                        .await
+                        .unwrap_or_else(|_| Err("driver dropped tool update validation".into()));
+                    if let Err(error) = validated {
+                        let _ = respond_to.send(Err(error));
+                        continue;
+                    }
+                    if persist_session
+                        && let Err(error) =
+                            session.set_tool_surface_override_json(Some(override_json.clone()))
+                    {
+                        let message = format!("could not persist session override: {error:#}");
+                        let _ = respond_to.send(Err(message));
+                        continue;
+                    }
                     let (driver_respond_to, driver_result) = tokio::sync::oneshot::channel();
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
@@ -13117,20 +13168,25 @@ pub(super) async fn run_worker(
                         .await
                         .unwrap_or_else(|_| Err("driver dropped tool update result".into()));
                     if let Err(error) = applied {
+                        if persist_session {
+                            // Validation and apply use the same construction
+                            // path. If an unexpected post-persistence failure
+                            // still occurs, close for recovery rather than
+                            // report an error while durable and live state
+                            // disagree.
+                            tracing::warn!(
+                                %error,
+                                session_id = %session_id,
+                                "durably persisted tool surface could not be installed live; closing worker for recovery"
+                            );
+                            let _ = respond_to.send(Ok(()));
+                            break WorkerStop::Shutdown {
+                                pause_for_resume: true,
+                                active: false,
+                                pending_tool_count: 0,
+                            };
+                        }
                         let _ = respond_to.send(Err(error));
-                        continue;
-                    }
-                    // Persist only after the driver accepted the transition.
-                    // Persisting first leaves a crash window where an
-                    // unacknowledged native-schema change is replayed during
-                    // startup without ever crossing the driver's cache-break
-                    // gate.
-                    if persist_session
-                        && let Err(error) =
-                            session.set_tool_surface_override_json(Some(override_json))
-                    {
-                        let message = format!("could not persist session override: {error:#}");
-                        let _ = respond_to.send(Err(message));
                         continue;
                     }
                     let _ = respond_to.send(Ok(()));

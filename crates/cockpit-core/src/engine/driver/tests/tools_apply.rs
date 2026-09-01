@@ -43,6 +43,47 @@ fn native_tool_surface_change_checks_reentry_fence_before_installing_surface() {
 }
 
 #[tokio::test]
+async fn tool_surface_validation_does_not_mutate_live_state() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    install_pinned_build_definition(&mut driver);
+    driver.stack[0].history = dup_read_history_big();
+    let before = driver.stack[0].agent.clone();
+    let mut base = crate::agents::embedded_default("Build").unwrap();
+    let mut tools = base.tools.take().unwrap();
+    tools.retain(|tool| tool != "read");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let (respond_to, result) = tokio::sync::oneshot::channel();
+
+    driver
+        .run_control(
+            DriverControl::ValidateToolSurfaceOverride {
+                selection: crate::agents::ToolSurfaceSelection {
+                    tools,
+                    tool_tiers: base.tool_tiers,
+                },
+                cache_break_acknowledged: true,
+                respond_to,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(result.await.unwrap(), Ok(()));
+    assert!(
+        Arc::ptr_eq(&driver.stack[0].agent, &before),
+        "pre-persistence validation must not install a live-only tool surface"
+    );
+    assert!(
+        !prune::dedup_plan(&driver.stack[0].history).is_empty(),
+        "pre-persistence validation must not prune cached history"
+    );
+    assert!(
+        drain_ready(&mut rx).is_empty(),
+        "pre-persistence validation must not emit an applied transition"
+    );
+}
+
+#[tokio::test]
 async fn tools_apply_rebuilds_root_and_prunes() {
     let (mut driver, tmp) = test_driver_without_network(1);
     install_pinned_build_definition(&mut driver);

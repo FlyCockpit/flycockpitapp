@@ -5657,16 +5657,30 @@ pub(crate) mod tests {
         let args = test_spawn_args(tmp.path());
         for &name in crate::agents::BUILTIN_AGENT_NAMES {
             let agent = load(name, &args).unwrap();
-            let inline_code_tokens: std::collections::BTreeSet<&str> =
-                agent.role_prompt.split('`').skip(1).step_by(2).collect();
             for tool in agent.tools.discoverable_mcp_tool_names() {
                 assert!(
-                    !inline_code_tokens.contains(&tool.as_str()),
+                    !prompt_contains_tool_identifier(&agent.role_prompt, &tool),
                     "canonical `{name}` prompt enumerates discoverable tool `{tool}`: {}",
                     agent.role_prompt
                 );
             }
         }
+    }
+
+    /// Tool names are identifier-shaped. Matching a complete identifier catches
+    /// plain prose, list entries, quoted names, and invocation examples without
+    /// treating an unrelated longer word (such as `codebase`) as a tool name.
+    fn prompt_contains_tool_identifier(prompt: &str, tool: &str) -> bool {
+        prompt.match_indices(tool).any(|(offset, _)| {
+            let before = prompt[..offset].chars().next_back();
+            let after = prompt[offset + tool.len()..].chars().next();
+            !before.is_some_and(is_tool_identifier_char)
+                && !after.is_some_and(is_tool_identifier_char)
+        })
+    }
+
+    fn is_tool_identifier_char(character: char) -> bool {
+        character.is_ascii_alphanumeric() || character == '_'
     }
 
     #[test]

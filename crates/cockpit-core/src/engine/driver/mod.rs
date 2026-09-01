@@ -256,6 +256,15 @@ pub enum DriverControl {
         monty_nudge: Option<String>,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
+    /// Verify that a tool-surface change can be installed without changing
+    /// the live driver. The session worker uses this before persisting the
+    /// replacement, so a failed durable write cannot leave a live-only tool
+    /// surface behind.
+    ValidateToolSurfaceOverride {
+        selection: crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Swap the session's redaction table live (`/toggle-redaction`). The
     /// session worker rebuilds the table from the in-memory effective
     /// `RedactConfig` and hands it here; the driver replaces `self.redact`
@@ -6416,6 +6425,16 @@ impl Driver {
                     .await;
                 let _ = respond_to.send(result);
             }
+            DriverControl::ValidateToolSurfaceOverride {
+                selection,
+                cache_break_acknowledged,
+                respond_to,
+            } => {
+                let result = self
+                    .validate_tool_surface_override(selection, cache_break_acknowledged, tx)
+                    .await;
+                let _ = respond_to.send(result);
+            }
             DriverControl::SetRedaction {
                 table,
                 scan_environment,
@@ -9690,16 +9709,51 @@ impl Driver {
         monty_nudge: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> std::result::Result<(), String> {
+        let updated = self.prepare_tool_surface_override(&selection, cache_break_acknowledged);
+        match updated {
+            Ok((updated, native_schema_changed)) => {
+                self.stack[0].agent = Arc::new(updated);
+                self.schedule.set_agent(self.stack[0].agent.clone());
+                if let Some(note) = monty_nudge {
+                    self.pending_monty_tool_nudge = Some(note);
+                }
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: "Tool surface updated for this session.".to_string(),
+                    })
+                    .await;
+                self.emit_context_projection(tx).await;
+                if native_schema_changed {
+                    self.do_prune(false, tx).await;
+                }
+                Ok(())
+            }
+            Err(error) => self.reject_tool_surface_override(error, tx).await,
+        }
+    }
+
+    /// Prove a prospective tool-surface transition can settle before the
+    /// worker changes durable session state. This intentionally shares the
+    /// exact construction and cache-break checks used by the committing path.
+    async fn validate_tool_surface_override(
+        &self,
+        selection: crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(), String> {
+        match self.prepare_tool_surface_override(&selection, cache_break_acknowledged) {
+            Ok(_) => Ok(()),
+            Err(error) => self.reject_tool_surface_override(error, tx).await,
+        }
+    }
+
+    fn prepare_tool_surface_override(
+        &self,
+        selection: &crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+    ) -> Result<(Agent, bool)> {
         if self.stack.len() != 1 {
-            tracing::warn!(
-                "tool surface override ignored: an interactive subagent holds the foreground"
-            );
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: "Tool surface changes were refused because an interactive subagent holds the foreground.".to_string(),
-                })
-                .await;
-            return Err("an interactive subagent holds the foreground".to_string());
+            anyhow::bail!("an interactive subagent holds the foreground");
         }
         let current = self.stack[0].agent.clone();
         let mut args = self.spawn_args(true);
@@ -9707,12 +9761,12 @@ impl Driver {
         args.model_override = Some(current.model.clone());
         args.params = current.params.clone();
         args.vnext_grant = current.vnext_grant.clone();
-        let updated = (|| -> Result<(Agent, bool)> {
+        (|| -> Result<(Agent, bool)> {
             let mut def =
                 current.definition.as_deref().cloned().ok_or_else(|| {
                     anyhow::anyhow!("running frame has no pinned agent definition")
                 })?;
-            crate::agents::apply_tool_surface_override(&mut def, &selection)?;
+            crate::agents::apply_tool_surface_override(&mut def, selection)?;
             let mut rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
             let native_schema_changed = !rebuilt
                 .tools
@@ -9746,38 +9800,26 @@ impl Driver {
             updated.tools = rebuilt.tools;
             updated.definition = rebuilt.definition;
             Ok((updated, native_schema_changed))
-        })();
-        match updated {
-            Ok((updated, native_schema_changed)) => {
-                self.stack[0].agent = Arc::new(updated);
-                self.schedule.set_agent(self.stack[0].agent.clone());
-                if let Some(note) = monty_nudge {
-                    self.pending_monty_tool_nudge = Some(note);
-                }
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: "Tool surface updated for this session.".to_string(),
-                    })
-                    .await;
-                self.emit_context_projection(tx).await;
-                if native_schema_changed {
-                    self.do_prune(false, tx).await;
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let message = format!("{e:#}");
-                tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: format!(
-                            "Tool surface update failed — {e:#}. Keeping the current tool surface active."
-                        ),
-                    })
-                    .await;
-                Err(message)
-            }
-        }
+        })()
+    }
+
+    async fn reject_tool_surface_override(
+        &self,
+        error: anyhow::Error,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(), String> {
+        let message = format!("{error:#}");
+        tracing::warn!(error = %error, "tool surface override failed to rebuild agent");
+        let text = if self.stack.len() != 1 {
+            "Tool surface changes were refused because an interactive subagent holds the foreground."
+                .to_string()
+        } else {
+            format!(
+                "Tool surface update failed — {error:#}. Keeping the current tool surface active."
+            )
+        };
+        let _ = tx.send(TurnEvent::Notice { text }).await;
+        Err(message)
     }
 
     /// Decide the cache-aware reuse-vs-fresh path for a re-queried subagent

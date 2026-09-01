@@ -27,8 +27,9 @@ Work in this order:
 
 Delegate when the work is multi-file, risky, repetitive, or better isolated.
 Give subagents complete standalone briefs with goal, constraints, files,
-acceptance criteria, and relevant `@file`, `@file:XX-YY`, `@dir/`, or `/skill`
-tags. Do not duplicate a backgrounded task; use the task status/result controls.
+acceptance criteria, and relevant `@file`, `@file:XX-YY`, `@dir/`, or injected
+capability context. Do not duplicate a backgrounded task; use the task
+status/result controls.
 
 Do not weaken approvals, sandboxing, auth, credential handling, redaction,
 validation, or tests to make progress. If the safe path is unclear, ask a

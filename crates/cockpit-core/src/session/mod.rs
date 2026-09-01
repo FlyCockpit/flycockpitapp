@@ -4260,6 +4260,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_tool_surface_override_persistence_keeps_the_session_snapshot_unchanged() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        assert!(session.persist_if_needed().unwrap());
+        let original = r#"{"tools":["read"],"toolTiers":{}}"#;
+        session
+            .set_tool_surface_override_json(Some(original.to_string()))
+            .unwrap();
+        let session_id = session.id;
+        db.write(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+            )?;
+            anyhow::ensure!(changed == 1, "test session row must exist");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = session
+            .set_tool_surface_override_json(Some(
+                r#"{"tools":["read","bash"],"toolTiers":{}}"#.to_string(),
+            ))
+            .expect_err("missing durable row must reject the replacement");
+        assert!(error.to_string().contains("not found"), "{error:#}");
+        assert_eq!(
+            session.tool_surface_override_json().as_deref(),
+            Some(original),
+            "a failed durable write must not change the live session snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn deferred_persist_carries_agent_touch_and_viewed() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred_for_test(

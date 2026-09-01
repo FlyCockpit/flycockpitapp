@@ -1056,6 +1056,7 @@ impl RedactionTable {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<Vec<_>>();
         entries.extend(store.provider_credential_entries());
+        entries.extend(store.provider_auth_command_entries());
         Self::build_with_env_and_secrets(cfg, cwd, env, entries)
     }
 

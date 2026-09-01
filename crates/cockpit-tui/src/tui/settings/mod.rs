@@ -3088,6 +3088,10 @@ pub struct SettingsCx {
     /// Malformed known extended-config fields reported by the daemon during
     /// the most recent authoritative load.
     pub(super) extended_warnings: Vec<String>,
+    /// Stable provider-layer enforcement warnings returned by the daemon's
+    /// redacted catalog snapshot. Kept separate from extended warnings so a
+    /// concurrent extended-config reload cannot erase a provider warning.
+    pub(super) provider_warnings: Vec<String>,
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
     pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
@@ -4203,6 +4207,7 @@ impl SettingsCx {
                         parsed.set_resolution_generation(config_generation);
                         self.config = parsed.clone();
                         self.original_config = parsed;
+                        self.provider_warnings = config.configuration_warnings.clone();
                         self.provider_edit_authority = Some(ProviderEditAuthority {
                             snapshot_session_id,
                             layer_id,
@@ -7221,6 +7226,7 @@ impl SettingsDialog {
                 completed_extended_save_rejections: BTreeMap::new(),
                 completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,
+                provider_warnings: Vec::new(),
                 mcp_config,
                 mcp_shadow_warnings: Vec::new(),
                 mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),
@@ -7318,7 +7324,7 @@ impl SettingsDialog {
     fn enter_providers(&mut self) {
         self.page = providers_page(ProvidersPage::List {
             cursor: providers::initial_list_cursor(&self.config),
-            status: None,
+            status: self.provider_warnings.first().cloned(),
             delete_pending: false,
         });
     }
@@ -8197,7 +8203,7 @@ impl SettingsPage for RootPage {
                     })),
                     PROVIDERS_TITLE => Some(providers_page(ProvidersPage::List {
                         cursor: providers::initial_list_cursor(&cx.config),
-                        status: None,
+                        status: cx.provider_warnings.first().cloned(),
                         delete_pending: false,
                     })),
                     "Dependencies" => {

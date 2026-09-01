@@ -214,8 +214,8 @@ pub async fn resolve_provider_request_async_with_store(
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match entry.auth_command.as_deref() {
-        Some(command) => Some(
-            crate::auth::command::resolve(provider_id, command, store.clone(), &env_lookup, false)
+        Some(_) => Some(
+            crate::auth::command::resolve(provider_id, entry, store.clone(), &env_lookup, false)
                 .await?,
         ),
         None => None,
@@ -262,10 +262,10 @@ async fn resolve_model_list_request_async_with_store(
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
-        (Some(command), Some(store)) => Some(
+        (Some(_), Some(store)) => Some(
             crate::auth::command::resolve(
                 provider_id,
-                command,
+                entry,
                 store.clone(),
                 &|name| std::env::var(name).ok(),
                 false,
@@ -857,11 +857,11 @@ pub async fn fetch_models_for_provider_with_store(
     if outcome
         .as_ref()
         .is_err_and(|error| auth_rejection_error(error))
-        && let (Some(command), Some(store)) = (entry.auth_command.as_deref(), auth_store)
+        && let (Some(_), Some(store)) = (entry.auth_command.as_deref(), auth_store)
     {
         let credential = crate::auth::command::resolve(
             provider_id,
-            command,
+            entry,
             store.clone(),
             &|name| std::env::var(name).ok(),
             true,

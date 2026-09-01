@@ -16801,6 +16801,17 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
+            if entry.auth_command.is_some()
+                && !is_local_owner_action(
+                    state,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                )
+            {
+                return Err(bad_request(
+                    "provider auth_command may only be configured by the local host owner",
+                ));
+            }
             #[cfg(feature = "remote")]
             let request = Request::UpsertProviderConfig {
                 project_root: project_root.clone(),
@@ -16834,6 +16845,17 @@ async fn handle_serialized_request_impl(
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            if entry.auth_command.is_some()
+                && !is_local_owner_action(
+                    state,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                )
+            {
+                return Err(bad_request(
+                    "provider auth_command may only be configured by the local host owner",
                 ));
             }
             #[cfg(feature = "remote")]
@@ -19761,6 +19783,25 @@ async fn daemon_provider_config(
     ),
     ErrorPayload,
 > {
+    daemon_provider_config_with_warnings(ctx, project_root)
+        .await
+        .map(|(cwd, policy, config, _)| (cwd, policy, config))
+}
+
+/// Same authoritative load as [`daemon_provider_config`], retaining the
+/// stable provider-layer warnings for a client-facing catalog snapshot.
+async fn daemon_provider_config_with_warnings(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> std::result::Result<
+    (
+        std::path::PathBuf,
+        crate::config::trust::WorkspaceTrustPolicy,
+        crate::config::providers::ProvidersConfig,
+        Vec<String>,
+    ),
+    ErrorPayload,
+> {
     let cwd = std::path::PathBuf::from(project_root);
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
@@ -19768,11 +19809,11 @@ async fn daemon_provider_config(
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
-    let (config, _) = ctx
+    let (config, _, warnings) = ctx
         .config_source()
-        .load_effective_for_daemon(&cwd, &trust_policy)
+        .load_effective_for_daemon_with_provider_warnings(&cwd, &trust_policy)
         .map_err(daemon_config_error)?;
-    Ok((cwd, trust_policy, config))
+    Ok((cwd, trust_policy, config, warnings))
 }
 
 /// Use the attached session's authenticated RefreshEnv overlay when one is
@@ -19805,7 +19846,8 @@ async fn provider_catalog_snapshot(
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
-    let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    let (cwd, trust_policy, mut config, provider_warnings) =
+        daemon_provider_config_with_warnings(ctx, project_root).await?;
     // The CAS covers the complete effective provider projection even when the
     // caller asks to render only one row. A sibling provider edit therefore
     // invalidates this capability instead of being overwritten by a partial
@@ -19927,6 +19969,7 @@ async fn provider_catalog_snapshot(
         false
     };
     let mut view = crate::secret_ref::redact_provider_view(&config);
+    view.configuration_warnings = provider_warnings;
     if minted_edit_capability {
         view.mcp_scope_revisions = mcp_scope_revisions;
     }

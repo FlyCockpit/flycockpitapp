@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::credentials::CredentialStore;
 use crate::secret_command::{CommandSecretExecutor, SubprocessCommandExecutor};
@@ -51,6 +52,17 @@ pub(crate) struct CommandCredential {
     pub headers: Option<BTreeMap<String, String>>,
 }
 
+/// The persisted command result is bound to the fully resolved argv and the
+/// complete provider configuration that will use it. Storing only the digest
+/// avoids putting resolved `$secret:`/environment values in the credential
+/// record.
+#[derive(Clone, Deserialize, Serialize)]
+struct CachedCommandCredential {
+    configuration_identity: String,
+    refresh_generation: u64,
+    credential: CommandCredential,
+}
+
 impl CommandCredential {
     fn is_expired(&self, now: i64) -> bool {
         self.expires_at.is_some_and(|expires_at| expires_at <= now)
@@ -84,14 +96,21 @@ impl std::fmt::Debug for CommandCredential {
 
 pub(crate) async fn resolve(
     provider_id: &str,
-    command: &[String],
+    entry: &cockpit_config::config::providers::ProviderEntry,
     store: CredentialStore,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     force_refresh: bool,
 ) -> Result<CommandCredential> {
-    resolve_with_executor(
+    let command = entry
+        .auth_command
+        .as_deref()
+        .context("provider has no auth_command")?;
+    let provider_configuration =
+        serde_json::to_vec(entry).context("serializing provider auth-command configuration")?;
+    resolve_with_executor_for_configuration(
         provider_id,
         command,
+        &provider_configuration,
         store,
         env_lookup,
         force_refresh,
@@ -100,24 +119,51 @@ pub(crate) async fn resolve(
     .await
 }
 
+#[cfg(test)]
 async fn resolve_with_executor(
     provider_id: &str,
     command: &[String],
+    provider_url: &str,
+    store: CredentialStore,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    force_refresh: bool,
+    executor: Arc<dyn CommandSecretExecutor>,
+) -> Result<CommandCredential> {
+    resolve_with_executor_for_configuration(
+        provider_id,
+        command,
+        provider_url.as_bytes(),
+        store,
+        env_lookup,
+        force_refresh,
+        executor,
+    )
+    .await
+}
+
+async fn resolve_with_executor_for_configuration(
+    provider_id: &str,
+    command: &[String],
+    provider_configuration: &[u8],
     store: CredentialStore,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     force_refresh: bool,
     executor: Arc<dyn CommandSecretExecutor>,
 ) -> Result<CommandCredential> {
     let argv = resolve_argv(command, &store, env_lookup)?;
+    let configuration_identity = configuration_identity(&argv, provider_configuration);
     let key = provider_id.to_string();
-    let prior_token = load_cached(&store, &key)?.map(|credential| credential.token);
+    let prior_refresh_generation = load_cached(&store, &key, &configuration_identity)?
+        .map(|credential| credential.refresh_generation);
     crate::auth::refresh_guard::serialized_refresh(&key, move || async move {
         let current = store.reopen()?;
-        if let Some(credential) = load_cached(&current, &key)? {
+        if let Some(cached) = load_cached(&current, &key, &configuration_identity)? {
             let another_waiter_refreshed =
-                force_refresh && prior_token.as_deref() != Some(credential.token.as_str());
-            if another_waiter_refreshed || (!force_refresh && !credential.is_expired(unix_now())) {
-                return Ok(credential);
+                force_refresh && prior_refresh_generation != Some(cached.refresh_generation);
+            if another_waiter_refreshed
+                || (!force_refresh && !cached.credential.is_expired(unix_now()))
+            {
+                return Ok(cached.credential);
             }
         }
 
@@ -128,20 +174,45 @@ async fn resolve_with_executor(
         let credential: CommandCredential =
             serde_json::from_str(&stdout).context("auth command returned malformed JSON")?;
         credential.validate()?;
-        current.save_record_merged(&key, serde_json::json!({ "auth_command": &credential }))?;
+        let refresh_generation = load_cached(&current, &key, &configuration_identity)?
+            .map_or(1, |cached| cached.refresh_generation.saturating_add(1));
+        let cached = CachedCommandCredential {
+            configuration_identity,
+            refresh_generation,
+            credential: credential.clone(),
+        };
+        current.save_record_merged(&key, serde_json::json!({ "auth_command": cached }))?;
         Ok(credential)
     })
     .await
 }
 
-fn load_cached(store: &CredentialStore, provider_id: &str) -> Result<Option<CommandCredential>> {
+fn load_cached(
+    store: &CredentialStore,
+    provider_id: &str,
+    configuration_identity: &str,
+) -> Result<Option<CachedCommandCredential>> {
     store
         .get(provider_id)
         .and_then(|record| record.get("auth_command"))
         .cloned()
-        .map(serde_json::from_value)
+        .map(serde_json::from_value::<CachedCommandCredential>)
         .transpose()
         .context("cached auth-command credential is malformed")
+        .map(|cached| {
+            cached.filter(|cached| cached.configuration_identity == configuration_identity)
+        })
+}
+
+fn configuration_identity(argv: &[String], provider_configuration: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((provider_configuration.len() as u64).to_be_bytes());
+    hasher.update(provider_configuration);
+    for part in argv {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn resolve_argv(
@@ -226,6 +297,17 @@ mod tests {
         (temp, store)
     }
 
+    fn cached(token: &str, expires_at: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "configuration_identity": configuration_identity(
+                &["auth-helper".to_string()],
+                b"https://example.test/v1",
+            ),
+            "refresh_generation": 1,
+            "credential": { "token": token, "expires_at": expires_at, "headers": null }
+        })
+    }
+
     #[tokio::test]
     async fn valid_json_is_cached_under_provider_record() {
         let (_temp, store) = store();
@@ -235,6 +317,7 @@ mod tests {
         let credential = resolve_with_executor(
             "custom",
             &["auth-helper".into()],
+            "https://example.test/v1",
             store.clone(),
             &|_| None,
             false,
@@ -245,7 +328,7 @@ mod tests {
 
         assert_eq!(credential.token, "fresh-token");
         assert_eq!(
-            store.reopen().unwrap().get("custom").unwrap()["auth_command"]["token"],
+            store.reopen().unwrap().get("custom").unwrap()["auth_command"]["credential"]["token"],
             "fresh-token"
         );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
@@ -258,6 +341,7 @@ mod tests {
         let error = resolve_with_executor(
             "malformed",
             &["auth-helper".into()],
+            "https://example.test/v1",
             store.clone(),
             &|_| None,
             false,
@@ -274,6 +358,7 @@ mod tests {
         let error = resolve_with_executor(
             "failed",
             &["auth-helper".into()],
+            "https://example.test/v1",
             store,
             &|_| None,
             false,
@@ -290,7 +375,7 @@ mod tests {
         store.set(
             "custom",
             serde_json::json!({
-                "auth_command": { "token": "expired", "expires_at": 1, "headers": null }
+                "auth_command": cached("expired", Some(1))
             }),
         );
         store.save().unwrap();
@@ -306,6 +391,7 @@ mod tests {
                 resolve_with_executor(
                     "custom",
                     &["auth-helper".into()],
+                    "https://example.test/v1",
                     store,
                     &|_| None,
                     false,
@@ -327,12 +413,12 @@ mod tests {
         store.set(
             "custom-401",
             serde_json::json!({
-                "auth_command": { "token": "rejected", "expires_at": null, "headers": null }
+                "auth_command": cached("rejected", None)
             }),
         );
         store.save().unwrap();
         let executor = FakeExecutor::new([Ok(
-            r#"{"token":"after-401","expires_at":null,"headers":null}"#.into(),
+            r#"{"token":"rejected","expires_at":null,"headers":null}"#.into(),
         )]);
 
         let run = || {
@@ -342,6 +428,7 @@ mod tests {
                 resolve_with_executor(
                     "custom-401",
                     &["auth-helper".into()],
+                    "https://example.test/v1",
                     store,
                     &|_| None,
                     true,
@@ -352,8 +439,43 @@ mod tests {
         };
         let (first, second) = tokio::join!(run(), run());
 
-        assert_eq!(first.unwrap().token, "after-401");
-        assert_eq!(second.unwrap().token, "after-401");
+        assert_eq!(first.unwrap().token, "rejected");
+        assert_eq!(second.unwrap().token, "rejected");
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_is_not_reused_after_command_destination_changes() {
+        let (_temp, store) = store();
+        let executor = FakeExecutor::new([
+            Ok(r#"{"token":"first","expires_at":null,"headers":null}"#.into()),
+            Ok(r#"{"token":"second","expires_at":null,"headers":null}"#.into()),
+        ]);
+
+        resolve_with_executor(
+            "custom",
+            &["auth-helper".into()],
+            "https://first.example/v1",
+            store.clone(),
+            &|_| None,
+            false,
+            executor.clone(),
+        )
+        .await
+        .unwrap();
+        let credential = resolve_with_executor(
+            "custom",
+            &["auth-helper".into()],
+            "https://second.example/v1",
+            store,
+            &|_| None,
+            false,
+            executor.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(credential.token, "second");
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
     }
 }

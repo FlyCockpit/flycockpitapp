@@ -161,6 +161,7 @@ pub fn redact_provider_view(
         category_defaults: providers.category_defaults.clone(),
         on_unlisted_models_fetch: providers.on_unlisted_models_fetch,
         active_model: providers.active_model.clone(),
+        configuration_warnings: Vec::new(),
         mcp_config_json: None,
         mcp_authored_config_json: None,
         mcp_owner_root: None,

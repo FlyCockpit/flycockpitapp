@@ -1468,17 +1468,16 @@ impl Session {
         providers: &crate::config::providers::ProvidersConfig,
         provider_id: &str,
     ) -> anyhow::Result<bool> {
-        let Some(command) = providers
-            .providers
-            .get(provider_id)
-            .and_then(|entry| entry.auth_command.as_deref())
-        else {
+        let Some(entry) = providers.providers.get(provider_id) else {
             return Ok(false);
         };
+        if entry.auth_command.is_none() {
+            return Ok(false);
+        }
         let store = self.provider_credential_store(providers)?;
         crate::auth::command::resolve(
             provider_id,
-            command,
+            entry,
             store,
             &|name| std::env::var(name).ok(),
             true,

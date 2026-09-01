@@ -1003,12 +1003,12 @@ impl SessionRegistry {
         // malformed/failed commands remain uncached and the selected model's
         // request build surfaces the same auth error fail-closed.
         for (provider_id, entry) in &providers_cfg.providers {
-            let Some(command) = entry.auth_command.as_deref() else {
+            if entry.auth_command.is_none() {
                 continue;
-            };
+            }
             if let Err(error) = crate::auth::command::resolve(
                 provider_id,
-                command,
+                entry,
                 store.clone(),
                 &|name| std::env::var(name).ok(),
                 false,

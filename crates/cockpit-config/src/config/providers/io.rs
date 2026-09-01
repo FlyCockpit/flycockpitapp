@@ -720,6 +720,15 @@ impl ConfigDoc {
     pub fn providers_from_workspace_layer_snapshot(
         snapshot: &crate::config::WorkspaceConfigLayerSnapshot,
     ) -> Result<ProvidersConfig> {
+        Self::providers_from_workspace_layer_snapshot_with_warnings(snapshot)
+            .map(|(providers, _)| providers)
+    }
+
+    /// Project one retained layer and retain any stable, secret-free policy
+    /// warnings so a daemon can surface them to the owner.
+    pub(crate) fn providers_from_workspace_layer_snapshot_with_warnings(
+        snapshot: &crate::config::WorkspaceConfigLayerSnapshot,
+    ) -> Result<(ProvidersConfig, Vec<String>)> {
         let bytes = snapshot.config_json.as_deref().unwrap_or(b"{}");
         let text =
             std::str::from_utf8(bytes).context("workspace config.json is not valid UTF-8")?;
@@ -732,6 +741,7 @@ impl ConfigDoc {
             anyhow::bail!("workspace config.json root must be an object");
         };
         let mut providers = Map::new();
+        let mut warnings = Vec::new();
         for (id, bytes) in &snapshot.provider_files {
             validate_provider_id_for_filename(id)?;
             let value: Value = serde_json::from_slice(bytes)
@@ -747,17 +757,23 @@ impl ConfigDoc {
                         | crate::config::dirs::ConfigDirKind::HomeDot
                 )
             ) {
-                strip_project_auth_command(id, &mut provider, "attached workspace config");
+                strip_project_auth_command(
+                    id,
+                    &mut provider,
+                    "attached workspace config",
+                    &mut warnings,
+                );
             }
             providers.insert(id.clone(), Value::Object(provider));
         }
         root.insert("providers".to_string(), Value::Object(providers));
-        Ok(Self {
+        let providers = Self {
             path: PathBuf::new(),
             raw,
             originally_loaded_providers: BTreeMap::new(),
         }
-        .providers())
+        .providers();
+        Ok((providers, warnings))
     }
 
     /// Merge a sequence of already-captured layers without consulting the
@@ -770,9 +786,10 @@ impl ConfigDoc {
     ) -> Result<ProvidersConfig> {
         let mut merged = Value::Object(Map::new());
         for snapshot in snapshots {
-            let layer =
-                serde_json::to_value(Self::providers_from_workspace_layer_snapshot(snapshot)?)
-                    .context("serializing retained workspace provider layer")?;
+            let layer = serde_json::to_value(
+                Self::providers_from_workspace_layer_snapshot_with_warnings(snapshot)?.0,
+            )
+            .context("serializing retained workspace provider layer")?;
             deep_merge_value(&mut merged, &layer);
         }
         serde_json::from_value(merged)
@@ -868,7 +885,7 @@ impl ConfigDoc {
     /// settings and strict-field provenance from another.
     pub(crate) fn try_load_effective_with_layer_snapshot(
         paths: &[PathBuf],
-    ) -> Result<(ProvidersConfig, Vec<(PathBuf, Value)>)> {
+    ) -> Result<(ProvidersConfig, Vec<(PathBuf, Value)>, Vec<String>)> {
         use crate::config::effective_default;
 
         effective_default::recover_layer_journals(
@@ -892,7 +909,8 @@ impl ConfigDoc {
         // while the bound fails closed under continuous config churn.
         const MAX_STABLE_CAPTURE_ATTEMPTS: usize = 4;
         for _ in 0..MAX_STABLE_CAPTURE_ATTEMPTS {
-            let (providers, layers) = Self::providers_and_layer_snapshot_with_masks(paths, &masks);
+            let (providers, layers, warnings) =
+                Self::providers_and_layer_snapshot_with_masks(paths, &masks);
             let (observed_masks, unmaskable) = effective_default::masked_layers(paths);
             if !unmaskable.is_empty() {
                 anyhow::bail!(
@@ -901,7 +919,11 @@ impl ConfigDoc {
                 );
             }
             if observed_masks == masks {
-                return Ok((providers.with_resolution_generation(generation), layers));
+                return Ok((
+                    providers.with_resolution_generation(generation),
+                    layers,
+                    warnings,
+                ));
             }
             masks = observed_masks;
         }
@@ -913,13 +935,14 @@ impl ConfigDoc {
     fn providers_and_layer_snapshot_with_masks(
         paths: &[PathBuf],
         masks: &HashMap<PathBuf, Vec<u8>>,
-    ) -> (ProvidersConfig, Vec<(PathBuf, Value)>) {
+    ) -> (ProvidersConfig, Vec<(PathBuf, Value)>, Vec<String>) {
         let mut merged = Value::Object(Map::new());
         let mut layers = Vec::new();
+        let mut warnings = Vec::new();
         for path in paths {
             let mask = masks.get(path).map(Vec::as_slice);
             if mask.is_none() && !path.exists() {
-                merge_provider_files_for_layer(&mut merged, path);
+                merge_provider_files_for_layer(&mut merged, path, &mut warnings);
                 continue;
             }
             match Self::load_with_mask(path, mask) {
@@ -937,7 +960,7 @@ impl ConfigDoc {
                     tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
                 }
             }
-            merge_provider_files_for_layer(&mut merged, path);
+            merge_provider_files_for_layer(&mut merged, path, &mut warnings);
         }
         let providers = Self {
             path: PathBuf::new(),
@@ -945,7 +968,7 @@ impl ConfigDoc {
             originally_loaded_providers: BTreeMap::new(),
         }
         .providers();
-        (providers, layers)
+        (providers, layers, warnings)
     }
 
     pub fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {
@@ -999,10 +1022,11 @@ impl ConfigDoc {
         masks: &HashMap<PathBuf, Vec<u8>>,
     ) -> ProvidersConfig {
         let mut merged = Value::Object(Map::new());
+        let mut warnings = Vec::new();
         for path in paths {
             let mask = masks.get(path).map(Vec::as_slice);
             if mask.is_none() && !path.exists() {
-                merge_provider_files_for_layer(&mut merged, path);
+                merge_provider_files_for_layer(&mut merged, path, &mut warnings);
                 continue;
             }
             match Self::load_with_mask(path, mask) {
@@ -1019,7 +1043,7 @@ impl ConfigDoc {
                     tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
                 }
             }
-            merge_provider_files_for_layer(&mut merged, path);
+            merge_provider_files_for_layer(&mut merged, path, &mut warnings);
         }
         Self {
             path: PathBuf::new(),
@@ -1641,7 +1665,11 @@ fn warn_inline_providers_ignored(path: &Path, raw: &Value) {
     );
 }
 
-fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
+fn merge_provider_files_for_layer(
+    merged: &mut Value,
+    config_path: &Path,
+    warnings: &mut Vec<String>,
+) {
     let Some(config_dir) = config_path.parent() else {
         return;
     };
@@ -1658,7 +1686,12 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
         match load_provider_raw_file(&path) {
             Ok(mut provider) => {
                 if !config_path_is_global_user_layer(config_path) {
-                    strip_project_auth_command(&id, &mut provider, "project provider config");
+                    strip_project_auth_command(
+                        &id,
+                        &mut provider,
+                        "project provider config",
+                        warnings,
+                    );
                 }
                 let url_changed = provider.get("url").is_some_and(|new_url| {
                     merged
@@ -1676,6 +1709,12 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
                     provider
                         .entry("headers".to_string())
                         .or_insert_with(|| Value::Array(Vec::new()));
+                    // A higher-precedence destination must never inherit a
+                    // host-executed global credential producer. `null` is a
+                    // deliberate deep-merge tombstone for the optional field.
+                    provider
+                        .entry("auth_command".to_string())
+                        .or_insert(Value::Null);
                 }
                 let mut layer = Map::new();
                 let mut providers = Map::new();
@@ -1712,6 +1751,7 @@ fn strip_project_auth_command(
     provider_id: &str,
     provider: &mut Map<String, Value>,
     source: &'static str,
+    warnings: &mut Vec<String>,
 ) -> bool {
     if provider.remove("auth_command").is_none() {
         return false;
@@ -1721,12 +1761,16 @@ fn strip_project_auth_command(
         source,
         "ignored project-scoped provider auth_command; executable authentication is global-only"
     );
+    warnings.push(
+        "ignored project-scoped provider auth_command; executable authentication is global-only"
+            .to_string(),
+    );
     true
 }
 
 fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig) {
     let mut merged = Value::Object(Map::new());
-    merge_provider_files_for_layer(&mut merged, config_path);
+    merge_provider_files_for_layer(&mut merged, config_path, &mut Vec::new());
     if let Some(map) = merged.get("providers").and_then(Value::as_object) {
         for (id, v) in map {
             if let Some(obj) = v.as_object()
@@ -1814,7 +1858,13 @@ mod atomic_write_tests {
             ),
         ]);
 
-        let warned = strip_project_auth_command("custom", &mut provider, "test project config");
+        let mut warnings = Vec::new();
+        let warned = strip_project_auth_command(
+            "custom",
+            &mut provider,
+            "test project config",
+            &mut warnings,
+        );
 
         assert!(
             warned,
@@ -1822,6 +1872,12 @@ mod atomic_write_tests {
         );
         assert!(!provider.contains_key("auth_command"));
         assert_eq!(provider["url"], "https://example.test/v1");
+        assert_eq!(
+            warnings,
+            [
+                "ignored project-scoped provider auth_command; executable authentication is global-only"
+            ]
+        );
     }
 
     #[test]
@@ -1857,6 +1913,55 @@ mod atomic_write_tests {
         assert_eq!(
             providers.providers["custom"].auth_command.as_deref(),
             Some(["/trusted/global-helper".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn project_url_override_clears_global_auth_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project/config.json");
+        std::fs::create_dir_all(project.parent().unwrap().join("providers")).unwrap();
+        std::fs::write(
+            project.parent().unwrap().join("providers/custom.json"),
+            r#"{"url":"https://project.example/v1"}"#,
+        )
+        .unwrap();
+
+        let mut merged = serde_json::json!({
+            "providers": {
+                "custom": {
+                    "url": "https://global.example/v1",
+                    "auth_command": ["trusted-helper"]
+                }
+            }
+        });
+        super::merge_provider_files_for_layer(&mut merged, &project, &mut Vec::new());
+        assert_eq!(
+            merged["providers"]["custom"]["url"],
+            "https://project.example/v1"
+        );
+        assert!(merged["providers"]["custom"]["auth_command"].is_null());
+    }
+
+    #[test]
+    fn daemon_snapshot_load_returns_project_auth_command_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("project/config.json");
+        std::fs::create_dir_all(config.parent().unwrap().join("providers")).unwrap();
+        std::fs::write(
+            config.parent().unwrap().join("providers/custom.json"),
+            r#"{"url":"https://project.example/v1","auth_command":["must-not-run"]}"#,
+        )
+        .unwrap();
+
+        let (providers, _layers, warnings) =
+            super::ConfigDoc::try_load_effective_with_layer_snapshot(&[config]).unwrap();
+        assert!(providers.providers["custom"].auth_command.is_none());
+        assert_eq!(
+            warnings,
+            [
+                "ignored project-scoped provider auth_command; executable authentication is global-only"
+            ]
         );
     }
 

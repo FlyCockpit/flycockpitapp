@@ -407,6 +407,10 @@ pub struct ProviderConfigView {
     pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    /// Stable, secret-free warnings raised while loading provider layers.
+    /// Clients display these rather than relying on daemon tracing output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration_warnings: Vec<String>,
     /// Optional daemon-redacted MCP layer projection. The string is JSON so
     /// the MCP config crate remains a client/core implementation detail; it
     /// contains no header/env literals or credential values.

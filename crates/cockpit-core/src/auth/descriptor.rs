@@ -432,8 +432,9 @@ async fn persist_initial(
     token: Map<String, Value>,
 ) -> Result<()> {
     let provider_id = provider_id.to_owned();
+    let lock_provider_id = provider_id.clone();
     let descriptor = descriptor.clone();
-    serialized_credential_mutation(&provider_id, || async move {
+    serialized_credential_mutation(&lock_provider_id, move || async move {
         let store = store.reopen()?;
         let record = initial_record(&provider_id, &descriptor, &store, token)?;
         store.save_record_merged(&credential_record_id(&provider_id), record)

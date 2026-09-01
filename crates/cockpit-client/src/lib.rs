@@ -1627,6 +1627,11 @@ mod tests {
         });
 
         received_rx.await.expect("request reaches daemon");
+        // Let the server register its delayed response before advancing the
+        // paused clock. Without this scheduling boundary the advance can run
+        // before the delay exists, leaving the test to advance only the
+        // caller deadline and making it race spuriously.
+        tokio::task::yield_now().await;
         tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
 
         let response = request

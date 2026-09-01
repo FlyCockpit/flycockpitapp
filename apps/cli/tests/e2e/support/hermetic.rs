@@ -328,7 +328,7 @@ impl HermeticLaunchSpec {
     }
 
     pub fn config_dir(&self) -> PathBuf {
-        self.home.join(".config").join("cockpit")
+        self.xdg_config_home.join("cockpit")
     }
 
     pub fn subprocess_env(&self) -> Vec<(String, String)> {

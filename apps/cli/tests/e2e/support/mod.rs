@@ -114,7 +114,7 @@ impl IsolatedHome {
     }
 
     pub fn config_dir(&self) -> PathBuf {
-        self._root.path().join(".config").join("cockpit")
+        self.config_home.join("cockpit")
     }
 
     pub fn project_path(&self) -> &std::path::Path {

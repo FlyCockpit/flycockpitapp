@@ -281,7 +281,6 @@ fn hooks_config_origin_is_nonpath_and_stable() {
     let temp = TempDir::new().unwrap();
     let cases = [
         (ConfigDirKind::HomeXdg, "global"),
-        (ConfigDirKind::HomeDot, "user"),
         (ConfigDirKind::MachineLocal, "machine"),
         (ConfigDirKind::Project, "project"),
     ];

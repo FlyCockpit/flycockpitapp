@@ -10121,7 +10121,6 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
 fn kind_label(kind: &ConfigDirKind) -> &'static str {
     match kind {
         ConfigDirKind::HomeXdg => "(home / XDG)",
-        ConfigDirKind::HomeDot => "(home / dotfile)",
         ConfigDirKind::MachineLocal => "(machine-local, scoped to cwd)",
         ConfigDirKind::Project => "(project — shareable with team)",
     }

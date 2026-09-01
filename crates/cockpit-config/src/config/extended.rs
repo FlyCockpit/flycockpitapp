@@ -2435,7 +2435,7 @@ pub fn guidance_proposal_doc_layers_from_snapshot_chain(
         let doc = extended_doc_from_workspace_snapshot(layer)?;
         let value = guidance_proposal_field_from_doc(&doc);
         match layer.origin.as_ref() {
-            Some(ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot) => {
+            Some(ConfigDirKind::HomeXdg) => {
                 out.global = fold_enablement_value(out.global, value);
             }
             Some(ConfigDirKind::MachineLocal | ConfigDirKind::Project) | None => {
@@ -2482,9 +2482,8 @@ fn guidance_proposal_field_from_doc(doc: &ExtendedConfigDoc) -> Option<bool> {
 /// Resolve the global and canonical machine-local project doc layers of
 /// `allow_computer_guidance_proposals` for `cwd`.
 ///
-/// Global/home directories (the platform config dir and legacy `~/.cockpit`)
-/// fold into the
-/// global slot; the machine-local per-cwd directory and any project
+/// The platform global config directory folds into the global slot; the
+/// machine-local per-cwd directory and any project
 /// `.cockpit` directories fold into the project slot. When `COCKPIT_CONFIG`
 /// selects a single file, that file is the effective (most-specific) layer and
 /// its value is treated as the project slot.
@@ -2529,7 +2528,7 @@ pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidancePropo
         };
         let value = guidance_proposal_field_from_doc(&doc);
         match dir.kind {
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot => {
+            ConfigDirKind::HomeXdg => {
                 layers.global = fold_enablement_value(layers.global, value);
             }
             ConfigDirKind::MachineLocal | ConfigDirKind::Project => {

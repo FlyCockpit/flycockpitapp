@@ -2,8 +2,7 @@
 //!
 //! Walk order (matches the [[config_layering]] plan):
 //!
-//!   1. Global platform config (`~/.config/cockpit/` on Linux), then the
-//!      legacy `~/.cockpit/` layer.
+//!   1. Global platform config (`~/.config/cockpit/` on Linux).
 //!   2. Machine-local-but-project-scoped: a hashed-cwd dir under the
 //!      cockpit data dir. Lets a user override per-cwd without
 //!      committing anything to the repo. Hashing the cwd dodges
@@ -75,8 +74,6 @@ fn mark_stray_warned(stray: &Path) -> bool {
 pub enum ConfigDirKind {
     /// Platform-default global config dir (`~/.config/cockpit/` on Linux).
     HomeXdg,
-    /// `~/.cockpit/`
-    HomeDot,
     /// `<cockpit_data_dir>/local-configs/<hash(cwd)>/` — machine-local
     /// per-cwd config. Never checked into a repo.
     MachineLocal,
@@ -124,16 +121,6 @@ pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
             path: global,
         });
     }
-    if let Some(home) = dirs::home_dir() {
-        let dot = home.join(".cockpit");
-        if dot.is_dir() {
-            out.push(ConfigDir {
-                kind: ConfigDirKind::HomeDot,
-                path: dot,
-            });
-        }
-    }
-
     if let Ok(local) = local_config_dir_for(cwd)
         && local.is_dir()
     {
@@ -300,7 +287,7 @@ fn file_layers_for_load(cwd: &Path, filename: &str) -> Vec<(ConfigDirKind, PathB
     for dir in discover_config_dirs(cwd) {
         match dir.kind {
             ConfigDirKind::Project => project.push((dir.kind, dir.path.join(filename))),
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
+            ConfigDirKind::HomeXdg | ConfigDirKind::MachineLocal => {
                 home_and_local.push((dir.kind, dir.path.join(filename)));
             }
         }
@@ -324,13 +311,13 @@ pub fn config_dirs_most_specific_first(cwd: &Path) -> Vec<ConfigDir> {
     for dir in discover_config_dirs(cwd) {
         match dir.kind {
             ConfigDirKind::Project => project.push(dir),
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
+            ConfigDirKind::HomeXdg | ConfigDirKind::MachineLocal => {
                 home_and_local.push(dir);
             }
         }
     }
     // `project` is already nearest-first; `home_and_local` is
-    // home-XDG → home-dot → machine-local, so reverse it to
+    // `home_and_local` is home-XDG → machine-local, so reverse it to
     // machine-local → home (most specific first) before appending.
     home_and_local.reverse();
     project.extend(home_and_local);
@@ -659,17 +646,11 @@ mod tests {
 
         assert_eq!(
             config_file_paths_for_load(&repo),
-            vec![
-                home.join(".config/cockpit/config.json"),
-                home.join(".cockpit/config.json"),
-            ]
+            vec![home.join(".config/cockpit/config.json")]
         );
         assert_eq!(
             mcp_file_paths_for_load(&repo),
-            vec![
-                home.join(".config/cockpit/mcp.json"),
-                home.join(".cockpit/mcp.json"),
-            ]
+            vec![home.join(".config/cockpit/mcp.json")]
         );
         assert!(
             !cwd_scoped_creatable_dirs(&repo)
@@ -912,12 +893,10 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
-    /// Guard against a behavior change in the no-project case: when no project
-    /// layer applies, the fallback stays the most-specific non-project layer
-    /// (here home-dot), exactly as the pre-fix `next_back()` resolved. Passes
-    /// both before and after the fix — it locks the fallback in place.
+    /// When no project layer applies, the fallback is the canonical global
+    /// layer. A legacy home dotfile must never take precedence over it.
     #[test]
-    fn no_project_fallback_targets_most_specific_home_layer_unchanged() {
+    fn no_project_fallback_targets_canonical_global_layer() {
         let tmp = TempDir::new().unwrap();
         let _env = test_support::IsolatedCockpitHome::new(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
@@ -929,8 +908,8 @@ mod tests {
 
         assert_eq!(
             most_specific_config_write_target(&work),
-            Some(home.join(".cockpit").join(CONFIG_FILE)),
-            "no project layer → most-specific non-project layer (home-dot)"
+            Some(home.join(".config/cockpit").join(CONFIG_FILE)),
+            "no project layer → canonical global layer; legacy home dotfile is ignored"
         );
         crate::config::trust::clear_runtime_policy_for_tests();
     }

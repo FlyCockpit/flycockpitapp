@@ -1125,12 +1125,6 @@ fn discovered_settings_layers(
             path: global,
         });
     }
-    if let Some(home) = dirs::home_dir() {
-        layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
-            kind: K::HomeDot,
-            path: home.join(".cockpit"),
-        });
-    }
     layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
         kind: K::MachineLocal,
         path: cockpit_config::config::dirs::local_config_dir_for(root).map_err(internal)?,
@@ -1149,7 +1143,6 @@ fn discovered_settings_layers(
             }
             let kind = match dir.kind {
                 K::HomeXdg => cockpit_proto::CockpitConfigLayer::HomeXdg,
-                K::HomeDot => cockpit_proto::CockpitConfigLayer::HomeDot,
                 K::MachineLocal => cockpit_proto::CockpitConfigLayer::MachineLocal,
                 K::Project => cockpit_proto::CockpitConfigLayer::Project,
             };

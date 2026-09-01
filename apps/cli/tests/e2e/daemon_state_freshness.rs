@@ -106,19 +106,14 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         &home,
     );
 
-    let ephemeral_socket = home
-        .socket_path()
-        .with_file_name("cockpit-freshness-ephemeral.sock");
-    let ephemeral_pid = home
-        .pid_file()
-        .with_file_name("cockpit-freshness-ephemeral.pid");
-    std::fs::create_dir_all(ephemeral_pid.parent().expect("ephemeral pid parent"))
-        .expect("create ephemeral pid parent");
+    // Ephemeral ownership is a lifetime policy on the canonical ledger
+    // endpoint. A shared follow-up daemon must discover the exact same socket
+    // and durable session after this owner exits.
+    let ephemeral_socket = home.socket_path();
     let mut daemon_command = home.cockpit();
     daemon_command
         .args(["daemon", "start", "--foreground"])
-        .env("COCKPIT_EPHEMERAL_SOCKET", &ephemeral_socket)
-        .env("COCKPIT_EPHEMERAL_PID_FILE", &ephemeral_pid)
+        .env("COCKPIT_DAEMON_LIFETIME", "ephemeral")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -6585,6 +6585,7 @@ impl SettingsDialog {
                 break;
             }
         }
+        self.apply_pending_provider_completions();
         self.apply_completed_provider_navigation();
     }
 
@@ -6644,6 +6645,84 @@ impl SettingsDialog {
         }
     }
 
+    fn apply_pending_provider_completions(&mut self) {
+        if let Some(completion) = self.cx.completed_provider_auth.take()
+            && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
+        {
+            match (completion, page) {
+                (
+                    CompletedProviderAuthMutation::Logout {
+                        provider_id,
+                        result,
+                    },
+                    ProvidersPage::Edit(state),
+                ) => {
+                    state.status = Some(match result {
+                        Ok(()) => format!("signed out of {provider_id}"),
+                        Err(error) => format!("sign out failed: {error}"),
+                    });
+                }
+                (
+                    CompletedProviderAuthMutation::Copilot {
+                        provider_id,
+                        result,
+                    },
+                    ProvidersPage::CopilotSetup { state, .. },
+                ) => state.apply_daemon_result(provider_id, result),
+                _ => {}
+            }
+        }
+        let completed_add = self.cx.completed_provider_add.take();
+        if let Some(completion) = completed_add
+            && let Some(ProvidersPage::Add(state)) = self.page.downcast_mut::<ProvidersPage>()
+        {
+            self.cx.adopt_provider_add_completion(state, completion);
+        }
+        if let Some(result) = self.cx.completed_provider_mutation.take()
+            && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
+        {
+            let status = match result {
+                Ok(()) => "saved".to_string(),
+                Err(error) => format!("provider save failed: {error}"),
+            };
+            match page {
+                ProvidersPage::List { status: slot, .. } => *slot = Some(status),
+                ProvidersPage::Edit(state) => state.status = Some(status),
+                ProvidersPage::Headers { parent, .. }
+                | ProvidersPage::Models { parent, .. }
+                | ProvidersPage::ModelSettings { parent, .. }
+                | ProvidersPage::ProviderSettings { parent, .. } => parent.status = Some(status),
+                _ => {}
+            }
+        }
+        if let Some(navigation) = self.cx.completed_provider_mutation_navigation.take() {
+            self.page = match navigation {
+                ProviderMutationNavigation::List { status } => {
+                    providers_page(ProvidersPage::List {
+                        cursor: initial_list_cursor(&self.cx.config),
+                        status: Some(status),
+                        delete_pending: false,
+                    })
+                }
+                ProviderMutationNavigation::Edit {
+                    provider_id,
+                    status,
+                } => {
+                    let entry = self
+                        .cx
+                        .config
+                        .providers
+                        .get(&provider_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut edit = EditState::new(provider_id, entry);
+                    edit.status = Some(status);
+                    providers_page(ProvidersPage::Edit(edit))
+                }
+            };
+        }
+    }
+
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
@@ -6663,6 +6742,21 @@ impl SettingsDialog {
                 );
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
                     page.apply_authoritative_settings_completion(&mut self.cx, sidecar_completion);
+                }
+                // Root navigation may open Harnesses while the authoritative
+                // extended-config snapshot is still in flight. Do not leave
+                // that transient loading text frozen in the page state after
+                // the completion has reconciled (or failed closed).
+                if let Some(harnesses_page::HarnessesPage::List(state)) =
+                    self.page.downcast_mut::<harnesses_page::HarnessesPage>()
+                    && state.status.as_deref() == Some("loading daemon-owned settings…")
+                {
+                    state.status = self
+                        .cx
+                        .extended_warnings
+                        .first()
+                        .filter(|warning| warning.as_str() != "loading daemon-owned settings…")
+                        .cloned();
                 }
                 self.apply_completed_provider_navigation();
                 if let Some(prompt) = self.cx.pending_shadow_prompt.take()
@@ -6743,78 +6837,7 @@ impl SettingsDialog {
                         }
                     }
                 }
-                if let Some(completion) = self.cx.completed_provider_auth.take()
-                    && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
-                {
-                    match (completion, page) {
-                        (
-                            CompletedProviderAuthMutation::Logout {
-                                provider_id,
-                                result,
-                            },
-                            ProvidersPage::Edit(state),
-                        ) => {
-                            state.status = Some(match result {
-                                Ok(()) => format!("signed out of {provider_id}"),
-                                Err(error) => format!("sign out failed: {error}"),
-                            });
-                        }
-                        (
-                            CompletedProviderAuthMutation::Copilot {
-                                provider_id,
-                                result,
-                            },
-                            ProvidersPage::CopilotSetup { state, .. },
-                        ) => state.apply_daemon_result(provider_id, result),
-                        _ => {}
-                    }
-                }
-                if let Some(completion) = self.cx.completed_provider_add.take()
-                    && let Some(ProvidersPage::Add(state)) =
-                        self.page.downcast_mut::<ProvidersPage>()
-                {
-                    self.cx.adopt_provider_add_completion(state, completion);
-                }
-                if let Some(result) = self.cx.completed_provider_mutation.take()
-                    && self.cx.completed_provider_add.is_none()
-                    && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
-                {
-                    let status = match result {
-                        Ok(()) => "provider settings committed".to_string(),
-                        Err(error) => format!("provider save failed: {error}"),
-                    };
-                    match page {
-                        ProvidersPage::List { status: slot, .. } => *slot = Some(status),
-                        ProvidersPage::Edit(state) => state.status = Some(status),
-                        _ => {}
-                    }
-                }
-                if let Some(navigation) = self.cx.completed_provider_mutation_navigation.take() {
-                    self.page = match navigation {
-                        ProviderMutationNavigation::List { status } => {
-                            providers_page(ProvidersPage::List {
-                                cursor: initial_list_cursor(&self.cx.config),
-                                status: Some(status),
-                                delete_pending: false,
-                            })
-                        }
-                        ProviderMutationNavigation::Edit {
-                            provider_id,
-                            status,
-                        } => {
-                            let entry = self
-                                .cx
-                                .config
-                                .providers
-                                .get(&provider_id)
-                                .cloned()
-                                .unwrap_or_default();
-                            let mut edit = EditState::new(provider_id, entry);
-                            edit.status = Some(status);
-                            providers_page(ProvidersPage::Edit(edit))
-                        }
-                    };
-                }
+                self.apply_pending_provider_completions();
                 return;
             }
             Err(completion) => completion,
@@ -8544,11 +8567,18 @@ pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
 fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
     let children = root_nodes();
     let cursor = cursor.min(children.len().saturating_sub(1));
+    // Keep at least one navigable root row in a short terminal. Description
+    // and guidance are supplemental; allocating their fixed full heights
+    // first used to leave the list at zero rows, which made every root action
+    // unreachable by pointer or wheel input.
+    let detail_budget = area.height.saturating_sub(2);
+    let description_height = detail_budget.min(3);
+    let guidance_height = detail_budget.saturating_sub(description_height).min(7);
     let rows = Layout::vertical([
-        Constraint::Min(0),
+        Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(7),
+        Constraint::Length(description_height),
+        Constraint::Length(guidance_height),
     ])
     .split(area);
 
@@ -8692,6 +8722,10 @@ impl SettingsCx {
         };
         self.pending_default_model_update_id = Some(default_update_id);
         self.pending_daemon_request = Some(request);
+        // The staged value is only an intent until the daemon returns the
+        // correlated authority receipt. Keep rendering the verified value in
+        // the meantime so an adjacent provider save cannot publish it early.
+        self.config.active_model = self.original_config.active_model.clone();
         true
     }
 

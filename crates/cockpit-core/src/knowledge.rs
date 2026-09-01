@@ -945,15 +945,6 @@ impl SidecarProcessLock {
     }
 }
 
-fn has_git_marker_in_ancestors(root: &Path) -> bool {
-    let contains_git_marker = |path: &Path| {
-        path.ancestors()
-            .any(|ancestor| ancestor.join(".git").exists())
-    };
-    contains_git_marker(root)
-        || fs::canonicalize(root).is_ok_and(|canonical_root| contains_git_marker(&canonical_root))
-}
-
 fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
     // Sidecars were canonicalized for lock identity. Resolve the KB root the
     // same way before deciding which artifacts are inside a Git worktree.
@@ -970,16 +961,10 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     if sidecar_paths.is_empty() {
         return Ok(());
     }
-    let prefix = match crate::git::run_git(root, &["rev-parse", "--show-prefix"]) {
-        Ok(output) if output.success => output.stdout,
-        Ok(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
-        Ok(output) => bail!(
-            "checking Git ignore rules for local knowledge base {} failed: {}",
-            root.display(),
-            output.stderr.trim()
-        ),
-        Err(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
-        Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
+    let prefix_probe = crate::git::run_git(root, &["rev-parse", "--show-prefix"])
+        .context("running Git to protect knowledge sidecars")?;
+    let Some(prefix) = git_worktree_prefix(root, prefix_probe)? else {
+        return Ok(());
     };
     let exclude = crate::git::run_git(root, &["rev-parse", "--git-path", "info/exclude"])
         .context("locating local knowledge repository exclusion file")?;
@@ -1074,6 +1059,29 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn git_worktree_prefix(root: &Path, output: crate::git::GitOutcome) -> Result<Option<String>> {
+    if output.success {
+        return Ok(Some(output.stdout));
+    }
+
+    // A nonzero rev-parse is safe to interpret as "outside Git" only when Git
+    // says exactly that. Ownership/safe.directory failures and other
+    // inspection refusals must not permit unprotected sidecar creation.
+    if output
+        .stderr
+        .to_ascii_lowercase()
+        .contains("not a git repository")
+    {
+        return Ok(None);
+    }
+
+    bail!(
+        "checking whether local knowledge base {} belongs to a Git worktree failed: {}",
+        root.display(),
+        output.stderr.trim()
+    )
 }
 
 /// Metadata for one durable dream projection. The dream executor supplies
@@ -2720,6 +2728,17 @@ impl KbProvider for RemoteKb {
 
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
+    // Dream transactions deliberately use a descriptor-bound root on Unix so
+    // no pathname replacement can redirect Git or model writes. The Linux
+    // procfs descriptor spelling is a capability view, not a caller-controlled
+    // symlink path, so duplicate that held directory instead of passing its
+    // magic link through the normal no-follow pathname walker.
+    #[cfg(target_os = "linux")]
+    if root.starts_with("/proc/self/fd/") {
+        let handle = fs::File::open(&root)
+            .with_context(|| format!("duplicating retained knowledge root {}", root.display()))?;
+        return parse_bundle_from_retained_root(root, &handle);
+    }
     let handle = cockpit_config::config::open_config_directory_nofollow(&root)?;
     parse_bundle_from_retained_root(root, &handle)
 }
@@ -4642,7 +4661,7 @@ pub(crate) async fn attached_bundles(
         // already carry their installation identity and intentionally retain it.
         if let Some(local) = &mut local {
             if !entry.has_bound_attachment_identity() {
-                match local_source_attachment_identity(&local.root)? {
+                match local_source_attachment_identity(&local.root, &entry.id)? {
                     Some((root, attachment_id)) => {
                         // Workspace-local sidecars live beside the source and
                         // must follow a canonicalized root. Assistant-owned
@@ -4670,19 +4689,19 @@ pub(crate) async fn attached_bundles(
             };
         }
         validate_registry_entry(&entry)?;
-        let attachment_id = entry.attachment_id();
-        if !seen_attachment_ids.insert(attachment_id) {
-            bail!(
-                "knowledge base registry contains duplicate attachment ID `{}`",
-                attachment_id
-            );
-        }
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
         if entry.trust_required && !executing_model_trusted {
             denied_knowledge_base_ids.push(entry.id.clone());
             continue;
+        }
+        let attachment_id = entry.attachment_id();
+        if !seen_attachment_ids.insert(attachment_id) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                attachment_id
+            );
         }
         let sealed_id = if let Some(local) = &mut local {
             let Some((snapshot, sealed_id)) =
@@ -4700,6 +4719,11 @@ pub(crate) async fn attached_bundles(
                 cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
                 local.sidecars = Some(KbSidecars::in_root(&cache_root.join(sealed_id.to_string())));
             }
+            let sidecars = local
+                .sidecars
+                .as_ref()
+                .context("local knowledge base has no sidecar paths")?;
+            cockpit_host::private_fs::ensure_private_dir(sidecars.root())?;
             local.snapshot = Some(snapshot);
             sealed_id
         } else {
@@ -4762,7 +4786,9 @@ fn prompt_snapshot_entries_from_registry(
                 cwd.join(local.root)
             };
             if !entry.has_bound_attachment_identity() {
-                let Some((root, attachment_id)) = local_source_attachment_identity(&root)? else {
+                let Some((root, attachment_id)) =
+                    local_source_attachment_identity(&root, &entry.id)?
+                else {
                     continue;
                 };
                 entry = entry.with_bound_attachment_identity(attachment_id);
@@ -4778,17 +4804,17 @@ fn prompt_snapshot_entries_from_registry(
             }
         }
         validate_registry_entry(&entry)?;
-        if !seen_attachment_ids.insert(entry.attachment_id()) {
-            bail!(
-                "knowledge base registry contains duplicate attachment ID `{}`",
-                entry.attachment_id()
-            );
-        }
         if allowed_knowledge_bases.is_some_and(|ids| !ids.contains(&entry.id)) {
             continue;
         }
         if entry.trust_required && trust_mode != WorkspaceTrustMode::Trust {
             continue;
+        }
+        if !seen_attachment_ids.insert(entry.attachment_id()) {
+            bail!(
+                "knowledge base registry contains duplicate attachment ID `{}`",
+                entry.attachment_id()
+            );
         }
         entries.push(entry);
     }
@@ -5716,7 +5742,10 @@ pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String>
 /// the directory, changes a symlink target, or rewrites the source in place,
 /// therefore cannot inherit the predecessor's boundary. A missing root is
 /// unavailable rather than a ledger lookup candidate.
-fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid::Uuid)>> {
+fn local_source_attachment_identity(
+    root: &Path,
+    registry_id: &str,
+) -> Result<Option<(PathBuf, uuid::Uuid)>> {
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5744,12 +5773,20 @@ fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid
         );
     }
 
-    let mut name = b"flycockpit/knowledge-local-attachment/v2\0".to_vec();
+    let mut name = b"flycockpit/knowledge-local-attachment/v3\0".to_vec();
     append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
+    // A registry entry is an explicit attachment authorization boundary. Two
+    // entries may intentionally expose the same local source under different
+    // trust policies, so their ledger identities must never collapse.
+    append_attachment_identity_component(&mut name, registry_id.as_bytes());
 
     let source_identity = sealed_marker_object_identity(&source)?;
     name.extend_from_slice(&source_identity.volume.to_le_bytes());
     name.extend_from_slice(&source_identity.file.to_le_bytes());
+    // Filesystems may reuse an inode immediately after a replacement at the
+    // same path. The directory change timestamp distinguishes that successor
+    // object even when both its contents and low-level object number match.
+    append_attachment_identity_component(&mut name, &source_directory_change_identity(&metadata));
     let mut documents =
         cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
             &source,
@@ -5782,6 +5819,28 @@ fn local_source_attachment_identity(root: &Path) -> Result<Option<(PathBuf, uuid
         root,
         uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, &name),
     )))
+}
+
+fn source_directory_change_identity(metadata: &std::fs::Metadata) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut identity = Vec::with_capacity(16);
+        identity.extend_from_slice(&metadata.ctime().to_le_bytes());
+        identity.extend_from_slice(&metadata.ctime_nsec().to_le_bytes());
+        return identity;
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(
+                || 0_u128.to_le_bytes().to_vec(),
+                |duration| duration.as_nanos().to_le_bytes().to_vec(),
+            )
+    }
 }
 
 fn append_attachment_identity_component(name: &mut Vec<u8>, component: &[u8]) {
@@ -8629,7 +8688,7 @@ mod tests {
     fn rewritten_local_kb_source_has_a_new_attachment_identity() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
-        let (_, first) = local_source_attachment_identity(tmp.path())
+        let (_, first) = local_source_attachment_identity(tmp.path(), "project")
             .unwrap()
             .unwrap();
 
@@ -8638,7 +8697,7 @@ mod tests {
             "---\ntype: decision\n---\n\nA replacement knowledge source.",
         )
         .unwrap();
-        let (_, second) = local_source_attachment_identity(tmp.path())
+        let (_, second) = local_source_attachment_identity(tmp.path(), "project")
             .unwrap()
             .unwrap();
 
@@ -9082,7 +9141,7 @@ Inventory facts for warehouse operations.
         let add = Command::new("git")
             .arg("-C")
             .arg(tmp.path())
-            .args(["add", "--", EMBEDDINGS_FILE, INDEX_FILE])
+            .args(["add", "-f", "--", EMBEDDINGS_FILE, INDEX_FILE])
             .status()
             .unwrap();
         assert!(add.success());
@@ -9114,6 +9173,40 @@ Inventory facts for warehouse operations.
                 .to_string()
                 .contains("checking whether knowledge sidecar"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn sidecar_git_inspection_refusal_fails_closed() {
+        let root = Path::new("/knowledge");
+        let error = git_worktree_prefix(
+            root,
+            crate::git::GitOutcome {
+                success: false,
+                stdout: String::new(),
+                stderr: "fatal: detected dubious ownership in repository at '/knowledge'".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to a Git worktree failed"),
+            "{error:#}"
+        );
+
+        assert!(
+            git_worktree_prefix(
+                root,
+                crate::git::GitOutcome {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "fatal: not a git repository (or any parent directory): .git".into(),
+                },
+            )
+            .unwrap()
+            .is_none(),
+            "only Git's not-a-repository signal may bypass exclusion setup"
         );
     }
 
@@ -9354,7 +9447,7 @@ Inventory facts for warehouse operations.
         conn.execute_batch("CREATE TABLE retained_identity_test (id INTEGER PRIMARY KEY);")
             .unwrap();
         let error = persist_private_sidecar_connection(&conn, &sidecars.index, &lock).unwrap_err();
-        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
         assert!(!tmp.path().join("attacker.sqlite").exists());
     }
 
@@ -9553,6 +9646,7 @@ Inventory facts for warehouse operations.
     async fn executing_definition_snapshot_restricts_workspace_knowledge_registry() {
         let _env = crate::test_env::lock_async().await;
         let tmp = TempDir::new().unwrap();
+        write_bundle(&tmp.path().join(".cockpit/knowledge"));
         let session = test_session(tmp.path()).await;
         let mut agent = crate::agents::embedded_default("Plan").unwrap();
         agent.vnext.as_mut().unwrap().allowed_knowledge_bases =
@@ -10692,6 +10786,9 @@ Inventory facts for warehouse operations.
             |root, _| {
                 for name in KB_MACHINE_STATE_GITIGNORE {
                     let path = root.join(name.trim_end_matches('/'));
+                    if path.exists() {
+                        continue;
+                    }
                     if name.ends_with('/') {
                         fs::create_dir_all(path).unwrap();
                     } else {
@@ -11140,19 +11237,14 @@ Inventory facts for warehouse operations.
 
     async fn test_session(root: &Path) -> Session {
         let db = crate::db::Db::open(&root.join("cockpit.db")).unwrap();
-        let project_root = root.to_str().unwrap().to_string();
-        let row = db
-            .write(move |conn| {
-                let row = crate::db::Db::build_new_session_row_conn(
-                    conn,
-                    "project",
-                    &project_root,
-                    "test",
-                )?;
-                crate::db::Db::insert_session_row_conn(conn, &row)
-            })
-            .await
-            .unwrap();
+        let row = Session::insert_row_for_test(
+            &db,
+            root,
+            "test",
+            crate::session::TestSessionRowOptions::default(),
+        )
+        .await
+        .unwrap();
         Session::resume_for_test(
             db,
             row.session_id,

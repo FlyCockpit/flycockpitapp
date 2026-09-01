@@ -1606,9 +1606,17 @@ impl UserSubmissionQueue {
             submission.queue_item_ids.push(item.id);
         }
         submission.queue_target = Some(item.target);
-        // Keep the stored class. `send_now` is a timing flag restored from
-        // `started_metadata` on requeue; it must not rewrite Held into Steering.
-        submission.delivery_class = item.delivery_class;
+        // Keep the durable class in `started_metadata` for a later requeue,
+        // but expose a send-now held item to the active turn as effective
+        // steering. Once popped, the consumer has no separate `send_now`
+        // flag; preserving Held here would make an explicitly escalated turn
+        // look like ordinary deferred work after it won the effective-top
+        // queue race.
+        submission.delivery_class = if item.send_now {
+            QueueDeliveryClass::Steering
+        } else {
+            item.delivery_class
+        };
         QueuePop::Item(Box::new(submission))
     }
 
@@ -3574,7 +3582,8 @@ mod tests {
                 .iter()
                 .map(|item| item.delivery_class)
                 .collect::<Vec<_>>(),
-            vec![QueueDeliveryClass::Held, QueueDeliveryClass::Held]
+            vec![QueueDeliveryClass::Steering, QueueDeliveryClass::Held],
+            "a send-now item retains Held durably but is steering while it is consumed"
         );
     }
 

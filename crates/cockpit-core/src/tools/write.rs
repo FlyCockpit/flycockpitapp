@@ -1801,23 +1801,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(&canonical).unwrap();
-        let project_root = canonical.display().to_string();
-        let session_row = db
-            .write(move |conn| {
-                crate::db::Db::insert_session_row_conn(
-                    conn,
-                    &crate::db::Db::build_new_assistant_session_row_conn(
-                        conn,
-                        &project_id,
-                        &project_root,
-                        "helper",
-                        "helper",
-                    )?,
-                )
-            })
-            .await
-            .unwrap();
+        let session_row = crate::session::Session::insert_row_for_test(
+            &db,
+            &canonical,
+            "helper",
+            crate::session::TestSessionRowOptions::default().with_assistant("helper"),
+        )
+        .await
+        .unwrap();
         let session = crate::session::Session::resume_for_test(
             db.clone(),
             session_row.session_id,
@@ -3574,10 +3565,14 @@ mod tests {
         let (ctx_a, db) = test_ctx_with_db(tmp.path());
         let file = tmp.path().join("shared.md");
         std::fs::write(&file, "base\n").unwrap();
-        let s_b = db
-            .create_session("p", &tmp.path().display().to_string(), "writer-b")
-            .await
-            .unwrap();
+        let s_b = crate::session::Session::insert_row_for_test(
+            &db,
+            tmp.path(),
+            "writer-b",
+            crate::session::TestSessionRowOptions::default(),
+        )
+        .await
+        .unwrap();
         let mut ctx_b = ctx_a.clone_for_dispatch();
         ctx_b.lock_identity = "writer-b".to_string();
         ctx_b.session = Arc::new(

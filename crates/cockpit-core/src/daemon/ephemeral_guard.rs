@@ -892,6 +892,26 @@ mod tests {
     }
 
     async fn receive_stop(stream: &mut ProtoStream<tokio::net::UnixStream>) -> uuid::Uuid {
+        let confirmation_id = match stream.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(envelope) => {
+                let Envelope { body, .. } = *envelope;
+                match body {
+                    Body::Request {
+                        id,
+                        request: Request::DaemonStatus,
+                    } => id,
+                    _ => panic!("expected daemon lifetime confirmation"),
+                }
+            }
+            frame => panic!("expected daemon lifetime confirmation, got {frame:?}"),
+        };
+        stream
+            .send(&Envelope::response(
+                confirmation_id,
+                hello_response(crate::daemon::proto::PROTOCOL_VERSION),
+            ))
+            .await
+            .unwrap();
         match stream.recv().await.unwrap().unwrap() {
             RecvFrame::Envelope(envelope) => {
                 let Envelope { body, .. } = *envelope;
@@ -1397,6 +1417,23 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let mut stream = ProtoStream::new(socket);
             send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let confirmation_id = match stream.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::DaemonStatus,
+                    } => id,
+                    other => panic!("expected daemon lifetime confirmation, got {other:?}"),
+                },
+                other => panic!("expected daemon lifetime confirmation envelope, got {other:?}"),
+            };
+            stream
+                .send(&Envelope::response(
+                    confirmation_id,
+                    hello_response(crate::daemon::proto::PROTOCOL_VERSION),
+                ))
+                .await
+                .unwrap();
             let request =
                 tokio::time::timeout(std::time::Duration::from_millis(100), stream.recv()).await;
             let received_stop = matches!(

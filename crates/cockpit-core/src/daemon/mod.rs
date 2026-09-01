@@ -293,6 +293,11 @@ fn write_endpoint_record_with_receipt_and_canonical(
     receipt: &DaemonPidReceipt,
 ) -> Result<()> {
     if paths.pid_file != canonical.pid_file || paths.socket != canonical.socket {
+        if paths.ephemeral {
+            // Ephemeral owners are intentionally private to their launching
+            // client and must never create a process-global endpoint record.
+            return Ok(());
+        }
         anyhow::bail!(
             "refusing to publish shared daemon endpoint from noncanonical paths: pid_file={}, socket={}",
             paths.pid_file.display(),
@@ -1584,6 +1589,10 @@ fn spawn_owned_test_persistent_daemon(
     let (completion, completed) = tokio::sync::oneshot::channel();
     let supervisor = std::thread::Builder::new()
         .name("cockpit-test-persistent-daemon".to_string())
+        // Initial migration validation builds the full SQLite schema and its
+        // recursive trigger graph. Keep the isolated test daemon independent
+        // of the host test thread's comparatively small default stack.
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1591,29 +1600,42 @@ fn spawn_owned_test_persistent_daemon(
                 .context("building test persistent daemon runtime")
                 .and_then(|runtime| {
                     runtime.block_on(async move {
-                        let db = crate::db::Db::open_in_memory()
-                            .context("opening isolated test daemon DB")?;
-                        let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
-                        let ctx = std::sync::Arc::new(server::DaemonContext::new(
-                            db,
-                            locks,
-                            paths,
-                            terminal::default_host_factory(),
-                            source,
-                        ));
-                        let _endpoint = server::register_in_process_context(ctx.clone());
-                        let force = ctx.shutdown_signal().clone();
+                        let ready = async {
+                            let db = crate::db::Db::open_in_memory()
+                                .context("opening isolated test daemon DB")?;
+                            let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
+                            let ctx = std::sync::Arc::new(server::DaemonContext::new(
+                                db,
+                                locks,
+                                paths,
+                                terminal::default_host_factory(),
+                                source,
+                            ));
+                            let _endpoint = server::register_in_process_context(ctx.clone());
+                            Ok::<_, anyhow::Error>(TestPersistentBootReady {
+                                force: ctx.shutdown_signal().clone(),
+                                ctx,
+                            })
+                        }
+                        .await;
+                        let ready = match ready {
+                            Ok(ready) => ready,
+                            Err(error) => {
+                                let _ = booted.send(Err(anyhow::anyhow!("{error:#}")));
+                                return Ok(());
+                            }
+                        };
                         if booted
                             .send(Ok(TestPersistentBootReady {
-                                ctx: ctx.clone(),
-                                force,
+                                ctx: ready.ctx.clone(),
+                                force: ready.force,
                             }))
                             .is_err()
                         {
-                            return shutdown_in_process_context(ctx, Vec::new()).await;
+                            return shutdown_in_process_context(ready.ctx, Vec::new()).await;
                         }
                         let _ = shutdown_request.await;
-                        shutdown_in_process_context(ctx, Vec::new()).await
+                        shutdown_in_process_context(ready.ctx, Vec::new()).await
                     })
                 });
             let _ = completion.send(result);

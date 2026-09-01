@@ -468,32 +468,12 @@ fn effective_grant_for_invariants(def: &AgentDef) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn validate_discoverable_tools_have_mcp(def: &AgentDef, tools: &[String]) -> Result<()> {
-    if tools.iter().any(|tool| tool == "mcp") {
-        return Ok(());
-    }
-    for tool in tools {
-        let tier = def
-            .tool_tiers
-            .get(tool)
-            .copied()
-            .unwrap_or_else(|| discoverable_default_tier(&def.name, tool));
-        if tier == ToolTier::Discoverable {
-            bail!(
-                "agent `{}` tiers tool `{tool}` as `discoverable` but does not grant `mcp`, so the tool is unreachable — grant `mcp` or tier it `enabled`",
-                def.name
-            );
-        }
-    }
+fn validate_discoverable_tools_have_mcp(_def: &AgentDef, _tools: &[String]) -> Result<()> {
+    // Monty is materialized for every real agent, independently of the legacy
+    // `mcp` grant. Discoverable native tools are therefore always reachable
+    // through `mcp.invoke('cockpit', ...)`; the grant now controls only
+    // external MCP servers.
     Ok(())
-}
-
-fn discoverable_default_tier(agent_name: &str, tool: &str) -> ToolTier {
-    if crate::engine::builtin::default_discoverable_tools_for(agent_name).contains(&tool) {
-        ToolTier::Discoverable
-    } else {
-        ToolTier::Enabled
-    }
 }
 
 #[cfg(test)]
@@ -645,7 +625,7 @@ mod grant_tests {
     }
 
     #[test]
-    fn discoverable_without_mcp_grant_is_rejected() {
+    fn discoverable_without_mcp_grant_is_accepted() {
         let def = tiered_def(
             "custom-discoverable",
             &["read", "code"],
@@ -653,17 +633,12 @@ mod grant_tests {
             ToolTier::Discoverable,
         );
 
-        let err = validate_invariants(&def)
-            .expect_err("discoverable tool without mcp must be rejected")
-            .to_string();
-
-        assert!(err.contains("custom-discoverable"), "{err}");
-        assert!(err.contains("code"), "{err}");
-        assert!(err.contains("mcp"), "{err}");
+        validate_invariants(&def)
+            .expect("discoverable native tool must not require the external-MCP grant");
     }
 
     #[test]
-    fn discoverable_with_mcp_grant_is_accepted() {
+    fn discoverable_native_tools_are_accepted_with_or_without_external_mcp_grant() {
         let with_mcp = tiered_def(
             "custom-discoverable",
             &["read", "code", "mcp"],
@@ -683,7 +658,7 @@ mod grant_tests {
             ToolTier::Disabled,
         );
 
-        validate_invariants(&with_mcp).expect("mcp makes discoverable tool reachable");
+        validate_invariants(&with_mcp).expect("external-MCP grant remains valid");
         validate_invariants(&builtin).expect("enabled tier is directly reachable");
         validate_invariants(&disabled).expect("disabled tier is not discoverable");
     }

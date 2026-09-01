@@ -53,6 +53,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::providers::{
@@ -1435,6 +1436,12 @@ impl SettingsCx {
         self.pending_provider_add = Some((id, entry, template.supports_models_endpoint));
         match self.save_config() {
             Ok(()) => {
+                // The mutation now owns the wizard. Advance to the explicit
+                // saving step as soon as it is queued, rather than leaving
+                // the completed OAuth confirmation actionable until the
+                // daemon receipt happens to arrive. The completion reducer
+                // advances from `saving` to the fetch/test terminal path.
+                let _ = s.run.submit(WizardAnswer::Acknowledged);
                 s.error = Some("saving provider…".into());
             }
             Err(e) => {
@@ -1833,7 +1840,17 @@ impl SettingsCx {
         self.config
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
+        let provider_is_unchanged = self
+            .original_config
+            .providers
+            .get(&s.provider_id)
+            .is_some_and(|original| provider_entries_equal(original, s.entry.as_ref()));
         match self.save_config() {
+            // A no-op save has no daemon effect to settle. Reporting it as
+            // pending would leave the Models/Headers sub-pages permanently
+            // on "saving provider…" even though their visible state is
+            // already authoritative.
+            Ok(()) if provider_is_unchanged => Some("saved".to_string()),
             Ok(()) => Some("saving provider…".to_string()),
             Err(error) => {
                 match previous {

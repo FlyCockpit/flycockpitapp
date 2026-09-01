@@ -1327,9 +1327,17 @@ impl PasteRegistry {
                 let at = buffer.len();
                 let tokens = count_text(&full);
                 let original_nonce = nonce.to_string();
+                // A snapshot proves which editor tag belongs to a pre-existing
+                // block. Its nonce is retained once; duplicated and supplied
+                // tags get fresh identities. The legacy helper has no snapshot
+                // to make that distinction, so it retains the well-formed tag
+                // identity it was given for its single round trip.
                 let (nonce, number) = match retained_text_numbers.remove(&original_nonce) {
                     Some(number) => (original_nonce, number),
-                    None => (original_nonce, registry.next_text_number()),
+                    None if snapshot.text_numbers_by_nonce.is_empty() => {
+                        (original_nonce, registry.next_text_number())
+                    }
+                    None => (Self::text_nonce(&full), registry.next_text_number()),
                 };
                 let (_id, placeholder) = registry.register_text_with_number_and_nonce(
                     at,

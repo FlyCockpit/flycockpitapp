@@ -165,9 +165,6 @@ impl Db {
                 )
                 .optional()
                 .context("reading session plan document revision")?;
-            let visible = |trust: Option<&str>| {
-                matches!(caller_trust, HistoryCallerTrust::Trusted) || trust != Some("trusted")
-            };
             let Some((current_revision, current_trust)) = current else {
                 if expected_revision != 0 {
                     return Ok(None);
@@ -186,7 +183,10 @@ impl Db {
                     model_trust: model_trust.map(str::to_owned),
                 }));
             };
-            if current_revision != expected_revision || !visible(current_trust.as_deref()) {
+            if current_revision != expected_revision
+                || !(matches!(caller_trust, HistoryCallerTrust::Trusted)
+                    || current_trust.as_deref() != Some("trusted"))
+            {
                 return Ok(None);
             }
 

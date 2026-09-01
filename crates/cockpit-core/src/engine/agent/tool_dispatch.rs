@@ -1251,9 +1251,14 @@ async fn execute_ordinary_call_unscoped(
     } else {
         None
     };
-    let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
-        && env.active_tools.call_availability(resolved_name)
-            != crate::engine::tool::ToolCallAvailability::NotAdvertised;
+    // Every syntactically valid provider call owns a durable lifecycle, even
+    // when it is rejected because the current tool surface does not advertise
+    // it.  In a scheduled mixed lane that rejected call is still a serial
+    // barrier, so omitting its `started` row makes the audit sequence diverge
+    // from the provider's source order.  `tool_rejected` remains the separate
+    // classification for the unavailable call; it is not a reason to erase
+    // the lifecycle attempt.
+    let lifecycle_started = placeholder_blocked || repair_outcome.valid;
     // Pin the AUTHORING model's frame inputs ONCE — its `(provider, model)`, the
     // config handle, and the pre-policy session table (captured as one Arc) — at
     // the authoring point, and reuse them for EVERY model-authored event AND the
@@ -2210,6 +2215,12 @@ async fn execute_ordinary_call_unscoped(
         .as_ref()
         .map(crate::agents::ContextPolicy::artifact_preview_lines)
         .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+    // A tool may explicitly retain a body even when it falls below the
+    // automatic spill threshold—for example, a host-capped result with a
+    // small but otherwise inaccessible tail.  The threshold controls only
+    // automatic capture of ordinary inline results, not the tool's explicit
+    // durable artifact contract.
+    let explicit_artifact_capture = artifact_capture.is_some();
     if artifact_capture.is_none()
         && canonical_result_is_text_only
         && result.as_ref().is_ok_and(|output| !output.truncated)
@@ -2225,7 +2236,7 @@ async fn execute_ordinary_call_unscoped(
             Some(capture),
             &output_str,
             recheck_modified_output,
-        ) && capture.content.len() > artifact_spill_bytes
+        ) && (explicit_artifact_capture || capture.content.len() > artifact_spill_bytes)
     });
 
     let truncated = matches!(

@@ -10666,7 +10666,14 @@ async fn remote_archive_unarchive_and_rename_reject_unknown_session_before_ledge
 #[cfg(feature = "remote")]
 async fn remote_archive_stops_worker_before_committing_archive() {
     let ctx = persistent_test_ctx();
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     insert_hung_worker(&ctx, session.session_id);
     let mut state = owner_state();
     let shared = state.shared_snapshot();
@@ -15045,9 +15052,7 @@ async fn attached_state_with_worker_receiver(
         .to_string_lossy()
         .into_owned();
     let project_root = project_root.to_str().unwrap().to_string();
-    let session_project_root = project_root.clone();
-    let session_row = ctx
-        .db
+    ctx.db
         .write(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
@@ -15055,20 +15060,19 @@ async fn attached_state_with_worker_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let mut row = crate::db::Db::build_new_session_row_conn(
-                conn,
-                "p",
-                &session_project_root,
-                "Build",
-            )?;
-            let selection = stub_active_model_ref();
-            row.provider = Some(selection.provider.clone());
-            row.model = Some(selection.model.clone());
-            row.model_selection_json = Some(serde_json::to_string(&selection)?);
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            Ok(())
         })
         .await
         .unwrap();
+    let session_row = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new(&project_root),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_model_selection(stub_active_model_ref()),
+    )
+    .await
+    .unwrap();
     let session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -16341,6 +16345,7 @@ fn dispatch_matrix_class_for_command(
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
         | ("pinned_message_state", "session_row_reader", false)
+        | ("read_assistant_inbox", "session_row_reader", false)
         | ("read_agent_tree", "session_row_reader", false)
         | ("read_agent_attention", "session_row_reader", false)
         | ("get_agent_effective_settings", "session_row_reader", false)
@@ -16533,9 +16538,29 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "attached response plus live session registration",
         },
         MutatingDispatchCase {
+            kind: "attach_knowledge_base_session",
+            effect_class: Durable,
+            observation: "knowledge-base attachment row is visible to later Dream source selection",
+        },
+        MutatingDispatchCase {
+            kind: "detach_knowledge_base_session",
+            effect_class: Durable,
+            observation: "knowledge-base attachment row is removed from later Dream source selection",
+        },
+        MutatingDispatchCase {
+            kind: "run_knowledge_dream",
+            effect_class: Durable,
+            observation: "typed ordered per-knowledge-base Dream run receipts",
+        },
+        MutatingDispatchCase {
             kind: "send_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::UserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "acknowledge_assistant_inbox_human_read",
+            effect_class: Durable,
+            observation: "idempotent durable human-read acknowledgement returns a typed receipt",
         },
         MutatingDispatchCase {
             kind: "send_user_message_bulk",
@@ -16601,6 +16626,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "send_now_queued_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::SendNowQueuedUserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "resume_from_compaction",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::ResumeFromCompaction is settled by the attached driver",
         },
         MutatingDispatchCase {
             kind: "resume_paused_work",
@@ -17254,6 +17284,8 @@ fn authz_allow(kind: &'static str) -> AuthzExpectation {
 fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
     match kind {
         "attach"
+        | "attach_knowledge_base_session"
+        | "detach_knowledge_base_session"
         | "subagent_transcript"
         | "cancel_attachment_upload"
         | "goal_status"
@@ -17269,6 +17301,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_write"
         | "fs_create_dir"
         | "read_session_messages"
+        | "read_assistant_inbox"
         | "read_client_submission_receipt"
         | "read_history_page"
         | "read_subagent_history_page"
@@ -17426,6 +17459,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_schedule"
         | "prune"
         | "compact"
+        | "resume_from_compaction"
         | "pin" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
@@ -17576,6 +17610,41 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "agent_installation_submit_choice"
         | "agent_installation_list"
         | "agent_installation_inspect" => AuthzAllowedOutcome::Response,
+        // Code-root capability probes deliberately use fresh, unknown opaque
+        // authorities. The owner reaches the handler, which rejects the
+        // forged authority after the central owner gate.
+        "attach_existing_code_root_v1"
+        | "close_code_root_attachment_v1"
+        | "attach_existing_code_root_with_acp_ingress_v1"
+        | "close_acp_code_root_attachment_v1"
+        | "read_code_root_v1"
+        | "read_code_root_deliveries_v1"
+        | "ack_code_root_deliveries_v1"
+        | "resolve_code_root_interrupt_v1"
+        | "execute_storage_cleanup"
+        | "set_primary_assistant_soul_edit_mode" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // Root creation requires a configured model; the matrix daemon is
+        // intentionally model-less. Discovery and the owner configuration /
+        // storage read paths remain fully typed on an empty daemon.
+        "create_code_root_v1"
+        | "create_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        "discover_code_roots_v1"
+        | "set_workspace_history_scope"
+        | "get_workspace_history_scope"
+        | "get_storage_report"
+        | "preview_storage_cleanup"
+        | "cancel_all_session_work"
+        | "exit_guard_status"
+        | "release_exit_guard" => AuthzAllowedOutcome::Response,
+        // The authz probe intentionally uses an unknown inbox item. Reaching
+        // the writer handler must therefore fail after authorization rather
+        // than manufacture a durable acknowledgement.
+        "acknowledge_assistant_inbox_human_read" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Internal)
+        }
+        "knowledge_dream_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "promote_to_persistent" => AuthzAllowedOutcome::Error(ErrorCode::Unavailable),
+        "run_knowledge_dream" => AuthzAllowedOutcome::Response,
         // `docs_ask` is authorized for the owner but then resolves workspace
         // trust for its (project_root:None ⇒ daemon canonical cwd) workspace,
         // which the ephemeral matrix daemon never trusts — so it fails closed
@@ -17614,7 +17683,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
     vec![
         authz_session_reader("attach"),
         authz_session_reader("subagent_transcript"),
+        authz_session_writer("attach_knowledge_base_session"),
+        authz_session_writer("detach_knowledge_base_session"),
         authz_session_writer("send_user_message"),
+        authz_session_writer("acknowledge_assistant_inbox_human_read"),
         authz_bulk_user_message(),
         authz_session_writer("steer_delegation"),
         authz_session_writer("begin_attachment_upload"),
@@ -17700,6 +17772,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_terminal("lsp_control"),
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
+        authz_session_reader("read_assistant_inbox"),
         authz_session_reader("read_client_submission_receipt"),
         authz_session_reader("read_history_page"),
         authz_session_reader("read_subagent_history_page"),
@@ -17744,6 +17817,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("cancel_schedule"),
         authz_session_writer("prune"),
         authz_session_writer("compact"),
+        authz_session_writer("resume_from_compaction"),
         authz_session_writer("pin"),
         #[cfg(feature = "remote")]
         authz_owner_only("store_flycockpit_credential"),
@@ -17875,6 +17949,35 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
         authz_owner_only("get_local_operation_settlement"),
+        // Owner-only local-control RPCs added with Code roots, workspace
+        // history consent, storage cleanup, and the attached-session exit
+        // guard. Keep these in the socket authorization inventory: their
+        // product-domain handlers are intentionally heterogeneous, but each
+        // still has to traverse the same owner gate before it can fail or
+        // return its typed result.
+        authz_owner_only("create_code_root_v1"),
+        authz_owner_only("attach_existing_code_root_v1"),
+        authz_owner_only("close_code_root_attachment_v1"),
+        authz_owner_only("create_code_root_with_acp_ingress_v1"),
+        authz_owner_only("attach_existing_code_root_with_acp_ingress_v1"),
+        authz_owner_only("close_acp_code_root_attachment_v1"),
+        authz_owner_only("discover_code_roots_v1"),
+        authz_owner_only("read_code_root_v1"),
+        authz_owner_only("read_code_root_deliveries_v1"),
+        authz_owner_only("ack_code_root_deliveries_v1"),
+        authz_owner_only("resolve_code_root_interrupt_v1"),
+        authz_owner_only("knowledge_dream_status"),
+        authz_owner_only("run_knowledge_dream"),
+        authz_owner_only("set_workspace_history_scope"),
+        authz_owner_only("get_workspace_history_scope"),
+        authz_owner_only("get_storage_report"),
+        authz_owner_only("preview_storage_cleanup"),
+        authz_owner_only("execute_storage_cleanup"),
+        authz_owner_only("cancel_all_session_work"),
+        authz_owner_only("promote_to_persistent"),
+        authz_owner_only("exit_guard_status"),
+        authz_owner_only("release_exit_guard"),
+        authz_owner_only("set_primary_assistant_soul_edit_mode"),
     ]
 }
 
@@ -18723,6 +18826,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_schedule"
             | "prune"
             | "compact"
+            | "resume_from_compaction"
             | "pin"
             | "refresh_env"
             | "refresh_config"
@@ -18732,6 +18836,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_media_upload"
             | "finalize_media_upload"
             | "discard_unreferenced_media_attachment"
+            | "cancel_all_session_work"
     )
         // Both kinds gate on `require_attached` before doing any work, in every
         // build profile — the prelude must attach wherever the level can attach
@@ -18754,7 +18859,8 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             kind,
             "read_agent_tree" | "read_agent_attention" | "get_agent_effective_settings"
         ) && level.can_attach())
-        || (kind == "lsp_control" && level.can_write())
+        || (matches!(kind, "lsp_control" | "exit_guard_status" | "release_exit_guard")
+            && level.can_write())
 }
 
 #[cfg(unix)]
@@ -18834,10 +18940,182 @@ fn authz_media_mutation_request(kind: &str) -> Request {
 }
 
 #[cfg(unix)]
+fn authz_opaque_id() -> proto::OpaqueAsciiId128V1 {
+    proto::OpaqueAsciiId128V1::new(Uuid::now_v7().to_string())
+        .expect("generated authz matrix id is valid opaque ASCII")
+}
+
+#[cfg(unix)]
+fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
+    proto::AcpForwardedMcpIngressV1 {
+        version: proto::ACP_FORWARDED_MCP_VERSION_V1,
+        declarations: Vec::new(),
+        client_provenance_id: authz_opaque_id(),
+        ingress_request_id: authz_opaque_id(),
+    }
+}
+
+#[cfg(unix)]
 fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
     let root = project_root.to_string_lossy().into_owned();
     match kind {
+        "create_code_root_v1" => proto::create_code_root_v1_request(
+            root,
+            None,
+            false,
+            false,
+            None,
+            proto::PROTOCOL_VERSION,
+            None,
+            Default::default(),
+        ),
+        "attach_existing_code_root_v1" => proto::attach_existing_code_root_v1_request(
+            session_id,
+            None,
+            None,
+            false,
+            false,
+            None,
+            proto::PROTOCOL_VERSION,
+            None,
+            Default::default(),
+        ),
+        "close_code_root_attachment_v1" => {
+            Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                client_request_id: authz_opaque_id(),
+            })
+        }
+        "create_code_root_with_acp_ingress_v1" => {
+            let Request::CreateCodeRootV1(base) = proto::create_code_root_v1_request(
+                root,
+                None,
+                false,
+                false,
+                None,
+                proto::PROTOCOL_VERSION,
+                None,
+                Default::default(),
+            ) else {
+                unreachable!("Code-root helper returns its documented request variant")
+            };
+            Request::CreateCodeRootWithAcpIngressV1(proto::CreateCodeRootWithAcpIngressV1Request {
+                base,
+                ingress: authz_acp_ingress(),
+            })
+        }
+        "attach_existing_code_root_with_acp_ingress_v1" => {
+            let Request::AttachExistingCodeRootV1(base) =
+                proto::attach_existing_code_root_v1_request(
+                    session_id,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    proto::PROTOCOL_VERSION,
+                    None,
+                    Default::default(),
+                )
+            else {
+                unreachable!("Code-root helper returns its documented request variant")
+            };
+            Request::AttachExistingCodeRootWithAcpIngressV1(
+                proto::AttachExistingCodeRootWithAcpIngressV1Request {
+                    base,
+                    ingress: authz_acp_ingress(),
+                },
+            )
+        }
+        "close_acp_code_root_attachment_v1" => {
+            Request::CloseAcpCodeRootAttachmentV1(proto::CloseAcpCodeRootAttachmentV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                client_request_id: authz_opaque_id(),
+            })
+        }
+        "discover_code_roots_v1" => {
+            Request::DiscoverCodeRootsV1(proto::DiscoverCodeRootsV1Request {
+                workspace_selector: Some(proto::CodeRootWorkspaceSelectorV1 { path: root }),
+                logical_client_id: authz_opaque_id(),
+                cursor: None,
+                limit: 1,
+            })
+        }
+        "read_code_root_v1" => Request::ReadCodeRootV1(proto::ReadCodeRootV1Request {
+            attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                Uuid::now_v7(),
+            ),
+        }),
+        "read_code_root_deliveries_v1" => {
+            Request::ReadCodeRootDeliveriesV1(proto::ReadCodeRootDeliveriesV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                after: None,
+                limit: 1,
+            })
+        }
+        "ack_code_root_deliveries_v1" => {
+            Request::AckCodeRootDeliveriesV1(proto::AckCodeRootDeliveriesV1Request {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                through: proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::now_v7()),
+                client_request_id: authz_opaque_id(),
+            })
+        }
+        "resolve_code_root_interrupt_v1" => {
+            Request::ResolveCodeRootInterruptV1(proto::ResolveCodeRootInterruptV1 {
+                attachment_capability: proto::CodeRootAttachmentCapabilityV1::from_daemon_random(
+                    Uuid::now_v7(),
+                ),
+                attention_id: authz_opaque_id(),
+                client_request_id: authz_opaque_id(),
+                selected_choice: authz_opaque_id(),
+            })
+        }
+        "knowledge_dream_status" => Request::KnowledgeDreamStatus {
+            project_root: root,
+            knowledge_base_id: "missing-kb".into(),
+        },
+        "run_knowledge_dream" => Request::RunKnowledgeDream {
+            project_root: root,
+            knowledge_base_id: None,
+            no_sandbox: false,
+        },
+        "set_workspace_history_scope" => Request::SetWorkspaceHistoryScope {
+            project_root: root,
+            outbound: true,
+            inbound: true,
+        },
+        "get_workspace_history_scope" => Request::GetWorkspaceHistoryScope { project_root: root },
+        "get_storage_report" => Request::GetStorageReport,
+        "preview_storage_cleanup" => Request::PreviewStorageCleanup {
+            target: proto::StorageCleanupTarget::ArchiveSessionsOlderThan {
+                age_days: 30,
+                include_renamed_or_pinned: false,
+            },
+        },
+        "execute_storage_cleanup" => Request::ExecuteStorageCleanup {
+            preview_id: Uuid::now_v7(),
+        },
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
+        "promote_to_persistent" => Request::PromoteToPersistent,
+        "exit_guard_status" => Request::ExitGuardStatus,
+        "release_exit_guard" => Request::ReleaseExitGuard,
         "attach" => attach_existing_request(session_id, project_root),
+        "attach_knowledge_base_session" => Request::AttachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id,
+        },
+        "detach_knowledge_base_session" => Request::DetachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id,
+        },
         "subagent_transcript" => Request::SubagentTranscript {
             session_id,
             task_call_id: "task-1".into(),
@@ -18876,6 +19154,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             forced_skill: None,
             delivery_class_override: None,
             run_invocation_options: None,
+        },
+        "acknowledge_assistant_inbox_human_read" => Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id: session_id,
+            inbox_item_ids: vec![Uuid::new_v4()],
         },
         "steer_delegation" => Request::SteerDelegation {
             session_id,
@@ -19181,6 +19463,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             before_seq: None,
             limit: 20,
         },
+        "read_assistant_inbox" => Request::ReadAssistantInbox {
+            main_session_id: session_id,
+            include_delivered: false,
+            limit: 20,
+        },
         "read_client_submission_receipt" => Request::ReadClientSubmissionReceipt {
             session_id,
             client_submission_id: Uuid::now_v7(),
@@ -19355,6 +19642,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember".into(),
         },
@@ -20313,7 +20601,14 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::SessionLiveStatus => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+                let session = Session::insert_row_for_test(
+                    &ctx.db,
+                    Path::new("/repo"),
+                    "Build",
+                    crate::session::TestSessionRowOptions::default(),
+                )
+                .await
+                .unwrap();
                 insert_hung_worker(&ctx, session.session_id);
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -20988,6 +21283,29 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
             };
             assert!(ctx.registry.live_handle(session_id).is_some());
         }
+        "attach_knowledge_base_session" | "detach_knowledge_base_session" => {
+            assert_knowledge_base_session_mutating_happy(case.kind).await;
+        }
+        "run_knowledge_dream" => {
+            let ctx = test_ctx();
+            let project = tempfile::tempdir().unwrap();
+            let response = dispatch_matrix_request(
+                &ctx,
+                Request::RunKnowledgeDream {
+                    project_root: project.path().to_string_lossy().into_owned(),
+                    knowledge_base_id: None,
+                    no_sandbox: false,
+                },
+            )
+            .await
+            .expect("empty Dream configuration returns ordered receipts");
+            assert!(
+                matches!(response, Response::KnowledgeDreamRuns { results } if results.is_empty())
+            );
+        }
+        "acknowledge_assistant_inbox_human_read" => {
+            assert_assistant_inbox_human_read_happy().await;
+        }
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -21140,6 +21458,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "cancel_schedule"
         | "prune"
         | "compact"
+        | "resume_from_compaction"
         | "pin" => assert_worker_delivery_happy(case.kind).await,
         "cancel_run_invocation" => {
             let ctx = test_ctx();
@@ -21221,6 +21540,51 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .expect_err("unknown attach session");
             assert_eq!(err.code, ErrorCode::UnknownSession);
             assert!(ctx.registry.active_session_ids().is_empty());
+        }
+        "attach_knowledge_base_session" | "detach_knowledge_base_session" => {
+            let ctx = test_ctx();
+            let request = if case.kind == "attach_knowledge_base_session" {
+                Request::AttachKnowledgeBaseSession {
+                    knowledge_base_id: "kb".into(),
+                    session_id: Uuid::new_v4(),
+                }
+            } else {
+                Request::DetachKnowledgeBaseSession {
+                    knowledge_base_id: "kb".into(),
+                    session_id: Uuid::new_v4(),
+                }
+            };
+            let err = dispatch_matrix_request(&ctx, request)
+                .await
+                .expect_err("unknown knowledge-base attachment session is rejected");
+            assert_eq!(err.code, ErrorCode::UnknownSession);
+        }
+        "run_knowledge_dream" => {
+            let ctx = test_ctx();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::RunKnowledgeDream {
+                    project_root: String::new(),
+                    knowledge_base_id: Some("missing-kb".into()),
+                    no_sandbox: true,
+                },
+            )
+            .await
+            .expect_err("unknown Dream knowledge base is rejected");
+            assert_eq!(err.code, ErrorCode::BadRequest);
+        }
+        "acknowledge_assistant_inbox_human_read" => {
+            let ctx = test_ctx();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::AcknowledgeAssistantInboxHumanRead {
+                    main_session_id: Uuid::new_v4(),
+                    inbox_item_ids: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("empty human-read acknowledgement is rejected before persistence");
+            assert_eq!(err.code, ErrorCode::BadRequest);
         }
         "begin_attachment_upload"
         | "upload_attachment_chunk"
@@ -21360,6 +21724,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "cancel_schedule"
         | "prune"
         | "compact"
+        | "resume_from_compaction"
         | "pin" => assert_attached_required_malformed(case.kind).await,
         "steer_delegation" => assert_steer_delegation_malformed().await,
         "set_caffeinate" => {
@@ -21482,9 +21847,7 @@ async fn live_worker_with_receiver(
         .to_string_lossy()
         .into_owned();
     let project_root = project_root.to_str().unwrap().to_string();
-    let session_project_root = project_root.clone();
-    let row = ctx
-        .db
+    ctx.db
         .write(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
@@ -21492,20 +21855,19 @@ async fn live_worker_with_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let mut row = crate::db::Db::build_new_session_row_conn(
-                conn,
-                "p",
-                &session_project_root,
-                "Build",
-            )?;
-            let selection = stub_active_model_ref();
-            row.provider = Some(selection.provider.clone());
-            row.model = Some(selection.model.clone());
-            row.model_selection_json = Some(serde_json::to_string(&selection)?);
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            Ok(())
         })
         .await
         .unwrap();
+    let row = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new(&project_root),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_model_selection(stub_active_model_ref()),
+    )
+    .await
+    .unwrap();
     let session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -22101,6 +22463,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(job_id, "job-1");
                 }
                 ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
+                ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
+                    respond_to
+                        .send(Ok(()))
+                        .expect("settle resume compaction work");
+                }
                 ("pin", SessionWork::Pin { text }) => {
                     assert_eq!(text, "remember this");
                 }
@@ -22422,6 +22789,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
@@ -22640,6 +23008,77 @@ async fn assert_attachment_mutating_happy(kind: &str) {
         .await
         .expect("server task joins")
         .expect("server task succeeds");
+}
+
+#[cfg(unix)]
+async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let project_root = root.path().to_string_lossy().into_owned();
+    let project_id = crate::session::project_id_for(root.path()).unwrap();
+    let session = ctx
+        .db
+        .create_session(&project_id, &project_root, "Build")
+        .await
+        .unwrap();
+    if kind == "detach_knowledge_base_session" {
+        ctx.db
+            .attach_session_to_knowledge_base("kb", &project_root, session.session_id)
+            .await
+            .unwrap();
+    }
+    let request = if kind == "attach_knowledge_base_session" {
+        Request::AttachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id: session.session_id,
+        }
+    } else {
+        Request::DetachKnowledgeBaseSession {
+            knowledge_base_id: "kb".into(),
+            session_id: session.session_id,
+        }
+    };
+    let response = dispatch_matrix_request(&ctx, request)
+        .await
+        .expect("knowledge-base session attachment mutation");
+    assert!(matches!(response, Response::Ack));
+    let attached: i64 = ctx
+        .db
+        .read(move |conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM knowledge_base_session_attachments
+                 WHERE kb_id = ?1 AND project_root = ?2 AND session_id = ?3",
+                rusqlite::params!["kb", project_root, session.session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        attached,
+        (kind == "attach_knowledge_base_session") as i64,
+        "knowledge-base attachment mutation must durably change its exact row"
+    );
+}
+
+#[cfg(unix)]
+async fn assert_assistant_inbox_human_read_happy() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id: session.session_id,
+            // An already-settled (or unknown) id is intentionally an
+            // idempotent acknowledgement, but still traverses the durable
+            // owner-bound mutation path.
+            inbox_item_ids: vec![Uuid::new_v4()],
+        },
+    )
+    .await
+    .expect("idempotent human-read acknowledgement");
+    assert!(matches!(response, Response::Ack));
 }
 
 #[cfg(unix)]
@@ -24229,11 +24668,14 @@ async fn assert_curator_mutating_happy() {
 async fn assert_session_db_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     match kind {
         "archive_session" => {
             let response = dispatch_matrix_request(
@@ -25331,6 +25773,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "pinned_message_state",
         "read_agent_attention",
         "read_agent_tree",
+        "read_assistant_inbox",
         "read_bulk_transfer_chunk",
         "read_redacted_export_chunk",
         "read_client_submission_receipt",
@@ -25345,6 +25788,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_packages",
         "list_failed_tool_calls",
         "get_session_compactions",
+        "get_storage_report",
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
@@ -25557,6 +26001,17 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 limit: 20,
             },
             kind: "read_session_messages",
+            session_id: Some(transcript_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReadAssistantInbox {
+                main_session_id: transcript_session_id,
+                include_delivered: false,
+                limit: 20,
+            },
+            kind: "read_assistant_inbox",
             session_id: Some(transcript_session_id),
             audit_path: None,
             mutating: false,
@@ -28805,13 +29260,17 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     // V2 resolves attachment identities through durable typed-media storage.
     // Provision it so acceptance and the later worker delivery use the same
     // retained component.
-    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
-        crate::media_storage::MediaStorageRecovery::open_or_create(
-            db,
-            &media_dir.path().join("media"),
-        )
-        .unwrap(),
-    ));
+    {
+        let context = Arc::get_mut(&mut ctx).unwrap();
+        context.paths.ephemeral = false;
+        context.media_storage_recovery = Some(Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(
+                db,
+                &media_dir.path().join("media"),
+            )
+            .unwrap(),
+        ));
+    }
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
@@ -28856,43 +29315,56 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     };
     assert_eq!(submission.client_submissions[0].id, first_id);
 
-    // Dropping the worker response is a post-accept handoff failure. The V2
-    // receipt is terminalized before the caller receives its deterministic
-    // rejection; immutable media remains reusable by a different submission.
+    // Dropping the worker response is an ambiguous post-accept handoff
+    // failure. Dispatch must leave the durable receipt accepted so an exact
+    // retry can reuse the same immutable identity without admitting a second
+    // durable execution.
     drop(respond_to);
     let (mut state, result) = first.await.unwrap();
-    let error = result.expect_err("lost worker response is durably rejected");
-    assert_eq!(error.code, ErrorCode::UserMessageTerminated);
-    let terminal = ctx
+    let error = result.expect_err("lost worker response is surfaced to the caller");
+    assert_eq!(error.code, ErrorCode::Internal);
+    let accepted = ctx
         .db
         .message_receipt_status(session_id, *first_operation_id.as_bytes())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(terminal.state, "terminal_rejected");
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.client_submission_id, *first_id.as_bytes());
+    assert_eq!(accepted.attachments.len(), 1);
+    assert_eq!(
+        accepted.attachments[0].attachment_id,
+        *image_ref.attachment_id.as_bytes()
+    );
+    assert_eq!(
+        accepted.attachments[0].attachment_version,
+        image_ref.attachment_version
+    );
+    assert_eq!(accepted.attachments[0].checksum, image_ref.checksum);
+    let accepted_queue = ctx.db.accepted_message_queue(session_id).await.unwrap();
+    assert_eq!(accepted_queue.len(), 1);
+    assert_eq!(accepted_queue[0].queue_item_id, *first_id.as_bytes());
+    assert_eq!(accepted_queue[0].client_submission_id, *first_id.as_bytes());
     assert_durable_attachment_persists(&ctx, image_ref.attachment_id).await;
 
-    let competing_ctx = ctx.clone();
-    let competing_request = request(Uuid::now_v7(), Uuid::now_v7());
-    let competing = tokio::spawn(async move {
-        let result = handle_request(competing_request, &mut state, &competing_ctx).await;
+    let retry_ctx = ctx.clone();
+    let retry_request = request(first_operation_id, first_id);
+    let retry = tokio::spawn(async move {
+        let result = handle_request(retry_request, &mut state, &retry_ctx).await;
         (state, result)
     });
     let SessionWork::UserMessage {
         submission,
         respond_to,
         ..
-    } = work_rx
-        .recv()
-        .await
-        .expect("competing request reaches worker")
+    } = work_rx.recv().await.expect("exact retry reaches worker")
     else {
-        panic!("expected competing UserMessage work");
+        panic!("expected retry UserMessage work");
     };
+    assert_eq!(submission.client_submissions[0].id, first_id);
     assert_same_durable_png_pixels(&submission.media[0], &sample_png());
-    let competing_id = submission.client_submissions[0].id;
     let item = proto::QueueItem {
-        id: competing_id,
+        id: first_id,
         status: proto::QueueItemStatus::Folding,
         text: submission.text.clone(),
         display_text: submission.display_text.clone(),
@@ -28901,16 +29373,35 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
         send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
-    let (mut state, competing) = competing.await.unwrap();
-    assert!(matches!(
-        competing.unwrap(),
-        Response::UserMessageQueued { .. }
-    ));
+    let (_state, retry) = retry.await.unwrap();
+    assert!(matches!(retry.unwrap(), Response::UserMessageQueued { .. }));
 
-    let retry_result = handle_request(request(first_operation_id, first_id), &mut state, &ctx)
+    let accepted = ctx
+        .db
+        .message_receipt_status(session_id, *first_operation_id.as_bytes())
         .await
-        .expect_err("same-UUID retry replays the durable terminal rejection");
-    assert_eq!(retry_result.code, ErrorCode::UserMessageTerminated);
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.client_submission_id, *first_id.as_bytes());
+    assert_eq!(accepted.attachments.len(), 1);
+    assert_eq!(
+        accepted.attachments[0].attachment_id,
+        *image_ref.attachment_id.as_bytes()
+    );
+    assert_eq!(
+        accepted.attachments[0].attachment_version,
+        image_ref.attachment_version
+    );
+    assert_eq!(accepted.attachments[0].checksum, image_ref.checksum);
+    let accepted_queue = ctx.db.accepted_message_queue(session_id).await.unwrap();
+    assert_eq!(
+        accepted_queue.len(),
+        1,
+        "exact retry must not admit duplicate execution"
+    );
+    assert_eq!(accepted_queue[0].queue_item_id, *first_id.as_bytes());
+    assert_eq!(accepted_queue[0].client_submission_id, *first_id.as_bytes());
 }
 
 #[tokio::test]
@@ -32340,11 +32831,15 @@ async fn serialized_requests_apply_in_receipt_order() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -32920,11 +33415,15 @@ async fn attach_replay_precedes_live_events_under_task_split() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -33016,11 +33515,15 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -33689,7 +34192,14 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
 async fn delete_live_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
     let err = handle_request(
@@ -33719,7 +34229,14 @@ async fn delete_live_session_timeout_leaves_row_intact() {
 async fn archive_live_session_timeout_leaves_row_unarchived() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
     let err = handle_request(
@@ -33748,7 +34265,14 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
 async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let parent = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     let side = ctx
         .db
         .create_ephemeral_fork(parent.session_id, None)
@@ -33823,11 +34347,14 @@ async fn btw_concurrent_with_parent_turn() {
     let mut ctx = test_ctx();
     attach_fake_secure_key_actor(&mut ctx).await;
     let tmp = tempfile::tempdir().unwrap();
-    let parent_row = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let parent_row = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     let parent_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34056,11 +34583,15 @@ async fn btw_rehydrate_reports_live_fork() {
         )
         .await
         .unwrap();
-    let parent = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let parent = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let created = ctx
         .db
         .create_btw_fork(parent.session_id, true)
@@ -34117,7 +34648,14 @@ async fn btw_rehydrate_reports_live_fork() {
 async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let root = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let root = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
     let child = ctx.db.create_fork(root.session_id, None).await.unwrap();
     insert_hung_worker(&ctx, child.session_id);
 
@@ -34209,11 +34747,14 @@ async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
         )
         .await
         .expect("trust workspace");
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .expect("create session");
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .expect("create session");
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34447,11 +34988,15 @@ async fn attach_replays_drain_state_after_attached_response() {
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let live_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34540,11 +35085,15 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
         )
         .await
         .unwrap();
-    let session = ctx
-        .db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .await
-        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
     let seq1 = ctx
         .db
         .insert_session_event(

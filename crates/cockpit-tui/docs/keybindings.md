@@ -147,6 +147,8 @@ Box-level `[send now] [steer all\|hold all] [edit] [cancel]` also sit on the top
 | --- | --- | --- |
 | `↑/↓` | move | highlight a session |
 | `Enter` | resume | resume the highlighted session |
+| `i` | inbox source | open the latest assistant inbox source thread |
+| `n` | inbox | show notify and pending assistant inbox entries |
 | `→/l` | forks | descend into a session's forks |
 | `←/h` | back | ascend to the parent level |
 | `a` | archived | toggle showing archived sessions |

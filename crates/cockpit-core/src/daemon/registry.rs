@@ -757,7 +757,7 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.persistent_service_transition)
     }
 
-    pub fn set_media_storage_recovery(
+    pub(crate) fn set_media_storage_recovery(
         &self,
         recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     ) {
@@ -3537,11 +3537,13 @@ mod tests {
                 .expect("stop assistant worker")
         );
 
+        let project_id = crate::session::project_id_for(&workspace)
+            .expect("durable resume fixture project identity");
         let persisted = reg
             .inner
             .db
             .create_session(
-                "provider",
+                &project_id,
                 workspace.to_str().expect("workspace UTF-8"),
                 "Build",
             )
@@ -3606,10 +3608,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let project_id = crate::session::project_id_for(&project)
+            .expect("durable resume fixture project identity");
         let persisted = reg
             .inner
             .db
-            .create_session("provider", project.to_str().unwrap(), "Build")
+            .create_session(&project_id, project.to_str().unwrap(), "Build")
             .await
             .unwrap();
         let error = reg

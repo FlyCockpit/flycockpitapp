@@ -5,8 +5,8 @@
 //! `Install*` / `Release*` lifecycle APIs.
 
 use cockpit_proto::{
-    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpTransportV1,
-    AcpNameValuePairV1, OpaqueAsciiId128V1,
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpNameValuePairV1,
+    AcpForwardedMcpTransportV1, OpaqueAsciiId128V1,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -133,10 +133,10 @@ fn declaration_from_dto(server: &McpServerDto) -> AcpForwardedMcpDeclarationV1 {
     }
 }
 
-fn pairs(pairs: &[NameValueDto]) -> Vec<AcpNameValuePairV1> {
+fn pairs(pairs: &[NameValueDto]) -> Vec<AcpForwardedMcpNameValuePairV1> {
     pairs
         .iter()
-        .map(|pair| AcpNameValuePairV1 {
+        .map(|pair| AcpForwardedMcpNameValuePairV1 {
             name: pair.name.clone(),
             value: pair.value.clone(),
         })

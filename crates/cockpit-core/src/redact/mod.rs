@@ -2632,14 +2632,18 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/engine/verification/intercept.rs",
         "crates/cockpit-core/src/harness/run.rs",
         "crates/cockpit-core/src/knowledge.rs",
+        "crates/cockpit-core/src/knowledge/dream.rs",
         "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/session/recording.rs",
         "crates/cockpit-core/src/skills/auto_select/mod.rs",
+        "crates/cockpit-core/src/tools/edit.rs",
         "crates/cockpit-core/src/tools/read.rs",
         "crates/cockpit-core/src/tools/recall.rs",
+        "crates/cockpit-core/src/tools/session_search.rs",
         "crates/cockpit-core/src/tools/skill.rs",
+        "crates/cockpit-core/src/tools/write.rs",
     ];
 
     #[test]

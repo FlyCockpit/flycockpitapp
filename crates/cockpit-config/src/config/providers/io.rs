@@ -1453,6 +1453,18 @@ fn merge_changed_models(
     if original == requested {
         return;
     }
+    let requested_order = requested
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            model
+                .as_object()
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
     let original = models_by_id(original);
     let requested = models_by_id(requested);
     let current_models = current_provider
@@ -1497,6 +1509,25 @@ fn merge_changed_models(
             current_models.push(Value::Object(requested_model));
         }
     }
+
+    // Model order is user-visible (and fetches intentionally put the current
+    // upstream catalog before retained manual/unlisted entries). Preserve the
+    // requested order after applying field-level conflict resolution; any
+    // concurrent model the caller did not know about remains at the tail.
+    let mut ordered = Vec::with_capacity(current_models.len());
+    for id in requested_order {
+        if let Some(index) = current_models.iter().position(|model| {
+            model
+                .as_object()
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                == Some(id.as_str())
+        }) {
+            ordered.push(current_models.remove(index));
+        }
+    }
+    ordered.append(current_models);
+    *current_models = ordered;
 }
 
 fn models_by_id(value: Option<&Value>) -> BTreeMap<String, Map<String, Value>> {

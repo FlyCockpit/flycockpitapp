@@ -70,7 +70,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`; separate calls get task IDs, `batch` groups/depends_on work. Use @file/@dir or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
+            "Delegate {list}: `intent` plus optional `payload`; separate calls get task IDs, `batch` groups/depends_on work. Use @file, @file:XX-YY, @dir/, or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
         // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -132,6 +132,37 @@ impl TaskTool {
             },
             "required": ["kind"]
         });
+        // A seed carries the exact arguments for one bounded read-only tool.
+        // Keep the schema discriminated and closed rather than advertising a
+        // free-form object: Responses strict mode rejects open objects, and
+        // the tool-specific schemas keep the model from inventing arguments
+        // that the implementation child could never replay.
+        let seed_read_items: Vec<Value> = [
+            ("read", crate::tools::read::ReadTool.parameters()),
+            ("grep", crate::tools::grep::GrepTool.parameters()),
+            ("code", crate::tools::intel::CodeTool.parameters()),
+            ("graph", crate::tools::intel::GraphTool.parameters()),
+            ("search", crate::tools::intel::SearchTool.parameters()),
+        ]
+        .into_iter()
+        .map(|(tool, args)| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string", "enum": [tool] },
+                    "args": args
+                },
+                "required": ["tool", "args"],
+                "additionalProperties": false
+            })
+        })
+        .collect();
+        let seed_reads_schema = serde_json::json!({
+            "type": "array",
+            "maxItems": 32,
+            "description": "Fresh read-only calls selected by explore; implementation child executes them before its first inference",
+            "items": { "anyOf": seed_read_items }
+        });
         let delegate_payload = serde_json::json!({
             "type": "object",
             "properties": {
@@ -176,20 +207,7 @@ impl TaskTool {
                     "items": { "type": "string" },
                     "description": "Extra tools"
                 },
-                "seed_reads": {
-                    "type": "array",
-                    "maxItems": 32,
-                    "description": "Fresh read-only calls selected by explore; implementation child executes them before its first inference",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "tool": { "type": "string", "enum": ["read", "grep", "code", "graph", "search"] },
-                            "args": { "type": "object" }
-                        },
-                        "required": ["tool", "args"],
-                        "additionalProperties": false
-                    }
-                },
+                "seed_reads": seed_reads_schema,
                 "seed_reads_receipt": {
                     "type": "string",
                     "description": "Opaque host-issued receipt paired with explore-selected seed_reads; copy unchanged"

@@ -106,6 +106,9 @@ async fn list_tools_for_entry(
 fn forwarded_catalog(
     host: &HostContext,
 ) -> Option<std::sync::Arc<super::forwarded::AcpForwardedMcpCatalogV1>> {
+    if !host.external_mcp_servers_allowed() {
+        return None;
+    }
     host.native_tool_ctx
         .as_ref()
         .and_then(|ctx| ctx.session.forwarded_mcp_catalog())
@@ -135,7 +138,24 @@ async fn list_tools_for_forwarded(
 }
 
 fn catalog_view(cfg: &McpConfig, host: &HostContext) -> EffectiveCatalog {
+    if !host.external_mcp_servers_allowed() {
+        return EffectiveCatalog::default();
+    }
     host.effective_catalog(cfg)
+}
+
+pub(crate) fn ensure_external_server_access(host: &HostContext, server: &str) -> Result<()> {
+    if !builtin::is_builtin_server(server) && !host.external_mcp_servers_allowed() {
+        bail!("external MCP server `{server}` requires the `mcp` grant")
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_external_server_host_access(host: &HostContext) -> Result<()> {
+    if let Some(ctx) = host.native_tool_ctx.as_ref() {
+        crate::knowledge::ensure_mcp_host_access(ctx).await?;
+    }
+    Ok(())
 }
 
 /// Fuzzy/keyword search over all enabled servers' tools.
@@ -146,6 +166,9 @@ fn catalog_view(cfg: &McpConfig, host: &HostContext) -> EffectiveCatalog {
 pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
     let mut hits = builtin::search(host, query);
+    if ensure_external_server_host_access(host).await.is_err() {
+        return cap_search_hits(hits);
+    }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
         let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
@@ -202,6 +225,9 @@ pub async fn grep_tool_names(
             });
         }
     }
+    if ensure_external_server_host_access(host).await.is_err() {
+        return Ok(cap_search_hits(hits));
+    }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
         let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
@@ -251,6 +277,9 @@ pub async fn grep_tool_definitions(
     for tool in builtin::available_descriptors(host) {
         push_definition_hit(&mut hits, &re, builtin::BUILTIN_SERVER_ID, &tool);
     }
+    if ensure_external_server_host_access(host).await.is_err() {
+        return Ok(cap_definition_hits(hits));
+    }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
         let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
@@ -288,6 +317,8 @@ pub async fn describe(
     if builtin::is_builtin_server(server) {
         return builtin::describe(host, tool);
     }
+    ensure_external_server_access(host, server)?;
+    ensure_external_server_host_access(host).await?;
     if let Some(epoch) = forwarded_catalog(host)
         && let Some(entry) = epoch.entry(server)
     {
@@ -404,6 +435,8 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
+    ensure_external_server_access(host, server)?;
+    ensure_external_server_host_access(host).await?;
     if let Some(epoch) = forwarded_catalog(host)
         && let Some(entry) = epoch.entry(server)
     {
@@ -806,6 +839,12 @@ for line in sys.stdin:
         }
     }
 
+    fn cached_stdio_cfg(script: &std::path::Path) -> ServerConfig {
+        let mut cfg = stdio_cfg(script);
+        cfg.cache_ttl_secs = 3600;
+        cfg
+    }
+
     fn local_kb_entry() -> KnowledgeBaseRegistryEntry {
         KnowledgeBaseRegistryEntry::new(
             "private".to_string(),
@@ -865,6 +904,16 @@ for line in sys.stdin:
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         HostContext::from_tool_ctx(&ctx)
+    }
+
+    async fn prime_external_descriptor_cache(name: &str, cfg: &ServerConfig) {
+        let primed = list_tools_cached_with_context(name, cfg, McpConnectContext::yolo_for_tests())
+            .await
+            .unwrap();
+        assert!(
+            !primed.is_empty(),
+            "cache priming should fetch the external descriptor first"
+        );
     }
 
     #[tokio::test]
@@ -968,6 +1017,131 @@ for line in sys.stdin:
             .to_string();
 
         assert!(err.contains("configured local knowledge base"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_filters_external_hits_when_local_kb_blocks_mcp_host_access() {
+        let tmp = fake_stdio_server_with_tools(vec![ToolDescriptor {
+            name: "calendar_external".into(),
+            description: "External calendar".into(),
+            input_schema: Value::Null,
+        }]);
+        let script = tmp.path().join("fake-mcp.py");
+        let mut cfg = McpConfig::default();
+        let external = cached_stdio_cfg(&script);
+        cfg.servers.insert("external".into(), external.clone());
+        let builtin_tool = builtin::BuiltinFunction::new(
+            "calendar_builtin",
+            "Builtin calendar",
+            builtin::BuiltinPresentation {
+                glyph: "cal",
+                label: "calendar_builtin".to_string(),
+            },
+            Arc::new(|| serde_json::json!({"type": "object"})),
+            Arc::new(|_ctx| builtin::Availability::available()),
+            true,
+            Arc::new(|_ctx, _args| Box::pin(async { Ok(Value::Null) })),
+        );
+        prime_external_descriptor_cache("external", &external).await;
+        let host = host_with_local_kb(tempfile::tempdir().unwrap().path()).with_builtin_registry(
+            Arc::new(builtin::BuiltinRegistry::from_functions(vec![builtin_tool])),
+        );
+
+        let hits = search(&cfg, &host, "calendar").await;
+        let names = hits
+            .iter()
+            .map(|hit| format!("{}.{}", hit.server, hit.tool))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["cockpit.calendar_builtin"]);
+    }
+
+    #[tokio::test]
+    async fn grep_tool_names_filters_external_hits_when_local_kb_blocks_mcp_host_access() {
+        let tmp = fake_stdio_server_with_tools(vec![ToolDescriptor {
+            name: "calendar_external".into(),
+            description: "External calendar".into(),
+            input_schema: Value::Null,
+        }]);
+        let script = tmp.path().join("fake-mcp.py");
+        let mut cfg = McpConfig::default();
+        let external = cached_stdio_cfg(&script);
+        cfg.servers.insert("external".into(), external.clone());
+        let builtin_tool = builtin::BuiltinFunction::new(
+            "calendar_builtin",
+            "Builtin calendar",
+            builtin::BuiltinPresentation {
+                glyph: "cal",
+                label: "calendar_builtin".to_string(),
+            },
+            Arc::new(|| serde_json::json!({"type": "object"})),
+            Arc::new(|_ctx| builtin::Availability::available()),
+            true,
+            Arc::new(|_ctx, _args| Box::pin(async { Ok(Value::Null) })),
+        );
+        prime_external_descriptor_cache("external", &external).await;
+        let host = host_with_local_kb(tempfile::tempdir().unwrap().path()).with_builtin_registry(
+            Arc::new(builtin::BuiltinRegistry::from_functions(vec![builtin_tool])),
+        );
+
+        let hits = grep_tool_names(&cfg, &host, "^calendar_").await.unwrap();
+        let names = hits
+            .iter()
+            .map(|hit| format!("{}.{}", hit.server, hit.tool))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["cockpit.calendar_builtin"]);
+    }
+
+    #[tokio::test]
+    async fn grep_tool_definitions_filters_external_hits_when_local_kb_blocks_mcp_host_access() {
+        let tmp = fake_stdio_server_with_tools(vec![ToolDescriptor {
+            name: "calendar_external".into(),
+            description: "External calendar".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "calendar_marker": { "type": "string" }
+                }
+            }),
+        }]);
+        let script = tmp.path().join("fake-mcp.py");
+        let mut cfg = McpConfig::default();
+        let external = cached_stdio_cfg(&script);
+        cfg.servers.insert("external".into(), external.clone());
+        let builtin_tool = builtin::BuiltinFunction::new(
+            "calendar_builtin",
+            "Builtin calendar",
+            builtin::BuiltinPresentation {
+                glyph: "cal",
+                label: "calendar_builtin".to_string(),
+            },
+            Arc::new(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "calendar_marker": { "type": "string" }
+                    }
+                })
+            }),
+            Arc::new(|_ctx| builtin::Availability::available()),
+            true,
+            Arc::new(|_ctx, _args| Box::pin(async { Ok(Value::Null) })),
+        );
+        prime_external_descriptor_cache("external", &external).await;
+        let host = host_with_local_kb(tempfile::tempdir().unwrap().path()).with_builtin_registry(
+            Arc::new(builtin::BuiltinRegistry::from_functions(vec![builtin_tool])),
+        );
+
+        let hits = grep_tool_definitions(&cfg, &host, "calendar_marker")
+            .await
+            .unwrap();
+        let names = hits
+            .iter()
+            .map(|hit| format!("{}.{}", hit.server, hit.tool))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["cockpit.calendar_builtin"]);
     }
 
     #[tokio::test]

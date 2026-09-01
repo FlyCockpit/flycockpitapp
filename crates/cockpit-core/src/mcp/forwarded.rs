@@ -538,7 +538,7 @@ fn platform_env_key(name: &str) -> String {
 
 fn validate_remote(
     raw_url: &str,
-    headers: &[cockpit_proto::AcpNameValuePairV1],
+    headers: &[cockpit_proto::AcpForwardedMcpNameValuePairV1],
 ) -> Result<AcpForwardedRemoteV1> {
     let url = super::transport::timeout::validate_remote_endpoint(raw_url)
         .map_err(|_| anyhow::anyhow!("acp_mcp_invalid_https_endpoint"))?;
@@ -772,7 +772,7 @@ mod tests {
                 name: "docs".to_string(),
                 transport: AcpForwardedMcpTransportV1::Http {
                     url: "https://example.com/mcp".to_string(),
-                    headers: vec![cockpit_proto::AcpNameValuePairV1 {
+                    headers: vec![cockpit_proto::AcpForwardedMcpNameValuePairV1 {
                         name: "Connection".to_string(),
                         value: "secret-value".to_string(),
                     }],

@@ -276,6 +276,12 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
 fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     let execution_kind = if matches!(name, "Computer" | "computer") {
         ExecutionKind::Computer
+    } else if name == "Dream" {
+        // Dream is a daemon-owned maintenance root, not a chat-owning
+        // assistant. Keeping it on the coding path prevents the Assistant
+        // default from demoting its required history_search tool to an
+        // unreachable discoverable MCP entry.
+        ExecutionKind::Coding
     } else if mode.is_chat_ownable() {
         ExecutionKind::Assistant
     } else {
@@ -539,7 +545,6 @@ fn builder_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
-            "grep",
             "write",
             "unlock",
             "edit",
@@ -586,8 +591,9 @@ fn builder_def() -> AgentDef {
     def
 }
 
-/// `explore` — read-only investigator, leaf in the invocation tree. Tool
-/// surface mirrors [`crate::engine::builtin::explore`].
+/// `explore` — read-only investigator, leaf in the invocation tree. It gets
+/// the universal Monty runtime but does not receive the external-MCP grant.
+/// Tool surface mirrors [`crate::engine::builtin::explore`].
 fn explore_def() -> AgentDef {
     def_with_normal(
         "explore",
@@ -602,7 +608,6 @@ fn explore_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
-            "mcp",
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
@@ -715,7 +720,7 @@ fn plan_def() -> AgentDef {
 
 /// `bee` — recursive, noninteractive, write-capable fan-out worker
 /// (GOALS §24/§26). `builder`'s write+intel surface plus `spawn` for deeper
-/// fan-out; no base MCP (parent-grantable). Tool surface mirrors
+/// fan-out; universal Monty runtime but no external-MCP grant. Tool surface mirrors
 /// [`crate::engine::builtin::bee`].
 fn bee_def() -> AgentDef {
     def_with_normal(
@@ -745,7 +750,7 @@ fn bee_def() -> AgentDef {
 }
 
 /// `Multireview` — hidden read-only primary reached only by `/multireview`.
-/// Grants `mcp` so its discoverable harness tools are reachable through the
+/// Its universal Monty runtime reaches discoverable harness tools through the
 /// MCP harness advert named by the role prompt.
 fn multireview_def() -> AgentDef {
     def_with_normal(

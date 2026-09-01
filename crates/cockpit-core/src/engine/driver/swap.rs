@@ -73,6 +73,12 @@ impl Driver {
                 ),
             )?;
         let mut args = self.spawn_args(true);
+        // The caller has already resolved the root's model against the
+        // current prepared route.  Rebuilding solely to attach the frozen KB
+        // prefix must not re-resolve that pinned definition through the
+        // outgoing foreground model.
+        args.model = agent.model.clone();
+        args.model_override = Some(agent.model.clone());
         args.knowledge_base_system_prefix = captured.system_prefix();
         let rebuilt = crate::engine::builtin::rebuild_from_pinned_definition(&agent, &args)?;
         self.session

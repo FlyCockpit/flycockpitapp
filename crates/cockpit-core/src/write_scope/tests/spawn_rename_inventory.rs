@@ -381,7 +381,7 @@ fn unrelated_output_dir_identifiers_remain_semantically_unchanged() {
     );
 
     // 2. The CLI manpage output directory is untouched.
-    let cli = read(repo_root().join("apps/cli/src/lib.rs"));
+    let cli = read(repo_root().join("apps").join("cli/src/lib.rs"));
     assert!(
         cli.contains("output_dir"),
         "the CLI manpage output directory variable must be left alone"

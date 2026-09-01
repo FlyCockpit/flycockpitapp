@@ -698,6 +698,7 @@ const APPROVED_BLOCKING_ADAPTERS: &[&str] = &[
     "discard_session_blocking",
     "list_sessions_blocking",
     "read_session_messages_blocking",
+    "read_assistant_inbox_blocking",
     "read_client_submission_receipt_blocking",
     "read_history_page_blocking",
     "read_subagent_history_page_blocking",
@@ -2489,7 +2490,9 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
             self.responder |= name.as_deref() == Some("serve_lifecycle_requests");
             if matches!(
                 name.as_deref(),
-                Some("new_composed" | "new_composed_with_session")
+                Some(
+                    "new_composed" | "new_composed_with_session" | "new_composed_with_session_mode"
+                )
             ) {
                 self.constructor |= !self.lifecycle_reassigned
                     && call.args.last().is_some_and(|argument| {
@@ -2689,8 +2692,15 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         "in-process shutdown must retain and join the supervisor thread"
     );
     let lifecycle_source = production_source(&read("crates/cockpit-core/src/daemon/client.rs"));
-    assert!(lifecycle_source.contains("futures::future::join_all"));
-    assert!(lifecycle_source.contains("for force in &force_handles"));
+    assert!(
+        lifecycle_source
+            .contains("run_owned_daemon(OwnedSessionMode::AttachOrEphemeral, operation).await"),
+        "foreground work must acquire the same discoverable ephemeral owner as TUI clients"
+    );
+    assert!(
+        !lifecycle_source.contains("boot_in_process("),
+        "foreground lifecycle must not hide work behind an in-process owner"
+    );
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(!settings.contains("serve_lifecycle_requests"));
     assert!(!settings.contains("LifecycleClient::channel"));

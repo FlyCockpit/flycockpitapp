@@ -1,5 +1,24 @@
 use super::*;
 
+#[test]
+fn auto_title_default_config_uses_session_model_metadata_fork() {
+    let default = crate::config::extended::ExtendedConfig::default();
+    assert!(default.auto_title_model_ref().is_none());
+    assert!(use_session_model_for_auto_title(&default));
+
+    let utility = crate::config::extended::ExtendedConfig {
+        utility_model: Some("test:utility".into()),
+        ..default.clone()
+    };
+    assert!(!use_session_model_for_auto_title(&utility));
+
+    let preferred_session = crate::config::extended::ExtendedConfig {
+        auto_title_with_session_model: true,
+        ..utility
+    };
+    assert!(use_session_model_for_auto_title(&preferred_session));
+}
+
 #[tokio::test]
 async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_schedule() {
     let (mut driver, tmp) = test_driver(1);
@@ -176,7 +195,10 @@ async fn stale_shadow_discarded() {
     install_test_providers(
         &mut driver,
         CacheMode::None,
-        ContextConfig::default(),
+        ContextConfig {
+            rolling_precompaction: false,
+            ..ContextConfig::default()
+        },
         10_000,
     );
     record_test_context_tokens(&driver, 7_600).await;

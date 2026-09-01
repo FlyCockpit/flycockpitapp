@@ -1200,21 +1200,21 @@ impl HostInputArbiter {
 
     /// Returns true if the given physical key currently has an active lease.
     pub fn is_held(&self, target_key: &PhysicalTargetKey) -> bool {
-        let key_str = Self::key_string(target_key);
-        self.current_lease.contains_key(&key_str)
+        self.current_lease
+            .values()
+            .any(|lease| lease.target_key == *target_key)
     }
 
     /// Returns the number of waiters queued for the given physical key.
     pub fn waiter_count(&self, target_key: &PhysicalTargetKey) -> usize {
-        let key_str = Self::key_string(target_key);
         self.queues
-            .get(&key_str)
-            .map(|q| {
-                q.iter()
-                    .filter(|w| !w.cancelled.load(std::sync::atomic::Ordering::Acquire))
-                    .count()
+            .values()
+            .flat_map(|waiters| waiters.iter())
+            .filter(|waiter| {
+                waiter.target_key == *target_key
+                    && !waiter.cancelled.load(std::sync::atomic::Ordering::Acquire)
             })
-            .unwrap_or(0)
+            .count()
     }
 
     /// Simulate owner death: release all leases held by the given owner
@@ -4240,7 +4240,12 @@ impl ComputerActionCoordinator {
     pub async fn close(&mut self) -> Result<(), ComputerError> {
         // Revoke Ask delegation leases for this delegation.
         self.revoke_ask_lease_for_delegation();
-        self.release_input_before_host_lease()
+        self.release_input_before_host_lease()?;
+        // `close` is the terminal owner of backend cleanup.  The coordinator
+        // is commonly dropped immediately afterwards, so leave the drop path
+        // unable to inject a second neutralization into the same backend.
+        self.input_cleanup_permitted = false;
+        Ok(())
     }
 
     /// Neutralize backend-owned key/button state before making the physical
@@ -6561,7 +6566,12 @@ mod tests {
         // the coordinator's key while the arbiter still records it as holder.
         {
             let mut external = shared_os.shared_clone();
-            external.release(&key);
+            external.release(
+                &coordinator
+                    .host_lease()
+                    .expect("host lease")
+                    .arbitration_key,
+            );
         }
 
         // Detection must not emit stale-owner cleanup. A competing process can
@@ -6963,7 +6973,7 @@ mod tests {
             second_events.lock().expect("event log").push("acquired");
             coordinator
         });
-        for _ in 0..10 {
+        for _ in 0..100 {
             if arbiter
                 .lock()
                 .expect("arbiter")
@@ -6972,7 +6982,7 @@ mod tests {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert_eq!(
             arbiter

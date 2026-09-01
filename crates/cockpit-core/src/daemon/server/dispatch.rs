@@ -5781,10 +5781,190 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             Ok(Response::Ack)
         }
-        Request::RunKnowledgeDream { .. } | Request::KnowledgeDreamStatus { .. } => {
-            Err(ErrorPayload {
-                code: ErrorCode::Unavailable,
-                message: "knowledge dream execution is not available in this daemon build".into(),
+        Request::RunKnowledgeDream {
+            project_root,
+            knowledge_base_id,
+            no_sandbox,
+        } => {
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &project_root,
+                )?;
+            let cwd = project_root.as_path();
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd)
+                    .await
+                    .map_err(internal)?;
+            let (providers, extended) = ctx
+                .config_source()
+                .load_effective_for_daemon(cwd, &trust_policy)
+                .map_err(daemon_config_error)?;
+            let knowledge_bases = match knowledge_base_id {
+                Some(knowledge_base_id) => vec![extended
+                    .knowledge_bases
+                    .iter()
+                    .find(|entry| entry.id == knowledge_base_id)
+                    .cloned()
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: format!(
+                            "knowledge base `{knowledge_base_id}` is not configured for this workspace"
+                        ),
+                    })?],
+                None => extended.knowledge_bases.clone(),
+            };
+            let mut results = Vec::with_capacity(knowledge_bases.len());
+            for knowledge_base in knowledge_bases {
+                if !matches!(
+                    &knowledge_base.source,
+                    crate::config::extended::KnowledgeBaseSource::Local { .. }
+                ) {
+                    results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
+                        knowledge_base_id: knowledge_base.id,
+                        outcome: crate::daemon::proto::KnowledgeDreamRunOutcome::Unavailable,
+                        session_ids: Vec::new(),
+                        commit: None,
+                        failure: None,
+                    });
+                    continue;
+                }
+                let run = async {
+                    let model = crate::knowledge::dream::resolve_dream_model(
+                        &knowledge_base,
+                        &extended,
+                        &providers,
+                    )?;
+                    let caller_trust =
+                        crate::knowledge::dream::history_caller_trust(&model, &providers);
+                    let model = crate::config::providers::ActiveModelRef {
+                        provider: model.provider,
+                        model: model.model,
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                        prompt_cache_retention: None,
+                    };
+                    crate::daemon::dream_scheduler::run_knowledge_dream(
+                        &ctx.db,
+                        &ctx.registry,
+                        cwd,
+                        &knowledge_base,
+                        model,
+                        caller_trust,
+                        no_sandbox,
+                        false,
+                    )
+                    .await
+                }
+                .await;
+                match run {
+                    Ok(run) => {
+                        let outcome = match run.disposition {
+                            crate::daemon::dream_scheduler::DreamRunDisposition::Empty => {
+                                crate::daemon::proto::KnowledgeDreamRunOutcome::NothingToDream
+                            }
+                            crate::daemon::dream_scheduler::DreamRunDisposition::Completed => {
+                                crate::daemon::proto::KnowledgeDreamRunOutcome::Dreamed
+                            }
+                        };
+                        results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
+                            knowledge_base_id: knowledge_base.id,
+                            outcome,
+                            session_ids: run.session_ids,
+                            commit: run.commit,
+                            failure: None,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            knowledge_base_id = %knowledge_base.id,
+                            error = %error,
+                            "manual knowledge dream failed; continuing ordered all-KB run"
+                        );
+                        results.push(crate::daemon::proto::KnowledgeDreamRunReceipt {
+                            knowledge_base_id: knowledge_base.id,
+                            outcome: crate::daemon::proto::KnowledgeDreamRunOutcome::Failed,
+                            session_ids: Vec::new(),
+                            commit: None,
+                            failure: Some(error.to_string()),
+                        });
+                    }
+                }
+            }
+            Ok(Response::KnowledgeDreamRuns { results })
+        }
+
+        Request::KnowledgeDreamStatus {
+            project_root,
+            knowledge_base_id,
+        } => {
+            let project_root =
+                crate::knowledge::dream::CanonicalDreamProjectRoot::from_request_root(
+                    &project_root,
+                )?;
+            let cwd = project_root.as_path();
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd)
+                    .await
+                    .map_err(internal)?;
+            let (providers, extended) = ctx
+                .config_source()
+                .load_effective_for_daemon(cwd, &trust_policy)
+                .map_err(daemon_config_error)?;
+            let knowledge_base = extended
+                .knowledge_bases
+                .iter()
+                .find(|entry| entry.id == knowledge_base_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "knowledge base `{knowledge_base_id}` is not configured for this workspace"
+                    ),
+                })?;
+            if !matches!(
+                &knowledge_base.source,
+                crate::config::extended::KnowledgeBaseSource::Local { .. }
+            ) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message:
+                        crate::daemon::dream_scheduler::REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE
+                            .to_string(),
+                });
+            }
+            let model =
+                crate::knowledge::dream::resolve_dream_model(knowledge_base, &extended, &providers)
+                    .map_err(daemon_config_error)?;
+            let consumer = ctx
+                .db
+                .ensure_installation_identity()
+                .await
+                .map_err(internal)?;
+            let undreamed_session_ids = ctx
+                .db
+                .undreamed_sessions_for_knowledge_base(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    consumer.as_hex(),
+                    crate::knowledge::dream::history_caller_trust(&model, &providers),
+                )
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(|source| source.session_id)
+                .collect();
+            let last_dreamed_at_unix_ms = ctx
+                .db
+                .knowledge_base_last_dreamed_at(
+                    &knowledge_base_id,
+                    project_root.as_str(),
+                    consumer.as_hex(),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::KnowledgeDreamStatus {
+                model: format!("{}/{}", model.provider, model.model),
+                undreamed_session_ids,
+                last_dreamed_at_unix_ms,
             })
         }
         Request::CancelAllSessionWork => {
@@ -5812,10 +5992,38 @@ async fn handle_serialized_request_impl(
             require_attached(state)?;
             Ok(Response::Ack)
         }
-        Request::ResumeFromCompaction => Err(ErrorPayload {
-            code: ErrorCode::Conflict,
-            message: "resume compaction requires an offered interactive away-resume choice".into(),
-        }),
+        Request::ResumeFromCompaction => {
+            let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::ResumeFromCompaction,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::ResumeFromCompaction { respond_to })
+                .await
+                .map_err(session_work_error)?;
+            match response_rx.await.map_err(internal)? {
+                Ok(()) => finish_nonrepeatable_response!(
+                    remote_operation,
+                    ctx,
+                    "resume_from_compaction",
+                    Response::Ack
+                ),
+                Err(message) => Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message,
+                }),
+            }
+        }
         Request::CreateCodeRootWithAcpIngressV1(request) => {
             let service = ctx
                 .acp_catalog_composition
@@ -6643,7 +6851,11 @@ async fn handle_serialized_request_impl(
                 })?;
             let decision = ctx
                 .db
-                .decision_attention_page(record.root_id.0, None, 256)
+                .decision_attention_page(
+                    record.root_id.0,
+                    None,
+                    crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+                )
                 .await
                 .map_err(internal)?
                 .entries
@@ -27461,7 +27673,11 @@ async fn code_root_read_from_attached_response(
         .and_then(|row| row.title);
     let attention = ctx
         .db
-        .decision_attention_page(session_id, None, 256)
+        .decision_attention_page(
+            session_id,
+            None,
+            crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+        )
         .await
         .map_err(internal)?
         .entries
@@ -27533,7 +27749,11 @@ async fn code_root_read_snapshot(
         .map_err(internal)?;
     let attention = ctx
         .db
-        .decision_attention_page(root_id.0, None, 256)
+        .decision_attention_page(
+            root_id.0,
+            None,
+            crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+        )
         .await
         .map_err(internal)?
         .entries
@@ -27644,6 +27864,7 @@ pub(super) async fn attach(
         (Some(_), Some(claim), _) => {
             let mode = claim.session_entry_mode();
             if let Some(requested) = requested_session_entry_mode
+                && mode != proto::SessionEntryMode::Code
                 && requested != mode
             {
                 return Err(ErrorPayload {
@@ -27674,6 +27895,7 @@ pub(super) async fn attach(
                     }
                 };
                 if let Some(requested) = requested_session_entry_mode
+                    && mode != proto::SessionEntryMode::Code
                     && requested != mode
                 {
                     return Err(ErrorPayload {

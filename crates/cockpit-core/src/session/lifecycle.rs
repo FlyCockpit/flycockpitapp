@@ -188,6 +188,22 @@ impl CapturedKnowledgeBasePromptSnapshot {
 }
 
 impl Session {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn test_session_identity(project_root: &Path) -> (PathBuf, String) {
+        let project_root =
+            std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let project_id = Self::project_id_for_canonical_test_session_root(&project_root);
+        (project_root, project_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn project_id_for_canonical_test_session_root(project_root: &Path) -> String {
+        super::project_id_from_workspace_object(&format!(
+            "cockpit-synthetic-test-workspace-root-v1\\0{}",
+            project_root.display()
+        ))
+    }
+
     /// Derive a session project id. Production sessions always prove the
     /// workspace directory identity; synthetic test roots retain a separate,
     /// deterministic test-only namespace and never publish workspace state.
@@ -198,21 +214,24 @@ impl Session {
         if initialize_workspace_scratch {
             return project_id_for(project_root);
         }
-        Ok(super::project_id_from_workspace_object(&format!(
-            "cockpit-synthetic-test-workspace-root-v1\\0{}",
-            project_root.display()
-        )))
+        #[cfg(any(test, feature = "test-support"))]
+        return Ok(Self::project_id_for_canonical_test_session_root(
+            project_root,
+        ));
+
+        #[cfg(not(any(test, feature = "test-support")))]
+        unreachable!("synthetic session roots are test-support only")
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn test_workspace_root(project_root: PathBuf) -> (PathBuf, bool) {
-        // Test fixtures commonly use stable synthetic paths (for example
-        // `/proj`) to exercise path policy without creating host files.
-        // Prefer production identity when the fixture root exists.
-        match std::fs::canonicalize(&project_root) {
-            Ok(canonical_root) => (canonical_root, true),
-            Err(_) => (project_root, false),
-        }
+        // Test-support constructors must not publish production workspace
+        // markers. Test runners create and remove temporary directories at a
+        // high rate, so their filesystem identities can be reused while the
+        // process-global durable state directory retains the old marker.
+        // Production constructors remain the only path that proves an on-disk
+        // workspace identity and initializes durable workspace scratch.
+        (Self::test_session_identity(&project_root).0, false)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -254,6 +273,7 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
+            false,
         )
     }
 
@@ -292,6 +312,7 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
+            false,
         )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -335,6 +356,7 @@ impl Session {
             vault,
             true,
             initialize_workspace_scratch,
+            false,
         )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
@@ -373,6 +395,7 @@ impl Session {
             vault,
             false,
             initialize_workspace_scratch,
+            false,
         )
     }
 
@@ -382,6 +405,27 @@ impl Session {
         session_id: Uuid,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Option<Self>> {
+        Self::resume_with_test_workspace_root_inner(db, session_id, resolver, vault, true)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resume_with_strict_test_workspace_root(
+        db: Db,
+        session_id: Uuid,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+    ) -> Result<Option<Self>> {
+        Self::resume_with_test_workspace_root_inner(db, session_id, resolver, vault, false)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn resume_with_test_workspace_root_inner(
+        db: Db,
+        session_id: Uuid,
+        resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
+        allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Option<Self>> {
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -401,6 +445,7 @@ impl Session {
             vault,
             false,
             initialize_workspace_scratch,
+            allow_unbound_test_fixture_project_id,
         )?))
     }
 
@@ -439,7 +484,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault, true, true)
+        Self::from_row(db, project_root, row, resolver, vault, true, true, false)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -473,7 +518,16 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            true,
+            false,
+        )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -623,7 +677,16 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true, true)?;
+        let session = Self::from_row(
+            db,
+            project_root,
+            row.clone(),
+            resolver,
+            vault,
+            true,
+            true,
+            false,
+        )?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -746,7 +809,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault, false, true)
+        Self::from_row(db, project_root, row, resolver, vault, false, true, false)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -774,6 +837,7 @@ impl Session {
             vault,
             false,
             true,
+            false,
         )?))
     }
 
@@ -785,19 +849,65 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
         freshly_created: bool,
         initialize_workspace_scratch: bool,
+        allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Self> {
         let project_root = if initialize_workspace_scratch {
             canonical_workspace_root(&project_root)
                 .context("canonicalizing persisted session workspace root")?
         } else {
-            // Test-support constructors deliberately permit synthetic roots
-            // such as `/proj`. Preserve canonicalization when possible so
-            // fixtures using real roots keep production-equivalent identity.
+            // Test-support project ids are derived from a stable path spelling
+            // rather than a host directory identity, and are never published
+            // through a production workspace marker.
             std::fs::canonicalize(&project_root).unwrap_or(project_root)
         };
-        anyhow::ensure!(
+        #[cfg(any(test, feature = "test-support"))]
+        let legacy_short_fixture_project_id = row.project_id.len() <= 24
+            && row
+                .project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        #[cfg(any(test, feature = "test-support"))]
+        let initialize_workspace_scratch = {
+            // Test-support rows intentionally use a separate project-id
+            // namespace so they cannot publish a process-global workspace
+            // marker. Those rows can still flow through the ordinary daemon
+            // resume path, which otherwise has no caller-side indication that
+            // the persisted row is synthetic. The durable project id is the
+            // discriminator: never downgrade an unrecognised production row.
+            let synthetic_id = Self::project_id_for_canonical_test_session_root(&project_root);
+            if row.project_id == synthetic_id {
+                false
+            } else if project_id_for(&project_root).ok().as_deref() == Some(&row.project_id) {
+                true
+            } else if legacy_short_fixture_project_id {
+                // The daemon integration tests still create a few low-level
+                // fixture rows directly in the ledger.  Their short labels
+                // are neither workspace-object identities nor safe durable
+                // workspace directory components, so keep them on the
+                // test-only scratch path below.
+                false
+            } else {
+                initialize_workspace_scratch
+            }
+        };
+        let project_id_matches =
             Self::project_id_for_session_root(&project_root, initialize_workspace_scratch)?
-                == row.project_id,
+                == row.project_id;
+        // Raw test fixtures predate workspace-object identities and enter
+        // test-only code with short human labels. Production identities are
+        // fixed-length workspace-object digests; deliberately malformed or
+        // digest-shaped rows still take the strict identity path.
+        anyhow::ensure!(
+            project_id_matches || allow_unbound_test_fixture_project_id || {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    legacy_short_fixture_project_id
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    false
+                }
+            },
             "persisted session project id does not match canonical workspace root"
         );
         let session_entry_mode = match row.session_entry_mode.as_str() {
@@ -862,7 +972,17 @@ impl Session {
             workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
                 .context("initializing required durable workspace scratch")?
         } else {
-            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)?;
+            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)
+                .or_else(|error| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    if legacy_short_fixture_project_id {
+                        return super::test_fixture_workspace_scratch_path_for_session(
+                            &row.project_id,
+                            row.session_id,
+                        );
+                    }
+                    Err(error)
+                })?;
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
             path

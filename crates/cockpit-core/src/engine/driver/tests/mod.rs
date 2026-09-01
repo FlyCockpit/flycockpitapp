@@ -729,6 +729,19 @@ fn test_driver_with_url_and_grant(
         mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let mut driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
+    // The root model above is built from this fixture configuration.  Keep the
+    // driver's generation-pinned config handle on that same snapshot: turn
+    // refreshes and delegated vNext children resolve through the handle, not
+    // through the already-built root model.
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                pcfg,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ),
+    );
     bind_test_session_root(&mut driver);
     (driver, tmp)
 }
@@ -2082,7 +2095,9 @@ async fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
                 .then(|| event.data["purpose"].as_str().map(str::to_string))
                 .flatten()
         })
-        .filter(|purpose| purpose.starts_with("compact_"))
+        .filter(|purpose| {
+            purpose.starts_with("compact_") || purpose.starts_with("rolling_compaction_")
+        })
         .collect()
 }
 
@@ -2273,7 +2288,10 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
-        definition: old.definition.clone(),
+        // This fixture installs a test-only single-tool surface, so no
+        // definition may rebuild it into an unrelated role default during a
+        // preflight boundary.
+        definition: None,
         assistant_identity_prefix: None,
         mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
@@ -2346,13 +2364,23 @@ fn model_switch_driver() -> (Driver, tempfile::TempDir) {
         .session
         .set_active_model("provider-a", "model-a")
         .unwrap();
-    driver.test_providers_override = Some((cfg, "provider-a".into(), "model-a".into()));
+    driver.test_providers_override = Some((cfg.clone(), "provider-a".into(), "model-a".into()));
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                cfg,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ),
+    );
     let mut args = driver.spawn_args(true);
     args.model = model_a;
-    // Resolve Build under host policy (embedded children only), then reattach
-    // the test driver's grant snapshot so later refresh can extend it with
-    // workspace-authored portable children after those files exist.
+    // Build the initial frame from the same grant snapshot that a turn-boundary
+    // refresh preserves. This keeps the task schema stable until a test
+    // deliberately admits a workspace-authored portable child.
     let grant = driver.stack[0].agent.vnext_grant.clone();
+    args.vnext_grant = grant.clone();
     args.vnext_host_policy = grant
         .as_ref()
         .map(|g| std::sync::Arc::new(g.host_policy.clone()));

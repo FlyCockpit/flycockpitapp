@@ -264,6 +264,8 @@ impl OAuthKeyOutcome {
         let Some(request) = action else {
             return Self::stay(None);
         };
+        let client_flow_id = request.client_flow_id;
+        let operation_id = request.operation_id;
         let OAuthFlowOp::Present {
             authorize_url,
             user_code,
@@ -283,6 +285,11 @@ impl OAuthKeyOutcome {
             opened: open_browser && (effects.open)(&authorize_url).is_ok(),
             advance_flow,
         };
+        // Keyboard-triggered presentation runs synchronously here. Retire
+        // the exact operation before accepting its result so a subsequent
+        // copy action (notably Codex-over-SSH: URL then device code) is not
+        // incorrectly fenced as an older operation still in flight.
+        assert!(state.accepts_result(client_flow_id, operation_id));
         Self::stay(state.apply_present(Ok(presentation)))
     }
 
@@ -974,7 +981,12 @@ impl OAuthFlowState {
     }
 
     pub(crate) fn has_unsettled_authority(&self) -> bool {
-        self.pending || self.polling || self.acknowledgement_authority_pending
+        // `pending`/`polling` describe an OAuth browser or device-code session
+        // that is waiting on the user. They are not an in-flight daemon
+        // mutation and must not freeze safe controls such as Copy URL, manual
+        // paste, or Poll. Only a correlated request (or the durable
+        // acknowledgement write) owns the settings interaction fence.
+        self.action_operation.is_pending() || self.acknowledgement_authority_pending
     }
 
     pub(crate) fn has_unsettled_acknowledgement(&self) -> bool {

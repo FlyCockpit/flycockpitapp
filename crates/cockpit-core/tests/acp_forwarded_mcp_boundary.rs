@@ -17,6 +17,11 @@ fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn production_source(path: &Path) -> String {
+    // Unit-test sibling modules can contain literal forwarded-ingress
+    // fixtures; they are never production capability consumers.
+    if path.file_name().is_some_and(|name| name == "tests.rs") {
+        return String::new();
+    }
     let source = fs::read_to_string(path).expect("read Rust source");
     strip_test_only_items(&source)
 }
@@ -174,7 +179,14 @@ fn cockpit_core_has_no_cli_or_acp_transport_schema_dependency() {
     collect_rust_files(&root, &mut files);
     assert!(!files.is_empty());
     for path in files {
-        let source = fs::read_to_string(&path).expect("read Rust source");
+        // This is a dependency-boundary ratchet, not a documentation
+        // ratchet: core may describe the CLI host in comments and test-only
+        // contracts without depending on its transport schema.
+        let source = production_source(&path)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for forbidden in [
             "apps::cli",
             "apps/cli",
@@ -244,8 +256,8 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
         vec![
             "AcpForwardedMcpDeclarationV1".to_string(),
             "AcpForwardedMcpIngressV1".to_string(),
+            "AcpForwardedMcpNameValuePairV1".to_string(),
             "AcpForwardedMcpTransportV1".to_string(),
-            "AcpNameValuePairV1".to_string(),
         ],
         "the closed ingress family is the only public ACP/MCP type family"
     );

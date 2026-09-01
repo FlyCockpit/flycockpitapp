@@ -391,6 +391,10 @@ pub struct EffectiveCatalogResolver {
     root_catalog: Arc<EffectiveCatalog>,
     catalog: Arc<EffectiveCatalog>,
     parent_reachable: Option<ParentReachableCatalog>,
+    /// Whether this agent's legacy `mcp` grant admits non-cockpit servers.
+    /// Monty's runtime itself is universal; this flag narrows only external
+    /// server discovery and invocation.
+    external_servers_allowed: bool,
 }
 
 impl EffectiveCatalogResolver {
@@ -414,6 +418,30 @@ impl EffectiveCatalogResolver {
         def: &crate::agents::AgentDef,
         parent_reachable: Option<ParentReachableCatalog>,
     ) -> Arc<Self> {
+        let external_servers_allowed = def
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "mcp"))
+            || (def.tools.is_none()
+                && crate::agents::embedded_default(&def.name)
+                    .and_then(|def| def.tools)
+                    .is_some_and(|tools| tools.iter().any(|tool| tool == "mcp")));
+        Self::for_agent_from_root_catalog_with_external_servers_allowed(
+            root_catalog,
+            def,
+            parent_reachable,
+            external_servers_allowed,
+        )
+    }
+
+    /// Project a definition with its already-resolved external-MCP grant.
+    /// Callers that apply parent grants supply the effective result here.
+    pub fn for_agent_from_root_catalog_with_external_servers_allowed(
+        root_catalog: Arc<EffectiveCatalog>,
+        def: &crate::agents::AgentDef,
+        parent_reachable: Option<ParentReachableCatalog>,
+        external_servers_allowed: bool,
+    ) -> Arc<Self> {
         let (layer, reserved) = parse_agent_package_mcp(def);
         Self::project_root_catalog(
             root_catalog,
@@ -421,6 +449,7 @@ impl EffectiveCatalogResolver {
             reserved,
             def.mcp_bindings.clone(),
             parent_reachable,
+            external_servers_allowed,
         )
     }
 
@@ -437,6 +466,7 @@ impl EffectiveCatalogResolver {
             root_catalog: self.root_catalog.clone(),
             catalog: Arc::new(catalog),
             parent_reachable: Some(parent),
+            external_servers_allowed: self.external_servers_allowed,
         })
     }
 
@@ -446,6 +476,7 @@ impl EffectiveCatalogResolver {
         agent_reserved_rejected: bool,
         bindings: Vec<crate::agents::McpBinding>,
         parent_reachable: Option<ParentReachableCatalog>,
+        external_servers_allowed: bool,
     ) -> Arc<Self> {
         let mut catalog = (*root_catalog).clone();
         if let Some(agent_layer) = agent_layer {
@@ -460,6 +491,7 @@ impl EffectiveCatalogResolver {
             root_catalog,
             catalog: Arc::new(catalog),
             parent_reachable,
+            external_servers_allowed,
         })
     }
 
@@ -472,6 +504,8 @@ impl EffectiveCatalogResolver {
             root_catalog: catalog.clone(),
             catalog,
             parent_reachable: None,
+            // Non-agent utility/test contexts do not carry an agent grant.
+            external_servers_allowed: true,
         })
     }
 
@@ -481,6 +515,10 @@ impl EffectiveCatalogResolver {
 
     pub fn root_catalog(&self) -> Arc<EffectiveCatalog> {
         self.root_catalog.clone()
+    }
+
+    pub fn external_servers_allowed(&self) -> bool {
+        self.external_servers_allowed
     }
 }
 

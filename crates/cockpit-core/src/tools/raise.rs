@@ -23,7 +23,7 @@ impl Tool for RaiseTool {
     }
 
     fn description(&self) -> &str {
-        "Raise a concise structured item from this assistant thread to the main thread inbox. Choose immediate to wake main at its next idle boundary, defer to wait for its next human turn or periodic heartbeat, or notify to alert the human without agent work."
+        "Raise a concise structured item from this assistant thread to the main inbox: immediate wakes it at idle, defer waits for its next turn, and notify alerts the human only."
     }
 
     fn verbose_description(&self) -> Option<String> {
@@ -55,7 +55,8 @@ impl Tool for RaiseTool {
                     "description": "How the main inbox should deliver this item"
                 }
             },
-            "required": ["summary", "delivery"]
+            "required": ["summary", "delivery"],
+            "additionalProperties": false
         })
     }
 

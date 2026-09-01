@@ -2,12 +2,19 @@ use super::{CTRL_C_EXIT_WINDOW, CtrlCAction, decide_ctrl_c, input};
 use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
 use std::time::{Duration, Instant};
 
-fn install_ephemeral_runner(app: &mut super::App) {
-    let mut runner = AgentRunner::test_fixture(TestRunnerOverrides::default());
+fn install_ephemeral_runner(
+    app: &mut super::App,
+) -> tokio::sync::mpsc::Receiver<crate::tui::agent_runner::ControlRequest> {
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
+    let runner = AgentRunner::test_fixture(TestRunnerOverrides {
+        control_tx: Some(control_tx),
+        ..Default::default()
+    });
     runner
         .ephemeral_owner
         .store(true, std::sync::atomic::Ordering::Release);
     app.agent_runner = Some(Ok(runner));
+    control_rx
 }
 
 /// Idle + single (first) press: arm the window + show hint only,
@@ -273,7 +280,7 @@ fn busy_ctrl_d_uses_guarded_quit_path() {
     use super::App;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    install_ephemeral_runner(&mut app);
+    let _control_rx = install_ephemeral_runner(&mut app);
 
     app.busy = true;
     app.queue.push(input::optimistic_queue_item(
@@ -315,7 +322,7 @@ fn scheduled_work_ctrl_d_uses_guarded_quit_path() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    install_ephemeral_runner(&mut app);
+    let _control_rx = install_ephemeral_runner(&mut app);
     app.active_schedules.insert(
         "sched-1".to_string(),
         ActiveSchedule {
@@ -355,7 +362,7 @@ fn exit_guard_stop_all_cancels_only_the_attached_session() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
-    let mut runner = AgentRunner::test_fixture(TestRunnerOverrides {
+    let runner = AgentRunner::test_fixture(TestRunnerOverrides {
         control_tx: Some(control_tx),
         ..Default::default()
     });
@@ -383,7 +390,7 @@ fn modal_state_ctrl_d_uses_guarded_quit_path() {
     let exit = app.handle_key(ctrl('d'));
 
     assert!(!exit, "ctrl+d should guard while confirm state is pending");
-    assert!(app.ctrl_c_armed_at.is_some());
+    assert!(app.ctrl_c_armed_at.is_none());
     assert!(
         app.pending_prune_confirm,
         "guarded ctrl+d must not answer or clear the pending modal"

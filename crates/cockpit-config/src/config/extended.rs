@@ -423,8 +423,9 @@ pub struct ExtendedConfig {
     pub auto_title: Option<String>,
 
     /// Prefer the active session model for the cache-reusing, ephemeral
-    /// title-and-description fork. When no utility title model is configured,
-    /// Cockpit also takes this path automatically.
+    /// title-and-description fork even when a title or utility model is
+    /// configured. When false, a configured title/utility model is used;
+    /// without one, session titling still falls back to the active model.
     #[serde(default)]
     pub auto_title_with_session_model: bool,
 

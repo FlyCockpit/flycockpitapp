@@ -9851,9 +9851,12 @@ mod render_history_spacing_tests {
         ]
         .into();
         let history_ids = app.history.ids().to_vec();
-        let history_before = format!("{:?}", &*app.history);
 
         let shown = buffer_text(&render_history_buffer(&mut app, 100, 40));
+        // Capture after the initial draw has consumed the history invalidation
+        // marker. The hide/show setting must not mutate durable transcript
+        // rows or their identities.
+        let history_before = format!("{:?}", &*app.history);
         for marker in [
             "tool-box-marker",
             "tool-line-marker",

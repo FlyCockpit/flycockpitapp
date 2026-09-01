@@ -48,9 +48,9 @@ CREATE TABLE assistant_inbox_items (
         AND length(replace(inbox_item_id, '-', '')) = 32
         AND replace(inbox_item_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     ),
-    assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE,
-    main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE ON UPDATE RESTRICT,
+    main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- Daemon-owned inference/replay scope. Provider tool-call IDs are only
     -- idempotency correlations, not globally unique operation identities.
     operation_scope    TEXT NOT NULL CHECK (length(CAST(operation_scope AS BLOB)) BETWEEN 1 AND 128),
@@ -81,7 +81,7 @@ CREATE INDEX assistant_inbox_items_assistant_rate_idx
 -- network-order bytes and never derive an identity by hashing the legacy key.
 CREATE TABLE project_identities (
     project_id   TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
-    project_uuid BLOB NOT NULL CHECK (
+    project_uuid BLOB NOT NULL UNIQUE CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
         AND project_uuid <> zeroblob(16)
     ),
@@ -1188,12 +1188,14 @@ CREATE TABLE knowledge_dreamed_sessions (
     kb_id       TEXT NOT NULL CHECK (length(CAST(kb_id AS BLOB)) BETWEEN 1 AND 255),
     project_root TEXT NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
     consumer_id TEXT NOT NULL CHECK (length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 255),
-    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     dreamed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (kb_id, project_root, consumer_id, session_id)
 );
 CREATE INDEX idx_knowledge_dreamed_sessions_last
     ON knowledge_dreamed_sessions(kb_id, project_root, consumer_id, dreamed_at_unix_ms DESC);
+CREATE INDEX idx_knowledge_dreamed_sessions_session
+    ON knowledge_dreamed_sessions(session_id);
 
 -- Monotonic identity for successful dream completions. Wall-clock time is
 -- presentation only: completion_revision advances even when the clock repeats
@@ -1226,7 +1228,7 @@ CREATE INDEX idx_knowledge_dream_schedule_state_last
 -- UUID, rather than the mutable registry id, prevents a replacement source
 -- from inheriting the predecessor's dream state.
 CREATE TABLE knowledge_dream_ledger (
-    project_uuid BLOB NOT NULL UNIQUE CHECK (
+    project_uuid BLOB NOT NULL CHECK (
         typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
         AND project_uuid <> zeroblob(16)
     ) REFERENCES project_identities(project_uuid) ON DELETE CASCADE ON UPDATE RESTRICT,
@@ -3456,47 +3458,6 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
--- ---- scheduled jobs --------------------------------------------------------
--- The immutable insertion identity fences stale asynchronous actions when a
--- user-chosen job id is deleted and later reused.
-CREATE TABLE scheduled_jobs (
-    id                TEXT    PRIMARY KEY,
-    row_identity      TEXT    NOT NULL UNIQUE,
-    owner             TEXT    NOT NULL,
-    schedule_json     TEXT    NOT NULL CHECK (
-        json_valid(schedule_json) AND json_type(schedule_json) = 'object'
-        AND length(CAST(schedule_json AS BLOB)) <= 65536
-    ),
-    payload_json      TEXT    NOT NULL CHECK (
-        json_valid(payload_json)
-        AND length(CAST(payload_json AS BLOB)) <= 1048576
-    ),
-    enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
-    created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
-    last_run_at       INTEGER,
-    next_run_at       INTEGER,
-    last_result_json  TEXT CHECK (
-        last_result_json IS NULL OR (
-            json_valid(last_result_json)
-            AND length(CAST(last_result_json AS BLOB)) <= 1048576
-        )
-    ),
-    failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
-    backoff_until     INTEGER,
-    disabled_notice   TEXT
-);
-
-CREATE INDEX idx_scheduled_jobs_next_run ON scheduled_jobs(enabled, next_run_at);
-CREATE INDEX idx_scheduled_jobs_owner ON scheduled_jobs(owner);
-
-CREATE TRIGGER scheduled_jobs_row_identity_immutable
-BEFORE UPDATE OF row_identity ON scheduled_jobs
-BEGIN
-    SELECT RAISE(ABORT, 'scheduled job row identity is immutable');
-END;
-
 -- ---- session full-text search (`history_search` / `cockpit://` recall) ------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session title/description, the text of `user_message` /
@@ -3549,6 +3510,8 @@ CREATE UNIQUE INDEX session_fts_docs_one_non_artifact_event_kind
 
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
+CREATE INDEX session_fts_docs_session_artifact_idx
+    ON session_fts_docs(session_id, artifact_id);
 
 -- Event sync: `user_message` / `assistant_message` rows carry conversational
 -- text at data_json.'$.text'. `session_compacted` rows carry model-written
@@ -4271,7 +4234,26 @@ BEGIN
            AND json_type(NEW.data_json, '$.artifact_projection.preview_head') = 'text'
            AND json_type(NEW.data_json, '$.artifact_projection.preview_tail') = 'text'
            AND json_type(NEW.data_json, '$.artifact_projection.provenance') = 'object'
-           AND (SELECT count(*) FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance'))) = 3
+           -- A spill keeps daemon-private storage identity beside the stable
+           -- tool provenance.  Imported spill artifacts lose only that local
+           -- path, retaining the source/preview contract, so accept the
+           -- tightly-bounded optional spill fields as well as legacy inline
+           -- three-key provenance.
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance')) p
+                 WHERE p.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+           )
+           AND (SELECT count(*) FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance'))) BETWEEN 3 AND 6
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.source') IS NULL
+                OR json_extract(NEW.data_json, '$.artifact_projection.provenance.source') = 'tool_result')
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.preview_lines') IS NULL
+                OR (json_type(NEW.data_json, '$.artifact_projection.provenance.preview_lines') = 'integer'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.preview_lines') BETWEEN 1 AND 10000))
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.blob_path') IS NULL
+                OR (json_type(NEW.data_json, '$.artifact_projection.provenance.blob_path') = 'text'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.blob_path') LIKE 'text-artifacts/%'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.blob_path') NOT LIKE '%..%'))
            AND json_type(NEW.data_json, '$.artifact_projection.provenance.tool') = 'text'
            AND length(CAST(json_extract(NEW.data_json, '$.artifact_projection.provenance.tool') AS BLOB)) BETWEEN 1 AND 256
            AND json_extract(NEW.data_json, '$.artifact_projection.provenance.tool') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
@@ -4330,7 +4312,20 @@ BEGIN
                    OR json_type(p.value, '$.preview_head') IS NOT 'text'
                    OR json_type(p.value, '$.preview_tail') IS NOT 'text'
                    OR json_type(p.value, '$.provenance') IS NOT 'object'
-                   OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) IS NOT 3
+                   OR EXISTS (
+                        SELECT 1 FROM json_each(json_extract(p.value, '$.provenance')) provenance
+                         WHERE provenance.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+                   )
+                   OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) NOT BETWEEN 3 AND 6
+                   OR (json_type(p.value, '$.provenance.source') IS NOT NULL
+                       AND json_extract(p.value, '$.provenance.source') IS NOT 'tool_result')
+                   OR (json_type(p.value, '$.provenance.preview_lines') IS NOT NULL
+                       AND (json_type(p.value, '$.provenance.preview_lines') IS NOT 'integer'
+                            OR json_extract(p.value, '$.provenance.preview_lines') NOT BETWEEN 1 AND 10000))
+                   OR (json_type(p.value, '$.provenance.blob_path') IS NOT NULL
+                       AND (json_type(p.value, '$.provenance.blob_path') IS NOT 'text'
+                            OR json_extract(p.value, '$.provenance.blob_path') NOT LIKE 'text-artifacts/%'
+                            OR json_extract(p.value, '$.provenance.blob_path') LIKE '%..%'))
                    OR json_type(p.value, '$.provenance.tool') IS NOT 'text'
                    OR length(CAST(json_extract(p.value, '$.provenance.tool') AS BLOB)) NOT BETWEEN 1 AND 256
                    OR json_extract(p.value, '$.provenance.tool') GLOB '*[' || char(1) || '-' || char(31) || ']*'
@@ -4408,13 +4403,25 @@ BEGIN
           ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
          WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
            AND a.kind = 'user_input_source' AND a.capture_reason = 'oversized_user_input'
-           AND a.content_bytes > 65536
+           AND a.content_bytes > 1024
            AND e.type = 'user_message'
-           AND json_type(a.provenance_json, '$.event_seq') = 'integer'
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 1
-           AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq
            AND json_type(e.data_json, '$.text') = 'text'
            AND json_extract(e.data_json, '$.text') = a.content
+           AND (
+               (a.content_representation = 'raw'
+                AND json_type(a.provenance_json, '$.event_seq') = 'integer'
+                AND json_extract(a.provenance_json, '$.source') = 'user_paste'
+                AND json_type(a.provenance_json, '$.blob_path') = 'text'
+                AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
+                AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'
+                AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+                AND json_extract(a.provenance_json, '$.preview_lines') BETWEEN 1 AND 10000
+                AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
+                AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq)
+               OR
+               (a.content_representation = 'export_redacted'
+                AND a.archive_import_id IS NOT NULL)
+           )
     ) THEN RAISE(ABORT, 'source user artifact binding is invalid') END;
     SELECT CASE WHEN NEW.relation = 'model_user_input_projection' AND NOT EXISTS (
         SELECT 1 FROM session_text_artifacts a JOIN session_events e
@@ -4425,7 +4432,12 @@ BEGIN
            AND json_type(a.provenance_json, '$.source_artifact_id') = 'text'
            AND json_type(a.provenance_json, '$.preprocessing_version') = 'integer'
            AND json_extract(a.provenance_json, '$.preprocessing_version') = 1
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 2
+           AND json_type(a.provenance_json, '$.blob_path') = 'text'
+           AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
+           AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'
+           AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+           AND json_extract(a.provenance_json, '$.preview_lines') BETWEEN 1 AND 10000
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
            AND EXISTS (
                SELECT 1 FROM session_text_artifact_event_refs source_ref
                JOIN session_text_artifacts source ON source.session_id = source_ref.session_id AND source.artifact_id = source_ref.artifact_id
@@ -4466,7 +4478,20 @@ BEGIN
                e.type = 'context_pruned'
                OR json_extract(a.provenance_json, '$.call_id') = e.call_id
            )
-           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 3
+           AND NOT EXISTS (
+                SELECT 1 FROM json_each(a.provenance_json) provenance
+                 WHERE provenance.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+           )
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) BETWEEN 3 AND 6
+           AND (json_type(a.provenance_json, '$.source') IS NULL
+                OR json_extract(a.provenance_json, '$.source') = 'tool_result')
+           AND (json_type(a.provenance_json, '$.preview_lines') IS NULL
+                OR (json_type(a.provenance_json, '$.preview_lines') = 'integer'
+                    AND json_extract(a.provenance_json, '$.preview_lines') BETWEEN 1 AND 10000))
+           AND (json_type(a.provenance_json, '$.blob_path') IS NULL
+                OR (json_type(a.provenance_json, '$.blob_path') = 'text'
+                    AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
+                    AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'))
     ) THEN RAISE(ABORT, 'tool artifact binding is invalid') END;
     -- The event-owned projection state is the authority for model context.
     -- Do not allow direct SQL to attach a real body to a made-up tool slot,
@@ -4505,7 +4530,7 @@ BEGIN
                     AND json_type(e.data_json, '$.artifact_projection.preview_head') = 'text'
                     AND json_type(e.data_json, '$.artifact_projection.preview_tail') = 'text'
                     AND json_type(e.data_json, '$.artifact_projection.provenance') = 'object'
-                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projection.provenance'))) = 3
+                    AND json_extract(e.data_json, '$.artifact_projection.provenance') = json(a.provenance_json)
                     AND json_extract(e.data_json, '$.artifact_projection.provenance.tool') = json_extract(a.provenance_json, '$.tool')
                     AND json_extract(e.data_json, '$.artifact_projection.provenance.call_id') = json_extract(a.provenance_json, '$.call_id')
                     AND json_type(e.data_json, '$.artifact_projection.provenance.agent_id') = json_type(a.provenance_json, '$.agent_id')
@@ -4550,7 +4575,7 @@ BEGIN
                             OR json_type(p.value, '$.preview_head') IS NOT 'text'
                             OR json_type(p.value, '$.preview_tail') IS NOT 'text'
                             OR json_type(p.value, '$.provenance') IS NOT 'object'
-                            OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) IS NOT 3
+                            OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) NOT BETWEEN 3 AND 6
                             OR json_type(p.value, '$.provenance.tool') IS NOT 'text'
                             OR json_type(p.value, '$.provenance.call_id') IS NOT 'text'
                             OR (json_type(p.value, '$.provenance.agent_id') IS NOT 'text'
@@ -4579,7 +4604,7 @@ BEGIN
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_head') = 'text'
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_tail') = 'text'
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance') = 'object'
-                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance'))) = 3
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance') = json(a.provenance_json)
                     AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.tool') = json_extract(a.provenance_json, '$.tool')
                     AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.call_id') = json_extract(a.provenance_json, '$.call_id')
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.agent_id') = json_type(a.provenance_json, '$.agent_id')
@@ -4638,7 +4663,7 @@ CREATE TABLE session_text_artifact_quota_reservations (
     operation_id BLOB NOT NULL CHECK(typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
     queue_item_id BLOB NOT NULL CHECK(typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
     source_digest BLOB NOT NULL CHECK(typeof(source_digest) = 'blob' AND length(source_digest) = 32),
-    source_bytes INTEGER NOT NULL CHECK(typeof(source_bytes) = 'integer' AND source_bytes BETWEEN 65537 AND 8388608),
+    source_bytes INTEGER NOT NULL CHECK(typeof(source_bytes) = 'integer' AND source_bytes BETWEEN 1025 AND 8388608),
     reserved_bytes INTEGER NOT NULL CHECK(typeof(reserved_bytes) = 'integer' AND reserved_bytes = source_bytes + 8388608),
     -- Set only by the atomic oversized-run phase-one composition. It makes
     -- terminalization ownership explicit instead of inferring it from a UUID
@@ -4934,12 +4959,19 @@ CREATE TABLE text_artifact_blob_cleanup_intents (
         AND blob_path NOT LIKE '%\n%'
         AND blob_path NOT LIKE '%\r%'
     ),
+    -- Deliberately NOT a foreign key: the whole point of this table is to
+    -- outlive the session cascade that orphans the blob.  A REFERENCES ...
+    -- ON DELETE CASCADE here would delete each intent in the same transaction
+    -- that enqueued it, stranding the file forever.  Same reasoning as
+    -- task_delegation_sidecar_cleanup_intents.session_id above.
     session_id TEXT NOT NULL,
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
 );
 
 CREATE INDEX idx_text_artifact_blob_cleanup_created
     ON text_artifact_blob_cleanup_intents(created_at_unix_ms, blob_path);
+CREATE INDEX idx_text_artifact_blob_cleanup_session
+    ON text_artifact_blob_cleanup_intents(session_id);
 
 -- A sidecar is published before its referencing payload transaction starts.
 -- This intent is committed first, so boot recovery can remove a file left by
@@ -6733,6 +6765,7 @@ CREATE TABLE secret_vault_items (
         'subscription_ack',
         'sealed_compartment',
         'session_sealed_value',
+        'knowledge_base_sealed_value',
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,

@@ -3724,10 +3724,9 @@ impl App {
                 crate::tui::session_setup::SessionSetupPane::loading_inline(true),
             ),
             session_setup_collapsed: false,
-            // Production starts on the setup panel so first-run navigation is
-            // reachable. Unit tests construct App as a composer harness and
-            // never Tab away from the panel, so they own the composer.
-            session_setup_focused: !cfg!(test),
+            // The panel is visible at startup, while the composer owns text
+            // input. Tab transfers focus to the setup controls.
+            session_setup_focused: false,
             session_setup_collapse_hint: None,
             question_dialog: None,
             question_dialog_btw: false,

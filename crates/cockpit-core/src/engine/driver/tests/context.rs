@@ -581,12 +581,16 @@ async fn exact_resume_offer_retains_snapshot_and_apply_uses_no_inference() {
     let cfg = ContextConfig {
         compact_shadow: false,
         rolling_precompaction: true,
+        compact_keep_recent_turns: 0,
         idle_window_secs: 1,
         resume_default: ResumeDefault::Ask,
         ..ContextConfig::default()
     };
     install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
-    append_complete_test_turns(&mut driver, 2);
+    // The rolling handoff includes durable working-set metadata. Exercise an
+    // actual reduction rather than asking a tiny two-turn transcript to carry
+    // that fixed handoff overhead.
+    append_complete_test_turns(&mut driver, 48);
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     let before = compact_inference_purposes(&driver).await;
@@ -960,6 +964,7 @@ async fn killswitch_writes_no_rows() {
     append_complete_test_turns(&mut driver, 2);
     let cfg = ContextConfig {
         compact_shadow: false,
+        rolling_precompaction: false,
         ..ContextConfig::default()
     };
     install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
@@ -1825,7 +1830,16 @@ async fn shadow_gated_on_prune_effectiveness() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig {
+            rolling_precompaction: false,
+            ..ContextConfig::default()
+        },
+        100,
+    );
+    append_complete_test_turns(&mut driver, 1);
     record_test_context_tokens(&driver, 72).await;
     assert!(
         !driver.maybe_shadow_brief(&tx).await,
@@ -3500,7 +3514,7 @@ async fn keep_warm_rejects_a_callback_before_its_minted_deadline() {
 fn keep_warm_idle_deadline_overflow_fails_closed() {
     assert!(
         keep_warm_idle_deadline(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             std::time::Duration::from_secs(u64::MAX),
         )
         .is_none(),

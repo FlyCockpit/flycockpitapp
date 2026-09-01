@@ -32,9 +32,9 @@ pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use acp::{
-    AckCodeRootDeliveriesV1Request, AckCodeRootDeliveriesV1Result, AcpForwardedMcpDeclarationV1,
-    AcpForwardedMcpIngressV1, AcpForwardedMcpTransportV1, AcpNameValuePairV1,
-    AttachExistingCodeRootV1Request, AttachExistingCodeRootV1Result,
+    ACP_FORWARDED_MCP_VERSION_V1, AckCodeRootDeliveriesV1Request, AckCodeRootDeliveriesV1Result,
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpNameValuePairV1,
+    AcpForwardedMcpTransportV1, AttachExistingCodeRootV1Request, AttachExistingCodeRootV1Result,
     AttachExistingCodeRootWithAcpIngressV1Request, AttachExistingCodeRootWithAcpIngressV1Result,
     CloseAcpCodeRootAttachmentV1Outcome, CloseAcpCodeRootAttachmentV1Request,
     CloseAcpCodeRootAttachmentV1Result, CloseCodeRootAttachmentV1Request,
@@ -5607,8 +5607,9 @@ mod forward_open_guard_tests {
         collect_deny_unknown_fields_violations(&src_root(), &mut violations);
         assert!(
             violations.is_empty(),
-            "cockpit-proto wire structs must stay forward-open for additive compatibility \
-             (see proto-additive-forward-compat); remove serde deny_unknown_fields from: {}",
+            "cockpit-proto wire structs outside the closed ACP ingress must stay forward-open \
+             for additive compatibility (see proto-additive-forward-compat); \
+             remove serde deny_unknown_fields from: {}",
             violations.join(", ")
         );
     }
@@ -5730,6 +5731,13 @@ mod forward_open_guard_tests {
                 continue;
             }
             if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            // ACP is a deliberately closed editor boundary: its ingress
+            // contract owns authorization-relevant, caller-provided fields
+            // and rejects extras at every nested level. All other protocol
+            // payloads stay forward-open for additive compatibility.
+            if path.file_name().is_some_and(|name| name == "acp.rs") {
                 continue;
             }
             let source = std::fs::read_to_string(&path)

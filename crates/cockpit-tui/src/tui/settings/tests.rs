@@ -93,8 +93,8 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
 fn provider_settings_use_one_exact_atomic_receipt_and_no_legacy_sequence() {
     let settings = include_str!("mod.rs");
     let executor = settings
-        .split("SettingsDaemonEffectWork::ProviderMutation(plan) =>")
-        .nth(1)
+        .rsplit("SettingsDaemonEffectWork::ProviderMutation(plan) =>")
+        .next()
         .and_then(|tail| {
             tail.split("SettingsDaemonEffectWork::TypedDocumentEdit")
                 .next()
@@ -131,14 +131,20 @@ fn settings_cannot_close_or_accept_a_stale_session_completion_while_pending() {
         owner: "owner".into(),
         revision: Some("revision".into()),
     };
-    let operation_id = settings.cx.queue_simple_mutation(
-        target.clone(),
-        Request::ListAssistants,
-        SettingsMutationAction::ProviderCredentialDelete {
-            provider_id: "example".into(),
-            client_operation_id: "test-operation".into(),
-            project_root: "/workspace".into(),
-            expected_request_hash: "00".repeat(32),
+    // Model an already-dispatched request: no local test effect is retained
+    // for `handle_key` to synchronously complete before the stale receipt
+    // arrives from the old session.
+    let operation_id = uuid::Uuid::new_v4();
+    settings.cx.pending_settings.insert(
+        operation_id,
+        PendingSettingsOperation::SimpleMutation {
+            target: target.clone(),
+            action: SettingsMutationAction::ProviderCredentialDelete {
+                provider_id: "example".into(),
+                client_operation_id: "test-operation".into(),
+                project_root: "/workspace".into(),
+                expected_request_hash: "00".repeat(32),
+            },
         },
     );
     assert!(!settings.handle_key(press(KeyCode::Char('q'))));
@@ -796,6 +802,11 @@ pub(super) fn open_fixture_dialog(path: &std::path::Path) -> SettingsDialog {
     }
     dialog.cx.queue_extended_load();
     dialog.cx.queue_provider_catalog(None);
+    // Production drives these initial authority reads from the App's effect
+    // loop before the settings surface becomes interactive. Unit fixtures use
+    // the same wire-valid fake, so settle that startup work here rather than
+    // rendering an artificial half-initialized dialog.
+    dialog.settle_test_effects();
     dialog
 }
 
@@ -872,6 +883,7 @@ fn save_extended_repairs_private_config_permissions() {
     let config_path = config_dir.join("config.json");
     std::fs::write(&config_path, "{}").unwrap();
     let mut d = SettingsDialog::open(config_path);
+    d.settle_test_effects();
     std::fs::set_permissions(&d.extended_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -904,6 +916,7 @@ fn save_extended_preserves_explicit_shared_parent_permissions() {
     env.set_cockpit_config(&config_path);
 
     let mut dialog = SettingsDialog::open(config_path.clone());
+    dialog.settle_test_effects();
     dialog.extended.redact.denylist = vec!["secret-value".to_string()];
     dialog.save_extended().unwrap();
 
@@ -1539,6 +1552,33 @@ fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
     session
 }
 
+fn sidecar_grantable_pointer_session() -> image_sidecar::SidecarSession {
+    let mut session = sidecar_pointer_session();
+    session.reducer.resolution = Some(image_sidecar::SidecarEffectiveTrace {
+        primary: Some(image_sidecar::SidecarPrimaryTrace {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            trust: "trusted".into(),
+            location: "public_cloud".into(),
+            credential_fingerprint: "fixture".into(),
+        }),
+        matched_source: "fixture".into(),
+        sidecar_provider: Some("openai".into()),
+        sidecar_model: Some("gpt-4o".into()),
+        origin: Some("https://api.example".into()),
+        capability_source: "configured".into(),
+        capability_freshness: "fresh".into(),
+        config_generation: 1,
+        mode: pointer_actions::SidecarModeChoice::Automatic,
+        available: true,
+        fallback_outcome: None,
+        reason: "selected".into(),
+    });
+    session.reducer.grant_candidate_id = Some("fixture-candidate".into());
+    session.selected_invocation = Some("inv-1".into());
+    session
+}
+
 #[test]
 fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
     use pointer_actions::{SettingsPointerAction, SidecarAction, SidecarModeChoice};
@@ -1575,7 +1615,7 @@ fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
 fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
     use pointer_actions::SettingsPointerAction;
 
-    let builders: [fn(&TempDir) -> SettingsDialog; 11] = [
+    let builders: [fn(&TempDir) -> SettingsDialog; 14] = [
         |tmp| {
             dialog_with_sidecar_page(
                 tmp,
@@ -1583,12 +1623,11 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
             )
         },
         |tmp| {
+            let mut session = sidecar_pointer_session();
+            session.form.local_edits_preserved = true;
             dialog_with_sidecar_page(
                 tmp,
-                image_sidecar::sidecar_page(
-                    image_sidecar::SidecarPageKind::ModeEditor,
-                    sidecar_pointer_session(),
-                ),
+                image_sidecar::sidecar_page(image_sidecar::SidecarPageKind::ModeEditor, session),
             )
         },
         |tmp| {
@@ -1598,6 +1637,14 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
                     image_sidecar::SidecarPageKind::DefaultEditor,
                     sidecar_pointer_session(),
                 ),
+            )
+        },
+        |tmp| {
+            let mut session = sidecar_pointer_session();
+            session.conflict = Some("fixture conflict".into());
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(image_sidecar::SidecarPageKind::ModeEditor, session),
             )
         },
         |tmp| {
@@ -1615,6 +1662,17 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
                 image_sidecar::sidecar_page(
                     image_sidecar::SidecarPageKind::CentralPolicyEditor,
                     sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            let mut session = sidecar_pointer_session();
+            session.form.local_edits_preserved = true;
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::CentralPolicyEditor,
+                    session,
                 ),
             )
         },
@@ -1661,6 +1719,15 @@ fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
                 image_sidecar::sidecar_page(
                     image_sidecar::SidecarPageKind::GrantEditor,
                     sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::GrantEditor,
+                    sidecar_grantable_pointer_session(),
                 ),
             )
         },
@@ -4555,6 +4622,7 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
             .unwrap()
             .set_text_for_test("Dock".into(), tmp.path());
     }
+    d.settle_test_effects();
     let before = d.extended.sandbox.dockerfile.clone();
     let _ = render_settings_rows(&d, 72, 20);
     let target = d
@@ -4975,7 +5043,7 @@ fn category_wrapped_values_continue_under_value_column() {
     let rendered = render_settings_rows(&d, 62, 30).join("\n");
     let continuation = rendered
         .lines()
-        .find(|line| line.contains("leave the sandbox"))
+        .find(|line| line.contains("approval to leave the"))
         .unwrap_or_else(|| panic!("expected wrapped approval-mode value:\n{rendered}"));
     assert!(
         continuation.starts_with("│     "),
@@ -5049,6 +5117,12 @@ fn lsp_server_row_windows_into_short_viewport() {
     let tmp = TempDir::new().unwrap();
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &cockpit_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let mut d = SettingsDialog::open(cockpit_dir.join("config.json"));
     d.set_test_page(Page::Lsp(LspPage {
         cursor: LSP_SERVER_ROW_START,
@@ -5176,10 +5250,14 @@ fn behavior_default_agent_row_cycles_and_persists() {
     let mut d = fresh_dialog(&tmp);
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
     open_category_on(&mut d, Category::Behavior, SettingId::DefaultPrimaryAgent);
+    d.settle_test_effects();
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
     assert_eq!(reloaded.default_primary_agent, DefaultPrimaryAgent::Plan);
+    d.settle_test_effects();
+    assert!(!d.authority_operation_pending());
+    d.handle_key(press(KeyCode::Char('n')));
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
 }
@@ -5191,6 +5269,7 @@ fn roster_trim_behavior_settings_has_no_experimental_row_and_cycles_build_plan()
     let mut d = fresh_dialog(&tmp);
 
     open_category_on(&mut d, Category::Behavior, SettingId::DefaultPrimaryAgent);
+    d.settle_test_effects();
     let rendered = render_settings_rows(&d, 100, 30).join("\n");
     assert!(
         !rendered.contains("experimental mode"),
@@ -5199,8 +5278,12 @@ fn roster_trim_behavior_settings_has_no_experimental_row_and_cycles_build_plan()
     d.extended.default_primary_agent = DefaultPrimaryAgent::Plan;
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
+    d.settle_test_effects();
+    d.handle_key(press(KeyCode::Char('n')));
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
+    d.settle_test_effects();
+    d.handle_key(press(KeyCode::Char('n')));
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
 }
@@ -5401,6 +5484,10 @@ fn privacy_sandbox_rows_cycle_edit_and_persist() {
     if let TestPageMut::Category(p) = d.test_page_mut() {
         let editor = p.path_editor.as_mut().expect("dockerfile path editor");
         editor.set_text_for_test("Dock".to_string(), tmp.path());
+    }
+    d.settle_test_effects();
+    if let TestPageMut::Category(p) = d.test_page_mut() {
+        let editor = p.path_editor.as_mut().expect("dockerfile path editor");
         assert!(
             editor
                 .suggest
@@ -5796,6 +5883,7 @@ fn privacy_redaction_rows_toggle_and_persist() {
     open_category_on(&mut d, Category::Privacy, SettingId::RedactScanEnvironment);
     d.handle_key(press(KeyCode::Enter));
     assert!(!d.extended.redact.scan_environment);
+    d.handle_key(press(KeyCode::Char('n')));
     // The env-file row is the next one down.
     d.handle_key(press(KeyCode::Down));
     let want = match d.test_page() {
@@ -6800,7 +6888,20 @@ fn open_providers_add_lands_on_add_page_when_config_exists() {
     // open without falling through to CreateConfig.
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
-    std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &cockpit_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &config_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let d = Dialog::open_providers_add(tmp.path());
     let Dialog::Settings(s) = d else {
         panic!("expected Settings dialog");
@@ -6817,7 +6918,14 @@ fn no_providers_auto_opens_wizard() {
     let tmp = TempDir::new().unwrap();
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
-    std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &config_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
 
     let d = Dialog::open_providers_add(tmp.path());
     let Dialog::Settings(s) = d else {
@@ -6979,7 +7087,6 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
     for expected in [
         "provider",
         "model",
-        "class",
         "trust",
         "capabilities",
         "context-tokens",
@@ -7471,12 +7578,16 @@ fn harnesses_page_refuses_a_layer_whose_unrelated_field_is_malformed() {
 
     let mut d = open_fixture_dialog(&path);
     enter_harnesses_from_root(&mut d);
+    d.settle_test_effects();
     // The settings snapshot is all-or-nothing: a layer the typed schema cannot
     // parse is refused whole, so the page opens on defaults instead of
     // presenting a partially parsed document as editable state.
     assert!(d.extended.harnesses.is_empty());
     assert!(d.extended_revision.is_none());
-    assert_eq!(harness_status(&d), None);
+    assert!(
+        harness_status(&d).is_some_and(|status| status.starts_with("load failed:")),
+        "the page keeps the daemon's typed-layer error instead of a stale loading state"
+    );
 }
 
 /// Move to the `[seed installed presets]` row and activate it. Assumes
@@ -8101,6 +8212,11 @@ fn pressing_a_on_picker_opens_scoped_create_dialog() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
+    };
+    let _trust = cockpit_config::trust::enter_workspace_trust_policy(policy);
     let mut d = Dialog::open(tmp.path());
     assert!(matches!(d, Dialog::PickConfig { .. }));
     let close = d.handle_key(press(KeyCode::Char('a')));
@@ -8119,6 +8235,11 @@ fn esc_from_scoped_create_returns_to_picker() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
+    };
+    let _trust = cockpit_config::trust::enter_workspace_trust_policy(policy);
     let mut d = Dialog::open(tmp.path());
     d.handle_key(press(KeyCode::Char('a')));
     assert!(matches!(d, Dialog::CreateScopedConfig { .. }));
@@ -9147,7 +9268,45 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     assert!(rendered.contains(secret_display::MASKED_VALUE));
     assert!(!rendered.contains("fc-secret-value"));
 
-    d.handle_key(press(KeyCode::Enter)); // owner-remoted persist
+    // Invoke the page reducer directly for the final Enter so the settings
+    // test wrapper cannot auto-settle and consume the newly queued effect.
+    // Production reaches the same reducer before its async effect loop drains
+    // the queue.
+    let nav = d.page.handle_key(&mut d.cx, press(KeyCode::Enter));
+    d.apply_nav(nav); // queue owner-remoted persist
+    // Cross the actual owner boundary with the dialog-produced effect. This
+    // keeps the persistence assertion coupled to the provider, payload, and
+    // operation identity emitted by the UI reducer.
+    let effect =
+        d.cx.take_daemon_effect()
+            .expect("web-key dialog must queue an owner credential effect");
+    let SettingsDaemonEffectWork::ProviderCredentialPut {
+        client_operation_id,
+        provider_id,
+        record,
+    } = effect.work
+    else {
+        panic!("web-key dialog queued the wrong daemon effect")
+    };
+    assert_eq!(provider_id, "firecrawl");
+    let record = record.take();
+    assert_eq!(record, r#"{"api_key":"fc-secret-value"}"#);
+    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+        .await
+        .expect("settings daemon client for web credential");
+    let response = client
+        .request(Request::PutProviderCredential {
+            client_operation_id,
+            provider_id,
+            record: record.into(),
+        })
+        .await
+        .expect("owner credential transport")
+        .expect("owner credential response");
+    assert!(matches!(
+        response,
+        Response::Ack | Response::ProviderCredentialCommitted { .. }
+    ));
 
     // Persistence is owner-remoted: the key must land in the daemon vault as a
     // redacted provider credential record — never a local credentials.json —
@@ -9453,8 +9612,8 @@ fn durable_settings_mutations_retain_unknown_settlement_until_receipt() {
     assert!(source.contains("authority_operation_pending"));
     assert!(source.contains("pending_settlement_kind"));
     assert!(source.contains("valid_local_settlement_hash"));
-    assert!(source.contains("operation was authoritatively rejected"));
-    assert!(source.contains("operation was authoritatively cancelled"));
+    assert!(source.contains("mutation was authoritatively rejected"));
+    assert!(source.contains("terminal_cancelled"));
 }
 
 #[test]
@@ -9472,7 +9631,7 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(source.contains("settings commit settlement is unknown"));
     assert!(source.contains("typed settings commit remains unsettled"));
     assert!(mcp.contains("expected_consumed_revision"));
-    assert!(mcp.contains("expected_result_revision"));
+    assert!(source.contains("is_opaque_authority_token(result_revision)"));
     assert!(source.contains("sanitized_intent_hash"));
     assert!(source.contains("returned_intent_hash == mutation_intent_hash"));
     assert!(source.contains("mutation_intent_hash == expected_request_hash"));

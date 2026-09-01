@@ -701,7 +701,7 @@ fn every_production_block_on_is_test_only_or_worker_owned() {
     let runner = include_str!("../agent_runner.rs");
     assert_eq!(
         runner.matches(".block_on(").count(),
-        4,
+        5,
         "agent-runner blocking adapters require a fresh call-site audit"
     );
     assert!(runner.contains("may be called only from an\n/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker"));

@@ -3570,7 +3570,7 @@ pub(crate) fn import_text_artifact_slots_conn(
                     slot.staged_blob_session_id,
                 ) {
                     (Some(path), Some(staged_session_id)) => {
-                        crate::db::Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
+                        Db::claim_staged_text_artifact_blob_cleanup_intent_conn(
                             conn,
                             &path,
                             staged_session_id,
@@ -4076,7 +4076,7 @@ mod tests {
         };
         assert_eq!(
             materialized.source_artifact.content,
-            "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES)
+            format!("{}\n", "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES))
         );
         let event = db
             .list_session_events(session.session_id)

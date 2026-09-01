@@ -592,8 +592,20 @@ impl ActionFixtureKey {
             Self::Providers(ProvidersFixture::WizardCopilotNoControl) => {
                 ExpectedReducerOutcome::NoPointerControl
             }
+            // Agent definitions are schema v2, whose tool authority is
+            // host-owned. The legacy structured-detail controls are retained
+            // in the reducer vocabulary for migration safety, but no current
+            // agent surface renders them; raw-editor controls retain Save.
+            Self::Agents(
+                AgentsFixture::ToggleTool | AgentsFixture::CycleTier | AgentsFixture::OpenRawEditor,
+            ) => ExpectedReducerOutcome::NoPointerControl,
             Self::List(ListFixture::MoveUp | ListFixture::MoveDown)
-            | Self::DefaultModel(DefaultModelFixture::Clear) => ExpectedReducerOutcome::Contextual,
+            | Self::DefaultModel(DefaultModelFixture::Clear)
+            | Self::Sidecar(
+                SidecarFixture::SaveSelection
+                | SidecarFixture::SaveCentralPolicy
+                | SidecarFixture::CreateGrant,
+            ) => ExpectedReducerOutcome::Contextual,
             Self::Root(_)
             | Self::Category(_)
             | Self::Agents(_)

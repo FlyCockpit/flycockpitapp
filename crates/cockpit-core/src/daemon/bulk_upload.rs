@@ -185,6 +185,7 @@ mod tests {
         let expected_chunk_count = expected_bytes
             .len()
             .div_ceil(crate::daemon::bulk_staging::STAGED_CHUNK_BYTES);
+        let server_socket = socket.clone();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept bulk-upload client");
@@ -206,6 +207,40 @@ mod tests {
                 ))
                 .await
                 .expect("send daemon hello");
+
+            let confirmation_id = match daemon
+                .recv()
+                .await
+                .expect("read client lifetime confirmation")
+                .expect("bulk-upload client stays connected")
+            {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::DaemonStatus,
+                        ..
+                    } => id,
+                    other => panic!("expected client lifetime confirmation, got {other:?}"),
+                },
+                other => panic!("expected client lifetime confirmation envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::response(
+                    confirmation_id,
+                    Response::DaemonStatus {
+                        pid: std::process::id(),
+                        uptime_secs: 0,
+                        active_sessions: 0,
+                        socket_path: server_socket.display().to_string(),
+                        daemon_version: "bulk-upload-test".to_owned(),
+                        protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: ":memory:".to_owned(),
+                        schema_version: 0,
+                    },
+                ))
+                .await
+                .expect("confirm bulk-upload client lifetime");
 
             let mut uploaded = Vec::new();
             let mut reference = None;

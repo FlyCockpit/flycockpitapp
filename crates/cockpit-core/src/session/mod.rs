@@ -48,6 +48,8 @@ mod recording;
 pub mod sealed_values;
 #[cfg(any(test, feature = "test-support"))]
 mod test_constructors;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_constructors::TestSessionRowOptions;
 /// The trusted-child sealed-value capture authority + pending-record registry
 /// (leak-report AC7/AC8, sub-increment 2c-2). Exercised end-to-end by its own
 /// unit tests; the production coordinator that mints and drives it lands in the
@@ -1108,7 +1110,8 @@ struct LastRecoverableToolCall {
 }
 
 /// The durable identity for exactly one inference send. Wall-clock time
-/// supplies the scheduler deadline; `send_id` prevents two sends in one
+/// supplies the daemon-job timing; the paired Tokio monotonic origin supplies
+/// the in-process scheduler deadline. `send_id` prevents two sends in one
 /// millisecond from being treated as the same cache-producing request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InferenceSendIdentity {
@@ -1119,6 +1122,7 @@ pub(crate) struct InferenceSendIdentity {
 #[derive(Clone, Copy)]
 struct InferenceSendTime {
     monotonic: std::time::Instant,
+    scheduler_monotonic: tokio::time::Instant,
     identity: InferenceSendIdentity,
 }
 
@@ -1729,6 +1733,7 @@ impl Session {
     pub fn note_send(&self) {
         self.note_send_at(
             std::time::Instant::now(),
+            tokio::time::Instant::now(),
             chrono::Utc::now().timestamp_millis(),
         );
     }
@@ -1756,11 +1761,11 @@ impl Session {
     /// window between sampling elapsed time and arming a timer.
     pub(crate) fn last_send_identity_and_origin(
         &self,
-    ) -> Option<(InferenceSendIdentity, std::time::Instant)> {
+    ) -> Option<(InferenceSendIdentity, tokio::time::Instant)> {
         self.last_send_at
             .lock()
             .unwrap()
-            .map(|t| (t.identity, t.monotonic))
+            .map(|t| (t.identity, t.scheduler_monotonic))
     }
 
     #[cfg(test)]
@@ -1770,6 +1775,9 @@ impl Session {
             std::time::Instant::now()
                 .checked_sub(elapsed)
                 .unwrap_or_else(std::time::Instant::now),
+            tokio::time::Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(tokio::time::Instant::now),
             chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(elapsed_millis),
@@ -1781,12 +1789,22 @@ impl Session {
     /// the millisecond used to calculate its deadline.
     #[cfg(test)]
     pub(crate) fn note_send_with_unix_millis_for_test(&self, unix_millis: i64) {
-        self.note_send_at(std::time::Instant::now(), unix_millis);
+        self.note_send_at(
+            std::time::Instant::now(),
+            tokio::time::Instant::now(),
+            unix_millis,
+        );
     }
 
-    fn note_send_at(&self, monotonic: std::time::Instant, unix_millis: i64) {
+    fn note_send_at(
+        &self,
+        monotonic: std::time::Instant,
+        scheduler_monotonic: tokio::time::Instant,
+        unix_millis: i64,
+    ) {
         *self.last_send_at.lock().unwrap() = Some(InferenceSendTime {
             monotonic,
+            scheduler_monotonic,
             identity: InferenceSendIdentity {
                 unix_millis,
                 send_id: Uuid::new_v4(),
@@ -2300,10 +2318,28 @@ fn workspace_scratch_dir_for_session(
             let marker: WorkspaceDirMarker = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing `{}`", marker_path.display()))?;
             anyhow::ensure!(
-                marker.project_id == project_id && marker.canonical_root == canonical_root,
-                "workspace marker does not match this project identity"
+                marker.project_id == project_id,
+                "workspace marker project id does not match directory"
             );
-            marker.created_at_unix_ms
+
+            if marker.canonical_root == canonical_root {
+                marker.created_at_unix_ms
+            } else if project_id_for(Path::new(&marker.canonical_root))
+                .ok()
+                .as_deref()
+                == Some(project_id)
+            {
+                // A live directory object with this identity is already
+                // bound to a different canonical root. Never retarget its
+                // durable scratch by accepting an alternate pathname.
+                anyhow::bail!("workspace marker does not match this project identity");
+            } else {
+                // Project IDs are derived from directory-object identity.
+                // Filesystems may reuse that identity after a workspace is
+                // removed, leaving a marker whose old root no longer proves
+                // the current project. Replace only that stale reverse map.
+                now
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => now,
         Err(error) => {
@@ -2335,6 +2371,25 @@ pub(crate) fn workspace_scratch_path_for_session(
     session_id: Uuid,
 ) -> Result<PathBuf> {
     Ok(workspace_dir_for_project_id(project_id)?
+        .join("sessions")
+        .join(session_id.to_string()))
+}
+
+/// Isolate direct, pre-identity test fixtures from the production workspace
+/// namespace.  These rows deliberately retain their short labels in the
+/// ledger, so using the label as a directory component would bypass the
+/// production project-id validation.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn test_fixture_workspace_scratch_path_for_session(
+    fixture_project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    let directory_id = project_id_from_workspace_object(&format!(
+        "cockpit-legacy-test-fixture-workspace-v1\\0{fixture_project_id}"
+    ));
+    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
+        .join("test-workspaces")
+        .join(directory_id)
         .join("sessions")
         .join(session_id.to_string()))
 }
@@ -3519,18 +3574,23 @@ mod tests {
         let supplied_root = project_root.join(".");
         let canonical_root = std::fs::canonicalize(&project_root).unwrap();
         let db = Db::open_in_memory().unwrap();
-        let a = Session::create_for_test(
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let a = Session::create(
             db.clone(),
             supplied_root.clone(),
             "builder",
+            &crate::config::extended::ExtendedConfig::default(),
             crate::session::test_redaction_key_resolver(),
+            vault.clone(),
         )
         .unwrap();
-        let b = Session::create_for_test(
+        let b = Session::create(
             db.clone(),
             supplied_root,
             "builder",
+            &crate::config::extended::ExtendedConfig::default(),
             crate::session::test_redaction_key_resolver(),
+            vault,
         )
         .unwrap();
 
@@ -4030,18 +4090,25 @@ mod tests {
     #[tokio::test]
     async fn resume_rejects_divergent_model_selection_projections() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "Build").await.unwrap();
-        row.provider = Some("projection-provider".to_string());
-        row.model = Some("projection-model".to_string());
-        row.model_selection_json = Some(
-            serde_json::json!({
-                "provider": "structured-provider",
-                "model": "structured-model",
-                "thinking_mode": "high"
-            })
-            .to_string(),
-        );
-        let row = db.insert_session_row(&row).await.unwrap();
+        let row = Session::insert_row_for_test(
+            &db,
+            Path::new("/x"),
+            "Build",
+            TestSessionRowOptions::default().with_raw_model_selection_fields(
+                Some("projection-provider".to_string()),
+                Some("projection-model".to_string()),
+                Some(
+                    serde_json::json!({
+                        "provider": "structured-provider",
+                        "model": "structured-model",
+                        "thinking_mode": "high"
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
 
         let error = Session::resume_for_test(
             db,
@@ -4057,10 +4124,18 @@ mod tests {
     #[tokio::test]
     async fn resume_rejects_projection_only_model_state() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "Build").await.unwrap();
-        row.provider = Some("projection-provider".to_string());
-        row.model = Some("projection-model".to_string());
-        let row = db.insert_session_row(&row).await.unwrap();
+        let row = Session::insert_row_for_test(
+            &db,
+            Path::new("/x"),
+            "Build",
+            TestSessionRowOptions::default().with_raw_model_selection_fields(
+                Some("projection-provider".to_string()),
+                Some("projection-model".to_string()),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
 
         let error = Session::resume_for_test(
             db,
@@ -4071,6 +4146,86 @@ mod tests {
         .expect("projection-only state must not synthesize empty preferences")
         .to_string();
         assert!(error.contains("require model_selection_json"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn insert_row_for_test_rejects_assistant_with_non_assistant_entry_mode() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
+
+        let error = Session::insert_row_for_test(
+            &db,
+            Path::new("/x"),
+            "Build",
+            TestSessionRowOptions::default()
+                .with_assistant("helper")
+                .with_entry_mode(crate::daemon::proto::SessionEntryMode::Computer),
+        )
+        .await
+        .expect_err("assistant rows must reject non-assistant entry modes")
+        .to_string();
+
+        assert_eq!(error, "assistant test row requires assistant entry mode");
+        assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_for_test_rejects_mismatched_raw_project_identity() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut row = db
+            .new_session_row(
+                "deliberately-mismatched-project-id",
+                root.path().to_str().unwrap(),
+                "Build",
+            )
+            .await
+            .unwrap();
+        row = db.insert_session_row(&row).await.unwrap();
+
+        let error = Session::resume_strict_for_test(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .err()
+        .expect("raw identity mismatch must fail closed")
+        .to_string();
+        assert_eq!(
+            error,
+            "persisted session project id does not match canonical workspace root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_row_persists_canonical_symlink_target_for_resume() {
+        let db = Db::open_in_memory().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("original");
+        let replacement = fixture.path().join("replacement");
+        let alias = fixture.path().join("workspace");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let canonical_original = std::fs::canonicalize(&original).unwrap();
+
+        let row =
+            Session::insert_row_for_test(&db, &alias, "Build", TestSessionRowOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(PathBuf::from(&row.project_root), canonical_original);
+
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        let resumed = Session::resume_for_test(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("durable row remains bound to the original canonical target");
+        assert_eq!(resumed.project_root, canonical_original);
     }
 
     #[tokio::test]

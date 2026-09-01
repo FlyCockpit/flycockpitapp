@@ -214,6 +214,14 @@ impl HostContext {
         }
     }
 
+    /// The `mcp` grant now admits only non-cockpit MCP servers. The Monty
+    /// runtime and the reserved `cockpit` server remain available without it.
+    pub fn external_mcp_servers_allowed(&self) -> bool {
+        self.native_tool_ctx
+            .as_ref()
+            .is_none_or(|ctx| ctx.mcp_resolver.external_servers_allowed())
+    }
+
     #[allow(dead_code)]
     pub fn empty_for_tests() -> Self {
         Self {
@@ -1503,6 +1511,11 @@ fn set_session_metadata<'a>(
 }
 
 fn rename_session_availability(ctx: &HostContext) -> Availability {
+    if !ctx.root_agent_frame {
+        return Availability::unavailable(
+            "rename_session can only be requested from the root agent frame",
+        );
+    }
     let Some(session) = ctx.session.as_ref() else {
         return Availability::unavailable("rename_session requires a live session");
     };
@@ -1524,6 +1537,11 @@ fn rename_session<'a>(
     args: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
+        if !ctx.root_agent_frame {
+            bail!(
+                "`cockpit.rename_session` is unavailable: session titles can only be changed from the root agent frame"
+            );
+        }
         let raw = args
             .get("name")
             .and_then(Value::as_str)

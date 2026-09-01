@@ -164,7 +164,7 @@ fn overlapping_local_knowledge_roots_are_rejected() {
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge/nested")).unwrap();
     std::fs::write(
-        tmp.path().join("config.json"),
+        tmp.path().join(".cockpit/config.json"),
         r#"{
           "knowledgeBases": [
             {
@@ -192,7 +192,8 @@ fn overlapping_local_knowledge_roots_are_rejected() {
 
     let _trust = enter_trusted_workspace(tmp.path());
     let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
-    assert!(error.to_string().contains("overlapping roots"), "{error}");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("overlapping roots"), "{diagnostic}");
 }
 
 #[cfg(unix)]
@@ -204,9 +205,10 @@ fn overlapping_local_knowledge_roots_fail_closed_when_a_symlinked_child_root_is_
     let tmp = TempDir::new().unwrap();
     let real = tmp.path().join("knowledge");
     std::fs::create_dir_all(real.join("nested")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
     symlink(&real, tmp.path().join("alias")).unwrap();
     std::fs::write(
-        tmp.path().join("config.json"),
+        tmp.path().join(".cockpit/config.json"),
         r#"{
           "knowledgeBases": [
             {
@@ -234,8 +236,9 @@ fn overlapping_local_knowledge_roots_fail_closed_when_a_symlinked_child_root_is_
 
     let _trust = enter_trusted_workspace(tmp.path());
     let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
-    assert!(error.to_string().contains("overlapping roots"), "{error}");
-    assert!(error.to_string().contains("future-child"), "{error}");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("overlapping roots"), "{diagnostic}");
+    assert!(diagnostic.contains("future-child"), "{diagnostic}");
 }
 
 #[test]

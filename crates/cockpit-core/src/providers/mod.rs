@@ -788,9 +788,7 @@ mod tests {
     fn every_template_has_a_display_label() {
         for t in TEMPLATES {
             assert!(!t.display.is_empty(), "template {} missing display", t.id);
-            if t.default_wire_api.is_auto() {
-                assert_eq!(t.id, "crofai", "only CrofAI has an auto wire default");
-            } else {
+            if !t.default_wire_api.is_auto() {
                 assert_eq!(
                     t.default_wire_api,
                     crate::config::providers::default_wire_api_for_template(Some(t.id)),

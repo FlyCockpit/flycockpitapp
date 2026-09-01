@@ -1883,7 +1883,6 @@ impl WireApi {
 pub fn default_wire_api_for_template(template: Option<&str>) -> WireApi {
     match template {
         Some(template) if template.eq_ignore_ascii_case("anthropic") => WireApi::Anthropic,
-        Some(template) if template.eq_ignore_ascii_case("crofai") => WireApi::Auto,
         Some(template)
             if matches!(
                 template.to_ascii_lowercase().as_str(),
@@ -3215,12 +3214,9 @@ impl ProvidersConfig {
     /// Resolve the effective request wire for `(provider, model)`.
     ///
     /// Explicit model and provider configuration win. An unset entry then
-    /// inherits its immutable template default. An `Auto` template uses the
-    /// model's live catalog capabilities, preferring Responses when both
-    /// OpenAI-compatible endpoints are advertised. Custom, unknown, and
-    /// metadata-free automatic providers default to Chat Completions. URLs,
-    /// mutable provider ids, model names, and learned endpoint state never
-    /// participate.
+    /// inherits its immutable template default; a custom or unknown provider
+    /// defaults to Chat Completions. URLs, mutable provider ids, model names,
+    /// live catalog metadata, and learned endpoint state never participate.
     pub fn resolve_wire_api(&self, provider: &str, model: &str) -> WireApi {
         let Some(entry) = self.providers.get(provider) else {
             return WireApi::Completions;
@@ -3238,16 +3234,7 @@ impl ProvidersConfig {
         if !entry.wire_api.is_auto() {
             return entry.wire_api;
         }
-        let template_default = default_wire_api_for_template(entry.effective_template(provider));
-        if !template_default.is_auto() {
-            return template_default;
-        }
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .and_then(|m| m.capabilities.preferred_wire_api())
-            .unwrap_or(WireApi::Completions)
+        default_wire_api_for_template(entry.effective_template(provider))
     }
 
     /// Whether a configured provider has a fixed effective wire. Resolution is

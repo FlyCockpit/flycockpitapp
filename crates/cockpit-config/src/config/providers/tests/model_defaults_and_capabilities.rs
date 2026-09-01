@@ -1497,7 +1497,10 @@ fn wire_api_template_defaults_are_total_and_identity_based() {
         default_wire_api_for_template(Some("codex-oauth")),
         WireApi::Responses
     );
-    assert_eq!(default_wire_api_for_template(Some("crofai")), WireApi::Auto);
+    assert_eq!(
+        default_wire_api_for_template(Some("crofai")),
+        WireApi::Completions
+    );
     assert_eq!(
         default_wire_api_for_template(Some("openai-compatible")),
         WireApi::Completions
@@ -1522,32 +1525,31 @@ fn wire_api_template_defaults_are_total_and_identity_based() {
 }
 
 #[test]
-fn crofai_auto_template_uses_catalog_wire_capabilities() {
+fn crofai_template_uses_normal_wire_resolution() {
     let mut cfg = ProvidersConfig::default();
     let mut responses_model = model("responses-model", false);
     responses_model.capabilities.supported_wire_apis = vec![WireApi::Responses];
-    let mut completions_model = model("completions-model", false);
-    completions_model.capabilities.supported_wire_apis = vec![WireApi::Completions];
+    let mut explicitly_routed_model = model("explicitly-routed-model", false);
+    explicitly_routed_model.wire_api = WireApi::Responses;
     cfg.providers.insert(
         "renamed-crofai".into(),
         ProviderEntry {
             template: Some("crofai".into()),
-            models: vec![responses_model, completions_model],
+            models: vec![responses_model, explicitly_routed_model],
             ..ProviderEntry::default()
         },
     );
 
+    // The template is only a wizard prefill: live catalog capabilities never
+    // select a request endpoint. A model can still opt into Responses through
+    // the ordinary explicit per-model configuration.
     assert_eq!(
         cfg.resolve_wire_api("renamed-crofai", "responses-model"),
+        WireApi::Completions
+    );
+    assert_eq!(
+        cfg.resolve_wire_api("renamed-crofai", "explicitly-routed-model"),
         WireApi::Responses
-    );
-    assert_eq!(
-        cfg.resolve_wire_api("renamed-crofai", "completions-model"),
-        WireApi::Completions
-    );
-    assert_eq!(
-        cfg.resolve_wire_api("renamed-crofai", "metadata-free-model"),
-        WireApi::Completions
     );
 }
 

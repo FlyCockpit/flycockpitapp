@@ -19,6 +19,44 @@ fn source(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("reading {relative}: {error}"))
 }
 
+fn enables_grok_subscription(value: &str) -> bool {
+    let value = value.strip_prefix("dep:").unwrap_or(value);
+    let value = value.strip_suffix('?').unwrap_or(value);
+    value == "grok-subscription" || value.ends_with("/grok-subscription")
+}
+
+fn dependency_enables_grok_subscription(value: &toml::Value) -> bool {
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+
+    for (key, child) in table {
+        if matches!(
+            key.as_str(),
+            "dependencies" | "build-dependencies" | "dev-dependencies"
+        ) && child.as_table().is_some_and(|dependencies| {
+            dependencies.values().any(|specification| {
+                specification
+                    .as_table()
+                    .and_then(|specification| specification.get("features"))
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|features| {
+                        features
+                            .iter()
+                            .filter_map(toml::Value::as_str)
+                            .any(enables_grok_subscription)
+                    })
+            })
+        }) {
+            return true;
+        }
+        if dependency_enables_grok_subscription(child) {
+            return true;
+        }
+    }
+    false
+}
+
 #[test]
 fn local_release_has_one_opt_in_remote_capability() {
     for manifest in [
@@ -131,10 +169,52 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
 #[test]
 fn official_release_never_enables_optional_cargo_features() {
     let release = source(".github/workflows/release.yml");
+    let policy = source("scripts/check-official-release-feature-policy.sh");
+    assert!(release.contains("bash scripts/check-official-release-feature-policy.sh"));
     assert!(release.contains("[ \"$default_features\" != \"[]\" ]"));
     assert!(release.contains("official release default features must be empty"));
     assert!(release.contains("(--all-features|--features|-F)"));
     assert!(release.contains("cockpit-cli/(remote|grok-subscription)"));
+    assert_eq!(release.matches("CARGO_ENCODED_RUSTFLAGS: \"\"").count(), 4);
+    assert_eq!(release.matches("CARGO_BUILD_RUSTFLAGS: \"\"").count(), 4);
+    assert_eq!(release.matches("\n          RUSTFLAGS: \"\"").count(), 4);
+    assert_eq!(release.matches("CARGO_TARGET_*_RUSTFLAGS").count(), 4);
+    assert!(policy.contains("dependency feature declaration"));
+    assert!(policy.contains("default feature declaration"));
+    assert!(policy.contains("Cargo config"));
+    assert!(policy.contains("grok-subscription"));
+}
+
+#[test]
+fn official_release_manifest_graph_cannot_unify_grok_subscription() {
+    let workspace: toml::Value = toml::from_str(&source("Cargo.toml")).unwrap();
+    for member in workspace["workspace"]["members"]
+        .as_array()
+        .expect("workspace members")
+    {
+        let manifest = format!(
+            "{}/Cargo.toml",
+            member.as_str().expect("workspace member path")
+        );
+        let parsed: toml::Value = toml::from_str(&source(&manifest))
+            .unwrap_or_else(|error| panic!("parsing {manifest}: {error}"));
+        let default_features = parsed
+            .get("features")
+            .and_then(toml::Value::as_table)
+            .and_then(|features| features.get("default"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str);
+        assert!(
+            !default_features.any(enables_grok_subscription),
+            "{manifest} default features activate grok-subscription"
+        );
+        assert!(
+            !dependency_enables_grok_subscription(&parsed),
+            "{manifest} activates grok-subscription through a dependency feature"
+        );
+    }
 }
 
 #[test]

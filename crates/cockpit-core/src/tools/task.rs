@@ -90,7 +90,7 @@ impl TaskTool {
              takes over the conversation with the user; the others run on their own and report \
              back. Only `builder` may write files, in either case. Use `intent=models` to discover \
              allowed structured model selectors. Model selectors choose capability, category, and \
-             cost only: data custody is host policy, so you cannot request a trusted (raw-custody) \
+             cost only: data custody is host policy, so you cannot request a capture-capable \
              child, and delegated routing always applies the redacted untrusted filter. \
              Use exactly one task intent: \
              - delegate: {{ \"intent\": \"delegate\", \"payload\": {{ \"agent\": \"builder\", \"prompt\": \"...\" }} }} \
@@ -349,7 +349,7 @@ impl TaskTool {
         // explicitly in the Defensive schema so the model does not try to
         // reintroduce a `trust` field for "sensitive" work.
         let defensive_model_selector = serde_json::json!(
-            "Capability/category/cost selector only. Data custody is host policy: there is no `trust` field, delegated routing always applies the redacted untrusted filter, and a trusted (raw-custody) child cannot be requested here"
+            "Capability/category/cost selector only. Data custody is host policy: there is no `trust` field, delegated routing always applies the redacted untrusted filter, and a capture-capable child cannot be requested here"
         );
         verbose_parameters["properties"]["payload"]["properties"]["model"]["description"] =
             defensive_model_selector.clone();
@@ -629,7 +629,7 @@ mod tests {
     /// AC7 (schema half). The Defensive presentation used to advertise a
     /// `trust` selector and tell the model to "prefer trusted models for
     /// sensitive delegated work" — that let an untrusted parent request
-    /// raw-custody routing. Data custody is host policy, so the field is gone
+    /// capture-capable routing. Data custody is host policy, so the field is gone
     /// from both schemas and both descriptions say so.
     #[test]
     fn task_schema_has_no_model_trust_selector() {

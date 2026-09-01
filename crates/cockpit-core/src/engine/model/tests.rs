@@ -4069,7 +4069,7 @@ fn disabled_table() -> TestArc<RedactionTable> {
 }
 
 #[test]
-fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
+fn trusted_model_uses_enforced_effective_table_and_keeps_session_table() {
     let (_tmp, redact) = secret_table();
     assert!(
         !redact.is_empty(),
@@ -4101,8 +4101,8 @@ fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
     );
 
     let trusted = Model::for_provider(&cfg, "local", "trusted", redact.clone()).unwrap();
-    assert!(trusted.redact_table().is_empty());
-    assert_eq!(trusted.redact().scrub(SECRET), SECRET);
+    assert!(!trusted.redact_table().is_empty());
+    assert!(!trusted.redact().scrub(SECRET).contains(SECRET));
     assert!(!trusted.session_redact_table().is_empty());
 
     let remote =
@@ -7948,12 +7948,8 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
     }
 }
 
-// AC4b: EVERY non-renderable media source (`Raw`/`FileId`/`Unknown`) on an
-// untrusted dispatch fails closed with a typed prep failure and provably NO
-// provider I/O (a live `ScriptedProvider` captures zero requests); the identical
-// message on a trusted model gets past our prep gate (raw custody), and a
-// trusted renderable dispatch actually reaches the provider carrying its raw
-// content.
+// AC4b: EVERY non-renderable media source (`Raw`/`FileId`/`Unknown`) on every
+// dispatch fails closed with a typed prep failure and provably NO provider I/O.
 #[tokio::test]
 async fn untrusted_non_renderable_wire_field_fails_before_network() {
     use rig::message::{DocumentSourceKind, Image};
@@ -8025,10 +8021,8 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         // Drain guard: nothing was queued at the wire.
         assert!(provider.captured().is_empty());
 
-        // The identical message on a TRUSTED model (raw custody) does NOT trip
-        // OUR fail-closed gate: prep succeeds. (rig itself still rejects these
-        // non-renderable channels downstream of our gate — the point is our
-        // untrusted-only gate did not fire.)
+        // The identical message on a TRUSTED model also trips the fail-closed
+        // gate: trust never bypasses completion redaction.
         let trusted = build_openai_model_from_resolved(
             "p",
             &resolved_local_request(provider.base_url()),
@@ -8057,13 +8051,12 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
             None,
         );
         assert!(
-            trusted_prep.is_ok(),
-            "trusted raw custody must pass our prep gate for the identical message"
+            trusted_prep.is_err(),
+            "trusted dispatch must fail closed too"
         );
     }
 
-    // (c) A trusted model actually DISPATCHES to the provider: a renderable
-    // message carrying the raw sentinel reaches the wire under trusted custody.
+    // (c) A trusted model dispatches a renderable message only after scrubbing.
     let mut provider = sse_capture_provider().await;
     let trusted = build_openai_model_from_resolved(
         "p",
@@ -8079,8 +8072,16 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         0,
         0,
         false,
-        TestArc::new(RedactionTable::empty()),
-        TestArc::new(RedactionTable::empty()),
+        TestArc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "[redacted]".to_string())
+                .unwrap(),
+        ),
+        TestArc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "[redacted]".to_string())
+                .unwrap(),
+        ),
     )
     .unwrap();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
@@ -8104,8 +8105,8 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         "trusted dispatch must reach the provider"
     );
     assert!(
-        body.contains(SECRET),
-        "trusted raw custody carries the literal to the wire: {body}"
+        !body.contains(SECRET),
+        "trusted completion must not carry the literal to the wire: {body}"
     );
 }
 

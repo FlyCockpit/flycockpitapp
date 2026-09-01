@@ -75,14 +75,14 @@ fn sanitized_extra_params_with(
 /// to itself (both key and value are protocol text, never a registered secret).
 pub(super) const REDACTED_COLLISION_MARKER: &str = "**REDACTED BY COCKPIT**";
 
-/// A wire field that has no renderer for an **untrusted** dispatch: a media
+/// A wire field that has no renderer for a completion dispatch: a media
 /// source that is not a scrubbable string channel (`Raw` bytes, a provider
 /// `FileId`, `Unknown`, or a future rig variant). Rather than pass an
 /// unscrubbable channel to a provider that may retain it, the prep step fails
 /// closed and the three prep entry points map this into a typed
 /// [`InferenceFailure`] with phase `prep` and class
-/// [`InferenceErrorClass::UnrenderableWireField`]. Trusted raw custody never
-/// runs the walk, so this can only arise on a route that must redact.
+/// [`InferenceErrorClass::UnrenderableWireField`]. Every completion route runs
+/// the walk.
 #[derive(Debug, Clone)]
 pub(crate) struct UnrenderableWireField {
     /// The channel that could not be rendered, for the failure detail.
@@ -96,7 +96,7 @@ impl UnrenderableWireField {
 
     pub(crate) fn detail(&self) -> String {
         format!(
-            "message wire field `{}` has no renderer for an untrusted dispatch",
+            "message wire field `{}` has no renderer for a completion dispatch",
             self.channel
         )
     }
@@ -106,16 +106,14 @@ impl std::fmt::Display for UnrenderableWireField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("message wire field `")?;
         f.write_str(self.channel)?;
-        f.write_str("` has no renderer for an untrusted dispatch")
+        f.write_str("` has no renderer for a completion dispatch")
     }
 }
 
 /// Scrub every dynamic text field of one history/prompt [`Message`] through
 /// `redact`, returning a rewritten copy (GOALS §7,
-/// `redaction-cover-all-llm-requests.md`). This is the untrusted-egress wire
-/// walk: it is only invoked for a route that must redact (a trusted raw-custody
-/// route bypasses it entirely), so it fails **closed** on any channel it cannot
-/// render.
+/// `redaction-cover-all-llm-requests.md`). This is the completion-egress wire
+/// walk and it fails **closed** on any channel it cannot render.
 ///
 /// The walk is a closed policy over every rig content variant — there is no
 /// silent passthrough. Each string channel is scrubbed: the system content,

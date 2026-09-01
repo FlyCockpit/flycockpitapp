@@ -983,7 +983,7 @@
       "monty_nudge": "monty tools enabled: code",
       "override_json": "{\"tools\":[\"read\",\"code\",\"mcp\"],\"toolTiers\":{\"code\":\"discoverable\"}}",
       "persist_session": true,
-      "prune_after_switch": true
+      "cache_break_acknowledged": true
     },
     "request": "set_tool_surface_override"
   },

@@ -1158,21 +1158,9 @@ impl Session {
     /// Written at dispatch (`pending`, no response) and again on settle
     /// (terminal status + captured response/usage).
     ///
-    /// `session_table` is the tandem target's PRE-POLICY session redaction table
-    /// (never the trusted-empty effective table) and `target_trusted` is that
-    /// target route's trust bit. A tandem target runs on its OWN trust: a TRUSTED
-    /// tandem keeps raw custody, so BOTH the assembled `request` body AND the
-    /// captured `response` it emits are persisted RAW and can carry a session-
-    /// table literal (`dispatch.rs` `complete_tandem`/`assemble_dispatch_request`
-    /// keep the raw history for a trusted route; the response echoes what that
-    /// route saw). Those raw literals are NOT otherwise journaled — the MAIN call
-    /// journals against the MAIN model's trust, which is independent of a tandem
-    /// target's — so when the target is trusted (and journaling is not opted out)
-    /// this journals every table-matched literal in the row to protected redaction
-    /// history in the SAME transaction as the row write (decision 10.2/11/12). An
-    /// UNTRUSTED tandem sends only the already-scrubbed body and never sees the raw
-    /// literal, so its request/response are post-redaction and journal nothing; a
-    /// scratch session ([`Self::allow_unjournaled_inference`]) journals nothing.
+    /// `session_table` is the tandem target's pre-policy session redaction
+    /// table and `target_trusted` is that target route's trust metadata. Tandem
+    /// request and response bodies are already post-redaction for every model.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_tandem_inference(
         &self,

@@ -52,6 +52,7 @@ impl TextArtifactKind {
 #[serde(rename_all = "snake_case")]
 pub enum CaptureReason {
     DisplayTruncation,
+    ExplicitAttachment,
     PruneBoundary,
     OversizedUserInput,
 }
@@ -60,6 +61,7 @@ impl CaptureReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DisplayTruncation => "display_truncation",
+            Self::ExplicitAttachment => "explicit_attachment",
             Self::PruneBoundary => "prune_boundary",
             Self::OversizedUserInput => "oversized_user_input",
         }
@@ -72,6 +74,8 @@ pub enum TextArtifactRelation {
     SourceUserInput,
     ModelUserInputProjection,
     ModelContextToolResult,
+    ToolResultDisplay,
+    ToolResultAttachment,
 }
 
 impl TextArtifactRelation {
@@ -80,6 +84,8 @@ impl TextArtifactRelation {
             Self::SourceUserInput => "source_user_input",
             Self::ModelUserInputProjection => "model_user_input_projection",
             Self::ModelContextToolResult => "model_context_tool_result",
+            Self::ToolResultDisplay => "tool_result_display",
+            Self::ToolResultAttachment => "tool_result_attachment",
         }
     }
 }
@@ -1204,11 +1210,8 @@ fn text_artifact_projection_call_ids_conn(
         let artifacts = list_event_artifacts_conn(conn, session_id, event_seq)?;
         let artifacts_by_slot = artifacts
             .iter()
+            .filter(|artifact| artifact.relation == TextArtifactRelation::ModelContextToolResult)
             .map(|artifact| {
-                ensure!(
-                    artifact.relation == TextArtifactRelation::ModelContextToolResult,
-                    "non-model-context artifact attached to a tool projection event"
-                );
                 Ok((
                     artifact
                         .projection_slot
@@ -1574,6 +1577,7 @@ fn record_event_with_text_artifacts_conn(
         .artifacts
         .iter()
         .zip(&plans)
+        .filter(|(candidate, _)| candidate.relation == TextArtifactRelation::ModelContextToolResult)
         .map(|(candidate, plan)| projection_state(candidate, *plan))
         .collect::<Result<Vec<_>>>()?;
     if let Some(unavailable) = &input.unavailable_projection {
@@ -1690,15 +1694,40 @@ fn validate_event_artifact_slots(input: &TextArtifactEventInput) -> Result<()> {
     match input.kind {
         SessionEventKind::ToolCall => {
             ensure!(
-                input.artifacts.len() + usize::from(input.unavailable_projection.is_some()) <= 1,
-                "tool_call accepts at most one artifact projection"
+                input
+                    .artifacts
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.relation == TextArtifactRelation::ModelContextToolResult
+                    })
+                    .count()
+                    + usize::from(input.unavailable_projection.is_some())
+                    <= 1,
+                "tool_call accepts at most one model-context artifact projection"
             );
-            if let Some(candidate) = input.artifacts.first() {
+            for candidate in &input.artifacts {
                 ensure!(
-                    candidate.relation == TextArtifactRelation::ModelContextToolResult
-                        && candidate.projection_slot == Some(0)
-                        && candidate.capture_reason == CaptureReason::DisplayTruncation,
-                    "tool_call artifact must use display-truncation model-context slot 0"
+                    matches!(
+                        (
+                            candidate.relation,
+                            candidate.projection_slot,
+                            candidate.capture_reason
+                        ),
+                        (
+                            TextArtifactRelation::ModelContextToolResult,
+                            Some(0),
+                            CaptureReason::DisplayTruncation
+                        ) | (
+                            TextArtifactRelation::ToolResultDisplay,
+                            Some(_),
+                            CaptureReason::DisplayTruncation
+                        ) | (
+                            TextArtifactRelation::ToolResultAttachment,
+                            Some(_),
+                            CaptureReason::ExplicitAttachment
+                        )
+                    ),
+                    "invalid tool_call artifact lane"
                 );
             }
             if let Some(unavailable) = &input.unavailable_projection {
@@ -2030,6 +2059,18 @@ fn validate_candidate(
         ) if slot >= 0 => {
             validate_tool_provenance(&provenance)?;
         }
+        (
+            TextArtifactKind::ToolResult,
+            CaptureReason::DisplayTruncation,
+            TextArtifactRelation::ToolResultDisplay,
+            Some(slot),
+        ) if slot >= 0 => validate_tool_provenance(&provenance)?,
+        (
+            TextArtifactKind::ToolResult,
+            CaptureReason::ExplicitAttachment,
+            TextArtifactRelation::ToolResultAttachment,
+            Some(slot),
+        ) if slot >= 0 => validate_tool_provenance(&provenance)?,
         (
             TextArtifactKind::UserInputSource,
             CaptureReason::OversizedUserInput,
@@ -3839,6 +3880,7 @@ fn parse_kind(value: String) -> rusqlite::Result<TextArtifactKind> {
 fn parse_reason(value: String) -> rusqlite::Result<CaptureReason> {
     match value.as_str() {
         "display_truncation" => Ok(CaptureReason::DisplayTruncation),
+        "explicit_attachment" => Ok(CaptureReason::ExplicitAttachment),
         "prune_boundary" => Ok(CaptureReason::PruneBoundary),
         "oversized_user_input" => Ok(CaptureReason::OversizedUserInput),
         _ => Err(rusqlite::Error::InvalidQuery),
@@ -3850,6 +3892,8 @@ fn parse_relation(value: String) -> rusqlite::Result<TextArtifactRelation> {
         "source_user_input" => Ok(TextArtifactRelation::SourceUserInput),
         "model_user_input_projection" => Ok(TextArtifactRelation::ModelUserInputProjection),
         "model_context_tool_result" => Ok(TextArtifactRelation::ModelContextToolResult),
+        "tool_result_display" => Ok(TextArtifactRelation::ToolResultDisplay),
+        "tool_result_attachment" => Ok(TextArtifactRelation::ToolResultAttachment),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }

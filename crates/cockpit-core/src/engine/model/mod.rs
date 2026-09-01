@@ -62,17 +62,14 @@ use crate::{
 
 pub(crate) type PreDrainFuture = Shared<BoxFuture<'static, std::result::Result<(), String>>>;
 
-/// Renders a model request through the session redaction table for one
-/// untrusted target. There is deliberately no raw variant: an untrusted
-/// custody class has no raw-byte conversion, so the only way a configured
-/// target ever sees raw bytes is a `Trusted` route's grant.
+/// Renders a model request through the enforced session redaction table.
+/// There is deliberately no raw variant: every model receives a redacted
+/// rendering regardless of its trust class.
 pub(crate) struct SessionRedactionRendering(Arc<RedactionTable>);
 
 impl SessionRedactionRendering {
-    /// Wrap the session table for one untrusted target. The table is taken in
-    /// its *enforced* view: `redact.enabled = false` is an opt-out for trusted
-    /// routes only and must not reach an untrusted rendering. The field is
-    /// private so no caller can install a non-enforcing table.
+    /// Wrap the session table in its *enforced* view. The field is private so
+    /// no caller can install a non-enforcing table.
     pub(crate) fn new(session_table: &Arc<RedactionTable>) -> Self {
         Self(RedactionTable::enforced_arc(session_table.clone()))
     }
@@ -850,32 +847,16 @@ impl Model {
     /// The redaction table a model built for `(provider_id, model_id)` must
     /// carry, given the custody `route` already resolved for it.
     ///
-    /// Raw custody — the empty table — is released **only** by a
-    /// [`TrustedCustodyGrant`] minted for this exact `(provider, model)`.
-    /// A route resolved under untrusted custody carries no grant, and a grant
-    /// minted for some other target does not authorize this one, so both fall
-    /// closed to the session table. Nothing here consults trust by name, so a
-    /// caller that never routed custody cannot obtain the raw table at all.
-    ///
-    /// The untrusted branch takes the session table's *enforced* view, so the
-    /// config-level opt-out `redact.enabled = false` cannot reach this sink.
-    /// That opt-out is honored for trusted routes only: model trust is the
-    /// single control over what leaves the machine raw, and a route without a
-    /// grant is always scrubbed against the real table.
+    /// Every route receives the session table's *enforced* view. A trusted
+    /// custody grant may authorize host-mediated capture, but it never changes
+    /// model egress or releases a sealed literal.
     pub fn effective_redact_table_for(
-        route: &ResolvedSensitiveModelPolicy,
-        provider_id: &str,
-        model_id: &str,
+        _route: &ResolvedSensitiveModelPolicy,
+        _provider_id: &str,
+        _model_id: &str,
         session_table: Arc<RedactionTable>,
     ) -> Arc<RedactionTable> {
-        let raw_released = route
-            .trusted_custody_grant()
-            .is_some_and(|grant| grant.provider() == provider_id && grant.model() == model_id);
-        if raw_released {
-            Arc::new(RedactionTable::empty())
-        } else {
-            RedactionTable::enforced_arc(session_table)
-        }
+        RedactionTable::enforced_arc(session_table)
     }
 
     /// The redaction table for a configured target, falling closed when custody

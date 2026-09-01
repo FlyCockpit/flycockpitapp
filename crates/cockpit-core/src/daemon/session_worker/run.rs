@@ -3183,14 +3183,26 @@ async fn relay_agent_tree_events(
 
 pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
-    prune_after_switch: bool,
+    cache_break_acknowledged: bool,
     monty_nudge: Option<String>,
     respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> crate::engine::driver::DriverControl {
     crate::engine::driver::DriverControl::SetToolSurfaceOverride {
         selection,
-        prune_after_switch,
+        cache_break_acknowledged,
         monty_nudge,
+        respond_to,
+    }
+}
+
+pub(super) fn validate_tool_surface_override_control(
+    selection: crate::agents::ToolSurfaceSelection,
+    cache_break_acknowledged: bool,
+    respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+) -> crate::engine::driver::DriverControl {
+    crate::engine::driver::DriverControl::ValidateToolSurfaceOverride {
+        selection,
+        cache_break_acknowledged,
         respond_to,
     }
 }
@@ -5699,7 +5711,7 @@ impl StartupWorkInbox {
         self.pending.iter().any(|work| {
             !matches!(
                 work,
-                SessionWork::Cancel | SessionWork::CancelAll | SessionWork::Shutdown { .. }
+                SessionWork::Cancel { .. } | SessionWork::CancelAll | SessionWork::Shutdown { .. }
             )
         })
     }
@@ -5826,7 +5838,7 @@ fn reject_unstarted_startup_work(work: SessionWork) {
                 },
             ));
         }
-        SessionWork::Cancel
+        SessionWork::Cancel { .. }
         | SessionWork::Shutdown { .. }
         | SessionWork::WakeGoal
         | SessionWork::RepublishQueue
@@ -5885,7 +5897,7 @@ mod startup_work_inbox_tests {
     fn work_text(work: &SessionWork) -> Option<&str> {
         match work {
             SessionWork::UserMessage { submission, .. } => Some(submission.text.as_str()),
-            SessionWork::Cancel => Some("cancel"),
+            SessionWork::Cancel { .. } => Some("cancel"),
             SessionWork::CancelAll => Some("cancel all"),
             SessionWork::Shutdown { .. } => Some("shutdown"),
             _ => None,
@@ -5899,7 +5911,10 @@ mod startup_work_inbox_tests {
         let (second, mut second_rx) = user_message_work("second queued");
         tx.try_send(first).unwrap();
         tx.try_send(second).unwrap();
-        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Cancel {
+            origin: CancelOrigin::InteractiveTurn,
+        })
+        .unwrap();
         tx.try_send(SessionWork::Shutdown {
             pause_for_resume: false,
         })
@@ -5936,7 +5951,10 @@ mod startup_work_inbox_tests {
     #[test]
     fn startup_stop_without_live_work_rejects_nothing_and_aborts() {
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Cancel {
+            origin: CancelOrigin::InteractiveTurn,
+        })
+        .unwrap();
         tx.try_send(SessionWork::Shutdown {
             pause_for_resume: false,
         })
@@ -11574,13 +11592,14 @@ pub(super) async fn run_worker(
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
                 }
-                work @ (SessionWork::Cancel | SessionWork::CancelAll) => {
-                    // User ctrl+c (`CancelTurn`). Fire the in-flight run's
+                work @ (SessionWork::Cancel { .. } | SessionWork::CancelAll) => {
+                    // Cancellation provenance is explicit: only an interactive
+                    // CancelTurn can open the user-message retract path.
                     // cancellation token: the driver's `turn` aborts the
                     // streaming inference (returning an `InferenceCancelled`
                     // sentinel that unwinds the run cleanly), and any running
                     // `bash` subprocess is killed via its process group. Safe
-                    // and idempotent at idle / mid-cancel — `CancelHandle::cancel`
+                    // and idempotent at idle / mid-cancel — the cancel handle
                     // is a no-op when no run is in flight. The driver then emits
                     // `AgentIdle`, clearing the TUI's busy state.
                     tracing::info!(session_id = %session_id, "cancel requested");
@@ -11589,7 +11608,16 @@ pub(super) async fn run_worker(
                     // interval therefore inherits a cancelled token; the fence
                     // then either owns its registry entry or invalidates its
                     // enqueue generation. Both happen before durable cleanup.
-                    cancel_handle.cancel();
+                    if matches!(
+                        work,
+                        SessionWork::Cancel {
+                            origin: CancelOrigin::InteractiveTurn
+                        }
+                    ) {
+                        cancel_handle.cancel_turn();
+                    } else {
+                        cancel_handle.cancel_noninteractive();
+                    }
                     adopted_processes.cancel_all(&driver_input_queue).await;
                     if let Some(staged) = driver_input_queue.stage_discard_pending().await {
                         let disposition =
@@ -13073,7 +13101,7 @@ pub(super) async fn run_worker(
                 SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
-                    prune_after_switch,
+                    cache_break_acknowledged,
                     monty_nudge,
                     respond_to,
                 } => {
@@ -13094,7 +13122,37 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     };
-                    let prior_override = session.tool_surface_override_json();
+                    // Validate on the live driver before changing the durable
+                    // row, but do not install yet. A failed persistence then
+                    // leaves both the driver and session snapshot untouched.
+                    let (validation_respond_to, validation_result) =
+                        tokio::sync::oneshot::channel();
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        validate_tool_surface_override_control(
+                            selection.clone(),
+                            cache_break_acknowledged,
+                            validation_respond_to,
+                        ),
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to
+                            .send(Err("driver stopped before tool update validation".into()));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let validated = validation_result
+                        .await
+                        .unwrap_or_else(|_| Err("driver dropped tool update validation".into()));
+                    if let Err(error) = validated {
+                        let _ = respond_to.send(Err(error));
+                        continue;
+                    }
                     if persist_session
                         && let Err(error) =
                             session.set_tool_surface_override_json(Some(override_json.clone()))
@@ -13108,7 +13166,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         tool_surface_override_control(
                             selection,
-                            prune_after_switch,
+                            cache_break_acknowledged,
                             monty_nudge,
                             driver_respond_to,
                         ),
@@ -13120,9 +13178,6 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
-                        if persist_session {
-                            let _ = session.set_tool_surface_override_json(prior_override);
-                        }
                         let _ = respond_to.send(Err("driver stopped before tool update".into()));
                         break WorkerStop::DriverFailed;
                     }
@@ -13130,15 +13185,23 @@ pub(super) async fn run_worker(
                         .await
                         .unwrap_or_else(|_| Err("driver dropped tool update result".into()));
                     if let Err(error) = applied {
-                        if persist_session
-                            && let Err(rollback_error) =
-                                session.set_tool_surface_override_json(prior_override)
-                        {
-                            tracing::error!(%rollback_error, session_id = %session_id, "rolling back refused tool override failed");
-                            let _ = respond_to.send(Err(format!(
-                                "{error}; durable rollback failed: {rollback_error:#}"
-                            )));
-                            continue;
+                        if persist_session {
+                            // Validation and apply use the same construction
+                            // path. If an unexpected post-persistence failure
+                            // still occurs, close for recovery rather than
+                            // report an error while durable and live state
+                            // disagree.
+                            tracing::warn!(
+                                %error,
+                                session_id = %session_id,
+                                "durably persisted tool surface could not be installed live; closing worker for recovery"
+                            );
+                            let _ = respond_to.send(Ok(()));
+                            break WorkerStop::Shutdown {
+                                pause_for_resume: true,
+                                active: false,
+                                pending_tool_count: 0,
+                            };
                         }
                         let _ = respond_to.send(Err(error));
                         continue;

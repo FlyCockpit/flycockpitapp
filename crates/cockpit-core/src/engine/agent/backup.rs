@@ -82,11 +82,12 @@ pub fn suggested_action_for_failure_class(
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct BackupTurnMetadata {
     pub fallback_decision: Option<BackupFallbackDecision>,
     pub fallback_tried: Vec<FailoverAttempt>,
     pub native_computer_items: Vec<serde_json::Value>,
+    pub response_window_closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run one turn with per-turn primary-first backup-model fallback
@@ -206,8 +207,15 @@ pub async fn turn_with_backup(
     // One display lifetime spans every physical primary/failover dispatch in
     // this logical call. A failed visible stream stays open until either the
     // next attempt emits Reset or this wrapper proves failure is terminal.
-    let display_slot =
-        crate::engine::agent::turn_phases::new_display_attempt_slot(&session, &config);
+    let response_window_closed = turn_metadata
+        .as_deref()
+        .map(|metadata| Arc::clone(&metadata.response_window_closed))
+        .unwrap_or_default();
+    let display_slot = crate::engine::agent::turn_phases::new_display_attempt_slot_with_window(
+        &session,
+        &config,
+        response_window_closed,
+    );
     // Credentials-rejected rebuild-and-retry latch (AC5), scoped to the WHOLE
     // logical dispatch — declared OUTSIDE the failover loop so at most ONE
     // automatic command-secret rebuild-and-retry happens across every physical
@@ -1696,19 +1704,14 @@ mod backup_fallback_tests {
     /// prompt names a trusted-primary→untrusted-failover scenario, but that
     /// scenario is IMPOSSIBLE on the real path. Failover custody is upgrade-only
     /// ([`FailoverCustody`] / `build_failover_models_with_diagnostics`): a
-    /// trusted primary REFUSES every untrusted candidate rather than re-rendering
-    /// its raw trusted body onto an untrusted wire. That rejection is itself the
-    /// enforcement of the "no raw trusted body reused on an untrusted wire"
-    /// invariant, and it is proven directly by
+    /// trusted primary REFUSES every untrusted candidate to preserve the
+    /// configured capture-eligibility class. That refusal is proven directly by
     /// [`trusted_primary_refuses_untrusted_failover_and_records_it`] and
     /// [`untrusted_failover_after_trusted_primary_is_rejected_by_custody`] below.
     /// So the direction the real path permits — and the one that exercises
-    /// target-specific redaction with a mixed-trust pair — is inverted here to an
-    /// untrusted primary failing over to a trusted failover: the untrusted
-    /// primary's wire is redacted (no sentinel), the trusted failover's wire is
-    /// raw (sentinel present), both derived from the same raw history snapshot,
-    /// and each stored attempt payload byte-agrees with its own captured wire
-    /// body's redaction state.
+    /// redaction with a mixed-trust pair — is inverted here to an untrusted
+    /// primary failing over to a trusted failover. Both wires are redacted, and
+    /// each stored attempt payload byte-agrees with its captured wire body.
     #[tokio::test]
     async fn interactive_backup_and_failover_redaction_is_target_specific() {
         use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
@@ -1815,8 +1818,8 @@ mod backup_fallback_tests {
         assert!(matches!(outcome, TurnOutcome::Done));
         let _ = drain(&mut rx);
 
-        // Per-target wire capture (real HTTP boundary): the untrusted primary's
-        // body is redacted, the trusted failover's body is raw.
+        // Per-target wire capture (real HTTP boundary): both the primary and
+        // trusted failover bodies are redacted.
         let primary_body = serde_json::to_string(&primary_provider.captured()[0].body).unwrap();
         let backup_body = serde_json::to_string(&backup_provider.captured()[0].body).unwrap();
         assert!(
@@ -1824,8 +1827,8 @@ mod backup_fallback_tests {
             "untrusted primary wire body is redacted: {primary_body}"
         );
         assert!(
-            backup_body.contains(sentinel),
-            "trusted failover wire body is raw: {backup_body}"
+            !backup_body.contains(sentinel),
+            "trusted failover wire body is redacted: {backup_body}"
         );
 
         // Two immutable attempt rows under one call_id, whose stored payloads
@@ -1847,10 +1850,10 @@ mod backup_fallback_tests {
         assert_eq!(attempts[1].ordinal, 1);
         assert_eq!(attempts[1].trust.as_deref(), Some("trusted"));
         assert!(
-            serde_json::to_string(&attempts[1].payload)
+            !serde_json::to_string(&attempts[1].payload)
                 .unwrap()
                 .contains(sentinel),
-            "failover row payload is raw"
+            "trusted failover row payload is redacted"
         );
 
         // Byte-level redaction-state agreement: each stored `(call_id, ordinal)`
@@ -1873,10 +1876,9 @@ mod backup_fallback_tests {
 
     /// Companion to [`interactive_backup_and_failover_redaction_is_target_specific`]:
     /// the direction that test cannot exercise (trusted primary →
-    /// untrusted failover) is REJECTED by the custody gate. This is the positive
-    /// enforcement of the "no raw trusted body is ever re-rendered onto an
-    /// untrusted wire" invariant: the untrusted candidate is refused, so no wire
-    /// body for it is ever produced. (A broader recording/user-visibility proof
+    /// untrusted failover) is REJECTED by the custody gate, preserving the
+    /// configured capture-eligibility class. The untrusted candidate is refused,
+    /// so no wire body for it is ever produced. (A broader recording/user-visibility proof
     /// lives in `trusted_primary_refuses_untrusted_failover_and_records_it`.)
     #[test]
     fn untrusted_failover_after_trusted_primary_is_rejected_by_custody() {
@@ -1921,9 +1923,8 @@ mod backup_fallback_tests {
         .unwrap();
         assert!(primary.is_trusted());
 
-        // The untrusted candidate is refused (custody upgrade-only), so failover
-        // produces NO untrusted target — the trusted primary's raw body can never
-        // be re-rendered onto an untrusted wire because there is no such wire.
+        // The untrusted candidate is refused (custody upgrade-only), so no
+        // untrusted failover target is built after a trusted primary.
         let (fallbacks, refusals) =
             crate::engine::driver::build_failover_models_with_diagnostics(&cfg, &primary);
         assert!(

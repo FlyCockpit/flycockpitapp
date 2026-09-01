@@ -21,8 +21,10 @@ use crate::sealed::action::{
 };
 use crate::sealed::compartment::SealedLiteralHandle;
 
-const SECRET_PLACEHOLDER: &str = "{{sealed_value}}";
-const FILE_PLACEHOLDER: &str = "{{sealed_file}}";
+/// Exact token replaced by the sealed literal in an argument-injection action.
+pub const SEALED_VALUE_ARG_PLACEHOLDER: &str = "{{sealed_value}}";
+/// Exact token replaced by the materialized path in a file consumer action.
+pub const SEALED_FILE_PATH_PLACEHOLDER: &str = "{{sealed_file}}";
 const MAX_COMMAND_PARTS: usize = 128;
 const MAX_COMMAND_PART_BYTES: usize = 4_096;
 
@@ -72,13 +74,13 @@ pub fn validate_command_kind(
     injection: &CommandInjection,
     parameters: &BTreeMap<String, SealedParamSpecJson>,
 ) -> Result<()> {
-    validate_argv(argv_template, SECRET_PLACEHOLDER)?;
+    validate_argv(argv_template, SEALED_VALUE_ARG_PLACEHOLDER)?;
     if parameters.len() > super::MAX_SEALED_ACTION_PARAMS {
         bail!("command action declares too many parameters");
     }
     let placeholder_count = argv_template
         .iter()
-        .filter(|part| part.as_str() == SECRET_PLACEHOLDER)
+        .filter(|part| part.as_str() == SEALED_VALUE_ARG_PLACEHOLDER)
         .count();
     match injection {
         CommandInjection::Argument if placeholder_count != 1 => {
@@ -139,10 +141,10 @@ pub fn validate_file_kind(
         bail!("ephemeral file actions require a fixed consuming command");
     }
     if !consumer_argv.is_empty() {
-        validate_argv(consumer_argv, FILE_PLACEHOLDER)?;
+        validate_argv(consumer_argv, SEALED_FILE_PATH_PLACEHOLDER)?;
         if consumer_argv
             .iter()
-            .filter(|part| part.as_str() == FILE_PLACEHOLDER)
+            .filter(|part| part.as_str() == SEALED_FILE_PATH_PLACEHOLDER)
             .count()
             != 1
         {
@@ -223,13 +225,15 @@ impl SealedHostAction for CommandSealedAction {
 
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, params: &SealedParams) -> Result<()> {
         rebind_params(&self.descriptor, params)?;
-        let mut argv = self.argv_template.clone();
+        // The substituted argv copy is wiped when invocation finishes; only
+        // the child process receives another OS-owned copy.
+        let mut argv = zeroize::Zeroizing::new(self.argv_template.clone());
         let mut environment = None;
         match &self.injection {
             CommandInjection::Argument => {
                 let part = argv
                     .iter_mut()
-                    .find(|part| part.as_str() == SECRET_PLACEHOLDER)
+                    .find(|part| part.as_str() == SEALED_VALUE_ARG_PLACEHOLDER)
                     .context("sealed argument placeholder vanished")?;
                 *part = literal.expose().to_string();
             }
@@ -290,23 +294,26 @@ impl SealedHostAction for FileSealedAction {
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, _params: &SealedParams) -> Result<()> {
         let path = resolve_destination(&self.destination)?;
         git_leak_guard(&path).await?;
-        write_private_file(&path, literal.expose()).await?;
         let cleanup = EphemeralFile::new(
             path.clone(),
             self.persistence == FilePersistence::Ephemeral,
         );
+        // Arm cleanup before opening the destination: a partial write, flush
+        // failure, cancellation, or panic must not strand an ephemeral file.
+        write_private_file(&path, literal.expose()).await?;
         if !self.consumer_argv.is_empty() {
-            let rendered = self
-                .consumer_argv
-                .iter()
-                .map(|part| {
-                    if part == FILE_PLACEHOLDER {
-                        path.to_string_lossy().into_owned()
-                    } else {
-                        part.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
+            let rendered = zeroize::Zeroizing::new(
+                self.consumer_argv
+                    .iter()
+                    .map(|part| {
+                        if part == SEALED_FILE_PATH_PLACEHOLDER {
+                            path.to_string_lossy().into_owned()
+                        } else {
+                            part.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
             run_command_scrubbed(&rendered, None, literal.expose()).await?;
         }
         drop(cleanup);
@@ -359,13 +366,14 @@ fn resolve_destination(destination: &FileDestination) -> Result<PathBuf> {
                 .filter(|path| path.is_absolute())
                 .unwrap_or_else(std::env::temp_dir)
                 .join(format!("flycockpit-sealed-{}", std::process::id()));
-            std::fs::create_dir_all(&base).context("creating private sealed runtime directory")?;
-            set_directory_private(&base)?;
+            cockpit_host::private_fs::ensure_private_dir(&base)
+                .context("creating private sealed runtime directory")?;
             Ok(base.join(filename))
         }
     }
 }
 
+#[cfg(unix)]
 async fn write_private_file(path: &Path, literal: &str) -> Result<()> {
     let parent = path.parent().context("sealed file destination has no parent")?;
     if !parent.is_dir() {
@@ -393,8 +401,20 @@ async fn write_private_file(path: &Path, literal: &str) -> Result<()> {
         .context("writing sealed file")?;
     file.flush().await.context("flushing sealed file")?;
     drop(file);
-    set_file_private(path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn write_private_file(path: &Path, literal: &str) -> Result<()> {
+    cockpit_host::private_fs::write_private_file(path, literal.as_bytes())
+        .context("writing ACL-private sealed file")
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn write_private_file(_path: &Path, _literal: &str) -> Result<()> {
+    bail!("sealed file materialization is unsupported on this platform")
 }
 
 async fn git_leak_guard(path: &Path) -> Result<()> {
@@ -450,36 +470,14 @@ impl EphemeralFile {
 impl Drop for EphemeralFile {
     fn drop(&mut self) {
         if self.remove {
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&self.path);
+            #[cfg(windows)]
+            let _ = cockpit_host::private_fs::delete_private_file(&self.path);
+            #[cfg(not(any(unix, windows)))]
             let _ = std::fs::remove_file(&self.path);
         }
     }
-}
-
-#[cfg(unix)]
-fn set_directory_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_directory_private(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_file_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_file_private(_path: &Path) -> Result<()> {
-    // TODO(issue-236): enforce an owner-only ACL when Windows file sink
-    // hosting is implemented; launch support currently relies on Unix mode
-    // 0600 as required by the issue.
-    Ok(())
 }
 
 #[cfg(test)]
@@ -490,7 +488,7 @@ mod tests {
     fn command_injection_is_exactly_one_fixed_sink() {
         assert!(
             validate_command_kind(
-                &["program".into(), SECRET_PLACEHOLDER.into()],
+                &["program".into(), SEALED_VALUE_ARG_PLACEHOLDER.into()],
                 &CommandInjection::Argument,
                 &BTreeMap::new(),
             )
@@ -516,7 +514,7 @@ mod tests {
         );
         assert!(
             validate_command_kind(
-                &["program".into(), SECRET_PLACEHOLDER.into()],
+                &["program".into(), SEALED_VALUE_ARG_PLACEHOLDER.into()],
                 &CommandInjection::Environment {
                     variable: "API_TOKEN".into(),
                 },
@@ -538,7 +536,7 @@ mod tests {
             validate_file_kind(
                 &destination,
                 FilePersistence::Ephemeral,
-                &["consumer".into(), FILE_PLACEHOLDER.into()],
+                &["consumer".into(), SEALED_FILE_PATH_PLACEHOLDER.into()],
             )
             .is_ok()
         );

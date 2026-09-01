@@ -508,7 +508,7 @@ async fn dispatch(
         }
         "network_configure" => configure_network_policy(host, args, kwargs)
             .await
-            .map(json_to_monty),
+            .map(|value| json_to_monty(&value)),
         "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent" | "b64encode"
         | "b64decode" | "sha256" | "sha512" => dispatch_pure_host_module(name, args, kwargs),
         "search" => {
@@ -818,7 +818,7 @@ async fn configure_network_policy(
         .approve_owner_network_configuration(&label, &approval_input)
         .await
         .map_err(|error| format!("network configuration approval failed: {error:#}"))?
-        .is_accept()
+        .is_allowed()
     {
         return Err("network configuration was not approved".to_string());
     }
@@ -1238,9 +1238,9 @@ fn dispatch_pure_host_module(
             use sha2::Digest as _;
             let input = str_arg(args, 0, "data", &format!("hashlib.{name}"))?;
             let digest = if name == "sha256" {
-                format!("{:x}", sha2::Sha256::digest(input.as_bytes()))
+                crate::intel::hex_lower(&sha2::Sha256::digest(input.as_bytes()))
             } else {
-                format!("{:x}", sha2::Sha512::digest(input.as_bytes()))
+                crate::intel::hex_lower(&sha2::Sha512::digest(input.as_bytes()))
             };
             Ok(MontyObject::Dataclass {
                 name: "Hash".to_string(),
@@ -1262,7 +1262,7 @@ fn dataclass_attr(receiver: Option<&MontyObject>, name: &str) -> Option<MontyObj
     let MontyObject::Dataclass { attrs, .. } = receiver? else {
         return None;
     };
-    attrs.iter().find_map(|(key, value)| match key {
+    attrs.into_iter().find_map(|(key, value)| match key {
         MontyObject::String(key) if key == name => Some(value.clone()),
         _ => None,
     })

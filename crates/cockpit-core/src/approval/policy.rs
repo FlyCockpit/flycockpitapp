@@ -397,7 +397,7 @@ impl Approver {
             .await
     }
 
-    async fn approve_owner_network_configuration_inner(
+    pub(super) async fn approve_owner_network_configuration_inner(
         &self,
         label: &str,
         input: &serde_json::Value,

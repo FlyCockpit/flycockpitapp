@@ -253,7 +253,7 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
             .context("network policy requires approval but no approver is attached")?;
         let label = format!("Monty {} request to {destination}", request.method);
         ensure!(
-            approver.approve_tool_call(&label).await?.is_accept(),
+            approver.approve_tool_call(&label).await?.is_allowed(),
             "network request was not approved"
         );
     }

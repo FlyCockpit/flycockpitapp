@@ -185,11 +185,22 @@ impl GovernedRequest {
     }
 }
 
+fn has_caller_supplied_host_header(headers: &BTreeMap<String, String>) -> bool {
+    headers.keys().any(|name| name.eq_ignore_ascii_case("host"))
+}
+
 pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Value> {
     let policy = effective_policy(host).await?;
     ensure!(
         policy.requests_enabled,
         "requests is disabled for this agent"
+    );
+    // The URL host is the sole destination authority. `reqwest` permits a
+    // caller-supplied Host header, which would otherwise route the request to
+    // a different virtual host while this policy authorizes only the URL.
+    ensure!(
+        !has_caller_supplied_host_header(&request.headers),
+        "caller-supplied Host header is forbidden for governed requests"
     );
     ensure!(
         request
@@ -202,10 +213,20 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
         .native_tool_ctx
         .as_ref()
         .context("governed network requires a live agent context")?;
+    // `effective_policy` performs the same fail-closed binding for its
+    // preflight. Bind it here as well: the final durable-policy read is the
+    // authority that linearizes transport egress with revocation.
+    let agent_instance_id = ctx
+        .agent_instance_id
+        .context("governed network requires a daemon-owned agent instance")?;
     let request = request.redact_fully(&ctx.redact)?;
     ensure!(
         request.visited_fields == request.expected_fields,
         "governed request redaction proof is incomplete"
+    );
+    ensure!(
+        !has_caller_supplied_host_header(&request.headers),
+        "redacted governed request contains a forbidden Host header"
     );
     let url = reqwest::Url::parse(&request.url).context("invalid governed request URL")?;
     ensure!(
@@ -254,24 +275,34 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     if let Some(body) = request.body {
         builder = builder.body(body);
     }
-    // This is the last awaited/read boundary before `send`: a revocation that
-    // changed either scope after the earlier snapshot refuses this dispatch.
-    let agent_fence = ctx
-        .session
-        .db
-        .monty_network_agent_fence_is_current(agent_instance_id, policy.agent_generation)
-        .await?;
-    let session_fence = ctx
-        .session
-        .monty_session_network_fence_allows(policy.session_generation, &destination);
-    ensure!(
-        agent_fence && (policy.agent_hosts.contains(&destination) || session_fence),
-        "network grant changed before dispatch; request refused"
-    );
-    let response = builder
-        .send()
-        .await
-        .context("governed network request failed")?;
+    // Acquire fences in a single global order: durable policy first, then
+    // session policy. Durable mutations take the Db write side before their
+    // SQLite transaction; session mutations take the Session write side
+    // before touching the grant mutex. Retain both permits through `send` so
+    // a completed revocation is ordered after this actual egress, never just
+    // after a preflight check.
+    let response = {
+        let _durable_egress_permit = ctx.session.db.monty_network_egress_permit().await;
+        let current_agent_policy = ctx
+            .session
+            .db
+            .monty_network_agent_policy(agent_instance_id)
+            .await?;
+        let _session_egress_permit = ctx.session.monty_network_egress_permit().await;
+        let current_session_policy = ctx.session.monty_session_network_grant_snapshot();
+        ensure!(
+            current_agent_policy.generation == policy.agent_generation
+                && current_session_policy.generation == policy.session_generation
+                && current_agent_policy.requests_enabled
+                && (current_agent_policy.hosts.contains(&destination)
+                    || current_session_policy.hosts.contains(&destination)),
+            "network grant changed before dispatch; request refused"
+        );
+        builder
+            .send()
+            .await
+            .context("governed network request failed")?
+    };
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -402,6 +433,19 @@ mod tests {
         let body = visited.body.unwrap();
         assert!(!body.contains("network-secret"));
         assert!(!body.contains("sealed-network-secret"));
+    }
+
+    #[test]
+    fn caller_host_header_is_rejected_case_insensitively() {
+        for name in ["Host", "host", "HOST", "hOsT"] {
+            let headers = BTreeMap::from([(name.to_string(), "other.example.test".to_string())]);
+            assert!(
+                has_caller_supplied_host_header(&headers),
+                "{name} must not override the URL-authorized destination"
+            );
+        }
+        let headers = BTreeMap::from([("x-forwarded-host".to_string(), "opaque".to_string())]);
+        assert!(!has_caller_supplied_host_header(&headers));
     }
 
     #[test]

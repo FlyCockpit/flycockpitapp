@@ -93,6 +93,12 @@ impl Db {
         mutation: MontyNetworkAgentMutation,
         now_unix_ms: i64,
     ) -> Result<MontyNetworkAgentPolicy> {
+        // A completed policy mutation must be ordered after an egress that
+        // already crossed its final durable-policy check, and before every
+        // later egress. The request holds the shared permit through
+        // `RequestBuilder::send`; do not move this exclusive acquisition
+        // below the SQLite transaction.
+        let _revocation_fence = self.monty_network_egress_gate.write().await;
         let agent_instance_id = agent_instance_id.to_string();
         self.transaction(move |conn| {
             conn.execute(
@@ -138,7 +144,11 @@ impl Db {
         .await
     }
 
-    /// Final generation fence immediately before transport dispatch.
+    /// Read-only generation predicate for diagnostics and focused tests.
+    ///
+    /// Transport dispatch uses [`Db::monty_network_egress_permit`] plus an
+    /// exact policy read instead, so the revocation fence remains held through
+    /// the actual `RequestBuilder::send` boundary.
     pub async fn monty_network_agent_fence_is_current(
         &self,
         agent_instance_id: Uuid,
@@ -224,5 +234,43 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn durable_policy_mutation_waits_for_an_in_flight_egress_permit() {
+        let db = Db::open_in_memory().unwrap();
+        let agent_instance_id = Uuid::new_v4();
+        let permit = db.monty_network_egress_permit().await;
+        let revoking_db = db.clone();
+        let revocation = tokio::spawn(async move {
+            revoking_db
+                .mutate_monty_network_agent_policy(
+                    agent_instance_id,
+                    MontyNetworkAgentMutation::SetRequestsEnabled(false),
+                    10,
+                )
+                .await
+        });
+        // Tokio's RwLock is fair/write-preferring: once the mutation has
+        // attempted the exclusive fence, later read attempts are blocked even
+        // while this first read permit remains held. Waiting for that state
+        // makes the assertion below fail if the mutation ever stops taking its
+        // write-side revocation fence, instead of merely racing one yield.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if db.monty_network_egress_gate.try_read().is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable policy mutation must attempt the write-side egress fence");
+        assert!(
+            !revocation.is_finished(),
+            "durable policy mutation committed while egress retained its permit"
+        );
+        drop(permit);
+        revocation.await.unwrap().unwrap();
     }
 }

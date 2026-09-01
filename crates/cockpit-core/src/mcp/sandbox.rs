@@ -898,6 +898,7 @@ async fn configure_network_policy(
                         host_name.ok_or_else(|| "grant_session_host requires host".to_string())?,
                     ),
                 )
+                .await
                 .map_err(|error| format!("network configuration failed: {error:#}"))?;
             ctx.session
                 .db
@@ -911,6 +912,7 @@ async fn configure_network_policy(
                         host_name.ok_or_else(|| "revoke_session_host requires host".to_string())?,
                     ),
                 )
+                .await
                 .map_err(|error| format!("network configuration failed: {error:#}"))?;
             ctx.session
                 .db
@@ -922,6 +924,7 @@ async fn configure_network_policy(
                 .mutate_monty_session_network_grants(
                     super::network::SessionNetworkMutation::RevokeAllHosts,
                 )
+                .await
                 .map_err(|error| format!("network configuration failed: {error:#}"))?;
             ctx.session
                 .db

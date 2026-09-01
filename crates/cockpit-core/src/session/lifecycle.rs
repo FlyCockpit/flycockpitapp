@@ -1056,6 +1056,7 @@ impl Session {
             )),
             container_network_enabled: AtomicBool::new(false),
             monty_network_grants: Mutex::new(crate::mcp::network::SessionNetworkGrants::default()),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
             sandbox_escalation_enabled: AtomicBool::new(true),
             sandbox_escalation_notice_state: AtomicBool::new(true),
             safety_gate_degrade_notice_key: Mutex::new(None),

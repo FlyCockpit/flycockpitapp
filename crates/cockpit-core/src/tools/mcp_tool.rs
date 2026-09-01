@@ -24,6 +24,7 @@ use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 pub struct McpTool {
+    requests_enabled: bool,
     description: String,
     verbose_description: String,
 }
@@ -36,6 +37,7 @@ impl McpTool {
         }
         let packages = packages.join(", ");
         Self {
+            requests_enabled,
             description: format!(
                 "{NORMAL_DESCRIPTION_PREFIX}{packages}{NORMAL_DESCRIPTION_SUFFIX}"
             ),

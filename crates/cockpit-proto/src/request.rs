@@ -6423,7 +6423,6 @@ mod tests {
             "save_provider_config",
             "delete_provider_config",
             "set_provider_layer_metadata",
-            "apply_setup_wizard",
         ] {
             let wire = serde_json::json!({ "request": tag, "params": {} });
             assert!(

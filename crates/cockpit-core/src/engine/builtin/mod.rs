@@ -101,6 +101,11 @@ pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use
 pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
 
+/// Uniform, cache-stable steering for every untrusted model. This intentionally
+/// depends only on the model's fixed trust posture, never on a turn's dynamic
+/// tool availability, so it remains stable in the cached system prefix.
+const UNTRUSTED_LEAK_REPORT_STEERING: &str = "Security: If you receive any secret, report it immediately with `report_leak` when that tool is available. Report the exact literal form you received, including base64, hexadecimal, URL-encoded, or any other encoded, transformed, or derived form. Do not decode, normalize, transform, repeat, or expose the material in text or another tool call.";
+
 /// Per-spawn knobs threaded from the driver.
 #[derive(Clone)]
 pub struct SpawnArgs {
@@ -1301,7 +1306,15 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
     compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
 }
 
-fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &SpawnArgs) -> String {
+/// Compose the model-specific cached system prompt used by every fresh or
+/// live-refreshed agent frame. The model's trust posture is part of this
+/// composition, so callers that replace an agent model must update this value
+/// in the same replacement.
+pub(crate) fn compose_system_prompt_for_model(
+    role_prompt: &str,
+    model: &Model,
+    args: &SpawnArgs,
+) -> String {
     let compiled_guidance = args.guidance_compiler.as_ref().map_or_else(
         || args.compiled_guidance.clone(),
         |compiler| compiler.compile(&args.cwd, model.provider_id(), model.model_id_ref()),
@@ -1323,7 +1336,7 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
     let model_prompt = args
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
-    if let Some(model_prompt) = model_prompt {
+    let mut out = if let Some(model_prompt) = model_prompt {
         let role_system = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
         out.push_str(model_prompt);
@@ -1341,7 +1354,25 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
+    };
+    append_untrusted_leak_report_steering(&mut out, model.is_trusted());
+    out
+}
+
+/// Add the uniform leak-report instruction to an untrusted agent's effective
+/// system prompt. Production agent constructors outside this module must use
+/// this helper when they synthesize a fresh system prompt rather than inheriting
+/// one from an existing agent.
+pub(crate) fn append_untrusted_leak_report_steering(system: &mut String, model_is_trusted: bool) {
+    if model_is_trusted {
+        return;
     }
+    if !system.ends_with('\n') {
+        system.push('\n');
+    }
+    system.push('\n');
+    system.push_str(UNTRUSTED_LEAK_REPORT_STEERING);
+    system.push('\n');
 }
 
 fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
@@ -2372,7 +2403,7 @@ fn compose_reposture_system(
     );
     let short_id = session.short_id();
     let role_system = compose_system_prompt(&role, &short_id, cwd);
-    match snapshot.get(model.provider_id(), model.model_id_ref()) {
+    let mut out = match snapshot.get(model.provider_id(), model.model_id_ref()) {
         Some(model_prompt) => {
             let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
             out.push_str(model_prompt);
@@ -2384,7 +2415,9 @@ fn compose_reposture_system(
             out
         }
         None => role_system,
-    }
+    };
+    append_untrusted_leak_report_steering(&mut out, model.is_trusted());
+    out
 }
 
 /// Immutable, side-effect-free description of the execution surface a delegated
@@ -8343,12 +8376,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compose_system_prompt_for_model_is_byte_identical_without_match() {
+    fn untrusted_system_prompt_includes_uniform_leak_report_steering() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
         let with_snapshot = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
-        assert_eq!(with_snapshot, existing);
+        assert!(
+            with_snapshot.starts_with(&existing),
+            "base prompt must be preserved: {with_snapshot}"
+        );
+        assert!(with_snapshot.contains("`report_leak`"));
+        for encoded_form in [
+            "base64",
+            "hexadecimal",
+            "URL-encoded",
+            "transformed",
+            "derived",
+        ] {
+            assert!(
+                with_snapshot.contains(encoded_form),
+                "untrusted steering must cover {encoded_form}: {with_snapshot}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_system_prompt_omits_leak_report_steering() {
+        use crate::config::providers::ModelTrust;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args_with_model_trust(tmp.path(), ModelTrust::Trusted);
+        let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
+        let prompt = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        assert_eq!(prompt, existing);
+        assert!(!prompt.contains("`report_leak`"));
     }
 
     #[test]

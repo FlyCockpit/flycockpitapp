@@ -1561,7 +1561,12 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             serde_json::to_vec(&editable_replay).unwrap()
         );
 
-        handle.send_work(SessionWork::Cancel).await.unwrap();
+        handle
+            .send_work(SessionWork::Cancel {
+                origin: CancelOrigin::InteractiveTurn,
+            })
+            .await
+            .unwrap();
         handle
             .send_work(SessionWork::Shutdown {
                 pause_for_resume: false,
@@ -1888,7 +1893,12 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             "the FCM2 conflict does not create the obsolete legacy ledger row"
         );
 
-        handle.send_work(SessionWork::Cancel).await.unwrap();
+        handle
+            .send_work(SessionWork::Cancel {
+                origin: CancelOrigin::InteractiveTurn,
+            })
+            .await
+            .unwrap();
         handle
             .send_work(SessionWork::Shutdown {
                 pause_for_resume: false,
@@ -2100,7 +2110,12 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         assert_eq!(run.state, "failed");
         assert_eq!(run.terminal_reason.as_deref(), Some("failed"));
 
-        handle.send_work(SessionWork::Cancel).await.unwrap();
+        handle
+            .send_work(SessionWork::Cancel {
+                origin: CancelOrigin::InteractiveTurn,
+            })
+            .await
+            .unwrap();
         handle
             .send_work(SessionWork::Shutdown {
                 pause_for_resume: false,

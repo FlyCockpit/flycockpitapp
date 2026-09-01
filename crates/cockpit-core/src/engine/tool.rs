@@ -40,8 +40,8 @@ pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
 ///   their own model-history insertion boundaries in `agent::turn_phases`;
 /// - structured built-in and native/custom results are projected at the same
 ///   boundary and the projected canonical result is the restart authority;
-/// - MCP dispatch is deliberately unchanged because MCP schemas/results do not
-///   participate in this host-owned marker contract;
+/// - external MCP schemas/results remain unchanged, while Monty's host-owned
+///   `show` lane is carried by `ToolOutput` display metadata marked below;
 /// - the existing `ToolOutput` sandbox, exit-code, resource, and output-sidecar
 ///   exclusions are expressed by `ToolOutput::result_metadata_schema` below.
 ///
@@ -663,7 +663,8 @@ mod model_ephemeral_tests {
             "sandbox": { "enabled": true },
             "resource": { "cpu": 1 },
             "exit_code": 1,
-            "output_sidecar": { "stdout": "full" }
+            "output_sidecar": { "stdout": "full" },
+            "display": "timeline only"
         });
         assert_eq!(
             strip_model_ephemeral_fields(&metadata, &ToolOutput::result_metadata_schema()),
@@ -1104,6 +1105,11 @@ pub trait Tool: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: CanonicalToolResultContents,
+    /// Optional display-only text for the durable timeline and live UI. The
+    /// model projection remains [`Self::content`]; this field is governed by
+    /// [`MODEL_EPHEMERAL_SCHEMA_KEY`] in [`Self::result_metadata_schema`], so
+    /// replay cannot accidentally promote it into model history.
+    pub display_content: Option<String>,
     /// Optional short-circuit guidance for an immediately repeated call with
     /// the same final semantic input. A tool sets this when its *result* was a
     /// recoverable dead-end the model should not repeat verbatim. The
@@ -1117,6 +1123,17 @@ pub struct ToolOutput {
     /// the dispatcher turns it into an immutable text artifact together with
     /// the owning event.
     pub text_artifact_capture: Option<TextArtifactCapture>,
+    /// Whether `text_artifact_capture` belongs only to the display projection.
+    /// Such an artifact is retained with the durable event but must never
+    /// replace the model result in live or rehydrated history.
+    pub text_artifact_model_ephemeral: bool,
+    /// Additional lane-tagged captures. This preserves the legacy singular
+    /// capture API while allowing an envelope-producing tool to retain every
+    /// independently spilled lane in the same owning event.
+    pub text_artifact_captures: Vec<ToolTextArtifactCapture>,
+    /// Host-owned human-only notices. The dispatcher publishes these only
+    /// after the same result-injection recheck that governs the tool result.
+    pub notices: Vec<String>,
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
@@ -1344,6 +1361,30 @@ pub struct TextArtifactCapture {
     pub stored_source_bytes: usize,
 }
 
+/// The projection lane that owns a retained tool body. Only model-lane
+/// artifacts may replace a tool result in model history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArtifactLane {
+    Model,
+    Display,
+    Attachment,
+}
+
+impl ToolArtifactLane {
+    pub const fn is_model_ephemeral(self) -> bool {
+        !matches!(self, Self::Model)
+    }
+}
+
+/// A retained tool body together with its projection lane. `explicit` means
+/// the tool requested retention even below the context spill threshold.
+#[derive(Debug, Clone)]
+pub struct ToolTextArtifactCapture {
+    pub lane: ToolArtifactLane,
+    pub capture: TextArtifactCapture,
+    pub explicit: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutputSidecar {
     pub payload: serde_json::Value,
@@ -1503,7 +1544,8 @@ impl ToolOutput {
                 "sandbox": { "x-cockpit-model-ephemeral": true },
                 "resource": { "x-cockpit-model-ephemeral": true },
                 "exit_code": { "x-cockpit-model-ephemeral": true },
-                "output_sidecar": { "x-cockpit-model-ephemeral": true }
+                "output_sidecar": { "x-cockpit-model-ephemeral": true },
+                "display": { "x-cockpit-model-ephemeral": true }
             }
         })
     }
@@ -1532,15 +1574,22 @@ impl ToolOutput {
         if let Some(sidecar) = &self.output_sidecar {
             metadata.insert("output_sidecar".to_string(), sidecar.payload.clone());
         }
+        if let Some(display) = &self.display_content {
+            metadata.insert("display".to_string(), Value::String(display.clone()));
+        }
         metadata
     }
 
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
+            display_content: None,
             repeat_guard: None,
             truncated: false,
             text_artifact_capture: None,
+            text_artifact_model_ephemeral: false,
+            text_artifact_captures: Vec::new(),
+            notices: Vec::new(),
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1554,9 +1603,13 @@ impl ToolOutput {
     pub fn truncated_text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
+            display_content: None,
             repeat_guard: None,
             truncated: true,
             text_artifact_capture: None,
+            text_artifact_model_ephemeral: false,
+            text_artifact_captures: Vec::new(),
+            notices: Vec::new(),
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1584,6 +1637,41 @@ impl ToolOutput {
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
         self.text_artifact_capture = Some(capture);
+        self
+    }
+
+    pub fn with_model_ephemeral_text_artifact_capture(
+        mut self,
+        capture: TextArtifactCapture,
+    ) -> Self {
+        self.text_artifact_capture = Some(capture);
+        self.text_artifact_model_ephemeral = true;
+        self
+    }
+
+    pub fn with_text_artifact_lane(
+        mut self,
+        lane: ToolArtifactLane,
+        capture: TextArtifactCapture,
+        explicit: bool,
+    ) -> Self {
+        self.text_artifact_captures.push(ToolTextArtifactCapture {
+            lane,
+            capture,
+            explicit,
+        });
+        self
+    }
+
+    pub fn with_notices(mut self, notices: Vec<String>) -> Self {
+        self.notices = notices;
+        self
+    }
+
+    /// Supply the timeline/UI projection while retaining `content` as the
+    /// only model-facing result.
+    pub fn with_model_ephemeral_display(mut self, display: impl Into<String>) -> Self {
+        self.display_content = Some(display.into());
         self
     }
 

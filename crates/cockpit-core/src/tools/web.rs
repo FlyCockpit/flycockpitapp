@@ -36,21 +36,9 @@ const MAX_SEARCH_LIMIT: usize = 10;
 const FIRECRAWL_NOTICE_KEYLESS: &str = "Firecrawl web request: your query or URL leaves this machine. You are using Firecrawl’s keyless tier, which is attributed to your IP.";
 const FIRECRAWL_NOTICE_KEYED: &str = "Firecrawl web request: your query or URL leaves this machine. You are using a configured Firecrawl API key.";
 
-fn global_web_notice_config_path(cwd: &std::path::Path) -> Result<std::path::PathBuf> {
-    use crate::config::dirs::{
-        CONFIG_FILE, ConfigDirKind, creatable_config_dirs, discover_config_dirs,
-    };
-    if let Some(dir) = discover_config_dirs(cwd)
-        .into_iter()
-        .find(|dir| matches!(dir.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
-    {
-        return Ok(dir.path.join(CONFIG_FILE));
-    }
-    let dir = creatable_config_dirs().into_iter().next().ok_or_else(|| {
-        anyhow::anyhow!("no home directory to persist Firecrawl notice acknowledgement")
-    })?;
-    std::fs::create_dir_all(&dir.path)?;
-    Ok(dir.path.join(CONFIG_FILE))
+fn global_web_notice_config_path(_cwd: &std::path::Path) -> Result<std::path::PathBuf> {
+    crate::config::dirs::global_config_file()
+        .map_err(|error| anyhow::anyhow!("resolving global Firecrawl notice config: {error}"))
 }
 
 fn firecrawl_notice_acknowledged(ctx: &ToolCtx) -> bool {

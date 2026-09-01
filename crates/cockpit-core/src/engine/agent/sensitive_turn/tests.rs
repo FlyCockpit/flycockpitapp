@@ -237,6 +237,47 @@ async fn redaction_install_precedes_contained_ack() {
     assert!(contain_idx < install_idx);
 }
 
+#[tokio::test]
+async fn encoded_report_installs_and_redacts_the_exact_reported_form() {
+    // This is a base64 representation, not the underlying secret. The barrier
+    // must contain and install this exact as-seen literal without decoding or
+    // normalizing it, so future output carrying the blob is scrubbed too.
+    let encoded_secret = "c3VwZXItc2VjcmV0LXRva2Vu";
+    let host = FakeHost::contained();
+    let out = run_sensitive_turn_barrier(&host, vec![report_leak_call(encoded_secret)]).await;
+
+    assert_eq!(out.state, SensitiveTurnState::Contained);
+    assert_eq!(
+        host.contained_args(),
+        vec![json!({
+            "secret": encoded_secret,
+            "source": "model_output",
+        })]
+    );
+    assert_eq!(host.installed(), vec![encoded_secret.to_string()]);
+    let redaction = crate::redact::RedactionTable::empty()
+        .with_forced_literal(host.installed()[0].clone(), "$leak:test".to_string())
+        .unwrap();
+    let scrubbed = redaction.scrub(&format!("later output: {encoded_secret}"));
+    assert!(
+        !scrubbed.contains(encoded_secret),
+        "the exact encoded form must be redacted: {scrubbed}"
+    );
+    assert_eq!(out.sensitive_results[0].model_output, "contained");
+}
+
+#[tokio::test]
+async fn sub_floor_report_is_discarded_before_containment_or_redaction_install() {
+    let host = FakeHost::contained();
+    let out = run_sensitive_turn_barrier(&host, vec![report_leak_call("abc")]).await;
+
+    assert_eq!(out.state, SensitiveTurnState::Discarded);
+    assert!(host.events().is_empty());
+    assert!(host.contained_args().is_empty());
+    assert!(host.installed().is_empty());
+    assert_eq!(out.sensitive_results[0].model_output, "failed");
+}
+
 // ---------------------------------------------------------------------------
 // Fail-closed: a redaction-install failure never acks `contained`.
 // ---------------------------------------------------------------------------

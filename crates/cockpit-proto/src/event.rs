@@ -960,6 +960,19 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preflight_cleaned: Option<String>,
     },
+    /// The latest durable user message was removed because its directly
+    /// answering assistant turn was cancelled before visible text or a tool
+    /// call. Every client removes the durable row, but only one that owns a
+    /// listed submission id restores its local draft; source text is
+    /// deliberately absent from this broadcast.
+    UserMessageRemoved {
+        session_id: Uuid,
+        seq: i64,
+        /// The client-generated submission identities for the removed row.
+        /// These opaque ids let only the originating client restore its local
+        /// composer draft; the user text is never broadcast.
+        client_submission_ids: Vec<Uuid>,
+    },
     /// One or more daemon-queued user messages were drained and folded into a
     /// model request. Carries stable queue ids plus the persisted timeline seq
     /// when the session log write succeeded.
@@ -1313,10 +1326,18 @@ pub enum Event {
 
     /// Warm reattach replay of persisted timeline entries. `max_seq` is the
     /// highest session_events seq represented by this batch, including entries
-    /// whose display shape does not carry its own seq field.
+    /// whose display shape does not carry its own seq field. Retracted user
+    /// rows are deliberately absent from `entries`; their durable tombstones
+    /// are carried as targeted, text-free removals instead.
     HistoryReplay {
         session_id: Uuid,
         entries: Vec<super::HistoryEntry>,
+        /// Durable user-row identities removed since the client's cursor.
+        /// This prevents a client that missed the live removal broadcast from
+        /// retaining a stale row after reconnect. The values are target row
+        /// seqs, not tombstone seqs, and contain no user text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed_user_message_seqs: Vec<i64>,
         max_seq: i64,
     },
 
@@ -1733,6 +1754,7 @@ macro_rules! event_variants {
             (Event::AssistantDisplayError { .. }, "assistant_display_error");
             (Event::AssistantText { .. }, "assistant_text");
             (Event::UserMessageRecorded { .. }, "user_message_recorded");
+            (Event::UserMessageRemoved { .. }, "user_message_removed");
             (Event::QueuedUserMessagesFolded { .. }, "queued_user_messages_folded");
             (Event::SessionPersistFailed { .. }, "session_persist_failed");
             (Event::SessionDriverFailed { .. }, "session_driver_failed");

@@ -1360,7 +1360,6 @@ impl WorkerWorkspaceConfigAuthority {
                 None => match &source.kind {
                     cockpit_config::config::extended::hooks::HookSourceKind::Layer(
                         crate::config::dirs::ConfigDirKind::HomeXdg
-                        | crate::config::dirs::ConfigDirKind::HomeDot
                         | crate::config::dirs::ConfigDirKind::MachineLocal,
                     ) => self.read_retained_global_hook_source(source),
                     cockpit_config::config::extended::hooks::HookSourceKind::Layer(
@@ -1964,7 +1963,6 @@ impl WorkerWorkspaceConfigAuthority {
         match &source.kind {
             cockpit_config::config::extended::hooks::HookSourceKind::Layer(
                 crate::config::dirs::ConfigDirKind::HomeXdg
-                | crate::config::dirs::ConfigDirKind::HomeDot
                 | crate::config::dirs::ConfigDirKind::MachineLocal,
             ) => true,
             cockpit_config::config::extended::hooks::HookSourceKind::Layer(

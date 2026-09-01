@@ -1931,6 +1931,10 @@ pub struct App {
     /// This makes reconciliation independent of whether a terminal worker
     /// broadcast or the request response reaches App first.
     pub(super) retained_user_submission_ids: HashSet<uuid::Uuid>,
+    /// Locally-originated durable rows, keyed by their daemon sequence. This
+    /// correlation lets a broadcast retraction update every transcript while
+    /// only the submitting client restores its private composer draft.
+    pub(super) local_user_submission_ids_by_seq: HashMap<i64, HashSet<uuid::Uuid>>,
     /// Submitted user messages (excluding queued ones). Used for Up/Down
     /// shell-style history navigation in the composer.
     pub(super) prompt_history: Vec<String>,
@@ -3699,6 +3703,7 @@ impl App {
             folded_queue_item_ids: HashSet::new(),
             folded_queue_item_order: VecDeque::new(),
             retained_user_submission_ids: HashSet::new(),
+            local_user_submission_ids_by_seq: HashMap::new(),
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
             staged_draft: None,

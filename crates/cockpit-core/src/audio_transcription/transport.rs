@@ -440,66 +440,60 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
         if matches!(outcome.status, 401 | 403)
             && let Some(refresh) = &self.command_refresh
         {
-            let entry = refresh
-                .current_entry()
-                .map_err(|_| TranscriptionEgressError::Authentication)?;
-            let refreshed =
-                crate::providers::models_fetch::refresh_provider_request_async_with_store(
-                    &refresh.provider_id,
-                    &entry,
-                    refresh.store.clone(),
-                    |name| {
-                        refresh
-                            .env
-                            .get(name)
-                            .cloned()
-                            .or_else(|| std::env::var(name).ok())
-                    },
-                    rejected_refresh_generation,
-                )
+            let refreshed = crate::providers::models_fetch::refresh_provider_request_async_with_store_authorized(
+                &refresh.provider_id,
+                refresh.store.clone(),
+                |name| {
+                    refresh
+                        .env
+                        .get(name)
+                        .cloned()
+                        .or_else(|| std::env::var(name).ok())
+                },
+                rejected_refresh_generation,
+                || refresh.current_entry(),
+            )
                 .await
                 .map_err(|_| TranscriptionEgressError::Authentication)?;
-            if let Some(refreshed) = refreshed {
-                let mut refreshed_headers = HeaderMap::new();
-                for header in &refreshed.headers {
-                    let name = HeaderName::from_bytes(header.name.as_bytes())
-                        .map_err(|_| TranscriptionEgressError::Authentication)?;
-                    let mut value = HeaderValue::from_str(&header.value)
-                        .map_err(|_| TranscriptionEgressError::Authentication)?;
-                    value.set_sensitive(true);
-                    refreshed_headers.insert(name, value);
-                }
-                let mut request_headers = refreshed_headers.clone();
-                request_headers.insert(CONTENT_TYPE, content_type_value);
-                // Publish the refreshed request state before retrying. The
-                // next long-lived dispatch must reject generation N+1 (not
-                // the construction-time N) if this retry is rejected too.
-                *self
-                    .headers
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed_headers.clone();
-                *refresh
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = CommandRequestState {
-                    headers: refreshed_headers.clone(),
-                    rejected_refresh_generation: refreshed.command_credential_generation(),
-                };
-                let retry = VettedHttpClient::new(self.dns.clone(), self.required_location)
-                    .execute(
-                        Method::POST,
-                        &url,
-                        request_headers,
-                        Some(body),
-                        self.body_limit,
-                    )
-                    .await
-                    .map_err(Self::map_error)?;
-                return Ok(TranscriptionHttpResponse {
-                    status: retry.status,
-                    body: retry.body,
-                });
+            let mut refreshed_headers = HeaderMap::new();
+            for header in &refreshed.headers {
+                let name = HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|_| TranscriptionEgressError::Authentication)?;
+                let mut value = HeaderValue::from_str(&header.value)
+                    .map_err(|_| TranscriptionEgressError::Authentication)?;
+                value.set_sensitive(true);
+                refreshed_headers.insert(name, value);
             }
+            let mut request_headers = refreshed_headers.clone();
+            request_headers.insert(CONTENT_TYPE, content_type_value);
+            // Publish the refreshed request state before retrying. The next
+            // long-lived dispatch must reject generation N+1 (not the
+            // construction-time N) if this retry is rejected too.
+            *self
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed_headers.clone();
+            *refresh
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = CommandRequestState {
+                headers: refreshed_headers.clone(),
+                rejected_refresh_generation: refreshed.command_credential_generation(),
+            };
+            let retry = VettedHttpClient::new(self.dns.clone(), self.required_location)
+                .execute(
+                    Method::POST,
+                    &url,
+                    request_headers,
+                    Some(body),
+                    self.body_limit,
+                )
+                .await
+                .map_err(Self::map_error)?;
+            return Ok(TranscriptionHttpResponse {
+                status: retry.status,
+                body: retry.body,
+            });
         }
         Ok(TranscriptionHttpResponse {
             status: outcome.status,

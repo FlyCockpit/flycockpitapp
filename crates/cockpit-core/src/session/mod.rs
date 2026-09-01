@@ -229,6 +229,24 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Exact per-turn accounting captured before one retractable user turn.
+/// Restoring it makes a cancelled/re-sent message consume the same title slot
+/// and time-prelude state as a single send.
+pub(crate) struct TitleProgressSnapshot {
+    title: Option<String>,
+    user_renamed: bool,
+    user_content_tokens: usize,
+    user_content_turns: usize,
+    title_stage: u8,
+    title_nudge_slot_pending: u8,
+    title_recovery_nudge_state: crate::db::sessions::TitleRecoveryNudgeState,
+    title_failure_noticed: bool,
+    /// `with_time_prelude` consumes this stamp while assembling the first
+    /// provider request. A successful user-message retract must put it back
+    /// so the resend produces the same request/cache prefix.
+    last_time_prelude: Option<DateTime<Utc>>,
+}
+
 /// Work due for the cache-reusing, same-model metadata fork. The title slots
 /// refine both fields; later slots refresh the richer description while still
 /// requiring the atomic combined metadata call.
@@ -4295,6 +4313,46 @@ mod tests {
         assert_eq!(
             row.goal_settings_override_json.as_deref(),
             Some(goal_override_json)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_tool_surface_override_persistence_keeps_the_session_snapshot_unchanged() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        assert!(session.persist_if_needed().unwrap());
+        let original = r#"{"tools":["read"],"toolTiers":{}}"#;
+        session
+            .set_tool_surface_override_json(Some(original.to_string()))
+            .unwrap();
+        let session_id = session.id;
+        db.write(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+            )?;
+            anyhow::ensure!(changed == 1, "test session row must exist");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = session
+            .set_tool_surface_override_json(Some(
+                r#"{"tools":["read","bash"],"toolTiers":{}}"#.to_string(),
+            ))
+            .expect_err("missing durable row must reject the replacement");
+        assert!(error.to_string().contains("not found"), "{error:#}");
+        assert_eq!(
+            session.tool_surface_override_json().as_deref(),
+            Some(original),
+            "a failed durable write must not change the live session snapshot"
         );
     }
 

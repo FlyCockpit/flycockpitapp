@@ -209,9 +209,7 @@ pub struct RunContext<'a> {
 /// The custody posture every external OS harness runs at, resolved from its
 /// explicit `trust` configuration field.
 ///
-/// [`HarnessTrust`] carries the same meaning as a model's custody class
-/// — trusted may hold raw content, untrusted must be handed a redacted
-/// rendering — but it is a deliberately separate type: an external harness is
+/// [`HarnessTrust`] is a deliberately separate type: an external harness is
 /// not a provider/model route, so this value must never reach model routing.
 /// It is never inferred from model, locality, command, or agent-definition
 /// posture; it is
@@ -220,9 +218,8 @@ pub struct RunContext<'a> {
 /// An untrusted harness receives the mandatory sensitive-redaction baseline
 /// (the enforced redaction table) — this holds even when discretionary
 /// redaction is disabled, because the enforced view ignores that opt-out.
-/// A trusted harness receives its raw prompt, including sensitive/sealed
-/// literals, only after the user explicitly configures it as trusted. Both
-/// classes receive no Cockpit-provided secret environment value.
+/// Every harness receives a redacted prompt. Both classes receive no
+/// Cockpit-provided secret environment value.
 ///
 /// `enforced` is the already-constructed enforced view of the session
 /// redaction table (see [`RedactionTable::enforced_checked`]): the single
@@ -233,26 +230,8 @@ fn render_for_harness_custody(
     enforced: &RedactionTable,
     prompt: &str,
 ) -> String {
-    match custody {
-        HarnessTrust::Untrusted => {
-            // The mandatory sensitive baseline: the enforced view of the
-            // session redaction table. This scrubs environment, credential-
-            // store, and sealed sentinels regardless of the config opt-out
-            // `redact.enabled = false`, because the enforced view ignores
-            // that opt-out. A disabled discretionary table cannot deliver
-            // any sensitive sentinel to an untrusted subprocess.
-            enforced.scrub(prompt)
-        }
-        HarnessTrust::Trusted => {
-            // A trusted harness receives its raw prompt, including
-            // sensitive/sealed literals. This is the explicit opt-in: only
-            // an explicit `trust: "trusted"` field reaches here. The raw
-            // prompt is never persisted (invocation records, child output,
-            // process records, histories, diagnostics, and /export debug
-            // receive only generic-redacted representations before write).
-            prompt.to_string()
-        }
-    }
+    let _ = custody;
+    enforced.scrub(prompt)
 }
 
 /// The exact marker prepended when a front-truncated child stream's leading
@@ -767,11 +746,10 @@ mod tests {
 
     /// The external-harness custody posture is expressed with
     /// [`HarnessTrust`] — a separate type from the model custody class,
-    /// because a harness is not a provider/model route. An untrusted harness
-    /// renders through the enforced session redaction table; a trusted
-    /// harness receives its raw prompt (the explicit opt-in).
+    /// because a harness is not a provider/model route. Every harness renders
+    /// through the enforced session redaction table.
     #[test]
-    fn harness_custody_untrusted_renders_redacted_trusted_renders_raw() {
+    fn harness_custody_always_renders_redacted() {
         let table = RedactionTable::empty()
             .with_forced_literal("sk-live-harness-secret".to_string(), "TEST".to_string())
             .expect("forced literal");
@@ -787,12 +765,10 @@ mod tests {
         assert!(!untrusted.contains("sk-live-harness-secret"), "{untrusted}");
         assert_eq!(untrusted, table.enforced().scrub(prompt));
 
-        // Trusted: the raw prompt is delivered (the explicit opt-in). The
-        // sentinel survives because the user explicitly configured this
-        // harness as trusted.
+        // Trusted: sealed values remain redacted too.
         let trusted = render_for_harness_custody(HarnessTrust::Trusted, &enforced, prompt);
-        assert_eq!(trusted, prompt);
-        assert!(trusted.contains("sk-live-harness-secret"), "{trusted}");
+        assert_eq!(trusted, untrusted);
+        assert!(!trusted.contains("sk-live-harness-secret"), "{trusted}");
     }
 
     /// Disabling discretionary redaction does not disable the mandatory
@@ -816,9 +792,9 @@ mod tests {
             "{untrusted}"
         );
 
-        // A trusted harness still receives the raw prompt.
+        // A trusted harness receives the same redacted prompt.
         let trusted = render_for_harness_custody(HarnessTrust::Trusted, &enforced, prompt);
-        assert_eq!(trusted, prompt);
+        assert!(!trusted.contains("sk-live-disabled-baseline"), "{trusted}");
     }
 
     /// A discretionary-disabled (`redact.enabled = false`) table that still
@@ -846,8 +822,8 @@ mod tests {
     /// prompt difference) AND echoes the registered secret on stdout (so we
     /// observe the OUTPUT scrub too).
     ///
-    /// Prompt custody: untrusted → scrubbed prompt (even under disabled
-    /// discretionary redaction); trusted → raw prompt (explicit opt-in).
+    /// Prompt custody: every trust class receives a scrubbed prompt, even
+    /// under disabled discretionary redaction.
     /// Output custody: the returned text is scrubbed for BOTH classes. The
     /// trusted-output leg is the one this patch introduces and FAILS against
     /// pre-change behavior, which returned the child's raw stdout verbatim.
@@ -928,9 +904,7 @@ mod tests {
             ctrl_res.text
         );
 
-        // Trusted + enabled: raw prompt crosses the boundary (custody), but the
-        // echoed secret is scrubbed OUT of the returned text (this patch's new
-        // behavior — fails against pre-change, which returned raw stdout).
+        // Trusted + enabled: prompt and echoed output are both scrubbed.
         let (t_received, t_res) = run_probe(
             HarnessTrust::Trusted,
             enabled.clone(),
@@ -940,8 +914,8 @@ mod tests {
         )
         .await;
         assert!(
-            t_received.contains(SECRET),
-            "trusted must see raw prompt: {t_received}"
+            !t_received.contains(SECRET),
+            "trusted must see scrubbed prompt: {t_received}"
         );
         assert!(
             !t_res.text.contains(SECRET),

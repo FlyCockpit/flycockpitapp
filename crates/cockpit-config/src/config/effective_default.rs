@@ -103,7 +103,7 @@ impl EffectiveDefaultScope {
     /// retained attach-time target; it must not rediscover the layer later.
     pub fn from_dir_kind(kind: &ConfigDirKind) -> Self {
         match kind {
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot => Self::User,
+            ConfigDirKind::HomeXdg => Self::User,
             ConfigDirKind::MachineLocal => Self::MachineLocal,
             ConfigDirKind::Project => Self::Project,
         }

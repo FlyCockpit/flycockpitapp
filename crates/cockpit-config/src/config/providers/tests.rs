@@ -1,6 +1,43 @@
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn anthropic_features_require_an_explicit_provider_gate() {
+    let template_without_gate = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        url: "https://anthropic.nahcrof.com/v1".to_string(),
+        ..ProviderEntry::default()
+    };
+    assert!(
+        template_without_gate
+            .effective_anthropic_features()
+            .is_empty()
+    );
+
+    let explicitly_enabled = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        anthropic: Some(AnthropicFeatures::first_party()),
+        ..ProviderEntry::default()
+    };
+    assert_eq!(
+        explicitly_enabled.effective_anthropic_features(),
+        AnthropicFeatures::first_party()
+    );
+
+    let host_without_gate = ProviderEntry {
+        url: "https://api.anthropic.com/v1".to_string(),
+        ..ProviderEntry::default()
+    };
+    assert!(host_without_gate.effective_anthropic_features().is_empty());
+
+    let explicit_disable = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        anthropic: Some(AnthropicFeatures::default()),
+        ..ProviderEntry::default()
+    };
+    assert!(explicit_disable.effective_anthropic_features().is_empty());
+}
+
 #[cfg(unix)]
 const PRIVATE_ATOMIC_WRITE_UMASK_CHILD: &str = "COCKPIT_TEST_PRIVATE_ATOMIC_WRITE_UMASK_CHILD";
 
@@ -32,7 +69,9 @@ fn provider_atomic_writes_are_private_under_a_permissive_umask() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        child_root.join("home/.cockpit/config.json").is_file(),
+        child_root
+            .join("home/.config/cockpit/config.json")
+            .is_file(),
         "the isolated child test must have executed"
     );
 }
@@ -59,7 +98,7 @@ fn run_private_atomic_write_umask_case(root: &Path) {
     // so no sibling test can observe this deliberately permissive umask.
     let _umask = UmaskRestore(unsafe { libc::umask(0o000) });
 
-    let config_path = root.join("home/.cockpit/config.json");
+    let config_path = root.join("home/.config/cockpit/config.json");
     let provider_path = provider_file_path_for_config(&config_path, "private-provider").unwrap();
     let mut doc = ConfigDoc::load(&config_path).unwrap();
     let mut cfg = ProvidersConfig {
@@ -958,6 +997,7 @@ fn round_trips_a_provider_entry() {
             embeddings: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
+            anthropic: Default::default(),
             shrink: ShrinkConfig::default(),
             context: ContextConfig::default(),
             auto_prune: None,
@@ -2548,8 +2588,7 @@ fn computer_use_resolve_matrix() {
 /// The literal a redacted rendering must never leak.
 const CUSTODY_TEST_SECRET: &str = "sk-live-policy-secret";
 
-/// Test rendering for the untrusted custody class. There is no raw variant:
-/// an untrusted payload exists only as a target-specific redacted rendering.
+/// Test rendering for every custody class. There is no raw variant.
 struct TestRedaction;
 
 impl RedactedRendering for TestRedaction {
@@ -2561,8 +2600,8 @@ impl RedactedRendering for TestRedaction {
     }
 }
 
-fn untrusted_payload() -> SensitivePayload {
-    SensitivePayload::redacted_for_untrusted_custody(std::sync::Arc::new(TestRedaction))
+fn redacted_payload(custody: ModelCustody) -> SensitivePayload {
+    SensitivePayload::redacted_for_custody(custody, std::sync::Arc::new(TestRedaction))
 }
 
 /// A criteria block with every custody-free dimension at its neutral value.
@@ -2580,16 +2619,13 @@ fn policy_criteria(selector: ModelPolicySelector<'_>) -> ModelPolicyCriteria<'_>
 }
 
 /// Resolve under an explicit custody filter, pairing the class with the only
-/// payload rendering that class permits.
+/// redacted payload rendering every class permits.
 fn resolve_sensitive(
     cfg: &ProvidersConfig,
     custody: ModelCustody,
     criteria: ModelPolicyCriteria<'_>,
 ) -> Result<ResolvedSensitiveModelPolicy, ModelPolicyError> {
-    let payload = match custody {
-        ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
-        ModelCustody::Untrusted => untrusted_payload(),
-    };
+    let payload = redacted_payload(custody);
     cfg.resolve_sensitive_model_policy(&SensitiveModelPolicyRequest::new(
         criteria, custody, payload,
     )?)
@@ -2667,7 +2703,7 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
                     availability: AvailabilityScope::Discovery,
                 },
                 ModelCustody::Untrusted,
-                untrusted_payload(),
+                redacted_payload(ModelCustody::Untrusted),
             )
             .unwrap(),
         )
@@ -2740,7 +2776,7 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
                     ..policy_criteria(ModelPolicySelector::Exact("mixed:top-trusted"))
                 },
                 ModelCustody::Trusted,
-                SensitivePayload::raw_for_trusted_custody(),
+                redacted_payload(ModelCustody::Trusted),
             )
             .unwrap(),
         )
@@ -2759,7 +2795,7 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
                     ..policy_criteria(ModelPolicySelector::Any)
                 },
                 ModelCustody::Trusted,
-                SensitivePayload::raw_for_trusted_custody(),
+                redacted_payload(ModelCustody::Trusted),
             )
             .unwrap(),
         )
@@ -2789,7 +2825,7 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
                     ..policy_criteria(ModelPolicySelector::Exact("mixed:hidden-trusted"))
                 },
                 ModelCustody::Trusted,
-                SensitivePayload::raw_for_trusted_custody(),
+                redacted_payload(ModelCustody::Trusted),
             )
             .unwrap(),
         )

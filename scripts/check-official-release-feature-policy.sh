@@ -23,19 +23,87 @@ done
 
 metadata="$(cargo metadata --locked --no-deps --format-version=1)"
 violations="$(jq -r '
-    def activates_grok_subscription:
-      sub("^dep:"; "") | sub("\\?$"; "") |
-      (. == "grok-subscription" or endswith("/grok-subscription"));
-    .packages[] |
-    .name as $package |
-    ((.features["default"] // [])[]? |
-      select(type == "string" and activates_grok_subscription) |
-      "\($package): default feature declaration enables grok-subscription"),
-    (.dependencies[] |
-      .name as $dependency |
-      (.features[]? |
-        select(type == "string" and activates_grok_subscription) |
-        "\($package): dependency feature declaration for \($dependency) enables grok-subscription"))
+    # Cargo features form a graph, not a flat list. In particular, a feature
+    # such as `release-grok = ["grok-subscription"]` can be enabled by a
+    # dependency declaration without ever spelling the forbidden feature at
+    # the declaration site. Walk that graph for every workspace package.
+    #
+    # `dep:name` only activates an optional dependency; it cannot select an
+    # optional dependency feature, so it has no feature edge of its own.
+    # That dependency default feature is checked independently below. `name?/x`
+    # is deliberately treated as an edge: although it needs `name` to be
+    # enabled elsewhere, it is still a manifest path by which that feature can
+    # enter Cargo feature unification.
+    def workspace_dependency($packages; $package; $handle):
+      $package.dependencies[]
+      | select((.rename // .name) == $handle and .path != null)
+      | .path as $path
+      | $packages[]
+      | select(.manifest_path == ($path + "/Cargo.toml"));
+
+    def feature_reference_targets($packages; $package; $reference):
+      if ($reference | startswith("dep:")) then
+        empty
+      elif ($reference | contains("/")) then
+        ($reference
+          | capture("^(?<dependency>[^/]+?)(?<conditional>\\?)?/(?<feature>.+)$"))
+          as $parsed
+        | workspace_dependency($packages; $package; $parsed.dependency)
+        | { package: ., feature: $parsed.feature }
+      else
+        { package: $package, feature: ($reference | sub("\\?$"; "")) }
+      end;
+
+    def feature_targets($packages; $node):
+      ($node.package.features[$node.feature] // [])[]?
+      | select(type == "string")
+      | feature_reference_targets($packages; $node.package; .);
+
+    def reaches_grok_subscription($packages; $node; $seen):
+      ($node.package.manifest_path + "#" + $node.feature) as $key
+      | if ($seen | index($key)) then
+          false
+        elif $node.feature == "grok-subscription" then
+          true
+        else
+          any(
+            feature_targets($packages; $node);
+            reaches_grok_subscription($packages; .; ($seen + [$key]))
+          )
+        end;
+
+    def dependency_feature_reaches_grok_subscription(
+      $packages; $package; $dependency; $feature
+    ):
+      if $feature == "grok-subscription" then
+        true
+      else
+        any(
+          workspace_dependency($packages; $package; ($dependency.rename // $dependency.name));
+          reaches_grok_subscription($packages; { package: ., feature: $feature }; [])
+        )
+      end;
+
+    .packages as $packages
+    | $packages[] as $package
+    | (
+        if reaches_grok_subscription(
+          $packages; { package: $package, feature: "default" }; []
+        ) then
+          "\($package.name): default feature declaration enables grok-subscription"
+        else
+          empty
+        end
+      ),
+      (
+        $package.dependencies[] as $dependency
+        | $dependency.features[]?
+        | select(type == "string")
+        | select(dependency_feature_reaches_grok_subscription(
+            $packages; $package; $dependency; .
+          ))
+        | "\($package.name): dependency feature declaration for \($dependency.rename // $dependency.name) enables grok-subscription"
+      )
   ' <<<"$metadata")"
 
 if [[ -n "$violations" ]]; then

@@ -566,6 +566,13 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Native Anthropic Messages API features accepted by this provider.
+    /// These vendor-specific request extensions are opt-in so an
+    /// Anthropic-compatible gateway receives only the portable Messages wire
+    /// unless its configuration explicitly enables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<AnthropicFeatures>,
+
     /// Delegation-shrink behavior for this provider (GOALS §10 /
     /// implementation note). Drives the parent-context
     /// shrink that hides cache-cold cost across a sub-agent delegation. A
@@ -894,6 +901,36 @@ pub struct BackupConfig {
     pub provider: String,
     /// The backup model id that `provider` serves.
     pub model: String,
+}
+
+/// Native Anthropic Messages-wire features accepted by a provider.
+///
+/// Custom Anthropic-compatible endpoints default to both fields disabled.
+/// The first-party Anthropic template materializes both as enabled when it
+/// creates a provider entry.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicFeatures {
+    /// Enable Anthropic `cache_control` request blocks.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_caching: bool,
+
+    /// Enable Anthropic beta headers, including extended cache TTL and
+    /// computer-use contracts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub betas: bool,
+}
+
+impl AnthropicFeatures {
+    pub const fn first_party() -> Self {
+        Self {
+            prompt_caching: true,
+            betas: true,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.prompt_caching && !self.betas
+    }
 }
 
 /// Prompt-cache configuration. Set per-provider on [`ProviderEntry`] and
@@ -1967,21 +2004,6 @@ pub fn default_wire_api_for_template(template: Option<&str>) -> WireApi {
     }
 }
 
-/// `true` when `base_url`'s host is the native Anthropic Messages endpoint
-/// (`api.anthropic.com`). Host-based rather than provider-id-based so renamed
-/// Anthropic providers still route natively, while Claude served by
-/// OpenRouter/Copilot/etc. remains OpenAI-compatible. Unparseable URLs are
-/// never native.
-pub fn is_anthropic_native_base_url(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|u| {
-            u.host_str()
-                .map(|h| h.eq_ignore_ascii_case("api.anthropic.com"))
-        })
-        .unwrap_or(false)
-}
-
 /// `true` when `base_url`'s HOST is GitHub Copilot's API host
 /// (`githubcopilot.com` or any `*.githubcopilot.com` subdomain, e.g.
 /// `api.githubcopilot.com`). Host-based rather than substring so a look-alike
@@ -2266,6 +2288,35 @@ impl ProviderEntry {
     /// and cannot prove registry provenance.
     pub fn effective_template(&self, _key: &str) -> Option<&str> {
         self.template.as_deref()
+    }
+
+    /// Resolve native Anthropic extensions from the provider's explicit gate.
+    /// A missing or empty gate disables both extensions. First-party defaults
+    /// are materialized when the Anthropic template creates the entry.
+    pub fn effective_anthropic_features(&self) -> AnthropicFeatures {
+        self.anthropic.unwrap_or_default()
+    }
+
+    /// Resolve the effective request wire for one model on this provider.
+    ///
+    /// Model pins win over a provider pin; an unpinned provider inherits its
+    /// immutable template default. URLs, provider ids, model names, live
+    /// catalog metadata, and learned endpoint state never participate.
+    pub fn resolve_wire_api(&self, provider_id: &str, model_id: &str) -> WireApi {
+        if let Some(wire_api) = self
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .filter(|model| model.wire_api_provenance.is_user_configured())
+            .map(|model| model.wire_api)
+            .filter(|wire_api| !wire_api.is_auto())
+        {
+            return wire_api;
+        }
+        if !self.wire_api.is_auto() {
+            return self.wire_api;
+        }
+        default_wire_api_for_template(self.effective_template(provider_id))
     }
 
     /// Whether this entry is GitHub Copilot, including renamed connections.
@@ -3293,20 +3344,7 @@ impl ProvidersConfig {
         let Some(entry) = self.providers.get(provider) else {
             return WireApi::Completions;
         };
-        if let Some(wire_api) = entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .filter(|m| m.wire_api_provenance.is_user_configured())
-            .map(|m| m.wire_api)
-            .filter(|w| !w.is_auto())
-        {
-            return wire_api;
-        }
-        if !entry.wire_api.is_auto() {
-            return entry.wire_api;
-        }
-        default_wire_api_for_template(entry.effective_template(provider))
+        entry.resolve_wire_api(provider, model)
     }
 
     /// Whether a configured provider has a fixed effective wire. Resolution is

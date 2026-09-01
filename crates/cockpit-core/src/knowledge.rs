@@ -459,10 +459,8 @@ impl KnowledgeConcept {
         &self,
         kb_id: &crate::sealed::SealedKnowledgeBaseId,
         resolver: &dyn crate::sealed::SealedResolver,
-        trusted_reader: bool,
     ) -> Result<String> {
-        let resolved =
-            crate::sealed::resolve_kb_markdown(&self.body, kb_id, resolver, trusted_reader).await?;
+        let resolved = crate::sealed::resolve_kb_markdown(&self.body, kb_id, resolver).await?;
         Ok(fence_knowledge_content_if_needed(&resolved))
     }
 }
@@ -4462,7 +4460,6 @@ pub(crate) async fn inject_knowledge_for_turn(
                 Some(&crate::sealed::LocalVaultResolver::new(
                     session.secret_vault().clone(),
                 )),
-                executing_model_trusted,
             )
             .await
             {
@@ -4513,7 +4510,6 @@ async fn retrieve_from_knowledge_bases(
     query: &str,
     limit: usize,
     resolver: Option<&dyn crate::sealed::SealedResolver>,
-    trusted_reader: bool,
 ) -> Result<Vec<SearchResult>> {
     let mut all = Vec::new();
     let mut available_providers = Vec::new();
@@ -4545,13 +4541,8 @@ async fn retrieve_from_knowledge_bases(
         let mut results = provider.retrieve(query, limit).await?;
         if let Some(resolver) = resolver {
             for result in &mut results {
-                result.snippet = crate::sealed::resolve_kb_markdown(
-                    &result.snippet,
-                    &kb_id,
-                    resolver,
-                    trusted_reader,
-                )
-                .await?;
+                result.snippet =
+                    crate::sealed::resolve_kb_markdown(&result.snippet, &kb_id, resolver).await?;
             }
         }
         all.extend(results);
@@ -4569,7 +4560,6 @@ async fn retrieve_structured_from_knowledge_bases(
     knowledge_bases: &[AttachedKnowledgeBase],
     query: &StructuredSearchQuery,
     resolver: Option<&dyn crate::sealed::SealedResolver>,
-    trusted_reader: bool,
 ) -> Result<Vec<SearchResult>> {
     let mut all = Vec::new();
     for knowledge_base in knowledge_bases {
@@ -4598,7 +4588,6 @@ async fn retrieve_structured_from_knowledge_bases(
                     &result.snippet,
                     &knowledge_base.sealed_id,
                     resolver,
-                    trusted_reader,
                 )
                 .await?;
             }
@@ -7671,7 +7660,6 @@ impl Tool for SemanticSearchTool {
             Some(&crate::sealed::LocalVaultResolver::new(
                 ctx.session.secret_vault().clone(),
             )),
-            ctx.knowledge_access_trusted,
         )
         .await?;
         let mut results = results;
@@ -7776,7 +7764,6 @@ impl Tool for StructuredSearchTool {
             Some(&crate::sealed::LocalVaultResolver::new(
                 ctx.session.secret_vault().clone(),
             )),
-            ctx.knowledge_access_trusted,
         )
         .await?;
         retain_search_result_sources(&mut results, &ctx.session)?;
@@ -10036,7 +10023,6 @@ Inventory facts for warehouse operations.
             "release shipping procedure",
             DEFAULT_SEARCH_LIMIT,
             None,
-            false,
         )
         .await
         .unwrap();
@@ -10094,7 +10080,6 @@ Inventory facts for warehouse operations.
             "release shipping procedure",
             DEFAULT_SEARCH_LIMIT,
             None,
-            false,
         )
         .await
         .unwrap_err();

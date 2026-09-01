@@ -91,6 +91,18 @@ pub enum PublicCommand {
     Run(RunArgs),
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Start an interactive Code session.
+    Code,
+    /// Start an interactive Assistant session.
+    Assistant,
+    /// Start an interactive Computer session.
+    Computer,
+    /// Manage legacy persistent assistant definitions and media accounting.
+    ///
+    /// This is deliberately separate from `cockpit assistant`, which is the
+    /// interactive Assistant-mode entry point.
+    #[command(subcommand)]
+    Assistants(AssistantCommand),
     #[command(subcommand, name = "provider")]
     Provider(ProvidersCommand),
     Setup(SetupArgs),
@@ -135,6 +147,10 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Ask(args) => Command::Ask(args),
                 PublicCommand::Run(args) => Command::Run(args),
                 PublicCommand::Agent(args) => Command::Agent(args),
+                PublicCommand::Code => Command::Code,
+                PublicCommand::Assistant => Command::Assistant,
+                PublicCommand::Computer => Command::Computer,
+                PublicCommand::Assistants(args) => Command::Assistants(args),
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),
@@ -1815,26 +1831,21 @@ mod tests {
     }
 
     #[test]
-    fn modes_session_setup_mode_entries_and_legacy_assistant_management_parse_distinctly() {
+    fn public_modes_and_legacy_assistant_management_map_to_runtime_commands() {
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "code"]).unwrap().command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "code"]).unwrap()).command,
             Some(Command::Code)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistant"])
-                .unwrap()
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "assistant"]).unwrap()).command,
             Some(Command::Assistant)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "computer"])
-                .unwrap()
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "computer"]).unwrap()).command,
             Some(Command::Computer)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistants", "list"])
-                .unwrap()
+            Cli::from(PublicCli::try_parse_from(["cockpit", "assistants", "list"]).unwrap())
                 .command,
             Some(Command::Assistants(AssistantCommand::List))
         ));
@@ -2136,10 +2147,9 @@ mod tests {
         );
     }
 
-    /// AC6. Checked docs search: every cited surface must say that trusted
-    /// inference may be raw, untrusted inference is redacted, exports and
-    /// client display stay redacted regardless of trust, and neither harness
-    /// mode nor locality implies trust.
+    /// Checked docs search: every cited surface must keep sealed egress
+    /// reference-only, describe trusted as capture-capable, and preserve the
+    /// export/display and locality boundaries.
     #[test]
     fn trust_and_mode_docs_are_orthogonal() {
         const PROVIDERS_DOC: &str = include_str!("../docs/providers.md");
@@ -2148,13 +2158,14 @@ mod tests {
         for (label, text) in [("README", README), ("providers doc", PROVIDERS_DOC)] {
             let lowered = text.to_ascii_lowercase();
             assert!(
-                lowered.contains("inference requests to a trusted model may be sent raw")
-                    || lowered.contains("inference requests to a `trusted` model may be sent raw"),
-                "{label} must say trusted inference may be raw"
+                lowered.contains(
+                    "every inference request receives redacted, reference-only sealed values"
+                ),
+                "{label} must say model egress is reference-only"
             );
             assert!(
-                lowered.contains("secrets and environment values"),
-                "{label} must name what a trusted provider receives"
+                lowered.contains("host-mediated capture"),
+                "{label} must describe trusted capture eligibility"
             );
             assert!(
                 lowered.contains("stay redacted regardless of trust"),
@@ -2190,11 +2201,11 @@ mod tests {
                     "{label} must not claim `{forbidden}`"
                 );
             }
-            // And trust must not be described as a blanket redaction switch:
-            // it governs inference custody, not the export/display boundary.
+            // Trust is a capture capability, not a raw egress switch.
             assert!(
-                !lowered.contains("trusted models disable outbound redaction"),
-                "{label} must not describe trust as a blanket redaction switch"
+                !lowered.contains("inference requests to a trusted model may be sent raw")
+                    && !lowered.contains("a trusted harness receives its raw prompt"),
+                "{label} must not describe a raw trust egress path"
             );
         }
 

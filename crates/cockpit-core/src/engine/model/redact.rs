@@ -11,6 +11,17 @@ const COCKPIT_OWNED_REQUEST_KEYS: &[&str] = &[
     "stream",
 ];
 
+/// These controls are owned only by the generic OpenAI Responses wire. Other
+/// wires may legitimately define identically named vendor parameters.
+const RESPONSES_STATEFUL_REQUEST_KEYS: &[&str] = &[
+    // Cockpit owns Responses statefulness. Every Responses request carries
+    // the full transcript and explicitly disables server-side retention; a
+    // provider fragment must not opt back into a stateful server session.
+    "store",
+    "previous_response_id",
+    "background",
+];
+
 /// Strip [`COCKPIT_OWNED_REQUEST_KEYS`] from an extra-params fragment so a
 /// merge into the outbound body supplies vendor keys only and can never
 /// clobber the params cockpit already sets. Returns `None` when there are
@@ -21,13 +32,32 @@ const COCKPIT_OWNED_REQUEST_KEYS: &[&str] = &[
 pub(crate) fn sanitized_extra_params(
     extra: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
+    sanitized_extra_params_with(extra, |key| COCKPIT_OWNED_REQUEST_KEYS.contains(&key))
+}
+
+/// Apply the generic collision guard plus the statelessness controls owned by
+/// the generic OpenAI Responses wire. Keeping this separate from
+/// [`sanitized_extra_params`] ensures a Chat Completions (or other) provider
+/// can use an identically named vendor parameter.
+pub(crate) fn sanitized_openai_responses_extra_params(
+    extra: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    sanitized_extra_params_with(extra, |key| {
+        COCKPIT_OWNED_REQUEST_KEYS.contains(&key) || RESPONSES_STATEFUL_REQUEST_KEYS.contains(&key)
+    })
+}
+
+fn sanitized_extra_params_with(
+    extra: Option<&serde_json::Value>,
+    is_owned: impl Fn(&str) -> bool,
+) -> Option<serde_json::Value> {
     let extra = extra?;
     let serde_json::Value::Object(map) = extra else {
         return Some(extra.clone());
     };
     let kept: serde_json::Map<String, serde_json::Value> = map
         .iter()
-        .filter(|(k, _)| !COCKPIT_OWNED_REQUEST_KEYS.contains(&k.as_str()))
+        .filter(|(k, _)| !is_owned(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     if kept.is_empty() {
@@ -45,14 +75,14 @@ pub(crate) fn sanitized_extra_params(
 /// to itself (both key and value are protocol text, never a registered secret).
 pub(super) const REDACTED_COLLISION_MARKER: &str = "**REDACTED BY COCKPIT**";
 
-/// A wire field that has no renderer for an **untrusted** dispatch: a media
+/// A wire field that has no renderer for a completion dispatch: a media
 /// source that is not a scrubbable string channel (`Raw` bytes, a provider
 /// `FileId`, `Unknown`, or a future rig variant). Rather than pass an
 /// unscrubbable channel to a provider that may retain it, the prep step fails
 /// closed and the three prep entry points map this into a typed
 /// [`InferenceFailure`] with phase `prep` and class
-/// [`InferenceErrorClass::UnrenderableWireField`]. Trusted raw custody never
-/// runs the walk, so this can only arise on a route that must redact.
+/// [`InferenceErrorClass::UnrenderableWireField`]. Every completion route runs
+/// the walk.
 #[derive(Debug, Clone)]
 pub(crate) struct UnrenderableWireField {
     /// The channel that could not be rendered, for the failure detail.
@@ -66,7 +96,7 @@ impl UnrenderableWireField {
 
     pub(crate) fn detail(&self) -> String {
         format!(
-            "message wire field `{}` has no renderer for an untrusted dispatch",
+            "message wire field `{}` has no renderer for a completion dispatch",
             self.channel
         )
     }
@@ -76,16 +106,14 @@ impl std::fmt::Display for UnrenderableWireField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("message wire field `")?;
         f.write_str(self.channel)?;
-        f.write_str("` has no renderer for an untrusted dispatch")
+        f.write_str("` has no renderer for a completion dispatch")
     }
 }
 
 /// Scrub every dynamic text field of one history/prompt [`Message`] through
 /// `redact`, returning a rewritten copy (GOALS §7,
-/// `redaction-cover-all-llm-requests.md`). This is the untrusted-egress wire
-/// walk: it is only invoked for a route that must redact (a trusted raw-custody
-/// route bypasses it entirely), so it fails **closed** on any channel it cannot
-/// render.
+/// `redaction-cover-all-llm-requests.md`). This is the completion-egress wire
+/// walk and it fails **closed** on any channel it cannot render.
 ///
 /// The walk is a closed policy over every rig content variant — there is no
 /// silent passthrough. Each string channel is scrubbed: the system content,

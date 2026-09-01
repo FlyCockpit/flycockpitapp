@@ -5,8 +5,9 @@
 //! exposed inside the sandbox: `mcp.search(query)`,
 //! `mcp.grep_tool_names(regex)`, `mcp.grep_tool_definitions(regex)`,
 //! `mcp.describe(server, tool)`, and `mcp.invoke(server, tool, args)`.
-//! The script's final value is returned as JSON. If the script returns
-//! `None`, captured `print(...)` output is returned as a fallback. The VM has no direct
+//! `emit`, `show`, `notify`, and `attach` project values into host-owned lanes.
+//! If `emit` is unused, the final value or captured `print(...)` output remains
+//! the model fallback. The VM has no direct
 //! filesystem, network, or environment access; host functions remain subject to the same
 //! authorization as native tool calls.
 
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::engine::agent::TurnEvent;
-use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolArtifactLane, ToolBox, ToolCtx, ToolOutput, invalid_input};
 use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
@@ -38,7 +39,7 @@ fn identity_accounting_key(ctx: &ToolCtx) -> usize {
     ctx as *const ToolCtx as usize
 }
 
-const NORMAL_DESCRIPTION: &str = "Run Python to script native tools, e.g. mcp.invoke('cockpit','read',{'path':'README.md'}), and use mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, mcp.describe, or mcp.invoke.";
+const NORMAL_DESCRIPTION: &str = "Run Python over native tools. Example: r=mcp.invoke('cockpit','read',{'path':'README.md'}); emit(r). Discover with mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, or mcp.describe.";
 const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
      and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \
@@ -47,9 +48,12 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      input schema, and `mcp.invoke(server, tool, args)` to call one. Search or grep before \
      concluding a capability is missing. Native cockpit tools are always scriptable, for example \
      `mcp.invoke(\"cockpit\", \"read\", {\"path\": \"README.md\"})`; non-cockpit servers require \
-     the `mcp` grant. Process intermediate results in Python and use a final \
-     expression for the value you want back, for example `hits = mcp.search(\"calendar\")` then \
-     `hits`. For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
+     the `mcp` grant. Raw invoke results stay in the sandbox. Project only what the model needs \
+     with `emit(x)`; the host serializes strings or JSON-able objects. For example: \
+     `r = mcp.invoke(\"cockpit\", \"read\", {\"path\": \"README.md\"}); emit(r)`. Use \
+     `show(x)` for persisted display-only content, `notify(s)` for a human-only notice, and \
+     `attach(x)` for an artifact. If no value is emitted, the final expression is returned. \
+     For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
      `{ok|err}` results so one failure does not abort the loop. If the script returns `None`, \
      printed output is captured and returned as a fallback. The VM has no direct filesystem, \
      network, or environment access; every host function remains subject to the same authorization as a native tool call.";
@@ -107,7 +111,7 @@ impl Tool for McpTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "script": { "type": "string", "description": "Python script" }
+                "script": { "type": "string", "description": "Python script; use emit(x) to project model context" }
             },
             "required": ["script"]
         })
@@ -119,7 +123,7 @@ impl Tool for McpTool {
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "Python source using mcp.search, mcp.describe, and mcp.invoke; prefer a final expression as the returned value, with print(...) output returned only as a fallback when the script returns None"
+                    "description": "Python source using mcp.search, mcp.describe, and mcp.invoke; use emit(x) for model context, show(x) for display only, notify(s) for a human-only notice, and attach(x) for an artifact; with no emit, the final expression is returned and print(...) is the fallback when it is None"
                 }
             },
             "required": ["script"]
@@ -167,8 +171,8 @@ impl Tool for McpTool {
         }
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
         let cfg = catalog.to_mcp_config();
-        let result = match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
-            Ok(out) => Ok(rendered_result_output(out)),
+        let result = match crate::mcp::sandbox::run_envelope_with_host(script, &cfg, &host).await {
+            Ok(envelope) => Ok(rendered_result_output(envelope, ctx)),
             // Unhandled Monty compile/runtime/OS denial/import/host
             // exceptions are failed parent tool calls (`hard_fail`). Authored
             // try/except that returns a value remains Ok above. Do not infer
@@ -208,19 +212,89 @@ impl Tool for McpTool {
     }
 }
 
-fn rendered_result_output(out: String) -> ToolOutput {
-    if out.len() > OUTPUT_BYTE_CAP {
-        ToolOutput::truncated_text(truncate_head_tail(&out, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&out))
+fn rendered_result_output(
+    envelope: crate::mcp::sandbox::ProjectionEnvelope,
+    ctx: &ToolCtx,
+) -> ToolOutput {
+    let model = ctx.redact.scrub(&envelope.model_text());
+    let display_lane = ctx.redact.scrub(&envelope.display_text());
+    let attachments = envelope
+        .artifacts
+        .iter()
+        .map(|attached| ctx.redact.scrub(attached))
+        .collect::<Vec<_>>();
+    let model_over_cap = model.len() > OUTPUT_BYTE_CAP;
+    let model_inline = if model_over_cap {
+        truncate_head_tail(&model, OUTPUT_BYTE_CAP)
     } else {
-        ToolOutput::text(out)
+        model.clone()
+    };
+    let mut output = if model_over_cap {
+        ToolOutput::truncated_text(model_inline)
+    } else {
+        ToolOutput::text(model_inline)
+    };
+    // A model-lane capture is the dispatcher authority to replace the whole
+    // model result with an artifact frame. Retain one only after this lane
+    // exceeds its inline bound; ordinary `emit` output (and the no-emit
+    // fallback) must keep the exact inline result in model history.
+    if model_over_cap {
+        output = output.with_text_artifact_lane(
+            ToolArtifactLane::Model,
+            capture_text_artifact_body(&model),
+            model_over_cap,
+        );
     }
+    if !display_lane.is_empty() {
+        output = output.with_text_artifact_lane(
+            ToolArtifactLane::Display,
+            capture_text_artifact_body(&display_lane),
+            display_lane.len() > OUTPUT_BYTE_CAP,
+        );
+    }
+    for attached in attachments {
+        output = output.with_text_artifact_lane(
+            ToolArtifactLane::Attachment,
+            capture_text_artifact_body(&attached),
+            true,
+        );
+    }
+
+    if !display_lane.is_empty() {
+        let display = if model.is_empty() {
+            display_lane
+        } else {
+            format!("{model}\n{display_lane}")
+        };
+        output = output.with_model_ephemeral_display(truncate_head_tail(&display, OUTPUT_BYTE_CAP));
+    }
+    output.with_notices(envelope.notifications)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn projection_redaction_table(root: &std::path::Path) -> crate::redact::RedactionTable {
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: "[redacted]".to_string(),
+            ..Default::default()
+        };
+        crate::redact::RedactionTable::build_with_env_and_secrets(
+            &cfg,
+            root,
+            &HashMap::from([("API_TOKEN".to_string(), "monty-secret-value".to_string())]),
+            Vec::<(String, String)>::new(),
+        )
+        .unwrap()
+    }
 
     fn mcp_description(toolbox: &ToolBox, steering: crate::agents::ToolSteering) -> String {
         toolbox
@@ -342,25 +416,180 @@ mod tests {
 
     #[test]
     fn mcp_tool_over_cap_result_carries_text_artifact_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
         let body = "m".repeat(OUTPUT_BYTE_CAP + 32);
 
-        let output = rendered_result_output(body.clone());
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec![body.clone()],
+                ..Default::default()
+            },
+            &ctx,
+        );
 
         assert!(output.truncated);
         let capture = output
-            .text_artifact_capture
-            .as_ref()
-            .expect("capture for over-cap mcp result");
-        assert_eq!(capture.host_original_bytes, body.len());
-        assert_eq!(capture.content, body);
+            .text_artifact_captures
+            .iter()
+            .find(|capture| capture.lane == ToolArtifactLane::Model)
+            .expect("model capture for over-cap mcp result");
+        assert_eq!(capture.capture.host_original_bytes, body.len());
+        assert_eq!(capture.capture.content, body);
     }
 
     #[test]
     fn mcp_tool_under_cap_result_has_no_text_artifact_capture() {
-        let output = rendered_result_output("small result".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["small result".to_string()],
+                ..Default::default()
+            },
+            &ctx,
+        );
 
         assert!(!output.truncated);
-        assert!(output.text_artifact_capture.is_none());
+        assert_eq!(output.content, "small result");
+        assert!(
+            output.text_artifact_captures.is_empty(),
+            "under-cap model output must remain inline rather than authorize a spill"
+        );
+    }
+
+    #[test]
+    fn projection_mapping_redacts_model_display_and_artifact_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.redact = Arc::new(projection_redaction_table(tmp.path()));
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["model monty-secret-value".to_string()],
+                display: vec!["display monty-secret-value".to_string()],
+                artifacts: vec!["artifact monty-secret-value".to_string()],
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        assert_eq!(output.content, "model [redacted]");
+        let display = output.display_content.as_deref().unwrap();
+        assert!(display.contains("model [redacted]"), "{display}");
+        assert!(display.contains("display [redacted]"), "{display}");
+        assert!(!display.contains("monty-secret-value"), "{display}");
+        assert!(output.text_artifact_captures.iter().any(|capture| {
+            capture.lane == ToolArtifactLane::Attachment
+                && capture.capture.content == "artifact [redacted]"
+        }));
+    }
+
+    #[test]
+    fn oversized_display_lane_spills_without_changing_model_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let display = "d".repeat(OUTPUT_BYTE_CAP + 64);
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["small model result".to_string()],
+                display: vec![display.clone()],
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        assert_eq!(output.content, "small model result");
+        assert!(output.display_content.as_ref().unwrap().len() <= OUTPUT_BYTE_CAP);
+        assert!(output.text_artifact_captures.iter().any(|capture| {
+            capture.lane == ToolArtifactLane::Display && capture.capture.content == display
+        }));
+    }
+
+    #[test]
+    fn display_and_attachment_lanes_do_not_replace_emit_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["exact model answer".to_owned()],
+                display: vec!["display body".to_owned()],
+                artifacts: vec!["attached body".to_owned()],
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        assert_eq!(output.content, "exact model answer");
+        assert!(
+            output
+                .text_artifact_captures
+                .iter()
+                .all(|capture| { capture.lane != ToolArtifactLane::Model })
+        );
+        assert!(
+            output
+                .text_artifact_captures
+                .iter()
+                .any(|capture| { capture.lane == ToolArtifactLane::Display && !capture.explicit })
+        );
+        assert!(output.text_artifact_captures.iter().any(|capture| {
+            capture.lane == ToolArtifactLane::Attachment
+                && capture.explicit
+                && capture.capture.content == "attached body"
+        }));
+    }
+
+    #[test]
+    fn each_attachment_keeps_an_individual_artifact_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["model".to_owned()],
+                artifacts: vec![
+                    "first attachment".to_owned(),
+                    "second attachment".to_owned(),
+                ],
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        let attachments = output
+            .text_artifact_captures
+            .iter()
+            .filter(|capture| capture.lane == ToolArtifactLane::Attachment)
+            .collect::<Vec<_>>();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].capture.content, "first attachment");
+        assert_eq!(attachments[1].capture.content, "second attachment");
+        assert!(attachments.iter().all(|capture| capture.explicit));
+    }
+
+    #[tokio::test]
+    async fn show_and_notify_stay_out_of_model_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let output = McpTool
+            .call(
+                serde_json::json!({
+                    "script": "emit('model only')\nshow({'detail': 'display only'})\nnotify('human only')"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.content, "model only");
+        assert!(!output.content.contains("display only"));
+        assert!(!output.content.contains("human only"));
+        assert!(
+            output
+                .display_content
+                .as_deref()
+                .is_some_and(|display| display.contains("display only"))
+        );
+        assert_eq!(output.notices, vec!["human only"]);
     }
 
     #[test]

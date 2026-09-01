@@ -1675,7 +1675,7 @@ impl SessionWorkerHandle {
         let transition_bypass = matches!(
             &work,
             SessionWork::ReplaceConfigSnapshot { .. }
-                | SessionWork::Cancel
+                | SessionWork::Cancel { .. }
                 | SessionWork::CancelAll
                 | SessionWork::Shutdown { .. }
         );
@@ -2308,7 +2308,12 @@ pub enum SessionWork {
         >,
     },
     RepublishQueue,
-    Cancel,
+    /// Explicit provenance for foreground cancellation. A turn retraction is
+    /// permitted only for an interactive `CancelTurn`; scheduler, lifecycle,
+    /// config, and invocation stops must cancel without user attribution.
+    Cancel {
+        origin: CancelOrigin,
+    },
     ResolveInterrupt {
         interrupt_id: Uuid,
         response: proto::ResolveResponse,
@@ -2377,7 +2382,7 @@ pub enum SessionWork {
     SetToolSurfaceOverride {
         override_json: String,
         persist_session: bool,
-        prune_after_switch: bool,
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
@@ -2456,6 +2461,12 @@ pub enum SessionWork {
     Shutdown {
         pause_for_resume: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOrigin {
+    InteractiveTurn,
+    Noninteractive,
 }
 
 /// One-shot constructor: persist its initial redaction boundary, then spawn the

@@ -1616,8 +1616,11 @@ pub enum Request {
         override_json: String,
         #[serde(default = "default_true")]
         persist_session: bool,
-        #[serde(default)]
-        prune_after_switch: bool,
+        /// Confirms that the caller warned the user that a native-schema
+        /// change breaks the provider prompt cache. The daemon independently
+        /// detects that change and always invalidates cached context; this is
+        /// an acknowledgement gate, never a caller-controlled prune switch.
+        cache_break_acknowledged: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         monty_nudge: Option<String>,
     },
@@ -2057,7 +2060,6 @@ pub enum Request {
     /// Apply the security or model setup wizard through the daemon owner.
     /// Answers are validated against the daemon's current descriptor; the
     /// descriptor itself never crosses the wire.
-    #[cfg(feature = "remote")]
     ApplySetupWizard {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -3462,7 +3464,6 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
-            #[cfg(feature = "remote")]
             Self::ApplySetupWizard {
                 project_root,
                 wizard_id,
@@ -4429,7 +4430,6 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { .. }, "save_provider_config");
             (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
-            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
             (Request::SaveMcpConfig { .. }, "save_mcp_config");
             (Request::GetAgentInventory { .. }, "get_agent_inventory");
@@ -4721,7 +4721,7 @@ macro_rules! command {
             (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, local_only, none, serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool", [default_update_id: Uuid => param, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider), reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param, clear: bool => param]);
             (Request::SetActiveModel { selection_id, provider, model, persist_as_default, trigger, reasoning_effort, thinking_mode, prompt_cache_retention }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>", [selection_id: Uuid => param, provider: String => provider_model_left(model), model: String => provider_model_right(provider), persist_as_default: bool => param, trigger: ActiveModelSwitchTrigger => param, reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param]);
             (Request::SetAgent { name }, "set_agent", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "name:String", [name: String => param]);
-            (Request::SetToolSurfaceOverride { override_json, persist_session, prune_after_switch, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>", [override_json: String => param, persist_session: bool => param, prune_after_switch: bool => param, monty_nudge: Option<String> => param]);
+            (Request::SetToolSurfaceOverride { override_json, persist_session, cache_break_acknowledged, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:String|persist_session:bool|cache_break_acknowledged:bool|monty_nudge:Option<String>", [override_json: String => param, persist_session: bool => param, cache_break_acknowledged: bool => param, monty_nudge: Option<String> => param]);
             (Request::SetGoalSettingsOverride { override_json, persist_session }, "set_goal_settings_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:Option<String>|persist_session:bool", [override_json: Option<String> => param, persist_session: bool => param]);
             (Request::SetApprovalMode { mode }, "set_approval_mode", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "mode:ApprovalMode", [mode: ApprovalMode => param]);
             (Request::SetDelegationRecursion { enabled, default_depth }, "set_delegation_recursion", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "enabled:bool|default_depth:u32", [enabled: bool => param, default_depth: u32 => param]);
@@ -4774,7 +4774,6 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>> => param]);
             (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
-            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
@@ -6446,7 +6445,6 @@ mod tests {
             "save_provider_config",
             "delete_provider_config",
             "set_provider_layer_metadata",
-            "apply_setup_wizard",
         ] {
             let wire = serde_json::json!({ "request": tag, "params": {} });
             assert!(

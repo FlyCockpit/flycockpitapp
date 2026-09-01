@@ -486,16 +486,7 @@ pub fn availability_snapshot() -> ContainerAvailability {
 }
 
 pub fn default_config_dir() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_CONFIG_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("cockpit"));
-    }
-    if let Some(dir) = dirs::config_dir() {
-        return Ok(dir.join("cockpit"));
-    }
-    let home = dirs::home_dir().context("could not locate home dir")?;
-    Ok(home.join(".config").join("cockpit"))
+    crate::config::config::resolve::cockpit_config_dir()
 }
 
 pub fn resolve_dockerfile_for_session(

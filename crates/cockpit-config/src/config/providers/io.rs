@@ -752,10 +752,7 @@ impl ConfigDoc {
             reject_legacy_redact_fields(id, &provider)?;
             if !matches!(
                 snapshot.origin,
-                Some(
-                    crate::config::dirs::ConfigDirKind::HomeXdg
-                        | crate::config::dirs::ConfigDirKind::HomeDot
-                )
+                Some(crate::config::dirs::ConfigDirKind::HomeXdg)
             ) {
                 strip_project_auth_command(
                     id,
@@ -1747,17 +1744,11 @@ fn merge_provider_files_for_layer(
     }
 }
 
-/// Only the two conventional home-scoped directories are global authority.
+/// Only the canonical platform global config file has global authority.
 /// Machine-local per-cwd, project `.cockpit`, attached workspace snapshots,
 /// and `COCKPIT_CONFIG` are project scoped for executable configuration.
 fn config_path_is_global_user_layer(config_path: &Path) -> bool {
-    let Some(parent) = config_path.parent() else {
-        return false;
-    };
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    parent == home.join(".cockpit") || parent == home.join(".config/cockpit")
+    crate::config::dirs::global_config_file().is_ok_and(|global| config_path == global)
 }
 
 fn strip_project_auth_command(
@@ -1851,7 +1842,7 @@ pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
 fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>) -> Result<()> {
     if provider.contains_key("redact") {
         anyhow::bail!(
-            "provider `{provider_id}` uses legacy `redact`; use `trust: \"trusted\"` to send inference requests raw or `trust: \"untrusted\"` to keep them redacted (exports and client display stay redacted regardless of trust)"
+            "provider `{provider_id}` uses legacy `redact`; use `trust: \"trusted\"` for host-mediated capture or `trust: \"untrusted\"` to disable capture (sealed inference remains reference-only for every trust level)"
         );
     }
     if let Some(models) = provider.get("models").and_then(Value::as_array) {
@@ -1865,7 +1856,7 @@ fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>)
                     .and_then(Value::as_str)
                     .unwrap_or("<unknown>");
                 anyhow::bail!(
-                    "model `{provider_id}:{model_id}` uses legacy `redact`; use `trust: \"trusted\"` to send inference requests raw or `trust: \"untrusted\"` to keep them redacted (exports and client display stay redacted regardless of trust)"
+                    "model `{provider_id}:{model_id}` uses legacy `redact`; use `trust: \"trusted\"` for host-mediated capture or `trust: \"untrusted\"` to disable capture (sealed inference remains reference-only for every trust level)"
                 );
             }
         }

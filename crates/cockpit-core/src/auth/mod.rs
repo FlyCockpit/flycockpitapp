@@ -15,7 +15,7 @@ pub mod copilot_setup;
 pub mod descriptor;
 #[cfg(feature = "remote")]
 pub mod flycockpit;
-mod refresh_guard;
+pub(crate) mod refresh_guard;
 pub mod subscription_ack;
 #[cfg(feature = "grok-subscription")]
 pub mod xai_oauth;

@@ -7723,7 +7723,7 @@ mod tests {
                 project_root: "/tmp/project".into(),
                 lease_id: Uuid::nil().to_string(),
                 markdown: Some(SensitiveWirePayload::new(
-                    "---\nschemaVersion: 2\n---\nBe helpful.\n".into(),
+                    "---\nschemaVersion: 1\n---\nBe helpful.\n".into(),
                 )),
             },
             Request::GetAgentEditorLeaseSettlement {

@@ -287,6 +287,53 @@ pub async fn refresh_provider_request_async_with_store(
     .map(Some)
 }
 
+/// Re-resolve a long-lived command-authenticated request using the provider
+/// entry authorized after this refresh owns the serialized execution turn.
+///
+/// A live client supplies `authorize_entry` instead of a cloned entry because
+/// config can reload while the refresh waits behind another request.
+pub(crate) async fn refresh_provider_request_async_with_store_authorized<F>(
+    provider_id: &str,
+    store: crate::credentials::CredentialStore,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
+    rejected_refresh_generation: Option<u64>,
+    authorize_entry: F,
+) -> Result<ResolvedRequest>
+where
+    F: FnOnce() -> Result<ProviderEntry>,
+{
+    let (entry, command_credential) = crate::auth::command::resolve_authorized(
+        provider_id,
+        store.clone(),
+        &env_lookup,
+        true,
+        rejected_refresh_generation,
+        authorize_entry,
+    )
+    .await?;
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential.refresh_generation;
+    let registry = ProviderRegistry::standard();
+    let credential = Some(OAuthCredential::Command(command_credential));
+    let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+    let request = resolve_provider_request_inner_with_sources(
+        provider_id,
+        &entry,
+        credential,
+        registry.provider_for(provider_id, &entry).request_kind(),
+        &env_lookup,
+        &secret_lookup,
+    )?;
+    #[cfg(not(test))]
+    {
+        let mut request = request;
+        request.command_credential_generation = Some(command_credential_generation);
+        return Ok(request);
+    }
+    #[cfg(test)]
+    Ok(request)
+}
+
 async fn resolve_provider_request_async_with_store_refresh(
     provider_id: &str,
     entry: &ProviderEntry,
@@ -1044,7 +1091,7 @@ pub async fn fetch_models_for_provider_with_store(
     .await?;
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    let url = provider.models_url(entry, &request.base_url);
+    let mut url = provider.models_url(entry, &request.base_url);
     let fallback_models = provider.fallback_models();
     let fallback_catalog = provider.fallback_catalog();
     let mut outcome = fetch_models_at_detailed(
@@ -1054,7 +1101,7 @@ pub async fn fetch_models_for_provider_with_store(
         ModelCatalogAbi::from(provider.request_kind()),
     )
     .await
-    .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
+    .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
     if outcome
         .as_ref()
         .is_err_and(|error| auth_rejection_error(error))
@@ -1081,7 +1128,8 @@ pub async fn fetch_models_for_provider_with_store(
             ModelCatalogAbi::from(provider.request_kind()),
         )
         .await
-        .and_then(|result| validate_anthropic_fetch_result(entry, &refreshed.base_url, result));
+        .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
+        url = refreshed_url;
     }
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
@@ -1141,15 +1189,15 @@ fn auth_rejection_error(error: &anyhow::Error) -> bool {
 }
 
 fn validate_anthropic_fetch_result(
+    provider_id: &str,
     entry: &ProviderEntry,
-    base_url: &str,
     result: FetchModelsAtResult,
 ) -> Result<FetchModelsAtResult> {
-    if !crate::config::providers::is_anthropic_native_base_url(base_url) {
-        return Ok(result);
-    }
     if let FetchOutcome::Models { models, .. } = &result.outcome {
         for fetched in models {
+            if entry.resolve_wire_api(provider_id, &fetched.id) != WireApi::Anthropic {
+                continue;
+            }
             let mut candidate_model = fetched.clone();
             if let Some(existing) = entry.models.iter().find(|model| model.id == fetched.id) {
                 candidate_model.capability_overrides = existing.capability_overrides.clone();
@@ -2445,12 +2493,17 @@ mod tests {
             status: Some(StatusCode::OK),
             body_nonempty: true,
         };
+        let anthropic_wire_provider = ProviderEntry {
+            url: "https://anthropic-compatible.example/v1".to_string(),
+            wire_api: WireApi::Anthropic,
+            ..ProviderEntry::default()
+        };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
-            Ok(_) => panic!("OpenAI-shaped native Anthropic mapping must be rejected"),
+            Ok(_) => panic!("OpenAI-shaped Anthropic-wire mapping must be rejected"),
             Err(error) => format!("{error:#}"),
         };
         assert!(error.contains("rejecting invalid Anthropic catalog entry"));
@@ -2492,8 +2545,8 @@ mod tests {
             body_nonempty: true,
         };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
             Ok(_) => panic!("unknown adaptive Anthropic targets must be rejected"),
@@ -2520,8 +2573,8 @@ mod tests {
             body_nonempty: true,
         };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
             Ok(_) => panic!("manual Anthropic mapping without an output limit must be rejected"),
@@ -2549,10 +2602,37 @@ mod tests {
             status: Some(StatusCode::OK),
             body_nonempty: true,
         };
+        validate_anthropic_fetch_result("third-party-anthropic", &anthropic_wire_provider, result)
+            .unwrap();
+
+        let first_party_host_on_openai_wire = ProviderEntry {
+            url: "https://api.anthropic.com/v1".to_string(),
+            wire_api: WireApi::Completions,
+            ..ProviderEntry::default()
+        };
+        let openai_shaped = parse_models_body(
+            r#"{"data":[{
+                "id":"openai-wire-model",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"high"}],
+                    "default":"high",
+                    "request_mapping":{"type":"json_field","field":"reasoning_effort"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
         validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
-            result,
+            "first-party-host-openai-wire",
+            &first_party_host_on_openai_wire,
+            FetchModelsAtResult {
+                outcome: FetchOutcome::Models {
+                    models: openai_shaped,
+                    catalog: ProviderModelCatalog::Live,
+                },
+                status: Some(StatusCode::OK),
+                body_nonempty: true,
+            },
         )
         .unwrap();
     }

@@ -3,13 +3,9 @@
 //! Perception remains pixel-based. Accessibility is queried separately by the
 //! target-evidence adapter and is never used to choose action coordinates.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
 use async_trait::async_trait;
 use objc2_core_foundation::CGPoint;
@@ -37,86 +33,53 @@ struct MacHeldInputState {
     buttons: Vec<MouseButton>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct MacHeldInputRecord {
-    generation: u64,
-    state: MacHeldInputState,
-}
-
 #[derive(Debug)]
 struct MacHeldInputJournal {
-    paths: [PathBuf; 2],
+    path: std::path::PathBuf,
 }
 
 impl MacHeldInputJournal {
-    fn for_global_hid_sink() -> Result<Self, ComputerError> {
-        // CGEvent posts to one host-wide HID sink, including across macOS
-        // login users. Keep the recovery records beside the matching shared
-        // advisory lock in the system sticky directory rather than beneath a
-        // per-user Cockpit data directory. Files are no-follow regular files
-        // with a shared mode so another authorized login can recover a dead
-        // predecessor; malformed or insecure state fails closed.
-        let root = PathBuf::from("/private/var/tmp");
+    fn for_current_user_hid_sink() -> Result<Self, ComputerError> {
+        // CGEvent reaches a host-wide HID sink, but recovery input state is
+        // authority to inject global key-up/mouse-up events. A user-private
+        // Cockpit state directory is therefore the trust boundary: only a
+        // replacement daemon for this login can consume this state. Cross-user
+        // recovery would require an authenticated privileged service, not a
+        // predictable file in a sticky directory.
+        let root = crate::config::resolve::cockpit_data_dir()
+            .map_err(input_journal_error)?
+            .join("computer-input-state");
+        cockpit_host::private_fs::ensure_private_dir(&root).map_err(input_journal_error)?;
         Ok(Self {
-            paths: [
-                root.join("flycockpit-macos-global-hid-state-a.v1.json"),
-                root.join("flycockpit-macos-global-hid-state-b.v1.json"),
-            ],
+            path: root.join("macos-hid.v1.json"),
         })
     }
 
     fn load(&self) -> Result<MacHeldInputState, ComputerError> {
-        Ok(self
-            .latest_record()?
-            .map_or_else(empty_held_input, |record| record.state))
+        let Some(bytes) =
+            cockpit_host::private_fs::read_private_file(&self.path, "macOS held-input")
+                .map_err(input_journal_error)?
+        else {
+            return Ok(empty_held_input());
+        };
+        let state = serde_json::from_slice::<MacHeldInputState>(&bytes)
+            .map_err(|_| journal_error("macOS held-input journal is malformed"))?;
+        validate_held_input_state(&state)?;
+        Ok(state)
     }
 
     fn store(&self, state: &MacHeldInputState) -> Result<(), ComputerError> {
         validate_held_input_state(state)?;
-        let previous = self.latest_record()?;
-        let generation = previous
-            .map_or(1, |record| record.generation.checked_add(1))
-            .ok_or_else(|| journal_error("macOS held-input journal generation overflow"))?;
-        let record = MacHeldInputRecord {
-            generation,
-            state: state.clone(),
-        };
-        let bytes = serde_json::to_vec(&record).map_err(input_journal_error)?;
-        // Alternating complete records preserves the predecessor's state if
-        // the process dies while writing its successor. This method is called
-        // only while the global HID lease is held.
-        write_shared_journal_record(&self.paths[(generation & 1) as usize], &bytes)
-    }
-
-    fn latest_record(&self) -> Result<Option<MacHeldInputRecord>, ComputerError> {
-        let mut latest = None;
-        let mut malformed_slot = false;
-        for path in &self.paths {
-            let Some(bytes) = read_shared_journal_record(path)? else {
-                continue;
-            };
-            let record = match serde_json::from_slice::<MacHeldInputRecord>(&bytes) {
-                Ok(record) => record,
-                // An interrupted write only ever targets the inactive slot;
-                // retain the prior complete record. If both slots are invalid,
-                // fail closed below rather than guessing about held input.
-                Err(_) => {
-                    malformed_slot = true;
-                    continue;
-                }
-            };
-            validate_held_input_state(&record.state)?;
-            if latest
-                .as_ref()
-                .is_none_or(|current: &MacHeldInputRecord| record.generation > current.generation)
-            {
-                latest = Some(record);
-            }
+        if state.keys.is_empty() && state.buttons.is_empty() {
+            return cockpit_host::private_fs::delete_private_file(&self.path)
+                .map_err(input_journal_error);
         }
-        if latest.is_none() && malformed_slot {
-            return Err(journal_error("macOS held-input journal is malformed"));
-        }
-        Ok(latest)
+        let bytes = serde_json::to_vec(state).map_err(input_journal_error)?;
+        // `write_private_file` replaces the slot crash-atomically and fsyncs
+        // the containing private directory. This method is called only while
+        // the global HID lease is held.
+        cockpit_host::private_fs::write_private_file(&self.path, &bytes)
+            .map_err(input_journal_error)
     }
 }
 
@@ -143,51 +106,6 @@ fn validate_held_input_state(state: &MacHeldInputState) -> Result<(), ComputerEr
         ));
     }
     Ok(())
-}
-
-fn read_shared_journal_record(path: &Path) -> Result<Option<Vec<u8>>, ComputerError> {
-    let file = match shared_journal_file(path, false) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(input_journal_error(error)),
-    };
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::BufReader::new(file), &mut bytes)
-        .map_err(input_journal_error)?;
-    Ok(Some(bytes))
-}
-
-fn write_shared_journal_record(path: &Path, bytes: &[u8]) -> Result<(), ComputerError> {
-    let mut file = shared_journal_file(path, true).map_err(input_journal_error)?;
-    file.set_len(0).map_err(input_journal_error)?;
-    file.write_all(bytes).map_err(input_journal_error)?;
-    file.sync_all().map_err(input_journal_error)
-}
-
-fn shared_journal_file(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(write)
-        .create(write)
-        .mode(0o666)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
-        return Err(std::io::Error::other(
-            "shared journal is not an unlinked regular file",
-        ));
-    }
-    if metadata.permissions().mode() & 0o777 != 0o666 {
-        // The creator repairs umask once; a different owner cannot make a
-        // per-user record appear shared, so that case fails closed.
-        file.set_permissions(std::fs::Permissions::from_mode(0o666))?;
-        if file.metadata()?.permissions().mode() & 0o777 != 0o666 {
-            return Err(std::io::Error::other("shared journal is not mode 0o666"));
-        }
-    }
-    Ok(file)
 }
 
 /// Physical macOS desktop backend. Construction performs both TCC preflights;
@@ -238,7 +156,7 @@ impl MacOsComputerBackend {
                 detail: "CoreGraphics returned null".to_string(),
             }
         })?;
-        let held_input_journal = MacHeldInputJournal::for_global_hid_sink()?;
+        let held_input_journal = MacHeldInputJournal::for_current_user_hid_sink()?;
         let held_input = held_input_journal.load()?;
         Ok(Self {
             source,

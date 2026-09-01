@@ -1081,6 +1081,23 @@ impl MacOsTargetEvidenceAdapter {
         let recheck_window = ax_attribute(&recheck_application, MacAxAttribute::FocusedWindow)?
             .downcast::<AXUIElement>()
             .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+        // The numeric CoreGraphics window number and AX geometry below can be
+        // recycled after the original window is destroyed. Recheck the live
+        // AX object against the retained lifetime witness before accepting
+        // those observable fields, otherwise a same-PID replacement could
+        // inherit the original window's epoch during this synchronous bracket.
+        let recheck_same_lifetime = self
+            .focused_window_lifetime
+            .as_ref()
+            .is_some_and(|retained| {
+                objc2_core_foundation::CFEqual(
+                    Some(retained.as_ref()),
+                    Some(recheck_window.as_ref()),
+                )
+            });
+        if !recheck_same_lifetime {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
         let (recheck_position, recheck_size) = ax_window_rect(&recheck_window)?;
         let recheck_window_number =
             cg_window_number_for_ax_window(frontmost_pid, recheck_position, recheck_size)?;

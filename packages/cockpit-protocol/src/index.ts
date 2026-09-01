@@ -1931,6 +1931,10 @@ export const attachedDataSchema = z
     active_subagent: activeSubagentSchema.optional(),
     active_model_state: activeModelStateSchema.optional(),
     history: z.array(historyEntryWireSchema),
+    // Target rows removed by durable user-message retraction tombstones.
+    // Apply these before merging the full history snapshot so a reconnect
+    // cannot retain a stale cached row outside the snapshot window.
+    removed_user_message_seqs: z.array(safeI64NumberSchema).optional(),
     paused_work: z.array(pausedWorkSummarySchema),
     repair_required: resumeRepairStateSchema.optional(),
     resume_compaction_offer: resumeCompactionOfferSchema.optional(),

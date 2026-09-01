@@ -1633,6 +1633,7 @@ struct ReconnectAttach {
     client: DaemonClient,
     session_entry_mode: proto::SessionEntryMode,
     history: Vec<proto::HistoryEntry>,
+    removed_user_message_seqs: Vec<i64>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
     active_model_state: Option<proto::ActiveModelState>,
@@ -1641,6 +1642,7 @@ struct ReconnectAttach {
 struct AttachedPayload {
     session_entry_mode: proto::SessionEntryMode,
     history: Vec<proto::HistoryEntry>,
+    removed_user_message_seqs: Vec<i64>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
     active_model_state: Option<proto::ActiveModelState>,
@@ -4036,6 +4038,7 @@ async fn reconnect_and_attach(
         client,
         session_entry_mode: payload.session_entry_mode,
         history: payload.history,
+        removed_user_message_seqs: payload.removed_user_message_seqs,
         paused_work: payload.paused_work,
         repair_required: payload.repair_required,
         active_model_state: payload.active_model_state,
@@ -4103,6 +4106,7 @@ fn attach_payload_from_response(
         Ok(Response::Attached {
             session_entry_mode,
             history,
+            removed_user_message_seqs,
             paused_work,
             repair_required,
             active_model_state,
@@ -4110,6 +4114,7 @@ fn attach_payload_from_response(
         }) => Ok(AttachedPayload {
             session_entry_mode,
             history,
+            removed_user_message_seqs,
             paused_work,
             repair_required: repair_required.map(|repair| *repair),
             active_model_state,
@@ -4133,6 +4138,7 @@ fn split_reconnect_attached(attached: ReconnectAttach) -> (DaemonClient, Attache
     let payload = AttachedPayload {
         session_entry_mode: attached.session_entry_mode,
         history: attached.history,
+        removed_user_message_seqs: attached.removed_user_message_seqs,
         paused_work: attached.paused_work,
         repair_required: attached.repair_required,
         active_model_state: attached.active_model_state,
@@ -4147,6 +4153,7 @@ fn apply_attached_payload(
     let AttachedPayload {
         session_entry_mode: _,
         history,
+        removed_user_message_seqs,
         paused_work,
         repair_required,
         active_model_state,
@@ -4164,14 +4171,14 @@ fn apply_attached_payload(
             },
         );
     }
-    if !history.is_empty() {
+    if !history.is_empty() || !removed_user_message_seqs.is_empty() {
         let max_seq = history.iter().filter_map(history_entry_seq).max();
         if let Some(max_seq) = max_seq {
             apply_incoming_event(
                 proto::Event::HistoryReplay {
                     session_id: ctx.session_id,
                     entries: history,
-                    removed_user_message_seqs: Vec::new(),
+                    removed_user_message_seqs,
                     max_seq,
                 },
                 ctx,
@@ -4181,7 +4188,7 @@ fn apply_attached_payload(
                 ctx,
                 TurnEvent::HistoryReplay {
                     entries: history,
-                    removed_user_message_seqs: Vec::new(),
+                    removed_user_message_seqs,
                 },
             );
         }
@@ -5339,6 +5346,7 @@ mod tests {
             active_model_state: None,
             session_entry_mode: proto::SessionEntryMode::Code,
             history,
+            removed_user_message_seqs: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
             resume_compaction_offer: None,
@@ -7518,6 +7526,49 @@ mod tests {
             } if output == "live"
         ));
         assert_eq!(current_last_applied_seq(&last), Some(9));
+    }
+
+    #[test]
+    fn full_attach_payload_replays_retracted_user_rows() {
+        let session_id = uuid::Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let primary_agent = Arc::new(Mutex::new("Build".to_string()));
+        let last_applied_seq = Arc::new(Mutex::new(None));
+        let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+        let attachment_epoch = Arc::new(AtomicU64::new(0));
+        let incoming = IncomingEventContext {
+            session_id,
+            client_epoch: 0,
+            attachment_epoch: &attachment_epoch,
+            events: &events,
+            event_notify: &notify,
+            active_agent: &active_agent,
+            active_agent_path: &active_agent_path,
+            primary_agent: &primary_agent,
+            last_applied_seq: &last_applied_seq,
+            awaiting_durable: &awaiting_durable,
+        };
+
+        apply_attached_payload(
+            AttachedPayload {
+                session_entry_mode: proto::SessionEntryMode::Assistant,
+                history: Vec::new(),
+                removed_user_message_seqs: vec![5],
+                paused_work: Vec::new(),
+                repair_required: None,
+                active_model_state: None,
+            },
+            &incoming,
+        );
+
+        assert!(matches!(
+            drained_event_payloads(&events).as_slice(),
+            [TurnEvent::HistoryReplay { entries, removed_user_message_seqs }]
+                if entries.is_empty() && removed_user_message_seqs.as_slice() == [5]
+        ));
     }
 
     struct FixedJitter {

@@ -116,6 +116,15 @@ describe("remote session reducers", () => {
     expect(replay.detailsBySession[sessionId].history.map((entry) => entry.id)).toEqual([
       "assistant:2",
     ]);
+
+    const fullAttach = mergeAttach(withDetail(), {
+      ...attachFixture,
+      history: [{ role: "assistant", seq: 2, agent: "Build", text: "I will inspect." }],
+      removed_user_message_seqs: [1],
+    });
+    expect(fullAttach.detailsBySession[sessionId].history.map((entry) => entry.id)).toEqual([
+      "assistant:2",
+    ]);
   });
 
   it("scopes an exact retry to its session and restores it after returning", () => {

@@ -896,7 +896,13 @@ export function mergeAttach(
 ): InstanceRemoteState {
   const current = existing.detailsBySession[attach.session_id];
   const mappedHistory = attach.history.map((entry, index) => toWebHistoryEntry(entry, index));
-  const mergedHistory = mergeHistorySnapshot(current?.history ?? [], mappedHistory);
+  const removedUserMessageSeqs = Array.isArray(attach.removed_user_message_seqs)
+    ? attach.removed_user_message_seqs.filter((seq): seq is number => typeof seq === "number")
+    : [];
+  const mergedHistory = mergeHistorySnapshot(
+    removeDurableUserMessages(current?.history ?? [], removedUserMessageSeqs),
+    mappedHistory,
+  );
   const attachedActiveModel = attach.active_model_state
     ? activeModelFromData(attach.active_model_state as Record<string, unknown>)
     : null;

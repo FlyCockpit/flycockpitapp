@@ -35310,6 +35310,39 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
         replay.2 > recorded_seq,
         "the replay cursor covers the newer tombstone, not only the older displayed row"
     );
+
+    let response = handle_request(
+        Request::Attach {
+            session_id: Some(session.session_id),
+            since_seq: None,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("full attach succeeds");
+    let Response::Attached {
+        history,
+        removed_user_message_seqs,
+        ..
+    } = response
+    else {
+        panic!("expected Attached response");
+    };
+    assert!(matches!(
+        history.as_slice(),
+        [proto::HistoryEntry::User { seq, text, .. }] if *seq == visible_seq && text == "older visible row"
+    ));
+    assert_eq!(removed_user_message_seqs, vec![recorded_seq]);
 }
 
 /// The local `CancelTurn` RPC must reach the real worker-owned driver rather

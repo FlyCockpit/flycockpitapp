@@ -27652,6 +27652,7 @@ async fn code_root_read_from_attached_response(
         active_subagent,
         active_model_state,
         history,
+        removed_user_message_seqs: _,
         paused_work,
         repair_required,
         // The ACP Code-root projection deliberately does not transfer this
@@ -28220,27 +28221,42 @@ pub(super) async fn attach(
                             .and_then(serde_json::Value::as_i64)
                     })
                     .collect();
-                let history =
-                    crate::engine::rehydrate::history_snapshot_since_with_active_subagent_conn(
-                        conn,
-                        session_id,
-                        &root_agent,
-                        active_subagent_for_attach.as_ref(),
-                        since_seq,
-                    )?;
-                (history, replay_max_seq, removed_user_message_seqs)
-            } else {
-                let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
+                let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
                     conn,
                     session_id,
                     &root_agent,
                     active_subagent_for_attach.as_ref(),
+                    replay_rows,
+                )?;
+                (history, replay_max_seq, removed_user_message_seqs)
+            } else {
+                // A full snapshot is merged with retained paged/live rows by
+                // remote clients, so it must carry all durable retraction
+                // targets as well. Absence from a snapshot is never treated
+                // as deletion: only these tombstone-backed identities remove
+                // a cached user row.
+                let snapshot_rows = crate::db::Db::list_session_events_conn(conn, session_id)?;
+                let removed_user_message_seqs = snapshot_rows
+                        .iter()
+                        .filter(|row| row.kind == "user_message_retracted")
+                        .filter_map(|row| {
+                            row.data
+                                .get("retracted_seq")
+                                .and_then(serde_json::Value::as_i64)
+                        })
+                        .collect();
+                let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
+                    conn,
+                    session_id,
+                    &root_agent,
+                    active_subagent_for_attach.as_ref(),
+                    snapshot_rows,
                 )
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, %session_id, "building attach history snapshot failed; sending empty history");
                     Vec::new()
                 });
-                (history, None, Vec::new())
+                (history, None, removed_user_message_seqs)
             };
             let paused_work = crate::db::Db::paused_session_work_conn(conn, session_id)?
                 .into_iter()
@@ -28282,6 +28298,11 @@ pub(super) async fn attach(
     } else {
         history
     };
+    let attached_removed_user_message_seqs = if replay_max_seq.is_none() {
+        removed_user_message_seqs.clone()
+    } else {
+        Vec::new()
+    };
     if let Some(max_seq) = replay_max_seq {
         if !history.is_empty() || !removed_user_message_seqs.is_empty() {
             state.pending_replay.push(proto::Event::HistoryReplay {
@@ -28312,6 +28333,7 @@ pub(super) async fn attach(
         active_subagent: foreground.active_subagent,
         active_model_state,
         history,
+        removed_user_message_seqs: attached_removed_user_message_seqs,
         paused_work,
         repair_required: state
             .attached

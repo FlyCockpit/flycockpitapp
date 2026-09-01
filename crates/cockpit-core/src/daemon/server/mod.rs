@@ -398,6 +398,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             active_subagent,
             active_model_state: _,
             history,
+            removed_user_message_seqs: _,
             paused_work,
             repair_required,
             resume_compaction_offer: _,

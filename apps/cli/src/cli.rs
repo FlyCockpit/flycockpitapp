@@ -91,6 +91,18 @@ pub enum PublicCommand {
     Run(RunArgs),
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Start an interactive Code session.
+    Code,
+    /// Start an interactive Assistant session.
+    Assistant,
+    /// Start an interactive Computer session.
+    Computer,
+    /// Manage legacy persistent assistant definitions and media accounting.
+    ///
+    /// This is deliberately separate from `cockpit assistant`, which is the
+    /// interactive Assistant-mode entry point.
+    #[command(subcommand)]
+    Assistants(AssistantCommand),
     #[command(subcommand, name = "provider")]
     Provider(ProvidersCommand),
     Setup(SetupArgs),
@@ -135,6 +147,10 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Ask(args) => Command::Ask(args),
                 PublicCommand::Run(args) => Command::Run(args),
                 PublicCommand::Agent(args) => Command::Agent(args),
+                PublicCommand::Code => Command::Code,
+                PublicCommand::Assistant => Command::Assistant,
+                PublicCommand::Computer => Command::Computer,
+                PublicCommand::Assistants(args) => Command::Assistants(args),
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),

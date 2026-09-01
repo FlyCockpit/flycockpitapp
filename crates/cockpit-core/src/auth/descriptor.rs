@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cockpit_config::config::providers::{OAuthDescriptor, OAuthFlowKind};
+use futures::StreamExt;
 use rand::Rng;
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,9 @@ const MIN_DEVICE_INTERVAL_SECS: u64 = 1;
 const MAX_DEVICE_POLL_SECS: u64 = 15 * 60;
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// OAuth endpoints are configured data, not a trusted daemon service.  Keep
+/// their error and token documents comfortably below the RPC payload ceiling.
+const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredCredential {
@@ -136,10 +140,9 @@ pub async fn begin_device_code_login(descriptor: &OAuthDescriptor) -> Result<Dev
         .context("requesting OAuth device code")?
         .error_for_status()
         .context("OAuth device-code request failed")?;
-    let parsed: DeviceAuthorizationResponse = response
-        .json()
-        .await
-        .context("OAuth device-code response is malformed")?;
+    let body = bounded_response_body(response).await?;
+    let parsed: DeviceAuthorizationResponse =
+        serde_json::from_str(&body).context("OAuth device-code response is malformed")?;
     ensure_nonempty(&parsed.device_code, "device_code")?;
     ensure_nonempty(&parsed.user_code, "user_code")?;
     let verification_uri = parsed
@@ -168,6 +171,17 @@ pub async fn complete_device_code_login_in(
     login: DeviceCodeLogin,
     store: CredentialStore,
 ) -> Result<()> {
+    let token = complete_device_code_login_unpersisted(descriptor, &login).await?;
+    persist_initial(provider_id, descriptor, store, token).await
+}
+
+/// Poll a descriptor device-code flow without persisting its token document.
+/// The daemon uses this so the one-shot OAuth-flow fence and credential write
+/// can commit atomically in its vault transaction.
+pub(crate) async fn complete_device_code_login_unpersisted(
+    descriptor: &OAuthDescriptor,
+    login: &DeviceCodeLogin,
+) -> Result<Map<String, Value>> {
     validate_descriptor(descriptor, OAuthFlowKind::DeviceCode)?;
     validate_login_identity(descriptor, &login.configuration_identity)?;
     let deadline = std::time::Instant::now()
@@ -187,10 +201,9 @@ pub async fn complete_device_code_login_in(
         )
         .await?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = bounded_response_body(response).await?;
         if status.is_success() {
-            let token = parse_token_response(&body)?;
-            return persist_initial(provider_id, descriptor, store, token);
+            return parse_token_response(&body);
         }
         let error = oauth_error_code(&body);
         match error.as_deref() {
@@ -237,6 +250,19 @@ pub async fn complete_pkce_browser_login_in(
     callback_or_code: &str,
     store: CredentialStore,
 ) -> Result<()> {
+    let token =
+        complete_pkce_browser_login_unpersisted(descriptor, &login, callback_or_code).await?;
+    persist_initial(provider_id, descriptor, store, token).await
+}
+
+/// Exchange a descriptor PKCE flow without persisting its token document.
+/// See [`complete_device_code_login_unpersisted`] for why daemon callers use
+/// this lower-level primitive.
+pub(crate) async fn complete_pkce_browser_login_unpersisted(
+    descriptor: &OAuthDescriptor,
+    login: &PkceBrowserLogin,
+    callback_or_code: &str,
+) -> Result<Map<String, Value>> {
     validate_descriptor(descriptor, OAuthFlowKind::PkceBrowser)?;
     validate_login_identity(descriptor, &login.configuration_identity)?;
     let code = parse_callback(callback_or_code, &login.state)?;
@@ -252,11 +278,11 @@ pub async fn complete_pkce_browser_login_in(
     )
     .await?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = bounded_response_body(response).await?;
     if !status.is_success() {
         return Err(token_endpoint_error(status, &body));
     }
-    persist_initial(provider_id, descriptor, store, parse_token_response(&body)?)
+    parse_token_response(&body)
 }
 
 pub(crate) async fn resolve(
@@ -299,9 +325,23 @@ pub(crate) async fn resolve(
         )
         .await?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = bounded_response_body(response).await?;
         if !status.is_success() {
-            return Err(token_endpoint_error(status, &body));
+            let error = token_endpoint_error(status, &body);
+            if is_terminal_refresh_error(status, &body) {
+                // The same provider lock covers login and refresh persistence.
+                // A concurrent descriptor writer can therefore only have
+                // changed this record before our re-open, never during this
+                // decision.  Still compare the token: a non-descriptor owner
+                // may have replaced the record externally.
+                let latest = store.reopen()?;
+                if load_cached(&latest, provider_id, &identity)?.is_some_and(|latest| {
+                    latest.token.get("refresh_token").and_then(Value::as_str) == Some(refresh_token)
+                }) {
+                    latest.remove_record_merged(provider_id)?;
+                }
+            }
+            return Err(error);
         }
         let mut merged = cached.token;
         // Expiry metadata describes the access token returned alongside it.
@@ -323,15 +363,51 @@ pub(crate) async fn resolve(
     .await
 }
 
-fn persist_initial(
+async fn persist_initial(
     provider_id: &str,
     descriptor: &OAuthDescriptor,
     store: CredentialStore,
     token: Map<String, Value>,
 ) -> Result<()> {
+    let provider_id = provider_id.to_owned();
+    let descriptor = descriptor.clone();
+    serialized_credential_mutation(&provider_id, || async move {
+        let store = store.reopen()?;
+        let record = initial_record(&provider_id, &descriptor, &store, token)?;
+        store.save_record_merged(&provider_id, record)
+    })
+    .await
+}
+
+/// Serialize every descriptor-owned credential mutation for one provider.
+/// Refresh holds this lock across reload, exchange, and save; initial login
+/// callers use it around their durable persistence transaction as well.
+pub(crate) async fn serialized_credential_mutation<T, F, Fut>(provider_id: &str, mutation: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    crate::auth::refresh_guard::serialized_refresh(&format!("oauth:{provider_id}"), mutation).await
+}
+
+pub(crate) async fn credential_mutation_lock(
+    provider_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    crate::auth::refresh_guard::serialized_refresh_lock(&format!("oauth:{provider_id}")).await
+}
+
+/// Build the persisted descriptor record while the caller owns
+/// [`serialized_credential_mutation`].  The daemon uses this to keep OAuth
+/// flow fencing and credential persistence in one SQLite transaction.
+pub(crate) fn initial_record(
+    provider_id: &str,
+    descriptor: &OAuthDescriptor,
+    store: &CredentialStore,
+    token: Map<String, Value>,
+) -> Result<Value> {
     validate_token_mapping(descriptor, &token)?;
     let configuration_identity = configuration_identity(descriptor)?;
-    let refresh_generation = load_cached(&store, provider_id, &configuration_identity)?
+    let refresh_generation = load_cached(store, provider_id, &configuration_identity)?
         .map_or(1, |cached| cached.refresh_generation.saturating_add(1));
     let cached = StoredCredential {
         configuration_identity,
@@ -339,7 +415,7 @@ fn persist_initial(
         expires_at: token_expiry(&token),
         token,
     };
-    store.save_record_merged(provider_id, serde_json::json!({ "oauth": cached }))
+    Ok(serde_json::json!({ "oauth": cached }))
 }
 
 fn load_cached(
@@ -475,6 +551,26 @@ async fn token_post(endpoint: &str, params: &[(&str, &str)]) -> Result<reqwest::
         .with_context(|| format!("POST OAuth token endpoint {endpoint}"))
 }
 
+async fn bounded_response_body(response: reqwest::Response) -> Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("OAuth endpoint response exceeds {MAX_OAUTH_RESPONSE_BYTES} bytes");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading OAuth endpoint response")?;
+        let remaining = MAX_OAUTH_RESPONSE_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            anyhow::bail!("OAuth endpoint response exceeds {MAX_OAUTH_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("OAuth endpoint response is not UTF-8")
+}
+
 fn oauth_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
@@ -565,6 +661,13 @@ fn oauth_error_code(body: &str) -> Option<String> {
 
 fn token_endpoint_error(status: StatusCode, _body: &str) -> anyhow::Error {
     anyhow!("OAuth token endpoint rejected the request ({status})")
+}
+
+fn is_terminal_refresh_error(status: StatusCode, body: &str) -> bool {
+    matches!(
+        oauth_error_code(body).as_deref(),
+        Some("invalid_grant" | "invalid_client" | "unauthorized_client" | "invalid_token")
+    ) || (status == StatusCode::UNAUTHORIZED && oauth_error_code(body).is_none())
 }
 
 fn ensure_nonempty(value: &str, field: &str) -> Result<()> {
@@ -668,6 +771,23 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
+    async fn error_response_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let reply = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
     #[tokio::test]
     async fn device_code_happy_path_persists_and_maps_headers() {
         let (base, server) = response_server(vec![
@@ -758,6 +878,7 @@ mod tests {
             }))
             .unwrap(),
         )
+        .await
         .unwrap();
 
         let credential = resolve("custom", &descriptor, store, false, None)
@@ -770,22 +891,52 @@ mod tests {
         assert!(requests[0].contains("refresh_token=rotate-me"));
     }
 
-    #[test]
-    fn malformed_token_response_fails_closed_without_persisting() {
-        let descriptor = descriptor("http://127.0.0.1:1", OAuthFlowKind::DeviceCode);
+    #[tokio::test]
+    async fn malformed_token_response_fails_closed_without_persisting() {
+        let (base, server) = response_server(vec![
+            r#"{"device_code":"device","user_code":"ABCD","verification_uri":"https://example.test/verify"}"#,
+            "{ malformed JSON",
+        ])
+        .await;
+        let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
         let (_temp, store) = store();
-        let error = persist_initial(
-            "custom",
-            &descriptor,
-            store.clone(),
-            serde_json::from_value(serde_json::json!({ "refresh_token": "only-refresh" })).unwrap(),
-        )
-        .unwrap_err();
+        let login = begin_device_code_login(&descriptor).await.unwrap();
+        let error = complete_device_code_login_in("custom", &descriptor, login, store.clone())
+            .await
+            .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("missing string field `access_token`")
+                .contains("OAuth token response is malformed")
         );
+        assert!(store.reopen().unwrap().get("custom").is_none());
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_refresh_failure_removes_revoked_credential() {
+        let base = error_response_server(r#"{"error":"invalid_grant"}"#).await;
+        let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
+        let (_temp, store) = store();
+        persist_initial(
+            "custom",
+            &descriptor,
+            store.clone(),
+            serde_json::from_value(serde_json::json!({
+                "access_token": "expired-access",
+                "refresh_token": "revoked-refresh",
+                "expires_in": 0,
+                "account_id": "account"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let error = resolve("custom", &descriptor, store.clone(), false, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("rejected"));
         assert!(store.reopen().unwrap().get("custom").is_none());
     }
 }

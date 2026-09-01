@@ -23,6 +23,13 @@ fn lock_for(key: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Acquire the shared credential mutation lock for a caller that must keep a
+/// larger transaction (such as an OAuth flow fence plus credential write)
+/// atomic with refresh. Callers reload the record after acquiring it.
+pub(crate) async fn serialized_refresh_lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    lock_for(key).lock_owned().await
+}
+
 /// Serialize an arbitrary credential refresh by credential-store key. The
 /// caller must re-open and re-check its credential after entering `refresh`;
 /// that double-check is what lets concurrent waiters reuse the winner's value.
@@ -31,8 +38,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
-    let lock = lock_for(key);
-    let _guard = lock.lock().await;
+    let _guard = serialized_refresh_lock(key).await;
     refresh().await
 }
 

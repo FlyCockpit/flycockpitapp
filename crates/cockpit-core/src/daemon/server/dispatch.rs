@@ -887,6 +887,20 @@ enum ProviderOAuthReady {
     #[cfg(feature = "grok-subscription")]
     Grok(crate::auth::xai_oauth::ManualLogin),
     Codex(crate::auth::codex_oauth::DeviceLogin),
+    Descriptor(DescriptorOAuthLogin),
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DescriptorOAuthLogin {
+    provider_id: String,
+    login: DescriptorOAuthLoginState,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "flow", rename_all = "snake_case")]
+enum DescriptorOAuthLoginState {
+    DeviceCode(crate::auth::descriptor::DeviceCodeLogin),
+    PkceBrowser(crate::auth::descriptor::PkceBrowserLogin),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -14658,16 +14672,25 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            let supported_provider = provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY || {
-                #[cfg(feature = "grok-subscription")]
-                {
-                    provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
-                }
-                #[cfg(not(feature = "grok-subscription"))]
-                {
-                    false
-                }
-            };
+            let oauth_config_root = ctx.canonical_cwd.to_string_lossy().into_owned();
+            let descriptor = daemon_provider_config(ctx, &oauth_config_root)
+                .await?
+                .2
+                .providers
+                .get(&provider_id)
+                .and_then(|entry| entry.oauth.clone());
+            let supported_provider = descriptor.is_some()
+                || provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY
+                || {
+                    #[cfg(feature = "grok-subscription")]
+                    {
+                        provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
+                    }
+                    #[cfg(not(feature = "grok-subscription"))]
+                    {
+                        false
+                    }
+                };
             if !supported_provider {
                 return Err(bad_request("unsupported provider OAuth flow"));
             }
@@ -14840,9 +14863,9 @@ async fn handle_serialized_request_impl(
                     return Ok(response);
                 }
                 let flow_id = uuid::Uuid::new_v4().to_string();
-                let (flow, authorize_url, user_code) = match provider_id.as_str() {
+                let (flow, authorize_url, user_code) = match (provider_id.as_str(), descriptor) {
                     #[cfg(feature = "grok-subscription")]
-                    crate::auth::xai_oauth::CREDENTIAL_KEY => {
+                    (crate::auth::xai_oauth::CREDENTIAL_KEY, _) => {
                         let login = match crate::auth::xai_oauth::begin_manual_login().await {
                             Ok(login) => login,
                             Err(cause) => return Err(internal(cause)),
@@ -14854,7 +14877,7 @@ async fn handle_serialized_request_impl(
                             None,
                         )
                     }
-                    crate::auth::codex_oauth::CREDENTIAL_KEY => {
+                    (crate::auth::codex_oauth::CREDENTIAL_KEY, _) => {
                         let login = match crate::auth::codex_oauth::begin_device_code_login().await
                         {
                             Ok(login) => login,
@@ -14868,6 +14891,42 @@ async fn handle_serialized_request_impl(
                             user_code,
                         )
                     }
+                    (_, Some(descriptor)) => match descriptor.flow {
+                        crate::config::providers::OAuthFlowKind::DeviceCode => {
+                            let login =
+                                crate::auth::descriptor::begin_device_code_login(&descriptor)
+                                    .await
+                                    .map_err(internal)?;
+                            let authorize_url = login.verification_uri.clone();
+                            let user_code = Some(login.user_code.clone());
+                            (
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Descriptor(
+                                    DescriptorOAuthLogin {
+                                        provider_id: provider_id.clone(),
+                                        login: DescriptorOAuthLoginState::DeviceCode(login),
+                                    },
+                                )),
+                                authorize_url,
+                                user_code,
+                            )
+                        }
+                        crate::config::providers::OAuthFlowKind::PkceBrowser => {
+                            let login =
+                                crate::auth::descriptor::begin_pkce_browser_login(&descriptor)
+                                    .map_err(internal)?;
+                            let authorize_url = login.authorize_url.clone();
+                            (
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Descriptor(
+                                    DescriptorOAuthLogin {
+                                        provider_id: provider_id.clone(),
+                                        login: DescriptorOAuthLoginState::PkceBrowser(login),
+                                    },
+                                )),
+                                authorize_url,
+                                None,
+                            )
+                        }
+                    },
                     _ => unreachable!("provider OAuth kind was validated before ledger admission"),
                 };
                 let ProviderOAuthFlow::Ready(durable_ready) = &flow else {
@@ -15076,6 +15135,7 @@ async fn handle_serialized_request_impl(
                     #[cfg(feature = "grok-subscription")]
                     ProviderOAuthReady::Grok(_) => crate::auth::xai_oauth::CREDENTIAL_KEY,
                     ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
+                    ProviderOAuthReady::Descriptor(login) => login.provider_id.as_str(),
                 };
                 claim_oauth_exchange(
                     ctx,
@@ -15109,7 +15169,13 @@ async fn handle_serialized_request_impl(
                             .map_err(internal)
                             .and_then(|tokens| {
                                 serde_json::to_vec(&tokens)
-                                    .map(|record| (crate::auth::xai_oauth::CREDENTIAL_KEY, record))
+                                    .map(|record| {
+                                        (
+                                            crate::auth::xai_oauth::CREDENTIAL_KEY.to_string(),
+                                            record,
+                                            None,
+                                        )
+                                    })
                                     .map_err(internal)
                             })
                     }
@@ -15125,14 +15191,94 @@ async fn handle_serialized_request_impl(
                             .and_then(|tokens| {
                                 serde_json::to_vec(&tokens)
                                     .map(|record| {
-                                        (crate::auth::codex_oauth::CREDENTIAL_KEY, record)
+                                        (
+                                            crate::auth::codex_oauth::CREDENTIAL_KEY.to_string(),
+                                            record,
+                                            None,
+                                        )
                                     })
                                     .map_err(internal)
                             })
                     }
+                    ProviderOAuthReady::Descriptor(login) => {
+                        let oauth_config_root = ctx.canonical_cwd.to_string_lossy().into_owned();
+                        let descriptor = daemon_provider_config(ctx, &oauth_config_root)
+                            .await
+                            .and_then(|(_, _, config)| {
+                                config
+                                    .providers
+                                    .get(&login.provider_id)
+                                    .and_then(|entry| entry.oauth.clone())
+                                    .ok_or_else(|| {
+                                        bad_request(format!(
+                                            "provider `{}` no longer has an OAuth descriptor",
+                                            login.provider_id
+                                        ))
+                                    })
+                            });
+                        let descriptor = descriptor?;
+                        let token = match login.login {
+                            DescriptorOAuthLoginState::DeviceCode(login) => {
+                                if input.is_some() {
+                                    return Err(bad_request(
+                                        "device-code OAuth does not accept callback input",
+                                    ));
+                                }
+                                crate::auth::descriptor::complete_device_code_login_unpersisted(
+                                    &descriptor,
+                                    &login,
+                                )
+                                .await
+                                .map_err(internal)?
+                            }
+                            DescriptorOAuthLoginState::PkceBrowser(login) => {
+                                let callback = input.as_deref().ok_or_else(|| {
+                                    bad_request(
+                                        "PKCE OAuth completion requires a callback URL or code",
+                                    )
+                                })?;
+                                crate::auth::descriptor::complete_pkce_browser_login_unpersisted(
+                                    &descriptor,
+                                    &login,
+                                    callback,
+                                )
+                                .await
+                                .map_err(internal)?
+                            }
+                        };
+                        serde_json::to_vec(&token)
+                            .map(|record| (login.provider_id, record, Some(descriptor)))
+                            .map_err(internal)
+                    }
                 };
-                let (provider_id, record) = exchange?;
-                let record = zeroize::Zeroizing::new(record);
+                let (provider_id, record, descriptor) = exchange?;
+                // Descriptor initial-login and refresh writes share this
+                // exact provider key.  The lock remains held through the
+                // durable OAuth-flow fence and credential record transaction.
+                let _descriptor_lock = match descriptor.as_ref() {
+                    Some(_) => {
+                        Some(crate::auth::descriptor::credential_mutation_lock(&provider_id).await)
+                    }
+                    None => None,
+                };
+                let record = match descriptor {
+                    Some(descriptor) => {
+                        let store = crate::credentials::CredentialStore::from_vault(
+                            ctx.secret_vault.clone(),
+                        )
+                        .map_err(internal)?;
+                        let token = serde_json::from_slice(&record).map_err(internal)?;
+                        let record = crate::auth::descriptor::initial_record(
+                            &provider_id,
+                            &descriptor,
+                            &store,
+                            token,
+                        )
+                        .map_err(internal)?;
+                        zeroize::Zeroizing::new(serde_json::to_vec(&record).map_err(internal)?)
+                    }
+                    None => zeroize::Zeroizing::new(record),
+                };
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("provider OAuth completion was cancelled"));

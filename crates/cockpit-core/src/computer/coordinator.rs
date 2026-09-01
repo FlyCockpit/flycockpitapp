@@ -922,19 +922,20 @@ impl HostInputArbiter {
         self.try_acquire_with_key(target_key, target_key, delegation)
     }
 
-    /// Acquire an X11 lease. Evidence remains monitor-sensitive, but xdotool
-    /// injection is global to the X server/session and therefore shares one
-    /// arbitration key across its RandR outputs.
-    fn try_acquire_x11(
+    /// Acquire an input-session lease. Evidence remains monitor-sensitive, but
+    /// the injection API is global to the named desktop session and therefore
+    /// shares one arbitration key across every physical display it can drive.
+    fn try_acquire_input_session(
         &mut self,
         target_key: &PhysicalTargetKey,
+        namespace: &'static [u8],
         delegation: DelegationId,
     ) -> AcquireResult {
         let arbitration_key = PhysicalTargetKey::new(
             target_key.host_installation_id,
             target_key.platform_session_or_seat_id,
             crate::computer::host_identity::domain_hash(
-                b"cockpit.x11.input-arbiter.v1",
+                namespace,
                 &[&target_key.platform_session_or_seat_id],
             ),
         );
@@ -1269,10 +1270,21 @@ async fn acquire_host_lease(
     loop {
         let acquired = {
             let mut arbiter = lock_poison_safe(arbiter);
-            if backend_kind == BackendKind::RealDesktopX11 {
-                arbiter.try_acquire_x11(physical_key, delegation.clone())
-            } else {
-                arbiter.try_acquire(physical_key, delegation.clone())
+            match backend_kind {
+                BackendKind::RealDesktopX11 => arbiter.try_acquire_input_session(
+                    physical_key,
+                    b"cockpit.x11.input-arbiter.v1",
+                    delegation.clone(),
+                ),
+                // SendInput controls session-global keyboard, pointer, focus,
+                // and absolute virtual-desktop coordinates. A monitor-specific
+                // evidence key must therefore not partition its host lease.
+                BackendKind::RealDesktopWindows => arbiter.try_acquire_input_session(
+                    physical_key,
+                    b"cockpit.windows.input-arbiter.v1",
+                    delegation.clone(),
+                ),
+                _ => arbiter.try_acquire(physical_key, delegation.clone()),
             }
         };
         match acquired {
@@ -5677,7 +5689,7 @@ mod tests {
     }
 
     #[test]
-    fn x11_arbiter_serializes_monitors_and_screen_suffixes_but_other_backends_do_not() {
+    fn session_input_arbiters_serialize_monitors_but_other_backends_do_not() {
         let os_lock = InMemoryOsAdvisoryLock::new();
         let mut arbiter_a =
             HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
@@ -5701,15 +5713,42 @@ mod tests {
             "DISPLAY screen suffixes must share the X server input-arbiter namespace"
         );
 
-        let token_a = match arbiter_a
-            .try_acquire_x11(&monitor_a, DelegationId("x11-monitor-a".to_string()))
-        {
+        let token_a = match arbiter_a.try_acquire_input_session(
+            &monitor_a,
+            b"cockpit.x11.input-arbiter.v1",
+            DelegationId("x11-monitor-a".to_string()),
+        ) {
             AcquireResult::Acquired(token) => token,
             other => panic!("first X11 monitor should acquire, got {other:?}"),
         };
         assert_eq!(token_a.target_key, monitor_a);
         assert!(matches!(
-            arbiter_b.try_acquire_x11(&monitor_b, DelegationId("x11-monitor-b".to_string()),),
+            arbiter_b.try_acquire_input_session(
+                &monitor_b,
+                b"cockpit.x11.input-arbiter.v1",
+                DelegationId("x11-monitor-b".to_string()),
+            ),
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
+        ));
+
+        let windows_lock = InMemoryOsAdvisoryLock::new();
+        let mut windows_arbiter_a =
+            HostInputArbiter::new(Box::new(windows_lock.shared_clone()), OwnerInstance(3));
+        let mut windows_arbiter_b = HostInputArbiter::new(Box::new(windows_lock), OwnerInstance(4));
+        assert!(matches!(
+            windows_arbiter_a.try_acquire_input_session(
+                &monitor_a,
+                b"cockpit.windows.input-arbiter.v1",
+                DelegationId("windows-monitor-a".to_string()),
+            ),
+            AcquireResult::Acquired(_)
+        ));
+        assert!(matches!(
+            windows_arbiter_b.try_acquire_input_session(
+                &monitor_b,
+                b"cockpit.windows.input-arbiter.v1",
+                DelegationId("windows-monitor-b".to_string()),
+            ),
             AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
         ));
 

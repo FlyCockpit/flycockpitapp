@@ -411,7 +411,7 @@ impl RealDesktopGrantStore {
         let Ok(stored) = fs::read_to_string(&self.path) else {
             return false;
         };
-        stored.trim() == current_machine_fingerprint().trim()
+        current_machine_fingerprint().is_some_and(|current| stored.trim() == current)
     }
 
     /// Resolve the existing machine-local real-desktop grant under Cockpit's
@@ -1687,11 +1687,100 @@ fn unsupported_platform() -> ComputerError {
     }
 }
 
-fn current_machine_fingerprint() -> String {
+#[cfg(not(target_os = "windows"))]
+fn current_machine_fingerprint() -> Option<String> {
     fs::read_to_string("/etc/machine-id")
+        .ok()
         .map(|value| value.trim().to_string())
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-machine".to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// A roaming `%APPDATA%` grant cannot authorize input on another Windows
+/// machine: the comparison is bound to the OS-owned, machine-local MachineGuid
+/// and fails closed if the registry value is inaccessible or malformed.
+#[cfg(target_os = "windows")]
+fn current_machine_fingerprint() -> Option<String> {
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW,
+    };
+    use windows::core::PCWSTR;
+
+    // SAFETY: all pointers are NUL-terminated local UTF-16 buffers and the
+    // registry handle is closed on every path after a successful open.
+    unsafe {
+        let key_name = "SOFTWARE\\Microsoft\\Cryptography"
+            .encode_utf16()
+            .chain([0])
+            .collect::<Vec<_>>();
+        let value_name = "MachineGuid".encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mut key = HKEY::default();
+        if !RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key_name.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .is_ok()
+        {
+            return None;
+        }
+        let value = (|| {
+            let mut value_type = REG_VALUE_TYPE(0);
+            let mut byte_len = 0_u32;
+            if !RegQueryValueExW(
+                key,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                Some(&mut value_type),
+                None,
+                Some(&mut byte_len),
+            )
+            .is_ok()
+                || value_type != REG_SZ
+                || byte_len < 2
+                || byte_len % 2 != 0
+            {
+                return None;
+            }
+            let mut units = vec![0_u16; byte_len as usize / 2];
+            if !RegQueryValueExW(
+                key,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                Some(&mut value_type),
+                Some(units.as_mut_ptr().cast()),
+                Some(&mut byte_len),
+            )
+            .is_ok()
+                || value_type != REG_SZ
+            {
+                return None;
+            }
+            let end = units
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units.len());
+            let machine_guid = String::from_utf16(&units[..end]).ok()?;
+            (!machine_guid.is_empty()).then(|| {
+                crate::computer::host_identity::domain_hash(
+                    b"cockpit.windows.machine-grant.v1",
+                    &[machine_guid.as_bytes()],
+                )
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+            })
+        })();
+        let _ = RegCloseKey(key);
+        value
+    }
 }
 
 pub const COMPUTER_TOOL_GROUP: &str = "computer:*";

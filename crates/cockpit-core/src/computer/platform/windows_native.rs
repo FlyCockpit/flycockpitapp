@@ -18,6 +18,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
+use windows::Win32::System::Ole::{
+    SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
+    SafeArrayUnaccessData,
+};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetProcessWindowStation,
@@ -57,8 +61,60 @@ pub struct WindowsDesktopBackend {
     geometry: DisplayGeometry,
     origin_x: i32,
     origin_y: i32,
-    held_keys: Vec<VIRTUAL_KEY>,
+    held_keyboard_inputs: Vec<HeldKeyboardInput>,
+    held_input_journal: WindowsHeldInputJournal,
     held_buttons: Vec<MouseButton>,
+}
+
+/// Every keyboard down event is made durable before `SendInput`. Recovery uses
+/// the journal under the Windows session-wide host lease, so an extra key-up is
+/// preferred over handing a possibly held key to a replacement daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum HeldKeyboardInput {
+    VirtualKey(u16),
+    Unicode(u16),
+}
+
+#[derive(Debug)]
+struct WindowsHeldInputJournal {
+    path: std::path::PathBuf,
+}
+
+impl WindowsHeldInputJournal {
+    fn for_current_input_session() -> Result<Self, ComputerError> {
+        let root = crate::config::resolve::cockpit_data_dir()
+            .map_err(win_input_error)?
+            .join("computer-input-state");
+        cockpit_host::private_fs::ensure_private_dir(&root).map_err(win_input_error)?;
+        let digest = windows_input_session_identity()?;
+        let name = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(Self {
+            path: root.join(format!("windows-{name}.json")),
+        })
+    }
+
+    fn load(&self) -> Result<Vec<HeldKeyboardInput>, ComputerError> {
+        let Some(bytes) =
+            cockpit_host::private_fs::read_private_file(&self.path, "Windows computer held-input")
+                .map_err(win_input_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|_| win_input_error("Windows held-input journal is malformed"))
+    }
+
+    fn store(&self, inputs: &[HeldKeyboardInput]) -> Result<(), ComputerError> {
+        if inputs.is_empty() {
+            return cockpit_host::private_fs::delete_private_file(&self.path)
+                .map_err(win_input_error);
+        }
+        let bytes = serde_json::to_vec(inputs).map_err(win_input_error)?;
+        cockpit_host::private_fs::write_private_file(&self.path, &bytes).map_err(win_input_error)
+    }
 }
 
 impl WindowsDesktopBackend {
@@ -75,13 +131,91 @@ impl WindowsDesktopBackend {
             return Err(ComputerError::RealDesktopGrantMissing);
         }
         let (geometry, origin_x, origin_y) = query_geometry()?;
+        let held_input_journal = WindowsHeldInputJournal::for_current_input_session()?;
+        let held_keyboard_inputs = held_input_journal.load()?;
         Ok(Self {
             geometry,
             origin_x,
             origin_y,
-            held_keys: Vec::new(),
+            held_keyboard_inputs,
+            held_input_journal,
             held_buttons: Vec::new(),
         })
+    }
+
+    fn reload_held_keyboard_inputs(&mut self) -> Result<(), ComputerError> {
+        self.held_keyboard_inputs = self.held_input_journal.load()?;
+        Ok(())
+    }
+
+    fn remember_held_keyboard_input(
+        &mut self,
+        input: HeldKeyboardInput,
+    ) -> Result<(), ComputerError> {
+        let mut inputs = self.held_keyboard_inputs.clone();
+        inputs.push(input);
+        self.held_input_journal.store(&inputs)?;
+        self.held_keyboard_inputs = inputs;
+        Ok(())
+    }
+
+    fn forget_held_keyboard_input(
+        &mut self,
+        input: HeldKeyboardInput,
+    ) -> Result<(), ComputerError> {
+        let mut inputs = self.held_keyboard_inputs.clone();
+        let Some(index) = inputs.iter().rposition(|held| *held == input) else {
+            return Err(win_input_error(
+                "Windows key-up has no durable key-down record",
+            ));
+        };
+        inputs.remove(index);
+        self.held_input_journal.store(&inputs)?;
+        self.held_keyboard_inputs = inputs;
+        Ok(())
+    }
+
+    fn key_down(&mut self, key: VIRTUAL_KEY) -> Result<(), ComputerError> {
+        self.remember_held_keyboard_input(HeldKeyboardInput::VirtualKey(key.0))?;
+        send_key(key, false)
+    }
+
+    fn key_up(&mut self, key: VIRTUAL_KEY) -> Result<(), ComputerError> {
+        send_key(key, true)?;
+        self.forget_held_keyboard_input(HeldKeyboardInput::VirtualKey(key.0))
+    }
+
+    fn unicode_down(&mut self, unit: u16) -> Result<(), ComputerError> {
+        self.remember_held_keyboard_input(HeldKeyboardInput::Unicode(unit))?;
+        send_unicode(unit, false)
+    }
+
+    fn unicode_up(&mut self, unit: u16) -> Result<(), ComputerError> {
+        send_unicode(unit, true)?;
+        self.forget_held_keyboard_input(HeldKeyboardInput::Unicode(unit))
+    }
+
+    fn send_modifiers(&mut self, modifiers: Modifiers, up: bool) -> Result<(), ComputerError> {
+        let keys = [
+            (modifiers.shift, VK_SHIFT),
+            (modifiers.control, VK_CONTROL),
+            (modifiers.alt, VK_MENU),
+            (modifiers.meta, VK_LWIN),
+        ];
+        if up {
+            for (enabled, key) in keys.iter().rev() {
+                if *enabled {
+                    self.key_up(*key)?;
+                }
+            }
+        } else {
+            for (enabled, key) in keys {
+                if enabled {
+                    self.key_down(key)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn refresh_geometry(&mut self) -> Result<(), ComputerError> {
@@ -258,12 +392,12 @@ impl ComputerBackend for WindowsDesktopBackend {
                 count,
                 modifiers,
             } => {
-                send_modifiers(*modifiers, false)?;
+                self.send_modifiers(*modifiers, false)?;
                 for _ in 0..click_count(*count) {
                     send_button(*button, false)?;
                     send_button(*button, true)?;
                 }
-                send_modifiers(*modifiers, true)?;
+                self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::MouseDown { button } => {
@@ -289,7 +423,7 @@ impl ComputerBackend for WindowsDesktopBackend {
                 for step in path {
                     checked_action_duration(step.duration)?;
                 }
-                send_modifiers(*modifiers, false)?;
+                self.send_modifiers(*modifiers, false)?;
                 move_with_timing(self, path[0].point, path[0].duration, path[0].easing)?;
                 send_button(*button, false)?;
                 self.held_buttons.push(*button);
@@ -298,13 +432,13 @@ impl ComputerBackend for WindowsDesktopBackend {
                 }
                 send_button(*button, true)?;
                 self.held_buttons.retain(|held| held != button);
-                send_modifiers(*modifiers, true)?;
+                self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::TypeText { text } => {
                 for unit in text.encode_utf16() {
-                    send_unicode(unit, false)?;
-                    send_unicode(unit, true)?;
+                    self.unicode_down(unit)?;
+                    self.unicode_up(unit)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -315,21 +449,19 @@ impl ComputerBackend for WindowsDesktopBackend {
                     .map(|key| virtual_key(key))
                     .collect::<Result<Vec<_>, _>>()?;
                 for key in &keys {
-                    send_key(*key, false)?;
+                    self.key_down(*key)?;
                 }
                 for key in keys.iter().rev() {
-                    send_key(*key, true)?;
+                    self.key_up(*key)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::HoldKey { key, duration } => {
                 checked_action_duration(*duration)?;
                 let key = virtual_key(key)?;
-                send_key(key, false)?;
-                self.held_keys.push(key);
+                self.key_down(key)?;
                 thread::sleep(*duration);
-                send_key(key, true)?;
-                self.held_keys.retain(|held| *held != key);
+                self.key_up(key)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Scroll {
@@ -339,14 +471,14 @@ impl ComputerBackend for WindowsDesktopBackend {
             } => {
                 checked_scroll_delta(*delta_x)?;
                 checked_scroll_delta(*delta_y)?;
-                send_modifiers(*modifiers, false)?;
+                self.send_modifiers(*modifiers, false)?;
                 if *delta_y != 0 {
                     send_mouse(0, 0, (*delta_y * 120) as u32, MOUSEEVENTF_WHEEL)?;
                 }
                 if *delta_x != 0 {
                     send_mouse(0, 0, (*delta_x * 120) as u32, MOUSEEVENTF_HWHEEL)?;
                 }
-                send_modifiers(*modifiers, true)?;
+                self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Wait { duration } => {
@@ -359,13 +491,23 @@ impl ComputerBackend for WindowsDesktopBackend {
 
     fn release_all(&mut self) -> Result<(), ComputerError> {
         let mut first = None;
-        for key in self
-            .held_keys
-            .drain(..)
-            .chain([VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN])
-        {
-            if let Err(error) = send_key(key, true) {
-                first.get_or_insert(error);
+        if let Err(error) = self.reload_held_keyboard_inputs() {
+            first.get_or_insert(error);
+        }
+        for input in self.held_keyboard_inputs.clone().into_iter().rev() {
+            let released = match input {
+                HeldKeyboardInput::VirtualKey(key) => send_key(VIRTUAL_KEY(key), true),
+                HeldKeyboardInput::Unicode(unit) => send_unicode(unit, true),
+            };
+            match released {
+                Ok(()) => {
+                    if let Err(error) = self.forget_held_keyboard_input(input) {
+                        first.get_or_insert(error);
+                    }
+                }
+                Err(error) => {
+                    first.get_or_insert(error);
+                }
             }
         }
         for button in self.held_buttons.drain(..).chain([
@@ -567,26 +709,6 @@ fn send_unicode(unit: u16, up: bool) -> Result<(), ComputerError> {
     }])
 }
 
-fn send_modifiers(modifiers: Modifiers, up: bool) -> Result<(), ComputerError> {
-    let keys = [
-        (modifiers.shift, VK_SHIFT),
-        (modifiers.control, VK_CONTROL),
-        (modifiers.alt, VK_MENU),
-        (modifiers.meta, VK_LWIN),
-    ];
-    let iter: Box<dyn Iterator<Item = &(bool, VIRTUAL_KEY)>> = if up {
-        Box::new(keys.iter().rev())
-    } else {
-        Box::new(keys.iter())
-    };
-    for (enabled, key) in iter {
-        if *enabled {
-            send_key(*key, up)?;
-        }
-    }
-    Ok(())
-}
-
 fn virtual_key(key: &str) -> Result<VIRTUAL_KEY, ComputerError> {
     let upper = key.to_ascii_uppercase();
     let vk = match upper.as_str() {
@@ -692,9 +814,7 @@ impl WindowsTargetEvidenceAdapter {
                 ],
             );
             let display_id = monitor_identity(hwnd)?;
-            let mut window_id = [0_u8; 16];
-            window_id[..size_of::<isize>()].copy_from_slice(&hwnd.0.to_le_bytes());
-            let (uia_role, uia_name) = uia_evidence(hwnd);
+            let (window_id, uia_role, uia_name) = uia_evidence(hwnd)?;
             let mut snapshot = empty_unavailable(BackendKind::RealDesktopWindows);
             snapshot.host_installation_id =
                 FieldEvidence::available(self.host, EvidenceSource::WinSessionDesktop);
@@ -786,8 +906,9 @@ impl WindowsTargetEvidenceAdapter {
                 },
                 EvidenceSource::WinMonitor,
             );
-            snapshot.synchronous_recheck =
-                GetForegroundWindow() == hwnd && IsWindow(Some(hwnd)).as_bool();
+            snapshot.synchronous_recheck = GetForegroundWindow() == hwnd
+                && IsWindow(Some(hwnd)).as_bool()
+                && matches!(uia_window_identity(hwnd), Ok(current) if current == window_id);
             if !snapshot.synchronous_recheck {
                 return Err(TargetUnavailableReason::QueryMismatch);
             }
@@ -843,6 +964,32 @@ unsafe fn session_desktop_names() -> Result<(String, String), TargetUnavailableR
         return Err(TargetUnavailableReason::LockOrSecureDesktop);
     }
     Ok((station_name?, input_desktop_name))
+}
+
+/// The input journal follows the Windows interactive session/desktop rather
+/// than a monitor. `SendInput` is scoped to precisely this input namespace.
+fn windows_input_session_identity() -> Result<[u8; 32], ComputerError> {
+    // SAFETY: the Win32 calls write only to initialized local storage.
+    unsafe {
+        let mut session = 0_u32;
+        ProcessIdToSessionId(GetCurrentProcessId(), &mut session)
+            .map_err(|_| win_input_error("could not determine the Windows input session"))?;
+        if session == 0 {
+            return Err(win_input_error(
+                "Windows session zero cannot receive desktop input",
+            ));
+        }
+        let (station_name, desktop_name) = session_desktop_names()
+            .map_err(|_| win_input_error("Windows interactive desktop is unavailable"))?;
+        Ok(domain_hash(
+            b"cockpit.windows.held-input.v1",
+            &[
+                &session.to_le_bytes(),
+                station_name.as_bytes(),
+                desktop_name.as_bytes(),
+            ],
+        ))
+    }
 }
 
 unsafe fn monitor_identity(hwnd: HWND) -> Result<[u8; 32], TargetUnavailableReason> {
@@ -954,12 +1101,17 @@ impl TargetEvidenceAdapter for WindowsTargetEvidenceAdapter {
     }
 }
 
-unsafe fn uia_evidence(hwnd: HWND) -> (Option<String>, Option<String>) {
+unsafe fn uia_evidence(
+    hwnd: HWND,
+) -> Result<([u8; 16], Option<String>, Option<String>), TargetUnavailableReason> {
     let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-    let evidence = (|| {
+    let evidence = (|| -> Result<_, TargetUnavailableReason> {
         let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok()?;
-        let element = unsafe { automation.ElementFromHandle(hwnd) }.ok()?;
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+        let element = unsafe { automation.ElementFromHandle(hwnd) }
+            .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+        let identity = unsafe { uia_runtime_id(&element) }?;
         let role = unsafe { element.CurrentControlType() }
             .ok()
             .map(|value| format!("uia.control_type.{}", value.0));
@@ -967,13 +1119,81 @@ unsafe fn uia_evidence(hwnd: HWND) -> (Option<String>, Option<String>) {
             .ok()
             .map(|value| value.to_string())
             .filter(|value| !value.is_empty());
-        Some((role, name))
-    })()
-    .unwrap_or((None, None));
+        Ok((identity, role, name))
+    })();
     if initialized {
         unsafe { CoUninitialize() };
     }
     evidence
+}
+
+/// UI Automation runtime IDs identify a live automation element, unlike an
+/// HWND value which Windows can recycle after destruction. The array belongs
+/// to the caller and is always destroyed after copying its bounded contents.
+unsafe fn uia_runtime_id(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Result<[u8; 16], TargetUnavailableReason> {
+    struct RuntimeIdArray(*mut windows::Win32::System::Com::SAFEARRAY);
+
+    impl Drop for RuntimeIdArray {
+        fn drop(&mut self) {
+            // SAFETY: UI Automation transferred ownership of this SAFEARRAY.
+            let _ = unsafe { SafeArrayDestroy(self.0) };
+        }
+    }
+
+    let array = unsafe { element.GetRuntimeId() }
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    if array.is_null() {
+        return Err(TargetUnavailableReason::FocusIdentityUnavailable);
+    }
+    let array = RuntimeIdArray(array);
+    let lower = unsafe { SafeArrayGetLBound(array.0, 1) }
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let upper = unsafe { SafeArrayGetUBound(array.0, 1) }
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let count = upper
+        .checked_sub(lower)
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| usize::try_from(length).ok())
+        .filter(|length| (1..=64).contains(length))
+        .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let mut data = std::ptr::null_mut();
+    unsafe { SafeArrayAccessData(array.0, &mut data) }
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    if data.is_null() {
+        let _ = unsafe { SafeArrayUnaccessData(array.0) };
+        return Err(TargetUnavailableReason::FocusIdentityUnavailable);
+    }
+    // SAFETY: UI Automation documents runtime IDs as SAFEARRAY(VT_I4); the
+    // bounds above constrain the copied slice before the array is unlocked.
+    let values = unsafe { std::slice::from_raw_parts(data.cast::<i32>(), count) };
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    unsafe { SafeArrayUnaccessData(array.0) }
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let digest = domain_hash(b"cockpit.windows.uia-runtime-id.v1", &[&bytes]);
+    let mut identity = [0_u8; 16];
+    identity.copy_from_slice(&digest[..16]);
+    Ok(identity)
+}
+
+unsafe fn uia_window_identity(hwnd: HWND) -> Result<[u8; 16], TargetUnavailableReason> {
+    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let result = (|| {
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+        let element = unsafe { automation.ElementFromHandle(hwnd) }
+            .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+        unsafe { uia_runtime_id(&element) }
+    })();
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    result
 }
 
 #[cfg(test)]

@@ -1279,7 +1279,17 @@ pub(super) fn build_chatgpt_completion_model(
 /// providers with no extra params and no cache params stay byte-for-byte
 /// unchanged.
 pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
-    let vendor = chatgpt_additional_params(params);
+    openai_additional_params_with_vendor(chatgpt_additional_params(params), params)
+}
+
+/// Add generic OpenAI cache parameters to a wire-specific sanitized provider
+/// fragment. Responses passes its statefulness-aware sanitizer here while
+/// Chat Completions keeps its vendor fragment untouched beyond universal
+/// request-key collision protection.
+fn openai_additional_params_with_vendor(
+    vendor: Option<serde_json::Value>,
+    params: &ModelParams,
+) -> Option<serde_json::Value> {
     let cache_key = params
         .prompt_cache_key
         .as_ref()
@@ -1320,13 +1330,18 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
 /// Responses calls are deliberately stateless: Cockpit replays the complete
 /// conversation as `input`, always sends `store: false`, and does not permit a
 /// provider fragment to select `previous_response_id` or `background` (those
-/// fields are removed by [`sanitized_extra_params`]). Rig's Responses
-/// serializer models reasoning effort as `reasoning.effort`, whereas the
+/// fields are removed by [`sanitized_openai_responses_extra_params`]). Rig's
+/// Responses serializer models reasoning effort as `reasoning.effort`, whereas the
 /// generic catalog's OpenAI-compatible mapping supplies `reasoning_effort`.
 /// Translate that mapping at the wire boundary instead of silently letting
 /// Rig discard it as an unknown additional parameter.
 pub(super) fn openai_responses_additional_params(params: &ModelParams) -> serde_json::Value {
-    let mut map = match openai_additional_params(params) {
+    let vendor = merge_native_computer_tools(
+        sanitized_openai_responses_extra_params(params.additional_params.as_ref()),
+        params,
+        |contract| contract == crate::computer::ComputerToolContract::OpenAiResponses,
+    );
+    let mut map = match openai_additional_params_with_vendor(vendor, params) {
         Some(serde_json::Value::Object(map)) => map,
         // A scalar cannot be represented in Rig's typed Responses parameters.
         // Place it in the typed `reasoning` slot so Rig rejects the malformed

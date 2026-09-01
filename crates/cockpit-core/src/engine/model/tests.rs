@@ -2140,11 +2140,8 @@ async fn draining_gate_refuses_new_requests() {
     );
 }
 
-/// The extra-params merge supplies vendor keys only — it can never
-/// clobber the keys cockpit owns on the request
-/// (implementation note). A fragment that (wrongly)
-/// carried `temperature`/`messages`/etc. has those stripped before the
-/// merge; legitimate vendor keys survive.
+/// The generic extra-params merge strips only the request keys Cockpit owns on
+/// every wire. Responses-only state keys remain available to other providers.
 #[test]
 fn sanitized_extra_params_strips_cockpit_owned_keys() {
     let extra = json!({
@@ -2164,7 +2161,28 @@ fn sanitized_extra_params_strips_cockpit_owned_keys() {
     let cleaned = sanitized_extra_params(Some(&extra)).expect("vendor keys survive");
     assert_eq!(
         cleaned,
-        json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "high" }),
+        json!({
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": "high",
+        }),
+    );
+}
+
+#[test]
+fn sanitized_openai_responses_extra_params_strips_stateful_controls() {
+    let extra = json!({
+        "store": true,
+        "previous_response_id": "response-123",
+        "background": true,
+        "vendor_knob": "on",
+    });
+
+    assert_eq!(
+        sanitized_openai_responses_extra_params(Some(&extra)),
+        Some(json!({ "vendor_knob": "on" })),
     );
 }
 
@@ -3045,6 +3063,27 @@ fn openai_responses_additional_params_forces_stateless_reasoning_wire_shape() {
             "reasoning": { "effort": "high" },
             "store": false,
         }),
+    );
+}
+
+#[test]
+fn openai_additional_params_preserves_non_responses_state_named_vendor_keys() {
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "store": "vendor-retention-mode",
+            "previous_response_id": "vendor-cursor",
+            "background": { "priority": "low" },
+        })),
+        ..ModelParams::default()
+    };
+
+    assert_eq!(
+        openai_additional_params(&params),
+        Some(json!({
+            "store": "vendor-retention-mode",
+            "previous_response_id": "vendor-cursor",
+            "background": { "priority": "low" },
+        })),
     );
 }
 

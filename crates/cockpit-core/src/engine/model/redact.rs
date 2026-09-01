@@ -9,6 +9,11 @@ const COCKPIT_OWNED_REQUEST_KEYS: &[&str] = &[
     "tools",
     "tool_choice",
     "stream",
+];
+
+/// These controls are owned only by the generic OpenAI Responses wire. Other
+/// wires may legitimately define identically named vendor parameters.
+const RESPONSES_STATEFUL_REQUEST_KEYS: &[&str] = &[
     // Cockpit owns Responses statefulness. Every Responses request carries
     // the full transcript and explicitly disables server-side retention; a
     // provider fragment must not opt back into a stateful server session.
@@ -27,13 +32,32 @@ const COCKPIT_OWNED_REQUEST_KEYS: &[&str] = &[
 pub(crate) fn sanitized_extra_params(
     extra: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
+    sanitized_extra_params_with(extra, |key| COCKPIT_OWNED_REQUEST_KEYS.contains(&key))
+}
+
+/// Apply the generic collision guard plus the statelessness controls owned by
+/// the generic OpenAI Responses wire. Keeping this separate from
+/// [`sanitized_extra_params`] ensures a Chat Completions (or other) provider
+/// can use an identically named vendor parameter.
+pub(crate) fn sanitized_openai_responses_extra_params(
+    extra: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    sanitized_extra_params_with(extra, |key| {
+        COCKPIT_OWNED_REQUEST_KEYS.contains(&key) || RESPONSES_STATEFUL_REQUEST_KEYS.contains(&key)
+    })
+}
+
+fn sanitized_extra_params_with(
+    extra: Option<&serde_json::Value>,
+    is_owned: impl Fn(&str) -> bool,
+) -> Option<serde_json::Value> {
     let extra = extra?;
     let serde_json::Value::Object(map) = extra else {
         return Some(extra.clone());
     };
     let kept: serde_json::Map<String, serde_json::Value> = map
         .iter()
-        .filter(|(k, _)| !COCKPIT_OWNED_REQUEST_KEYS.contains(&k.as_str()))
+        .filter(|(k, _)| !is_owned(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     if kept.is_empty() {

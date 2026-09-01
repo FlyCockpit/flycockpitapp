@@ -6692,6 +6692,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_composition_failure_replaces_capped_model_body_with_unavailable_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        // The audit-row write precedes artifact composition and targets a
+        // different table. Reject only the composed ToolCall event so this
+        // exercises the persistence-error branch, rather than artifact
+        // admission or the ordinary tool-call journal.
+        session
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_tool_call_artifact_composition
+                     BEFORE INSERT ON session_events
+                     WHEN NEW.type = 'tool_call'
+                     BEGIN
+                         SELECT RAISE(FAIL, 'forced artifact composition failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let call = tool_call("big", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "big", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        assert!(
+            wire.starts_with("<cockpit_artifact_v1 payload_utf8_bytes="),
+            "persistence failure must replace the capped model body with an artifact frame: {wire}"
+        );
+        assert!(wire.contains("\"status\":\"unavailable\""), "{wire}");
+        assert!(
+            wire.contains("\"reason\":\"persistence_unavailable\""),
+            "{wire}"
+        );
+        assert!(wire.contains("\"kind\":\"tool_result\""), "{wire}");
+        assert_ne!(
+            wire, "visible line\n[truncated]\n",
+            "the former behavior leaked the capped projection after persistence failed"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_result_artifact_live_projection_is_byte_identical_to_rehydrate() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));

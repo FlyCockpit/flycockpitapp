@@ -85,6 +85,28 @@ pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
     Some(first)
 }
 
+/// Remove the exact durable user row named by a retract event, together with
+/// its adjacent tag-expansion presentation rows.
+pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(
+    history: &mut H,
+    seq: i64,
+) -> bool {
+    let Some(index) = history.entries().iter().position(
+        |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
+    ) else {
+        return false;
+    };
+    while history
+        .entries()
+        .get(index + 1)
+        .is_some_and(is_optimistic_tag_expansion)
+    {
+        history.remove_entry(index + 1);
+    }
+    history.remove_entry(index);
+    true
+}
+
 /// Merge a daemon replay into an already-rendered live transcript. Durable
 /// receipt ids replace matching optimistic rows in place instead of appending
 /// a second copy after reconnect or lag resync. A multi-id folded row replaces
@@ -1215,6 +1237,21 @@ impl App {
                         *optimistic_submission_id = None;
                         break;
                     }
+                }
+            }
+            TurnEvent::UserMessageRemoved { seq, text } => {
+                remove_durable_user_history(&mut self.history, seq);
+                // Reasoning is provisional and has no durable value in this
+                // cancel window. Drop it instead of finalizing a thinking chip
+                // when the following AgentIdle arrives.
+                self.pending = None;
+                self.active_display_attempt_id = None;
+                self.reconnect = None;
+                let draft = self.composer.text().to_owned();
+                if draft.is_empty() {
+                    self.replace_composer_buffer(text);
+                } else {
+                    self.replace_composer_buffer(format!("{text}\n\n{draft}"));
                 }
             }
             TurnEvent::SessionPersistFailed {
@@ -4328,6 +4365,46 @@ mod tests {
         };
         assert_eq!(calls[0].state, ToolCallState::Success);
         assert!(calls[0].progress.is_none());
+    }
+
+    #[test]
+    fn initial_thinking_retract_removes_row_merges_draft_and_drops_reasoning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.history.push(HistoryEntry::User {
+            text: "cancel me".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(41),
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.apply_event(TurnEvent::AssistantDisplayReasoningDelta {
+            agent: "Build".to_string(),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(9),
+            delta: "private thought".to_string(),
+        });
+        app.replace_composer_buffer("new draft");
+
+        app.apply_event(TurnEvent::UserMessageRemoved {
+            seq: 41,
+            text: "cancel me".to_string(),
+        });
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: cockpit_proto::IdleReason::Interrupted,
+        });
+
+        assert!(!app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::User { seq: Some(41), .. })
+        ));
+        assert_eq!(app.composer.text(), "cancel me\n\nnew draft");
+        assert!(app.pending.is_none());
+        assert!(!app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::Agent { reasoning, .. } if reasoning.contains("private thought"))
+        ));
     }
 
     #[test]

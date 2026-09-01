@@ -3934,6 +3934,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AssistantDisplayError { session_id, .. }
         | AssistantText { session_id, .. }
         | UserMessageRecorded { session_id, .. }
+        | UserMessageRemoved { session_id, .. }
         | QueuedUserMessagesFolded { session_id, .. }
         | SessionPersistFailed { session_id, .. }
         | SessionDriverFailed { session_id, .. }
@@ -4432,6 +4433,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             client_submission_ids,
             preflight_cleaned,
         },
+        UserMessageRemoved { seq, text, .. } => TurnEvent::UserMessageRemoved { seq, text },
         QueuedUserMessagesFolded {
             text,
             display_text,
@@ -7059,6 +7061,22 @@ mod tests {
                 turn_id: Some(turn_id),
                 reason: cockpit_proto::IdleReason::Completed,
             } if turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn user_message_removal_maps_without_being_deduplicated_by_replay_cursor() {
+        let session_id = uuid::Uuid::new_v4();
+        let event = proto::Event::UserMessageRemoved {
+            session_id,
+            seq: 17,
+            text: "restore me".to_string(),
+        };
+        assert_eq!(event_session(&event), Some(session_id));
+        assert_eq!(event_persisted_seq(&event), None);
+        assert!(matches!(
+            proto_event_to_turn_event(event),
+            Some(TurnEvent::UserMessageRemoved { seq: 17, text }) if text == "restore me"
         ));
     }
 

@@ -18,7 +18,7 @@ use super::{
     App, FreshQueueAck, RunnerAttachContinuation,
     events::{
         reconcile_folded_user_history, reconcile_history_replay,
-        remove_correlated_optimistic_user_history,
+        remove_correlated_optimistic_user_history, remove_durable_user_history,
     },
     new_pending, wire_history_to_entries,
 };
@@ -308,6 +308,17 @@ impl BtwPane {
                     .copied()
                     .collect::<std::collections::HashSet<_>>();
                 remove_correlated_optimistic_user_history(&mut self.history, &ids);
+            }
+            TurnEvent::UserMessageRemoved { seq, text } => {
+                remove_durable_user_history(&mut self.history, seq);
+                self.pending = None;
+                self.active_display_attempt_id = None;
+                let draft = self.composer.text().to_owned();
+                if draft.is_empty() {
+                    self.composer.replace_buffer(text);
+                } else {
+                    self.composer.replace_buffer(format!("{text}\n\n{draft}"));
+                }
             }
             TurnEvent::ThinkingStarted { agent, .. } => {
                 self.finalize_pending();

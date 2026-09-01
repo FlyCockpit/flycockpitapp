@@ -21600,6 +21600,10 @@ async fn stage_and_recover_provider_batch(
     let batch_id = Uuid::now_v7().to_string();
 
     for mut upsert in mutation.upserts {
+        // Secret resolution validates a header against the complete provider
+        // projection. Keep that projection separate from the mutable headers
+        // below so a batch cannot observe a partially staged entry.
+        let entry_for_secret_resolution = upsert.entry.clone();
         let prior = desired
             .providers
             .get(&upsert.provider_id)
@@ -21646,10 +21650,10 @@ async fn stage_and_recover_provider_batch(
                 let secret = resolve_provider_header_secret(
                     secret,
                     &upsert.provider_id,
-                    &upsert.entry,
+                    &entry_for_secret_resolution,
                     &header_name,
                     &header_value,
-                    std::env::var,
+                    |variable| std::env::var(variable),
                 )?;
                 let slug = upsert
                     .provider_id
@@ -21918,7 +21922,7 @@ fn resolve_provider_header_secret(
         ));
     }
     let template = template.expect("validated template exists");
-    let placeholder_headers = crate::providers::templates::headers_for_pasted_key(template, "");
+    let placeholder_headers = crate::providers::headers_for_pasted_key(template, "");
     let Some(header_index) = placeholder_headers.iter().position(|header| {
         header.name.eq_ignore_ascii_case(header_name) && header.value == header_value
     }) else {
@@ -21931,7 +21935,7 @@ fn resolve_provider_header_secret(
             "detected environment variable `{variable}` is unavailable to the daemon"
         ))
     })?;
-    let resolved = crate::providers::templates::headers_for_pasted_key(template, &value)
+    let resolved = crate::providers::headers_for_pasted_key(template, &value)
         .get(header_index)
         .map(|header| header.value.clone())
         .ok_or_else(|| bad_request("provider template header shape changed"))?;
@@ -22945,7 +22949,7 @@ mod provider_atomic_authority_tests {
             template: Some(template.id.to_string()),
             ..Default::default()
         };
-        entry.headers = crate::providers::templates::headers_for_pasted_key(template, "");
+        entry.headers = crate::providers::headers_for_pasted_key(template, "");
         let resolved = resolve_provider_header_secret(
             cockpit_proto::ProviderSecretValue::detected_environment(
                 template.id.to_string(),

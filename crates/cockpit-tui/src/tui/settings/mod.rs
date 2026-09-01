@@ -9020,7 +9020,7 @@ impl SettingsCx {
                 let detected_header_index = detected_copy.as_ref().and_then(|copy| {
                     let template = cockpit_core::providers::template_by_id(&copy.template_id)?;
                     let placeholder_headers =
-                        cockpit_core::providers::templates::headers_for_pasted_key(template, "");
+                        cockpit_core::providers::headers_for_pasted_key(template, "");
                     entry.headers.iter().position(|header| {
                         placeholder_headers.iter().any(|placeholder| {
                             placeholder.name.eq_ignore_ascii_case(&header.name)

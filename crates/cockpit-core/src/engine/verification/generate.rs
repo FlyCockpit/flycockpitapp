@@ -18,7 +18,9 @@ use crate::engine::model::UtilityCallSite;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect};
 use crate::session::Session;
 
-use super::inference::{VerificationInferenceInput, journaled_verification_inference};
+use super::inference::{
+    VerificationInferenceInput, effective_verification_route, journaled_verification_inference,
+};
 use super::recipe::{RecipeAssemblyInput, assemble_recipe};
 
 const GENERATOR_SYSTEM: &str = "Independently verify the proposed file change. You may use only \
@@ -268,7 +270,7 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             &[]
         };
         let Ok(reservation_body) =
-            generator_budget_text(&assembled.prompt, initial_history, &tools)
+            generator_budget_text(&generator_model, &assembled.prompt, initial_history, &tools)
         else {
             continue;
         };
@@ -522,12 +524,14 @@ fn generator_tools(
 }
 
 fn generator_budget_text(
+    model: &Model,
     prompt: &str,
     history: &[Message],
     tools: &[ToolDefinition],
 ) -> Result<String> {
+    let (system, tools, _) = effective_verification_route(GENERATOR_SYSTEM, model, tools);
     Ok(serde_json::to_string(&serde_json::json!({
-        "system": GENERATOR_SYSTEM,
+        "system": system,
         "history": history,
         "prompt": prompt,
         "tools": tools,
@@ -544,7 +548,7 @@ pub(super) fn conservative_generator_budget_text(
 ) -> Result<String> {
     let mut tools = agent.tools.definitions(agent.tool_steering);
     tools.push(candidate_tool_definition());
-    generator_budget_text(prompt, history, &tools)
+    generator_budget_text(&agent.model, prompt, history, &tools)
 }
 
 fn take_bounded_private_output(output: String, remaining: &mut usize) -> String {
@@ -595,7 +599,7 @@ async fn generate_with_turns(
         if let Some(answer) = take_override_answer() {
             return GenerationOutcome::Answer(answer);
         }
-        let Ok(turn_body) = generator_budget_text(prompt, &private_history, &tools) else {
+        let Ok(turn_body) = generator_budget_text(model, prompt, &private_history, &tools) else {
             return GenerationOutcome::Failed;
         };
         let turn_estimate =
@@ -751,6 +755,7 @@ async fn generate_one_shot(
         session: input.ctx.session.clone(),
         model,
         config: &input.ctx.config,
+        interrupts: input.ctx.interrupts.as_ref(),
         system: GENERATOR_SYSTEM,
         history,
         prompt,

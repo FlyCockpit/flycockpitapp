@@ -809,14 +809,25 @@ async fn configure_network_policy(
     let approver = ctx.approver.as_ref().ok_or_else(|| {
         "network configuration requires an interactive owner approver".to_string()
     })?;
+    let approval_input = serde_json::json!({
+        "agent_instance_id": agent_instance_id,
+        "action": &action,
+        "host": host_name.as_deref(),
+    });
     if !approver
-        .approve_tool_call(&label)
+        .approve_owner_network_configuration(&label, &approval_input)
         .await
         .map_err(|error| format!("network configuration approval failed: {error:#}"))?
         .is_accept()
     {
         return Err("network configuration was not approved".to_string());
     }
+    crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+        "monty_network_policy_mutation",
+        &[serde_json::json!({"execute": {"wire_input": approval_input}})],
+    )
+    .await
+    .map_err(|error| format!("network configuration approval became stale: {error:#}"))?;
     let now = chrono::Utc::now().timestamp_millis();
     let (agent_policy, session_policy) =
         async {
@@ -1593,7 +1604,7 @@ mod tests {
         )));
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
             events,
-            redaction,
+            redaction.clone(),
             Arc::new(AtomicUsize::new(1)),
             db.clone(),
             ctx.session.id,
@@ -1604,10 +1615,11 @@ mod tests {
             root.to_path_buf(),
             ctx.config.clone(),
         );
-        let approver = Arc::new(crate::approval::Approver::new(
+        let approver = Arc::new(crate::approval::Approver::new_for_session(
             store,
             db.clone(),
-            ctx.session.id,
+            ctx.session.clone(),
+            redaction,
             ctx.agent_id.clone(),
             hub.clone(),
         ));
@@ -2689,6 +2701,41 @@ mod tests {
             .await
             .unwrap();
         assert!(policy.hosts.contains("api.example.test"));
+    }
+
+    #[tokio::test]
+    async fn network_configuration_prompts_even_in_yolo_mode() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut ctx, db, hub) = approvable_ctx(tmp.path());
+        let agent_instance_id = uuid::Uuid::new_v4();
+        ctx.agent_instance_id = Some(agent_instance_id);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+        let session_id = ctx.session.id;
+        let host = HostContext::from_tool_ctx(&ctx);
+
+        let task = tokio::spawn(async move {
+            run_with_host("mcp.network_configure('enable_requests')", &cfg, &host).await
+        });
+        let prompt = resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        assert!(prompt.description.contains("Enable governed requests"));
+        task.await.unwrap().unwrap();
+
+        assert!(
+            db.monty_network_agent_policy(agent_instance_id)
+                .await
+                .unwrap()
+                .requests_enabled
+        );
     }
 
     #[test]

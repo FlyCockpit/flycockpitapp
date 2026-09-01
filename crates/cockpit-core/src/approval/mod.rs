@@ -314,6 +314,15 @@ pub enum AuthorizationRequest<'a> {
         /// approval operation's final-input binding.
         input: &'a serde_json::Value,
     },
+    /// An owner-controlled Monty network-policy mutation. Unlike ordinary
+    /// native-tool calls, this can expand the agent's future egress authority
+    /// and therefore always requires a live interactive owner decision; it
+    /// must never inherit Auto or Yolo approval shortcuts.
+    OwnerNetworkConfiguration {
+        label: &'a str,
+        /// Canonical, daemon-owned description of the exact policy mutation.
+        input: &'a serde_json::Value,
+    },
     ExternalMcpTool {
         agent: &'a str,
         profile: &'a str,
@@ -605,6 +614,10 @@ impl Approver {
             } => self.approve_command_inner(command, Some(escalation)).await,
             AuthorizationRequest::NativeTool { label, input } => {
                 self.approve_tool_call_inner(label, input).await
+            }
+            AuthorizationRequest::OwnerNetworkConfiguration { label, input } => {
+                self.approve_owner_network_configuration_inner(label, input)
+                    .await
             }
             AuthorizationRequest::ExternalMcpTool {
                 agent,

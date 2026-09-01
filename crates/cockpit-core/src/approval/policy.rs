@@ -381,6 +381,80 @@ impl Approver {
         Ok(decision)
     }
 
+    /// Approve a Monty network-policy mutation made by the session owner.
+    ///
+    /// This is deliberately separate from [`Self::approve_tool_call`]. A
+    /// policy mutation can expand an agent's future egress authority, so Yolo
+    /// and Auto are not authority to accept it. The only allow path is a
+    /// response from a currently attached interactive client, and the prompt
+    /// binds that response to the exact daemon-owned mutation input.
+    pub async fn approve_owner_network_configuration(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        self.authorize(AuthorizationRequest::OwnerNetworkConfiguration { label, input })
+            .await
+    }
+
+    async fn approve_owner_network_configuration_inner(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        // Do this before raising an interrupt and deliberately before any
+        // approval-mode branch. An unattended or auto-allow run cannot grant
+        // itself future network authority.
+        if !self.interrupts.is_interactive_attached() {
+            return Ok(Decision::NoninteractiveDeny);
+        }
+        let offered = [Scope::Once];
+        let question = approval_question(
+            label,
+            true,
+            GrantKind::Command,
+            None,
+            None,
+            None,
+            &offered,
+            None,
+        );
+        let set = approval_option_set("owner_network_configuration", true, &offered, None);
+        let choice = self
+            .raise_and_decode(
+                label,
+                question,
+                "owner_network_configuration",
+                serde_json::json!({
+                    "wire_input": input,
+                    "candidate_effects": [
+                        {"selection": "approve", "execute": {"wire_input": input}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
+            .await?;
+        let decision = match choice {
+            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Deny
+            | ApprovalChoice::Reject(_)
+            | ApprovalChoice::Approve(Scope::Session | Scope::Project | Scope::Global)
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+        };
+        self.record_permission_decision(
+            "owner_network_configuration",
+            label,
+            &offered,
+            decision,
+            DecisionSource::UserPrompt,
+        )
+        .await;
+        Ok(decision)
+    }
+
     /// Gate an external MCP server tool invocation. This is distinct from
     /// [`Self::approve_tool_call`]: the key is persistable as exact
     /// `(server, tool)`, so the user can remember a server's tool at

@@ -1614,7 +1614,8 @@ mod tests {
         let error = anyhow::anyhow!("tool-call evidence storage is unavailable");
 
         assert!(
-            super::adjudicate::adjudication_prompt("edit", &args, &[]).is_ok(),
+            crate::engine::verification::adjudicate::adjudication_prompt("edit", &args, &[])
+                .is_ok(),
             "the regression requires an otherwise-valid original-only projection"
         );
         assert!(

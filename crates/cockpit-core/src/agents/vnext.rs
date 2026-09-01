@@ -4069,7 +4069,7 @@ mod tests {
         clean.validate().unwrap();
         let compiled = clean.verification.unwrap().compile();
         assert_eq!(compiled.regions[0].rule.generators.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             compiled.regions[0].rule.generators[0].recipe,
             VerificationRecipe::CleanRoom {
                 include_linked_files: false,
@@ -4080,7 +4080,7 @@ mod tests {
                 ],
                 tool_allowlist: vec![],
             }
-        ));
+        );
     }
 
     #[test]

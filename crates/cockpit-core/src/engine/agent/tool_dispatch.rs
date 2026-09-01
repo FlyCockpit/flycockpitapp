@@ -4887,6 +4887,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn under_cap_mcp_emit_stays_inline_when_artifact_policy_is_lower() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let mut agent = test_agent(tools.clone());
+        agent.context_policy = Some(crate::agents::ContextPolicy {
+            artifact_spill_bytes: Some(1),
+            ..Default::default()
+        });
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "mcp",
+            serde_json::json!({ "script": "emit('small result')" }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "mcp", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "mcp")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolEnd { tool, output, .. }) if tool == "mcp" && output == "small result")
+        );
+        assert_eq!(last_tool_result_text(&history), "small result");
+        assert!(
+            !last_tool_result_text(&history).contains("cockpit://"),
+            "an under-cap Monty result must not be replaced by an artifact handle"
+        );
+        assert!(
+            session
+                .db
+                .list_text_artifacts(session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn name_repaired_call_uses_executed_name_in_tool_result() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(EchoTool));

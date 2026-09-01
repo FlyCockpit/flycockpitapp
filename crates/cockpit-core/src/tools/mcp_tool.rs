@@ -242,11 +242,11 @@ fn rendered_result_output(
     } else {
         ToolOutput::text(model_inline)
     };
-    // Keep each envelope lane independent through dispatch. Model and display
-    // candidates are automatic (threshold controlled by the host policy),
-    // while `attach` is an explicit durable request. This prevents either
-    // non-model lane from replacing what `emit` selected for model history.
-    if !model.is_empty() {
+    // A model-lane capture is the dispatcher authority to replace the whole
+    // model result with an artifact frame. Retain one only after this lane
+    // exceeds its inline bound; ordinary `emit` output (and the no-emit
+    // fallback) must keep the exact inline result in model history.
+    if model_over_cap {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Model,
             capture_text_artifact_body(&model),
@@ -454,10 +454,10 @@ mod tests {
         );
 
         assert!(!output.truncated);
-        assert_eq!(output.text_artifact_captures.len(), 1);
-        assert_eq!(
-            output.text_artifact_captures[0].lane,
-            ToolArtifactLane::Model
+        assert_eq!(output.content, "small result");
+        assert!(
+            output.text_artifact_captures.is_empty(),
+            "under-cap model output must remain inline rather than authorize a spill"
         );
     }
 
@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_and_automatic_lanes_do_not_replace_emit_projection() {
+    fn display_and_attachment_lanes_do_not_replace_emit_projection() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         let output = rendered_result_output(
@@ -527,7 +527,7 @@ mod tests {
             output
                 .text_artifact_captures
                 .iter()
-                .any(|capture| { capture.lane == ToolArtifactLane::Model && !capture.explicit })
+                .all(|capture| { capture.lane != ToolArtifactLane::Model })
         );
         assert!(
             output

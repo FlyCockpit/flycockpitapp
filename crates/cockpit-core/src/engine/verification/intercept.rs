@@ -1401,6 +1401,7 @@ mod tests {
                 }],
             }),
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         definition.resolve_grant(&host()).expect("grant resolves")
     }
@@ -1727,6 +1728,7 @@ mod tests {
                 }],
             }),
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         let grant = definition.resolve_grant(&host()).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1806,6 +1808,7 @@ mod tests {
                 }],
             }),
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         definition.resolve_grant(&host()).unwrap()
     }
@@ -1840,6 +1843,7 @@ mod tests {
                 }],
             }),
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         definition.resolve_grant(&host()).unwrap()
     }

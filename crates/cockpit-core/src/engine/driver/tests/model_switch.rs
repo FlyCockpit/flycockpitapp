@@ -2358,7 +2358,7 @@ fn write_custom_agent(root: &std::path::Path, name: &str) {
     std::fs::write(
         agents.join(format!("{name}.md")),
         format!(
-            "---\ndescription: test agent\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test model refresh\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{name} body\n"
+            "---\ndescription: test agent\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test model refresh\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{name} body\n"
         ),
     )
     .unwrap();
@@ -2549,7 +2549,7 @@ async fn foreground_definition_is_pinned_while_new_children_see_fresh_definition
         std::fs::create_dir_all(&agents).unwrap();
         let definition = |body: &str| {
             format!(
-                "---\ndescription: pinned builder\nschemaVersion: 2\nagentId: cockpit/builder\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test definition pinning\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+                "---\ndescription: pinned builder\nschemaVersion: 1\nagentId: cockpit/builder\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test definition pinning\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
             )
         };
         let path = agents.join("builder.md");

@@ -15495,12 +15495,12 @@ impl Driver {
     ) -> Result<crate::engine::builtin::DelegationRecursionContext, String> {
         let parent = self.stack.last().expect("stack never empty").agent.as_ref();
         if parent.vnext_grant.is_some() {
-            // v2 has no projection onto the legacy recursive-task context.
+            // launch-v1 has no projection onto the legacy recursive-task context.
             // The asynchronous task-admission seam resolves the selected child
             // under this parent's EffectiveVnextGrant immediately before
             // construction, including depth, targets, and the caller/child
             // kind matrix. `remaining_depth` is legacy wire input and cannot
-            // widen a v2 grant.
+            // widen a launch-v1 grant.
             let _ = (child_agent, requested_depth, model);
             return Ok(crate::engine::builtin::DelegationRecursionContext::default());
         }

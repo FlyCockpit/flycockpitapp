@@ -6733,7 +6733,7 @@ fn minimal_template(
         AgentInstallationExecutionKindV1::Computer => "computer",
     };
     format!(
-        "---\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: {execution_kind}\ndescription: Custom {name} agent\nmodelSlots:\n  {primary_slot}:\n    purpose: Primary model\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\n\nYou are the `{name}` Cockpit agent.\n"
+        "---\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: {execution_kind}\ndescription: Custom {name} agent\nmodelSlots:\n  {primary_slot}:\n    purpose: Primary model\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\n\nYou are the `{name}` Cockpit agent.\n"
     )
 }
 fn receipt(
@@ -6950,7 +6950,7 @@ pub(crate) mod session_setup_test_support {
 
     pub(crate) fn markdown(agent_id: &str, required_capability: &str) -> String {
         format!(
-            "---\ndescription: setup fixture\nschemaVersion: 2\nagentId: {agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n---\nfixture body\n"
+            "---\ndescription: setup fixture\nschemaVersion: 1\nagentId: {agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n---\nfixture body\n"
         )
     }
 
@@ -7563,7 +7563,7 @@ mod tests {
         fn fetched() -> FetchedAgentSource {
             FetchedAgentSource {
                 commit_sha: "a".repeat(40),
-                markdown: b"---\ndescription: helper\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n".to_vec(),
+                markdown: b"---\ndescription: helper\nschemaVersion: 1\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n".to_vec(),
             }
         }
 
@@ -7597,7 +7597,7 @@ mod tests {
         FetchedAgentSource {
             commit_sha: "b".repeat(40),
             markdown: format!(
-                "---\ndescription: helper\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n  optional:\n    purpose: optional\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-a\n---\nbody\n"
+                "---\ndescription: helper\nschemaVersion: 1\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n  optional:\n    purpose: optional\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-a\n---\nbody\n"
             )
             .into_bytes(),
         }
@@ -7643,7 +7643,7 @@ mod tests {
     {
         let harness = ServiceHarness::new(FetchReply::Source(FetchedAgentSource {
             commit_sha: "d".repeat(40),
-            markdown: b"---\ndescription: invalid\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\n---\nmissing slots\n".to_vec(),
+            markdown: b"---\ndescription: invalid\nschemaVersion: 1\nagentId: authored/helper\nexecutionKind: coding\n---\nmissing slots\n".to_vec(),
         }));
         let result = harness
             .service
@@ -10278,7 +10278,7 @@ mod tests {
         std::fs::write(harness.target(), "locally modified agent").expect("modify owned copy");
         *harness.fetcher.reply.lock().expect("fetcher reply") = FetchReply::Source(FetchedAgentSource {
             commit_sha: "c".repeat(40),
-            markdown: b"---\ndescription: refreshed helper\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nrefreshed\n".to_vec(),
+            markdown: b"---\ndescription: refreshed helper\nschemaVersion: 1\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nrefreshed\n".to_vec(),
         });
         let result = harness
             .service

@@ -46,7 +46,7 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
     let local = tmp.path().join("local.md");
     fs::write(
         &local,
-        "---\ndescription: local\nschemaVersion: 2\nagentId: local/00000000-0000-0000-0000-000000000003\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        "---\ndescription: local\nschemaVersion: 1\nagentId: local/00000000-0000-0000-0000-000000000003\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
     )
     .unwrap();
     let global = installation(
@@ -81,7 +81,7 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
     let authored = tmp.path().join("shared.md");
     fs::write(
         &authored,
-        "---\ndescription: shared\nschemaVersion: 2\nagentId: authored/shared\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        "---\ndescription: shared\nschemaVersion: 1\nagentId: authored/shared\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
     )
     .unwrap();
     assert!(
@@ -198,13 +198,13 @@ fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
 
 fn vnext_document(extra_frontmatter: &str) -> String {
     format!(
-        "---\ndescription: Reviewer\nschemaVersion: 2\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra_frontmatter}---\nbody\n"
+        "---\ndescription: Reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra_frontmatter}---\nbody\n"
     )
 }
 
 fn vnext_agent_document(description: &str, body: &str) -> String {
     format!(
-        "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+        "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
     )
 }
 
@@ -220,7 +220,7 @@ fn builtin_override_document(name: &str, description: &str, body: &str) -> Strin
 fn agent_vnext_parse_round_trip_preserves_advisory_model_metadata() {
     let text = r#"---
 description: Reviewer
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/reviewer
 executionKind: coding
 modelSlots:
@@ -249,7 +249,7 @@ Review only the declared scope.
 "#;
 
     let parsed = parse_agent(text, "reviewer", "reviewer.md".into()).unwrap();
-    let vnext = parsed.vnext.as_ref().expect("v2 definition");
+    let vnext = parsed.vnext.as_ref().expect("launch-v1 definition");
     assert_eq!(vnext.agent_id, "authored/reviewer");
     assert_eq!(vnext.model_slots["primary"].suggested_models.len(), 1);
     assert_eq!(
@@ -271,7 +271,7 @@ Review only the declared scope.
 #[test]
 fn agent_vnext_rejects_legacy_authority_fields_and_unsorted_capabilities() {
     let authority = r#"---
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/reviewer
 executionKind: coding
 modelSlots:
@@ -309,7 +309,7 @@ fn agent_vnext_rejects_empty_duplicate_and_unknown_capabilities() {
 #[test]
 fn agent_vnext_rejects_legacy_keys_by_raw_presence_even_when_default_or_null() {
     let base = r#"---
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/reviewer
 executionKind: coding
 modelSlots:
@@ -331,7 +331,7 @@ body
         let invalid = base.replacen("---\nbody", &format!("{legacy}\n---\nbody"), 1);
         assert!(
             parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err(),
-            "v2 accepted legacy key {legacy}"
+            "launch-v1 accepted legacy key {legacy}"
         );
     }
 }
@@ -339,7 +339,7 @@ body
 #[test]
 fn agent_vnext_canonical_digest_bytes_ignore_authored_mapping_order() {
     let first_source = r#"---
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/reviewer
 executionKind: coding
 modelSlots:
@@ -364,7 +364,7 @@ modelSlots:
     purpose: Review source changes
 executionKind: coding
 agentId: authored/reviewer
-schemaVersion: 2
+schemaVersion: 1
 ---
 body
 "#;
@@ -398,7 +398,7 @@ legacy body
     assert!(parse_agent(schema_less, "legacy", "legacy.md".into()).is_err());
 
     let null_delegation = r#"---
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/reviewer
 executionKind: coding
 modelSlots:
@@ -419,7 +419,7 @@ body
 fn agent_vnext_workspace_definition_cannot_claim_daemon_local_publisher() {
     let text = r#"---
 description: Private reviewer
-schemaVersion: 2
+schemaVersion: 1
 agentId: local/00000000-0000-0000-0000-000000000001
 executionKind: coding
 modelSlots:
@@ -535,7 +535,7 @@ You are a reviewer. Be terse.\n";
     let error = parse_agent(text, "my-reviewer", "x.md".into())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("schemaVersion: 2"), "{error}");
+    assert!(error.contains("schemaVersion: 1"), "{error}");
 }
 
 #[test]
@@ -552,7 +552,7 @@ Body.
     let error = parse_agent(text, "forker", "forker.md".into())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("schemaVersion: 2"), "{error}");
+    assert!(error.contains("schemaVersion: 1"), "{error}");
 }
 
 #[test]
@@ -561,7 +561,7 @@ fn agent_vnext_rejects_missing_schema_version_instead_of_defaulting_mode() {
     let error = parse_agent(text, "a", "a.md".into())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("schemaVersion: 2"), "{error}");
+    assert!(error.contains("schemaVersion: 1"), "{error}");
 }
 
 #[test]
@@ -682,7 +682,7 @@ fn to_markdown_round_trips_through_parse() {
     .unwrap();
     assert_eq!(parsed.description, def.description);
     assert_eq!(parsed.vnext, def.vnext);
-    // Ejection serializes the user-authorable v2 contract only. Built-in
+    // Ejection serializes the user-authorable launch-v1 contract only. Built-in
     // tool surfaces stay host-owned factory data and cannot become frontmatter
     // authority by round-tripping through an editable file.
     assert!(parsed.tools.is_none());
@@ -710,11 +710,77 @@ fn vnext_allowed_knowledge_bases_round_trip_through_markdown() {
 }
 
 #[test]
-fn agent_vnext_every_editable_builtin_ejects_closed_schema_v2() {
+fn vnext_author_tool_tier_preferences_are_grant_bounded_and_overridable() {
+    let document = vnext_document("toolTierPreferences:\n  code: discoverable\n  read: enabled\n");
+    let mut def = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
+    assert_eq!(
+        def.vnext
+            .as_ref()
+            .unwrap()
+            .tool_tier_preferences
+            .get("code"),
+        Some(&ToolTier::Discoverable)
+    );
+    assert!(def.to_markdown().unwrap().contains("toolTierPreferences:"));
+
+    // A definition that has not received its host projection cannot use a
+    // preference to change the display/runtime tier of an ungranted name.
+    assert_eq!(computed_tool_tier(&def, "code"), ToolTier::Enabled);
+    assert!(def.tool_tiers.is_empty());
+
+    def.tools = Some(vec!["read".to_string(), "code".to_string()]);
+    apply_author_tool_tier_preferences(&mut def).unwrap();
+    assert_eq!(computed_tool_tier(&def, "code"), ToolTier::Discoverable);
+
+    apply_tool_surface_override(
+        &mut def,
+        &ToolSurfaceSelection {
+            tools: vec!["read".to_string(), "code".to_string()],
+            tool_tiers: std::collections::BTreeMap::from([("code".to_string(), ToolTier::Enabled)]),
+        },
+    )
+    .unwrap();
+    assert_eq!(computed_tool_tier(&def, "code"), ToolTier::Enabled);
+
+    let mut ungranted = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
+    ungranted.tools = Some(vec!["read".to_string()]);
+    apply_author_tool_tier_preferences(&mut ungranted).unwrap();
+    assert_eq!(ungranted.tools.as_deref(), Some(&["read".to_string()][..]));
+    assert!(!ungranted.tool_tiers.contains_key("code"));
+
+    let mut no_preference = parse_agent(&vnext_document(""), "Build", "Build.md".into()).unwrap();
+    no_preference.tools = Some(vec!["graph".to_string()]);
+    assert_eq!(
+        computed_tool_tier(&no_preference, "graph"),
+        ToolTier::Discoverable
+    );
+}
+
+#[test]
+fn vnext_author_tool_tier_preferences_reject_unknown_or_disabled_tools() {
+    for preference in [
+        "toolTierPreferences:\n  not_a_tool: enabled\n",
+        "toolTierPreferences:\n  read: disabled\n",
+        "toolTierPreferences:\n  transcribe_audio: enabled\n",
+        "toolTierPreferences:\n  ask_image: enabled\n",
+    ] {
+        assert!(
+            parse_agent(
+                &vnext_document(preference),
+                "reviewer",
+                "reviewer.md".into()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn agent_vnext_every_editable_builtin_ejects_closed_launch_schema_v1() {
     for &name in crate::agents::BUILTIN_AGENT_NAMES {
         let embedded = embedded_default(name).unwrap();
         let markdown = embedded.to_markdown().unwrap();
-        assert!(markdown.contains("schemaVersion: 2"), "{name}");
+        assert!(markdown.contains("schemaVersion: 1"), "{name}");
         assert!(
             parse_agent_with_scope(
                 &markdown,
@@ -1173,7 +1239,7 @@ fn resolve_rejects_override_with_invariant_violation() {
     )
     .unwrap();
     let err = trusted_resolve(tmp.path(), "explore").unwrap_err();
-    assert!(format!("{err}").contains("schemaVersion: 2"));
+    assert!(format!("{err}").contains("schemaVersion: 1"));
 }
 
 // ── list_all ─────────────────────────────────────────────────────────────
@@ -1512,7 +1578,7 @@ fn dir_form_enforces_invariants_at_load() {
     )
     .unwrap();
     let err = trusted_resolve(tmp.path(), "rev").unwrap_err();
-    assert!(format!("{err}").contains("schemaVersion: 2"), "{err}");
+    assert!(format!("{err}").contains("schemaVersion: 1"), "{err}");
 }
 
 // ── chat-ownable primaries + cycle ─────────────────────────────────────────
@@ -1733,10 +1799,10 @@ Body.
 }
 
 #[test]
-fn schema_v2_rejects_legacy_tool_descriptions_field() {
+fn launch_schema_rejects_tool_descriptions_field() {
     let text = r#"---
 description: A custom builder.
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/builder
 executionKind: coding
 modelSlots:
@@ -1753,10 +1819,10 @@ tool_descriptions:
 Body.
 "#;
     let error = parse_agent(text, "builder", "x.md".into())
-        .expect_err("v2 forbids legacy tool_descriptions")
+        .expect_err("launch-v1 forbids legacy tool_descriptions")
         .to_string();
     assert!(
-        error.contains("legacy field `tool_descriptions`"),
+        error.contains("unknown field `tool_descriptions`"),
         "{error}"
     );
 }
@@ -1778,10 +1844,10 @@ Body.
 }
 
 #[test]
-fn unknown_tool_description_mode_key_is_rejected() {
+fn launch_schema_rejects_nested_tool_description_fields() {
     let text = r#"---
 description: A custom builder.
-schemaVersion: 2
+schemaVersion: 1
 agentId: authored/builder
 executionKind: coding
 modelSlots:
@@ -1800,16 +1866,7 @@ Body.
 "#;
     let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
-    assert!(
-        msg.contains("unknown tool-description key `normal`"),
-        "{msg}"
-    );
-    assert_eq!(
-        msg.matches("tool_descriptions.grep:").count(),
-        1,
-        "nested field path must not be duplicated: {msg}"
-    );
+    assert!(msg.contains("unknown field `tool_descriptions`"), "{msg}");
 }
 
 #[test]
@@ -1977,7 +2034,7 @@ fn agent_def_capabilities_parse_and_validate() {
     validate_invariants(&def).expect("all four capabilities are valid");
 
     // Wire names parse via serde.
-    let yaml = "---\nschemaVersion: 2\nagentId: authored/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n---\n";
+    let yaml = "---\nschemaVersion: 1\nagentId: authored/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n---\n";
     let parsed = parse_agent(yaml, "cap", "cap.md".into()).expect("capabilities parse");
     let resolved = parsed.capabilities.expect("capabilities present");
     assert!(resolved.contains(&AgentCapability::FollowupSeed));
@@ -1995,7 +2052,7 @@ fn absent_capabilities_resolve_to_no_grants() {
 
 #[test]
 fn agent_def_load_and_model_override_warnings_are_advisory() {
-    let text = "---\nschemaVersion: 2\nagentId: authored/local-worker\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: local\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: local-small\n        upstreamIdentity: local/small-model\n        providerAliases:\n          - providerId: local\n            modelId: small-model\ncapabilities: [forkContext]\ndescription: local worker\n---\nbody\n";
+    let text = "---\nschemaVersion: 1\nagentId: authored/local-worker\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: local\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: local-small\n        upstreamIdentity: local/small-model\n        providerAliases:\n          - providerId: local\n            modelId: small-model\ncapabilities: [forkContext]\ndescription: local worker\n---\nbody\n";
     let def = parse_agent(text, "local-worker", "local-worker.md".into()).unwrap();
     let before = PostureResolution::from_def(&def).grants().clone();
 
@@ -2118,7 +2175,7 @@ fn agent_def_context_policy_bounds() {
 #[test]
 fn agent_def_digest_changes_iff_posture_fields_change() {
     // vnext_digest_bytes hashes the full canonical markdown, so the new
-    // posture fields must survive canonical v2 serialization and affect the
+    // posture fields must survive canonical launch-v1 serialization and affect the
     // digest iff they change.
     let mut base = parse_agent(
         &vnext_agent_document("A custom agent.", "body"),

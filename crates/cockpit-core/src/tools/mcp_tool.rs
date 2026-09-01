@@ -218,10 +218,11 @@ fn rendered_result_output(
 ) -> ToolOutput {
     let model = ctx.redact.scrub(&envelope.model_text()).into_owned();
     let display_lane = ctx.redact.scrub(&envelope.display_text()).into_owned();
-    let attached = ctx
-        .redact
-        .scrub(&envelope.artifacts.join("\n"))
-        .into_owned();
+    let attachments = envelope
+        .artifacts
+        .iter()
+        .map(|attached| ctx.redact.scrub(attached).into_owned())
+        .collect::<Vec<_>>();
     let display = (!display_lane.is_empty()).then(|| {
         if model.is_empty() {
             display_lane
@@ -259,7 +260,7 @@ fn rendered_result_output(
             display_lane.len() > OUTPUT_BYTE_CAP,
         );
     }
-    if !attached.is_empty() {
+    for attached in attachments {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Attachment,
             capture_text_artifact_body(&attached),
@@ -539,6 +540,33 @@ mod tests {
                 && capture.explicit
                 && capture.capture.content == "attached body"
         }));
+    }
+
+    #[test]
+    fn each_attachment_keeps_an_individual_artifact_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["model".to_owned()],
+                artifacts: vec![
+                    "first attachment".to_owned(),
+                    "second attachment".to_owned(),
+                ],
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        let attachments = output
+            .text_artifact_captures
+            .iter()
+            .filter(|capture| capture.lane == ToolArtifactLane::Attachment)
+            .collect::<Vec<_>>();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].capture.content, "first attachment");
+        assert_eq!(attachments[1].capture.content, "second attachment");
+        assert!(attachments.iter().all(|capture| capture.explicit));
     }
 
     #[tokio::test]

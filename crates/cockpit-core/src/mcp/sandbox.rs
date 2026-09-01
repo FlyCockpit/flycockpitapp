@@ -258,7 +258,12 @@ fn dispatch_projection(
             }
             envelope.notifications.push(message.clone());
         }
-        "attach" => envelope.artifacts.push(value),
+        "attach" => {
+            if value.is_empty() {
+                return Err("attach(x) requires a non-empty body".to_owned());
+            }
+            envelope.artifacts.push(value);
+        }
         other => return Err(format!("unknown MCP sandbox function `{other}`")),
     }
     Ok(MontyObject::None)
@@ -933,6 +938,19 @@ mod tests {
         assert_eq!(envelope.notifications, ["done"]);
         assert_eq!(envelope.artifacts, [r#"{"large":true}"#]);
         assert_eq!(envelope.model_text(), "first\n{\"answer\":42}");
+    }
+
+    #[tokio::test]
+    async fn empty_attachment_fails_closed() {
+        let error = run_envelope_with_host(
+            "attach('')",
+            &McpConfig::default(),
+            &HostContext::empty_for_tests(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires a non-empty body"));
     }
 
     #[tokio::test]

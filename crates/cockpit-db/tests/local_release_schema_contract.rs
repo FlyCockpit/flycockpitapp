@@ -2213,12 +2213,19 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
         .iter()
         .filter_map(|(name, owner)| (owner.status == "remove-from-v0.1").then_some(name.clone()))
         .collect::<BTreeSet<_>>();
+    let deferred_tables = ownership
+        .iter()
+        .filter_map(|(name, owner)| {
+            (owner.launch_profile != "local").then_some(name.clone())
+        })
+        .collect::<BTreeSet<_>>();
     assert_eq!(
         full_tables
             .difference(&local_tables)
             .cloned()
             .collect::<BTreeSet<_>>(),
-        remote_tables
+        deferred_tables,
+        "full profile additions must be exactly the extended and remote ownership layers"
     );
 
     assert!(
@@ -2271,12 +2278,19 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
     // Disabled-but-retained tables must be justified by a real schema
     // reference from another retained object; otherwise they should not cross
     // the v0.1 boundary merely as speculative storage.
+    let retained = Connection::open_in_memory().unwrap();
+    retained
+        .execute_batch(local_sql)
+        .expect("local base schema must apply for retained dependency inspection");
+    retained
+        .execute_batch(extended_sql)
+        .expect("extended schema must apply for retained dependency inspection");
     for (table, owner) in &ownership {
         if owner.status == "launch-disabled-but-schema-required" {
-            let referenced = local_inventory.iter().any(|(_, objects)| {
+            let referenced = schema_inventory(&retained).iter().any(|(_, objects)| {
                 objects.iter().any(|object| {
                     object != table && {
-                        let sql: Option<String> = local
+                        let sql: Option<String> = retained
                             .query_row(
                                 "SELECT sql FROM sqlite_schema WHERE name = ?1",
                                 [object],

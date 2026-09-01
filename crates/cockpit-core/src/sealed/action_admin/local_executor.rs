@@ -156,7 +156,7 @@ fn sha256_file(file: &mut std::fs::File) -> Result<String> {
     }
     file.seek(SeekFrom::Start(0))
         .context("rewinding sealed action executable after hashing")?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::intel::hex_lower(&hasher.finalize()))
 }
 
 /// Where a fixed command receives the sealed literal.
@@ -355,7 +355,7 @@ pub fn validate_file_kind(
     consumer_argv: &[String],
     consumer_executable_identity: Option<&ExecutableIdentity>,
 ) -> Result<()> {
-    if let FilePersistence::PersistentOwnerApproved(approval) = persistence {
+    if let FilePersistence::PersistentOwnerApproved(approval) = &persistence {
         PersistentFileApproval::acknowledge(approval.acknowledged_at_ms, &approval.warning)?;
     }
     match destination {
@@ -898,7 +898,7 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
         .output()
         .await
         .context("running sealed file git worktree inspection")?;
-    if !inside.success() {
+    if !inside.status.success() {
         // A directory outside Git cannot contain a tracked or ignored
         // destination, so it needs no Git guard. Do not treat exit status 128
         // alone as that state: Git also uses it for broken repositories and
@@ -978,7 +978,7 @@ impl EphemeralFile {
 
     fn remove(mut self) -> Result<()> {
         if self.remove {
-            remove_ephemeral_file_checked(&self.path, self.identity)?;
+            remove_ephemeral_file_checked(&self.path, self.identity.clone())?;
             self.remove = false;
         }
         Ok(())

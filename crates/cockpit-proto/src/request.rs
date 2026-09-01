@@ -5329,6 +5329,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<u64>" => "option<u64>",
         "Vec<Uuid>" => "list<uuid>",
         "Vec<Option<String>>" => "list<option<string>>",
+        "Vec<Option<crate::ProviderSecretValue>>" => "list<option<sha256-redacted>>",
         "Vec<(String,String)>" => "list<tuple<string,string>>",
         "HashMap<String,String>" => "map<string,string>",
         "Vec<TagExpansionMeta>" => "list<struct:TagExpansionMeta:v1>",

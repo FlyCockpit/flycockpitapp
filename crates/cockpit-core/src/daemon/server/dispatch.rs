@@ -22274,6 +22274,15 @@ async fn provider_models_fetch(
                     crate::providers::auth_check::AuthCheckSuccess::Models { models, catalog } => {
                         crate::providers::models_fetch::FetchOutcome::Models { models, catalog }
                     }
+                    crate::providers::auth_check::AuthCheckSuccess::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    } => crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    },
                     crate::providers::auth_check::AuthCheckSuccess::Checked => {
                         crate::providers::models_fetch::FetchOutcome::Unsupported
                     }

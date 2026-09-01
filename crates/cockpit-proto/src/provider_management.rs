@@ -137,6 +137,37 @@ impl ProviderSecretValue {
     }
 }
 
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for ProviderSecretValue {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> anyhow::Result<()> {
+        // FCOR backs remote idempotency. It must distinguish a literal from a
+        // detected-environment reference (and distinguish their values), but
+        // its canonical buffer is not zeroizing, so it may never receive a
+        // literal secret. Hash a tagged representation instead.
+        let mut digest = Sha256::new();
+        match self {
+            Self::Literal(value) => {
+                digest.update(b"literal\\0");
+                digest.update(value.as_bytes());
+            }
+            Self::DetectedEnvironment {
+                template_id,
+                variable,
+            } => {
+                digest.update(b"detected-environment\\0");
+                digest.update(template_id.as_bytes());
+                digest.update(b"\\0");
+                digest.update(variable.as_bytes());
+            }
+        }
+        let digest = digest.finalize();
+        out.push_bytes(&digest)
+    }
+}
+
 impl std::fmt::Debug for ProviderSecretValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ProviderSecretValue([REDACTED])")

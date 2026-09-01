@@ -476,6 +476,7 @@ enum FirstRunFlow {
     AwaitWelcome,
     AwaitProfile,
     AwaitProvider,
+    AwaitProviderValidation,
     AwaitModel,
     AwaitFinish,
 }
@@ -3969,7 +3970,13 @@ impl App {
             first_run_flow: match onboarding_stage {
                 cockpit_core::welcome::OnboardingStage::Welcome => FirstRunFlow::AwaitWelcome,
                 cockpit_core::welcome::OnboardingStage::Profile => FirstRunFlow::AwaitProfile,
-                cockpit_core::welcome::OnboardingStage::Provider => FirstRunFlow::AwaitProvider,
+                cockpit_core::welcome::OnboardingStage::Provider => {
+                    if cockpit_core::welcome::onboarding_provider_pending_validation().is_some() {
+                        FirstRunFlow::AwaitProviderValidation
+                    } else {
+                        FirstRunFlow::AwaitProvider
+                    }
+                }
                 cockpit_core::welcome::OnboardingStage::Model => FirstRunFlow::AwaitModel,
                 cockpit_core::welcome::OnboardingStage::Complete => FirstRunFlow::None,
             },

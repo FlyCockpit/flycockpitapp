@@ -62,6 +62,19 @@ impl App {
                     Some("Resume setup: add and validate a provider credential.".to_string()),
                 )
             }
+            FirstRunFlow::AwaitProviderValidation => {
+                let Some(provider_id) =
+                    cockpit_core::welcome::onboarding_provider_pending_validation()
+                else {
+                    self.first_run_flow = FirstRunFlow::AwaitProvider;
+                    self.maybe_open_add_provider_wizard();
+                    return;
+                };
+                crate::tui::settings::Dialog::open_onboarding_provider_validation(
+                    &self.launch.cwd,
+                    &provider_id,
+                )
+            }
             FirstRunFlow::AwaitModel => {
                 match crate::tui::settings::Dialog::open_onboarding_model_setup(Some(
                     "Resume setup: enter a model ID and its context settings.".to_string(),
@@ -115,7 +128,7 @@ impl App {
                 self.first_run_flow = FirstRunFlow::AwaitProvider;
                 true
             }
-            FirstRunFlow::AwaitProvider => {
+            FirstRunFlow::AwaitProvider | FirstRunFlow::AwaitProviderValidation => {
                 let Some(provider_id) = self.dialog.take_completed_provider_id() else {
                     return false;
                 };

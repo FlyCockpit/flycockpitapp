@@ -1038,6 +1038,14 @@ impl AddState {
         self.run.return_to("template").unwrap();
         self.template_cursor = cursor;
     }
+
+    pub(super) fn resume_onboarding_validation(&mut self, provider_id: &str) {
+        self.run
+            .return_to("test-key-choice")
+            .expect("provider validation step exists");
+        self.saved_provider_id = Some(provider_id.to_string());
+        self.error = Some("Resume setup: test the saved credential with the daemon.".into());
+    }
 }
 
 fn provider_entry_from_add(
@@ -1468,6 +1476,19 @@ impl SettingsCx {
         template: &'static ProviderTemplate,
         detected_env: Option<String>,
     ) {
+        // The daemon owns the save and may finish after this dialog (or the
+        // process) is gone. Persist its validation continuation before the
+        // mutation is handed off so Escape can never detach a committed
+        // provider from first-run onboarding.
+        if s.onboarding
+            && let Err(error) =
+                cockpit_core::welcome::persist_onboarding_provider_pending_validation(&id)
+        {
+            s.error = Some(format!(
+                "could not record setup progress before saving provider: {error}"
+            ));
+            return;
+        }
         self.config.providers.insert(id.clone(), entry.clone());
         self.pending_provider_add = Some((
             id,

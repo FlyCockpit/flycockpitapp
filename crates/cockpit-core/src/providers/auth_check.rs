@@ -16,6 +16,11 @@ pub enum AuthCheckSuccess {
         models: Vec<ModelEntry>,
         catalog: ProviderModelCatalog,
     },
+    FallbackAvailable {
+        models: Vec<ModelEntry>,
+        catalog: ProviderModelCatalog,
+        reason: String,
+    },
     Checked,
 }
 
@@ -72,10 +77,18 @@ pub async fn check_provider_auth_with_store(
             .await
             .map_err(classify_error)?;
             match outcome {
-                FetchOutcome::Models { models, catalog }
-                | FetchOutcome::FallbackAvailable {
-                    models, catalog, ..
-                } => Ok(AuthCheckSuccess::Models { models, catalog }),
+                FetchOutcome::Models { models, catalog } => {
+                    Ok(AuthCheckSuccess::Models { models, catalog })
+                }
+                FetchOutcome::FallbackAvailable {
+                    models,
+                    catalog,
+                    reason,
+                } => Ok(AuthCheckSuccess::FallbackAvailable {
+                    models,
+                    catalog,
+                    reason,
+                }),
                 FetchOutcome::Unsupported => Ok(AuthCheckSuccess::Checked),
             }
         }

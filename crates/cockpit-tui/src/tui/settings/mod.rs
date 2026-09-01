@@ -5811,6 +5811,37 @@ impl Dialog {
         Self::open_providers_add_mode(cwd, status, true)
     }
 
+    /// Resume the mandatory validation of a provider whose daemon-owned save
+    /// committed after the add wizard was cancelled.
+    pub fn open_onboarding_provider_validation(cwd: &std::path::Path, provider_id: &str) -> Self {
+        let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
+        match path {
+            Ok((path, global_root)) => {
+                let mut s = SettingsDialog::open_from_picker(path, global_root);
+                if s.config.providers.contains_key(provider_id) {
+                    let mut add = AddState::new_with_onboarding(true);
+                    add.resume_onboarding_validation(provider_id);
+                    s.page = providers_page(ProvidersPage::Add(add));
+                } else {
+                    let mut add = AddState::new_with_onboarding(true);
+                    add.error = Some(format!(
+                        "The saved provider `{provider_id}` is no longer configured. Add and validate a provider to resume setup."
+                    ));
+                    s.page = providers_page(ProvidersPage::Add(add));
+                }
+                Dialog::Settings(Box::new(s))
+            }
+            Err(error) => Dialog::CreateConfig {
+                choices: Vec::new(),
+                cursor: 0,
+                cwd: cwd.to_path_buf(),
+                status: Some(format!(
+                    "could not resolve the global Cockpit config: {error}"
+                )),
+            },
+        }
+    }
+
     pub fn open_onboarding_welcome(cwd: &std::path::Path) -> Self {
         let reduced_motion = std::env::var_os("NO_COLOR").is_some()
             || std::env::var("TERM").is_ok_and(|term| term == "dumb")

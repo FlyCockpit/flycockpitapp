@@ -3179,7 +3179,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|provider_id:string|entry:struct:ProviderEntry:v1|header_secrets:list<option<string>>",
+      "fcorCanonicalSchema": "project_root:string|provider_id:string|entry:struct:ProviderEntry:v1|header_secrets:list<option<sha256-redacted>>",
       "fcorRoles": [
         {
           "field": "project_root",
@@ -3199,10 +3199,10 @@
         {
           "field": "header_secrets",
           "role": "param",
-          "type": "Vec<Option<String>>"
+          "type": "Vec<Option<cockpit_proto::ProviderSecretValue>>"
         }
       ],
-      "fcorSchema": "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<String>>",
+      "fcorSchema": "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_provider_config"
     },

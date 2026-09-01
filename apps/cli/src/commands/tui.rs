@@ -147,6 +147,7 @@ pub async fn run_with_session(
         launch_start,
         lifecycle,
     );
+    app.configure_onboarding_launch(false, false);
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;

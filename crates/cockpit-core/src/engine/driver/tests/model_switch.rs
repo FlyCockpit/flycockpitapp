@@ -3054,8 +3054,8 @@ async fn refresh_preserves_confirmed_endpoint_without_probe_cache() {
 }
 
 #[tokio::test]
-async fn explicit_config_endpoint_beats_stale_confirmation_after_refresh() {
-    use crate::config::providers::WireApi;
+async fn turn_refresh_rebuilds_when_wire_api_changes_model_variant() {
+    use crate::config::providers::{HeaderSpec, WireApi};
 
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
@@ -3067,23 +3067,25 @@ async fn explicit_config_endpoint_beats_stale_confirmation_after_refresh() {
         .test_providers_override
         .as_mut()
         .expect("model switch harness installs provider override");
-    cfg.providers
+    let entry = cfg
+        .providers
         .get_mut("provider-a")
-        .expect("provider-a exists")
-        .wire_api = WireApi::Completions;
+        .expect("provider-a exists");
+    entry.wire_api = WireApi::Responses;
+    entry.headers.push(HeaderSpec {
+        name: "Authorization".into(),
+        value: "Bearer test-token".into(),
+    });
 
     driver.refresh_active_frame_for_turn(&tx).await;
 
     let refreshed = &driver.stack[0].agent.model;
-    assert_eq!(
-        refreshed.confirmed_wire_api_for_base_url("http://localhost:1/v1"),
-        Some(WireApi::Responses),
-        "the stale confirmation is preserved for the session"
-    );
-    assert_eq!(
-        refreshed.resolve_live_wire_api_for_base_url("http://localhost:1/v1"),
-        WireApi::Completions,
-        "but the fresh explicit config pin wins over it"
+    assert!(
+        matches!(
+            refreshed.as_ref(),
+            crate::engine::model::Model::ChatGpt { .. }
+        ),
+        "a Responses configuration must rebuild the active model into the Responses variant"
     );
 }
 

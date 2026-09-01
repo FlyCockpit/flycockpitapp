@@ -300,15 +300,10 @@ impl Model {
     }
 }
 
-pub(super) fn is_anthropic_native(base_url: &str) -> bool {
-    crate::config::providers::is_anthropic_native_base_url(base_url)
-}
-
-/// Route a `(provider, model)` build to the native Anthropic path or the
-/// OpenAI-compat path based on the resolved base-URL host
-/// ([`is_anthropic_native`]). The `cache` config drives the Anthropic TTL
-/// mode (5-min vs 1h) and is unused on the OpenAI-compat path (which relies
-/// on prefix stability + `prompt_cache_key`, set later via `ModelParams`).
+/// Route a `(provider, model)` build solely from its resolved `wire_api`.
+/// The `cache` config drives the Anthropic TTL mode (5-min vs 1h) and is
+/// unused on the OpenAI-compatible path (which relies on prefix stability +
+/// `prompt_cache_key`, set later via `ModelParams`).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_model(
@@ -379,15 +374,6 @@ pub(super) fn build_model_with_can_delegate(
     secret_lookup: impl Fn(&str) -> Option<String>,
     store: Option<crate::credentials::CredentialStore>,
 ) -> Result<Model> {
-    let registry = crate::providers::ProviderRegistry::standard();
-    let is_codex_oauth =
-        registry.provider_for(provider_id, entry).id() == crate::auth::codex_oauth::CREDENTIAL_KEY;
-    if is_codex_oauth && provider_id.eq_ignore_ascii_case("openai-compatible") {
-        anyhow::bail!(
-            "Codex OAuth cannot be used through the generic `openai-compatible` provider; remove the stale provider entry and select `codex-oauth` in /settings -> Providers."
-        );
-    }
-
     let resolved = match store {
         Some(store) => models_fetch::resolve_provider_request_blocking_with_store(
             provider_id,
@@ -403,10 +389,11 @@ pub(super) fn build_model_with_can_delegate(
         )?,
     };
     let utility_token_limit = resolve_utility_token_limit(entry, model_id);
-    if is_codex_oauth {
-        build_chatgpt_model_with_utility_limit(
+    match wire_api {
+        crate::config::providers::WireApi::Responses => build_chatgpt_model_with_utility_limit(
             provider_id,
             &resolved,
+            resolved.is_codex_credential,
             model_id,
             utility_token_limit,
             timeout,
@@ -419,48 +406,53 @@ pub(super) fn build_model_with_can_delegate(
             can_delegate,
             session_redact,
             redact,
-        )
-    } else if is_anthropic_native(&resolved.base_url) {
-        let max_tokens =
-            crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
-        build_anthropic_model_with_can_delegate(
-            provider_id,
-            &resolved,
-            model_id,
-            max_tokens,
-            cache,
-            timeout,
-            hard_timeout_on_stall,
-            trusted,
-            location,
-            quality_rank,
-            cost_rank,
-            subagent_invokable,
-            can_delegate,
-            computer_use.as_ref(),
-            session_redact,
-            redact,
-        )
-    } else {
-        build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
-            provider_id,
-            &resolved,
-            model_id,
-            utility_token_limit,
-            timeout,
-            hard_timeout_on_stall,
-            client_side_tools,
-            wire_api,
-            wire_api_explicit,
-            trusted,
-            location,
-            quality_rank,
-            cost_rank,
-            subagent_invokable,
-            can_delegate,
-            session_redact,
-            redact,
-        )
+        ),
+        crate::config::providers::WireApi::Anthropic => {
+            let max_tokens =
+                crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
+            build_anthropic_model_with_can_delegate(
+                provider_id,
+                &resolved,
+                model_id,
+                max_tokens,
+                cache,
+                timeout,
+                hard_timeout_on_stall,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                computer_use.as_ref(),
+                session_redact,
+                redact,
+            )
+        }
+        crate::config::providers::WireApi::Completions => {
+            build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
+                provider_id,
+                &resolved,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                client_side_tools,
+                wire_api,
+                wire_api_explicit,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
+        crate::config::providers::WireApi::Auto => {
+            anyhow::bail!("effective wire_api must not be auto")
+        }
     }
 }
 
@@ -587,10 +579,10 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     let extra_headers = resolved
         .headers
         .iter()
-        .filter(|h| {
-            h.name
-                .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
-        })
+        // Rig owns the `x-api-key` it builds from below. Every other resolved
+        // header, including Authorization, is part of the configured native
+        // Anthropic request and must reach compatible gateways unchanged.
+        .filter(|h| !h.name.eq_ignore_ascii_case("x-api-key"))
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
     let client = builder
@@ -652,6 +644,7 @@ pub(super) fn build_chatgpt_model(
     build_chatgpt_model_with_utility_limit(
         provider_id,
         resolved,
+        resolved.is_codex_credential,
         model_id,
         None,
         timeout,
@@ -671,6 +664,7 @@ pub(super) fn build_chatgpt_model(
 pub(super) fn build_chatgpt_model_with_utility_limit(
     provider_id: &str,
     resolved: &models_fetch::ResolvedRequest,
+    is_codex_credential: bool,
     model_id: &str,
     utility_token_limit: Option<u64>,
     timeout: &crate::config::providers::TimeoutConfig,
@@ -696,27 +690,34 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         })
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .context("Codex OAuth resolved request is missing Authorization bearer token")?;
+        .context("Responses provider resolved request is missing Authorization bearer token")?;
 
-    let account_id = resolved
-        .headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case("chatgpt-account-id"))
-        .map(|h| h.value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .context("Codex OAuth resolved request is missing chatgpt-account-id")?;
+    let account_id = if is_codex_credential {
+        Some(
+            resolved
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("chatgpt-account-id"))
+                .map(|h| h.value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .context("Codex OAuth resolved request is missing chatgpt-account-id")?,
+        )
+    } else {
+        None
+    };
 
-    // Rig's ChatGPT provider supplies Authorization, ChatGPT-Account-Id,
-    // originator, Accept, Content-Type, and its own per-request session_id.
-    // Preserve resolver-owned compatibility headers that rig does not know
-    // about, especially the Codex Responses beta opt-in.
+    // Rig's ChatGPT provider supplies Responses serialization. Codex
+    // credential resolution adds its account and compatibility headers; a
+    // non-Codex Responses provider keeps only its configured request headers.
     let extra_headers = resolved
         .headers
         .iter()
+        // `session_id` is deliberately left to Rig, which generates a new
+        // request identifier for every request. A resolver-owned value would
+        // otherwise overwrite that per-request identifier.
         .filter(|h| {
-            h.name.eq_ignore_ascii_case("OpenAI-Beta")
-                || h.name
-                    .eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str())
+            !h.name.eq_ignore_ascii_case("authorization")
+                && !h.name.eq_ignore_ascii_case("session_id")
         })
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
@@ -724,7 +725,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     let client = chatgpt::Client::builder()
         .api_key(chatgpt::ChatGPTAuth::AccessToken {
             access_token,
-            account_id: Some(account_id),
+            account_id,
         })
         .base_url(&resolved.base_url)
         .originator("cockpit")
@@ -732,9 +733,13 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         // system prompt is the only instruction source. An empty default is
         // a no-op when a real preamble is present.
         .default_instructions("")
-        .http_client(UsageAliasHttpClient::new(extra_headers)?)
+        .http_client(if is_codex_credential {
+            UsageAliasHttpClient::new(extra_headers)?
+        } else {
+            UsageAliasHttpClient::without_codex_headers(extra_headers)?
+        })
         .build()
-        .with_context(|| format!("building native ChatGPT client for `{provider_id}`"))?;
+        .with_context(|| format!("building Responses client for `{provider_id}`"))?;
 
     Ok(Model::ChatGpt {
         model: chatgpt::ResponsesCompletionModel::new(client, model_id).with_strict_tools(),
@@ -892,14 +897,10 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let resolved_wire_api = if !wire_api.is_auto() {
-        wire_api
-    } else if let Some(learned) =
-        learned_working_endpoint(provider_id, model_id, &resolved.base_url)
-    {
-        learned
+    let resolved_wire_api = if wire_api.is_auto() {
+        crate::config::providers::WireApi::Completions
     } else {
-        crate::config::providers::WireApi::detect_for_provider(provider_id, model_id)
+        wire_api
     };
     // A missing Authorization header means the provider is keyless — a
     // fully-local OpenAI-compatible endpoint (e.g. LM Studio at
@@ -952,10 +953,7 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         // here so the endpoint fallback's persist is best-effort/skipped for
         // tests + utility models.
         config_path: None,
-        live_wire_api: Arc::new(Mutex::new(LiveWireApiState::new(
-            wire_api,
-            wire_api_explicit,
-        ))),
+        live_wire_api: Arc::new(Mutex::new(LiveWireApiState::new(wire_api_explicit))),
         timeout: timeout.clone(),
         hard_timeout_on_stall,
         client_side_tools,

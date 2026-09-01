@@ -11,7 +11,6 @@ use serde_json::json;
 
 use crate::config::providers::{
     CapabilitySource, ModelEntry, ProvidersConfig, WireApi, WireApiProvenance,
-    is_anthropic_native_base_url,
 };
 use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
@@ -180,6 +179,7 @@ fn wire_api_label(wire: WireApi) -> &'static str {
         WireApi::Auto => "auto",
         WireApi::Completions => "completions",
         WireApi::Responses => "responses",
+        WireApi::Anthropic => "anthropic",
     }
 }
 
@@ -520,7 +520,7 @@ pub fn collect_deepfetch_targets(
         {
             continue;
         }
-        if is_anthropic_native_base_url(&entry.url) {
+        if cfg.resolve_wire_api(provider_id, "") == WireApi::Anthropic {
             continue;
         }
         if provider_id == "codex-oauth" {
@@ -558,14 +558,7 @@ pub fn collect_deepfetch_targets(
                 },
                 inherited_wire_api: entry.wire_api,
                 supported_wire_apis: model.capabilities.supported_wire_apis.clone(),
-                automatic_wire_api: {
-                    let resolved = cfg.resolve_wire_api(provider_id, &model.id);
-                    if resolved.is_auto() {
-                        WireApi::detect_for_provider_entry(provider_id, entry, &model.id)
-                    } else {
-                        resolved
-                    }
-                },
+                automatic_wire_api: cfg.resolve_wire_api(provider_id, &model.id),
                 direct_model_scope: scope.provider.is_some() && scope.model.is_some(),
             });
         }
@@ -737,7 +730,9 @@ pub async fn probe_target<C: DeepfetchProbeClient>(
             endpoint: match endpoint {
                 WireApi::Completions => ProbeEndpoint::Completions,
                 WireApi::Responses => ProbeEndpoint::Responses,
-                WireApi::Auto => return Ok(DeepfetchApplyReport::SkippedNoEndpointChoice),
+                WireApi::Auto | WireApi::Anthropic => {
+                    return Ok(DeepfetchApplyReport::SkippedNoEndpointChoice);
+                }
             },
             max_tokens: CONTEXT_PROBE_MAX_TOKENS,
         })

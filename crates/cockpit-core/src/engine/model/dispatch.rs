@@ -1353,7 +1353,10 @@ impl Model {
                 provider_id
             }
             Model::OpenAi { .. } => "openai-compatible",
-            Model::ChatGpt { .. } => "codex-oauth",
+            // Responses is a wire, not a credential. Preserve the configured
+            // provider identity for custom Responses endpoints while the
+            // built-in Codex template naturally remains `codex-oauth`.
+            Model::ChatGpt { provider_id, .. } => provider_id,
             Model::Anthropic { .. } => "anthropic",
         }
     }
@@ -1974,7 +1977,8 @@ async fn openai_text_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system.unwrap_or(""),
@@ -2027,7 +2031,8 @@ async fn openai_tool_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system,

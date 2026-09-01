@@ -20,11 +20,9 @@
 //! `api.anthropic.com`, which gets rig's provider-concrete per-block
 //! prompt caching, prompt `prompt-caching-strategy.md`).
 //!
-//! Routing: a build site picks the native Anthropic path **only** when
-//! the resolved base URL's host is `api.anthropic.com` (see
-//! [`is_anthropic_native`]). Claude models served by any other host stay
-//! on the OpenAI-compat path — they're not native Anthropic endpoints and
-//! don't accept inline cache breakpoints.
+//! Routing: a build site picks the wire solely from the resolved
+//! `ProviderEntry.wire_api`. Provider ids, model names, and base URLs never
+//! select a request wire.
 //!
 //! Authentication: we delegate to
 //! [`crate::providers::models_fetch::resolve_provider_request`], the
@@ -451,15 +449,13 @@ pub(crate) fn has_retained_native_computer_items() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct LiveWireApiState {
-    configured: crate::config::providers::WireApi,
     explicit: bool,
     session_confirmed: HashMap<String, crate::config::providers::WireApi>,
 }
 
 impl LiveWireApiState {
-    fn new(configured: crate::config::providers::WireApi, explicit: bool) -> Self {
+    fn new(explicit: bool) -> Self {
         Self {
-            configured,
             explicit,
             session_confirmed: HashMap::new(),
         }
@@ -505,10 +501,9 @@ pub enum Model {
         /// most once. `None` (tests / utility models) skips the persist; the
         /// fallback itself still works.
         config_path: Option<PathBuf>,
-        /// Live per-session endpoint state. The build-time `wire_api` remains
-        /// the diagnostic/default endpoint, but dispatch resolves through this
-        /// cell every turn so a confirmed self-heal and turn-boundary config
-        /// refresh apply without rebuilding the model.
+        /// Per-session endpoint-recovery state. The concrete `wire_api` stays
+        /// immutable for this model instance; a config change takes effect by
+        /// rebuilding at the turn boundary, including across `Model` variants.
         live_wire_api: LiveWireApi,
         /// Resolved inference-stream timeouts (TTFT + idle) for this
         /// `(provider, model)`
@@ -554,10 +549,9 @@ pub enum Model {
         /// debug/request payloads are exact-as-sent and may contain secrets.
         redact: Arc<RedactionTable>,
     },
-    /// Native ChatGPT/Codex subscription Responses endpoint. This is distinct
-    /// from the generic OpenAI-compatible arm because the ChatGPT backend
-    /// requires top-level `instructions` on `/responses`, plus ChatGPT account
-    /// OAuth headers resolved by Cockpit's provider credential path.
+    /// Responses endpoint. The same request serializer serves generic
+    /// Responses providers and ChatGPT/Codex; Codex-only headers remain bound
+    /// to the resolved Codex credential path.
     ChatGpt {
         model: ChatGptResponsesModel,
         model_id: String,
@@ -591,10 +585,8 @@ pub enum Model {
         /// Same effective outbound-provider redaction table as [`Model::OpenAi`].
         redact: Arc<RedactionTable>,
     },
-    /// Native Anthropic Messages endpoint (`api.anthropic.com`). Routed
-    /// here only when the resolved base URL host is `api.anthropic.com`
-    /// (see [`is_anthropic_native`]); Claude served by any other host
-    /// stays on [`Model::OpenAi`]. The stored `model` already has rig's
+    /// Native Anthropic Messages endpoint. Routed here only by
+    /// `wire_api = anthropic`. The stored `model` already has rig's
     /// per-block prompt caching enabled (5-min `with_prompt_caching()` or,
     /// on the 1h opt-in, top-level `with_automatic_caching_1h()`) — see
     /// [`build_anthropic_model`]. It's `Clone`, so the per-attempt closure
@@ -1104,6 +1096,7 @@ impl Model {
                 crate::config::providers::WireApi::Auto => "auto",
                 crate::config::providers::WireApi::Completions => "completions",
                 crate::config::providers::WireApi::Responses => "responses",
+                crate::config::providers::WireApi::Anthropic => "anthropic",
             },
             Model::ChatGpt { .. } => "responses",
             Model::Anthropic { .. } => "messages",
@@ -1116,7 +1109,7 @@ impl Model {
                 self.resolve_live_wire_api_for_base_url(client.base_url())
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Anthropic,
         }
     }
 
@@ -1156,26 +1149,6 @@ impl Model {
         }
     }
 
-    pub(crate) fn refresh_wire_api_config(
-        &self,
-        providers: &crate::config::providers::ProvidersConfig,
-    ) {
-        let Model::OpenAi {
-            provider_id,
-            model_id,
-            live_wire_api,
-            ..
-        } = self
-        else {
-            return;
-        };
-        let mut state = live_wire_api
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.configured = providers.resolve_wire_api(provider_id, model_id);
-        state.explicit = providers.is_wire_api_explicit(provider_id, model_id);
-    }
-
     pub(crate) fn with_live_wire_api(mut self, donor: &Self) -> Self {
         let Model::OpenAi {
             live_wire_api: fresh_live_wire_api,
@@ -1191,17 +1164,16 @@ impl Model {
         else {
             return self;
         };
-        let (configured, explicit) = {
+        let explicit = {
             let fresh_state = fresh_live_wire_api
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (fresh_state.configured, fresh_state.explicit)
+            fresh_state.explicit
         };
         {
             let mut donor_state = donor_live_wire_api
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            donor_state.configured = configured;
             donor_state.explicit = explicit;
         }
         *fresh_live_wire_api = donor_live_wire_api.clone();
@@ -1210,47 +1182,18 @@ impl Model {
 
     pub(crate) fn resolve_live_wire_api_for_base_url(
         &self,
-        base_url: &str,
+        _base_url: &str,
     ) -> crate::config::providers::WireApi {
         match self {
-            Model::OpenAi {
-                provider_id,
-                model_id,
-                wire_api,
-                live_wire_api,
-                ..
-            } => {
-                let state = live_wire_api
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.explicit && !state.configured.is_auto() {
-                    return state.configured;
-                }
-                let normalized = normalize_probe_base_url(base_url);
-                if let Some(endpoint) = state.session_confirmed.get(&normalized) {
-                    return *endpoint;
-                }
-                // A freshly fetched model catalog is stronger evidence than a
-                // process-local probe from an earlier catalog generation. In
-                // particular, Copilot may move a model from Chat Completions
-                // to Responses while the old learned endpoint is still in the
-                // TTL cache. Session-confirmed recovery stays above this so a
-                // successful swap remains stable for the current session.
-                if !state.configured.is_auto() {
-                    return state.configured;
-                }
-                drop(state);
-                if let Some(learned) = learned_working_endpoint(provider_id, model_id, base_url) {
-                    return learned;
-                }
-                if !wire_api.is_auto() {
-                    *wire_api
+            Model::OpenAi { wire_api, .. } => {
+                if wire_api.is_auto() {
+                    crate::config::providers::WireApi::Completions
                 } else {
-                    crate::config::providers::WireApi::detect_for_provider(provider_id, model_id)
+                    *wire_api
                 }
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Anthropic,
         }
     }
 

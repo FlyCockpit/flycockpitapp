@@ -1844,12 +1844,7 @@ fn export_resume_repair_state_conn(conn: &Connection, target: &SessionRow) -> Op
     let provider = target.provider.clone().unwrap_or_default();
     let model = target.model.clone().unwrap_or_default();
     let providers = crate::secret_ref::load_effective(Path::new(&target.project_root));
-    let configured = providers.resolve_wire_api(&provider, &model);
-    let wire_api = if configured.is_auto() {
-        crate::config::providers::WireApi::detect_for_provider(&provider, &model)
-    } else {
-        configured
-    };
+    let wire_api = providers.resolve_wire_api(&provider, &model);
     if !matches!(wire_api, crate::config::providers::WireApi::Responses) {
         return None;
     }

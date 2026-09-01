@@ -1718,6 +1718,7 @@ fn native_chatgpt_model(redact: TestArc<RedactionTable>) -> Model {
                 value: "acc_123".to_string(),
             },
         ],
+        is_codex_credential: true,
     };
     build_chatgpt_model(
         "codex-oauth",
@@ -1750,6 +1751,7 @@ fn native_anthropic_model_at(
             name: "x-api-key".into(),
             value: "sk-test-anthropic".into(),
         }],
+        is_codex_credential: false,
     };
     build_anthropic_model(
         "anthropic",
@@ -1782,6 +1784,7 @@ fn native_anthropic_requires_x_api_key() {
     let resolved = ResolvedRequest {
         base_url: "http://127.0.0.1:1".to_string(),
         headers: vec![],
+        is_codex_credential: false,
     };
     let err = match build_anthropic_model(
         "anthropic",
@@ -2777,30 +2780,10 @@ fn assembled_request_carries_trailing_system_injection() {
 /// `api.anthropic.com` host (prompt `prompt-caching-strategy.md`). Claude
 /// served by any other host (OpenRouter, Copilot, a local proxy) stays on
 /// the OpenAI-compat path; an unparseable URL is never native.
+/// `build_model` routes solely on `wire_api`: URL and provider id do not alter
+/// the selected model arm.
 #[test]
-fn anthropic_native_selector_matches_only_the_anthropic_host() {
-    assert!(is_anthropic_native("https://api.anthropic.com/v1"));
-    assert!(is_anthropic_native("https://api.anthropic.com"));
-    // Case-insensitive host match.
-    assert!(is_anthropic_native("https://API.Anthropic.Com/v1"));
-    // Claude via other hosts → not native (OpenAI-compat path).
-    assert!(!is_anthropic_native("https://openrouter.ai/api/v1"));
-    assert!(!is_anthropic_native("https://api.githubcopilot.com"));
-    assert!(!is_anthropic_native("http://localhost:1234/v1"));
-    // A look-alike subdomain is not the native host.
-    assert!(!is_anthropic_native(
-        "https://api.anthropic.com.evil.test/v1"
-    ));
-    // Unparseable → never native.
-    assert!(!is_anthropic_native("not a url"));
-    assert!(!is_anthropic_native(""));
-}
-
-/// `build_model` routes the native Anthropic template (api.anthropic.com,
-/// `x-api-key`) to [`Model::Anthropic`], while a Claude-over-OpenRouter
-/// entry (same model id, different host) stays on [`Model::OpenAi`].
-#[test]
-fn build_model_routes_anthropic_host_to_native_arm() {
+fn build_model_routes_from_wire_api() {
     use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities};
 
     // Set the key the anthropic template reads so the build succeeds.
@@ -2833,7 +2816,7 @@ fn build_model_routes_anthropic_host_to_native_arm() {
         &crate::config::providers::TimeoutConfig::default(),
         false,
         ClientSideToolsCapability::default(),
-        crate::config::providers::WireApi::Auto,
+        crate::config::providers::WireApi::Anthropic,
         false,
         false,
         None,
@@ -2847,7 +2830,7 @@ fn build_model_routes_anthropic_host_to_native_arm() {
     .expect("native anthropic must build");
     assert!(
         matches!(model, Model::Anthropic { .. }),
-        "api.anthropic.com host must route to the native arm"
+        "Anthropic wire must route to the native arm"
     );
     assert_eq!(model.provider_label(), "anthropic");
     assert_eq!(model.model_id(), "claude-opus-4-8");
@@ -2869,7 +2852,7 @@ fn build_model_routes_anthropic_host_to_native_arm() {
         &crate::config::providers::TimeoutConfig::default(),
         false,
         ClientSideToolsCapability::default(),
-        crate::config::providers::WireApi::Auto,
+        crate::config::providers::WireApi::Completions,
         false,
         false,
         None,
@@ -2883,8 +2866,79 @@ fn build_model_routes_anthropic_host_to_native_arm() {
     .expect("openrouter must build");
     assert!(
         matches!(model, Model::OpenAi { .. }),
-        "non-anthropic host must stay on the OpenAI-compat arm"
+        "Chat Completions wire must route to the OpenAI-compatible arm"
     );
+}
+
+#[test]
+fn custom_provider_wire_api_selects_each_model_arm() {
+    use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities, WireApi};
+
+    let redact = std::sync::Arc::new(RedactionTable::empty());
+    let response_entry = ProviderEntry {
+        url: "https://subscription.example/v1".into(),
+        headers: vec![HeaderSpec {
+            name: "Authorization".into(),
+            value: "Bearer subscription-token".into(),
+        }],
+        ..ProviderEntry::default()
+    };
+    let response_model = build_model(
+        "my-subscription",
+        &response_entry,
+        "provider-model",
+        &CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Responses,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        redact.clone(),
+        redact.clone(),
+        |_| None,
+    )
+    .expect("custom Responses provider must build");
+    assert!(matches!(response_model, Model::ChatGpt { .. }));
+    assert_eq!(response_model.provider_label(), "my-subscription");
+
+    let anthropic_entry = ProviderEntry {
+        url: "https://subscription.example/v1".into(),
+        headers: vec![HeaderSpec {
+            name: "x-api-key".into(),
+            value: "subscription-token".into(),
+        }],
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(1024),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let anthropic_model = build_model(
+        "my-subscription",
+        &anthropic_entry,
+        "provider-model",
+        &CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        redact.clone(),
+        redact,
+        |_| None,
+    )
+    .expect("custom Anthropic provider must build");
+    assert!(matches!(anthropic_model, Model::Anthropic { .. }));
 }
 
 /// The OpenAI-compat path injects `prompt_cache_key` as a top-level key
@@ -4263,6 +4317,7 @@ fn resolved_local_request(base_url: String) -> crate::providers::models_fetch::R
     crate::providers::models_fetch::ResolvedRequest {
         base_url,
         headers: Vec::new(),
+        is_codex_credential: false,
     }
 }
 
@@ -4871,6 +4926,7 @@ fn outbound_guard_shared_by_dispatch_and_embedder() {
         crate::providers::models_fetch::ResolvedRequest {
             base_url: "http://127.0.0.1:1/v1".into(),
             headers: vec![],
+            is_codex_credential: false,
         },
         "text-embedding-3-small".into(),
         Some(3),
@@ -5143,20 +5199,58 @@ async fn approved_chat_404_retries_responses_and_captures_final_wire() {
 }
 
 #[test]
-fn resolve_live_endpoint_precedence_order() {
-    use crate::config::providers::{ModelEntry, WireApi};
+fn resolved_wire_api_ignores_runtime_endpoint_observations_and_confirmations() {
+    use crate::config::providers::WireApi;
+
     let _guard = endpoint_probe_test_guard();
     endpoint_probes().lock().unwrap().clear();
-    let resolved = resolved_local_request("http://localhost:1234/v1".to_string());
-    let model = build_openai_model_from_resolved(
+    let url = "http://localhost:1234/v1";
+    let model = openai_model_at_with_wire(url, WireApi::Completions, false);
+
+    record_endpoint_observation(
         "p",
-        &resolved,
-        "plain-model",
+        "m",
+        url,
+        WireApi::Responses,
+        EndpointObservation::Works,
+    );
+    model.confirm_wire_api_for_base_url(url, WireApi::Responses);
+
+    assert_eq!(
+        model.resolve_live_wire_api_for_base_url(url),
+        WireApi::Completions,
+        "the built model routes only from its resolved wire_api"
+    );
+}
+
+#[test]
+fn wire_api_change_requires_a_model_rebuild() {
+    use crate::config::providers::{CacheConfig, HeaderSpec, WireApi};
+
+    let url = "http://localhost:1234/v1";
+    let existing = openai_model_at_with_wire(url, WireApi::Completions, false);
+    assert_eq!(
+        existing.resolve_live_wire_api_for_base_url(url),
+        WireApi::Completions
+    );
+
+    let rebuilt = build_model(
+        "custom-responses",
+        &ProviderEntry {
+            url: url.into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer test-token".into(),
+            }],
+            ..ProviderEntry::default()
+        },
+        "m",
+        &CacheConfig::default(),
         &crate::config::providers::TimeoutConfig::default(),
         false,
         ClientSideToolsCapability::default(),
-        WireApi::Auto,
-        false,
+        WireApi::Responses,
+        true,
         false,
         None,
         0,
@@ -5164,101 +5258,14 @@ fn resolve_live_endpoint_precedence_order() {
         false,
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
+        |_| None,
     )
-    .unwrap();
+    .expect("Responses selection must rebuild into its dedicated model arm");
+    assert!(matches!(rebuilt, Model::ChatGpt { .. }));
     assert_eq!(
-        model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
-        WireApi::Completions
-    );
-
-    record_endpoint_observation(
-        "p",
-        "plain-model",
-        "http://localhost:1234/v1",
-        WireApi::Responses,
-        EndpointObservation::Works,
-    );
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
-        WireApi::Responses
-    );
-
-    model.confirm_wire_api_for_base_url("http://localhost:1234/v1", WireApi::Completions);
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
-        WireApi::Completions
-    );
-
-    let mut providers = ProvidersConfig::default();
-    providers.providers.insert(
-        "p".into(),
-        ProviderEntry {
-            url: "http://localhost:1234/v1".into(),
-            models: vec![ModelEntry {
-                id: "plain-model".into(),
-                wire_api: WireApi::Responses,
-                ..ModelEntry::default()
-            }],
-            ..ProviderEntry::default()
-        },
-    );
-    model.refresh_wire_api_config(&providers);
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
-        WireApi::Responses
-    );
-}
-
-#[test]
-fn live_catalog_endpoint_supersedes_stale_learned_endpoint() {
-    use crate::config::providers::ModelCapabilities;
-    let _guard = endpoint_probe_test_guard();
-    endpoint_probes().lock().unwrap().clear();
-    let url = "http://localhost:1234/v1";
-    let model = openai_model_at_with_wire(url, WireApi::Auto, false);
-
-    record_endpoint_observation(
-        "p",
-        "m",
-        url,
+        existing.resolve_live_wire_api_for_base_url(url),
         WireApi::Completions,
-        EndpointObservation::Works,
-    );
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url(url),
-        WireApi::Completions,
-        "the learned endpoint remains the best route before catalog metadata arrives"
-    );
-
-    let mut providers = ProvidersConfig::default();
-    providers.providers.insert(
-        "p".into(),
-        ProviderEntry {
-            url: url.into(),
-            models: vec![ModelEntry {
-                id: "m".into(),
-                capabilities: ModelCapabilities {
-                    supported_wire_apis: vec![WireApi::Responses],
-                    ..ModelCapabilities::default()
-                },
-                ..ModelEntry::default()
-            }],
-            ..ProviderEntry::default()
-        },
-    );
-    model.refresh_wire_api_config(&providers);
-
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url(url),
-        WireApi::Responses,
-        "live catalog metadata must supersede a stale learned endpoint"
-    );
-
-    model.confirm_wire_api_for_base_url(url, WireApi::Completions);
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url(url),
-        WireApi::Completions,
-        "a successful recovery remains authoritative for the current session"
+        "the prior model remains immutable until its owner swaps in the rebuilt model"
     );
 }
 
@@ -5289,8 +5296,8 @@ fn with_live_wire_api_preserves_session_confirmed_and_reseeds_config() {
     );
     assert_eq!(
         auto_rebuild.resolve_live_wire_api_for_base_url(url),
-        WireApi::Responses,
-        "removing the explicit pin lets the session confirmation resurface"
+        WireApi::Completions,
+        "a rebuilt model routes only from its resolved wire_api"
     );
 
     let chatgpt_donor = build_chatgpt_model(
@@ -5307,6 +5314,7 @@ fn with_live_wire_api_preserves_session_confirmed_and_reseeds_config() {
                     value: "acct-test".into(),
                 },
             ],
+            is_codex_credential: true,
         },
         "gpt-5",
         &crate::config::providers::TimeoutConfig::default(),
@@ -5663,52 +5671,6 @@ async fn explicit_wire_api_pin_wins_over_learned() {
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
-#[test]
-fn wire_api_config_change_applies_without_rebuild() {
-    use crate::config::providers::{ModelEntry, WireApi};
-    let resolved = resolved_local_request("http://localhost:1234/v1".to_string());
-    let model = build_openai_model_from_resolved(
-        "p",
-        &resolved,
-        "m",
-        &crate::config::providers::TimeoutConfig::default(),
-        false,
-        ClientSideToolsCapability::default(),
-        WireApi::Completions,
-        true,
-        false,
-        None,
-        0,
-        0,
-        false,
-        TestArc::new(RedactionTable::empty()),
-        TestArc::new(RedactionTable::empty()),
-    )
-    .unwrap();
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
-        WireApi::Completions
-    );
-    let mut providers = ProvidersConfig::default();
-    providers.providers.insert(
-        "p".into(),
-        ProviderEntry {
-            url: "http://localhost:1234/v1".into(),
-            models: vec![ModelEntry {
-                id: "m".into(),
-                wire_api: WireApi::Responses,
-                ..ModelEntry::default()
-            }],
-            ..ProviderEntry::default()
-        },
-    );
-    model.refresh_wire_api_config(&providers);
-    assert_eq!(
-        model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
-        WireApi::Responses
-    );
-}
-
 #[tokio::test]
 async fn declined_swap_does_not_confirm_or_pin() {
     use crate::config::providers::WireApi;
@@ -5775,7 +5737,10 @@ async fn declined_swap_does_not_confirm_or_pin() {
     );
     assert_eq!(model.confirmed_wire_api_for_base_url(&url), None);
     let doc = crate::config::providers::ConfigDoc::load(&path).unwrap();
-    assert_eq!(doc.providers().resolve_wire_api("p", "m"), WireApi::Auto);
+    assert_eq!(
+        doc.providers().resolve_wire_api("p", "m"),
+        WireApi::Completions
+    );
 }
 
 #[tokio::test]
@@ -6384,7 +6349,10 @@ async fn utility_never_prompts_or_pins() {
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(model.confirmed_wire_api_for_base_url(&url), None);
     let doc = crate::config::providers::ConfigDoc::load(&path).unwrap();
-    assert_eq!(doc.providers().resolve_wire_api("p", "m"), WireApi::Auto);
+    assert_eq!(
+        doc.providers().resolve_wire_api("p", "m"),
+        WireApi::Completions
+    );
 }
 
 #[tokio::test]
@@ -6657,10 +6625,17 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     let mut provider = anthropic_capture_provider().await;
     let resolved = ResolvedRequest {
         base_url: provider.base_url(),
-        headers: vec![ResolvedHeader {
-            name: "x-api-key".to_string(),
-            value: "anthropic-key".to_string(),
-        }],
+        headers: vec![
+            ResolvedHeader {
+                name: "x-api-key".to_string(),
+                value: "anthropic-key".to_string(),
+            },
+            ResolvedHeader {
+                name: "Authorization".to_string(),
+                value: "Bearer gateway-token".to_string(),
+            },
+        ],
+        is_codex_credential: false,
     };
     let model = build_anthropic_model(
         "anthropic",
@@ -6685,6 +6660,10 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     assert_eq!(
         request_header_value(&request.headers, "user-agent"),
         Some(crate::user_agent::user_agent())
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "authorization"),
+        Some("Bearer gateway-token")
     );
 }
 
@@ -6722,6 +6701,7 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
                 value: "resolver-session-id".to_string(),
             },
         ],
+        is_codex_credential: true,
     };
     let model = build_chatgpt_model(
         "codex-oauth",
@@ -6795,7 +6775,9 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
         request_header_value(&request.headers, "content-type"),
         Some("application/json")
     );
-    assert!(request_header_value(&request.headers, "session_id").is_some());
+    let session_id = request_header_value(&request.headers, "session_id")
+        .expect("Rig must generate a session_id for every request");
+    assert_ne!(session_id, "resolver-session-id");
 
     let body = request.body;
     assert_eq!(body["model"], json!("gpt-5-codex"));
@@ -6821,42 +6803,96 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
     );
 }
 
-#[test]
-fn stale_codex_openai_compatible_config_gets_corrective_error() {
+#[tokio::test]
+async fn non_codex_responses_wire_omits_codex_headers() {
+    use crate::config::providers::{CacheConfig, HeaderSpec, WireApi};
+
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::Responses)
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
     let entry = ProviderEntry {
-        url: crate::auth::codex_oauth::DEFAULT_BASE_URL.to_string(),
-        auth: Some(crate::config::providers::AuthKind::OAuth),
+        url: provider.base_url(),
+        headers: vec![
+            HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer subscription-token".into(),
+            },
+            // These names alone must not make a custom credential look like
+            // Codex OAuth to the Responses builder.
+            HeaderSpec {
+                name: "chatgpt-account-id".into(),
+                value: "spoofed-account".into(),
+            },
+            HeaderSpec {
+                name: "originator".into(),
+                value: "spoofed-originator".into(),
+            },
+            HeaderSpec {
+                name: "OpenAI-Beta".into(),
+                value: "spoofed-beta".into(),
+            },
+            HeaderSpec {
+                name: "session_id".into(),
+                value: "spoofed-session".into(),
+            },
+        ],
         ..ProviderEntry::default()
     };
-    let result = build_model(
-        "openai-compatible",
+    let redact = TestArc::new(RedactionTable::empty());
+    let model = build_model(
+        "custom-subscription",
         &entry,
-        "gpt-5-codex",
-        &crate::config::providers::CacheConfig::default(),
+        "provider-model",
+        &CacheConfig::default(),
         &crate::config::providers::TimeoutConfig::default(),
         false,
         ClientSideToolsCapability::default(),
-        crate::config::providers::WireApi::Responses,
-        false,
+        WireApi::Responses,
+        true,
         false,
         None,
         0,
         0,
         false,
-        TestArc::new(RedactionTable::empty()),
-        TestArc::new(RedactionTable::empty()),
+        redact.clone(),
+        redact,
         |_| None,
-    );
-    assert!(
-        result.is_err(),
-        "stale config should fail before auth resolution"
-    );
-    let msg = result.err().unwrap().to_string();
-    assert!(
-        msg.contains("generic `openai-compatible` provider"),
-        "{msg}"
-    );
-    assert!(msg.contains("codex-oauth"), "{msg}");
+    )
+    .expect("custom Responses provider must build");
+    assert!(matches!(model, Model::ChatGpt { .. }));
+    assert_eq!(model.provider_label(), "custom-subscription");
+
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    model
+        .complete_captured(
+            "system",
+            &[],
+            Message::user("hi"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("custom Responses request must complete");
+
+    let request = provider.next_request().await;
+    for header in [
+        "chatgpt-account-id",
+        "originator",
+        "openai-beta",
+        "session_id",
+    ] {
+        assert_eq!(
+            request_header_value(&request.headers, header),
+            None,
+            "{header}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6880,6 +6916,7 @@ async fn openai_compatible_dispatch_sends_canonical_user_agent_and_resolved_extr
                 value: "cockpit".to_string(),
             },
         ],
+        is_codex_credential: false,
     };
     let model = build_openai_model_from_resolved(
         "codex-oauth",

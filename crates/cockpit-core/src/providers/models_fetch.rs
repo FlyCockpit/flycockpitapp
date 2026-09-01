@@ -72,6 +72,10 @@ impl fmt::Debug for ResolvedHeader {
 pub struct ResolvedRequest {
     pub base_url: String,
     pub headers: Vec<ResolvedHeader>,
+    /// True only when Cockpit resolved a Codex OAuth credential for this
+    /// request. Header names are request data and must not be used to infer
+    /// credential ownership.
+    pub(crate) is_codex_credential: bool,
     #[cfg(not(test))]
     pub(crate) origin: ResolvedProviderOrigin,
 }
@@ -81,7 +85,8 @@ impl fmt::Debug for ResolvedRequest {
         let mut debug = f.debug_struct("ResolvedRequest");
         debug
             .field("base_url", &self.base_url)
-            .field("headers", &self.headers);
+            .field("headers", &self.headers)
+            .field("is_codex_credential", &self.is_codex_credential);
         #[cfg(not(test))]
         debug.field("origin", &self.origin);
         debug.finish()
@@ -477,6 +482,7 @@ fn resolve_provider_request_inner_with_sources(
         );
     }
 
+    let is_codex_credential = matches!(&oauth_credential, Some(OAuthCredential::Codex(_)));
     if let Some(credential) = oauth_credential {
         let token = credential.access_token().to_string();
         headers.push(ResolvedHeader {
@@ -500,10 +506,6 @@ fn resolve_provider_request_inner_with_sources(
             headers.push(ResolvedHeader {
                 name: "OpenAI-Beta".to_string(),
                 value: "responses=experimental".to_string(),
-            });
-            headers.push(ResolvedHeader {
-                name: "session_id".to_string(),
-                value: uuid::Uuid::new_v4().to_string(),
             });
         }
     } else if let Some(auth) = auth_header {
@@ -550,6 +552,7 @@ fn resolve_provider_request_inner_with_sources(
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, env_lookup)?,
         headers,
+        is_codex_credential,
         #[cfg(not(test))]
         origin,
     })
@@ -595,6 +598,7 @@ pub(crate) fn resolve_codex_model_list_request(
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, false, lookup)?,
         headers,
+        is_codex_credential: true,
         #[cfg(not(test))]
         origin: ProviderRegistry::standard().resolve_origin(provider_id, entry)?,
     })
@@ -2614,6 +2618,7 @@ mod tests {
                 name: "Authorization".into(),
                 value: "Bearer fixture-secret-token".into(),
             }],
+            is_codex_credential: false,
         };
 
         let rendered = format!("{resolved:?}");
@@ -2875,7 +2880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_oauth_async_resolver_injects_stored_bearer_and_codex_headers() {
+    async fn codex_oauth_async_resolver_marks_credential_and_injects_codex_headers() {
         let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
         env.set_var("XDG_STATE_HOME", tmp.path());
@@ -2929,11 +2934,13 @@ mod tests {
                 .any(|h| h.name.eq_ignore_ascii_case("OpenAI-Beta")
                     && h.value == "responses=experimental")
         );
+        assert!(resolved.is_codex_credential);
         assert!(
-            resolved
+            !resolved
                 .headers
                 .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("session_id") && !h.value.is_empty())
+                .any(|h| h.name.eq_ignore_ascii_case("session_id")),
+            "Rig owns the per-request session_id"
         );
     }
 
@@ -3220,6 +3227,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
 
             let outcome = fetch_models_for_provider_with_store(
@@ -3285,6 +3293,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
@@ -3316,6 +3325,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let outcome = fetch_models_for_provider_with_store(
@@ -3357,6 +3367,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
 
             let err = fetch_models_for_provider_with_store(
@@ -3386,6 +3397,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let err = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
@@ -3419,6 +3431,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
@@ -3693,6 +3706,7 @@ mod tests {
                 name: "Authorization".into(),
                 value: "Bearer bt-test".into(),
             }],
+            is_codex_credential: false,
         };
 
         let outcome =
@@ -3769,6 +3783,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -3966,6 +3981,7 @@ mod tests {
                     name: "Authorization".into(),
                     value: "Bearer SECRETKEY".into(),
                 }],
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -4002,6 +4018,7 @@ mod tests {
                     name: "Authorization".into(),
                     value: "Bearer SECRETKEY".into(),
                 }],
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -4032,6 +4049,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -4063,6 +4081,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_millis(50))
@@ -4090,6 +4109,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(2))

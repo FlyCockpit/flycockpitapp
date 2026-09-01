@@ -2788,6 +2788,9 @@ CREATE INDEX packages_source_url ON packages(source_url);
 --     millisecond resolution. The `type` discriminant aligns with the
 --     engine `TurnEvent` vocabulary; per-type fields ride in `data_json`
 --     so the schema stays stable as the event set grows.
+--     Rows are append-only except for the atomic cancel-before-response
+--     retraction of the latest user_message. AUTOINCREMENT is intentionally
+--     retained: removed ids are never reused, preserving replay cursors.
 
 -- One row per DISPATCHED TARGET ATTEMPT of a logical inference call. The
 -- primary attempt is ordinal 0; each backup/failover attempt shares the logical

@@ -202,6 +202,13 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 preflight_cleaned,
             }]
         }
+        TurnEvent::UserMessageRemoved { seq, text } => {
+            vec![Event::UserMessageRemoved {
+                session_id,
+                seq,
+                text,
+            }]
+        }
         TurnEvent::QueuedUserMessagesFolded {
             text,
             display_text,

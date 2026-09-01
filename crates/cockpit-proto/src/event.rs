@@ -960,6 +960,14 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preflight_cleaned: Option<String>,
     },
+    /// The latest durable user message was removed because its directly
+    /// answering assistant turn was cancelled before visible text or a tool
+    /// call. `text` is the authored composer draft clients restore.
+    UserMessageRemoved {
+        session_id: Uuid,
+        seq: i64,
+        text: String,
+    },
     /// One or more daemon-queued user messages were drained and folded into a
     /// model request. Carries stable queue ids plus the persisted timeline seq
     /// when the session log write succeeded.
@@ -1733,6 +1741,7 @@ macro_rules! event_variants {
             (Event::AssistantDisplayError { .. }, "assistant_display_error");
             (Event::AssistantText { .. }, "assistant_text");
             (Event::UserMessageRecorded { .. }, "user_message_recorded");
+            (Event::UserMessageRemoved { .. }, "user_message_removed");
             (Event::QueuedUserMessagesFolded { .. }, "queued_user_messages_folded");
             (Event::SessionPersistFailed { .. }, "session_persist_failed");
             (Event::SessionDriverFailed { .. }, "session_driver_failed");

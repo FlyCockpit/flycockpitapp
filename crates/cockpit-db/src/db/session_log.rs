@@ -1374,6 +1374,38 @@ impl Db {
             .await
     }
 
+    /// Remove exactly the latest user event in a session when it is the named
+    /// message. This is the sole narrow exception to the append-only ledger:
+    /// the caller has proved that the directly answering turn emitted neither
+    /// response text nor a tool call. The predicate and delete are one SQL
+    /// statement so a concurrent newer human message makes it lose safely.
+    pub async fn remove_latest_user_message(
+        &self,
+        session_id: Uuid,
+        seq: i64,
+    ) -> Result<bool> {
+        self.write(move |conn| {
+            let removed = conn
+                .execute(
+                    "DELETE FROM session_events
+                      WHERE session_id = ?1
+                        AND seq = ?2
+                        AND type = 'user_message'
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM session_events AS newer
+                             WHERE newer.session_id = ?1
+                               AND newer.type = 'user_message'
+                               AND newer.seq > ?2
+                        )",
+                    params![session_id.to_string(), seq],
+                )
+                .context("removing latest retractable user message")?;
+            Ok(removed == 1)
+        })
+        .await
+    }
+
     /// Return the durable user-message row for a client idempotency key.
     /// One folded row can represent multiple accepted submissions.
     pub async fn client_submission_receipt(
@@ -2012,6 +2044,79 @@ fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retract_removes_only_the_latest_user_message_without_reusing_seq() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let first = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "first"}),
+            )
+            .await
+            .unwrap();
+        let notice = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::Notice,
+                Some("Build"),
+                None,
+                &json!({"text": "display-only"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            db.remove_latest_user_message(session.session_id, first)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.list_session_events(session.session_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![notice]
+        );
+        let resent = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "first"}),
+            )
+            .await
+            .unwrap();
+        assert!(resent > notice, "AUTOINCREMENT replay cursors must stay monotonic");
+
+        let newer = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "newer"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.remove_latest_user_message(session.session_id, resent)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.remove_latest_user_message(session.session_id, newer)
+                .await
+                .unwrap()
+        );
+    }
     use serde_json::json;
 
     fn hook_audit(status: HookRunStatus) -> HookRunAudit {

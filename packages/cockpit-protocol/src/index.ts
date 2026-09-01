@@ -2739,6 +2739,7 @@ export const knownEventKindSchema = z.enum([
   "tool_start",
   "usage",
   "user_message_recorded",
+  "user_message_removed",
   "user_message_retracted",
   "user_messages_terminated",
   "waiting_for_lock",
@@ -2845,6 +2846,13 @@ const userMessageRecordedDataSchema = z
     seq: safeI64NumberSchema,
     client_submission_ids: z.array(uuidSchema),
     preflight_cleaned: z.string().nullable().optional(),
+  })
+  .passthrough();
+const userMessageRemovedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    seq: safeI64NumberSchema,
+    text: z.string(),
   })
   .passthrough();
 export const userMessageTerminalDispositionSchema = z.enum([
@@ -3019,6 +3027,7 @@ const structuredEventDataSchemas = {
   queued_user_messages_folded: queuedUserMessagesFoldedDataSchema,
   session_persist_failed: sessionPersistFailedDataSchema,
   user_message_recorded: userMessageRecordedDataSchema,
+  user_message_removed: userMessageRemovedDataSchema,
   user_message_retracted: correlatedPreflightDataSchema,
   user_messages_terminated: userMessagesTerminatedDataSchema,
   workspace_trust_reconciliation: workspaceTrustReconciliationDataSchema,

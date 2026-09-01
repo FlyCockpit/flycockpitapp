@@ -1294,6 +1294,9 @@ impl RunOutcome {
                 // terminal event after this submitted message can finish it.
                 self.terminal_seen = false;
             }
+            proto::Event::UserMessageRemoved { .. } => {
+                self.message_recorded = false;
+            }
             proto::Event::ThinkingStarted { .. } => {
                 self.inference_dispatched = true;
                 self.terminal_failure = false;
@@ -1764,6 +1767,9 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
         proto::Event::UserMessageRecorded { seq, .. } => {
             json!({ "event": "user_message_recorded", "session_id": session_id, "seq": seq })
         }
+        proto::Event::UserMessageRemoved { seq, text, .. } => {
+            json!({ "event": "user_message_removed", "session_id": session_id, "seq": seq, "text": text })
+        }
         proto::Event::ToolStart {
             agent,
             call_id,
@@ -1973,6 +1979,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AssistantDisplayError { session_id, .. }
         | AssistantText { session_id, .. }
         | UserMessageRecorded { session_id, .. }
+        | UserMessageRemoved { session_id, .. }
         | QueuedUserMessagesFolded { session_id, .. }
         | SessionPersistFailed { session_id, .. }
         | SessionDriverFailed { session_id, .. }

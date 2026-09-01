@@ -55,9 +55,8 @@ pub(crate) struct VerificationInferenceInput<'a> {
     pub agent_name: &'a str,
     pub site: UtilityCallSite,
     pub cancel: &'a tokio_util::sync::CancellationToken,
-    /// Set at the model's irreversible provider-stream handoff. Callers which
-    /// need to distinguish a pre-dispatch refusal from a provider inference
-    /// attempt use this only as an execution fact, never as an outcome signal.
+    /// Set once the model has successfully established its provider stream.
+    /// Callers use this as an execution fact, never as a completion signal.
     pub provider_handoff: Option<&'a AtomicBool>,
     /// Optional caller-owned absolute deadline. The inference barrier owns
     /// the timeout so a deadline cannot drop a provider future while leaving

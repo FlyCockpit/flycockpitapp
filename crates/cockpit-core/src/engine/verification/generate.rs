@@ -181,11 +181,42 @@ fn candidate_is_adjudicable(
         && matches!(accepted, Ok(CandidateTransitionOutcome::Transitioned))
 }
 
-async fn collect_one_candidate(
+/// The complete first-turn request materialization. Dispatch consumes this
+/// snapshot rather than reassembling after a warm request, when workspace
+/// inputs may have changed.
+struct PreparedGeneratorCandidate<'a> {
+    index: usize,
+    spec: &'a GeneratorSpec,
+    model: Model,
+    prompt: String,
+    initial_history: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+    params: crate::engine::model::ModelParams,
+    reservation_body: String,
+    cacheable_request_prefix: String,
+}
+
+struct CandidateExecution {
+    candidate: Option<CollectedCandidate>,
+    /// Stronger than a stream poll: a successful generator run has completed
+    /// the request that may populate the provider cache.
+    completed_provider_request: bool,
+}
+
+impl CandidateExecution {
+    fn not_dispatched() -> Self {
+        Self {
+            candidate: None,
+            completed_provider_request: false,
+        }
+    }
+}
+
+async fn prepare_generator_candidate<'spec>(
     input: &CollectionInput<'_>,
-    spec: &GeneratorSpec,
-    provider_handoff: Option<&AtomicBool>,
-) -> Result<Option<CollectedCandidate>> {
+    index: usize,
+    spec: &'spec GeneratorSpec,
+) -> Result<Option<PreparedGeneratorCandidate<'spec>>> {
     let guidance_names = input.ctx.config.extended().agent_guidance_files.clone();
     let target = input
         .args
@@ -200,7 +231,6 @@ async fn collect_one_candidate(
             }
         });
     let target_ref = target.as_deref();
-    let placeholder = input.ctx.redact.placeholder().to_string();
     if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
         return Ok(None);
     }
@@ -264,11 +294,52 @@ async fn collect_one_candidate(
     else {
         return Ok(None);
     };
-    let reservation_digest = VerificationDigest::of(reservation_body.as_bytes());
+    let params = if inherit_uses_author_context(spec, same_as_author) {
+        input.agent.params.clone()
+    } else {
+        crate::engine::model::ModelParams::default()
+    };
+    // This is the full first-turn system/history/prompt/tool surface, plus
+    // endpoint identity and parameters. Conservative equality is intentional:
+    // a false split only loses an optimization; a false match corrupts it.
+    let cacheable_request_prefix = serde_json::to_string(&serde_json::json!({
+        // A slot is a custody boundary even when two slots happen to resolve
+        // to the same configured provider/model today.
+        "slot": &spec.slot,
+        "provider": generator_model.provider_id(),
+        "model": generator_model.model_id_ref(),
+        "request": &reservation_body,
+        "params": format!("{params:?}"),
+    }))?;
+    Ok(Some(PreparedGeneratorCandidate {
+        index,
+        spec,
+        model: generator_model,
+        prompt: assembled.prompt,
+        initial_history: initial_history.to_vec(),
+        tools,
+        params,
+        reservation_body,
+        cacheable_request_prefix,
+    }))
+}
+
+async fn collect_one_candidate(
+    input: &CollectionInput<'_>,
+    candidate: &PreparedGeneratorCandidate<'_>,
+    provider_handoff: Option<&AtomicBool>,
+) -> Result<CandidateExecution> {
+    let placeholder = input.ctx.redact.placeholder().to_string();
+    if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
+        return Ok(CandidateExecution::not_dispatched());
+    }
+    let spec = candidate.spec;
+    let generator_model = &candidate.model;
+    let reservation_digest = VerificationDigest::of(candidate.reservation_body.as_bytes());
     let prices = crate::db::stats::PriceTable::load_default();
     let price = super::estimate::model_prices(&prices, generator_model.model_id_ref());
     let reservation = super::estimate::estimate_multi_turn_candidate(
-        &reservation_body,
+        &candidate.reservation_body,
         super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
         price.map(|price| price.0),
         price.map(|price| price.1),
@@ -299,7 +370,7 @@ async fn collect_one_candidate(
         .await
     {
         Ok(row) => row,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(CandidateExecution::not_dispatched()),
     };
     let Ok(running) = input
         .session
@@ -315,26 +386,27 @@ async fn collect_one_candidate(
         )
         .await
     else {
-        return Ok(None);
+        return Ok(CandidateExecution::not_dispatched());
     };
     if running != CandidateTransitionOutcome::Transitioned {
-        return Ok(None);
+        return Ok(CandidateExecution::not_dispatched());
     }
     let generated = if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
         GenerationOutcome::TimedOut
     } else {
         generate_with_turns(
             input,
-            &generator_model,
+            generator_model,
             spec,
-            &assembled.prompt,
-            same_as_author,
+            candidate,
             reservation_tokens,
             reserved_cost,
             provider_handoff,
         )
         .await
     };
+    let completed_provider_request = matches!(generated, GenerationOutcome::Answer(_))
+        && provider_handoff.is_some_and(|handoff| handoff.load(Ordering::Acquire));
     let (mut answer, forced_terminal) = materialize_generation(generated);
     // Candidate arguments cross the same schema-repair/path-normalization
     // boundary as an authored call before they can become adjudicable.
@@ -405,7 +477,10 @@ async fn collect_one_candidate(
                     now,
                 )
                 .await;
-            return Ok(None);
+            return Ok(CandidateExecution {
+                candidate: None,
+                completed_provider_request,
+            });
         }
     };
     let accepted = input
@@ -421,30 +496,36 @@ async fn collect_one_candidate(
             now + 2,
         )
         .await;
-    Ok(
-        candidate_is_adjudicable(terminal, &accepted).then_some(CollectedCandidate {
+    Ok(CandidateExecution {
+        candidate: candidate_is_adjudicable(terminal, &accepted).then_some(CollectedCandidate {
             candidate_id: reserved.candidate_id,
             answer,
         }),
-    )
+        completed_provider_request,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CandidateDispatchPlan {
     scheduled_mode: VerificationCandidateDispatch,
     warm_candidate: Option<usize>,
-    /// Requests which follow a completed warm request and therefore carry this
-    /// group's proven shared prefix as provider cache reads.
-    cache_read_candidates: Vec<usize>,
 }
 
-/// Every first-turn cache-prefix input is derived from the collection input
-/// shared by all candidates plus the complete generator spec: the slot selects
-/// the endpoint, the recipe selects prompt/history material, and `max_turns`
-/// constrains the advertised tool surface and turn contract. This deliberately
-/// conservative equivalence may split otherwise cacheable requests, but never
-/// warms one request for a sibling with unequal prefix inputs.
-fn shares_cacheable_request_prefix(first: &GeneratorSpec, second: &GeneratorSpec) -> bool {
+/// Equivalence is based on each candidate's immutable, realized first-turn
+/// request snapshot, not merely its declarative generator spec. A matching
+/// spec can otherwise observe changed guidance, linked files, targets, or
+/// curated read history while its sibling is warming.
+fn shares_cacheable_request_prefix(
+    first: &PreparedGeneratorCandidate<'_>,
+    second: &PreparedGeneratorCandidate<'_>,
+) -> bool {
+    shares_realized_cacheable_request_prefix(
+        &first.cacheable_request_prefix,
+        &second.cacheable_request_prefix,
+    )
+}
+
+fn shares_realized_cacheable_request_prefix(first: &str, second: &str) -> bool {
     first == second
 }
 
@@ -460,46 +541,33 @@ fn candidate_dispatch_plan(
         CandidateDispatchPlan {
             scheduled_mode: VerificationCandidateDispatch::WarmThenFanout,
             warm_candidate: candidates.first().copied(),
-            cache_read_candidates: candidates[1..].to_vec(),
         }
     } else {
         CandidateDispatchPlan {
             scheduled_mode: VerificationCandidateDispatch::Parallel,
             warm_candidate: None,
-            cache_read_candidates: Vec::new(),
         }
     }
 }
 
-async fn slot_supports_observed_cache_hits(
+fn slot_supports_observed_cache_hits(
     input: &CollectionInput<'_>,
-    spec: &GeneratorSpec,
+    candidate: &PreparedGeneratorCandidate<'_>,
 ) -> bool {
-    let model = if input.profile_snapshot_id.is_nil() {
-        input.agent.model.clone()
-    } else {
-        let Ok(model) = super::models::resolve_profile_utility_model(
-            input.session,
-            input.ctx,
-            input.profile_snapshot_id,
-            &spec.slot,
-        )
-        .await
-        else {
-            return false;
-        };
-        model
-    };
     cache_warm_is_eligible(
         input
             .ctx
             .config
             .providers()
-            .resolve_cache(model.provider_id(), model.model_id_ref())
+            .resolve_cache(
+                candidate.model.provider_id(),
+                candidate.model.model_id_ref(),
+            )
             .mode,
-        input
-            .session
-            .has_observed_cache_hit_for_endpoint(model.provider_id(), model.model_id_ref()),
+        input.session.has_observed_cache_hit_for_endpoint(
+            candidate.model.provider_id(),
+            candidate.model.model_id_ref(),
+        ),
     )
 }
 
@@ -509,66 +577,113 @@ fn cache_warm_is_eligible(cache_mode: CacheMode, observed_cache_hit: bool) -> bo
 
 fn completed_dispatch_mode(
     plan: &CandidateDispatchPlan,
-    warm_reached_provider: bool,
+    warm_completed_provider_request: bool,
 ) -> VerificationCandidateDispatch {
-    if plan.warm_candidate.is_some() && warm_reached_provider {
+    if plan.warm_candidate.is_some() && warm_completed_provider_request {
         VerificationCandidateDispatch::WarmThenFanout
     } else {
         VerificationCandidateDispatch::Parallel
     }
 }
 
+fn dispatched_cache_read_count(
+    actual_mode: VerificationCandidateDispatch,
+    fanout_provider_handoffs: impl IntoIterator<Item = bool>,
+) -> usize {
+    if actual_mode == VerificationCandidateDispatch::WarmThenFanout {
+        fanout_provider_handoffs
+            .into_iter()
+            .filter(|reached_provider| *reached_provider)
+            .count()
+    } else {
+        0
+    }
+}
+
 async fn collect_dispatch_group(
     input: &CollectionInput<'_>,
     slot: &str,
-    candidates: Vec<(usize, &GeneratorSpec)>,
+    candidates: &[PreparedGeneratorCandidate<'_>],
     plan: &CandidateDispatchPlan,
 ) -> Result<CollectedDispatchGroup> {
     let mut collected = Vec::new();
     let candidate_count = candidates.len();
-    let provider_handoff = AtomicBool::new(false);
     if let Some(warm_index) = plan.warm_candidate {
-        let (index, spec) = candidates
+        let warm = candidates
             .iter()
-            .find(|(index, _)| *index == warm_index)
+            .find(|candidate| candidate.index == warm_index)
             .expect("warm candidate must belong to its dispatch group");
-        if let Some(candidate) = collect_one_candidate(input, spec, Some(&provider_handoff)).await?
-        {
-            collected.push((*index, candidate));
+        let warm_handoff = AtomicBool::new(false);
+        let warm_execution = collect_one_candidate(input, warm, Some(&warm_handoff)).await?;
+        if let Some(candidate) = warm_execution.candidate {
+            collected.push((warm_index, candidate));
         }
+        let fanout = candidates
+            .iter()
+            .filter(|candidate| candidate.index != warm_index)
+            .collect::<Vec<_>>();
+        // Each sibling gets its own execution observation. Planned fan-out is
+        // not telemetry: deadline, model, budget, and ledger gates can refuse
+        // a sibling before its first provider request.
+        let fanout_handoffs = fanout
+            .iter()
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>();
+        for result in join_all(fanout.iter().zip(fanout_handoffs.iter()).map(
+            |(candidate, handoff)| async move {
+                Ok::<_, anyhow::Error>((
+                    candidate.index,
+                    collect_one_candidate(input, candidate, Some(handoff)).await?,
+                ))
+            },
+        ))
+        .await
+        {
+            let (index, execution) = result?;
+            if let Some(candidate) = execution.candidate {
+                collected.push((index, candidate));
+            }
+        }
+        let actual_mode = completed_dispatch_mode(plan, warm_execution.completed_provider_request);
+        let cache_read_candidate_count = dispatched_cache_read_count(
+            actual_mode,
+            fanout_handoffs
+                .iter()
+                .map(|handoff| handoff.load(Ordering::Acquire)),
+        );
+        return Ok(CollectedDispatchGroup {
+            collected,
+            telemetry: serde_json::json!({
+                "slot": slot,
+                "actual_mode": match actual_mode {
+                    VerificationCandidateDispatch::Parallel => "parallel",
+                    VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
+                },
+                "candidate_count": candidate_count,
+                "cache_read_candidate_count": cache_read_candidate_count,
+            }),
+        });
     }
-    let warmed_provider_cache = provider_handoff.load(Ordering::Acquire);
-    let fanout = candidates
-        .into_iter()
-        .filter(|(index, _)| plan.warm_candidate != Some(*index));
-    for result in join_all(fanout.map(|(index, spec)| async move {
-        Ok::<_, anyhow::Error>(
-            collect_one_candidate(input, spec, None)
-                .await?
-                .map(|candidate| (index, candidate)),
-        )
+    for result in join_all(candidates.iter().map(|candidate| async move {
+        Ok::<_, anyhow::Error>((
+            candidate.index,
+            collect_one_candidate(input, candidate, None).await?,
+        ))
     }))
     .await
     {
-        if let Some(candidate) = result? {
-            collected.push(candidate);
+        let (index, execution) = result?;
+        if let Some(candidate) = execution.candidate {
+            collected.push((index, candidate));
         }
     }
-    let actual_mode = completed_dispatch_mode(plan, warmed_provider_cache);
     Ok(CollectedDispatchGroup {
         collected,
         telemetry: serde_json::json!({
             "slot": slot,
-            "actual_mode": match actual_mode {
-                VerificationCandidateDispatch::Parallel => "parallel",
-                VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
-            },
+            "actual_mode": "parallel",
             "candidate_count": candidate_count,
-            "cache_read_candidate_count": if actual_mode == VerificationCandidateDispatch::WarmThenFanout {
-                plan.cache_read_candidates.len()
-            } else {
-                0
-            },
+            "cache_read_candidate_count": 0,
         }),
     })
 }
@@ -603,39 +718,50 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         .len()
         .min(usize::from(input.max_candidates))
         .min(usize::from(crate::agents::MAX_VERIFICATION_CANDIDATES));
-    let mut groups = Vec::<Vec<(usize, &GeneratorSpec)>>::new();
-    for (index, spec) in input
-        .generators
-        .iter()
-        .take(effective_candidate_count)
-        .enumerate()
+    let mut prepared = Vec::with_capacity(effective_candidate_count);
+    for candidate in join_all(
+        input
+            .generators
+            .iter()
+            .take(effective_candidate_count)
+            .enumerate()
+            .map(|(index, spec)| prepare_generator_candidate(input, index, spec)),
+    )
+    .await
     {
+        if let Some(candidate) = candidate? {
+            prepared.push(candidate);
+        }
+    }
+
+    let mut groups = Vec::<Vec<PreparedGeneratorCandidate<'_>>>::new();
+    for candidate in prepared {
         if let Some(group) = groups.iter_mut().find(|group| {
             group
                 .first()
-                .is_some_and(|(_, first)| shares_cacheable_request_prefix(first, spec))
+                .is_some_and(|first| shares_cacheable_request_prefix(first, &candidate))
         }) {
-            group.push((index, spec));
+            group.push(candidate);
         } else {
-            groups.push(vec![(index, spec)]);
+            groups.push(vec![candidate]);
         }
     }
 
     let mut scheduled = Vec::with_capacity(groups.len());
     for candidates in groups {
         let supports_cache = match candidates.first() {
-            Some((_, spec)) => slot_supports_observed_cache_hits(input, spec).await,
+            Some(candidate) => slot_supports_observed_cache_hits(input, candidate),
             None => false,
         };
         let indices = candidates
             .iter()
-            .map(|(index, _)| *index)
+            .map(|candidate| candidate.index)
             .collect::<Vec<_>>();
         let plan = candidate_dispatch_plan(input.candidate_dispatch, &indices, supports_cache);
         let slot = candidates
             .first()
             .expect("dispatch group must contain at least one candidate")
-            .1
+            .spec
             .slot
             .clone();
         scheduled.push((slot, candidates, plan));
@@ -643,9 +769,11 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
 
     let mut indexed = Vec::new();
     let mut telemetry = Vec::with_capacity(scheduled.len());
-    for group in join_all(scheduled.iter().map(|(slot, candidates, plan)| {
-        collect_dispatch_group(input, slot, candidates.clone(), plan)
-    }))
+    for group in join_all(
+        scheduled
+            .iter()
+            .map(|(slot, candidates, plan)| collect_dispatch_group(input, slot, candidates, plan)),
+    )
     .await
     {
         let group = group?;
@@ -806,8 +934,7 @@ async fn generate_with_turns(
     input: &CollectionInput<'_>,
     model: &Model,
     spec: &GeneratorSpec,
-    prompt: &str,
-    same_as_author: bool,
+    candidate: &PreparedGeneratorCandidate<'_>,
     reserved_tokens: u64,
     reserved_cost_microusd: u64,
     provider_handoff: Option<&AtomicBool>,
@@ -816,17 +943,9 @@ async fn generate_with_turns(
         .max_turns
         .max(1)
         .min(crate::agents::MAX_GENERATOR_TURNS);
-    let mut private_history = if inherit_uses_author_context(spec, same_as_author) {
-        input.history.to_vec()
-    } else {
-        Vec::new()
-    };
-    let tools = generator_tools(input, spec, same_as_author);
-    let params = if inherit_uses_author_context(spec, same_as_author) {
-        input.agent.params.clone()
-    } else {
-        crate::engine::model::ModelParams::default()
-    };
+    let mut private_history = candidate.initial_history.clone();
+    let tools = &candidate.tools;
+    let params = &candidate.params;
     let prices = crate::db::stats::PriceTable::load_default();
     let price = super::estimate::model_prices(&prices, model.model_id_ref());
     let encoding = super::estimate::encoding_for_model_id(model.model_id_ref());
@@ -838,7 +957,9 @@ async fn generate_with_turns(
         if let Some(answer) = take_override_answer() {
             return GenerationOutcome::Answer(answer);
         }
-        let Ok(turn_body) = generator_budget_text(model, prompt, &private_history, &tools) else {
+        let Ok(turn_body) =
+            generator_budget_text(model, &candidate.prompt, &private_history, tools)
+        else {
             return GenerationOutcome::Failed;
         };
         let turn_estimate =
@@ -856,10 +977,10 @@ async fn generate_with_turns(
         match generate_one_shot(
             input,
             model,
-            prompt,
+            &candidate.prompt,
             &private_history,
-            &tools,
-            params.clone(),
+            tools,
+            (*params).clone(),
             provider_handoff,
         )
         .await
@@ -1112,11 +1233,6 @@ mod tests {
             VerificationCandidateDispatch::WarmThenFanout
         );
         assert_eq!(plan.warm_candidate, Some(0));
-        assert_eq!(
-            plan.cache_read_candidates,
-            vec![1, 2],
-            "the N-1 fan-out requests must carry the prefix warmed by candidate 1 as cache reads"
-        );
     }
 
     #[test]
@@ -1129,7 +1245,6 @@ mod tests {
             );
             assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
             assert_eq!(plan.warm_candidate, None);
-            assert!(plan.cache_read_candidates.is_empty());
         }
     }
 
@@ -1141,21 +1256,32 @@ mod tests {
             cache_warm_is_eligible(CacheMode::None, true),
         );
         assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
-        assert!(plan.cache_read_candidates.is_empty());
     }
 
     #[test]
-    fn dispatch_telemetry_counts_cache_reads_only_after_a_provider_handoff() {
+    fn dispatch_telemetry_requires_a_completed_warm_request_and_actual_fanout_handoffs() {
         let plan =
             candidate_dispatch_plan(VerificationCandidateDispatch::WarmThenFanout, &[0, 1], true);
         assert_eq!(
             completed_dispatch_mode(&plan, false),
             VerificationCandidateDispatch::Parallel,
-            "a deadline, resolution, reservation, or running-transition refusal must not be recorded as a cache warm"
+            "a stream poll or pre-dispatch refusal must not be recorded as a completed cache warm"
         );
         assert_eq!(
             completed_dispatch_mode(&plan, true),
             VerificationCandidateDispatch::WarmThenFanout
+        );
+        assert_eq!(
+            dispatched_cache_read_count(
+                VerificationCandidateDispatch::WarmThenFanout,
+                [true, false]
+            ),
+            1,
+            "only fan-out siblings that crossed their own provider handoff are cache-read dispatches"
+        );
+        assert_eq!(
+            dispatched_cache_read_count(VerificationCandidateDispatch::Parallel, [true, true]),
+            0
         );
     }
 
@@ -1167,35 +1293,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_warm_groups_require_the_complete_generator_spec() {
-        let inherit = GeneratorSpec {
-            slot: "primary".into(),
-            recipe: VerificationRecipe::Inherit,
-            max_turns: 1,
-        };
-        let same_prefix = inherit.clone();
-        let different_recipe = GeneratorSpec {
-            recipe: VerificationRecipe::CleanRoom {
-                include_linked_files: false,
-                last_n_reads: 1,
-                tool_categories: Default::default(),
-                tool_allowlist: Vec::new(),
-            },
-            ..inherit.clone()
-        };
-        let different_turn_surface = GeneratorSpec {
-            max_turns: 2,
-            ..inherit.clone()
-        };
+    fn cache_warm_groups_require_identical_realized_request_snapshots() {
+        let prefix = r#"{"provider":"p","prompt":"before"}"#;
+        let changed_workspace_input = r#"{"provider":"p","prompt":"after"}"#;
 
-        assert!(shares_cacheable_request_prefix(&inherit, &same_prefix));
+        assert!(shares_realized_cacheable_request_prefix(prefix, prefix));
         assert!(
-            !shares_cacheable_request_prefix(&inherit, &different_recipe),
-            "same-slot recipes may assemble different prompts and histories"
-        );
-        assert!(
-            !shares_cacheable_request_prefix(&inherit, &different_turn_surface),
-            "max-turns changes the advertised tool surface"
+            !shares_realized_cacheable_request_prefix(prefix, changed_workspace_input),
+            "matching generator specs cannot share a cache group if their realized workspace inputs differ"
         );
     }
 

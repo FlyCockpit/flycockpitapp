@@ -477,10 +477,10 @@ impl Model {
         .await
     }
 
-    /// Captured completion which reports the exact irreversible provider
-    /// stream handoff. This is intentionally narrower than an attempt or a
-    /// completion: cancellation, drain, and dispatch-deadline gates may still
-    /// refuse a request before its stream is constructed.
+    /// Captured completion which reports successful provider stream
+    /// establishment. This remains narrower than a completion: cancellation,
+    /// drain, and dispatch-deadline gates may still refuse a request before
+    /// its stream is constructed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_captured_with_provider_handoff(
         &self,
@@ -2388,9 +2388,9 @@ where
     // during the initial round-trip aborts promptly. The request is now on
     // the wire: record `Dispatched` so a stall before the first token is
     // attributed to the dispatched (not prep) phase.
-    // Polling `request.stream()` can put bytes on the wire before it resolves,
-    // including when it resolves with an error. Advance first so every error
-    // or cancellation from that poll is conservatively post-handoff.
+    // A stream poll can fail during local preparation or transport setup, so
+    // do not report a provider handoff until rig has successfully established
+    // the stream. The bit is an execution observation, not an attempt marker.
     if cancel.is_cancelled() {
         return Err(attempt_cancelled());
     }
@@ -2405,12 +2405,13 @@ where
     }
     let mut stream = dispatch_stream_before_deadline(dispatch_deadline, cancel, || async {
         // `dispatch_stream_before_deadline` can win its cancellation arm
-        // before polling this future. Set the fact only on the poll which may
-        // enter rig's stream handoff, not while merely constructing it.
+        // before polling this future. Only a successfully constructed stream
+        // proves the request passed the local and transport setup boundary.
+        let stream = request.stream().await?;
         if let Some(provider_handoff) = provider_handoff {
             provider_handoff.store(true, std::sync::atomic::Ordering::Release);
         }
-        request.stream().await
+        Ok(stream)
     })
     .await?;
     bump_phase(phase, InferencePhase::Dispatched);

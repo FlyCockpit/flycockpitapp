@@ -263,23 +263,31 @@ impl Session {
 
     #[allow(dead_code)]
     pub fn set_tool_surface_override_json(&self, override_json: Option<String>) -> Result<()> {
-        *self.tool_surface_override_json.lock().unwrap() = override_json.clone();
         if self.stage_pending_row(|row| {
             row.tool_surface_override_json = override_json.clone();
         }) {
+            *self.tool_surface_override_json.lock().unwrap() = override_json;
             return Ok(());
         }
         let session_id = self.id;
+        let persisted_override_json = override_json.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET tool_surface_override_json = ?1 WHERE session_id = ?2",
-                    params![override_json, session_id.to_string()],
-                )
-                .context("setting session tool surface override")?;
+                let changed = conn
+                    .execute(
+                        "UPDATE sessions SET tool_surface_override_json = ?1 WHERE session_id = ?2",
+                        params![persisted_override_json, session_id.to_string()],
+                    )
+                    .context("setting session tool surface override")?;
+                if changed != 1 {
+                    anyhow::bail!(
+                        "session {session_id} not found while setting tool surface override"
+                    );
+                }
                 Ok(())
             })
             .context("persisting session tool surface override")?;
+        *self.tool_surface_override_json.lock().unwrap() = override_json;
         Ok(())
     }
 

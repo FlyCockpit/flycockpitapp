@@ -31,7 +31,7 @@ use super::identity::{SealedKnowledgeBaseId, SealedRecordId, SealedScopeKind, Se
 
 const TOKEN_PREFIX: &str = "{{sealed:v1:";
 const TOKEN_SUFFIX: &str = "}}";
-const UNTRUSTED_REDACTION: &str = "[sealed value redacted]";
+const SEALED_REDACTION: &str = "[sealed value redacted]";
 
 /// A parsed, safe symbolic reference. It is deliberately independent of the
 /// implementation that will resolve it: no field is a vault key or ciphertext
@@ -201,16 +201,14 @@ impl KnowledgeBaseSealedStore {
     }
 }
 
-/// Resolve KB tokens in one concept body at read time. For untrusted readers
-/// the resolver is still consulted (so a dangling/foreign reference fails
-/// closed), but the literal is dropped and a fixed redaction marker is emitted.
-/// Thus no untrusted response can contain plaintext even when global redaction
-/// is disabled.
+/// Resolve KB tokens in one concept body at read time. The resolver is still
+/// consulted so dangling and foreign references fail closed, but its literal is
+/// never returned. Every model-facing reader receives a fixed marker and must
+/// use an explicit sealed-value grant through `use_sealed_value` for any use.
 pub async fn resolve_kb_markdown(
     markdown: &str,
     kb_id: &SealedKnowledgeBaseId,
     resolver: &dyn SealedResolver,
-    trusted_reader: bool,
 ) -> Result<String> {
     let mut output = String::with_capacity(markdown.len());
     let mut rest = markdown;
@@ -226,12 +224,8 @@ pub async fn resolve_kb_markdown(
         if reference.knowledge_base_id()? != *kb_id {
             bail!("knowledge markdown contains a sealed reference for a different knowledge base");
         }
-        let literal = resolver.resolve(&reference).await?;
-        if trusted_reader {
-            output.push_str(literal.expose_for_redaction());
-        } else {
-            output.push_str(UNTRUSTED_REDACTION);
-        }
+        let _literal = resolver.resolve(&reference).await?;
+        output.push_str(SEALED_REDACTION);
         rest = &token_start[end..];
     }
     output.push_str(rest);
@@ -289,7 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeded_secret_stays_out_of_serialized_markdown_and_untrusted_reads() {
+    async fn seeded_secret_stays_out_of_serialized_markdown_for_every_reader() {
         let kb_id = SealedKnowledgeBaseId::parse("4b3a7cd2-2af9-4f1f-bf8f-7f4cb32b59a9").unwrap();
         let reference = SealedReference::new(
             SealedScopeRef::KnowledgeBase(kb_id.clone()),
@@ -312,19 +306,12 @@ mod tests {
         // exists only behind the resolver and therefore cannot enter git.
         let committed = crate::knowledge::serialize_concept(&concept);
         assert!(!committed.contains(SEEDED_SECRET));
-        let untrusted = concept
-            .body_for_reader(&kb_id, &SeededResolver, false)
+        let rendered = concept
+            .body_for_reader(&kb_id, &SeededResolver)
             .await
             .unwrap();
-        assert!(!untrusted.contains(SEEDED_SECRET));
-        assert!(untrusted.contains(UNTRUSTED_REDACTION));
-        assert_eq!(
-            concept
-                .body_for_reader(&kb_id, &SeededResolver, true)
-                .await
-                .unwrap(),
-            format!("Deploy with {SEEDED_SECRET}.")
-        );
+        assert!(!rendered.contains(SEEDED_SECRET));
+        assert_eq!(rendered, format!("Deploy with {SEALED_REDACTION}."));
     }
 
     #[tokio::test]
@@ -342,7 +329,6 @@ mod tests {
                 &reference.token().unwrap(),
                 &destination_kb,
                 &SeededResolver,
-                false,
             )
             .await
             .is_err()
@@ -362,10 +348,10 @@ mod tests {
         let markdown = reference.token().unwrap();
         assert!(!markdown.contains(SEEDED_SECRET));
         assert_eq!(
-            resolve_kb_markdown(&markdown, &kb_id, &local, true)
+            resolve_kb_markdown(&markdown, &kb_id, &local)
                 .await
                 .unwrap(),
-            SEEDED_SECRET
+            SEALED_REDACTION
         );
     }
 }

@@ -193,6 +193,7 @@ impl App {
         self.folded_queue_item_ids.clear();
         self.folded_queue_item_order.clear();
         self.retained_user_submission_ids.clear();
+        self.local_user_submission_ids_by_seq.clear();
         self.pending = None;
         self.pending_render_cache = None;
         self.prunable_tokens = 0;

@@ -2017,7 +2017,7 @@ mod tests {
     fn definition(extra: &str) -> AgentDef {
         super::super::parse_agent(
             &format!(
-                "---\ndescription: Profile test\nschemaVersion: 2\nagentId: authored/profile-test\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra}---\nbody\n"
+                "---\ndescription: Profile test\nschemaVersion: 1\nagentId: authored/profile-test\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra}---\nbody\n"
             ),
             "profile-test",
             "profile-test.md".into(),
@@ -2315,7 +2315,7 @@ mod tests {
             "    approvals: automatic\n",
         ] {
             let text = format!(
-                "---\ndescription: authority test\nschemaVersion: 2\nagentId: authored/authority-test\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{injected_field}---\nbody\n"
+                "---\ndescription: authority test\nschemaVersion: 1\nagentId: authored/authority-test\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{injected_field}---\nbody\n"
             );
             assert!(
                 super::super::parse_agent(&text, "authority-test", "authority-test.md".into())
@@ -2327,7 +2327,7 @@ mod tests {
 
     #[test]
     fn agent_profile_resolution_question_override_monotonic_missing_timeout_is_rejected() {
-        let text = "---\ndescription: question test\nschemaVersion: 2\nagentId: authored/question-test\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\nquestions:\n  autoAnswer: recommended_low_risk\n  resolverOrder: warm_parent_then_utility\n  resolverSlot: primary\n---\nbody\n";
+        let text = "---\ndescription: question test\nschemaVersion: 1\nagentId: authored/question-test\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\nquestions:\n  autoAnswer: recommended_low_risk\n  resolverOrder: warm_parent_then_utility\n  resolverSlot: primary\n---\nbody\n";
         assert!(
             super::super::parse_agent(text, "question-test", "question-test.md".into()).is_err()
         );

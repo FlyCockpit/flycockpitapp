@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use super::sessions::*;
 use super::*;
+use crate::daemon::session_worker::{CancelOrigin, SessionWork};
 use crate::db::run_invocations::{
     AcceptRunInvocationOutcome, LookupRunInvocationOutcome, RunInvocationRow,
 };
@@ -454,7 +455,11 @@ pub(super) async fn handle_cancel_run_invocation(
 
     // Best-effort live cancel of the owning session worker.
     if let Some(handle) = ctx.registry.live_handle(updated.session_id) {
-        let _ = handle.send_work(SessionWork::Cancel).await;
+        let _ = handle
+            .send_work(SessionWork::Cancel {
+                origin: CancelOrigin::Noninteractive,
+            })
+            .await;
     }
 
     Ok(Response::RunInvocationCancelResult {

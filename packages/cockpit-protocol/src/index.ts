@@ -1931,6 +1931,10 @@ export const attachedDataSchema = z
     active_subagent: activeSubagentSchema.optional(),
     active_model_state: activeModelStateSchema.optional(),
     history: z.array(historyEntryWireSchema),
+    // Target rows removed by durable user-message retraction tombstones.
+    // Apply these before merging the full history snapshot so a reconnect
+    // cannot retain a stale cached row outside the snapshot window.
+    removed_user_message_seqs: z.array(safeI64NumberSchema).optional(),
     paused_work: z.array(pausedWorkSummarySchema),
     repair_required: resumeRepairStateSchema.optional(),
     resume_compaction_offer: resumeCompactionOfferSchema.optional(),
@@ -2739,6 +2743,7 @@ export const knownEventKindSchema = z.enum([
   "tool_start",
   "usage",
   "user_message_recorded",
+  "user_message_removed",
   "user_message_retracted",
   "user_messages_terminated",
   "waiting_for_lock",
@@ -2766,6 +2771,10 @@ const historyReplayDataSchema = z
   .object({
     session_id: uuidSchema,
     entries: z.array(historyEntryWireSchema),
+    // Target rows removed by durable user-message retraction tombstones. This
+    // lets reconnecting clients delete only proven-stale rows without ever
+    // receiving the removed user text.
+    removed_user_message_seqs: z.array(safeI64NumberSchema).optional(),
     max_seq: safeI64NumberSchema,
   })
   .passthrough();
@@ -2845,6 +2854,15 @@ const userMessageRecordedDataSchema = z
     seq: safeI64NumberSchema,
     client_submission_ids: z.array(uuidSchema),
     preflight_cleaned: z.string().nullable().optional(),
+  })
+  .passthrough();
+const userMessageRemovedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    seq: safeI64NumberSchema,
+    // Opaque client submission ids identify who may restore its private draft;
+    // the removed user text is never sent in this broadcast.
+    client_submission_ids: z.array(uuidSchema),
   })
   .passthrough();
 export const userMessageTerminalDispositionSchema = z.enum([
@@ -3019,6 +3037,7 @@ const structuredEventDataSchemas = {
   queued_user_messages_folded: queuedUserMessagesFoldedDataSchema,
   session_persist_failed: sessionPersistFailedDataSchema,
   user_message_recorded: userMessageRecordedDataSchema,
+  user_message_removed: userMessageRemovedDataSchema,
   user_message_retracted: correlatedPreflightDataSchema,
   user_messages_terminated: userMessagesTerminatedDataSchema,
   workspace_trust_reconciliation: workspaceTrustReconciliationDataSchema,

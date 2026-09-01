@@ -1,15 +1,7 @@
-//! The typed raw-literal custody predicate.
+//! The sealed-value custody predicate.
 //!
-//! `ModelTrust` is the **sole** custody gate for releasing a raw sealed or
-//! environment literal:
-//!
-//! * `Trusted` — a self-hosted / log-safe provider. Raw literals may reach it.
-//! * `Untrusted` — a cloud provider that may retain logs. It receives IDs,
-//!   safe descriptions, and reference mechanisms only, forever.
-//!
-//! The invariant is one-directional: a raw sensitive value must never reach an
-//! untrusted model. Nothing widens that — not a steering posture, not a tool,
-//! not a grant.
+//! No model receives a sealed literal. Trust governs capture/write authority
+//! and reference reach elsewhere; it never changes sealed-value read custody.
 //!
 //! Steering posture is an independent harness-steering axis that selects
 //! context variants and verbose tool-definition prose. It
@@ -20,26 +12,21 @@
 
 use crate::config::providers::ModelTrust;
 
-/// Whether a caller may receive a raw literal at all.
+/// Every model uses sealed values by reference only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealedLiteralCustody {
-    /// Trusted custody: the ordinary raw-custody contract applies. Note this
-    /// is a statement about *inference egress*, not about tool APIs — no
-    /// literal-returning sealed tool exists for any caller.
-    RawLiteralPermitted,
-    /// Untrusted custody: sealed values are usable by reference only.
     ReferenceOnly,
 }
 
 impl SealedLiteralCustody {
     /// The one-directional invariant, phrased positively.
     pub fn permits_raw_literal(self) -> bool {
-        matches!(self, Self::RawLiteralPermitted)
+        false
     }
 
     /// Whether the caller is restricted to reference-only use.
     pub fn is_reference_only(self) -> bool {
-        matches!(self, Self::ReferenceOnly)
+        true
     }
 }
 
@@ -64,23 +51,16 @@ impl SealedCustodyRequest {
     }
 }
 
-/// The custody predicate.
-///
-/// Deliberately a single `match` on `trust`. There is no steering axis to
-/// read; any future edit that introduces one is both an orthogonality
-/// regression and a custody-gate regression, and is caught by
-/// `trust_alone_decides_sealed_value_custody`.
+/// The custody predicate. Trust is deliberately ignored: `use_sealed_value`
+/// plus grants is the only model-facing sealed-use surface.
 pub fn sealed_literal_custody(request: SealedCustodyRequest) -> SealedLiteralCustody {
-    match request.trust {
-        ModelTrust::Trusted => SealedLiteralCustody::RawLiteralPermitted,
-        ModelTrust::Untrusted => SealedLiteralCustody::ReferenceOnly,
-    }
+    let _ = request;
+    SealedLiteralCustody::ReferenceOnly
 }
 
 /// Custody from trust alone, for call sites that have no steering in hand.
 ///
-/// Identical by construction to [`sealed_literal_custody`] — trust is the
-/// whole input either way.
+/// Identical by construction to [`sealed_literal_custody`].
 pub fn sealed_literal_custody_for_trust(trust: ModelTrust) -> SealedLiteralCustody {
     sealed_literal_custody(SealedCustodyRequest { trust })
 }

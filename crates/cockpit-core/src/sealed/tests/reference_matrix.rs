@@ -1,10 +1,9 @@
 //! AC6 `built_in_and_monty_sealed_reference_matrix`
 //!
 //! Every built-in and Monty sealed-use path accepts only
-//! `{sealed_value_id, action_id, bounded_params}`. Untrusted callers cannot
-//! receive a literal; trusted callers follow `ModelTrust` raw inference
-//! custody **without** gaining a literal-returning tool API. Steering posture
-//! never widens custody (issue #75).
+//! `{sealed_value_id, action_id, bounded_params}`. No caller can receive a
+//! literal; `ModelTrust` controls host-mediated capture only and never widens
+//! sealed-value use. Steering posture never widens custody (issue #75).
 //!
 //! Two tests, and the split is deliberate:
 //!

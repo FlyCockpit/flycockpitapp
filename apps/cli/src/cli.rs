@@ -2078,10 +2078,9 @@ mod tests {
         assert_no_internal_jargon("providers doc", include_str!("../docs/providers.md"));
     }
 
-    /// AC6. Checked docs search: every cited surface must say that trusted
-    /// inference may be raw, untrusted inference is redacted, exports and
-    /// client display stay redacted regardless of trust, and neither harness
-    /// mode nor locality implies trust.
+    /// Checked docs search: every cited surface must keep sealed egress
+    /// reference-only, describe trusted as capture-capable, and preserve the
+    /// export/display and locality boundaries.
     #[test]
     fn trust_and_mode_docs_are_orthogonal() {
         const PROVIDERS_DOC: &str = include_str!("../docs/providers.md");
@@ -2090,13 +2089,14 @@ mod tests {
         for (label, text) in [("README", README), ("providers doc", PROVIDERS_DOC)] {
             let lowered = text.to_ascii_lowercase();
             assert!(
-                lowered.contains("inference requests to a trusted model may be sent raw")
-                    || lowered.contains("inference requests to a `trusted` model may be sent raw"),
-                "{label} must say trusted inference may be raw"
+                lowered.contains(
+                    "every inference request receives redacted, reference-only sealed values"
+                ),
+                "{label} must say model egress is reference-only"
             );
             assert!(
-                lowered.contains("secrets and environment values"),
-                "{label} must name what a trusted provider receives"
+                lowered.contains("host-mediated capture"),
+                "{label} must describe trusted capture eligibility"
             );
             assert!(
                 lowered.contains("stay redacted regardless of trust"),
@@ -2132,11 +2132,11 @@ mod tests {
                     "{label} must not claim `{forbidden}`"
                 );
             }
-            // And trust must not be described as a blanket redaction switch:
-            // it governs inference custody, not the export/display boundary.
+            // Trust is a capture capability, not a raw egress switch.
             assert!(
-                !lowered.contains("trusted models disable outbound redaction"),
-                "{label} must not describe trust as a blanket redaction switch"
+                !lowered.contains("inference requests to a trusted model may be sent raw")
+                    && !lowered.contains("a trusted harness receives its raw prompt"),
+                "{label} must not describe a raw trust egress path"
             );
         }
 

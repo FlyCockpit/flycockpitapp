@@ -107,9 +107,9 @@ pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessTrust {
-    /// The harness may receive its raw prompt, including sensitive/sealed
-    /// literals. Only after the user explicitly configures `trust: "trusted"`.
-    /// Never permits Cockpit-provided secret environment values.
+    /// The harness may participate in host-mediated capture after the user
+    /// explicitly configures `trust: "trusted"`. Its prompt remains redacted
+    /// and it never receives Cockpit-provided secret environment values.
     Trusted,
     /// The harness receives a redacted rendering of the prompt. The default:
     /// every external harness is untrusted until explicitly configured
@@ -127,7 +127,7 @@ impl HarnessTrust {
         }
     }
 
-    /// `true` when this harness may receive raw prompt content.
+    /// `true` when this harness is eligible for host-mediated capture.
     pub fn is_trusted(self) -> bool {
         matches!(self, HarnessTrust::Trusted)
     }
@@ -224,10 +224,9 @@ pub struct HarnessConfig {
     pub agent_file_env: Option<String>,
     /// The custody posture of this harness. Defaults to `Untrusted`: every
     /// external harness is untrusted until explicitly configured `trusted`.
-    /// A trusted harness may receive its raw prompt (including sensitive/sealed
-    /// literals); an untrusted harness receives a redacted rendering. Neither
-    /// class receives Cockpit-provided secret environment values. Never
-    /// inferred from model, locality, or command.
+    /// Trust may allow host-mediated capture; every harness receives a redacted
+    /// rendering and neither class receives Cockpit-provided secret environment
+    /// values. Never inferred from model, locality, or command.
     #[serde(default)]
     pub trust: HarnessTrust,
     /// A non-mutating command (relative to [`Self::command`]) whose exit 0

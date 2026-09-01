@@ -78,7 +78,7 @@ pub enum SelectorResolution {
 /// It carries capability/category/cost intent only. Data custody is host
 /// policy: every selection made from one of these is routed under a forced
 /// [`ModelCustody::Untrusted`] filter, so an untrusted parent can never pull a
-/// sensitive brief onto a raw-custody child. The only trusted-child path is
+/// sensitive brief onto a capture-capable child. The only trusted-child path is
 /// the separately host-authorized [`resolve_trusted_child_model`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DelegationModelSelector {
@@ -569,16 +569,14 @@ pub fn resolve_delegated_model_with_custody(
 
 /// Host-authorized trusted-child selection.
 ///
-/// This is the **only** path that may route a sensitive brief to a raw-custody
-/// child, and it exists solely for the host-selected sealed-acquisition
-/// coordinator contract. Nothing a model can write reaches it: the caller must
-/// already hold host authority, and it returns the
-/// [`TrustedCustodyGrant`] that unlocks raw provider bytes.
+/// This is the host-authorized selection path for the sealed-acquisition
+/// coordinator. Nothing a model can write reaches it: the caller must already
+/// hold host authority, and the returned [`TrustedCustodyGrant`] identifies a
+/// capture-capable destination. It is not a model egress capability.
 ///
 /// A grant is minted only when the resolved model's [`ModelLocation`] is
 /// `Local`. A trusted child on a `Remote`, `PrivateRemote`, or unknown
-/// location fails closed with no grant, so no raw provider bytes can be
-/// released to a child that is not host-local. Custody/trust and location are
+/// location fails closed with no capture grant. Custody/trust and location are
 /// both required; harness mode is never consulted.
 pub fn resolve_trusted_child_model(
     category: &str,
@@ -608,25 +606,25 @@ pub fn resolve_trusted_child_model(
     let request = SensitiveModelPolicyRequest::new(
         criteria,
         ModelCustody::Trusted,
-        SensitivePayload::raw_for_trusted_custody(),
+        SensitivePayload::redacted_for_custody(
+            ModelCustody::Trusted,
+            Arc::new(SessionTableRedaction::new(
+                &session_model.session_redact_table(),
+            )),
+        ),
     )
     .map_err(|error| SelectorResolution::InvalidLiteral(policy_error_message(error)))?;
     let resolved = providers
         .resolve_sensitive_model_policy(&request)
         .map_err(policy_error_message)
         .map_err(SelectorResolution::InvalidLiteral)?;
-    // AC5: raw sealed/environment inference context is released to a trusted
-    // CHILD only when the resolved model is host-`Local`. A `Remote`,
-    // `PrivateRemote`, or MISSING location fails closed HERE — before the grant
-    // is minted — so `SensitivePayload::raw_provider_bytes` returns `None` and
-    // no raw request bytes, retries, diagnostics, or exports can be assembled
-    // downstream. Location, not posture, gates the raw release: `ModelCustody`/
-    // trust already filtered the selection above, and harness posture is never
-    // consulted. This is the single mint point for trusted-child grants, so
-    // gating it closes the raw path for every non-local trusted child.
+    // AC5: capture-capable child selection requires a host-`Local` model. A
+    // `Remote`, `PrivateRemote`, or missing location fails closed before a
+    // capture grant can be returned. The child still receives only the
+    // enforced redacted rendering.
     if resolved.policy.location != Some(ModelLocation::Local) {
         return Err(SelectorResolution::InvalidLiteral(
-            "trusted-child raw custody requires a host-local model location".to_string(),
+            "trusted-child capture requires a host-local model location".to_string(),
         ));
     }
     let grant = resolved.trusted_custody_grant().cloned().ok_or_else(|| {
@@ -800,9 +798,10 @@ fn build_redacted_policy_model(
     store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let session_redact = session_model.session_redact_table();
-    let payload = SensitivePayload::redacted_for_untrusted_custody(Arc::new(
-        SessionTableRedaction::new(&session_redact),
-    ));
+    let payload = SensitivePayload::redacted_for_custody(
+        ModelCustody::Untrusted,
+        Arc::new(SessionTableRedaction::new(&session_redact)),
+    );
     let request = SensitiveModelPolicyRequest::new(criteria, ModelCustody::Untrusted, payload)
         .map_err(|error| SelectorResolution::InvalidLiteral(policy_error_message(error)))?;
     let resolved = providers
@@ -819,9 +818,10 @@ fn build_redacted_policy_model(
     .map(Arc::new)
     .map_err(|e| SelectorResolution::InvalidLiteral(format!("{e:#}")))?;
     let custody = DelegationCustody {
-        payload: SensitivePayload::redacted_for_untrusted_custody(Arc::new(
-            SessionTableRedaction::new(&session_redact),
-        )),
+        payload: SensitivePayload::redacted_for_custody(
+            ModelCustody::Untrusted,
+            Arc::new(SessionTableRedaction::new(&session_redact)),
+        ),
         route: resolved.policy.clone(),
         grant: resolved.trusted_custody_grant().cloned(),
         session_redact,
@@ -851,12 +851,10 @@ pub(crate) fn custody_payload_for(
     custody: ModelCustody,
     session_redact: &Arc<crate::redact::RedactionTable>,
 ) -> SensitivePayload {
-    match custody {
-        ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
-        ModelCustody::Untrusted => SensitivePayload::redacted_for_untrusted_custody(Arc::new(
-            SessionTableRedaction::new(session_redact),
-        )),
-    }
+    SensitivePayload::redacted_for_custody(
+        custody,
+        Arc::new(SessionTableRedaction::new(session_redact)),
+    )
 }
 
 pub(crate) fn custody_for_trust(trust: ModelTrust) -> ModelCustody {
@@ -953,11 +951,9 @@ fn host_selected_custody_for_model(
     let trust = providers.resolve_trust(&provider, &model_id);
     let custody = custody_for_trust(trust);
     let session_redact = model.session_redact_table();
-    // A host-chosen trusted model is a self-hosted / no-log endpoint: its
-    // children must keep receiving raw briefs. Re-run the host-named typed
-    // request so the grant that releases them is minted properly rather than
-    // fabricated. If the model is not in this config the grant stays `None`
-    // and `render_brief` falls closed to the session scrub.
+    // A host-chosen trusted model can be capture-capable. Re-run the host-named
+    // typed request to obtain its route-bound capture grant rather than
+    // fabricating one. `render_brief` always uses the session scrub.
     let grant = if custody == ModelCustody::Trusted {
         let selector = format!("{provider}:{model_id}");
         let criteria = ModelPolicyCriteria {
@@ -1009,9 +1005,9 @@ fn host_selected_custody_for_model(
 /// Render a delegation brief for an already-resolved child model.
 ///
 /// The child's route was decided by [`resolve_delegated_model_with_custody`];
-/// this renders the brief for that destination's custody class at dispatch
-/// time. An untrusted (cloud) child receives the session redaction-table
-/// rendering; a trusted (self-hosted / no-log) child receives it unchanged.
+/// this renders the brief for that destination at dispatch time. Every child,
+/// including a capture-capable trusted child, receives the session
+/// redaction-table rendering.
 pub fn render_brief_for_model(
     providers: &ProvidersConfig,
     model: &Arc<Model>,
@@ -1043,7 +1039,7 @@ pub fn render_model_discovery(caller_agent: &str, providers: &ProvidersConfig) -
     let mut lines = vec![
         "subagent model discovery: use `task` with `payload.model` as one of these selector objects."
             .to_string(),
-        "data custody is host policy: selectors cannot request a trusted (raw-custody) child, and delegated routing always applies the redacted untrusted filter."
+        "data custody is host policy: selectors cannot request a capture-capable child, and delegated routing always applies the redacted untrusted filter."
             .to_string(),
     ];
     let mut categories = std::collections::BTreeSet::new();
@@ -1908,8 +1904,8 @@ mod tests {
                 id: "trusted-reasoning".into(),
                 subagent_invokable: Some(true),
                 trust: Some(ModelTrust::Trusted),
-                // AC5: the coordinator (step 4) mints a raw-custody grant only
-                // for a host-local trusted child, so this trusted child is
+                // AC5: the coordinator mints a capture grant only for a
+                // host-local trusted child, so this trusted child is
                 // `Local`. The `Remote`/`PrivateRemote`/missing fail-closed
                 // paths are proven separately in `trusted_child_*` below.
                 location: Some(ModelLocation::Local),
@@ -2444,8 +2440,8 @@ mod tests {
         );
         assert_eq!(
             render_brief_for_model(&providers, &trusted_child, &extended, &brief),
-            brief,
-            "a self-hosted / no-log child keeps the raw brief"
+            session.session_redact_table().scrub(&brief),
+            "a trusted child remains reference-only"
         );
 
         // Rendering is idempotent, so a path that renders twice (batch entry
@@ -2644,13 +2640,7 @@ mod tests {
         );
     }
 
-    // ---- AC5 (2c-1): trusted-child raw custody is trust + LOCATION only ----
-
-    /// A distinct marker that only a minted grant can release through
-    /// [`SensitivePayload::raw_provider_bytes`]. It is never handed to any
-    /// non-local path: a failed (`Err`) `resolve_trusted_child_model` produces
-    /// no grant, so there is nothing to release it with.
-    const PLANTED_SECRET: &str = "sk-trusted-child-raw-custody-PLANTED-2c1";
+    // ---- AC5 (2c-1): trusted-child capture is trust + LOCATION only ----
 
     /// Providers carrying a single trusted `reasoning` child at `location`, plus
     /// an untrusted `reasoning` alternative so the forced-`Trusted` scan has to
@@ -2694,27 +2684,11 @@ mod tests {
         }
     }
 
-    /// A trusted-child grant is not a raw egress capability.
-    fn raw_bytes_released_by(grant: &TrustedCustodyGrant, model: &Arc<Model>) -> Option<String> {
-        let route = ResolvedModelPolicy {
-            provider: model.provider_id().to_string(),
-            model: model.model_id_ref().to_string(),
-            trust: ModelTrust::Trusted,
-            location: Some(ModelLocation::Local),
-            quality_rank: 0,
-            cost_rank: 0,
-            custody_filter: Some(ModelCustody::Trusted),
-        };
-        SensitivePayload::raw_for_trusted_custody()
-            .raw_provider_bytes(grant, &route, PLANTED_SECRET)
-            .map(str::to_string)
-    }
-
     /// AC5. A trusted child resolved to a `Remote` location must fail closed:
-    /// no grant is minted, so no raw provider bytes can ever be released. Fails
-    /// against pre-gate code, where a Remote trusted child mints a grant.
+    /// no capture grant is minted. Fails against pre-gate code, where a Remote
+    /// trusted child mints a grant.
     #[test]
-    fn trusted_child_raw_custody_is_trust_only() {
+    fn trusted_child_capture_requires_local_location() {
         let providers = trusted_child_providers(Some(ModelLocation::Remote));
         let session = session_model(&providers);
         match resolve_trusted_child_model(
@@ -2731,7 +2705,7 @@ mod tests {
                     "the fail-closed reason must name the location gate: {message}"
                 );
                 assert!(
-                    !message.contains(PLANTED_SECRET),
+                    !message.contains("secret"),
                     "the fail-closed reason must be content-free: {message}"
                 );
             }
@@ -2743,10 +2717,10 @@ mod tests {
         }
     }
 
-    /// AC5 positive control. A trusted, host-`Local` child mints a grant, but
-    /// the grant cannot release the planted bytes to that model.
+    /// AC5 positive control. A trusted, host-`Local` child mints a capture
+    /// grant; its model egress remains redacted by the normal model boundary.
     #[test]
-    fn trusted_child_local_receives_raw_custody() {
+    fn trusted_child_local_is_capture_capable() {
         let providers = trusted_child_providers(Some(ModelLocation::Local));
         let session = session_model(&providers);
         let (model, grant) = resolve_trusted_child_model(
@@ -2762,15 +2736,10 @@ mod tests {
         assert_eq!(model.model_id_ref(), "trusted-reasoning");
         assert_eq!(grant.provider(), "minimax");
         assert_eq!(grant.model(), "trusted-reasoning");
-        assert_eq!(
-            raw_bytes_released_by(&grant, &model).as_deref(),
-            None,
-            "a host-local trusted child must remain reference-only"
-        );
     }
 
     /// AC5. `PrivateRemote` and a MISSING location each fail closed exactly like
-    /// `Remote`: only `Local` releases raw custody. Both fail against pre-gate
+    /// `Remote`: only `Local` permits trusted capture. Both fail against pre-gate
     /// code (both minted a grant).
     #[test]
     fn trusted_child_non_local_locations_fail_closed() {
@@ -2835,8 +2804,8 @@ mod tests {
         );
     }
 
-    /// AC5. Trusted selection is independent of harness posture, and neither
-    /// local nor remote selection gains a raw egress capability.
+    /// AC5. Trusted selection is independent of harness posture; only local
+    /// selection is capture-capable and neither selection changes model egress.
     #[test]
     fn trusted_child_custody_ignores_harness_mode() {
         let providers = trusted_child_providers(Some(ModelLocation::Local));
@@ -2850,11 +2819,8 @@ mod tests {
             None,
         )
         .expect("a local trusted child must route");
-        assert_eq!(
-            raw_bytes_released_by(&grant, &model).as_deref(),
-            None,
-            "a host-local trusted child must remain reference-only"
-        );
+        assert_eq!(grant.provider(), model.provider_id());
+        assert_eq!(grant.model(), model.model_id_ref());
 
         let providers = trusted_child_providers(Some(ModelLocation::Remote));
         let session = session_model(&providers);

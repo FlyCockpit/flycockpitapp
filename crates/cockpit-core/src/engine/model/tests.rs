@@ -3900,7 +3900,7 @@ fn disabled_table() -> TestArc<RedactionTable> {
 }
 
 #[test]
-fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
+fn trusted_model_uses_enforced_effective_table_and_keeps_session_table() {
     let (_tmp, redact) = secret_table();
     assert!(
         !redact.is_empty(),
@@ -3932,8 +3932,8 @@ fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
     );
 
     let trusted = Model::for_provider(&cfg, "local", "trusted", redact.clone()).unwrap();
-    assert!(trusted.redact_table().is_empty());
-    assert_eq!(trusted.redact().scrub(SECRET), SECRET);
+    assert!(!trusted.redact_table().is_empty());
+    assert!(!trusted.redact().scrub(SECRET).contains(SECRET));
     assert!(!trusted.session_redact_table().is_empty());
 
     let remote =

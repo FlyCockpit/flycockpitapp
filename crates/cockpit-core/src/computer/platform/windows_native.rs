@@ -396,9 +396,7 @@ impl WindowsDesktopBackend {
             if rows != height {
                 return Err(win32_error("BitBlt/GetDIBits"));
             }
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
+            gdi_bgra_to_rgba_opaque(&mut pixels);
             let image = image::RgbaImage::from_raw(region.width, region.height, pixels)
                 .ok_or_else(|| win_input_error("GDI returned an invalid image buffer"))?;
             crate::media_image::encode_png_rgba(
@@ -419,6 +417,16 @@ impl WindowsDesktopBackend {
             0,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )
+    }
+}
+
+/// A 32-bit `BI_RGB` DIB is BGRA-shaped in memory, but GDI does not define its
+/// fourth byte as alpha. Screenshots are opaque, so normalize it before PNG
+/// encoding rather than preserving uninitialized or zero alpha values.
+fn gdi_bgra_to_rgba_opaque(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = u8::MAX;
     }
 }
 
@@ -1447,6 +1455,15 @@ mod tests {
         }
         assert!(!virtual_key("enter").unwrap().extended);
         assert!(virtual_key("not-a-key").is_err());
+    }
+
+    #[test]
+    fn gdi_capture_pixels_are_converted_to_opaque_rgba() {
+        let mut pixels = [0x11, 0x22, 0x33, 0x00, 0x44, 0x55, 0x66, 0x7f];
+
+        gdi_bgra_to_rgba_opaque(&mut pixels);
+
+        assert_eq!(pixels, [0x33, 0x22, 0x11, 0xff, 0x66, 0x55, 0x44, 0xff]);
     }
 
     #[test]

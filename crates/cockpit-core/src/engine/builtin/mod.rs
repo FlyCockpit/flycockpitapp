@@ -1306,7 +1306,15 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
     compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
 }
 
-fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &SpawnArgs) -> String {
+/// Compose the model-specific cached system prompt used by every fresh or
+/// live-refreshed agent frame. The model's trust posture is part of this
+/// composition, so callers that replace an agent model must update this value
+/// in the same replacement.
+pub(crate) fn compose_system_prompt_for_model(
+    role_prompt: &str,
+    model: &Model,
+    args: &SpawnArgs,
+) -> String {
     let compiled_guidance = args.guidance_compiler.as_ref().map_or_else(
         || args.compiled_guidance.clone(),
         |compiler| compiler.compile(&args.cwd, model.provider_id(), model.model_id_ref()),

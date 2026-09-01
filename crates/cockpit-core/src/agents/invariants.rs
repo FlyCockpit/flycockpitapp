@@ -487,8 +487,8 @@ fn validate_discoverable_tools_have_mcp(_def: &AgentDef, _tools: &[String]) -> R
 mod grant_tests {
     use super::*;
     use crate::agents::{
-        AgentCapability, AgentMode, AgentRole, DelegationPolicy, DelegationTarget, ModelCapability,
-        ModelLocality, ModelSlot, VnextAgentDef,
+        AgentCapability, AgentMode, AgentRole, AllowedChild, DelegationPolicy, DelegationTarget,
+        ModelCapability, ModelLocality, ModelSlot, VnextAgentDef,
     };
 
     fn g(names: &[&str]) -> Vec<String> {
@@ -715,7 +715,7 @@ mod grant_tests {
                 },
             )]),
             delegation: DelegationPolicy {
-                allowed_children: vec!["acme/child".to_string()],
+                allowed_children: vec![AllowedChild::portable_ref("acme/child")],
                 max_descendant_depth: Some(1),
                 max_concurrent_children: Some(1),
                 targets: vec![DelegationTarget::SameRoot],

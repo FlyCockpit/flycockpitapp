@@ -1970,7 +1970,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
 
 #[test]
 fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
-    use crate::engine::tool::{Tool, definition_of};
+    use crate::engine::tool::definition_of;
     use crate::tools::{glob::GlobTool, grep::GrepTool};
 
     let def = super::builtin_defs::embedded_internal_default("docs-answerer").unwrap();

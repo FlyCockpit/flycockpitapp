@@ -92,7 +92,7 @@ Bearer credential only and never sends `chatgpt-account-id`, `originator`, or
 the Codex `OpenAI-Beta` header. Responses requests are stateless: Cockpit sends
 the complete conversation in `input`, always uses `store: false`, and never
 sends `previous_response_id`, `background`, or server-side tools. Providers
-that support it also receive the configured `reasoning_effort` request field.
+that support it also receive the configured reasoning-effort control.
 
 ## Credentials
 

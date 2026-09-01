@@ -1318,6 +1318,50 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
     Some(serde_json::Value::Object(map))
 }
 
+/// Compose the generic OpenAI **Responses**-wire extras.
+///
+/// Responses calls are deliberately stateless: Cockpit replays the complete
+/// conversation as `input`, always sends `store: false`, and does not permit a
+/// provider fragment to select `previous_response_id` or `background` (those
+/// fields are removed by [`sanitized_extra_params`]). Rig's Responses
+/// serializer models reasoning effort as `reasoning.effort`, whereas the
+/// generic catalog's OpenAI-compatible mapping supplies `reasoning_effort`.
+/// Translate that mapping at the wire boundary instead of silently letting
+/// Rig discard it as an unknown additional parameter.
+pub(super) fn openai_responses_additional_params(params: &ModelParams) -> serde_json::Value {
+    let mut map = match openai_additional_params(params) {
+        Some(serde_json::Value::Object(map)) => map,
+        // A scalar cannot be represented in Rig's typed Responses parameters.
+        // Place it in the typed `reasoning` slot so Rig rejects the malformed
+        // config instead of silently sending an unconstrained request body.
+        Some(other) => serde_json::Map::from_iter([("reasoning".into(), other)]),
+        None => serde_json::Map::new(),
+    };
+
+    if let Some(effort) = map.remove("reasoning_effort") {
+        match map.entry("reasoning".to_string()) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::json!({ "effort": effort }));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                serde_json::Value::Object(reasoning) => {
+                    reasoning.insert("effort".to_string(), effort);
+                }
+                // The catalog mapping is authoritative for this request. A
+                // malformed hand-authored `reasoning` shape cannot cause its
+                // selected effort to be silently dropped.
+                other => *other = serde_json::json!({ "effort": effort }),
+            },
+        }
+    }
+
+    // This is intentionally injected after vendor composition. The provider
+    // fragment cannot override it, and the typed Rig serializer therefore
+    // emits the key rather than applying a provider default by omission.
+    map.insert("store".to_string(), serde_json::Value::Bool(false));
+    serde_json::Value::Object(map)
+}
+
 /// Native ChatGPT/Codex subscription backend extras: sanitized vendor fragment
 /// plus OpenAI-Responses native computer tools. **Does not** inject
 /// `prompt_cache_key` / `prompt_cache_retention` — those are OpenAI-compatible

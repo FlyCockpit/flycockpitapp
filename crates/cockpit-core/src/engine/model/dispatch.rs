@@ -891,7 +891,7 @@ impl Model {
                                     prompt.clone(),
                                     wire_tools,
                                     &attempt_params,
-                                    openai_additional_params(&attempt_params),
+                                    Some(openai_responses_additional_params(&attempt_params)),
                                 );
                                 drain_completion_stream(
                                     request,
@@ -1854,7 +1854,7 @@ impl Model {
                             prompt.clone(),
                             wire_tools,
                             &params,
-                            openai_additional_params(&params),
+                            Some(openai_responses_additional_params(&params)),
                         )
                         .send()
                         .await?;
@@ -1982,7 +1982,7 @@ async fn openai_text_completion(
                 Message::user(prompt),
                 &[],
                 params,
-                openai_additional_params(params),
+                Some(openai_responses_additional_params(params)),
             )
             .send()
             .await
@@ -2035,7 +2035,7 @@ async fn openai_tool_completion(
                 Message::user(prompt),
                 std::slice::from_ref(&wire_tool),
                 params,
-                openai_additional_params(params),
+                Some(openai_responses_additional_params(params)),
             )
             .tool_choice(ToolChoice::Required)
             .send()

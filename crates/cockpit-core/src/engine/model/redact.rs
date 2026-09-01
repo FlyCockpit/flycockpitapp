@@ -9,6 +9,12 @@ const COCKPIT_OWNED_REQUEST_KEYS: &[&str] = &[
     "tools",
     "tool_choice",
     "stream",
+    // Cockpit owns Responses statefulness. Every Responses request carries
+    // the full transcript and explicitly disables server-side retention; a
+    // provider fragment must not opt back into a stateful server session.
+    "store",
+    "previous_response_id",
+    "background",
 ];
 
 /// Strip [`COCKPIT_OWNED_REQUEST_KEYS`] from an extra-params fragment so a

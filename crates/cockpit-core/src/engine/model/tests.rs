@@ -2154,6 +2154,9 @@ fn sanitized_extra_params_strips_cockpit_owned_keys() {
         "tool_choice": "none",
         "max_tokens": 1,
         "stream": false,
+        "store": true,
+        "previous_response_id": "response-123",
+        "background": true,
         "thinking": { "type": "enabled" },
         "reasoning_effort": "high",
     });
@@ -2941,7 +2944,7 @@ fn custom_provider_wire_api_selects_each_model_arm() {
             ..
         }
     ));
-    assert_eq!(response_model.provider_label(), "my-subscription");
+    assert_eq!(response_model.provider_label(), "openai-compatible");
 
     let anthropic_entry = ProviderEntry {
         url: "https://subscription.example/v1".into(),
@@ -3013,6 +3016,27 @@ fn openai_additional_params_injects_prompt_cache_key() {
         ..ModelParams::default()
     };
     assert_eq!(openai_additional_params(&params), None);
+}
+
+#[test]
+fn openai_responses_additional_params_forces_stateless_reasoning_wire_shape() {
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "reasoning_effort": "high",
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+        })),
+        ..ModelParams::default()
+    };
+
+    assert_eq!(
+        openai_responses_additional_params(&params),
+        json!({
+            "reasoning": { "effort": "high" },
+            "store": false,
+        }),
+    );
 }
 
 #[test]
@@ -7059,7 +7083,7 @@ async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
             ..
         }
     ));
-    assert_eq!(model.provider_label(), "custom-subscription");
+    assert_eq!(model.provider_label(), "openai-compatible");
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
     // The scripted Responses stream contains output text and completion items
@@ -7071,7 +7095,12 @@ async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
             Message::user("hi"),
             &[],
             ModelParams {
-                additional_params: Some(json!({ "reasoning_effort": "high" })),
+                additional_params: Some(json!({
+                    "reasoning_effort": "high",
+                    "store": true,
+                    "previous_response_id": "response-123",
+                    "background": true,
+                })),
                 ..ModelParams::default()
             },
             "Build",
@@ -7114,7 +7143,13 @@ async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
         "history missing from input: {input}"
     );
     assert!(input.contains("hi"), "prompt missing from input: {input}");
-    assert_eq!(request.body["reasoning_effort"], json!("high"));
+    assert!(request.body.get("background").is_none(), "{}", request.body);
+    assert_eq!(request.body["reasoning"]["effort"], json!("high"));
+    assert!(
+        request.body.get("reasoning_effort").is_none(),
+        "{}",
+        request.body
+    );
 }
 
 #[tokio::test]

@@ -2097,6 +2097,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         def.resolve_grant(&host()).unwrap()
     }
@@ -2527,6 +2528,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         let leaf_grant = leaf.resolve_grant(&host()).unwrap();
         assert!(

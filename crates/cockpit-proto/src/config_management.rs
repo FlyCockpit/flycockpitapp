@@ -25,7 +25,6 @@ pub fn is_opaque_authority_token(value: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum CockpitConfigLayer {
     HomeXdg,
-    HomeDot,
     MachineLocal,
     Project,
 }

@@ -878,8 +878,8 @@ fn save_extended_repairs_private_config_permissions() {
 
     let tmp = TempDir::new().unwrap();
     let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = tmp.path().join("home/.cockpit");
-    std::fs::create_dir(&config_dir).unwrap();
+    let config_dir = tmp.path().join("home/.config/cockpit");
+    std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.json");
     std::fs::write(&config_path, "{}").unwrap();
     let mut d = SettingsDialog::open(config_path);
@@ -7083,6 +7083,9 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
         tool_surface_touched,
         cwd: tmp.path().to_path_buf(),
         status: None,
+        dialog_id: uuid::Uuid::new_v4(),
+        queued_daemon_effect: None,
+        pending_operation_id: None,
     }));
     for expected in [
         "provider",

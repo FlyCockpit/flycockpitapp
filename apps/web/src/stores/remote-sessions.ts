@@ -669,6 +669,12 @@ function mergeHistorySnapshot(current: WebHistoryEntry[], snapshot: WebHistoryEn
   return mergeHistoryEntries(snapshot, preserved);
 }
 
+function removeDurableUserMessages(history: WebHistoryEntry[], seqs: readonly number[]) {
+  if (!seqs.length) return history;
+  const removed = new Set(seqs);
+  return history.filter((entry) => entry.kind !== "user_message" || !removed.has(entry.seq));
+}
+
 export function mergeHistoryPage(detail: SessionDetail, page: HistoryPageResult): SessionDetail {
   const pageEntries = page.entries.map((entry, index) => toWebHistoryEntry(entry, index));
   const history = mergeHistoryEntries(detail.history, pageEntries);
@@ -890,7 +896,13 @@ export function mergeAttach(
 ): InstanceRemoteState {
   const current = existing.detailsBySession[attach.session_id];
   const mappedHistory = attach.history.map((entry, index) => toWebHistoryEntry(entry, index));
-  const mergedHistory = mergeHistorySnapshot(current?.history ?? [], mappedHistory);
+  const removedUserMessageSeqs = Array.isArray(attach.removed_user_message_seqs)
+    ? attach.removed_user_message_seqs.filter((seq): seq is number => typeof seq === "number")
+    : [];
+  const mergedHistory = mergeHistorySnapshot(
+    removeDurableUserMessages(current?.history ?? [], removedUserMessageSeqs),
+    mappedHistory,
+  );
   const attachedActiveModel = attach.active_model_state
     ? activeModelFromData(attach.active_model_state as Record<string, unknown>)
     : null;
@@ -1390,12 +1402,18 @@ export function reduceRemoteSessionEvent(
   if (event.event === "history_replay") {
     const entries = data?.entries;
     if (!sessionId || !Array.isArray(entries)) return { state: existing, warningKind: event.event };
+    const removedUserMessageSeqs = Array.isArray(data.removed_user_message_seqs)
+      ? data.removed_user_message_seqs.filter((seq): seq is number => typeof seq === "number")
+      : [];
     return {
       state: updateDetail(existing, sessionId, (detail) => {
         const replayedHistory = sortHistory(
           entries.map((entry, index) => toWebHistoryEntry(entry as WireHistoryEntry, index)),
         );
-        const history = mergeHistorySnapshot(detail.history, replayedHistory);
+        const history = mergeHistorySnapshot(
+          removeDurableUserMessages(detail.history, removedUserMessageSeqs),
+          replayedHistory,
+        );
         return {
           ...detail,
           history,
@@ -1468,6 +1486,24 @@ export function reduceRemoteSessionEvent(
           },
         );
         return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+      }),
+    };
+  }
+
+  if (event.event === "user_message_removed") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const seq = numberField(data, "seq");
+    if (seq === undefined) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => {
+        const history = removeDurableUserMessages(detail.history, [seq]);
+        if (history === detail.history) return detail;
+        return {
+          ...detail,
+          history,
+          nextSeq: nextSeqFromHistory(history),
+          paging: pagingFromHistory(history, detail.paging),
+        };
       }),
     };
   }

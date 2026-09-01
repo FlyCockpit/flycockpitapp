@@ -123,9 +123,8 @@ pub fn workspace_config_layer_snapshot_chain_with_exclusive(
         // identical bytes, so it is part of the retained-chain revision.
         hasher.update(match layer.origin.as_ref() {
             Some(dirs::ConfigDirKind::HomeXdg) => [1],
-            Some(dirs::ConfigDirKind::HomeDot) => [2],
-            Some(dirs::ConfigDirKind::MachineLocal) => [3],
-            Some(dirs::ConfigDirKind::Project) => [4],
+            Some(dirs::ConfigDirKind::MachineLocal) => [2],
+            Some(dirs::ConfigDirKind::Project) => [3],
             None => [0],
         });
         hasher.update((layer.digest.len() as u64).to_be_bytes());

@@ -2,15 +2,14 @@
 //!
 //! # The invariant
 //!
-//! A raw sensitive value must never reach an untrusted model. The invariant is
-//! one-directional: [`ModelTrust`](crate::config::providers::ModelTrust) is
-//! the *sole* custody gate for releasing a raw literal, and harness-steering
-//! posture is an independent axis that never widens custody. See [`custody`].
+//! A raw sealed value must never reach any model. Every model uses a sealed
+//! value through `use_sealed_value` plus an exact grant; trust governs capture
+//! authority and never releases a literal. See [`custody`].
 //!
 //! # The shape
 //!
 //! * [`identity`] — canonical typed identity. Safe metadata only.
-//! * [`custody`] — the raw-literal custody predicate.
+//! * [`custody`] — the reference-only custody predicate.
 //! * [`compartment`] — the sealed-value-only credential compartment holding
 //!   Project and Global literals under random opaque exact keys. Session
 //!   literals stay in SQLite.

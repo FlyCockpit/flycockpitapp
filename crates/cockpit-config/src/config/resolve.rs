@@ -9,6 +9,17 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+/// Platform-default global configuration directory.
+///
+/// This is `~/.config/cockpit` on Linux (respecting `XDG_CONFIG_HOME`) and
+/// the platform configuration location elsewhere. It is intentionally
+/// separate from workspace `.cockpit/` directories: workspace trust controls
+/// only those project-local layers, never this user-owned global directory.
+pub fn cockpit_config_dir() -> Result<PathBuf> {
+    let base = dirs::config_dir().context("could not locate user config dir")?;
+    Ok(base.join("cockpit"))
+}
+
 /// `~/.local/share/cockpit/` on Unix (`$XDG_DATA_HOME/cockpit` if set),
 /// `%APPDATA%\cockpit` on Windows. Holds the session SQLite database
 /// and any other durable user data the daemon writes between runs.
@@ -57,6 +68,14 @@ mod tests {
         env.set_var("XDG_DATA_HOME", "/tmp/xdg-data-test");
         let p = cockpit_data_dir().unwrap();
         assert_eq!(p, PathBuf::from("/tmp/xdg-data-test/cockpit"));
+    }
+
+    #[test]
+    fn config_dir_respects_platform_config_home() {
+        let env = crate::test_env::lock();
+        env.set_var("XDG_CONFIG_HOME", "/tmp/xdg-config-test");
+        let path = cockpit_config_dir().unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg-config-test/cockpit"));
     }
 
     #[test]

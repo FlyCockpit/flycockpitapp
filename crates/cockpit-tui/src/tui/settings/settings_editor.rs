@@ -343,7 +343,7 @@ impl ProviderSettingId {
                 "Fallback request target used after inference thresholds; leave blank for no backup.",
             ),
             Self::TrustPolicy => Some(
-                "Data custody only, independent of locality: inference requests to a trusted model may be sent raw, including secrets and environment values, while inference requests to an untrusted model are redacted. Trusted is meant for a self-hosted or no-log endpoint you are content to hold raw content. Marking an external provider trusted sends it raw secrets and environment values. Exports and client display stay redacted regardless of trust.",
+                "Capture policy only, independent of locality: every model receives redacted, reference-only sealed values. Trusted models may participate in host-mediated capture; untrusted models may not. Marking an external provider trusted never sends it sealed literals. Exports and client display stay redacted regardless of trust.",
             ),
             Self::Location => {
                 Some("Locality is routing metadata only; local and trusted are separate decisions.")
@@ -1173,7 +1173,7 @@ impl SettingsEditor {
                     };
                     self.status = if self.trust == Some(ModelTrust::Trusted) {
                         Some(
-                            "trusted: inference requests may be sent raw, including secrets and environment values"
+                            "trusted: eligible for host-mediated capture; inference remains redacted"
                                 .to_string(),
                         )
                     } else {
@@ -1194,7 +1194,7 @@ impl SettingsEditor {
                             .is_some_and(|ready_at| Instant::now() < ready_at)
                         {
                             self.status = Some(
-                                "wait before confirming provider trust; future fetched models inherit raw-custody access to secrets and environment values"
+                                "wait before confirming provider trust; future fetched models inherit host-mediated capture eligibility"
                                     .to_string(),
                             );
                             return;
@@ -1203,7 +1203,7 @@ impl SettingsEditor {
                         self.provider_trust_confirm_pending = false;
                         self.provider_trust_confirm_ready_at = None;
                         self.status = Some(
-                            "provider trusted: it now receives raw secrets and environment values in inference requests, and future fetched models inherit that"
+                            "provider trusted: it is eligible for host-mediated capture; inference remains redacted, and future fetched models inherit that"
                                 .to_string(),
                         );
                     }
@@ -1212,7 +1212,7 @@ impl SettingsEditor {
                         self.provider_trust_confirm_ready_at =
                             Some(Instant::now() + self.provider_trust_confirm_lockout);
                         self.status = Some(
-                            "press Enter again to mark the provider trusted; it will receive raw secrets and environment values in inference requests, and future fetched models inherit that"
+                            "press Enter again to mark the provider trusted; it will be eligible for host-mediated capture, and future fetched models inherit that"
                                 .to_string(),
                         );
                     }
@@ -2537,25 +2537,23 @@ mod tests {
     use super::*;
 
     /// AC6 (provider/model editor half). The trust row carries custody
-    /// language and the explicit raw-secrets warning.
+    /// language and the reference-only sealed-value invariant.
     #[test]
     fn trust_help_describes_custody_only() {
         let trust = ProviderSettingId::TrustPolicy
             .help_text()
             .expect("trust row has help");
         assert!(
-            trust.contains("Data custody only, independent of locality"),
+            trust.contains("Capture policy only, independent of locality"),
             "trust help: {trust}"
         );
         assert!(
-            trust.contains("may be sent raw, including secrets and environment values"),
+            trust.contains("every model receives redacted, reference-only sealed values"),
             "trust help: {trust}"
         );
         assert!(
-            trust.contains(
-                "Marking an external provider trusted sends it raw secrets and environment values"
-            ),
-            "trust help must carry the explicit warning: {trust}"
+            trust.contains("Trusted models may participate in host-mediated capture"),
+            "trust help must describe capture eligibility: {trust}"
         );
         assert!(
             trust.contains("Exports and client display stay redacted regardless of trust"),

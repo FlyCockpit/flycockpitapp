@@ -45,6 +45,41 @@ cockpit models
 - Baseten Model APIs (`baseten`): Chat Completions at `https://inference.baseten.co/v1` with `BASETEN_API_KEY` / `Authorization: Bearer $BASETEN_API_KEY`. Live catalog via `cockpit fetch-models baseten` (`GET /v1/models`). Input capabilities (vision/audio) stay model-dependent and conservatively Unknown until mapped; custom Baseten deployments use a separate custom/OpenAI-compatible provider entry, not this template.
 - GitHub Copilot: OAuth-backed provider setup.
 
+## Anthropic-Compatible Endpoints
+
+For a third-party endpoint that implements Anthropic's Messages wire (for
+example, a proxy or aggregator rather than `api.anthropic.com`), add a custom
+provider and choose **anthropic** in the wizard's wire picker. Enter the
+endpoint's `/v1` base URL and the auth shape it documents:
+
+- `x-api-key: $PROVIDER_API_KEY`
+- `Authorization: Bearer $PROVIDER_API_KEY`
+
+Bearer-authenticated endpoints receive `Authorization` only; Cockpit removes
+the native client's required internal `x-api-key` header before the request is
+sent. Keep `anthropic-version` as a normal provider header when the endpoint
+requires it (the first-party Anthropic template uses `2023-06-01`).
+
+Custom Anthropic-wire providers default to the portable Messages API. They do
+not send `cache_control` blocks or `anthropic-beta` headers unless the gateway
+explicitly supports those Anthropic extensions. Opt in per provider only after
+confirming support:
+
+```json
+{
+  "anthropic": {
+    "prompt_caching": true,
+    "betas": true
+  }
+}
+```
+
+`prompt_caching` enables prompt-cache blocks. `betas` permits the extended
+cache-TTL and computer-use beta headers; without it, a one-hour cache setting
+uses the compatible five-minute cache form. Third-party endpoints must support
+the Messages request and streaming response formats; third-party Anthropic
+OAuth or subscription login is not supported.
+
 ## Credentials
 
 Provider config stores non-secret policy and references in layered `.cockpit/` config. Raw pasted secrets and OAuth tokens live in Cockpit's private credential store, not in project files. A project can name a provider or model, but workspace trust controls whether project config is loaded at all.

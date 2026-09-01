@@ -1777,7 +1777,7 @@ fn native_anthropic_model(redact: TestArc<RedactionTable>) -> Model {
 }
 
 #[test]
-fn native_anthropic_requires_x_api_key() {
+fn native_anthropic_requires_x_api_key_or_bearer_authorization() {
     use crate::config::providers::{CacheConfig, TimeoutConfig};
     use crate::providers::models_fetch::ResolvedRequest;
 
@@ -1802,12 +1802,13 @@ fn native_anthropic_requires_x_api_key() {
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     ) {
-        Ok(_) => panic!("missing x-api-key must reject native Anthropic provider"),
+        Ok(_) => panic!("missing Anthropic credentials must reject native provider"),
         Err(err) => err,
     };
 
     let message = err.to_string();
     assert!(message.contains("x-api-key"), "{message}");
+    assert!(message.contains("Authorization: Bearer"), "{message}");
     assert!(message.contains("anthropic"), "{message}");
 }
 
@@ -2776,10 +2777,6 @@ fn assembled_request_carries_trailing_system_injection() {
     assert!(rendered.contains("+ new"));
 }
 
-/// The routing selector picks the native Anthropic path **only** for the
-/// `api.anthropic.com` host (prompt `prompt-caching-strategy.md`). Claude
-/// served by any other host (OpenRouter, Copilot, a local proxy) stays on
-/// the OpenAI-compat path; an unparseable URL is never native.
 /// `build_model` routes solely on `wire_api`: URL and provider id do not alter
 /// the selected model arm.
 #[test]
@@ -2834,6 +2831,40 @@ fn build_model_routes_from_wire_api() {
     );
     assert_eq!(model.provider_label(), "anthropic");
     assert_eq!(model.model_id(), "claude-opus-4-8");
+
+    let compatible_anthropic = ProviderEntry {
+        url: "https://anthropic.nahcrof.com/v1".into(),
+        headers: vec![HeaderSpec {
+            name: "Authorization".into(),
+            value: "Bearer $ANTHROPIC_API_KEY".into(),
+        }],
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(128_000),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let model = build_model(
+        "compatible-anthropic",
+        &compatible_anthropic,
+        "claude-opus-4-8",
+        &CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        crate::config::providers::WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        std::sync::Arc::new(RedactionTable::empty()),
+        std::sync::Arc::new(RedactionTable::empty()),
+        |name| std::env::var(name).ok(),
+    )
+    .expect("third-party Anthropic wire must build without host detection");
+    assert!(matches!(model, Model::Anthropic { .. }));
 
     // Same Claude model id over OpenRouter → OpenAI-compat arm.
     let via_openrouter = ProviderEntry {
@@ -6625,16 +6656,10 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     let mut provider = anthropic_capture_provider().await;
     let resolved = ResolvedRequest {
         base_url: provider.base_url(),
-        headers: vec![
-            ResolvedHeader {
-                name: "x-api-key".to_string(),
-                value: "anthropic-key".to_string(),
-            },
-            ResolvedHeader {
-                name: "Authorization".to_string(),
-                value: "Bearer gateway-token".to_string(),
-            },
-        ],
+        headers: vec![ResolvedHeader {
+            name: "Authorization".to_string(),
+            value: "Bearer gateway-token".to_string(),
+        }],
         is_codex_credential: false,
     };
     let model = build_anthropic_model(
@@ -6665,6 +6690,149 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
         request_header_value(&request.headers, "authorization"),
         Some("Bearer gateway-token")
     );
+    assert_eq!(
+        request_header_value(&request.headers, "x-api-key"),
+        None,
+        "Bearer-compatible gateways must not receive Rig's synthetic x-api-key"
+    );
+}
+
+#[tokio::test]
+async fn native_anthropic_x_api_key_auth_is_unchanged_on_the_wire() {
+    use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
+
+    let mut provider = anthropic_capture_provider().await;
+    let resolved = ResolvedRequest {
+        base_url: provider.base_url(),
+        headers: vec![ResolvedHeader {
+            name: "x-api-key".to_string(),
+            value: "anthropic-key".to_string(),
+        }],
+        is_codex_credential: false,
+    };
+    let model = build_anthropic_model(
+        "anthropic",
+        &resolved,
+        "claude-haiku",
+        128,
+        &crate::config::providers::CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+    )
+    .expect("native Anthropic model must build");
+
+    let _ = model.text_completion("hi").await;
+    let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "x-api-key"),
+        Some("anthropic-key")
+    );
+}
+
+#[tokio::test]
+async fn custom_anthropic_wire_omits_prompt_caching_and_beta_headers_by_default() {
+    use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities};
+
+    let mut provider = anthropic_capture_provider().await;
+    let entry = ProviderEntry {
+        url: provider.base_url(),
+        headers: vec![HeaderSpec {
+            name: "Authorization".to_string(),
+            value: "Bearer gateway-token".to_string(),
+        }],
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(128),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let model = build_model(
+        "gateway",
+        &entry,
+        "claude-haiku",
+        &CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+        |_| None,
+    )
+    .expect("custom Anthropic-wire provider must build");
+
+    let _ = model.text_completion("hi").await;
+    let request = provider.next_request().await;
+    assert_eq!(request_header_value(&request.headers, "anthropic-beta"), None);
+    assert!(!request_body_string(&request).contains("cache_control"));
+}
+
+#[tokio::test]
+async fn first_party_anthropic_features_keep_extended_caching_enabled() {
+    use crate::config::providers::{
+        AnthropicFeatures, CacheConfig, HeaderSpec, ProviderCapabilities,
+    };
+
+    let mut provider = anthropic_capture_provider().await;
+    let entry = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        url: provider.base_url(),
+        headers: vec![HeaderSpec {
+            name: "x-api-key".to_string(),
+            value: "anthropic-key".to_string(),
+        }],
+        anthropic: Some(AnthropicFeatures::first_party()),
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(128),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let cache = CacheConfig {
+        ttl_secs: 3_600,
+        ..CacheConfig::default()
+    };
+    let model = build_model(
+        "anthropic",
+        &entry,
+        "claude-haiku",
+        &cache,
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+        |_| None,
+    )
+    .expect("first-party Anthropic provider must build");
+
+    let _ = model.text_completion("hi").await;
+    let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "anthropic-beta"),
+        Some("extended-cache-ttl-2025-04-11")
+    );
+    assert!(request_body_string(&request).contains("cache_control"));
 }
 
 #[tokio::test]

@@ -1,6 +1,32 @@
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn anthropic_features_default_by_template_without_endpoint_host_detection() {
+    let first_party = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        url: "https://anthropic.nahcrof.com/v1".to_string(),
+        ..ProviderEntry::default()
+    };
+    assert_eq!(
+        first_party.effective_anthropic_features(),
+        AnthropicFeatures::first_party()
+    );
+
+    let custom = ProviderEntry {
+        url: "https://api.anthropic.com/v1".to_string(),
+        ..ProviderEntry::default()
+    };
+    assert!(custom.effective_anthropic_features().is_empty());
+
+    let explicit_disable = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        anthropic: Some(AnthropicFeatures::default()),
+        ..ProviderEntry::default()
+    };
+    assert!(explicit_disable.effective_anthropic_features().is_empty());
+}
+
 #[cfg(unix)]
 const PRIVATE_ATOMIC_WRITE_UMASK_CHILD: &str = "COCKPIT_TEST_PRIVATE_ATOMIC_WRITE_UMASK_CHILD";
 

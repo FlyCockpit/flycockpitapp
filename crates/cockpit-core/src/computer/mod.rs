@@ -1497,7 +1497,7 @@ fn checked_zoom_scale(scale: ScaleFactor) -> Result<ScaleFactor, ComputerError> 
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError> {
     if (scale.0 - 1.0).abs() < f64::EPSILON {
         return Ok(png);
@@ -1520,7 +1520,7 @@ fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError>
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scaled_dimension(value: u32, scale: ScaleFactor) -> Result<u32, ComputerError> {
     let scaled = (f64::from(value) * scale.0).round();
     if !scaled.is_finite() || scaled < 1.0 || scaled > f64::from(u32::MAX) {

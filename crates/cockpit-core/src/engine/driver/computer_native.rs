@@ -64,10 +64,17 @@ pub(crate) async fn open_native_computer_for_delegation(
     } else {
         None
     };
-    let backend = match crate::computer::VirtualDisplayBackend::construct(
+    #[cfg(not(target_os = "macos"))]
+    let backend_result = crate::computer::VirtualDisplayBackend::construct(
         candidate.target,
         grant_store.as_ref(),
-    ) {
+    );
+    #[cfg(target_os = "macos")]
+    let backend_result = crate::computer::MacOsComputerBackend::construct(
+        candidate.target,
+        grant_store.as_ref(),
+    );
+    let backend = match backend_result {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!(error = %error, "native computer backend open failed");
@@ -116,9 +123,29 @@ pub(crate) async fn open_native_computer_for_delegation(
                     ))),
                 )
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
             {
-                unreachable!("non-Linux real desktop construction fails closed")
+                let adapter = crate::computer::platform::MacOsTargetEvidenceAdapter::new()
+                    .map_err(|reason| {
+                        anyhow::anyhow!(
+                            "real desktop target evidence unavailable: {reason:?}"
+                        )
+                    })?;
+                let file_lock = crate::computer::coordinator::FileAdvisoryLock::new()
+                    .map_err(|error| anyhow::anyhow!("host input arbiter unavailable: {error}"))?;
+                (
+                    Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                    Some(Arc::new(std::sync::Mutex::new(
+                        crate::computer::coordinator::HostInputArbiter::new(
+                            Box::new(file_lock),
+                            owner_instance,
+                        ),
+                    ))),
+                )
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                unreachable!("unsupported real desktop construction fails closed")
             }
         }
     };

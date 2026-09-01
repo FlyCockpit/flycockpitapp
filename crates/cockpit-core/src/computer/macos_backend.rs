@@ -17,9 +17,10 @@ use objc2_core_graphics::{
 
 use super::{
     CaptureFrame, ClickCount, ComputerAction, ComputerActionOutcome, ComputerBackend,
-    ComputerError, DisplayGeometry, Easing, Modifiers, MouseButton, PixelPoint, PixelRect,
-    PixelSize, ScaleFactor, checked_action_duration, checked_point, checked_rect,
-    checked_scroll_delta, checked_zoom_scale, click_repetitions, eased_progress, scale_png,
+    ComputerError, DisplayGeometry, DisplayTarget, Easing, Modifiers, MouseButton, PixelPoint,
+    PixelRect, PixelSize, RealDesktopGrantStore, ScaleFactor, checked_action_duration,
+    checked_point, checked_rect, checked_scroll_delta, checked_zoom_scale, click_repetitions,
+    eased_progress, scale_png,
 };
 use crate::computer::target::BackendKind;
 
@@ -43,7 +44,18 @@ unsafe impl Send for MacOsComputerBackend {}
 unsafe impl Sync for MacOsComputerBackend {}
 
 impl MacOsComputerBackend {
-    pub fn construct() -> Result<Self, ComputerError> {
+    pub fn construct(
+        target: DisplayTarget,
+        grant_store: Option<&RealDesktopGrantStore>,
+    ) -> Result<Self, ComputerError> {
+        if target != DisplayTarget::RealDesktop {
+            return Err(ComputerError::UnsupportedPlatform {
+                platform: "macos-virtual-display".to_string(),
+            });
+        }
+        if !grant_store.is_some_and(RealDesktopGrantStore::has_current_machine_grant) {
+            return Err(ComputerError::RealDesktopGrantMissing);
+        }
         if !Path::new(SCREENCAPTURE).is_file() {
             return Err(ComputerError::MissingTool {
                 tool: SCREENCAPTURE.to_string(),
@@ -672,6 +684,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn construction_fails_before_platform_access_without_machine_grant() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let grant = RealDesktopGrantStore::new(temp.path().join("missing-grant"));
+        let result = MacOsComputerBackend::construct(DisplayTarget::RealDesktop, Some(&grant));
+        assert!(matches!(result, Err(ComputerError::RealDesktopGrantMissing)));
+    }
+
+    #[test]
     fn key_map_and_modifier_flags_cover_primary_chords() {
         assert_eq!(key_code("Command"), Some(0x37));
         assert_eq!(key_code("ArrowLeft"), Some(0x7b));
@@ -683,7 +703,9 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive macOS login plus Screen Recording and Accessibility grants"]
     fn constructs_and_captures_real_desktop_when_tcc_granted() {
-        let mut backend = MacOsComputerBackend::construct().expect("construct macOS backend");
+        let grant = RealDesktopGrantStore::for_cockpit_data_dir().expect("grant store");
+        let mut backend = MacOsComputerBackend::construct(DisplayTarget::RealDesktop, Some(&grant))
+            .expect("construct macOS backend");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let outcome = runtime
             .block_on(backend.execute_one(&ComputerAction::CaptureFull))

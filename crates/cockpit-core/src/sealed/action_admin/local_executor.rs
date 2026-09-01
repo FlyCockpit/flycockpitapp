@@ -730,60 +730,68 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
             path,
             parent_identity,
         } => {
-            let parent = path
-                .parent()
-                .context("pinned sealed-file destination has no parent")?;
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("pinned sealed-file destination filename is not valid UTF-8")?
-                .to_owned();
-            let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(parent)
-                .context("opening pinned sealed-file parent through no-follow authority")?;
-            if held.identity() != parent_identity.stable_id.as_str() {
-                bail!("pinned sealed-file destination parent identity changed since approval");
-            }
-            #[cfg(windows)]
-            let windows_execution_lease = Some(
-                held.acquire_windows_execution_lease(parent)
-                    .context("leasing pinned sealed-file parent for Windows consumer path")?,
-            );
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let path = held
-                .retained_relative_path(&name)
-                .context("creating retained pinned sealed-file destination path")?;
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let path = path.clone();
-            // macOS has no procfs descriptor path, and the host layer does
-            // not yet offer an equivalent retained-directory execution
-            // capability. Re-opening the approved spelling would let a
-            // parent replacement redirect the plaintext write, Git guard,
-            // consumer path, or cleanup, so reject pinned destinations.
+            // macOS has no procfs descriptor path, and the host layer does not
+            // yet offer an equivalent retained-directory execution capability.
+            // Re-opening the approved spelling would let a parent replacement
+            // redirect the plaintext write, Git guard, consumer path, or
+            // cleanup, so reject pinned destinations here -- at the boundary,
+            // before opening the parent or taking any authority, rather than
+            // doing that work and discarding it.
             #[cfg(target_os = "macos")]
-            bail!(
-                "pinned sealed-file destinations are unsupported on macOS until retained-directory execution is available"
-            );
-            #[cfg(not(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "macos",
-                windows
-            )))]
-            bail!("pinned sealed-file destinations are unsupported on this platform");
-            let repo_parent = path
-                .parent()
-                .context("retained pinned sealed-file destination has no parent")?
-                .to_path_buf();
-            Ok(ResolvedDestination {
-                path,
-                git_guard: GitGuard::Inspect {
-                    repo_parent,
-                    destination_name: name,
-                },
-                _pinned_parent: Some(held),
+            {
+                let _ = (path, parent_identity);
+                bail!(
+                    "pinned sealed-file destinations are unsupported on macOS until retained-directory execution is available"
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let parent = path
+                    .parent()
+                    .context("pinned sealed-file destination has no parent")?;
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("pinned sealed-file destination filename is not valid UTF-8")?
+                    .to_owned();
+                let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(parent)
+                .context("opening pinned sealed-file parent through no-follow authority")?;
+                if held.identity() != parent_identity.stable_id.as_str() {
+                    bail!("pinned sealed-file destination parent identity changed since approval");
+                }
                 #[cfg(windows)]
-                _pinned_windows_execution_lease: windows_execution_lease,
-            })
+                let windows_execution_lease = Some(
+                    held.acquire_windows_execution_lease(parent)
+                        .context("leasing pinned sealed-file parent for Windows consumer path")?,
+                );
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let path = held
+                    .retained_relative_path(&name)
+                    .context("creating retained pinned sealed-file destination path")?;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let path = path.clone();
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "macos",
+                    windows
+                )))]
+                bail!("pinned sealed-file destinations are unsupported on this platform");
+                let repo_parent = path
+                    .parent()
+                    .context("retained pinned sealed-file destination has no parent")?
+                    .to_path_buf();
+                Ok(ResolvedDestination {
+                    path,
+                    git_guard: GitGuard::Inspect {
+                        repo_parent,
+                        destination_name: name,
+                    },
+                    _pinned_parent: Some(held),
+                    #[cfg(windows)]
+                    _pinned_windows_execution_lease: windows_execution_lease,
+                })
+            }
         }
         FileDestination::PrivateRuntime { filename } => {
             let runtime_dir = cockpit_host::private_fs::private_runtime_root().context(

@@ -199,24 +199,32 @@ pub async fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid"))?;
     loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` points to writable initialized storage. `P_PID`
-        // restricts observation to the exact child identity, and `WNOWAIT`
-        // guarantees the observation cannot release that identity for reuse.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
+        // `siginfo_t` must not survive to the await below: on Darwin it carries
+        // an `si_addr: *mut c_void`, which would make this future non-Send and
+        // break every `#[async_trait]` caller. Confine it to this block so it is
+        // dropped before the suspension point.
+        let exited = {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` points to writable initialized storage. `P_PID`
+            // restricts observation to the exact child identity, and `WNOWAIT`
+            // guarantees the observation cannot release that identity for reuse.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: waitid initialized the SIGCHLD fields in `info`; a zero
+            // PID is the specified WNOHANG result when the child has not exited.
+            let observed_pid = unsafe { info.si_pid() };
+            observed_pid != 0
         };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: waitid initialized the SIGCHLD fields in `info`; a zero PID
-        // is the specified WNOHANG result when the child has not exited.
-        if unsafe { info.si_pid() } != 0 {
+        if exited {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(1)).await;

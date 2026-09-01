@@ -2076,7 +2076,7 @@ fn set_private_open_file_permissions(file: &std::fs::File) -> Result<()> {
 }
 
 #[cfg(test)]
-#[cfg(all(not(unix), not(windows)))]
+#[cfg(not(unix))]
 fn set_private_open_file_permissions(_file: &std::fs::File) -> Result<()> {
     Ok(())
 }

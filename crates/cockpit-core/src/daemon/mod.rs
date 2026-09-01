@@ -95,7 +95,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
 #[cfg(unix)]
 use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;

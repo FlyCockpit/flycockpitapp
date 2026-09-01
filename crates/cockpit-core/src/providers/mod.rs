@@ -110,7 +110,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generic OpenAI-compatible endpoint. You can add as many of these as you want; each one needs a unique id.",
         ),
         use_id_as_default: false,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -132,7 +132,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate a key at https://platform.openai.com/api-keys. GPT-5-family models use the Responses API.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Responses,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -208,7 +208,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: false,
         hint: Some("Generate a key at https://z.ai/manage-apikey/apikey-list"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -237,7 +237,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate a key at https://portal.nousresearch.com/api-docs. Chat Completions only; no published /models endpoint.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -265,7 +265,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate an API key at https://app.baseten.co/settings/api_keys. Model APIs: https://docs.baseten.co/inference/model-apis/overview",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -285,7 +285,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://platform.minimaxi.com/"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -309,7 +309,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a token at https://opencode.ai/zen"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -331,7 +331,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Auth uses GitHub's documented tokens. Set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN to a GitHub OAuth/App/fine-grained token with Copilot access (a token from the `copilot` CLI works). COPILOT_API_URL overrides the base URL.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -351,7 +351,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://openrouter.ai/keys"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -371,7 +371,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://platform.deepseek.com/api_keys"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -396,7 +396,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate an API key at https://console.anthropic.com/settings/keys. Browser subscription login is not available for this provider.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Anthropic,
         api_key: Some(ApiKeyTemplate {
             header_name: "x-api-key",
             value_template: "{key}",
@@ -423,7 +423,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Xiaomi MiMo open platform. Generate a key at https://api.xiaomimimo.com/. Flagship is MiMo-V2.5-Pro (1M context); MiMo-V2-Flash is the cheap-fast tier.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
@@ -585,7 +585,7 @@ mod tests {
         assert!(t.default_headers.iter().all(|(n, _)| {
             !n.eq_ignore_ascii_case("x402") && !n.to_ascii_lowercase().contains("payment")
         }));
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(!t.supports_models_endpoint);
         // No built-in thinking params for nous-research (reasoning is model config).
         assert!(builtin_thinking_params("nous-research", ThinkingMode::High).is_none());
@@ -612,7 +612,7 @@ mod tests {
             );
         }
         assert!(matches!(t.auth_check, AuthCheckKind::ModelsEndpoint));
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(!t.url.contains("embeddings"));
         assert!(!t.url.contains("audio"));
         assert!(!t.url.contains("images"));
@@ -662,7 +662,7 @@ mod tests {
             t.default_headers,
             &[("Authorization", "Bearer $BASETEN_API_KEY")]
         );
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(t.supports_models_endpoint);
         assert!(t.use_id_as_default);
         assert_eq!(
@@ -695,7 +695,7 @@ mod tests {
             t.default_headers,
             &[("Authorization", "Bearer $NOUS_API_KEY")]
         );
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(!t.supports_models_endpoint);
         assert!(t.use_id_as_default);
         let api_key = t.api_key.expect("api key metadata");
@@ -727,6 +727,17 @@ mod tests {
     fn every_template_has_a_display_label() {
         for t in TEMPLATES {
             assert!(!t.display.is_empty(), "template {} missing display", t.id);
+            assert!(
+                !t.default_wire_api.is_auto(),
+                "template {} must define a concrete wire default",
+                t.id
+            );
+            assert_eq!(
+                t.default_wire_api,
+                crate::config::providers::default_wire_api_for_template(Some(t.id)),
+                "template {} and config resolution must agree",
+                t.id
+            );
         }
     }
 
@@ -815,7 +826,7 @@ mod tests {
             openai.default_headers,
             &[("Authorization", "Bearer $OPENAI_API_KEY")]
         );
-        assert_eq!(openai.default_wire_api, WireApi::Auto);
+        assert_eq!(openai.default_wire_api, WireApi::Responses);
 
         let codex = template_by_id("codex-oauth").expect("codex-oauth template");
         assert_eq!(codex.url, "https://chatgpt.com/backend-api/codex");

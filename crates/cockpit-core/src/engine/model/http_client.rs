@@ -35,6 +35,7 @@ pub(super) type AnthropicCompletionModel =
 pub struct UsageAliasHttpClient {
     client: reqwest::Client,
     extra_headers: reqwest::header::HeaderMap,
+    strip_codex_headers: bool,
 }
 
 impl Default for UsageAliasHttpClient {
@@ -47,12 +48,29 @@ impl fmt::Debug for UsageAliasHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UsageAliasHttpClient")
             .field("extra_headers", &self.extra_headers.len())
+            .field("strip_codex_headers", &self.strip_codex_headers)
             .finish()
     }
 }
 
 impl UsageAliasHttpClient {
     pub(super) fn new(extra_headers: Vec<(String, String)>) -> anyhow::Result<Self> {
+        Self::with_header_policy(extra_headers, false)
+    }
+
+    /// The rig ChatGPT Responses client supplies ChatGPT subscription headers
+    /// itself. Generic Responses providers use the same request serializer but
+    /// must not receive those Codex-specific headers.
+    pub(super) fn without_codex_headers(
+        extra_headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::with_header_policy(extra_headers, true)
+    }
+
+    fn with_header_policy(
+        extra_headers: Vec<(String, String)>,
+        strip_codex_headers: bool,
+    ) -> anyhow::Result<Self> {
         let extra_headers = with_canonical_user_agent(extra_headers);
         let mut validated = reqwest::header::HeaderMap::new();
         for (name, value) in extra_headers {
@@ -68,6 +86,7 @@ impl UsageAliasHttpClient {
         Ok(Self {
             client,
             extra_headers: validated,
+            strip_codex_headers,
         })
     }
 }
@@ -88,8 +107,19 @@ fn with_canonical_user_agent(mut headers: Vec<(String, String)>) -> Vec<(String,
 fn apply_extra_headers<T>(
     req: rig::http_client::Request<T>,
     headers: &reqwest::header::HeaderMap,
+    strip_codex_headers: bool,
 ) -> rig::http_client::Request<T> {
     let (mut parts, body) = req.into_parts();
+    if strip_codex_headers {
+        for name in [
+            "chatgpt-account-id",
+            "originator",
+            "openai-beta",
+            "session_id",
+        ] {
+            parts.headers.remove(name);
+        }
+    }
     for (name, value) in headers {
         parts.headers.insert(name.clone(), value.clone());
     }
@@ -303,7 +333,7 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         U: Send + 'static,
     {
         let client = self.client.clone();
-        let req = apply_extra_headers(req, &self.extra_headers);
+        let req = apply_extra_headers(req, &self.extra_headers, self.strip_codex_headers);
         let (parts, body) = req.into_parts();
         let req = rig::http_client::Request::from_parts(
             parts,
@@ -334,8 +364,11 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         U: From<bytes::Bytes>,
         U: Send + 'static,
     {
-        self.client
-            .send_multipart(apply_extra_headers(req, &self.extra_headers))
+        self.client.send_multipart(apply_extra_headers(
+            req,
+            &self.extra_headers,
+            self.strip_codex_headers,
+        ))
     }
 
     fn send_streaming<T>(
@@ -348,7 +381,7 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         T: Into<bytes::Bytes> + Send,
     {
         let client = self.client.clone();
-        let req = apply_extra_headers(req, &self.extra_headers);
+        let req = apply_extra_headers(req, &self.extra_headers, self.strip_codex_headers);
         let (parts, body) = req.into_parts();
         let req = rig::http_client::Request::from_parts(
             parts,

@@ -2331,6 +2331,7 @@ pub(crate) async fn run_turn(
                                     "Chat Completions"
                                 }
                                 crate::config::providers::WireApi::Responses => "Responses",
+                                crate::config::providers::WireApi::Anthropic => "Anthropic",
                                 crate::config::providers::WireApi::Auto => "auto",
                             };
                             let set = crate::daemon::proto::InterruptQuestionSet {

@@ -578,10 +578,9 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub timeout: TimeoutConfig,
 
-    /// Provider-level OpenAI-compatible wire endpoint default. A concrete
-    /// `completions` or `responses` applies to models that do not pin their
-    /// own `wire_api`; `auto` leaves routing to learned state and the
-    /// provider-aware conservative default.
+    /// Provider-level request-wire default. A concrete value applies to models
+    /// that do not pin their own `wire_api`; `auto` inherits the selected
+    /// provider template's default (or Chat Completions for custom providers).
     #[serde(default, skip_serializing_if = "WireApi::is_auto")]
     pub wire_api: WireApi,
 
@@ -1775,18 +1774,20 @@ impl ProviderModelCatalog {
     }
 }
 
-/// Which OpenAI-compatible wire endpoint a model speaks.
+/// Which request wire a model speaks.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WireApi {
-    /// No explicit pin: name-detect, then self-heal via the fallback. The
-    /// default for every model so existing configs are unaffected.
+    /// No explicit pin. Resolution falls back to the provider template default
+    /// (or Chat Completions for a custom provider).
     #[default]
     Auto,
     /// Force the Chat Completions endpoint (`/chat/completions`).
     Completions,
     /// Force the Responses endpoint (`/responses`).
     Responses,
+    /// Force Anthropic's native Messages endpoint (`/v1/messages`).
+    Anthropic,
 }
 
 /// Authority of a concrete model-level [`WireApi`] value.
@@ -1813,52 +1814,9 @@ impl WireApiProvenance {
 
 impl WireApi {
     /// True for the `Auto` (unpinned) variant — the serde skip predicate and
-    /// the resolver's "fall through to auto-detect" test.
+    /// effective-resolution fallback.
     pub fn is_auto(&self) -> bool {
         matches!(self, WireApi::Auto)
-    }
-
-    /// Conservative name auto-detect for `Auto` models: a model id beginning
-    /// with `gpt-5` (case-insensitive) is responses-only → [`WireApi::Responses`];
-    /// everything else → [`WireApi::Completions`] (today's default for every
-    /// existing model). Deliberately minimal — the error-driven fallback
-    /// corrects any miss, so this list never tries to enumerate every model.
-    pub fn detect(model_id: &str) -> WireApi {
-        // Byte-compare (panic-free across UTF-8 boundaries; the prefix is pure
-        // ASCII so byte equality is exactly the case-insensitive `str` match).
-        if model_id.len() >= 5 && model_id.as_bytes()[..5].eq_ignore_ascii_case(b"gpt-5") {
-            WireApi::Responses
-        } else {
-            WireApi::Completions
-        }
-    }
-
-    /// Provider-aware conservative default. OpenAI and Copilot share the
-    /// `gpt-5*` → Responses fallback; a fetched catalog remains authoritative
-    /// whenever it advertises concrete endpoints. Arbitrary OpenAI-compatible
-    /// endpoints default to Chat Completions.
-    pub fn detect_for_provider(provider_id: &str, model_id: &str) -> WireApi {
-        match provider_id {
-            "openai" | "copilot" => Self::detect(model_id),
-            "codex-oauth" | "grok" | "grok-oauth" => WireApi::Responses,
-            _ => WireApi::Completions,
-        }
-    }
-
-    /// Provider-aware conservative default using an entry's immutable vendor
-    /// identity as well as its legacy config key.  A connection created from
-    /// the Copilot template may be renamed, so the key alone is not enough to
-    /// select Copilot's GPT-5 Responses fallback.
-    pub fn detect_for_provider_entry(
-        provider_id: &str,
-        entry: &ProviderEntry,
-        model_id: &str,
-    ) -> WireApi {
-        if entry.is_copilot_identity(provider_id) {
-            Self::detect(model_id)
-        } else {
-            Self::detect_for_provider(provider_id, model_id)
-        }
     }
 
     /// The opposite concrete endpoint — the one the error-driven fallback
@@ -1867,8 +1825,27 @@ impl WireApi {
     pub fn opposite(self) -> WireApi {
         match self {
             WireApi::Responses => WireApi::Completions,
-            WireApi::Completions | WireApi::Auto => WireApi::Responses,
+            WireApi::Completions | WireApi::Auto | WireApi::Anthropic => WireApi::Responses,
         }
+    }
+}
+
+/// The built-in template default used when a provider entry leaves
+/// [`ProviderEntry::wire_api`] unset. This deliberately depends on immutable
+/// template identity only: map keys and URLs are user-controlled and never
+/// participate in wire selection.
+pub fn default_wire_api_for_template(template: Option<&str>) -> WireApi {
+    match template {
+        Some(template) if template.eq_ignore_ascii_case("anthropic") => WireApi::Anthropic,
+        Some(template)
+            if matches!(
+                template.to_ascii_lowercase().as_str(),
+                "openai" | "codex-oauth" | "grok" | "grok-oauth"
+            ) =>
+        {
+            WireApi::Responses
+        }
+        _ => WireApi::Completions,
     }
 }
 
@@ -3089,10 +3066,7 @@ impl ProvidersConfig {
     pub fn resolve_active_model_reasoning_params(&self) -> Option<Value> {
         let active = self.active_model.as_ref()?;
         if self.has_reasoning_effort_capability(&active.provider, &active.model) {
-            let wire_api = match self.resolve_wire_api(&active.provider, &active.model) {
-                WireApi::Auto => WireApi::detect_for_provider(&active.provider, &active.model),
-                wire_api => wire_api,
-            };
+            let wire_api = self.resolve_wire_api(&active.provider, &active.model);
             return self
                 .resolve_reasoning_effort_params_for_openai_endpoint(
                     &active.provider,
@@ -3191,13 +3165,15 @@ impl ProvidersConfig {
         })
     }
 
-    /// Resolve configured wire endpoint authority for `(provider, model)`.
-    /// Concrete model pins win, then concrete provider defaults, then a live
-    /// catalog's advertised endpoints. `Auto` means the caller should consult
-    /// learned state and conservative defaults.
+    /// Resolve the effective request wire for `(provider, model)`.
+    ///
+    /// Explicit model and provider configuration win. An unset entry then
+    /// inherits its immutable template default; a custom or unknown provider
+    /// defaults to Chat Completions. URLs, mutable provider ids, model names,
+    /// live catalog metadata, and learned endpoint state never participate.
     pub fn resolve_wire_api(&self, provider: &str, model: &str) -> WireApi {
         let Some(entry) = self.providers.get(provider) else {
-            return WireApi::Auto;
+            return WireApi::Completions;
         };
         if let Some(wire_api) = entry
             .models
@@ -3212,44 +3188,13 @@ impl ProvidersConfig {
         if !entry.wire_api.is_auto() {
             return entry.wire_api;
         }
-        if let Some(model) = entry.models.iter().find(|m| m.id == model)
-            && let Some(wire_api) = preferred_catalog_wire_api(&model.capabilities)
-        {
-            return wire_api;
-        }
-        if let Some(wire_api) = entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .filter(|m| matches!(m.wire_api_provenance, WireApiProvenance::Recovered))
-            .map(|m| m.wire_api)
-            .filter(|w| !w.is_auto())
-        {
-            return wire_api;
-        }
-        // Copilot's model catalog is authoritative when present, but a
-        // temporary/missing catalog must not make a renamed Copilot GPT-5
-        // connection start at Chat Completions. Other providers retain the
-        // historic `Auto` result so their learned-endpoint path remains
-        // unchanged.
-        if entry.is_copilot_identity(provider) {
-            WireApi::detect(model)
-        } else {
-            WireApi::Auto
-        }
+        default_wire_api_for_template(entry.effective_template(provider))
     }
 
-    /// Whether the endpoint is explicitly pinned by model or provider config.
-    pub fn is_wire_api_explicit(&self, provider: &str, model: &str) -> bool {
-        let Some(entry) = self.providers.get(provider) else {
-            return false;
-        };
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .is_some_and(|m| !m.wire_api.is_auto() && m.wire_api_provenance.is_user_configured())
-            || !entry.wire_api.is_auto()
+    /// Whether a configured provider has a fixed effective wire. Resolution is
+    /// total for configured providers, so template defaults are fixed too.
+    pub fn is_wire_api_explicit(&self, provider: &str, _model: &str) -> bool {
+        self.providers.contains_key(provider)
     }
 }
 

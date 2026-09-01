@@ -1987,7 +1987,8 @@ async fn openai_text_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system.unwrap_or(""),
@@ -2040,7 +2041,8 @@ async fn openai_tool_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system,

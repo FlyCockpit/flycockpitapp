@@ -182,6 +182,7 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
         WireApi::Auto => {}
         WireApi::Completions => summary.push_str(" · wire completions"),
         WireApi::Responses => summary.push_str(" · wire responses"),
+        WireApi::Anthropic => summary.push_str(" · wire anthropic"),
     }
     if entry.backup.is_some() {
         summary.push_str(" · backup set");

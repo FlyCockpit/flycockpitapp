@@ -2038,15 +2038,8 @@ impl ToolCallProviderIdentity {
         provider_item_id: String,
         provider_call_id: Option<String>,
     ) -> Self {
-        let wire_api = resolved_wire_api.or_else(|| {
-            // Fallback only: normal recording passes the concrete endpoint from
-            // the resolved model/config. If that is unavailable, keep the old
-            // conservative provider-aware detector rather than fabricating a
-            // Responses label.
-            Some(crate::config::providers::WireApi::detect_for_provider(
-                provider?, model?,
-            ))
-        });
+        let wire_api =
+            resolved_wire_api.or_else(|| providers?.resolve_wire_api(provider?, model?).into());
         let is_responses = matches!(wire_api, Some(crate::config::providers::WireApi::Responses));
         let is_completions = matches!(
             wire_api,
@@ -2078,6 +2071,7 @@ fn wire_api_label(wire_api: crate::config::providers::WireApi) -> Option<&'stati
     match wire_api {
         crate::config::providers::WireApi::Responses => Some("responses"),
         crate::config::providers::WireApi::Completions => Some("completions"),
+        crate::config::providers::WireApi::Anthropic => Some("anthropic"),
         // `Auto` is a configuration directive, not an observed wire endpoint.
         // Preserve that uncertainty as SQL/JSON null instead of inventing a
         // string label.

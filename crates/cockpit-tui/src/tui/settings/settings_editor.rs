@@ -62,8 +62,8 @@ use cockpit_config::providers::{
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES,
     ModelCapabilityOverrides, ModelEntry, ModelLocation, ModelTrust, PromptCacheRetention,
     ProviderEntry, ProvidersConfig, ShrinkConfig, ShrinkStrategy, ThinkingMode, TimeoutConfig,
-    WireApi, WireApiProvenance, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url,
-    is_xai_grok_provider, model_system_prompt_too_large, normalize_model_system_prompt,
+    WireApi, WireApiProvenance, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_xai_grok_provider,
+    model_system_prompt_too_large, normalize_model_system_prompt,
 };
 
 use super::multimodal_capability_editor::{
@@ -471,7 +471,7 @@ impl SettingsEditor {
     pub(super) fn for_provider(provider_id: &str, entry: &ProviderEntry) -> Self {
         let xai_multi_agent_tools_beta =
             tools_entitlement_enabled(&entry.capabilities.client_side_tools);
-        let show_wire_api = !is_anthropic_native_base_url(&entry.url);
+        let show_wire_api = true;
         let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
             scope: SettingsScope::Provider,
@@ -583,7 +583,7 @@ impl SettingsEditor {
         let detected_capabilities = model
             .map(|m| detected_model_capabilities(entry, m))
             .unwrap_or_default();
-        let show_wire_api = !is_anthropic_native_base_url(&entry.url);
+        let show_wire_api = true;
         let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
             scope: SettingsScope::Model {
@@ -1334,6 +1334,10 @@ impl SettingsEditor {
                             self.wire_api_present = true;
                         }
                         (true, WireApi::Responses) => {
+                            self.wire_api = WireApi::Anthropic;
+                            self.wire_api_present = true;
+                        }
+                        (true, WireApi::Anthropic) => {
                             self.wire_api = WireApi::Auto;
                             self.wire_api_present = false;
                         }
@@ -1346,7 +1350,8 @@ impl SettingsEditor {
                     self.wire_api = match self.wire_api {
                         WireApi::Auto => WireApi::Completions,
                         WireApi::Completions => WireApi::Responses,
-                        WireApi::Responses => WireApi::Auto,
+                        WireApi::Responses => WireApi::Anthropic,
+                        WireApi::Anthropic => WireApi::Auto,
                     };
                     self.wire_api_present = true;
                 }
@@ -2494,6 +2499,7 @@ fn wire_api_label(wire_api: WireApi) -> &'static str {
         WireApi::Auto => "auto",
         WireApi::Completions => "completions",
         WireApi::Responses => "responses",
+        WireApi::Anthropic => "anthropic",
     }
 }
 

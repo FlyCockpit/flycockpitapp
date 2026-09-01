@@ -944,6 +944,7 @@ fn round_trips_a_provider_entry() {
             allow_insecure_http: false,
             credential_ref: None,
             auth: Some(AuthKind::ApiKey),
+            auth_command: None,
             trust: None,
             location: None,
             quality_rank: None,

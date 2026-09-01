@@ -78,6 +78,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "favorite",
     "credential_ref",
     "auth",
+    "auth_command",
     "trust",
     "location",
     "quality_rank",
@@ -478,6 +479,16 @@ pub struct ProviderEntry {
     /// driven by `headers` + `credential_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthKind>,
+
+    /// External authentication command, expressed as an argv vector (program
+    /// followed by arguments). This is accepted only from a global user
+    /// provider layer; project/workspace layers strip it before merging.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonempty_argv"
+    )]
+    pub auth_command: Option<Vec<String>>,
 
     /// Product-facing trust policy. `trusted` disables outbound request
     /// redaction for models inheriting it; `untrusted` keeps the session
@@ -1124,8 +1135,27 @@ pub enum AuthKind {
     ApiKey,
     /// OAuth bearer resolved from the credential store at request time.
     OAuth,
+    /// Bearer token and optional headers returned by `auth_command`.
+    Command,
     /// No authentication (e.g. a self-hosted ollama server).
     None,
+}
+
+fn deserialize_optional_nonempty_argv<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Vec<String>>::deserialize(deserializer)?;
+    if value.as_ref().is_some_and(|argv| {
+        argv.is_empty() || argv.first().is_some_and(|program| program.is_empty())
+    }) {
+        return Err(serde::de::Error::custom(
+            "auth_command must contain a non-empty executable",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1787,6 +1817,8 @@ pub enum WireApi {
     Completions,
     /// Force the Responses endpoint (`/responses`).
     Responses,
+    /// Force Anthropic's native Messages endpoint (`/v1/messages`).
+    Anthropic,
 }
 
 /// Authority of a concrete model-level [`WireApi`] value.
@@ -1854,7 +1886,9 @@ impl WireApi {
         entry: &ProviderEntry,
         model_id: &str,
     ) -> WireApi {
-        if entry.is_copilot_identity(provider_id) {
+        if is_anthropic_native_base_url(&entry.url) {
+            WireApi::Anthropic
+        } else if entry.is_copilot_identity(provider_id) {
             Self::detect(model_id)
         } else {
             Self::detect_for_provider(provider_id, model_id)
@@ -1867,7 +1901,7 @@ impl WireApi {
     pub fn opposite(self) -> WireApi {
         match self {
             WireApi::Responses => WireApi::Completions,
-            WireApi::Completions | WireApi::Auto => WireApi::Responses,
+            WireApi::Completions | WireApi::Auto | WireApi::Anthropic => WireApi::Responses,
         }
     }
 }
@@ -3089,10 +3123,7 @@ impl ProvidersConfig {
     pub fn resolve_active_model_reasoning_params(&self) -> Option<Value> {
         let active = self.active_model.as_ref()?;
         if self.has_reasoning_effort_capability(&active.provider, &active.model) {
-            let wire_api = match self.resolve_wire_api(&active.provider, &active.model) {
-                WireApi::Auto => WireApi::detect_for_provider(&active.provider, &active.model),
-                wire_api => wire_api,
-            };
+            let wire_api = self.resolve_wire_api_or_detect(&active.provider, &active.model);
             return self
                 .resolve_reasoning_effort_params_for_openai_endpoint(
                     &active.provider,
@@ -3237,6 +3268,19 @@ impl ProvidersConfig {
         } else {
             WireApi::Auto
         }
+    }
+
+    /// Resolve the configured endpoint, falling back to the entry-aware
+    /// conservative detector when no concrete endpoint has been selected.
+    pub fn resolve_wire_api_or_detect(&self, provider: &str, model: &str) -> WireApi {
+        let configured = self.resolve_wire_api(provider, model);
+        if !configured.is_auto() {
+            return configured;
+        }
+        self.providers
+            .get(provider)
+            .map(|entry| WireApi::detect_for_provider_entry(provider, entry, model))
+            .unwrap_or_else(|| WireApi::detect_for_provider(provider, model))
     }
 
     /// Whether the endpoint is explicitly pinned by model or provider config.

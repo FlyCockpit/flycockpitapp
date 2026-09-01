@@ -180,6 +180,7 @@ fn wire_api_label(wire: WireApi) -> &'static str {
         WireApi::Auto => "auto",
         WireApi::Completions => "completions",
         WireApi::Responses => "responses",
+        WireApi::Anthropic => "messages",
     }
 }
 
@@ -737,7 +738,9 @@ pub async fn probe_target<C: DeepfetchProbeClient>(
             endpoint: match endpoint {
                 WireApi::Completions => ProbeEndpoint::Completions,
                 WireApi::Responses => ProbeEndpoint::Responses,
-                WireApi::Auto => return Ok(DeepfetchApplyReport::SkippedNoEndpointChoice),
+                WireApi::Auto | WireApi::Anthropic => {
+                    return Ok(DeepfetchApplyReport::SkippedNoEndpointChoice);
+                }
             },
             max_tokens: CONTEXT_PROBE_MAX_TOKENS,
         })

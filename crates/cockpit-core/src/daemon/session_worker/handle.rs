@@ -1129,12 +1129,7 @@ pub(super) fn active_wire_api_for_session(
 ) -> (String, String, crate::config::providers::WireApi) {
     let provider = session.active_provider().unwrap_or_default();
     let model = session.active_model().unwrap_or_default();
-    let configured = providers.resolve_wire_api(&provider, &model);
-    let resolved = if configured.is_auto() {
-        crate::config::providers::WireApi::detect_for_provider(&provider, &model)
-    } else {
-        configured
-    };
+    let resolved = providers.resolve_wire_api_or_detect(&provider, &model);
     (provider, model, resolved)
 }
 
@@ -1142,6 +1137,7 @@ pub(super) fn wire_api_label(wire_api: crate::config::providers::WireApi) -> &'s
     match wire_api {
         crate::config::providers::WireApi::Responses => "responses",
         crate::config::providers::WireApi::Completions => "completions",
+        crate::config::providers::WireApi::Anthropic => "messages",
         crate::config::providers::WireApi::Auto => "auto",
     }
 }

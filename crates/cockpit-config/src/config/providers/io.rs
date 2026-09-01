@@ -736,11 +736,20 @@ impl ConfigDoc {
             validate_provider_id_for_filename(id)?;
             let value: Value = serde_json::from_slice(bytes)
                 .with_context(|| format!("parsing workspace provider `{id}`"))?;
-            let Some(provider) = value.as_object() else {
+            let Some(mut provider) = value.as_object().cloned() else {
                 anyhow::bail!("workspace provider `{id}` must be a JSON object");
             };
-            reject_legacy_redact_fields(id, provider)?;
-            providers.insert(id.clone(), value);
+            reject_legacy_redact_fields(id, &provider)?;
+            if !matches!(
+                snapshot.origin,
+                Some(
+                    crate::config::dirs::ConfigDirKind::HomeXdg
+                        | crate::config::dirs::ConfigDirKind::HomeDot
+                )
+            ) {
+                strip_project_auth_command(id, &mut provider, "attached workspace config");
+            }
+            providers.insert(id.clone(), Value::Object(provider));
         }
         root.insert("providers".to_string(), Value::Object(providers));
         Ok(Self {
@@ -1648,6 +1657,9 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
         };
         match load_provider_raw_file(&path) {
             Ok(mut provider) => {
+                if !config_path_is_global_user_layer(config_path) {
+                    strip_project_auth_command(&id, &mut provider, "project provider config");
+                }
                 let url_changed = provider.get("url").is_some_and(|new_url| {
                     merged
                         .get("providers")
@@ -1681,6 +1693,34 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
             }
         }
     }
+}
+
+/// Only the conventional home-scoped directories may configure executable
+/// provider authentication. Every other configuration layer is project scoped.
+fn config_path_is_global_user_layer(config_path: &Path) -> bool {
+    let Some(parent) = config_path.parent() else {
+        return false;
+    };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    parent == home.join(".cockpit") || parent == home.join(".config/cockpit")
+}
+
+fn strip_project_auth_command(
+    provider_id: &str,
+    provider: &mut Map<String, Value>,
+    source: &'static str,
+) -> bool {
+    if provider.remove("auth_command").is_none() {
+        return false;
+    }
+    tracing::warn!(
+        provider = %provider_id,
+        source,
+        "ignored project-scoped provider auth_command; executable authentication is global-only"
+    );
+    true
 }
 
 fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig) {

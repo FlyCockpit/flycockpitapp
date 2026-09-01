@@ -1123,6 +1123,7 @@ impl Model {
                 crate::config::providers::WireApi::Auto => "auto",
                 crate::config::providers::WireApi::Completions => "completions",
                 crate::config::providers::WireApi::Responses => "responses",
+                crate::config::providers::WireApi::Anthropic => "messages",
             },
             Model::ChatGpt { .. } => "responses",
             Model::Anthropic { .. } => "messages",
@@ -1135,7 +1136,7 @@ impl Model {
                 self.resolve_live_wire_api_for_base_url(client.base_url())
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Anthropic,
         }
     }
 
@@ -1269,7 +1270,7 @@ impl Model {
                 }
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Anthropic,
         }
     }
 

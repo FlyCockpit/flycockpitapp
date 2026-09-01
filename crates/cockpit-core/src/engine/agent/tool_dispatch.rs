@@ -3193,7 +3193,7 @@ mod tests {
     use crate::{
         approval::{Approver, store::GrantStore},
         config::extended::ApprovalMode,
-        engine::tool::Tool as _,
+        engine::tool::Tool,
     };
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};

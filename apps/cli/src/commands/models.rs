@@ -264,6 +264,7 @@ fn wire_api_label(wire_api: WireApi) -> &'static str {
         WireApi::Auto => "wire=auto",
         WireApi::Completions => "wire=completions",
         WireApi::Responses => "wire=responses",
+        WireApi::Anthropic => "wire=messages",
     }
 }
 

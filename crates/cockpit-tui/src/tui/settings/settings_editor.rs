@@ -1346,7 +1346,7 @@ impl SettingsEditor {
                     self.wire_api = match self.wire_api {
                         WireApi::Auto => WireApi::Completions,
                         WireApi::Completions => WireApi::Responses,
-                        WireApi::Responses => WireApi::Auto,
+                        WireApi::Responses | WireApi::Anthropic => WireApi::Auto,
                     };
                     self.wire_api_present = true;
                 }
@@ -2494,6 +2494,7 @@ fn wire_api_label(wire_api: WireApi) -> &'static str {
         WireApi::Auto => "auto",
         WireApi::Completions => "completions",
         WireApi::Responses => "responses",
+        WireApi::Anthropic => "messages",
     }
 }
 

@@ -100,6 +100,7 @@ pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
 pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
+pub(crate) const SEALED_ACQUISITION_PROMPT: &str = include_str!("sealed_acquisition.md");
 
 /// Uniform, cache-stable steering for every untrusted model. This intentionally
 /// depends only on the model's fixed trust posture, never on a turn's dynamic
@@ -697,6 +698,9 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "glob",
         "list_sealed_value_descriptions",
         "use_sealed_value",
+        "capture_sealed_value",
+        "acquisition_requires_user",
+        "acquisition_fail",
         "inspect_audio",
         "inspect_video",
         "extract_video_clip",
@@ -1166,6 +1170,15 @@ pub(crate) fn materialize_tool_by_name(
             tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool,
         )),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "capture_sealed_value" => tb.with(Arc::new(
+            tools::trusted_child_acquisition::CaptureSealedValueTool,
+        )),
+        "acquisition_requires_user" => tb.with(Arc::new(
+            tools::trusted_child_acquisition::AcquisitionRequiresUserTool,
+        )),
+        "acquisition_fail" => tb.with(Arc::new(
+            tools::trusted_child_acquisition::AcquisitionFailTool,
+        )),
         "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
         | "extract_audio" | "transcribe_audio"
             if media_forbidden =>
@@ -2238,7 +2251,7 @@ pub(crate) fn is_docs_pipeline(name: &str) -> bool {
 fn is_internal_agent_def_name(name: &str) -> bool {
     matches!(
         name,
-        "Computer" | "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker"
+        "Computer" | "computer" | "docs-resolver" | "docs-answerer" | "Dream" | "dream-worker" | "sealed-acquisition"
     )
 }
 

@@ -74,6 +74,12 @@ pub const STRUCTURAL_TOOLS: &[&str] = &[
     "start_build",
 ];
 
+const ACQUISITION_TERMINAL_TOOLS: &[&str] = &[
+    "capture_sealed_value",
+    "acquisition_requires_user",
+    "acquisition_fail",
+];
+
 /// Tools that may be granted **only to primary (chat-owning) agents** —
 /// the external-harness delegation tools (GOALS §6,
 /// implementation note). An external harness runs outside
@@ -183,6 +189,14 @@ pub fn validate_grant(
         if SANDBOX_ONLY_TOOLS.contains(&tool.as_str()) {
             bail!(
                 "delegation to `{target_name}` may not be granted the docs-answerer-only sandboxed tool `{tool}`"
+            );
+        }
+        if ACQUISITION_TERMINAL_TOOLS.contains(&tool.as_str())
+            && def.name != "sealed-acquisition"
+        {
+            bail!(
+                "agent `{}` may request but may not grant itself the trusted-child acquisition sub-profile tool `{tool}`",
+                def.name
             );
         }
         if tool == SPAWN_TOOL && !SPAWN_AGENTS.contains(&target_name) {

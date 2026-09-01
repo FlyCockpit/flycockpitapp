@@ -1245,7 +1245,9 @@ async fn execute_ordinary_call_unscoped(
     if should_scan_tool_result(
         resolved_name,
         env.agent.scan_tool_results,
-        env.session.approval_mode(),
+        crate::tools::trusted_child_acquisition::effective_approval_mode(
+            env.session.approval_mode(),
+        ),
         guard.threshold,
     ) {
         recheck_result = true;
@@ -1441,7 +1443,7 @@ async fn execute_ordinary_call_unscoped(
     if selected_replay_denied_before_intercept {
         cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
     }
-    let (result, duration_ms) = if reserved_native_computer {
+    let (mut result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
         // path is the only route that executes these items.
@@ -1922,6 +1924,17 @@ async fn execute_ordinary_call_unscoped(
             .unwrap_or_else(|| format!("`{resolved_name}` arguments failed schema validation"));
         (Err(invalid_input(msg)), 0)
     };
+    // Acquisition outputs cross their containment boundary at production,
+    // before hooks, audit rows, artifacts, events, or history can retain the
+    // plaintext. Outside the host-conferred task-local profile this is a no-op.
+    if let Ok(output) = &mut result {
+        crate::tools::trusted_child_acquisition::quarantine_bash_result(
+            tc.id.as_str(),
+            resolved_name,
+            output,
+        );
+    }
+
     // This is the outer approval scope's exact effect outcome. The nested
     // timeout scope has already completed any approval raised *inside* the
     // tool; this records the result for approvals raised by the loop/safety/

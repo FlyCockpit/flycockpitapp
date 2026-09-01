@@ -101,6 +101,10 @@ pub enum AgentCapability {
     SandboxEscalate,
     ForkContext,
     ScopedParallelWrite,
+    /// Request for the host-only trusted-child acquisition sub-profile. A
+    /// definition can declare the request, but ordinary posture resolution
+    /// never turns it into authority; only the owner acquisition action does.
+    SealedAcquisitionCapture,
 }
 
 impl AgentCapability {
@@ -111,6 +115,7 @@ impl AgentCapability {
             "sandboxEscalate" => Some(Self::SandboxEscalate),
             "forkContext" => Some(Self::ForkContext),
             "scopedParallelWrite" => Some(Self::ScopedParallelWrite),
+            "sealedAcquisitionCapture" => Some(Self::SealedAcquisitionCapture),
             _ => None,
         }
     }
@@ -122,6 +127,7 @@ impl AgentCapability {
             Self::SandboxEscalate => "sandboxEscalate",
             Self::ForkContext => "forkContext",
             Self::ScopedParallelWrite => "scopedParallelWrite",
+            Self::SealedAcquisitionCapture => "sealedAcquisitionCapture",
         }
     }
 }
@@ -237,7 +243,13 @@ impl PostureResolution {
                         .capabilities
                         .iter()
                         .copied()
-                        .filter(|capability| *capability != AgentCapability::ComputerUse)
+                        .filter(|capability| {
+                            !matches!(
+                                capability,
+                                AgentCapability::ComputerUse
+                                    | AgentCapability::SealedAcquisitionCapture
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),

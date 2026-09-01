@@ -3717,6 +3717,12 @@ impl SettingsCx {
                     .to_string(),
                     yellow,
                 )));
+                if s.is_step("test-key") && s.fetch.is_none() {
+                    lines.push(Line::from(Span::styled(
+                        "Validation failed or the network is offline. Press o to continue with manual model setup, or Esc to cancel and resume later.",
+                        muted,
+                    )));
+                }
             }
             Some("done") | None => {
                 lines.push(Line::from(Span::styled(
@@ -3941,12 +3947,6 @@ impl SettingsCx {
                         ),
                     ),
                 ));
-                if s.is_step("test-key") && s.fetch.is_none() {
-                    lines.push(Line::from(Span::styled(
-                        "Validation failed or the network is offline. Press o to continue with manual model setup, or Esc to cancel and resume later.",
-                        muted,
-                    )));
-                }
                 lines.push(Line::from(label));
             }
         }

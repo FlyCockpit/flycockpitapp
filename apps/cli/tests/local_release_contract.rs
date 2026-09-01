@@ -4,7 +4,11 @@
 //! if a remote dependency, command, daemon worker, protocol module, or release
 //! workflow becomes reachable without the single `remote` feature.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -17,44 +21,6 @@ fn repo_root() -> PathBuf {
 fn source(relative: &str) -> String {
     std::fs::read_to_string(repo_root().join(relative))
         .unwrap_or_else(|error| panic!("reading {relative}: {error}"))
-}
-
-fn enables_grok_subscription(value: &str) -> bool {
-    let value = value.strip_prefix("dep:").unwrap_or(value);
-    let value = value.strip_suffix('?').unwrap_or(value);
-    value == "grok-subscription" || value.ends_with("/grok-subscription")
-}
-
-fn dependency_enables_grok_subscription(value: &toml::Value) -> bool {
-    let Some(table) = value.as_table() else {
-        return false;
-    };
-
-    for (key, child) in table {
-        if matches!(
-            key.as_str(),
-            "dependencies" | "build-dependencies" | "dev-dependencies"
-        ) && child.as_table().is_some_and(|dependencies| {
-            dependencies.values().any(|specification| {
-                specification
-                    .as_table()
-                    .and_then(|specification| specification.get("features"))
-                    .and_then(toml::Value::as_array)
-                    .is_some_and(|features| {
-                        features
-                            .iter()
-                            .filter_map(toml::Value::as_str)
-                            .any(enables_grok_subscription)
-                    })
-            })
-        }) {
-            return true;
-        }
-        if dependency_enables_grok_subscription(child) {
-            return true;
-        }
-    }
-    false
 }
 
 #[test]
@@ -182,38 +148,125 @@ fn official_release_never_enables_optional_cargo_features() {
     assert!(policy.contains("dependency feature declaration"));
     assert!(policy.contains("default feature declaration"));
     assert!(policy.contains("Cargo config"));
+    assert!(policy.contains("Cargo features form a graph"));
+    assert!(policy.contains("reaches_grok_subscription"));
     assert!(policy.contains("grok-subscription"));
 }
 
+fn feature_policy_fixture(
+    core_default_features: &str,
+    cli_dependency_features: &str,
+) -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("creating feature-policy fixture");
+    let root = fixture.path();
+    fs::create_dir_all(root.join("scripts")).expect("creating fixture script directory");
+    fs::create_dir_all(root.join("apps/cli/src")).expect("creating fixture CLI source directory");
+    fs::create_dir_all(root.join("crates/cockpit-core/src"))
+        .expect("creating fixture core source directory");
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["apps/cli", "crates/cockpit-core"]
+resolver = "3"
+"#,
+    )
+    .expect("writing fixture workspace manifest");
+    fs::write(root.join("apps/cli/src/lib.rs"), "").expect("writing fixture CLI source");
+    fs::write(root.join("crates/cockpit-core/src/lib.rs"), "")
+        .expect("writing fixture core source");
+    fs::write(
+        root.join("apps/cli/Cargo.toml"),
+        format!(
+            r#"[package]
+name = "cockpit-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cockpit-core = {{ path = "../../crates/cockpit-core", default-features = false, features = [{cli_dependency_features}] }}
+"#,
+        ),
+    )
+    .expect("writing fixture CLI manifest");
+    fs::write(
+        root.join("crates/cockpit-core/Cargo.toml"),
+        format!(
+            r#"[package]
+name = "cockpit-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = [{core_default_features}]
+release-grok = ["intermediate-grok"]
+intermediate-grok = ["grok-subscription"]
+grok-subscription = []
+"#,
+        ),
+    )
+    .expect("writing fixture core manifest");
+    fs::copy(
+        repo_root().join("scripts/check-official-release-feature-policy.sh"),
+        root.join("scripts/check-official-release-feature-policy.sh"),
+    )
+    .expect("copying release feature policy into fixture");
+
+    let lockfile = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(root)
+        .status()
+        .expect("generating fixture lockfile");
+    assert!(lockfile.success(), "generating fixture lockfile failed");
+    fixture
+}
+
 #[test]
-fn official_release_manifest_graph_cannot_unify_grok_subscription() {
-    let workspace: toml::Value = toml::from_str(&source("Cargo.toml")).unwrap();
-    for member in workspace["workspace"]["members"]
-        .as_array()
-        .expect("workspace members")
-    {
-        let manifest = format!(
-            "{}/Cargo.toml",
-            member.as_str().expect("workspace member path")
-        );
-        let parsed: toml::Value = toml::from_str(&source(&manifest))
-            .unwrap_or_else(|error| panic!("parsing {manifest}: {error}"));
-        let mut default_features = parsed
-            .get("features")
-            .and_then(toml::Value::as_table)
-            .and_then(|features| features.get("default"))
-            .and_then(toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(toml::Value::as_str);
-        assert!(
-            !default_features.any(enables_grok_subscription),
-            "{manifest} default features activate grok-subscription"
-        );
-        assert!(
-            !dependency_enables_grok_subscription(&parsed),
-            "{manifest} activates grok-subscription through a dependency feature"
-        );
+fn official_release_feature_policy_rejects_transitive_grok_subscription_aliases() {
+    for (description, core_default_features, cli_dependency_features, expected_failure) in [
+        (
+            "default feature alias chain",
+            "\"release-grok\"",
+            "",
+            Some("cockpit-core: default feature declaration enables grok-subscription"),
+        ),
+        (
+            "dependency feature alias chain",
+            "",
+            "\"release-grok\"",
+            Some(
+                "cockpit-cli: dependency feature declaration for cockpit-core enables grok-subscription",
+            ),
+        ),
+        ("manifest with no grok feature root", "", "", None),
+    ] {
+        let fixture = feature_policy_fixture(core_default_features, cli_dependency_features);
+        let output = Command::new("bash")
+            .arg(
+                fixture
+                    .path()
+                    .join("scripts/check-official-release-feature-policy.sh"),
+            )
+            .current_dir(fixture.path())
+            .output()
+            .expect("running copied release feature policy");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match expected_failure {
+            Some(expected) => {
+                assert!(
+                    !output.status.success(),
+                    "the policy accepted a {description}: stderr={stderr}"
+                );
+                assert!(
+                    stderr.contains(expected),
+                    "the policy did not identify the {description}: stderr={stderr}"
+                );
+            }
+            None => assert!(
+                output.status.success(),
+                "the policy rejected a {description}: stderr={stderr}"
+            ),
+        }
     }
 }
 

@@ -16,11 +16,11 @@ use objc2_core_graphics::{
 };
 
 use super::{
-    CaptureFrame, ClickCount, ComputerAction, ComputerActionOutcome, ComputerBackend,
-    ComputerError, DisplayGeometry, DisplayTarget, Easing, Modifiers, MouseButton, PixelPoint,
-    PixelRect, PixelSize, RealDesktopGrantStore, ScaleFactor, checked_action_duration,
-    checked_point, checked_rect, checked_scroll_delta, checked_zoom_scale, click_repetitions,
-    eased_progress, scale_png,
+    CaptureFrame, ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError,
+    DisplayGeometry, DisplayTarget, Easing, Modifiers, MouseButton, PixelPoint, PixelRect,
+    PixelSize, RealDesktopGrantStore, ScaleFactor, checked_action_duration, checked_point,
+    checked_rect, checked_scroll_delta, checked_zoom_scale, click_repetitions, eased_progress,
+    scale_png,
 };
 use crate::computer::target::BackendKind;
 
@@ -128,13 +128,9 @@ impl MacOsComputerBackend {
         flags: CGEventFlags,
         click_state: i64,
     ) -> Result<(), ComputerError> {
-        let event = CGEvent::new_mouse_event(
-            Some(&self.source),
-            event_type,
-            point,
-            cg_button(button),
-        )
-        .ok_or_else(|| cg_null("CGEventCreateMouseEvent"))?;
+        let event =
+            CGEvent::new_mouse_event(Some(&self.source), event_type, point, cg_button(button))
+                .ok_or_else(|| cg_null("CGEventCreateMouseEvent"))?;
         CGEvent::set_flags(Some(&event), flags);
         if click_state > 0 {
             CGEvent::set_integer_value_field(
@@ -326,13 +322,7 @@ impl MacOsComputerBackend {
                     None,
                 )?;
                 let flags = modifier_flags(*modifiers);
-                self.post_mouse(
-                    mouse_down_type(*button),
-                    *button,
-                    self.cursor()?,
-                    flags,
-                    1,
-                )?;
+                self.post_mouse(mouse_down_type(*button), *button, self.cursor()?, flags, 1)?;
                 self.held_buttons.push(*button);
                 for step in path.iter().skip(1) {
                     self.move_cursor(
@@ -342,13 +332,7 @@ impl MacOsComputerBackend {
                         Some(*button),
                     )?;
                 }
-                self.post_mouse(
-                    mouse_up_type(*button),
-                    *button,
-                    self.cursor()?,
-                    flags,
-                    1,
-                )?;
+                self.post_mouse(mouse_up_type(*button), *button, self.cursor()?, flags, 1)?;
                 self.held_buttons.retain(|held| held != button);
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -366,9 +350,13 @@ impl MacOsComputerBackend {
                 let flags = flags_for_keys(&chord.keys);
                 for code in &codes {
                     self.post_key(*code, true, flags)?;
+                    if !self.held_keys.contains(code) {
+                        self.held_keys.push(*code);
+                    }
                 }
                 for code in codes.iter().rev() {
                     self.post_key(*code, false, flags)?;
+                    self.held_keys.retain(|held| held != code);
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -489,8 +477,10 @@ fn query_geometry() -> Result<DisplayGeometry, ComputerError> {
     }
     Ok(DisplayGeometry {
         physical: PixelSize {
-            width: u32::try_from(physical_width).map_err(|error| command_error("CoreGraphics", error))?,
-            height: u32::try_from(physical_height).map_err(|error| command_error("CoreGraphics", error))?,
+            width: u32::try_from(physical_width)
+                .map_err(|error| command_error("CoreGraphics", error))?,
+            height: u32::try_from(physical_height)
+                .map_err(|error| command_error("CoreGraphics", error))?,
         },
         logical: super::LogicalSize {
             width: logical_width as f64,
@@ -540,12 +530,12 @@ fn flags_for_keys(keys: &[String]) -> CGEventFlags {
         control: keys
             .iter()
             .any(|key| key.eq_ignore_ascii_case("control") || key.eq_ignore_ascii_case("ctrl")),
-        alt: keys.iter().any(|key| {
-            key.eq_ignore_ascii_case("alt") || key.eq_ignore_ascii_case("option")
-        }),
-        meta: keys.iter().any(|key| {
-            key.eq_ignore_ascii_case("meta") || key.eq_ignore_ascii_case("command")
-        }),
+        alt: keys
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case("alt") || key.eq_ignore_ascii_case("option")),
+        meta: keys
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case("meta") || key.eq_ignore_ascii_case("command")),
     })
 }
 
@@ -688,15 +678,20 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("temp dir");
         let grant = RealDesktopGrantStore::new(temp.path().join("missing-grant"));
         let result = MacOsComputerBackend::construct(DisplayTarget::RealDesktop, Some(&grant));
-        assert!(matches!(result, Err(ComputerError::RealDesktopGrantMissing)));
+        assert!(matches!(
+            result,
+            Err(ComputerError::RealDesktopGrantMissing)
+        ));
     }
 
     #[test]
     fn key_map_and_modifier_flags_cover_primary_chords() {
         assert_eq!(key_code("Command"), Some(0x37));
         assert_eq!(key_code("ArrowLeft"), Some(0x7b));
-        assert!(flags_for_keys(&["Command".into(), "Shift".into()])
-            .contains(CGEventFlags::MaskCommand | CGEventFlags::MaskShift));
+        assert!(
+            flags_for_keys(&["Command".into(), "Shift".into()])
+                .contains(CGEventFlags::MaskCommand | CGEventFlags::MaskShift)
+        );
         assert_eq!(key_code("not-a-key"), None);
     }
 

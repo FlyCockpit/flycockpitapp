@@ -65,15 +65,11 @@ pub(crate) async fn open_native_computer_for_delegation(
         None
     };
     #[cfg(not(target_os = "macos"))]
-    let backend_result = crate::computer::VirtualDisplayBackend::construct(
-        candidate.target,
-        grant_store.as_ref(),
-    );
+    let backend_result =
+        crate::computer::VirtualDisplayBackend::construct(candidate.target, grant_store.as_ref());
     #[cfg(target_os = "macos")]
-    let backend_result = crate::computer::MacOsComputerBackend::construct(
-        candidate.target,
-        grant_store.as_ref(),
-    );
+    let backend_result =
+        crate::computer::MacOsComputerBackend::construct(candidate.target, grant_store.as_ref());
     let backend = match backend_result {
         Ok(backend) => backend,
         Err(error) => {
@@ -127,9 +123,7 @@ pub(crate) async fn open_native_computer_for_delegation(
             {
                 let adapter = crate::computer::platform::MacOsTargetEvidenceAdapter::new()
                     .map_err(|reason| {
-                        anyhow::anyhow!(
-                            "real desktop target evidence unavailable: {reason:?}"
-                        )
+                        anyhow::anyhow!("real desktop target evidence unavailable: {reason:?}")
                     })?;
                 let file_lock = crate::computer::coordinator::FileAdvisoryLock::new()
                     .map_err(|error| anyhow::anyhow!("host input arbiter unavailable: {error}"))?;

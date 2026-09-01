@@ -5751,20 +5751,16 @@ mod tests {
         let mut display_b = display_a;
         display_b.physical_display_id = [99; 32];
 
-        let token_a = match arbiter_a.try_acquire_macos(
-            &display_a,
-            DelegationId("macos-display-a".to_string()),
-        ) {
+        let token_a = match arbiter_a
+            .try_acquire_macos(&display_a, DelegationId("macos-display-a".to_string()))
+        {
             AcquireResult::Acquired(token) => token,
             other => panic!("first macOS display should acquire, got {other:?}"),
         };
         assert_eq!(token_a.target_key, display_a);
         assert_ne!(token_a.arbitration_key, display_a);
         assert!(matches!(
-            arbiter_b.try_acquire_macos(
-                &display_b,
-                DelegationId("macos-display-b".to_string()),
-            ),
+            arbiter_b.try_acquire_macos(&display_b, DelegationId("macos-display-b".to_string()),),
             AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
         ));
     }

@@ -902,12 +902,10 @@ impl MacOsTargetEvidenceAdapter {
         })
     }
 
-    fn capture_macos_snapshot(
-        &self,
-    ) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+    fn capture_macos_snapshot(&self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         use objc2_app_kit::NSWorkspace;
         use objc2_application_services::{AXUIElement, AXValue, AXValueType};
-        use objc2_core_foundation::{CGPoint, CGSize, CFString};
+        use objc2_core_foundation::{CGPoint, CGSize};
         use objc2_core_graphics::{
             CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGError,
             CGGetActiveDisplayList,
@@ -928,9 +926,7 @@ impl MacOsTargetEvidenceAdapter {
             .downcast::<AXUIElement>()
             .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
         let mut ax_pid: libc::pid_t = 0;
-        let pid_status = unsafe {
-            application.pid(std::ptr::NonNull::from(&mut ax_pid))
-        };
+        let pid_status = unsafe { application.pid(std::ptr::NonNull::from(&mut ax_pid)) };
         if pid_status != objc2_application_services::AXError::Success
             || u32::try_from(ax_pid).ok() != Some(frontmost_pid)
         {
@@ -1036,17 +1032,14 @@ impl MacOsTargetEvidenceAdapter {
         }
         // SAFETY: ColorSync documents a non-null retained UUID for a valid
         // active display ID. objc2 represents that audited contract directly.
-        let display_uuid = unsafe {
-            objc2_color_sync::CGDisplayCreateUUIDFromDisplayID(display_id)
-        };
+        let display_uuid =
+            unsafe { objc2_color_sync::CGDisplayCreateUUIDFromDisplayID(display_id) };
         let display_uuid_bytes: [u8; 16] = display_uuid.uuid_bytes().into();
 
         let role = ax_string(&window, MacAxAttribute::Role)?;
         let subrole = ax_optional_string(&window, MacAxAttribute::Subrole);
         let title = ax_optional_string(&window, MacAxAttribute::Title);
-        let bundle_id = frontmost
-            .bundleIdentifier()
-            .map(|value| value.to_string());
+        let bundle_id = frontmost.bundleIdentifier().map(|value| value.to_string());
         let app_name = frontmost.localizedName().map(|value| value.to_string());
 
         // Recheck both independently observed focus authorities after all
@@ -1058,9 +1051,8 @@ impl MacOsTargetEvidenceAdapter {
             .downcast::<AXUIElement>()
             .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
         let mut recheck_ax_pid: libc::pid_t = 0;
-        let recheck_status = unsafe {
-            recheck_application.pid(std::ptr::NonNull::from(&mut recheck_ax_pid))
-        };
+        let recheck_status =
+            unsafe { recheck_application.pid(std::ptr::NonNull::from(&mut recheck_ax_pid)) };
         if recheck_status != objc2_application_services::AXError::Success
             || recheck_frontmost_pid != Some(frontmost_pid)
             || u32::try_from(recheck_ax_pid).ok() != Some(frontmost_pid)
@@ -1115,8 +1107,10 @@ impl MacOsTargetEvidenceAdapter {
                 )
             },
         );
-        snapshot.accessibility_role =
-            FieldEvidence::available(role, EvidenceSource::Accessibility);
+        // TODO(issue #188 follow-up): semantic accessibility-driven
+        // perception remains deferred; these AX fields are target evidence
+        // only, while screenshots remain the model's perception surface.
+        snapshot.accessibility_role = FieldEvidence::available(role, EvidenceSource::Accessibility);
         snapshot.accessibility_subrole = optional_ax_field(subrole);
         snapshot.title_hint = title.map_or_else(
             || {
@@ -1230,17 +1224,15 @@ fn ax_attribute(
     let mut raw: *const CFType = std::ptr::null();
     // SAFETY: `raw` is a valid writable out pointer. On success AX returns a
     // non-null +1 CF object, transferred immediately into CFRetained.
-    let status = unsafe {
-        element.copy_attribute_value(&name, std::ptr::NonNull::from(&mut raw))
-    };
+    let status = unsafe { element.copy_attribute_value(&name, std::ptr::NonNull::from(&mut raw)) };
     if status == AXError::APIDisabled {
         return Err(TargetUnavailableReason::PermissionDenied);
     }
     if status != AXError::Success {
         return Err(TargetUnavailableReason::FocusIdentityUnavailable);
     }
-    let raw = std::ptr::NonNull::new(raw.cast_mut())
-        .ok_or(TargetUnavailableReason::QueryMismatch)?;
+    let raw =
+        std::ptr::NonNull::new(raw.cast_mut()).ok_or(TargetUnavailableReason::QueryMismatch)?;
     // SAFETY: AXUIElementCopyAttributeValue returned success and ownership of
     // the non-null +1 value represented by `raw`.
     Ok(unsafe { CFRetained::from_raw(raw) })

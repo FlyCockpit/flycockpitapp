@@ -2934,7 +2934,13 @@ fn custom_provider_wire_api_selects_each_model_arm() {
         |_| None,
     )
     .expect("custom Responses provider must build");
-    assert!(matches!(response_model, Model::ChatGpt { .. }));
+    assert!(matches!(
+        &response_model,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
     assert_eq!(response_model.provider_label(), "my-subscription");
 
     let anthropic_entry = ProviderEntry {
@@ -5293,7 +5299,13 @@ fn wire_api_change_requires_a_model_rebuild() {
         |_| None,
     )
     .expect("Responses selection must rebuild into its dedicated model arm");
-    assert!(matches!(rebuilt, Model::ChatGpt { .. }));
+    assert!(matches!(
+        rebuilt,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
     assert_eq!(
         existing.resolve_live_wire_api_for_base_url(url),
         WireApi::Completions,
@@ -6983,7 +6995,7 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
 }
 
 #[tokio::test]
-async fn non_codex_responses_wire_omits_codex_headers() {
+async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
     use crate::config::providers::{CacheConfig, HeaderSpec, WireApi};
 
     let mut provider = ScriptedProvider::builder()
@@ -7040,17 +7052,28 @@ async fn non_codex_responses_wire_omits_codex_headers() {
         |_| None,
     )
     .expect("custom Responses provider must build");
-    assert!(matches!(model, Model::ChatGpt { .. }));
+    assert!(matches!(
+        &model,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
     assert_eq!(model.provider_label(), "custom-subscription");
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    // The scripted Responses stream contains output text and completion items
+    // only: no reasoning output item is required for a successful turn.
     model
         .complete_captured(
             "system",
-            &[],
+            &[Message::user("earlier turn")],
             Message::user("hi"),
             &[],
-            ModelParams::default(),
+            ModelParams {
+                additional_params: Some(json!({ "reasoning_effort": "high" })),
+                ..ModelParams::default()
+            },
             "Build",
             Some(&tx),
             &CancellationToken::new(),
@@ -7060,6 +7083,10 @@ async fn non_codex_responses_wire_omits_codex_headers() {
         .expect("custom Responses request must complete");
 
     let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "authorization"),
+        Some("Bearer subscription-token")
+    );
     for header in [
         "chatgpt-account-id",
         "originator",
@@ -7072,6 +7099,22 @@ async fn non_codex_responses_wire_omits_codex_headers() {
             "{header}"
         );
     }
+    assert_eq!(request.body["store"], json!(false));
+    assert!(
+        request.body.get("previous_response_id").is_none(),
+        "generic Responses requests must not rely on server state: {}",
+        request.body
+    );
+    let input = request.body["input"]
+        .as_array()
+        .expect("Responses requests must carry the full conversation as input");
+    let input = serde_json::to_string(input).expect("input must serialize");
+    assert!(
+        input.contains("earlier turn"),
+        "history missing from input: {input}"
+    );
+    assert!(input.contains("hi"), "prompt missing from input: {input}");
+    assert_eq!(request.body["reasoning_effort"], json!("high"));
 }
 
 #[tokio::test]

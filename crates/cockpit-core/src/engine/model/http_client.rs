@@ -21,11 +21,10 @@ const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SSE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
-// Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
-// MiniMax, OpenCode Zen, generic openai-compatible, Ollama) speaks the
-// *Chat Completions* API — `/chat/completions`. We have to construct
-// the `CompletionsClient` variant instead, or every non-OpenAI-proper
-// endpoint 404s on the wrong path.
+// Most OpenAI-compatible providers in `src/providers/mod.rs` (z.ai, MiniMax,
+// OpenCode Zen, generic openai-compatible, Ollama) speak the *Chat
+// Completions* API, so `Model::OpenAi` retains a `CompletionsClient` and
+// selects its Responses view only when the configured wire is `responses`.
 pub(super) type OpenAiCompatClient = openai::CompletionsClient<UsageAliasHttpClient>;
 pub(super) type ChatGptResponsesModel = chatgpt::ResponsesCompletionModel<UsageAliasHttpClient>;
 pub(super) type AnthropicCompletionModel =
@@ -69,9 +68,9 @@ impl UsageAliasHttpClient {
         Self::with_header_policy(extra_headers, false, true)
     }
 
-    /// The rig ChatGPT Responses client supplies ChatGPT subscription headers
-    /// itself. Generic Responses providers use the same request serializer but
-    /// must not receive those Codex-specific headers.
+    /// Generic Responses providers must not receive headers that identify a
+    /// ChatGPT/Codex subscription, whether they originate in rig or provider
+    /// configuration.
     pub(super) fn without_codex_headers(
         extra_headers: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {

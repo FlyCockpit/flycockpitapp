@@ -393,23 +393,49 @@ pub(super) fn build_model_with_can_delegate(
     };
     let utility_token_limit = resolve_utility_token_limit(entry, model_id);
     match wire_api {
-        crate::config::providers::WireApi::Responses => build_chatgpt_model_with_utility_limit(
-            provider_id,
-            &resolved,
-            resolved.is_codex_credential,
-            model_id,
-            utility_token_limit,
-            timeout,
-            hard_timeout_on_stall,
-            trusted,
-            location,
-            quality_rank,
-            cost_rank,
-            subagent_invokable,
-            can_delegate,
-            session_redact,
-            redact,
-        ),
+        crate::config::providers::WireApi::Responses if resolved.is_codex_credential => {
+            build_chatgpt_model_with_utility_limit(
+                provider_id,
+                &resolved,
+                true,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
+        // Responses is a wire choice, not a Codex credential. Third-party
+        // Bearer providers use the generic OpenAI client and its `/responses`
+        // serializer; only the Codex credential may select `Model::ChatGpt`.
+        crate::config::providers::WireApi::Responses => {
+            build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
+                provider_id,
+                &resolved,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                client_side_tools,
+                wire_api,
+                wire_api_explicit,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
         crate::config::providers::WireApi::Anthropic => {
             let max_tokens =
                 crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
@@ -982,10 +1008,19 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
+    let http_client = if resolved_wire_api == crate::config::providers::WireApi::Responses {
+        // Generic Responses endpoints must not receive headers that identify a
+        // ChatGPT/Codex subscription, even if they were supplied in custom
+        // provider configuration. Those headers belong exclusively to the
+        // native Codex credential path above.
+        UsageAliasHttpClient::without_codex_headers(extra_headers)?
+    } else {
+        UsageAliasHttpClient::new(extra_headers)?
+    };
     let client = openai::CompletionsClient::builder()
         .api_key(token)
         .base_url(&resolved.base_url)
-        .http_client(UsageAliasHttpClient::new(extra_headers)?)
+        .http_client(http_client)
         .build()
         .with_context(|| format!("building openai-compatible client for `{provider_id}`"))?;
     Ok(Model::OpenAi {

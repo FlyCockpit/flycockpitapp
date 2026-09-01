@@ -470,10 +470,10 @@ pub(crate) type LiveWireApi = Arc<Mutex<LiveWireApiState>>;
 /// as we wire more providers.
 #[derive(Clone)]
 pub enum Model {
-    /// OpenAI-compatible chat-completions endpoint. Used for the
-    /// generic openai-compatible template and every vendor that exposes
-    /// `/v1/chat/completions` (z.ai, MiniMax, OpenCode Zen, Ollama,
-    /// OpenRouter, …). The model id is what the provider's API
+    /// Generic OpenAI-wire endpoint. Used for the generic
+    /// openai-compatible template and every provider that exposes either
+    /// `/v1/chat/completions` or `/v1/responses` (z.ai, MiniMax, OpenCode
+    /// Zen, Ollama, OpenRouter, …). The model id is what the provider's API
     /// expects (e.g. `claude-opus-4-7`, `glm-4.6`, `gpt-4o-mini`).
     OpenAi {
         client: OpenAiCompatClient,
@@ -551,9 +551,9 @@ pub enum Model {
         /// debug/request payloads are exact-as-sent and may contain secrets.
         redact: Arc<RedactionTable>,
     },
-    /// Responses endpoint. The same request serializer serves generic
-    /// Responses providers and ChatGPT/Codex; Codex-only headers remain bound
-    /// to the resolved Codex credential path.
+    /// Native ChatGPT/Codex Responses endpoint. Codex-only headers remain
+    /// bound to the resolved Codex credential path; generic Responses
+    /// providers use [`Model::OpenAi`].
     ChatGpt {
         model: ChatGptResponsesModel,
         model_id: String,

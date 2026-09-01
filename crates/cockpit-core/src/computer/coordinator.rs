@@ -50,6 +50,7 @@ use super::frame::{
     ScreenshotMediaType, TransientProviderRequest, anthropic_transient_image_block,
     openai_transient_computer_output,
 };
+use super::host_identity::HostInstallationId;
 use super::observation::{
     GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
 };
@@ -445,6 +446,10 @@ impl std::error::Error for HostLockError {}
 pub struct FileAdvisoryLock {
     /// Directory that holds the per-key lock files.
     root: std::path::PathBuf,
+    /// The macOS HID event tap is one physical sink across login users. Its
+    /// lock is therefore intentionally rooted in the system sticky directory
+    /// and shared read/write, unlike every per-user Cockpit lock.
+    shared_across_users: bool,
     /// Locks currently held by this instance, keyed by the arbiter key string.
     /// The value owns the live descriptor/handle; dropping it releases the OS
     /// lock.
@@ -467,11 +472,24 @@ impl std::fmt::Debug for FileAdvisoryLock {
 }
 
 impl FileAdvisoryLock {
-    /// Open a production lock rooted at the private Cockpit data directory.
+    /// Open a production lock. macOS HID injection uses a user-independent
+    /// namespace under the system sticky directory; all other backends retain
+    /// the private per-user Cockpit root.
     pub fn new() -> Result<Self, HostLockError> {
-        let root = crate::config::resolve::cockpit_data_dir()
-            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-        Self::with_root(root)
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(Self {
+                root: std::path::PathBuf::from("/private/var/tmp"),
+                shared_across_users: true,
+                held: HashMap::new(),
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let root = crate::config::resolve::cockpit_data_dir()
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            Self::with_root(root)
+        }
     }
 
     /// Open a lock rooted at an explicit directory. Tests inject a private
@@ -481,6 +499,7 @@ impl FileAdvisoryLock {
         ensure_lock_root(&root)?;
         Ok(Self {
             root,
+            shared_across_users: false,
             held: HashMap::new(),
         })
     }
@@ -493,8 +512,12 @@ impl FileAdvisoryLock {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         HostInputArbiter::key_string(key).hash(&mut hasher);
         let digest = hasher.finish();
-        self.root
-            .join(format!("computer-host-input-{digest:016x}.lock"))
+        let name = if self.shared_across_users {
+            format!("flycockpit-macos-global-hid-{digest:016x}.lock")
+        } else {
+            format!("computer-host-input-{digest:016x}.lock")
+        };
+        self.root.join(name)
     }
 
     /// Test-only accessor for the per-key lock-file path, so tests can
@@ -532,7 +555,10 @@ fn ensure_lock_root(root: &std::path::Path) -> Result<(), HostLockError> {
 /// process or another open description in this process), or `Err(LockFileIo)`
 /// on any other I/O failure.
 #[cfg(unix)]
-fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+fn os_lock_file(
+    path: &std::path::Path,
+    shared_across_users: bool,
+) -> Result<std::fs::File, HostLockError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
@@ -540,15 +566,10 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
         .read(true)
         .write(true)
         .create(true)
-        .mode(0o600)
+        .mode(if shared_across_users { 0o666 } else { 0o600 })
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-
-    // `.mode(0o600)` only applies to a NEWLY created file; a pre-existing lock
-    // file may carry broader permissions or a foreign owner. Verify and tighten
-    // the held fd (fstat/fchmod — no path re-resolution, so no TOCTOU) before
-    // taking the lock; fail closed on anything we cannot make owner-private.
     let meta = file
         .metadata()
         .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
@@ -557,24 +578,55 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
             "lock path is not a regular file".to_string(),
         ));
     }
-    // SAFETY: `geteuid` is always safe.
-    let euid = unsafe { libc::geteuid() };
-    if meta.uid() != euid {
-        return Err(HostLockError::LockFileIo(
-            "lock file owned by another user".to_string(),
-        ));
-    }
-    if meta.mode() & 0o777 != 0o600 {
-        // `File::set_permissions` is `fchmod` on the held fd.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-        let remeta = file
-            .metadata()
-            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-        if remeta.mode() & 0o777 != 0o600 {
+
+    if shared_across_users {
+        // The system sticky directory prevents another user from unlinking a
+        // lock they do not own. A shared mode is required so independently
+        // logged-in Cockpit users contend on this one HID sink; if a prior
+        // creator left any other mode, fail closed rather than silently fork
+        // arbitration.
+        if meta.mode() & 0o777 != 0o666 {
+            // A newly-created file is filtered through the creator's umask.
+            // Repair through the held fd; another user's private/insecure
+            // file cannot be repaired and therefore fails closed.
+            file.set_permissions(std::fs::Permissions::from_mode(0o666))
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            if file
+                .metadata()
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?
+                .mode()
+                & 0o777
+                != 0o666
+            {
+                return Err(HostLockError::LockFileIo(
+                    "shared macOS HID lock is not mode 0o666".to_string(),
+                ));
+            }
+        }
+    } else {
+        // `.mode(0o600)` only applies to a NEWLY created file; a pre-existing lock
+        // file may carry broader permissions or a foreign owner. Verify and tighten
+        // the held fd (fstat/fchmod — no path re-resolution, so no TOCTOU) before
+        // taking the lock; fail closed on anything we cannot make owner-private.
+        // SAFETY: `geteuid` is always safe.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
             return Err(HostLockError::LockFileIo(
-                "could not tighten lock file to 0o600".to_string(),
+                "lock file owned by another user".to_string(),
             ));
+        }
+        if meta.mode() & 0o777 != 0o600 {
+            // `File::set_permissions` is `fchmod` on the held fd.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            let remeta = file
+                .metadata()
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            if remeta.mode() & 0o777 != 0o600 {
+                return Err(HostLockError::LockFileIo(
+                    "could not tighten lock file to 0o600".to_string(),
+                ));
+            }
         }
     }
 
@@ -592,7 +644,10 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
 }
 
 #[cfg(windows)]
-fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+fn os_lock_file(
+    path: &std::path::Path,
+    _shared_across_users: bool,
+) -> Result<std::fs::File, HostLockError> {
     use std::os::windows::fs::OpenOptionsExt as _;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
@@ -629,7 +684,10 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn os_lock_file(_path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+fn os_lock_file(
+    _path: &std::path::Path,
+    _shared_across_users: bool,
+) -> Result<std::fs::File, HostLockError> {
     Err(HostLockError::LockFileIo(
         "host input advisory locks are unsupported on this platform".to_string(),
     ))
@@ -644,7 +702,7 @@ impl OsAdvisoryLock for FileAdvisoryLock {
             return Ok(());
         }
         let path = self.lock_path(key);
-        let file = os_lock_file(&path)?;
+        let file = os_lock_file(&path, self.shared_across_users)?;
         self.held.insert(key_str, HeldFileLock { _file: file });
         Ok(())
     }
@@ -950,14 +1008,14 @@ impl HostInputArbiter {
         delegation: DelegationId,
     ) -> AcquireResult {
         let arbitration_key = PhysicalTargetKey::new(
-            target_key.host_installation_id,
+            HostInstallationId([0; 32]),
             crate::computer::host_identity::domain_hash(
                 b"cockpit.macos.global-hid.session.v1",
-                &[target_key.host_installation_id.as_bytes()],
+                &[],
             ),
             crate::computer::host_identity::domain_hash(
                 b"cockpit.macos.global-hid.display.v1",
-                &[target_key.host_installation_id.as_bytes()],
+                &[],
             ),
         );
         self.try_acquire_with_key(target_key, &arbitration_key, delegation)
@@ -5780,6 +5838,9 @@ mod tests {
         display_b.physical_display_id = [99; 32];
         // Audit sessions do not partition the global HID event tap.
         display_b.platform_session_or_seat_id = [98; 32];
+        // A separately installed Cockpit instance (for example, a different
+        // macOS login user) must still contend for the one HID event tap.
+        display_b.host_installation_id = HostInstallationId([77; 32]);
 
         let token_a = match arbiter_a
             .try_acquire_macos(&display_a, DelegationId("macos-display-a".to_string()))

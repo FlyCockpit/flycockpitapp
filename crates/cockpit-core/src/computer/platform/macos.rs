@@ -865,6 +865,25 @@ impl MacObservedEpoch {
     }
 }
 
+/// Epoch tied to the AX focused-window object's lifetime, rather than to a
+/// recyclable PID or CoreGraphics window number. The production adapter feeds
+/// this with `CFEqual` on a retained AX element; a replacement advances it
+/// even when every numeric/window-geometry field happens to repeat.
+#[derive(Debug, Default)]
+pub struct MacFocusedWindowLifetimeEpoch {
+    epoch: u64,
+}
+
+impl MacFocusedWindowLifetimeEpoch {
+    pub fn observe(&mut self, same_live_window: bool) -> Result<u64, MacEvidenceError> {
+        if same_live_window {
+            return Ok(self.epoch);
+        }
+        self.epoch = self.epoch.checked_add(1).ok_or(MacEvidenceError::Stale)?;
+        Ok(self.epoch)
+    }
+}
+
 // --- Production adapter ---------------------------------------------------
 
 /// Synchronous macOS AX/AppKit/CoreGraphics evidence adapter.
@@ -877,6 +896,13 @@ pub struct MacOsTargetEvidenceAdapter {
     host: HostInstallationId,
     reducer: FocusGenerationReducer,
     observed_epoch: u64,
+    /// Retained AX element for the currently observed focused window. AX
+    /// window and CoreGraphics numbers are recyclable; this retained live AX
+    /// object is the lifetime witness that distinguishes a replacement from
+    /// the prior object even when those numeric IDs are identical.
+    focused_window_lifetime:
+        Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>>,
+    focused_window_lifetime_epoch: MacFocusedWindowLifetimeEpoch,
 }
 
 #[cfg(target_os = "macos")]
@@ -899,10 +925,14 @@ impl MacOsTargetEvidenceAdapter {
             host,
             reducer: FocusGenerationReducer::new(),
             observed_epoch: 0,
+            focused_window_lifetime: None,
+            focused_window_lifetime_epoch: MacFocusedWindowLifetimeEpoch::default(),
         })
     }
 
-    fn capture_macos_snapshot(&self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+    fn capture_macos_snapshot(
+        &mut self,
+    ) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         use objc2_app_kit::NSWorkspace;
         use objc2_application_services::AXUIElement;
         use objc2_core_graphics::{
@@ -934,6 +964,26 @@ impl MacOsTargetEvidenceAdapter {
         let window = ax_attribute(&application, MacAxAttribute::FocusedWindow)?
             .downcast::<AXUIElement>()
             .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+
+        // `CFEqual` is AX's object-identity comparison, not a comparison of
+        // window bounds or the recyclable CGWindowID. Keep the prior object
+        // retained across snapshots: a destroyed AX element and a replacement
+        // that happens to receive the same PID/window number compare unequal.
+        // The resulting epoch is mixed into the opaque ID consumed by both
+        // planning and pre-handoff generation checks.
+        let same_live_window = self
+            .focused_window_lifetime
+            .as_ref()
+            .is_some_and(|previous| {
+                objc2_core_foundation::CFEqual(Some(previous.as_ref()), Some(window.as_ref()))
+            });
+        let focused_window_lifetime_epoch = self
+            .focused_window_lifetime_epoch
+            .observe(same_live_window)
+            .map_err(|_| TargetUnavailableReason::EpochOverflow)?;
+        if !same_live_window {
+            self.focused_window_lifetime = Some(window.clone());
+        }
 
         let (position, size) = ax_window_rect(&window)?;
         let window_number = cg_window_number_for_ax_window(frontmost_pid, position, size)?;
@@ -1042,8 +1092,12 @@ impl MacOsTargetEvidenceAdapter {
         }
 
         let window_hash = domain_hash(
-            b"cockpit.macos.cg-window.v1",
-            &[&frontmost_pid.to_le_bytes(), &window_number.to_le_bytes()],
+            b"cockpit.macos.ax-window-lifetime.v1",
+            &[
+                &frontmost_pid.to_le_bytes(),
+                &window_number.to_le_bytes(),
+                &focused_window_lifetime_epoch.to_le_bytes(),
+            ],
         );
         let mut window_id = [0_u8; 16];
         window_id.copy_from_slice(&window_hash[..16]);
@@ -1148,10 +1202,11 @@ impl TargetEvidenceAdapter for MacOsTargetEvidenceAdapter {
 
     fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         let mut snapshot = self.capture_macos_snapshot()?;
-        self.observed_epoch = self
-            .observed_epoch
-            .checked_add(1)
-            .ok_or(TargetUnavailableReason::EpochOverflow)?;
+        // This adapter does not publish a native callback stream yet, so a
+        // synchronous snapshot is not itself an observed focus event. The
+        // pre-handoff bracket below compares the complete fingerprint, which
+        // now includes the retained-AX lifetime epoch; advancing this counter
+        // on every read would reject every otherwise stable dispatch.
         snapshot.adapter_observed_epoch = self.observed_epoch;
         snapshot.focus_generation = self.reducer.observe(&snapshot)?;
         Ok(snapshot)

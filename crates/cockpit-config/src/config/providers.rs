@@ -78,6 +78,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "favorite",
     "credential_ref",
     "auth",
+    "auth_command",
     "trust",
     "location",
     "quality_rank",
@@ -478,6 +479,19 @@ pub struct ProviderEntry {
     /// driven by `headers` + `credential_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthKind>,
+
+    /// External authentication command, expressed as an argv vector (program
+    /// followed by arguments). The command is accepted only from a global
+    /// user provider layer. Project/workspace layers strip this field before
+    /// merging, so merely opening a repository can never authorize process
+    /// execution. Each argv item supports the same `${VAR}`, `$VAR`, and
+    /// `$secret:<name>` references as provider headers.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonempty_argv"
+    )]
+    pub auth_command: Option<Vec<String>>,
 
     /// Product-facing trust policy. `trusted` disables outbound request
     /// redaction for models inheriting it; `untrusted` keeps the session
@@ -1123,8 +1137,27 @@ pub enum AuthKind {
     ApiKey,
     /// OAuth bearer resolved from the credential store at request time.
     OAuth,
+    /// Bearer token and optional headers returned by `auth_command`.
+    Command,
     /// No authentication (e.g. a self-hosted ollama server).
     None,
+}
+
+fn deserialize_optional_nonempty_argv<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Vec<String>>::deserialize(deserializer)?;
+    if value.as_ref().is_some_and(|argv| {
+        argv.is_empty() || argv.first().is_some_and(|program| program.is_empty())
+    }) {
+        return Err(serde::de::Error::custom(
+            "auth_command must contain a non-empty executable",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

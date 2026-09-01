@@ -736,11 +736,20 @@ impl ConfigDoc {
             validate_provider_id_for_filename(id)?;
             let value: Value = serde_json::from_slice(bytes)
                 .with_context(|| format!("parsing workspace provider `{id}`"))?;
-            let Some(provider) = value.as_object() else {
+            let Some(mut provider) = value.as_object().cloned() else {
                 anyhow::bail!("workspace provider `{id}` must be a JSON object");
             };
-            reject_legacy_redact_fields(id, provider)?;
-            providers.insert(id.clone(), value);
+            reject_legacy_redact_fields(id, &provider)?;
+            if !matches!(
+                snapshot.origin,
+                Some(
+                    crate::config::dirs::ConfigDirKind::HomeXdg
+                        | crate::config::dirs::ConfigDirKind::HomeDot
+                )
+            ) {
+                strip_project_auth_command(id, &mut provider, "attached workspace config");
+            }
+            providers.insert(id.clone(), Value::Object(provider));
         }
         root.insert("providers".to_string(), Value::Object(providers));
         Ok(Self {
@@ -1648,6 +1657,9 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
         };
         match load_provider_raw_file(&path) {
             Ok(mut provider) => {
+                if !config_path_is_global_user_layer(config_path) {
+                    strip_project_auth_command(&id, &mut provider, "project provider config");
+                }
                 let url_changed = provider.get("url").is_some_and(|new_url| {
                     merged
                         .get("providers")
@@ -1681,6 +1693,35 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
             }
         }
     }
+}
+
+/// Only the two conventional home-scoped directories are global authority.
+/// Machine-local per-cwd, project `.cockpit`, attached workspace snapshots,
+/// and `COCKPIT_CONFIG` are project scoped for executable configuration.
+fn config_path_is_global_user_layer(config_path: &Path) -> bool {
+    let Some(parent) = config_path.parent() else {
+        return false;
+    };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    parent == home.join(".cockpit") || parent == home.join(".config/cockpit")
+}
+
+fn strip_project_auth_command(
+    provider_id: &str,
+    provider: &mut Map<String, Value>,
+    source: &'static str,
+) -> bool {
+    if provider.remove("auth_command").is_none() {
+        return false;
+    }
+    tracing::warn!(
+        provider = %provider_id,
+        source,
+        "ignored project-scoped provider auth_command; executable authentication is global-only"
+    );
+    true
 }
 
 fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig) {
@@ -1756,6 +1797,76 @@ fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>)
 
 #[cfg(test)]
 mod atomic_write_tests {
+    use serde_json::{Map, Value};
+
+    use super::strip_project_auth_command;
+
+    #[test]
+    fn project_auth_command_is_ignored_and_reported() {
+        let mut provider = Map::from_iter([
+            ("url".into(), Value::String("https://example.test/v1".into())),
+            (
+                "auth_command".into(),
+                serde_json::json!(["/definitely/must/not/run"]),
+            ),
+        ]);
+
+        let warned = strip_project_auth_command("custom", &mut provider, "test project config");
+
+        assert!(warned, "stripping the command must surface a warning signal");
+        assert!(!provider.contains_key("auth_command"));
+        assert_eq!(provider["url"], "https://example.test/v1");
+    }
+
+    #[test]
+    fn retained_project_layer_cannot_replace_global_auth_command() {
+        let snapshot = |origin, command: &str| crate::config::WorkspaceConfigLayerSnapshot {
+            origin,
+            config_json: None,
+            provider_files: vec![(
+                "custom".into(),
+                serde_json::to_vec(&serde_json::json!({
+                    "url": "https://example.test/v1",
+                    "auth": "command",
+                    "auth_command": [command],
+                    "models": [{ "id": "model" }]
+                }))
+                .unwrap(),
+            )],
+            effective_default_artifact_digest: None,
+            digest: command.into(),
+        };
+        let global = snapshot(
+            Some(crate::config::dirs::ConfigDirKind::HomeXdg),
+            "/trusted/global-helper",
+        );
+        let project = snapshot(
+            Some(crate::config::dirs::ConfigDirKind::Project),
+            "/must/not/execute",
+        );
+
+        let providers = super::ConfigDoc::providers_from_workspace_layer_snapshots(&[
+            global, project,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            providers.providers["custom"].auth_command.as_deref(),
+            Some(["/trusted/global-helper".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn auth_command_schema_rejects_empty_argv() {
+        let error = serde_json::from_value::<super::ProviderEntry>(serde_json::json!({
+            "auth": "command",
+            "auth_command": []
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-empty executable"));
+    }
+
     #[test]
     fn prepared_write_publishes_only_at_commit_and_replaces_existing_destination() {
         let temp = tempfile::tempdir().unwrap();

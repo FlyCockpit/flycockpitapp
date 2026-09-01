@@ -1422,23 +1422,6 @@ impl Session {
         providers: &crate::config::providers::ProvidersConfig,
         provider_id: &str,
     ) -> bool {
-        if let Some(entry) = providers.providers.get(provider_id)
-            && let Some(command) = entry.auth_command.as_deref()
-        {
-            let store = match self.provider_credential_store(providers) {
-                Ok(store) => store,
-                Err(_) => return false,
-            };
-            return crate::auth::command::resolve(
-                provider_id,
-                command,
-                store,
-                &|name| std::env::var(name).ok(),
-                true,
-            )
-            .await
-            .is_ok();
-        }
         let Some(cache) = self.command_secret_cache() else {
             return false;
         };
@@ -1474,6 +1457,35 @@ impl Session {
             }
         }
         reresolved_any
+    }
+
+    /// Force-refresh this provider's global auth command, if configured.
+    /// Unlike the legacy named-command boolean seam above, command execution
+    /// and JSON failures are returned so a rejected request surfaces the auth
+    /// failure instead of silently falling back to its original 401.
+    pub(crate) async fn refresh_provider_auth_command(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+        provider_id: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(command) = providers
+            .providers
+            .get(provider_id)
+            .and_then(|entry| entry.auth_command.as_deref())
+        else {
+            return Ok(false);
+        };
+        let store = self.provider_credential_store(providers)?;
+        crate::auth::command::resolve(
+            provider_id,
+            command,
+            store,
+            &|name| std::env::var(name).ok(),
+            true,
+        )
+        .await
+        .map_err(crate::auth::command::refresh_failure)?;
+        Ok(true)
     }
 
     /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]

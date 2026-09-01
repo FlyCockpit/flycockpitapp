@@ -189,7 +189,9 @@ pub async fn resolve_provider_request_async(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     if entry.auth_command.is_some() {
-        anyhow::bail!("provider `{provider_id}` auth_command requires an injected credential store");
+        anyhow::bail!(
+            "provider `{provider_id}` auth_command requires an injected credential store"
+        );
     }
     let registry = ProviderRegistry::standard();
     if registry
@@ -212,13 +214,10 @@ pub async fn resolve_provider_request_async_with_store(
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match entry.auth_command.as_deref() {
-        Some(command) => Some(crate::auth::command::resolve(
-            provider_id,
-            command,
-            store.clone(),
-            &env_lookup,
-            false,
-        ).await?),
+        Some(command) => Some(
+            crate::auth::command::resolve(provider_id, command, store.clone(), &env_lookup, false)
+                .await?,
+        ),
         None => None,
     };
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
@@ -263,15 +262,20 @@ async fn resolve_model_list_request_async_with_store(
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
-        (Some(command), Some(store)) => Some(crate::auth::command::resolve(
-            provider_id,
-            command,
-            store.clone(),
-            &|name| std::env::var(name).ok(),
-            false,
-        ).await?),
+        (Some(command), Some(store)) => Some(
+            crate::auth::command::resolve(
+                provider_id,
+                command,
+                store.clone(),
+                &|name| std::env::var(name).ok(),
+                false,
+            )
+            .await?,
+        ),
         (Some(_), None) => {
-            anyhow::bail!("provider `{provider_id}` auth_command requires an injected credential store")
+            anyhow::bail!(
+                "provider `{provider_id}` auth_command requires an injected credential store"
+            )
         }
         (None, _) => None,
     };
@@ -280,9 +284,11 @@ async fn resolve_model_list_request_async_with_store(
         Some(OAuthCredential::Command(credential))
     } else {
         match (credential_kind, store) {
-            (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => Some(OAuthCredential::Codex(
-                crate::auth::codex_oauth::credential_from_store(store).await?,
-            )),
+            (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => {
+                Some(OAuthCredential::Codex(
+                    crate::auth::codex_oauth::credential_from_store(store).await?,
+                ))
+            }
             (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
                 crate::auth::xai_oauth::bearer_token_from_store(store).await?,
             )),
@@ -307,10 +313,11 @@ pub fn resolve_provider_request_blocking(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if entry.auth_command.is_none() && registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_none()
+    if entry.auth_command.is_none()
+        && registry
+            .provider_for(provider_id, entry)
+            .credential_kind()
+            .is_none()
     {
         return resolve_provider_request(provider_id, entry);
     }
@@ -367,10 +374,11 @@ where
     S: Fn(&str) -> Option<String>,
 {
     let registry = ProviderRegistry::standard();
-    if entry.auth_command.is_none() && registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_none()
+    if entry.auth_command.is_none()
+        && registry
+            .provider_for(provider_id, entry)
+            .credential_kind()
+            .is_none()
     {
         return resolve_provider_request_with_sources(provider_id, entry, lookup, secret_lookup);
     }
@@ -387,10 +395,11 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let registry = ProviderRegistry::standard();
-    if entry.auth_command.is_none() && registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_none()
+    if entry.auth_command.is_none()
+        && registry
+            .provider_for(provider_id, entry)
+            .credential_kind()
+            .is_none()
     {
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
         return resolve_provider_request_with_sources(provider_id, entry, lookup, secret_lookup);
@@ -460,8 +469,10 @@ fn resolve_provider_request_inner_with_sources(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
-    if matches!(entry.auth, Some(crate::config::providers::AuthKind::Command))
-        && entry.auth_command.is_none()
+    if matches!(
+        entry.auth,
+        Some(crate::config::providers::AuthKind::Command)
+    ) && entry.auth_command.is_none()
     {
         anyhow::bail!(
             "provider `{provider_id}` uses command authentication but no global auth_command is configured"
@@ -828,13 +839,8 @@ pub async fn fetch_models_for_provider_with_store(
     store: Option<crate::credentials::CredentialStore>,
 ) -> Result<FetchOutcome> {
     let auth_store = store.clone();
-    let request = resolve_model_list_request_async_with_store(
-        provider_id,
-        entry,
-        resolved,
-        store,
-    )
-    .await?;
+    let request =
+        resolve_model_list_request_async_with_store(provider_id, entry, resolved, store).await?;
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     let url = provider.models_url(entry, &request.base_url);
@@ -878,9 +884,7 @@ pub async fn fetch_models_for_provider_with_store(
             ModelCatalogAbi::from(provider.request_kind()),
         )
         .await
-        .and_then(|result| {
-            validate_anthropic_fetch_result(entry, &refreshed.base_url, result)
-        });
+        .and_then(|result| validate_anthropic_fetch_result(entry, &refreshed.base_url, result));
     }
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
@@ -2448,8 +2452,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved_header_value(&request, "Authorization"), Some("Token override"));
-        assert_eq!(resolved_header_value(&request, "X-Tenant"), Some("returned"));
+        assert_eq!(
+            resolved_header_value(&request, "Authorization"),
+            Some("Token override")
+        );
+        assert_eq!(
+            resolved_header_value(&request, "X-Tenant"),
+            Some("returned")
+        );
         assert_eq!(resolved_header_value(&request, "X-Static"), Some("kept"));
     }
 

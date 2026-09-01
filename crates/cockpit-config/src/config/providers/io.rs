@@ -1804,7 +1804,10 @@ mod atomic_write_tests {
     #[test]
     fn project_auth_command_is_ignored_and_reported() {
         let mut provider = Map::from_iter([
-            ("url".into(), Value::String("https://example.test/v1".into())),
+            (
+                "url".into(),
+                Value::String("https://example.test/v1".into()),
+            ),
             (
                 "auth_command".into(),
                 serde_json::json!(["/definitely/must/not/run"]),
@@ -1813,7 +1816,10 @@ mod atomic_write_tests {
 
         let warned = strip_project_auth_command("custom", &mut provider, "test project config");
 
-        assert!(warned, "stripping the command must surface a warning signal");
+        assert!(
+            warned,
+            "stripping the command must surface a warning signal"
+        );
         assert!(!provider.contains_key("auth_command"));
         assert_eq!(provider["url"], "https://example.test/v1");
     }
@@ -1845,10 +1851,8 @@ mod atomic_write_tests {
             "/must/not/execute",
         );
 
-        let providers = super::ConfigDoc::providers_from_workspace_layer_snapshots(&[
-            global, project,
-        ])
-        .unwrap();
+        let providers =
+            super::ConfigDoc::providers_from_workspace_layer_snapshots(&[global, project]).unwrap();
 
         assert_eq!(
             providers.providers["custom"].auth_command.as_deref(),

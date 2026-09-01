@@ -72,13 +72,7 @@ fn provider_reference_strings(entry: &ProviderEntry) -> impl Iterator<Item = &st
         .headers
         .iter()
         .map(|header| header.value.as_str())
-        .chain(
-            entry
-                .auth_command
-                .iter()
-                .flatten()
-                .map(String::as_str),
-        )
+        .chain(entry.auth_command.iter().flatten().map(String::as_str))
 }
 
 /// CLI-owned effective provider loader. The config crate keeps header values

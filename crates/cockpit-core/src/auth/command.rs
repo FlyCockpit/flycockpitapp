@@ -13,9 +13,34 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::credentials::CredentialStore;
-use crate::secret_command::{
-    CommandSecretExecutor, SubprocessCommandExecutor,
-};
+use crate::secret_command::{CommandSecretExecutor, SubprocessCommandExecutor};
+
+#[derive(Debug)]
+struct RefreshFailure {
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("provider auth command refresh failed")
+    }
+}
+
+impl std::error::Error for RefreshFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(crate) fn refresh_failure(source: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RefreshFailure { source })
+}
+
+pub(crate) fn is_refresh_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RefreshFailure>().is_some())
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct CommandCredential {
@@ -32,7 +57,10 @@ impl CommandCredential {
     }
 
     fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.token.is_empty(), "auth command returned an empty token");
+        anyhow::ensure!(
+            !self.token.is_empty(),
+            "auth command returned an empty token"
+        );
         Ok(())
     }
 }
@@ -45,7 +73,10 @@ impl std::fmt::Debug for CommandCredential {
             .field("expires_at", &self.expires_at)
             .field(
                 "header_names",
-                &self.headers.as_ref().map(|headers| headers.keys().collect::<Vec<_>>()),
+                &self
+                    .headers
+                    .as_ref()
+                    .map(|headers| headers.keys().collect::<Vec<_>>()),
             )
             .finish()
     }
@@ -85,9 +116,7 @@ async fn resolve_with_executor(
         if let Some(credential) = load_cached(&current, &key)? {
             let another_waiter_refreshed =
                 force_refresh && prior_token.as_deref() != Some(credential.token.as_str());
-            if another_waiter_refreshed
-                || (!force_refresh && !credential.is_expired(unix_now()))
-            {
+            if another_waiter_refreshed || (!force_refresh && !credential.is_expired(unix_now())) {
                 return Ok(credential);
             }
         }
@@ -96,20 +125,18 @@ async fn resolve_with_executor(
             .run(&argv)
             .await
             .map_err(|error| anyhow::anyhow!("auth command failed: {}", error.code()))?;
-        let credential: CommandCredential = serde_json::from_str(&stdout)
-            .context("auth command returned malformed JSON")?;
+        let credential: CommandCredential =
+            serde_json::from_str(&stdout).context("auth command returned malformed JSON")?;
         credential.validate()?;
-        current.save_record_merged(
-            &key,
-            serde_json::json!({ "auth_command": credential }),
-        )?;
+        current.save_record_merged(&key, serde_json::json!({ "auth_command": &credential }))?;
         Ok(credential)
     })
     .await
 }
 
 fn load_cached(store: &CredentialStore, provider_id: &str) -> Result<Option<CommandCredential>> {
-    store.get(provider_id)
+    store
+        .get(provider_id)
         .and_then(|record| record.get("auth_command"))
         .cloned()
         .map(serde_json::from_value)
@@ -127,16 +154,17 @@ fn resolve_argv(
     let mut missing = Vec::new();
     let mut errors = Vec::new();
     for item in command {
-        let resolved = crate::envref::resolve_with_sources(
-            item,
-            env_lookup,
-            |name| store.named_secret(name).map(str::to_string),
-        );
+        let resolved = crate::envref::resolve_with_sources(item, env_lookup, |name| {
+            store.named_secret(name).map(str::to_string)
+        });
         missing.extend(resolved.missing);
         errors.extend(resolved.errors);
         argv.push(resolved.value);
     }
-    anyhow::ensure!(errors.is_empty(), "auth_command contains invalid references");
+    anyhow::ensure!(
+        errors.is_empty(),
+        "auth_command contains invalid references"
+    );
     anyhow::ensure!(
         missing.is_empty(),
         "auth_command references missing environment variable(s) or named secret(s): {}",
@@ -202,8 +230,7 @@ mod tests {
     async fn valid_json_is_cached_under_provider_record() {
         let (_temp, store) = store();
         let executor = FakeExecutor::new([Ok(
-            r#"{"token":"fresh-token","expires_at":null,"headers":{"X-Tenant":"one"}}"#
-                .into(),
+            r#"{"token":"fresh-token","expires_at":null,"headers":{"X-Tenant":"one"}}"#.into(),
         )]);
         let credential = resolve_with_executor(
             "custom",

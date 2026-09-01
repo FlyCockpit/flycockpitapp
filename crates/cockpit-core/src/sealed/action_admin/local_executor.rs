@@ -11,7 +11,7 @@
 //! placing ephemeral plaintext in a persistent or shared temp location.
 
 use std::collections::BTreeMap;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -108,6 +108,42 @@ impl ExecutableIdentity {
         })
     }
 
+    /// Copy the approved bytes into a caller-owned execution object while
+    /// hashing the copy itself. The destination can subsequently be made
+    /// immutable, closing the source-file write race between verification and
+    /// exec without ever trusting the mutable source descriptor as executable
+    /// authority.
+    pub(crate) fn copy_approved_bytes(
+        &self,
+        source: &mut std::fs::File,
+        destination: &mut std::fs::File,
+    ) -> Result<()> {
+        let source_id = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_identity(source)
+            .context("capturing sealed action source executable identity")?;
+        if source_id != self.stable_id {
+            bail!("sealed action executable identity changed");
+        }
+        source.seek(SeekFrom::Start(0))?;
+        destination.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 32 * 1024];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            destination.write_all(&buffer[..read])?;
+            hasher.update(&buffer[..read]);
+        }
+        destination.flush()?;
+        destination.seek(SeekFrom::Start(0))?;
+        if crate::intel::hex_lower(&hasher.finalize()) != self.content_sha256 {
+            bail!("sealed action executable contents changed");
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
     pub(crate) fn matches(&self, file: &mut std::fs::File) -> Result<bool> {
         let actual = Self::from_open_file(file)?;
         Ok(actual.stable_id == self.stable_id && actual.content_sha256 == self.content_sha256)
@@ -819,7 +855,12 @@ fn write_private_file(
                 path,
                 literal.as_bytes(),
             )
-            .context("atomically replacing private sealed file through retained parent")?;
+            .map_err(|error| {
+                let context = format!(
+                    "atomically replacing private sealed file through retained parent: {error}"
+                );
+                error.context(context)
+            })?;
         }
         let file = parent
             .open_regular_file_relative(&[name
@@ -832,8 +873,12 @@ fn write_private_file(
         cockpit_host::private_fs::write_private_file_exclusive(path, literal.as_bytes())
             .context("writing private sealed file exclusively")?;
     } else {
-        cockpit_host::private_fs::write_private_file(path, literal.as_bytes())
-            .context("atomically replacing private sealed file")?;
+        cockpit_host::private_fs::write_private_file(path, literal.as_bytes()).map_err(
+            |error| {
+                let context = format!("atomically replacing private sealed file: {error}");
+                error.context(context)
+            },
+        )?;
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -889,8 +934,12 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
         // Make the one status we classify below stable. All other Git errors,
         // including corrupt repository/configuration failures, remain
         // fail-closed and their text is never surfaced.
+        .env_clear()
         .env("LC_ALL", "C")
         .env("LANGUAGE", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", "/dev/null")
+        .env("XDG_CONFIG_HOME", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -903,9 +952,7 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
         // destination, so it needs no Git guard. Do not treat exit status 128
         // alone as that state: Git also uses it for broken repositories and
         // configuration errors, which must remain fail-closed.
-        if inside.status.code() == Some(128)
-            && inside.stderr.starts_with(b"fatal: not a git repository")
-        {
+        if inside.status.code() == Some(128) && repository_metadata_absent(parent)? {
             return Ok(());
         }
         bail!("cannot establish sealed file git-guard state for destination");
@@ -924,7 +971,7 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
     // relative pathspec is therefore evaluated inside that same retained
     // directory. Never pass the approval-time pathname to Git: it may have
     // been rebound after the parent was opened.
-    let tracked = git_status(
+    let tracked = git_query_status(
         parent,
         &[
             "ls-files",
@@ -934,12 +981,12 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
         ],
     )
     .await?;
-    let ignored = git_status(
+    let ignored = git_query_status(
         parent,
         &["check-ignore", "-q", "--", destination_name.as_str()],
     )
     .await?;
-    if tracked || !ignored {
+    if tracked != GitQueryStatus::Negative || ignored != GitQueryStatus::Positive {
         bail!(
             "sealed file destination is tracked or not ignored; add the pinned path to .gitignore before approving materialization"
         );
@@ -947,18 +994,91 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
     Ok(())
 }
 
-async fn git_status(parent: &Path, args: &[&str]) -> Result<bool> {
-    Ok(tokio::process::Command::new("git")
+/// Prove an explicit non-repository state without interpreting Git's error
+/// prose. Any `.git` entry (directory, worktree file, symlink, or malformed
+/// object) means repository state exists and a failed Git inspection remains
+/// fail-closed. Metadata lookup errors likewise propagate rather than disable
+/// the leak guard.
+fn repository_metadata_absent(start: &Path) -> Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if start.starts_with("/proc/self/fd") {
+        return metadata_absent_from_retained_directory(start);
+    }
+    metadata_absent_in_ancestors(start)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn metadata_absent_from_retained_directory(start: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut directory = start.to_path_buf();
+    for _ in 0..1024 {
+        match std::fs::symlink_metadata(directory.join(".git")) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspecting Git metadata for sealed file"),
+        }
+        // Appending `..` to `/proc/self/fd/N` is resolved by the kernel from
+        // the held directory object, so ancestor discovery remains anchored
+        // even if an approved pathname is concurrently renamed or rebound.
+        let here =
+            std::fs::metadata(&directory).context("inspecting retained Git ancestor identity")?;
+        let parent = directory.join("..");
+        let above =
+            std::fs::metadata(&parent).context("inspecting retained Git parent identity")?;
+        if here.dev() == above.dev() && here.ino() == above.ino() {
+            return Ok(true);
+        }
+        directory = parent;
+    }
+    bail!("Git metadata ancestor inspection exceeded its safety bound")
+}
+
+fn metadata_absent_in_ancestors(start: &Path) -> Result<bool> {
+    for ancestor in start.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspecting Git metadata for sealed file"),
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitQueryStatus {
+    Positive,
+    Negative,
+}
+
+async fn git_query_status(parent: &Path, args: &[&str]) -> Result<GitQueryStatus> {
+    let status = tokio::process::Command::new("git")
         .arg("-C")
         .arg(parent)
         .args(args)
+        // Repository and configuration authority comes exclusively from the
+        // descriptor-backed `-C` directory. Ambient GIT_DIR, GIT_WORK_TREE,
+        // config, object-store, and identity variables must not redirect or
+        // break either half of the materialization guard.
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", "/dev/null")
+        .env("XDG_CONFIG_HOME", "/dev/null")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await
-        .context("running sealed file git guard")?
-        .success())
+        .context("running sealed file git guard")?;
+    match status.code() {
+        Some(0) => Ok(GitQueryStatus::Positive),
+        // These two queries document 1 as their expected negative result.
+        // Every other status is an operational failure, including repository
+        // mutation between queries, and must remain distinct and fail closed.
+        Some(1) => Ok(GitQueryStatus::Negative),
+        _ => bail!("cannot establish sealed file Git query result"),
+    }
 }
 
 struct EphemeralFile {
@@ -1356,6 +1476,27 @@ mod tests {
         assert!(PERSISTENT_FILE_APPROVAL_WARNING.contains("transform or exfiltrate"));
     }
 
+    #[test]
+    fn pinned_persistent_destination_remains_a_valid_owner_approved_fallback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut destination = FileDestination::Pinned {
+            path: directory.path().join("credential.pem"),
+            parent_identity: FileSystemIdentity::unpinned(),
+        };
+        pin_file_destination(&mut destination).expect("pin owner-selected destination");
+
+        validate_file_kind(
+            &destination,
+            FilePersistence::PersistentOwnerApproved(
+                PersistentFileApproval::acknowledge(1, PERSISTENT_FILE_APPROVAL_WARNING)
+                    .expect("record explicit persistence approval"),
+            ),
+            &[],
+            None,
+        )
+        .expect("owner-approved pinned persistence is supported");
+    }
+
     #[cfg(unix)]
     #[test]
     fn persistent_materialization_repairs_mode_before_replacing_contents() {
@@ -1440,8 +1581,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_guard_accepts_a_pinned_destination_outside_git() {
-        let directory = tempfile::tempdir().expect("tempdir");
+    async fn git_guard_accepts_a_pinned_destination_in_a_bare_repository() {
+        let directory = tempfile::tempdir().expect("isolated tempdir");
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .current_dir(directory.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .expect("initialize isolated bare repository");
+        assert!(init.success());
         let resolved = ResolvedDestination {
             path: directory.path().join("credential.pem"),
             git_guard: GitGuard::Inspect {
@@ -1454,7 +1603,106 @@ mod tests {
         };
         git_leak_guard(&resolved)
             .await
-            .expect("non-repository destination does not need Git protection");
+            .expect("bare repository has no worktree destination to protect");
+    }
+
+    #[tokio::test]
+    async fn git_guard_ignores_malformed_ambient_git_dir_at_production_boundary() {
+        const CHILD_MARKER: &str = "COCKPIT_GIT_GUARD_AMBIENT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "sealed::action_admin::local_executor::tests::git_guard_ignores_malformed_ambient_git_dir_at_production_boundary", "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env("GIT_DIR", "definitely-missing-git-directory")
+                .output()
+                .expect("run isolated environment test process");
+            assert!(
+                output.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().expect("isolated tempdir");
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .current_dir(directory.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .expect("initialize isolated bare repository");
+        assert!(init.success());
+        let resolved = ResolvedDestination {
+            path: directory.path().join("credential.pem"),
+            git_guard: GitGuard::Inspect {
+                repo_parent: directory.path().to_path_buf(),
+                destination_name: "credential.pem".to_string(),
+            },
+            _pinned_parent: None,
+            #[cfg(windows)]
+            _pinned_windows_execution_lease: None,
+        };
+
+        git_leak_guard(&resolved)
+            .await
+            .expect("ambient Git authority must not affect the materialization guard");
+    }
+
+    #[tokio::test]
+    async fn git_guard_rejects_malformed_repository_metadata() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(directory.path().join(".git"), b"not a gitdir declaration")
+            .expect("write malformed Git metadata");
+        let resolved = ResolvedDestination {
+            path: directory.path().join("credential.pem"),
+            git_guard: GitGuard::Inspect {
+                repo_parent: directory.path().to_path_buf(),
+                destination_name: "credential.pem".to_string(),
+            },
+            _pinned_parent: None,
+            #[cfg(windows)]
+            _pinned_windows_execution_lease: None,
+        };
+
+        let error = git_leak_guard(&resolved)
+            .await
+            .expect_err("broken repository metadata must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot establish sealed file git-guard state")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_query_operational_failure_is_not_an_expected_negative() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(directory.path())
+            .status()
+            .expect("initialize repository");
+        assert!(init.success());
+        std::fs::write(directory.path().join(".gitignore"), b"credential.pem\n")
+            .expect("write ignore rule");
+
+        let query_error = git_query_status(directory.path(), &["ls-files", "--bad-option"])
+            .await
+            .expect_err("operational query failure must remain an error");
+        assert!(
+            query_error
+                .to_string()
+                .contains("cannot establish sealed file Git query result")
+        );
+        assert_eq!(
+            git_query_status(
+                directory.path(),
+                &["check-ignore", "-q", "--", "credential.pem"]
+            )
+            .await
+            .expect("later ignore query succeeds"),
+            GitQueryStatus::Positive
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -222,7 +222,21 @@ pub(crate) async fn run_injected_process(
     } else {
         return Err(CommandSecretError::Io("identity_pin_missing".to_string()));
     };
+    #[cfg(test)]
+    run_after_executable_snapshot_test_hook(program);
     let mut command = tokio::process::Command::new(pinned_executable.launch_path());
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    {
+        // Executing through procfs must not change argv[0] semantics. This is
+        // particularly important for static multi-call binaries, which choose
+        // their behavior from the approved executable's basename.
+        command.arg0(program);
+    }
     command
         .args(args)
         // The action snapshot has already pinned an absolute executable. Do
@@ -266,38 +280,41 @@ fn open_identity_pinned_executable(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(program)
             .map_err(map_spawn_error)?;
-        if !identity
-            .matches(&mut file)
-            .map_err(|error| CommandSecretError::Io(error.to_string()))?
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return PinnedExecutable::sealed_linux_snapshot(file, identity);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            return Err(CommandSecretError::Io("identity_pin_changed".to_string()));
+            return PinnedExecutable::unlinked_apple_snapshot(file, identity);
         }
-        Ok(PinnedExecutable::unix(file, program))
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        {
+            let _ = (file, identity);
+            Err(CommandSecretError::Io(
+                "identity_pin_unsupported".to_string(),
+            ))
+        }
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(program)
-            .map_err(map_spawn_error)?;
-        if !identity
-            .matches(&mut file)
-            .map_err(|error| CommandSecretError::Io(error.to_string()))?
-        {
-            return Err(CommandSecretError::Io("identity_pin_changed".to_string()));
-        }
-        Ok(PinnedExecutable::windows(file, program))
+        // CreateProcessW accepts a pathname, not an already-open executable
+        // object. A pre-existing write-sharing handle can therefore alter the
+        // verified inode before image creation even while our read lease is
+        // held. Until this funnel owns a proven Windows snapshot launch, do
+        // not silently fall back to that pathname race.
+        let _ = (program, identity);
+        Err(CommandSecretError::Io(
+            "identity_pin_unsupported".to_string(),
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -314,48 +331,118 @@ struct PinnedExecutable {
 }
 
 impl PinnedExecutable {
-    #[cfg(unix)]
-    fn unix(file: std::fs::File, _program: &str) -> Self {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use std::os::fd::AsRawFd as _;
-            return Self {
-                launch_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
-                _file: file,
-            };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn sealed_linux_snapshot(
+        mut source: std::fs::File,
+        identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
+    ) -> Result<Self, CommandSecretError> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let name = CString::new("cockpit-sealed-executable").expect("static memfd name");
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+        if fd < 0 {
+            return Err(CommandSecretError::Io(io_kind_label(
+                std::io::Error::last_os_error().kind(),
+            )));
         }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            use std::os::fd::AsRawFd as _;
-            return Self {
-                launch_path: format!("/dev/fd/{}", file.as_raw_fd()),
-                _file: file,
-            };
+        let mut snapshot = unsafe { std::fs::File::from_raw_fd(fd) };
+        identity
+            .copy_approved_bytes(&mut source, &mut snapshot)
+            .map_err(|_| CommandSecretError::Io("identity_pin_changed".to_string()))?;
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(CommandSecretError::Io(io_kind_label(
+                std::io::Error::last_os_error().kind(),
+            )));
         }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            target_os = "ios"
-        )))]
-        {
-            Self {
-                _file: file,
-                launch_path: _program.to_string(),
-            }
-        }
+        Ok(Self {
+            launch_path: format!("/proc/self/fd/{}", snapshot.as_raw_fd()),
+            _file: snapshot,
+        })
     }
 
-    #[cfg(windows)]
-    fn windows(file: std::fs::File, program: &str) -> Self {
-        Self {
-            _file: file,
-            launch_path: program.to_string(),
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn unlinked_apple_snapshot(
+        mut source: std::fs::File,
+        identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
+    ) -> Result<Self, CommandSecretError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        // The directory is owner-only and the inode is new, so no outside
+        // writer can acquire it while the approved bytes are copied. Reopen it
+        // read-only, unlink it, and drop the sole writable handle before the
+        // descriptor becomes executable authority.
+        let directory = tempfile::Builder::new()
+            .prefix("cockpit-executable-")
+            .tempdir()
+            .map_err(map_spawn_error)?;
+        let path = directory.path().join("snapshot");
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .map_err(map_spawn_error)?;
+        identity
+            .copy_approved_bytes(&mut source, &mut writer)
+            .map_err(|_| CommandSecretError::Io("identity_pin_changed".to_string()))?;
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .map_err(map_spawn_error)?;
+        let snapshot = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(map_spawn_error)?;
+        std::fs::remove_file(&path).map_err(map_spawn_error)?;
+        drop(writer);
+        drop(directory);
+
+        // Scripts need the descriptor after the kernel hands `/dev/fd/N` to
+        // their interpreter, so FD_CLOEXEC must remain clear on this read-only
+        // snapshot descriptor.
+        if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+            return Err(CommandSecretError::Io(io_kind_label(
+                std::io::Error::last_os_error().kind(),
+            )));
         }
+        Ok(Self {
+            launch_path: format!("/dev/fd/{}", snapshot.as_raw_fd()),
+            _file: snapshot,
+        })
     }
 
     fn launch_path(&self) -> &str {
         &self.launch_path
+    }
+}
+
+#[cfg(test)]
+type ExecutableSnapshotTestHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static AFTER_EXECUTABLE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<
+    Option<(String, ExecutableSnapshotTestHook)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_after_executable_snapshot_test_hook(program: &str) {
+    let mut slot = AFTER_EXECUTABLE_SNAPSHOT_TEST_HOOK
+        .lock()
+        .expect("executable snapshot test hook lock");
+    let hook = match slot.as_ref() {
+        Some((expected_program, _)) if expected_program == program => {
+            slot.take().map(|(_, hook)| hook)
+        }
+        _ => None,
+    };
+    drop(slot);
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -765,6 +852,44 @@ impl CommandResolutionStatus {
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn injected_process_executes_verified_snapshot_after_source_is_mutated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program = directory.path().join("consumer");
+        std::fs::write(&program, b"#!/bin/sh\nprintf 'approved:%s' \"$1\"\n")
+            .expect("write approved consumer");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("mark consumer executable");
+        let mut argv = vec![
+            program.to_string_lossy().into_owned(),
+            "sealed plaintext".to_string(),
+        ];
+        let identity = crate::sealed::action_admin::local_executor::pin_argv_executable(&mut argv)
+            .expect("pin approved consumer");
+        let source_to_mutate = program.clone();
+        *AFTER_EXECUTABLE_SNAPSHOT_TEST_HOOK
+            .lock()
+            .expect("executable snapshot test hook lock") = Some((
+            argv[0].clone(),
+            Box::new(move || {
+                std::fs::write(source_to_mutate, b"#!/bin/sh\nprintf 'mutated:%s' \"$1\"\n")
+                    .expect("mutate approved source after snapshot verification");
+            }),
+        ));
+        let capture = run_injected_process(&argv, None, Some(identity))
+            .await
+            .expect("the immutable main-executable snapshot remains executable");
+        assert!(capture.success);
+        assert_eq!(capture.stdout, b"approved:sealed plaintext");
+        assert_eq!(
+            std::fs::read(&program).expect("read mutated source"),
+            b"#!/bin/sh\nprintf 'mutated:%s' \"$1\"\n"
+        );
+    }
 
     /// Counting fake: records every invocation and returns a canned outcome
     /// immediately.

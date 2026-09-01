@@ -224,6 +224,13 @@ impl DeclarativeUsageProbe {
         )?;
         let client = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
+            // Usage specs reuse arbitrary inference headers, including custom
+            // credential headers that reqwest cannot prove safe to retain on a
+            // redirect. The resolved endpoint is the only transport target
+            // validated against the provider's HTTPS/local/opt-in policy, so
+            // reject redirects rather than allowing a credential-bearing
+            // request to leave that boundary.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let mut request = (match self.spec.method {
             UsageProbeMethod::Get => client.get(&url),
@@ -938,6 +945,29 @@ mod tests {
             }
             other => panic!("unexpected availability: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_rejects_redirects_without_replaying_inference_headers() {
+        let (usage_url, handle) = serve_usage_responses(vec![
+            TestUsageResponse::status(302, r#"{"error":"moved"}"#)
+                .with_header("Location", "http://credential-leak.invalid/usage"),
+        ])
+        .await;
+        let entry = declarative_entry("Redirect", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("redirect", &entry)
+            .await;
+
+        let UsageAvailability::Error { message } = snapshot.availability else {
+            panic!("redirected usage probe must fail closed");
+        };
+        assert!(message.contains("usage API returned 302"), "{message}");
+
+        // The only accepted connection was the validated endpoint. In
+        // particular, no request can be sent to the redirect target with the
+        // declarative probe's arbitrary inference headers.
+        assert_eq!(handle.await.unwrap().len(), 1);
     }
 
     #[test]

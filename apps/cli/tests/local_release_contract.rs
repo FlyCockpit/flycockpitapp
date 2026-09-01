@@ -198,7 +198,7 @@ fn official_release_manifest_graph_cannot_unify_grok_subscription() {
         );
         let parsed: toml::Value = toml::from_str(&source(&manifest))
             .unwrap_or_else(|error| panic!("parsing {manifest}: {error}"));
-        let default_features = parsed
+        let mut default_features = parsed
             .get("features")
             .and_then(toml::Value::as_table)
             .and_then(|features| features.get("default"))

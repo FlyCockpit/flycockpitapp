@@ -4172,6 +4172,7 @@ mod steering_tests {
             ("harness_invoke", ToolEffect::Dynamic),
             ("harness_list", ToolEffect::Dynamic),
             ("list-packages", ToolEffect::Dynamic),
+            ("list_sealed_value_descriptions", ToolEffect::ReadOnly),
             ("lsp", ToolEffect::ReadOnly),
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),

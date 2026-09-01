@@ -40,14 +40,37 @@ should use `cleanRoom`.
 
 Stable-parts-first so the prefix caches across verifications:
 
-1. Instructions file (target-anchored, trust-gated — see below)
-2. Optional files the instructions link
-3. Last N file reads (from the session tool-call log, **not** the lock
-   read-tracker)
-4. The proposed diff (`write` diffs against the current file, empty for
+1. The persisted session goal (objective and non-empty context)
+2. Instructions file (target-anchored, trust-gated — see below)
+3. Optional files the instructions link
+4. Up to N curated investigation results from the session tool-call log
+   (**not** the lock read-tracker), preferring results relevant to the target
+   before falling back to recency
+5. The proposed diff (`write` diffs against the current file, empty for
    new files)
 
-`includeLinkedFiles` defaults false; `lastNReads` defaults 3.
+The curated investigation section keeps an output's provenance header (for
+example path, query, and range) and its output, but never includes the raw
+tool-call invocation JSON.
+
+`includeLinkedFiles` defaults to `false`; `lastNReads` defaults to `5`.
+`toolCategories` defaults to `[reads, exploration]`: `reads` selects `read`,
+and `exploration` selects `code`, `graph`, `search`, `grep`, and `glob`.
+`toolAllowlist` defaults to `[]` and additionally selects the exact tool names
+it contains. Results selected by either mechanism share the same N-result
+window.
+
+For example, this recipe keeps up to four target-relevant exploration results
+or `context_pack` results:
+
+```yaml
+recipe:
+  cleanRoom:
+    includeLinkedFiles: true
+    lastNReads: 4
+    toolCategories: [exploration]
+    toolAllowlist: [context_pack]
+```
 
 #### Instructions-file selection (target-anchored)
 
@@ -77,10 +100,16 @@ errors fail open to omission.
 
 ## Custody
 
-Trust custody is one-directional. A generator on an untrusted slot
-receives a redacted transcript. Candidates containing the redaction
-placeholder are marked `invalid` and are never selectable. Config
+Trust custody is one-directional. Only a generator on the author's slot can
+use `inherit` and receive the author's live history. Every foreign-slot
+generator — including one configured with `inherit` — is projected through the
+default `cleanRoom` recipe instead: it receives the session goal, selected
+instructions/files, curated tool outputs with provenance, and the proposed
+change, but no author transcript or raw tool-call invocations. Configuration
 validation warns when an `inherit` generator targets an untrusted slot.
+
+The trusted adjudicator still receives the full context. Candidates containing
+the redaction placeholder are marked `invalid` and are never selectable.
 
 Generator and adjudicator inferences are journaled through the normal
 inference-journal barrier. Candidate bodies never enter the tool-call

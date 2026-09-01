@@ -436,10 +436,8 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
             )
             .await
             .map_err(Self::map_error)?;
-        if matches!(
-            outcome.status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) && let Some(refresh) = &self.command_refresh
+        if matches!(outcome.status, 401 | 403)
+            && let Some(refresh) = &self.command_refresh
         {
             let entry = refresh
                 .current_entry()

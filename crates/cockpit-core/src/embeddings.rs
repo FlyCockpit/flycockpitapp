@@ -237,8 +237,8 @@ impl OpenAiCompatEmbedder {
         let effective_ua = headers
             .iter()
             .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
-            .map(|header| header.value.as_str())
-            .unwrap_or_else(crate::user_agent::user_agent);
+            .map(|header| header.value.clone())
+            .unwrap_or_else(|| crate::user_agent::user_agent().to_owned());
         req = req.header(reqwest::header::USER_AGENT, effective_ua);
         for header in headers {
             if !header.name.eq_ignore_ascii_case("user-agent") {
@@ -735,7 +735,11 @@ mod tests {
             guard,
         );
 
-        let _: &OutboundGuard = &embedder.guard;
+        let guard = embedder
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _: &OutboundGuard = &guard;
     }
 
     #[tokio::test]
@@ -816,6 +820,10 @@ mod tests {
             guard(false),
         );
 
-        let _: &OutboundGuard = &embedder.guard;
+        let guard = embedder
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _: &OutboundGuard = &guard;
     }
 }

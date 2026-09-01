@@ -231,7 +231,7 @@ pub async fn resolve_provider_request_async_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
     store: crate::credentials::CredentialStore,
-    env_lookup: impl Fn(&str) -> Option<String>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<ResolvedRequest> {
     resolve_provider_request_async_with_store_refresh(
         provider_id,
@@ -253,7 +253,7 @@ pub async fn refresh_provider_request_async_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
     store: crate::credentials::CredentialStore,
-    env_lookup: impl Fn(&str) -> Option<String>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
     rejected_refresh_generation: Option<u64>,
 ) -> Result<Option<ResolvedRequest>> {
     if entry.auth_command.is_none() {
@@ -278,7 +278,7 @@ async fn resolve_provider_request_async_with_store_refresh(
     provider_id: &str,
     entry: &ProviderEntry,
     store: crate::credentials::CredentialStore,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
 ) -> Result<ResolvedRequest> {
@@ -347,7 +347,7 @@ async fn resolve_model_list_request_async_with_store(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
     store: Option<crate::credentials::CredentialStore>,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
@@ -489,7 +489,7 @@ pub fn resolve_provider_request_blocking_with_store<F>(
     store: crate::credentials::CredentialStore,
 ) -> Result<ResolvedRequest>
 where
-    F: Fn(&str) -> Option<String> + Send,
+    F: Fn(&str) -> Option<String> + Send + Sync,
 {
     let registry = ProviderRegistry::standard();
     if entry.auth_command.is_none()
@@ -944,7 +944,7 @@ pub async fn fetch_models_for_provider_with_store(
     resolved: &ResolvedRequest,
     timeout: Duration,
     store: Option<crate::credentials::CredentialStore>,
-    env_lookup: impl Fn(&str) -> Option<String>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<FetchOutcome> {
     let auth_store = store.clone();
     let request = resolve_model_list_request_async_with_store(
@@ -2559,6 +2559,7 @@ mod tests {
                 ("authorization".into(), "Token override".into()),
                 ("x-tenant".into(), "returned".into()),
             ])),
+            refresh_generation: 0,
         });
         let request = resolve_provider_request_inner_with_sources(
             "custom",

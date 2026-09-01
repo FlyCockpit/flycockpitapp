@@ -103,7 +103,7 @@ pub(crate) async fn resolve(
     provider_id: &str,
     entry: &cockpit_config::config::providers::ProviderEntry,
     store: CredentialStore,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
 ) -> Result<CommandCredential> {
@@ -132,7 +132,7 @@ async fn resolve_with_executor(
     command: &[String],
     provider_url: &str,
     store: CredentialStore,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
     executor: Arc<dyn CommandSecretExecutor>,
@@ -155,7 +155,7 @@ async fn resolve_with_executor_for_configuration(
     command: &[String],
     provider_configuration: &[u8],
     store: CredentialStore,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
     executor: Arc<dyn CommandSecretExecutor>,
@@ -163,9 +163,10 @@ async fn resolve_with_executor_for_configuration(
     let argv = resolve_argv(command, &store, env_lookup)?;
     let configuration_identity = configuration_identity(&argv, provider_configuration);
     let key = provider_id.to_string();
+    let refresh_key = key.clone();
     crate::auth::refresh_guard::serialized_refresh(&key, move || async move {
         let current = store.reopen()?;
-        if let Some(cached) = load_cached(&current, &key, &configuration_identity)? {
+        if let Some(cached) = load_cached(&current, &refresh_key, &configuration_identity)? {
             // A rejection is tied to the credential generation that actually
             // left the process. A late 401 for generation N must reuse the
             // winner's N+1 credential, even if it enters this lock after the
@@ -190,7 +191,7 @@ async fn resolve_with_executor_for_configuration(
         let mut credential: CommandCredential =
             serde_json::from_str(&stdout).context("auth command returned malformed JSON")?;
         credential.validate()?;
-        let refresh_generation = load_cached(&current, &key, &configuration_identity)?
+        let refresh_generation = load_cached(&current, &refresh_key, &configuration_identity)?
             .map_or(1, |cached| cached.refresh_generation.saturating_add(1));
         credential.refresh_generation = refresh_generation;
         let cached = CachedCommandCredential {
@@ -198,7 +199,7 @@ async fn resolve_with_executor_for_configuration(
             refresh_generation,
             credential: credential.clone(),
         };
-        current.save_record_merged(&key, serde_json::json!({ "auth_command": cached }))?;
+        current.save_record_merged(&refresh_key, serde_json::json!({ "auth_command": cached }))?;
         Ok(credential)
     })
     .await
@@ -229,13 +230,17 @@ fn configuration_identity(argv: &[String], provider_configuration: &[u8]) -> Str
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn resolve_argv(
     command: &[String],
     store: &CredentialStore,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<Vec<String>> {
     anyhow::ensure!(!command.is_empty(), "auth_command is empty");
     let mut argv = Vec::with_capacity(command.len());

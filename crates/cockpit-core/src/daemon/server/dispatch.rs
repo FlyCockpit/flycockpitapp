@@ -14469,6 +14469,13 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            // A direct owner write may target a descriptor credential. Share
+            // its per-provider mutation fence with descriptor refresh and
+            // initial login before taking the secret-owner lock, so an
+            // acknowledged replacement cannot be overwritten by a refresh
+            // that had loaded the prior record.
+            let _descriptor_lock =
+                crate::auth::descriptor::credential_mutation_lock(&provider_id).await;
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let consumed_vault_generation = match ctx.secret_vault.current_inventory_generation() {
                 Ok(generation) => generation,
@@ -15161,6 +15168,17 @@ async fn handle_serialized_request_impl(
                     ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
                     ProviderOAuthReady::Descriptor(login) => login.provider_id.as_str(),
                 };
+                // Descriptor initial-login, refresh, and every owner-directed
+                // write of this record share one fence. Acquire it before the
+                // network exchange as well as the durable flow/credential
+                // transaction, so a replacement or logout acknowledged while
+                // this login is in flight cannot be overwritten afterward.
+                let _descriptor_lock = match &ready {
+                    ProviderOAuthReady::Descriptor(_) => {
+                        Some(crate::auth::descriptor::credential_mutation_lock(provider_id).await)
+                    }
+                    _ => None,
+                };
                 claim_oauth_exchange(
                     ctx,
                     flow_id.clone(),
@@ -15285,15 +15303,6 @@ async fn handle_serialized_request_impl(
                     }
                 };
                 let (provider_id, record, descriptor) = exchange?;
-                // Descriptor initial-login and refresh writes share this
-                // exact provider key.  The lock remains held through the
-                // durable OAuth-flow fence and credential record transaction.
-                let _descriptor_lock = match descriptor.as_ref() {
-                    Some(_) => {
-                        Some(crate::auth::descriptor::credential_mutation_lock(&provider_id).await)
-                    }
-                    None => None,
-                };
                 let record = match descriptor {
                     Some(descriptor) => {
                         let store = crate::credentials::CredentialStore::from_vault(
@@ -16742,6 +16751,14 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+            // Provider-model resolution runs under the config-publication lock
+            // and can refresh a descriptor credential. Keep that order, then
+            // take the descriptor fence before the secret-owner lock. This
+            // makes an acknowledged logout the last mutation of a descriptor
+            // record: a refresh either finishes before this delete or reloads
+            // after it and fails closed as logged out.
+            let _descriptor_lock =
+                crate::auth::descriptor::credential_mutation_lock(&provider_id).await;
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             // A CLI identifies a configured provider, never a hidden vault
             // record name. Resolve that reference only inside the daemon so a
@@ -22788,6 +22805,62 @@ mod provider_atomic_authority_tests {
         )
         .unwrap_err();
         assert_eq!(concurrent.code, ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn descriptor_owner_credential_writes_share_the_refresh_fence() {
+        let source = include_str!("dispatch.rs");
+        let completion = source
+            .split("Request::CompleteProviderOAuth {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::CancelProviderOAuth {").next())
+            .expect("complete-provider-oauth dispatch arm");
+        let completion_descriptor_lock = completion
+            .find("credential_mutation_lock(provider_id)")
+            .expect("descriptor completion shares the credential fence");
+        let claim_exchange = completion
+            .find("claim_oauth_exchange(")
+            .expect("descriptor completion claims its exchange");
+        assert!(
+            completion_descriptor_lock < claim_exchange,
+            "descriptor completion must take the credential fence before its exchange"
+        );
+
+        let put = source
+            .split("Request::PutProviderCredential {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::GetLocalOperationSettlement").next())
+            .expect("put-provider-credential dispatch arm");
+        let put_descriptor_lock = put
+            .find("credential_mutation_lock(&provider_id)")
+            .expect("put shares the descriptor credential fence");
+        let put_secret_owner_lock = put
+            .find("SECRET_OWNER_RPC_LOCK.lock().await")
+            .expect("put takes the secret-owner lock");
+        assert!(
+            put_descriptor_lock < put_secret_owner_lock,
+            "put must take the descriptor fence before the secret-owner lock"
+        );
+
+        let delete = source
+            .split("Request::DeleteProviderCredential {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::GetProviderCatalogSnapshot").next())
+            .expect("delete-provider-credential dispatch arm");
+        let delete_config_lock = delete
+            .find("CONFIG_PUBLICATION_RPC_LOCK.lock().await")
+            .expect("delete takes the config-publication lock");
+        let delete_descriptor_lock = delete
+            .find("credential_mutation_lock(&provider_id)")
+            .expect("delete shares the descriptor credential fence");
+        let delete_secret_owner_lock = delete
+            .find("SECRET_OWNER_RPC_LOCK.lock().await")
+            .expect("delete takes the secret-owner lock");
+        assert!(
+            delete_config_lock < delete_descriptor_lock
+                && delete_descriptor_lock < delete_secret_owner_lock,
+            "delete lock order must be config publication, descriptor fence, then secret owner"
+        );
     }
 
     #[test]

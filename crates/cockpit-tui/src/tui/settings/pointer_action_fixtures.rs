@@ -186,6 +186,7 @@ fixture_enum!(ProvidersFixture {
     DeepFetchFetch,
     DeepFetchCancel,
     WizardTemplate,
+    WizardWireApi,
     WizardProviderIdEdit,
     WizardUrlEdit,
     WizardHeadersOpen,
@@ -380,6 +381,7 @@ impl PayloadFixtureKey {
 
 fixture_enum!(WizardPayloadControlKey {
     Template,
+    WireApi,
     AuthPasteKey,
     AuthEnvVar,
     AuthAdvancedHeaders,
@@ -403,6 +405,7 @@ fixture_enum!(WizardPayloadControlKey {
 fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
     match control {
         WizardControlId::Template(_) => WizardPayloadControlKey::Template,
+        WizardControlId::WireApi(_) => WizardPayloadControlKey::WireApi,
         WizardControlId::AuthMethod(WizardAuthMethod::PasteKey) => {
             WizardPayloadControlKey::AuthPasteKey
         }
@@ -511,6 +514,7 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::TestKey
             | ProviderWizardStep::Fetching => false,
             ProviderWizardStep::Template
+            | ProviderWizardStep::WireApi
             | ProviderWizardStep::ProviderId
             | ProviderWizardStep::Url
             | ProviderWizardStep::Headers
@@ -999,6 +1003,7 @@ fn row_key(action: &ProviderRowEditorAction) -> ProvidersFixture {
 #[derive(Clone, Copy)]
 enum WizardControlKind {
     Template,
+    WireApi,
     AuthPasteKey,
     AuthEnvVar,
     AuthAdvancedHeaders,
@@ -1017,6 +1022,7 @@ enum WizardControlKind {
 fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
     match control {
         WizardControlId::Template(_) => WizardControlKind::Template,
+        WizardControlId::WireApi(_) => WizardControlKind::WireApi,
         WizardControlId::AuthMethod(WizardAuthMethod::PasteKey) => WizardControlKind::AuthPasteKey,
         WizardControlId::AuthMethod(WizardAuthMethod::EnvVar) => WizardControlKind::AuthEnvVar,
         WizardControlId::AuthMethod(WizardAuthMethod::AdvancedHeaders) => {
@@ -1040,6 +1046,9 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
     match step {
         ProviderWizardStep::Template if matches!(control, WizardControlKind::Template) => {
             ProvidersFixture::WizardTemplate
+        }
+        ProviderWizardStep::WireApi if matches!(control, WizardControlKind::WireApi) => {
+            ProvidersFixture::WizardWireApi
         }
         ProviderWizardStep::ProviderId if matches!(control, WizardControlKind::EditText) => {
             ProvidersFixture::WizardProviderIdEdit
@@ -1108,6 +1117,7 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
             unreachable!("non-interactive provider wizard step cannot publish a pointer control")
         }
         ProviderWizardStep::Template
+        | ProviderWizardStep::WireApi
         | ProviderWizardStep::ProviderId
         | ProviderWizardStep::Url
         | ProviderWizardStep::Headers

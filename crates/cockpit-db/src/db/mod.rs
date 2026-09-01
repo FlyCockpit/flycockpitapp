@@ -3558,6 +3558,54 @@ mod tests {
     }
 
     #[test]
+    fn opening_database_terminalizes_only_interrupted_acquisition_audits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("interrupted-acquisition.db");
+        let db = Db::open(&path).unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            conn.execute_batch(
+                "INSERT INTO sealed_value_acquisition_audit
+                     (acquisition_id, record_id, session_id, project_key, name, description,
+                      child_agent, consent_mode, outcome, created_at_ms, completed_at_ms)
+                 VALUES
+                     ('interrupted', 'record-interrupted', 'session-interrupted', 'project',
+                      'interrupted_value', 'interrupted acquisition', 'sealed-acquisition',
+                      'audit_only', 'pending', 1, NULL),
+                     ('already-terminal', 'record-terminal', 'session-terminal', 'project',
+                      'terminal_value', 'terminal acquisition', 'sealed-acquisition',
+                      'audit_only', 'failed', 2, 77);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+
+        // This models a cancellation or runtime shutdown after publishing the
+        // audit row. Reopen recovery runs before the DB can be observed again.
+        let recovered = Db::open(&path).unwrap();
+        let rows: Vec<(String, Option<i64>)> = recovered
+            .blocking_for_sync_cli(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT outcome, completed_at_ms
+                       FROM sealed_value_acquisition_audit
+                      ORDER BY acquisition_id",
+                )?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("failed".to_owned(), Some(77)));
+        assert_eq!(rows[1].0, "failed");
+        assert!(
+            rows[1].1.is_some(),
+            "recovery must terminalize the interrupted pending audit"
+        );
+    }
+
+    #[test]
     fn storage_failure_contract_is_stable_through_context() {
         let cases = [
             (

@@ -34,10 +34,16 @@ const MAX_ACQUISITION_TURNS_PER_ATTEMPT: usize = 8;
 const MAX_TERMINAL_NUDGES: usize = 2;
 const TERMINAL_NUDGE: &str = "Choose exactly one terminal move now: capture_sealed_value(source_tool_call_id), acquisition_requires_user(reason, prompt), or acquisition_fail(). Never ask for or repeat the value.";
 
-/// Owns the two lifecycle obligations that otherwise disappear when Tokio
-/// drops a cancelled acquisition future. `Drop` is deliberately synchronous:
-/// it first releases only its own in-memory reservation, then keeps retrying
-/// the idempotent durable terminal transition on the live runtime.
+/// Owns the lifecycle obligations that otherwise disappear when Tokio drops a
+/// cancelled acquisition future. `Drop` immediately releases its in-memory
+/// reservation and makes one bounded best-effort terminal write. The durable
+/// owner is database-open recovery: a restart fails every still-pending row
+/// before exposing the database to readers or dispatching another attempt.
+///
+/// The cancellation cleanup must not retry forever. A failing writer already
+/// requires daemon recovery, and the pending row is the durable recovery
+/// intent; retaining a detached task (or a database clone) cannot improve the
+/// safety of that state.
 struct PendingAcquisitionGuard<'a> {
     registry: &'a TrustedChildCaptureRegistry,
     session_id: String,
@@ -62,23 +68,21 @@ impl Drop for PendingAcquisitionGuard<'_> {
         let acquisition_id = self.acquisition_id.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                loop {
-                    match db
+                // This is only a prompt best-effort path. The timeout bounds
+                // the dropped future's retained state; Db-open reconciliation
+                // is authoritative if this attempt cannot reach the writer.
+                let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                    let _ = db
                         .finish_sealed_value_acquisition_audit(
-                            acquisition_id.clone(),
+                            acquisition_id,
                             "failed".to_owned(),
                             None,
                             None,
                             chrono::Utc::now().timestamp_millis(),
                         )
-                        .await
-                    {
-                        // A false result means another terminal transition
-                        // won; either way no pending row remains to repair.
-                        Ok(_) => return,
-                        Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                    }
-                }
+                        .await;
+                })
+                .await;
             });
         }
     }

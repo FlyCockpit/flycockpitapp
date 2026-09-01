@@ -2700,6 +2700,10 @@ async fn execute_ordinary_call_unscoped(
                             ));
                         }
                         crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult => {
+                            model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
+                                &candidate,
+                                "persistence_unavailable",
+                            ));
                         }
                         _ => unreachable!("tool calls only admit tool-result artifact lanes"),
                     }

@@ -53,6 +53,7 @@ pub fn enrich_session_setup_snapshot(
         // instead of turning a read-only setup query into an internal error.
         .or_else(|| agents::embedded_default("Build"))
         .ok_or_else(|| anyhow::anyhow!("embedded Build agent is unavailable"))?;
+    agents::apply_author_tool_tier_preferences(&mut def)?;
     if let Some(json) = tool_surface_override_json
         && let Ok(selection) = serde_json::from_str::<ToolSurfaceSelection>(json)
     {

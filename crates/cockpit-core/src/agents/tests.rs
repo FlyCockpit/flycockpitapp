@@ -710,6 +710,65 @@ fn vnext_allowed_knowledge_bases_round_trip_through_markdown() {
 }
 
 #[test]
+fn vnext_author_tool_tier_preferences_are_grant_bounded_and_overridable() {
+    let document = vnext_document("toolTierPreferences:\n  code: discoverable\n  read: enabled\n");
+    let mut def = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
+    assert_eq!(
+        def.vnext
+            .as_ref()
+            .unwrap()
+            .tool_tier_preferences
+            .get("code"),
+        Some(&ToolTier::Discoverable)
+    );
+    assert!(def.to_markdown().unwrap().contains("toolTierPreferences:"));
+
+    def.tools = Some(vec!["read".to_string(), "code".to_string()]);
+    apply_author_tool_tier_preferences(&mut def).unwrap();
+    assert_eq!(computed_tool_tier(&def, "code"), ToolTier::Discoverable);
+
+    apply_tool_surface_override(
+        &mut def,
+        &ToolSurfaceSelection {
+            tools: vec!["read".to_string(), "code".to_string()],
+            tool_tiers: std::collections::BTreeMap::from([("code".to_string(), ToolTier::Enabled)]),
+        },
+    )
+    .unwrap();
+    assert_eq!(computed_tool_tier(&def, "code"), ToolTier::Enabled);
+
+    let mut ungranted = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
+    ungranted.tools = Some(vec!["read".to_string()]);
+    apply_author_tool_tier_preferences(&mut ungranted).unwrap();
+    assert_eq!(ungranted.tools.as_deref(), Some(&["read".to_string()][..]));
+    assert!(!ungranted.tool_tiers.contains_key("code"));
+
+    let mut no_preference = parse_agent(&vnext_document(""), "Build", "Build.md".into()).unwrap();
+    no_preference.tools = Some(vec!["graph".to_string()]);
+    assert_eq!(
+        computed_tool_tier(&no_preference, "graph"),
+        ToolTier::Discoverable
+    );
+}
+
+#[test]
+fn vnext_author_tool_tier_preferences_reject_unknown_or_disabled_tools() {
+    for preference in [
+        "toolTierPreferences:\n  not_a_tool: enabled\n",
+        "toolTierPreferences:\n  read: disabled\n",
+    ] {
+        assert!(
+            parse_agent(
+                &vnext_document(preference),
+                "reviewer",
+                "reviewer.md".into()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn agent_vnext_every_editable_builtin_ejects_closed_schema_v2() {
     for &name in crate::agents::BUILTIN_AGENT_NAMES {
         let embedded = embedded_default(name).unwrap();

@@ -1632,6 +1632,20 @@ fn non_direct_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTr
         .map(|(name, _tier)| name.clone())
         .collect();
     names.extend(
+        def.vnext
+            .as_ref()
+            .into_iter()
+            .flat_map(|definition| definition.tool_tier_preferences.iter())
+            .filter(|(name, tier)| {
+                **tier != crate::agents::ToolTier::Enabled
+                    && def
+                        .tools
+                        .as_ref()
+                        .is_none_or(|granted| granted.iter().any(|tool| tool == *name))
+            })
+            .map(|(name, _tier)| name.clone()),
+    );
+    names.extend(
         default_discoverable_tools_for(&def.name)
             .iter()
             .map(|name| (*name).to_string()),
@@ -1702,18 +1716,39 @@ pub(crate) fn effective_tool_tier(
     tool: &str,
     is_assistant: bool,
 ) -> crate::agents::ToolTier {
-    // A/V tier overrides are disable-only. Apply that ceiling before generic
-    // override precedence: an override may lower Enabled to Disabled, but
-    // cannot elevate a documented Disabled placement or create Discoverable.
+    // A/V session overrides are disable-only. The author preference is
+    // considered next, then the name-based A/V default.
     if let Some(documented) = documented_av_tool_tier(&def.name, tool) {
         if let Some(override_tier) = def.tool_tiers.get(tool) {
             if *override_tier == crate::agents::ToolTier::Disabled {
                 return crate::agents::ToolTier::Disabled;
             }
         }
+        if def
+            .tools
+            .as_ref()
+            .is_none_or(|granted| granted.iter().any(|name| name == tool))
+            && let Some(tier) = def
+                .vnext
+                .as_ref()
+                .and_then(|definition| definition.tool_tier_preferences.get(tool))
+        {
+            return *tier;
+        }
         return documented;
     }
     if let Some(tier) = def.tool_tiers.get(tool) {
+        return *tier;
+    }
+    if def
+        .tools
+        .as_ref()
+        .is_none_or(|granted| granted.iter().any(|name| name == tool))
+        && let Some(tier) = def
+            .vnext
+            .as_ref()
+            .and_then(|definition| definition.tool_tier_preferences.get(tool))
+    {
         return *tier;
     }
     if tool == "transcribe_audio" {

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::ToolTier;
+
 pub const SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
 pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
@@ -1028,6 +1030,15 @@ pub struct VnextAgentDef {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_knowledge_bases: Option<BTreeSet<String>>,
+    /// The author's preferred placement for host-granted tools. This chooses
+    /// only between direct native schemas and Monty discovery; it is never a
+    /// tool grant and host/session policy remains authoritative.
+    #[serde(
+        rename = "toolTierPreferences",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub tool_tier_preferences: BTreeMap<String, ToolTier>,
 }
 
 impl VnextAgentDef {
@@ -1054,6 +1065,33 @@ impl VnextAgentDef {
         if let Some(knowledge_bases) = &self.allowed_knowledge_bases {
             for id in knowledge_bases {
                 validate_knowledge_base_id(id)?;
+            }
+        }
+        for (tool, tier) in &self.tool_tier_preferences {
+            if !crate::agents::known_tool_names().contains(&tool.as_str()) {
+                bail!("toolTierPreferences names unknown tool `{tool}`");
+            }
+            if !matches!(tier, ToolTier::Enabled | ToolTier::Discoverable) {
+                bail!(
+                    "toolTierPreferences for `{tool}` must be `enabled` or `discoverable`, not `{}`",
+                    tier.label()
+                );
+            }
+            if !crate::agents::legal_tool_tiers(tool).contains(tier) {
+                bail!(
+                    "toolTierPreferences may not place `{tool}` at `{}`",
+                    tier.label()
+                );
+            }
+            if matches!(
+                tool.as_str(),
+                "read_image"
+                    | "inspect_audio"
+                    | "inspect_video"
+                    | "extract_video_clip"
+                    | "extract_audio"
+            ) {
+                bail!("toolTierPreferences may not name direct-native media tool `{tool}`");
             }
         }
         Ok(())
@@ -2747,6 +2785,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         }
     }
 

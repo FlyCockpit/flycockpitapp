@@ -641,6 +641,7 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
         questions: None,
         verification: None,
         allowed_knowledge_bases: None,
+        tool_tier_preferences: std::collections::BTreeMap::new(),
     };
     definition
         .resolve_grant(&host)

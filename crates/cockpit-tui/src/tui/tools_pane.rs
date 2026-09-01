@@ -978,6 +978,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         });
         focus_tool(&mut pane, "skill");
         pane.handle_key(KeyEvent::from(KeyCode::Char(' ')));

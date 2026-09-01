@@ -448,8 +448,8 @@ pub fn known_tool_names() -> &'static [&'static str] {
     invariants::known_tool_names()
 }
 
-/// Computed runtime tier for display. vNext defs cannot author `toolTiers`;
-/// this is the engine's effective result, not the def.
+/// Computed runtime tier for display. vNext definitions can express only a
+/// native-vs-discoverable preference; this remains the host's effective result.
 pub fn computed_tool_tier(def: &AgentDef, tool: &str) -> ToolTier {
     let is_assistant = def
         .vnext
@@ -501,6 +501,32 @@ pub fn apply_tool_surface_override(
     def.tools = candidate.tools;
     def.tool_tiers = candidate.tool_tiers;
     Ok(())
+}
+
+/// Project the author-declared placement preference onto an already
+/// host-granted vNext surface. Preferences for names outside the host grant
+/// are intentionally ignored: a definition may influence presentation of a
+/// granted tool, never acquire a new one.
+pub fn apply_author_tool_tier_preferences(def: &mut AgentDef) -> Result<()> {
+    let Some(preferences) = def
+        .vnext
+        .as_ref()
+        .map(|definition| definition.tool_tier_preferences.clone())
+    else {
+        return Ok(());
+    };
+    let Some(tools) = def.tools.clone() else {
+        // The engine may derive the host grant later. `effective_tool_tier`
+        // still honors the preference while materializing that derived list.
+        return Ok(());
+    };
+    let mut tool_tiers = def.tool_tiers.clone();
+    tool_tiers.extend(
+        preferences
+            .into_iter()
+            .filter(|(tool, _)| tools.iter().any(|granted| granted == tool)),
+    );
+    apply_tool_surface_override(def, &ToolSurfaceSelection { tools, tool_tiers })
 }
 
 /// Validate a host-projected tool grant on a v2 definition. v2
@@ -1278,6 +1304,12 @@ impl AgentDef {
                 serde_yaml::to_value(knowledge_bases)?,
             );
         }
+        if !vnext.tool_tier_preferences.is_empty() {
+            fm.insert(
+                "toolTierPreferences".into(),
+                serde_yaml::to_value(&vnext.tool_tier_preferences)?,
+            );
+        }
         if let Some(capabilities) = &self.capabilities {
             fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
         }
@@ -1412,6 +1444,8 @@ fn parse_agent_with_scope(
         verification: Option<VerificationPolicy>,
         #[serde(rename = "allowedKnowledgeBases", default)]
         allowed_knowledge_bases: Option<BTreeSet<String>>,
+        #[serde(rename = "toolTierPreferences", default)]
+        tool_tier_preferences: BTreeMap<String, ToolTier>,
         #[serde(default)]
         description: String,
         #[serde(default)]
@@ -1557,6 +1591,7 @@ fn parse_agent_with_scope(
                 questions: fm.questions,
                 verification: fm.verification,
                 allowed_knowledge_bases: fm.allowed_knowledge_bases,
+                tool_tier_preferences: fm.tool_tier_preferences,
             };
             definition.validate_for_scope(scope).map_err(|error| {
                 anyhow::anyhow!(

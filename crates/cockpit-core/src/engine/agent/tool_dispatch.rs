@@ -2055,7 +2055,14 @@ async fn execute_ordinary_call_unscoped(
             true,
             Some(crate::engine::tool::ToolFailKind::Execution),
         ),
-        (Ok(ToolOutput { content, .. }), _) => (content.model_text().to_owned(), false, None),
+        (Ok(output), _) => (
+            output
+                .display_content
+                .clone()
+                .unwrap_or_else(|| output.content.model_text().to_owned()),
+            false,
+            None,
+        ),
         (Err(e), _) => {
             let msg = format!("Error: {e}");
             (msg, true, Some(crate::engine::tool::classify_failure(e)))
@@ -2400,11 +2407,11 @@ async fn execute_ordinary_call_unscoped(
     if let Some(canonical_output_text) = &canonical_history_text {
         event_data["canonical_output_text"] = canonical_output_text.clone().into();
     }
-    if model_result_contents.as_ref().is_some_and(|projected| {
-        result
-            .as_ref()
-            .ok()
-            .is_some_and(|output| projected.parts() != output.content.parts())
+    if result.as_ref().ok().is_some_and(|output| {
+        output.display_content.is_some()
+            || model_result_contents
+                .as_ref()
+                .is_some_and(|projected| projected.parts() != output.content.parts())
     }) {
         event_data["model_projection_required"] = Value::Bool(true);
     }
@@ -2517,7 +2524,14 @@ async fn execute_ordinary_call_unscoped(
                                         &candidate.content,
                                         artifact_preview_lines,
                                     );
-                                model_artifact_frame = Some(
+                                model_artifact_frame = Some(if resolved_name == "mcp" {
+                                    format!(
+                                        "({} bytes spilled -> handle cockpit://session/{}/artifacts/{})",
+                                        artifact.content_bytes,
+                                        env.session.short_id(),
+                                        artifact.artifact_id
+                                    )
+                                } else {
                                     crate::engine::text_artifact_frame::render_artifact_frame(
                                         &crate::engine::text_artifact_frame::ArtifactFrame {
                                             status: "available",
@@ -2535,8 +2549,8 @@ async fn execute_ordinary_call_unscoped(
                                             preview_head: &preview_head,
                                             preview_tail: "",
                                         },
-                                    ),
-                                );
+                                    )
+                                });
                             }
                             admission => {
                                 if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
@@ -3312,6 +3326,9 @@ mod tests {
                     .with_output_sidecar(crate::engine::tool::ToolOutputSidecar {
                         payload: serde_json::json!({"detail": "sidecar metadata sentinel"}),
                     })
+                    .with_model_ephemeral_display(
+                        "kept result\nmodel ephemeral display sentinel",
+                    )
             })
         }
     }
@@ -6281,6 +6298,7 @@ mod tests {
         const SANDBOX_SECRET: &str = "sandbox metadata sentinel";
         const RESOURCE_SECRET: &str = "resource metadata sentinel";
         const SIDECAR_SECRET: &str = "sidecar metadata sentinel";
+        const DISPLAY_ONLY: &str = "model ephemeral display sentinel";
         const NATIVE_SANDBOX: &str = "native sandbox result";
         const NATIVE_RESOURCE: &str = "native resource result";
         const NATIVE_SIDECAR: &str = "native sidecar result";
@@ -6327,6 +6345,7 @@ mod tests {
         assert!(!live_wire.contains(SANDBOX_SECRET), "{live_wire}");
         assert!(!live_wire.contains(RESOURCE_SECRET), "{live_wire}");
         assert!(!live_wire.contains(SIDECAR_SECRET), "{live_wire}");
+        assert!(!live_wire.contains(DISPLAY_ONLY), "{live_wire}");
         assert!(!live_wire.contains("987654321"), "{live_wire}");
         assert!(live_wire.contains(NATIVE_SANDBOX), "{live_wire}");
         assert!(live_wire.contains(NATIVE_RESOURCE), "{live_wire}");
@@ -6346,6 +6365,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.original_input_json["secret"], ARG_SECRET);
         assert!(row.wire_input_json.get("secret").is_none());
+        assert!(row.output.contains(DISPLAY_ONLY), "{}", row.output);
         let event = session
             .db
             .list_session_events(session.id)
@@ -6358,6 +6378,7 @@ mod tests {
         assert!(event.data.to_string().contains(SANDBOX_SECRET));
         assert!(event.data.to_string().contains(RESOURCE_SECRET));
         assert!(event.data.to_string().contains(SIDECAR_SECRET));
+        assert!(event.data.to_string().contains(DISPLAY_ONLY));
         assert_eq!(event.data["exit_code"], 987_654_321);
         assert_eq!(event.data["model_projection_required"], true);
         assert!(
@@ -6382,6 +6403,7 @@ mod tests {
         assert!(!restart_wire.contains(SANDBOX_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(RESOURCE_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(SIDECAR_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains(DISPLAY_ONLY), "{restart_wire}");
         assert!(!restart_wire.contains("987654321"), "{restart_wire}");
         assert!(restart_wire.contains("kept argument"), "{restart_wire}");
         assert!(restart_wire.contains("kept result"), "{restart_wire}");

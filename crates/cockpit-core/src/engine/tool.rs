@@ -663,7 +663,8 @@ mod model_ephemeral_tests {
             "sandbox": { "enabled": true },
             "resource": { "cpu": 1 },
             "exit_code": 1,
-            "output_sidecar": { "stdout": "full" }
+            "output_sidecar": { "stdout": "full" },
+            "display": "timeline only"
         });
         assert_eq!(
             strip_model_ephemeral_fields(&metadata, &ToolOutput::result_metadata_schema()),
@@ -1104,6 +1105,11 @@ pub trait Tool: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: CanonicalToolResultContents,
+    /// Optional display-only text for the durable timeline and live UI. The
+    /// model projection remains [`Self::content`]; this field is governed by
+    /// [`MODEL_EPHEMERAL_SCHEMA_KEY`] in [`Self::result_metadata_schema`], so
+    /// replay cannot accidentally promote it into model history.
+    pub display_content: Option<String>,
     /// Optional short-circuit guidance for an immediately repeated call with
     /// the same final semantic input. A tool sets this when its *result* was a
     /// recoverable dead-end the model should not repeat verbatim. The
@@ -1503,7 +1509,8 @@ impl ToolOutput {
                 "sandbox": { "x-cockpit-model-ephemeral": true },
                 "resource": { "x-cockpit-model-ephemeral": true },
                 "exit_code": { "x-cockpit-model-ephemeral": true },
-                "output_sidecar": { "x-cockpit-model-ephemeral": true }
+                "output_sidecar": { "x-cockpit-model-ephemeral": true },
+                "display": { "x-cockpit-model-ephemeral": true }
             }
         })
     }
@@ -1532,12 +1539,16 @@ impl ToolOutput {
         if let Some(sidecar) = &self.output_sidecar {
             metadata.insert("output_sidecar".to_string(), sidecar.payload.clone());
         }
+        if let Some(display) = &self.display_content {
+            metadata.insert("display".to_string(), Value::String(display.clone()));
+        }
         metadata
     }
 
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
+            display_content: None,
             repeat_guard: None,
             truncated: false,
             text_artifact_capture: None,
@@ -1554,6 +1565,7 @@ impl ToolOutput {
     pub fn truncated_text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
+            display_content: None,
             repeat_guard: None,
             truncated: true,
             text_artifact_capture: None,
@@ -1584,6 +1596,13 @@ impl ToolOutput {
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
         self.text_artifact_capture = Some(capture);
+        self
+    }
+
+    /// Supply the timeline/UI projection while retaining `content` as the
+    /// only model-facing result.
+    pub fn with_model_ephemeral_display(mut self, display: impl Into<String>) -> Self {
+        self.display_content = Some(display.into());
         self
     }
 

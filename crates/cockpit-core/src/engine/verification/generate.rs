@@ -21,7 +21,7 @@ use crate::session::Session;
 use super::inference::{
     VerificationInferenceInput, effective_verification_route, journaled_verification_inference,
 };
-use super::recipe::{RecipeAssemblyInput, assemble_recipe};
+use super::recipe::{RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot};
 
 const GENERATOR_SYSTEM: &str = "Independently verify the proposed file change. You may use only \
     the advertised read-only investigation tools. Return exactly one structured candidate through \
@@ -164,6 +164,10 @@ fn is_author_slot(slot: &str, author_slot: &str) -> bool {
     slot == author_slot
 }
 
+fn inherit_uses_author_context(spec: &GeneratorSpec, same_as_author: bool) -> bool {
+    matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author
+}
+
 fn candidate_is_adjudicable(
     terminal: VerificationCandidateState,
     accepted: &Result<CandidateTransitionOutcome>,
@@ -233,7 +237,12 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         let mut generator_model = generator_model.as_ref().clone();
         generator_model
             .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone());
-        let (include_linked, last_n) = match &spec.recipe {
+        // Slot identity, not provider/model equality, decides cache-prefix
+        // inheritance. Two distinct slots may intentionally bind the same
+        // provider model but have different custody and prompt identities.
+        let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
+        let recipe = generator_recipe_for_slot(&spec.recipe, same_as_author);
+        let (include_linked, last_n) = match recipe.as_ref() {
             VerificationRecipe::Inherit => (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS),
             VerificationRecipe::CleanRoom {
                 include_linked_files,
@@ -241,8 +250,8 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
                 ..
             } => (*include_linked_files, *last_n_reads),
         };
-        let Ok(assembled) = assemble_recipe(RecipeAssemblyInput {
-            recipe: &spec.recipe,
+        let assembled = assemble_recipe(RecipeAssemblyInput {
+            recipe: recipe.as_ref(),
             history: input.history,
             session: input.session,
             workspace_root: input.workspace_root,
@@ -256,16 +265,9 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             inherit_framing: "Produce an alternative implementation of the proposed write/edit. \
                  Answer through the candidate tool only.",
         })
-        .await
-        else {
-            continue;
-        };
-        // Slot identity, not provider/model equality, decides cache-prefix
-        // inheritance. Two distinct slots may intentionally bind the same
-        // provider model but have different custody and prompt identities.
-        let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
+        .await?;
         let tools = generator_tools(input, spec, same_as_author);
-        let initial_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
+        let initial_history = if inherit_uses_author_context(spec, same_as_author) {
             input.history
         } else {
             &[]
@@ -578,13 +580,13 @@ async fn generate_with_turns(
         .max_turns
         .max(1)
         .min(crate::agents::MAX_GENERATOR_TURNS);
-    let mut private_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
+    let mut private_history = if inherit_uses_author_context(spec, same_as_author) {
         input.history.to_vec()
     } else {
         Vec::new()
     };
     let tools = generator_tools(input, spec, same_as_author);
-    let params = if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
+    let params = if inherit_uses_author_context(spec, same_as_author) {
         input.agent.params.clone()
     } else {
         crate::engine::model::ModelParams::default()
@@ -907,6 +909,24 @@ mod tests {
         assert!(!is_author_slot("reviewer", "author"));
         assert!(!is_author_slot("primary", "author"));
         assert!(!is_author_slot("same-model-different-slot", "author"));
+    }
+
+    #[test]
+    fn inherit_author_context_is_reserved_for_the_author_slot() {
+        let spec = GeneratorSpec {
+            slot: "author".into(),
+            recipe: VerificationRecipe::Inherit,
+            max_turns: 1,
+        };
+        assert!(inherit_uses_author_context(&spec, true));
+        assert!(!inherit_uses_author_context(&spec, false));
+
+        let clean_room = GeneratorSpec {
+            slot: "reviewer".into(),
+            recipe: VerificationRecipe::clean_room_default(),
+            max_turns: 1,
+        };
+        assert!(!inherit_uses_author_context(&clean_room, true));
     }
 
     #[test]

@@ -2533,8 +2533,8 @@ impl VerificationRule {
             .unwrap_or(OnAdjudicationFailure::DispatchOriginal)
     }
 
-    /// Custody note: inherit generators on untrusted slots see a redacted
-    /// transcript and produce placeholder-bearing (invalid) candidates.
+    /// Custody note: foreign inherit generators receive the curated clean-room
+    /// projection. Candidates remain invalid when redaction inserts placeholders.
     pub fn inherit_untrusted_slot_warnings(
         &self,
         untrusted_slots: &BTreeSet<String>,
@@ -2547,7 +2547,7 @@ impl VerificationRule {
             })
             .map(|generator| {
                 format!(
-                    "verification inherit generator on untrusted slot `{}` will receive a redacted transcript; placeholder-bearing candidates are invalid and never selectable",
+                    "verification inherit generator on untrusted slot `{}` will receive the curated clean-room projection; placeholder-bearing candidates are invalid and never selectable",
                     generator.slot
                 )
             })

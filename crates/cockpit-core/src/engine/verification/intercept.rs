@@ -39,7 +39,9 @@ use super::{
         input_cost_microusd,
     },
     generate::{CollectedCandidate, CollectionInput, collect_candidates},
-    recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target},
+    recipe::{
+        RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot, select_guidance_for_target,
+    },
 };
 
 /// Outcome of the verification intercept.
@@ -306,6 +308,7 @@ async fn run_verification(
     .await
     .map(|(_, body)| body)
     .unwrap_or_default();
+    let author_slot = author_slot_for_agent(input.agent);
     for generator in &rule.generators {
         let model = if profile_snapshot_id.is_nil() {
             Some(input.agent.model.clone())
@@ -323,7 +326,9 @@ async fn run_verification(
             estimated_cost = None;
             continue;
         };
-        let (include_linked_files, last_n_reads) = match generator.recipe {
+        let generator_recipe =
+            generator_recipe_for_slot(&generator.recipe, generator.slot == author_slot);
+        let (include_linked_files, last_n_reads) = match generator_recipe.as_ref() {
             crate::agents::VerificationRecipe::Inherit => {
                 (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS)
             }
@@ -334,7 +339,7 @@ async fn run_verification(
             } => (include_linked_files, last_n_reads),
         };
         let recipe = assemble_recipe(RecipeAssemblyInput {
-            recipe: &generator.recipe,
+            recipe: generator_recipe.as_ref(),
             history: input.history,
             session: input.session,
             workspace_root: input.session.project_root.as_path(),
@@ -347,12 +352,14 @@ async fn run_verification(
             include_linked_files,
             inherit_framing: "Produce an alternative implementation of the proposed write/edit. Answer through verification_candidate.",
         }).await?;
-        let generator_history =
-            if matches!(generator.recipe, crate::agents::VerificationRecipe::Inherit) {
-                input.history
-            } else {
-                &[]
-            };
+        let generator_history = if matches!(
+            generator_recipe.as_ref(),
+            crate::agents::VerificationRecipe::Inherit
+        ) {
+            input.history
+        } else {
+            &[]
+        };
         let assembled_generator = super::generate::conservative_generator_budget_text(
             input.agent,
             &recipe.prompt,

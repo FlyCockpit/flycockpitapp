@@ -6125,10 +6125,9 @@ impl Dialog {
         match self {
             Dialog::None => false,
             Dialog::OnboardingWelcome { cwd, .. } => {
-                if let Ok(next) = Self::open_setup_wizard(
-                    cwd,
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                ) {
+                if let Ok(next) =
+                    Self::open_setup_wizard(cwd, cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                {
                     *self = next;
                 }
                 false

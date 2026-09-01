@@ -21,18 +21,20 @@ impl App {
         match self.first_run_flow {
             FirstRunFlow::None => false,
             FirstRunFlow::AwaitWelcome => {
-                if !self.dialog.setup_wizard_is_active(
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                ) {
+                if !self
+                    .dialog
+                    .setup_wizard_is_active(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                {
                     return false;
                 }
                 self.first_run_flow = FirstRunFlow::AwaitProfile;
                 true
             }
             FirstRunFlow::AwaitProfile => {
-                if !self.dialog.setup_wizard_is_complete(
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                ) {
+                if !self
+                    .dialog
+                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
@@ -51,11 +53,13 @@ impl App {
                 let model_id =
                     first_provider_model_id(&self.config_snapshot.providers, &provider_id);
                 let dialog = match model_id.as_deref() {
-                    Some(model_id) => crate::tui::settings::Dialog::open_onboarding_model_setup_preselected(
-                        &provider_id,
-                        model_id,
-                        Some("Choose the model Cockpit should use by default.".to_string()),
-                    ),
+                    Some(model_id) => {
+                        crate::tui::settings::Dialog::open_onboarding_model_setup_preselected(
+                            &provider_id,
+                            model_id,
+                            Some("Choose the model Cockpit should use by default.".to_string()),
+                        )
+                    }
                     None => crate::tui::settings::Dialog::open_setup_wizard(
                         &self.launch.cwd,
                         cockpit_core::wizard::MODEL_WIZARD_ID,

@@ -14,8 +14,8 @@ pub use apply::{
     ModelAnswersOutcome, apply_model_answers, apply_security_answers,
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
-    descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
-    onboarding_model_descriptor_for_cwd, security_config_path,
+    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
+    security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";

@@ -6372,8 +6372,9 @@ pub(super) async fn run_worker(
             // backends (prompt `prompt-caching-strategy.md`, decision 3),
             // held constant across the session so per-key prefix caching keeps
             // hitting. Only the main session worker's foreground model sets
-            // it; background/utility models leave it `None`. The native
-            // Anthropic arm ignores it (it caches per-block instead).
+            // it; background/utility models leave it `None`. The Anthropic
+            // Messages-wire arm ignores it because the wire has no top-level
+            // cache-key field.
             prompt_cache_key: Some(session_id.to_string()),
             ..ModelParams::default()
         },

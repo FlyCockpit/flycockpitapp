@@ -303,9 +303,10 @@ impl Model {
 }
 
 /// Route a `(provider, model)` build solely from its resolved `wire_api`.
-/// The `cache` config drives the Anthropic TTL mode (5-min vs 1h) and is
-/// unused on the OpenAI-compatible path (which relies on prefix stability +
-/// `prompt_cache_key`, set later via `ModelParams`).
+/// When the provider enables Anthropic prompt caching, the `cache` config
+/// drives its TTL mode (5-min vs 1h). It is unused on the OpenAI-compatible
+/// path, which relies on prefix stability plus `prompt_cache_key`, set later
+/// via `ModelParams`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_model(
@@ -1055,15 +1056,16 @@ pub struct ModelParams {
     /// (OpenAI Responses, GitHub Copilot, …) keeps hitting. Ignored by
     /// backends that don't honor it; zero risk. Set **only** on the main
     /// session worker's foreground model; background/utility models leave it
-    /// `None`. The native Anthropic arm ignores it entirely (it uses
-    /// provider-concrete per-block caching instead).
+    /// `None`. The Anthropic Messages-wire arm ignores it entirely because
+    /// that wire has no top-level cache-key field.
     pub prompt_cache_key: Option<String>,
     /// Opaque provider-defined prompt-cache retention policy for
     /// OpenAI-compatible backends, such as OpenAI's `"24h"`. `None` is the
     /// default and sends no retention key, so existing request bodies are
     /// unchanged. When set to a non-empty value, the OpenAI-compatible
     /// additional-params composition passes it through verbatim; native
-    /// Anthropic ignores it because it uses per-block caching.
+    /// Anthropic ignores it because its Messages wire has no top-level cache
+    /// key, whether or not provider-configured prompt caching is enabled.
     pub prompt_cache_retention: Option<String>,
     /// Provider-native computer-use tool overlay. This stays `None` by default;
     /// the gating prompt is responsible for attaching it only to approved
@@ -1212,9 +1214,9 @@ pub(super) fn build_openai_responses_completion_model(
     openai::responses_api::ResponsesCompletionModel::new(client, model_id).with_strict_tools()
 }
 
-/// Return the pre-built native Anthropic completion model. Its caching mode is
-/// selected while constructing the provider client above; request-specific
-/// system messages, tools, and parameters are configured through
+/// Return the pre-built Anthropic Messages-wire completion model. Its optional
+/// caching mode is selected while constructing the provider client above;
+/// request-specific system messages, tools, and parameters are configured through
 /// `CompletionModel::completion_request`.
 pub(super) fn build_anthropic_completion_model(
     model: AnthropicCompletionModel,

@@ -781,7 +781,7 @@ pub async fn fetch_models_for_provider_with_store(
         ModelCatalogAbi::from(provider.request_kind()),
     )
     .await
-    .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
+    .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
@@ -835,15 +835,15 @@ pub async fn fetch_models_for_provider_with_store(
 }
 
 fn validate_anthropic_fetch_result(
+    provider_id: &str,
     entry: &ProviderEntry,
-    base_url: &str,
     result: FetchModelsAtResult,
 ) -> Result<FetchModelsAtResult> {
-    if !crate::config::providers::is_anthropic_native_base_url(base_url) {
-        return Ok(result);
-    }
     if let FetchOutcome::Models { models, .. } = &result.outcome {
         for fetched in models {
+            if entry.resolve_wire_api(provider_id, &fetched.id) != WireApi::Anthropic {
+                continue;
+            }
             let mut candidate_model = fetched.clone();
             if let Some(existing) = entry.models.iter().find(|model| model.id == fetched.id) {
                 candidate_model.capability_overrides = existing.capability_overrides.clone();
@@ -2139,12 +2139,17 @@ mod tests {
             status: Some(StatusCode::OK),
             body_nonempty: true,
         };
+        let anthropic_wire_provider = ProviderEntry {
+            url: "https://anthropic-compatible.example/v1".to_string(),
+            wire_api: WireApi::Anthropic,
+            ..ProviderEntry::default()
+        };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
-            Ok(_) => panic!("OpenAI-shaped native Anthropic mapping must be rejected"),
+            Ok(_) => panic!("OpenAI-shaped Anthropic-wire mapping must be rejected"),
             Err(error) => format!("{error:#}"),
         };
         assert!(error.contains("rejecting invalid Anthropic catalog entry"));
@@ -2186,8 +2191,8 @@ mod tests {
             body_nonempty: true,
         };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
             Ok(_) => panic!("unknown adaptive Anthropic targets must be rejected"),
@@ -2214,8 +2219,8 @@ mod tests {
             body_nonempty: true,
         };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
             Ok(_) => panic!("manual Anthropic mapping without an output limit must be rejected"),
@@ -2243,10 +2248,37 @@ mod tests {
             status: Some(StatusCode::OK),
             body_nonempty: true,
         };
+        validate_anthropic_fetch_result("third-party-anthropic", &anthropic_wire_provider, result)
+            .unwrap();
+
+        let first_party_host_on_openai_wire = ProviderEntry {
+            url: "https://api.anthropic.com/v1".to_string(),
+            wire_api: WireApi::Completions,
+            ..ProviderEntry::default()
+        };
+        let openai_shaped = parse_models_body(
+            r#"{"data":[{
+                "id":"openai-wire-model",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"high"}],
+                    "default":"high",
+                    "request_mapping":{"type":"json_field","field":"reasoning_effort"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
         validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
-            result,
+            "first-party-host-openai-wire",
+            &first_party_host_on_openai_wire,
+            FetchModelsAtResult {
+                outcome: FetchOutcome::Models {
+                    models: openai_shaped,
+                    catalog: ProviderModelCatalog::Live,
+                },
+                status: Some(StatusCode::OK),
+                body_nonempty: true,
+            },
         )
         .unwrap();
     }

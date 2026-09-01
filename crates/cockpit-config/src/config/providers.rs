@@ -1886,21 +1886,6 @@ pub fn default_wire_api_for_template(template: Option<&str>) -> WireApi {
     }
 }
 
-/// `true` when `base_url`'s host is the native Anthropic Messages endpoint
-/// (`api.anthropic.com`). Host-based rather than provider-id-based so renamed
-/// Anthropic providers still route natively, while Claude served by
-/// OpenRouter/Copilot/etc. remains OpenAI-compatible. Unparseable URLs are
-/// never native.
-pub fn is_anthropic_native_base_url(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|u| {
-            u.host_str()
-                .map(|h| h.eq_ignore_ascii_case("api.anthropic.com"))
-        })
-        .unwrap_or(false)
-}
-
 /// `true` when `base_url`'s HOST is GitHub Copilot's API host
 /// (`githubcopilot.com` or any `*.githubcopilot.com` subdomain, e.g.
 /// `api.githubcopilot.com`). Host-based rather than substring so a look-alike
@@ -2192,6 +2177,28 @@ impl ProviderEntry {
     /// are materialized when the Anthropic template creates the entry.
     pub fn effective_anthropic_features(&self) -> AnthropicFeatures {
         self.anthropic.unwrap_or_default()
+    }
+
+    /// Resolve the effective request wire for one model on this provider.
+    ///
+    /// Model pins win over a provider pin; an unpinned provider inherits its
+    /// immutable template default. URLs, provider ids, model names, live
+    /// catalog metadata, and learned endpoint state never participate.
+    pub fn resolve_wire_api(&self, provider_id: &str, model_id: &str) -> WireApi {
+        if let Some(wire_api) = self
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .filter(|model| model.wire_api_provenance.is_user_configured())
+            .map(|model| model.wire_api)
+            .filter(|wire_api| !wire_api.is_auto())
+        {
+            return wire_api;
+        }
+        if !self.wire_api.is_auto() {
+            return self.wire_api;
+        }
+        default_wire_api_for_template(self.effective_template(provider_id))
     }
 
     /// Whether this entry is GitHub Copilot, including renamed connections.
@@ -3219,20 +3226,7 @@ impl ProvidersConfig {
         let Some(entry) = self.providers.get(provider) else {
             return WireApi::Completions;
         };
-        if let Some(wire_api) = entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .filter(|m| m.wire_api_provenance.is_user_configured())
-            .map(|m| m.wire_api)
-            .filter(|w| !w.is_auto())
-        {
-            return wire_api;
-        }
-        if !entry.wire_api.is_auto() {
-            return entry.wire_api;
-        }
-        default_wire_api_for_template(entry.effective_template(provider))
+        entry.resolve_wire_api(provider, model)
     }
 
     /// Whether a configured provider has a fixed effective wire. Resolution is

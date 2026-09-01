@@ -3152,8 +3152,9 @@ fn openai_additional_params_unchanged_when_retention_unset() {
 }
 
 /// The captured/as-sent body reflects the cache key for the OpenAI flavor
-/// but omits it for native Anthropic (per-block cache) and native ChatGPT/
-/// Codex subscription (`codex-oauth` — distinct backend, no OpenAI cache keys).
+/// but omits it for the Anthropic Messages wire (no top-level cache-key field)
+/// and native ChatGPT/Codex subscription (`codex-oauth` — distinct backend,
+/// no OpenAI cache keys).
 #[test]
 fn assembled_request_cache_key_is_openai_only() {
     let params = ModelParams {
@@ -3182,7 +3183,7 @@ fn assembled_request_cache_key_is_openai_only() {
         &[],
         &params,
     );
-    // No top-level cache key in the native Anthropic capture.
+    // No top-level cache key in the Anthropic Messages-wire capture.
     assert_eq!(anthropic["additional_params"], serde_json::Value::Null);
 
     let chatgpt = assembled_request(

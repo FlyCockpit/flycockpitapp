@@ -160,6 +160,13 @@ pub(crate) trait TerminalActionHandler {
         run: &'a WizardRun,
         io: &'a mut dyn TerminalIo,
     ) -> ActionFuture<'a>;
+
+    /// Returns an interactive step to retry from after an action failure only
+    /// when the handler has not transferred ownership of the action's data or
+    /// made a durable change.
+    fn retry_step_after_action_error(&self, _step_id: &'static str) -> Option<&'static str> {
+        None
+    }
 }
 
 pub(crate) async fn run_terminal_wizard(
@@ -227,7 +234,19 @@ pub(crate) async fn run_terminal_wizard(
             }
             StepKind::Action { progress } => {
                 io.write_line(progress)?;
-                actions.run_action(step.id, &run, io).await?;
+                if let Err(error) = actions.run_action(step.id, &run, io).await {
+                    let Some(retry_step) = actions.retry_step_after_action_error(step.id) else {
+                        return Err(error);
+                    };
+                    run.return_to(retry_step).map_err(|return_error| {
+                        anyhow!(
+                            "action `{}` failed ({error}) and could not return to `{retry_step}`: {return_error}",
+                            step.id
+                        )
+                    })?;
+                    io.write_line(&format!("{error}. Choose another credential method."))?;
+                    continue;
+                }
                 submit(&mut run, WizardAnswer::Acknowledged, io)?;
             }
             StepKind::Info => {
@@ -1289,6 +1308,14 @@ impl TerminalActionHandler for ProviderSetupActions {
     ) -> ActionFuture<'a> {
         Box::pin(self.handle_action(step_id, run, io))
     }
+
+    fn retry_step_after_action_error(&self, step_id: &'static str) -> Option<&'static str> {
+        // CopyDetectedEnv reads the process environment before it creates
+        // headers or hands a provider mutation to the daemon. A race with the
+        // shell environment is therefore safe to recover by returning to the
+        // credential choice; save/fetch/OAuth errors are not equivalently safe.
+        (step_id == "copy-detected-env").then_some("auth-method")
+    }
 }
 
 fn subscription_oauth_provider(step_id: &str) -> Option<&'static str> {
@@ -1447,6 +1474,7 @@ mod tests {
         saved: Option<(String, String)>,
         fetches: usize,
         headers: Vec<HeaderSpec>,
+        copy_detected_env_failure: bool,
     }
 
     impl TerminalActionHandler for TestActions {
@@ -1458,6 +1486,9 @@ mod tests {
         ) -> ActionFuture<'a> {
             Box::pin(async move {
                 match step_id {
+                    "copy-detected-env" if self.copy_detected_env_failure => {
+                        anyhow::bail!("$OPENAI_API_KEY disappeared before it could be copied")
+                    }
                     "headers" => {
                         let template =
                             selected_provider_template(run).context("provider template")?;
@@ -1479,6 +1510,11 @@ mod tests {
                 }
                 Ok(())
             })
+        }
+
+        fn retry_step_after_action_error(&self, step_id: &'static str) -> Option<&'static str> {
+            (self.copy_detected_env_failure && step_id == "copy-detected-env")
+                .then_some("auth-method")
         }
     }
 
@@ -1902,6 +1938,41 @@ mod tests {
         );
         assert_eq!(actions.fetches, 0);
         assert!(io.output.contains("Choose a provider template"));
+    }
+
+    #[tokio::test]
+    async fn terminal_renderer_retries_copy_detected_env_from_auth_method() {
+        let mut io = ScriptIo::new(&[
+            "openai",
+            "",
+            "",
+            "copy-detected-env",
+            "advanced-headers",
+            "skip-test",
+        ]);
+        let mut actions = TestActions {
+            copy_detected_env_failure: true,
+            ..Default::default()
+        };
+
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .unwrap();
+
+        assert!(run.is_complete());
+        assert_eq!(
+            actions.saved,
+            Some((
+                "openai".to_string(),
+                "https://api.openai.com/v1".to_string()
+            ))
+        );
+        assert!(io.output.contains("Choose another credential method."));
     }
 
     #[tokio::test]

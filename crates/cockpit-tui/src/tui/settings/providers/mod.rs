@@ -1784,16 +1784,11 @@ impl SettingsCx {
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         let choice = AUTH_METHODS[s.auth_method_cursor];
                         if choice == "copy-detected-env" {
-                            if let Err(error) =
-                                s.run.submit(WizardAnswer::Select(choice.to_string()))
-                            {
-                                s.error = Some(error);
-                                return Nav::Stay;
-                            }
                             let env_var = s
                                 .detected_env_offer
                                 .as_deref()
-                                .expect("copy choice requires detected env");
+                                .expect("copy choice requires detected env")
+                                .to_string();
                             let template = s.template.expect("template chosen");
                             let id = s.id_field.text().trim().to_string();
                             // This process detected the variable, so it owns
@@ -1802,7 +1797,13 @@ impl SettingsCx {
                             // when a long-lived daemon cannot see a shell-local
                             // export. Keep the bytes zeroizing while building
                             // the same staged-secret mutation as a pasted key.
-                            let value = match std::env::var(env_var) {
+                            //
+                            // The read is deliberately before the wizard
+                            // transition: CopyDetectedEnv is non-interactive,
+                            // so a missing value must leave this attempt at
+                            // AuthMethod where the user can choose another
+                            // credential source.
+                            let value = match std::env::var(&env_var) {
                                 Ok(value) if !value.trim().is_empty() => {
                                     zeroize::Zeroizing::new(value)
                                 }
@@ -1813,6 +1814,12 @@ impl SettingsCx {
                                     return Nav::Stay;
                                 }
                             };
+                            if let Err(error) =
+                                s.run.submit(WizardAnswer::Select(choice.to_string()))
+                            {
+                                s.error = Some(error);
+                                return Nav::Stay;
+                            }
                             let headers =
                                 templates::headers_for_pasted_key(template, value.as_str());
                             let entry = provider_entry_from_add(s, template, headers);

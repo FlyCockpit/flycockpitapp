@@ -2716,17 +2716,26 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
         };
         let (_tmp, mut fresh) = fixture();
         click_rendered_provider_action(&mut fresh, &action);
-        let expected_step = match method {
-            WizardAuthMethod::PasteKey => "api-key",
-            WizardAuthMethod::EnvVar => "env-var",
-            WizardAuthMethod::AdvancedHeaders => "headers",
-            WizardAuthMethod::CopyDetectedEnv => "copy-detected-env",
-        };
-        assert!(matches!(
-            fresh.test_page(),
-            TestPageRef::Providers(ProvidersPage::Add(state))
-                if state.is_step(expected_step)
-        ));
+        if method == WizardAuthMethod::CopyDetectedEnv {
+            assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.is_step("auth-method")
+                        && state.error.as_deref().is_some_and(|error| error.contains("no longer available"))
+            ));
+        } else {
+            let expected_step = match method {
+                WizardAuthMethod::PasteKey => "api-key",
+                WizardAuthMethod::EnvVar => "env-var",
+                WizardAuthMethod::AdvancedHeaders => "headers",
+                WizardAuthMethod::CopyDetectedEnv => unreachable!(),
+            };
+            assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.is_step(expected_step)
+            ));
+        }
     }
 }
 
